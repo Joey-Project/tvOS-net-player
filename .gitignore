@@ -2,6 +2,13 @@
 .env
 .env.*
 .codex-tmp/
+.swiftpm/
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
 node_modules/
 dist/
 build/
@@ -9,3 +16,4 @@ out/
 target/
 __pycache__/
 *.py[cod]
+docs/project_journal/INDEX.md

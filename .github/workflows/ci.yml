@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tvos:
+    name: tvOS build and tests
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            brew install shellcheck
+          fi
+
+      - name: Run pre-commit checks
+        run: scripts/pre-commit.sh
+
+      - name: Build tvOS simulator app
+        run: scripts/build.sh
+
+      - name: Build tvOS XCTest bundle
+        run: scripts/build-for-testing.sh
+
+      - name: Run core unit tests
+        run: scripts/test.sh
