@@ -1,37 +1,126 @@
-# Codex-Gated Repository Template
+# TVOS Net Player
 
-This template starts a repository with the Codex review gate workflow already on
-the default branch. It is intentionally language-neutral; add project-specific CI,
-tests, release workflows, and licensing after creating a repository from it.
+这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本先提供最小可运行骨架：
 
-## Included
+- SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
+- Swift package core tests：覆盖 URL 规范化逻辑，不依赖本机 tvOS simulator runtime。
+- GitHub Actions CI：pre-commit checks、tvOS simulator build、XCTest bundle compile、core tests。
+- LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
+- Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
 
-- `.github/workflows/codex-review-gate.yml`
-- `.gitignore`
-- this README
+## 本地环境
 
-The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. It pins
-`JoeyTeng/codex-review-gate-action` to the v1.2.1 commit SHA so privileged
-`pull_request_target` runs do not depend on a movable tag.
+- Xcode 26 或更新版本。
+- Apple TV 开启开发者模式，并在 Xcode / Devices and Simulators 中和这台 Mac 配对。
+- Xcode 里登录 Apple ID；物理设备安装时需要能生成 tvOS development provisioning profile。
 
-## After Creating a Repository
+## 常用命令
 
-1. Add the project source, CI workflow, tests, and license.
-2. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
-   branch before requiring the status check.
-3. Enable the required status check with the bootstrap helper from
-   `JoeyTeng/codex-review-gate`:
+```bash
+make lint
+make format
+make build
+make build-for-testing
+make test
+```
+
+`make lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）和 `swift-format lint --strict`。`make format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码。
+
+`make build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`make build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`make test` 运行 Swift package core tests，不需要本机安装 tvOS simulator runtime。
+
+如果要跑 Xcode/tvOS simulator XCTest target：
+
+```bash
+TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' make test-tvos
+```
+
+## Pre-commit Hook
+
+安装本仓库自带的 Git hook：
+
+```bash
+make install-hooks
+```
+
+默认 pre-commit 只运行快速检查：
+
+```bash
+scripts/pre-commit.sh
+```
+
+如果希望本地提交前也跑 build 或 tests：
+
+```bash
+PRE_COMMIT_RUN_BUILD=1 scripts/pre-commit.sh
+PRE_COMMIT_RUN_TESTS=1 scripts/pre-commit.sh
+```
+
+## 刷新到 Apple TV
+
+先列出 Xcode/CoreDevice 能看到的设备：
+
+```bash
+xcrun devicectl list devices
+```
+
+然后用你的 Team ID 和 Apple TV identifier 安装并启动：
+
+```bash
+DEVELOPMENT_TEAM=ABCDE12345 \
+TVOS_DEVICE_ID=00000000-0000-0000-0000-000000000000 \
+make deploy
+```
+
+默认 bundle id 是 `dev.joey.tvos-net-player`。如果你需要避开已有 provisioning profile 或换成自己的命名空间：
+
+```bash
+DEVELOPMENT_TEAM=ABCDE12345 \
+PRODUCT_BUNDLE_IDENTIFIER=com.example.tvos-net-player \
+TVOS_DEVICE_ID=00000000-0000-0000-0000-000000000000 \
+make deploy
+```
+
+`scripts/deploy-lan.sh` 会执行 `xcodebuild -allowProvisioningUpdates`，然后用：
+
+```bash
+xcrun devicectl device install app --device "$TVOS_DEVICE_ID" build/DerivedData/Build/Products/Debug-appletvos/TVOSNetPlayer.app
+```
+
+自签名或个人开发签名的有效期取决于你的 Apple Developer 账户和生成出来的 provisioning profile；过期后重新运行 `make deploy` 就会刷新本机 build 和设备安装。
+
+## CI
+
+`.github/workflows/ci.yml` 使用 `macos-26` runner 跑：
+
+```bash
+scripts/pre-commit.sh
+scripts/build.sh
+scripts/build-for-testing.sh
+scripts/test.sh
+```
+
+其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
+
+后续设置 required checks 时，建议至少 gate：
+
+- `CI / tvOS build and tests`
+- `codex/review-gate`
+
+## Codex Review Gate
+
+模板自带的 `.github/workflows/codex-review-gate.yml` 仍然保留。它写入 `codex/review-gate` status check，并把
+`JoeyTeng/codex-review-gate-action` pin 到 v1.2.1 commit SHA，避免 privileged `pull_request_target` 运行依赖可移动 tag。
+
+启用 required status check 时，可以使用 `JoeyTeng/codex-review-gate` 的 bootstrap helper：
 
 ```bash
 node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
 node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
 ```
 
-The helper defaults to dry-run. It refuses to require `codex/review-gate` until
-the workflow exists on the repository default branch.
+helper 默认 dry-run，并且会在 workflow 已经存在于默认分支前拒绝要求 `codex/review-gate`。
 
-## Optional Repository Variables
+## 可选仓库变量
 
 - `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
   `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
