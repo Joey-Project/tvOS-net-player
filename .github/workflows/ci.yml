@@ -42,5 +42,8 @@ jobs:
       - name: Build tvOS XCTest bundle
         run: scripts/build-for-testing.sh
 
+      - name: Run tvOS XCTest target
+        run: scripts/test-tvos-simulator.sh
+
       - name: Run core unit tests
         run: scripts/test.sh

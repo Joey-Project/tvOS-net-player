@@ -2,6 +2,23 @@ import XCTest
 @testable import TVOSNetPlayer
 
 final class PlayerViewModelTests: XCTestCase {
+    private var defaultsSuiteName: String!
+    private var defaults: UserDefaults!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        defaultsSuiteName = "PlayerViewModelTests-\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsSuiteName))
+        defaults.removePersistentDomain(forName: defaultsSuiteName)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: defaultsSuiteName)
+        defaults = nil
+        defaultsSuiteName = nil
+        super.tearDown()
+    }
+
     func testNormalizesBareHostAsHTTPURL() {
         let url = PlayerViewModel.normalizedHTTPURL(from: "192.168.1.10:8080/video.mp4")
 
@@ -16,5 +33,101 @@ final class PlayerViewModelTests: XCTestCase {
 
     func testRejectsUnsupportedSchemes() {
         XCTAssertNil(PlayerViewModel.normalizedHTTPURL(from: "file:///tmp/movie.mp4"))
+    }
+
+    @MainActor
+    func testSavedURLInitializesIdleModel() {
+        defaults.set("https://example.com/movie.m3u8", forKey: PlayerViewModel.lastStreamURLDefaultsKey)
+
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        XCTAssertEqual(model.streamURLText, "https://example.com/movie.m3u8")
+        XCTAssertEqual(model.statusMessage, "Ready to replay https://example.com/movie.m3u8.")
+        XCTAssertNil(model.loadedURL)
+        XCTAssertNil(model.player)
+        XCTAssertTrue(model.canClear)
+    }
+
+    @MainActor
+    func testClearingSavedURLTextRemovesPersistedURL() {
+        defaults.set("https://example.com/movie.m3u8", forKey: PlayerViewModel.lastStreamURLDefaultsKey)
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        model.streamURLText = ""
+
+        XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
+        XCTAssertEqual(model.statusMessage, "Ready for an HTTP or HTTPS stream on your network.")
+        XCTAssertFalse(model.canClear)
+    }
+
+    @MainActor
+    func testLoadStoresNormalizedURL() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.streamURLText = "example.com/movie.m3u8"
+
+        model.load()
+
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://example.com/movie.m3u8")
+        XCTAssertEqual(model.streamURLText, "http://example.com/movie.m3u8")
+        XCTAssertEqual(
+            defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey), "http://example.com/movie.m3u8")
+        XCTAssertNil(model.validationMessage)
+    }
+
+    @MainActor
+    func testInvalidURLKeepsCurrentPlayer() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.streamURLText = "https://example.com/movie.m3u8"
+        model.load()
+        let loadedURL = model.loadedURL
+
+        model.streamURLText = "file:///tmp/movie.mp4"
+        model.load()
+
+        XCTAssertEqual(model.loadedURL, loadedURL)
+        XCTAssertNotNil(model.player)
+        XCTAssertEqual(model.validationMessage, "Use an HTTP or HTTPS URL.")
+    }
+
+    @MainActor
+    func testCorrectingInvalidURLClearsValidationMessage() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.streamURLText = "file:///tmp/movie.mp4"
+        model.load()
+
+        model.streamURLText = "https://example.com/movie.m3u8"
+
+        XCTAssertNil(model.validationMessage)
+        XCTAssertEqual(model.statusMessage, "Ready to play https://example.com/movie.m3u8.")
+    }
+
+    @MainActor
+    func testClearCanResetEmptyValidationState() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        model.load()
+
+        XCTAssertTrue(model.canClear)
+        XCTAssertEqual(model.validationMessage, "Use an HTTP or HTTPS URL.")
+
+        model.clear()
+
+        XCTAssertFalse(model.canClear)
+        XCTAssertEqual(model.statusMessage, "Ready for an HTTP or HTTPS stream on your network.")
+        XCTAssertNil(model.validationMessage)
+    }
+
+    @MainActor
+    func testClearRemovesSavedURLAndStopsPlayer() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.streamURLText = "https://example.com/movie.m3u8"
+        model.load()
+
+        model.clear()
+
+        XCTAssertEqual(model.streamURLText, "")
+        XCTAssertNil(model.loadedURL)
+        XCTAssertNil(model.player)
+        XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
     }
 }

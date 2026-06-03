@@ -3,8 +3,9 @@
 这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本先提供最小可运行骨架：
 
 - SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
+- 手动 URL v0 工作流：保存上次播放地址，支持停止、清空和输入校验。
 - Swift package core tests：覆盖 URL 规范化逻辑，不依赖本机 tvOS simulator runtime。
-- GitHub Actions CI：pre-commit checks、tvOS simulator build、XCTest bundle compile、core tests。
+- GitHub Actions CI：pre-commit checks、tvOS simulator build、tvOS XCTest target、core tests。
 - LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
 - Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
 
@@ -18,10 +19,12 @@
 ## 常用命令
 
 ```bash
+just ci
 just lint
 just format
 just build
 just build-for-testing
+just test-tvos
 just test
 ```
 
@@ -97,10 +100,11 @@ xcrun devicectl device install app --device "$TVOS_DEVICE_ID" build/DerivedData/
 scripts/pre-commit.sh
 scripts/build.sh
 scripts/build-for-testing.sh
+scripts/test-tvos-simulator.sh
 scripts/test.sh
 ```
 
-其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
+其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
 
 后续设置 required checks 时，建议至少 gate：
 
