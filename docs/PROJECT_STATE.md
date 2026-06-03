@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、本机 build/test/deploy 脚本、Swift formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -17,4 +17,4 @@
 ## Notes
 
 - CI 不保存 Apple Developer secrets；设备刷新只在本机通过 `scripts/deploy-lan.sh` 执行。
-- 本地 hook 用 `make install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。
+- 本地 hook 用 `just install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。
