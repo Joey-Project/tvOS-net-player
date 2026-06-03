@@ -11,27 +11,28 @@
 ## 本地环境
 
 - Xcode 26 或更新版本。
+- `just` task runner。
 - Apple TV 开启开发者模式，并在 Xcode / Devices and Simulators 中和这台 Mac 配对。
 - Xcode 里登录 Apple ID；物理设备安装时需要能生成 tvOS development provisioning profile。
 
 ## 常用命令
 
 ```bash
-make lint
-make format
-make build
-make build-for-testing
-make test
+just lint
+just format
+just build
+just build-for-testing
+just test
 ```
 
-`make lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）和 `swift-format lint --strict`。`make format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码。
+`just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）和 `swift-format lint --strict`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码。
 
-`make build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`make build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`make test` 运行 Swift package core tests，不需要本机安装 tvOS simulator runtime。
+`just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core tests，不需要本机安装 tvOS simulator runtime。
 
 如果要跑 Xcode/tvOS simulator XCTest target：
 
 ```bash
-TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' make test-tvos
+TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
 
 ## Pre-commit Hook
@@ -39,7 +40,7 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' make test-tvos
 安装本仓库自带的 Git hook：
 
 ```bash
-make install-hooks
+just install-hooks
 ```
 
 默认 pre-commit 只运行快速检查：
@@ -68,7 +69,7 @@ xcrun devicectl list devices
 ```bash
 DEVELOPMENT_TEAM=ABCDE12345 \
 TVOS_DEVICE_ID=00000000-0000-0000-0000-000000000000 \
-make deploy
+just deploy
 ```
 
 默认 bundle id 是 `dev.joey.tvos-net-player`。如果你需要避开已有 provisioning profile 或换成自己的命名空间：
@@ -77,7 +78,7 @@ make deploy
 DEVELOPMENT_TEAM=ABCDE12345 \
 PRODUCT_BUNDLE_IDENTIFIER=com.example.tvos-net-player \
 TVOS_DEVICE_ID=00000000-0000-0000-0000-000000000000 \
-make deploy
+just deploy
 ```
 
 `scripts/deploy-lan.sh` 会执行 `xcodebuild -allowProvisioningUpdates`，然后用：
@@ -86,7 +87,7 @@ make deploy
 xcrun devicectl device install app --device "$TVOS_DEVICE_ID" build/DerivedData/Build/Products/Debug-appletvos/TVOSNetPlayer.app
 ```
 
-自签名或个人开发签名的有效期取决于你的 Apple Developer 账户和生成出来的 provisioning profile；过期后重新运行 `make deploy` 就会刷新本机 build 和设备安装。
+自签名或个人开发签名的有效期取决于你的 Apple Developer 账户和生成出来的 provisioning profile；过期后重新运行 `just deploy` 就会刷新本机 build 和设备安装。
 
 ## CI
 
