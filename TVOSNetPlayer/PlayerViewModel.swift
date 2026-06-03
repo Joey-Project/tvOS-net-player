@@ -4,36 +4,92 @@ import Foundation
 
 @MainActor
 final class PlayerViewModel: ObservableObject {
-    @Published var streamURLText: String
+    static let lastStreamURLDefaultsKey = "LastStreamURLText"
+
+    @Published var streamURLText: String {
+        didSet {
+            syncStateAfterInputChange()
+        }
+    }
     @Published private(set) var loadedURL: URL?
     @Published private(set) var player: AVPlayer?
     @Published private(set) var statusMessage: String
+    @Published private(set) var validationMessage: String?
 
-    init(defaultStreamURLText: String = "") {
-        streamURLText = defaultStreamURLText
-        statusMessage = "Ready for an HTTP or HTTPS stream on your network."
+    private let defaults: UserDefaults
+    private let autoplay: Bool
+
+    var canClear: Bool {
+        !streamURLText.isEmpty || player != nil || validationMessage != nil
     }
 
-    func loadDefaultIfAvailable() {
-        guard player == nil, !streamURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
-        }
-        load()
+    init(defaultStreamURLText: String? = nil, defaults: UserDefaults = .standard, autoplay: Bool = true) {
+        self.defaults = defaults
+        self.autoplay = autoplay
+
+        let initialStreamURLText = defaultStreamURLText ?? defaults.string(forKey: Self.lastStreamURLDefaultsKey) ?? ""
+        streamURLText = initialStreamURLText
+        statusMessage =
+            initialStreamURLText.isEmpty
+            ? "Ready for an HTTP or HTTPS stream on your network."
+            : "Ready to replay \(initialStreamURLText)."
     }
 
     func load() {
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
-            player = nil
-            loadedURL = nil
-            statusMessage = "Use an HTTP or HTTPS URL, for example http://192.168.1.10:8080/video.mp4."
+            validationMessage = "Use an HTTP or HTTPS URL."
+            statusMessage = "Cannot load this stream."
             return
         }
 
         let nextPlayer = AVPlayer(url: url)
         player = nextPlayer
         loadedURL = url
-        statusMessage = "Loaded \(url.absoluteString)"
-        nextPlayer.play()
+        validationMessage = nil
+        streamURLText = url.absoluteString
+        defaults.set(url.absoluteString, forKey: Self.lastStreamURLDefaultsKey)
+        statusMessage = "Playing \(url.absoluteString)"
+
+        if autoplay {
+            nextPlayer.play()
+        }
+    }
+
+    func stop() {
+        player?.pause()
+        player = nil
+        loadedURL = nil
+        statusMessage = "Stopped."
+    }
+
+    func clear() {
+        stop()
+        streamURLText = ""
+        validationMessage = nil
+        defaults.removeObject(forKey: Self.lastStreamURLDefaultsKey)
+        statusMessage = "Ready for an HTTP or HTTPS stream on your network."
+    }
+
+    private func syncStateAfterInputChange() {
+        if let url = Self.normalizedHTTPURL(from: streamURLText) {
+            if validationMessage != nil {
+                validationMessage = nil
+                statusMessage = "Ready to play \(url.absoluteString)."
+            }
+            return
+        }
+
+        guard streamURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        validationMessage = nil
+        defaults.removeObject(forKey: Self.lastStreamURLDefaultsKey)
+
+        if player == nil {
+            loadedURL = nil
+            statusMessage = "Ready for an HTTP or HTTPS stream on your network."
+        }
     }
 
     nonisolated static func normalizedHTTPURL(from text: String) -> URL? {

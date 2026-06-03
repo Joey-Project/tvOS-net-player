@@ -19,16 +19,18 @@ superseded_by:
 ## Current State
 
 - app target `TVOSNetPlayer` 使用 SwiftUI + `AVPlayer` 播放 HTTP/HTTPS URL。
-- CI workflow `CI` 在 `macos-26` 上运行 pre-commit checks、tvOS simulator build、Xcode XCTest bundle compile 和 Swift package core tests。
+- v0 播放工作流选择手动 URL 输入；app 会保存上次 URL，并提供停止、清空和输入校验状态。
+- CI workflow `CI` 在 `macos-26` 上运行 pre-commit checks、tvOS simulator build、tvOS XCTest target 和 Swift package core tests。
 - `just lint` 运行 shell lint 和 `swift-format lint --strict`；`just format` 运行 `swift-format format --in-place`。
-- `just build-for-testing` 编译 Xcode XCTest bundle 但不启动 simulator；`just test` 运行不依赖 tvOS simulator runtime 的 Swift package tests；`just test-tvos` 保留给本机或 runner 有 tvOS simulator runtime 时使用。
+- `just ci` 对齐 GitHub CI，依次覆盖 lint、tvOS simulator build、XCTest bundle compile、tvOS XCTest target 和 Swift package core tests。
+- `just build-for-testing` 编译 Xcode XCTest bundle 但不启动 simulator；`just test-tvos` 运行 app target 的 tvOS XCTest；`just test` 运行不依赖 tvOS simulator runtime 的 Swift package tests。
 - `just install-hooks` 安装 tracked pre-commit hook，hook 默认调用 `scripts/pre-commit.sh` 的快速 lint 检查。
 - 本机部署入口是 `just deploy` / `scripts/deploy-lan.sh`，通过 `DEVELOPMENT_TEAM`、`TVOS_DEVICE_ID` 和可选 `PRODUCT_BUNDLE_IDENTIFIER` 控制签名和设备。
 
 ## Next Steps
 
 - 在 Apple TV 实机配对后运行一次 `just deploy`，确认 automatic signing profile、安装和启动都正常。
-- 选择首个真实网络播放工作流，再扩展 UI、错误处理和媒体源发现。
+- 后续选择是否加入固定家庭媒体源、Bonjour 发现，或配套局域网服务端。
 
 ## Evidence
 

@@ -9,7 +9,7 @@ build:
 build-for-testing:
     scripts/build-for-testing.sh
 
-ci: lint build build-for-testing test
+ci: lint build build-for-testing test-tvos test
 
 deploy:
     scripts/deploy-lan.sh
