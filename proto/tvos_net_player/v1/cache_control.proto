@@ -1,0 +1,238 @@
+syntax = "proto3";
+
+package tvos_net_player.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "TVOSNetPlayer.Cache.V1";
+
+// Control-plane API for the LAN cache server.
+// Media bytes are never sent through gRPC. PlaybackSource.uri must be an HTTP
+// URL that AVPlayer can play directly, such as an HLS playlist or MP4 asset.
+
+service ServerService {
+  rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfo);
+  rpc CheckHealth(CheckHealthRequest) returns (HealthStatus);
+}
+
+service LibraryService {
+  rpc ListLibraryItems(ListLibraryItemsRequest) returns (ListLibraryItemsResponse);
+  rpc GetLibraryItem(GetLibraryItemRequest) returns (LibraryItem);
+  rpc GetPlaybackSource(GetPlaybackSourceRequest) returns (PlaybackSource);
+  rpc RescanLibrary(RescanLibraryRequest) returns (RescanLibraryResponse);
+}
+
+service TaskService {
+  rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc WatchTasks(WatchTasksRequest) returns (stream TaskEvent);
+  rpc CancelTask(CancelTaskRequest) returns (Task);
+}
+
+service CacheService {
+  rpc ListCacheRoots(ListCacheRootsRequest) returns (ListCacheRootsResponse);
+  rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
+}
+
+message GetServerInfoRequest {}
+
+message ServerInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  repeated string media_base_uris = 4;
+  repeated ServerCapability capabilities = 5;
+}
+
+enum ServerCapability {
+  SERVER_CAPABILITY_UNSPECIFIED = 0;
+  SERVER_CAPABILITY_BILIBILI_TASKS = 1;
+  SERVER_CAPABILITY_HTTP_RANGE = 2;
+  SERVER_CAPABILITY_HLS = 3;
+  SERVER_CAPABILITY_BONJOUR_DISCOVERY = 4;
+}
+
+message CheckHealthRequest {}
+
+message HealthStatus {
+  HealthState state = 1;
+  string message = 2;
+  google.protobuf.Timestamp checked_at = 3;
+}
+
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_SERVING = 1;
+  HEALTH_STATE_DEGRADED = 2;
+  HEALTH_STATE_NOT_SERVING = 3;
+}
+
+message ListLibraryItemsRequest {
+  string page_token = 1;
+  int32 page_size = 2;
+  LibraryFilter filter = 3;
+}
+
+message LibraryFilter {
+  repeated LibrarySource sources = 1;
+  string search_text = 2;
+}
+
+message ListLibraryItemsResponse {
+  repeated LibraryItem items = 1;
+  string next_page_token = 2;
+}
+
+message GetLibraryItemRequest {
+  string id = 1;
+}
+
+message LibraryItem {
+  string id = 1;
+  string title = 2;
+  string subtitle = 3;
+  LibrarySource source = 4;
+  string source_id = 5;
+  string poster_uri = 6;
+  repeated MediaVariant variants = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+enum LibrarySource {
+  LIBRARY_SOURCE_UNSPECIFIED = 0;
+  LIBRARY_SOURCE_LOCAL_CACHE = 1;
+  LIBRARY_SOURCE_MOUNTED_SMB = 2;
+  LIBRARY_SOURCE_BILIBILI = 3;
+}
+
+message MediaVariant {
+  string id = 1;
+  string label = 2;
+  PlaybackProtocol protocol = 3;
+  string container = 4;
+  string video_codec = 5;
+  string audio_codec = 6;
+  int32 width = 7;
+  int32 height = 8;
+  int64 bitrate = 9;
+  int64 size_bytes = 10;
+}
+
+message GetPlaybackSourceRequest {
+  string item_id = 1;
+  string variant_id = 2;
+}
+
+message PlaybackSource {
+  string item_id = 1;
+  string variant_id = 2;
+  PlaybackProtocol protocol = 3;
+  string uri = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+enum PlaybackProtocol {
+  PLAYBACK_PROTOCOL_UNSPECIFIED = 0;
+  PLAYBACK_PROTOCOL_HTTP_FILE = 1;
+  PLAYBACK_PROTOCOL_HLS = 2;
+}
+
+message RescanLibraryRequest {
+  repeated string cache_root_ids = 1;
+}
+
+message RescanLibraryResponse {
+  int32 discovered_item_count = 1;
+}
+
+message CreateBilibiliTaskRequest {
+  string url_or_id = 1;
+  BilibiliDownloadOptions options = 2;
+}
+
+message BilibiliDownloadOptions {
+  string quality_preference = 1;
+  string encoding_preference = 2;
+  bool prefer_tv_api = 3;
+  bool download_subtitles = 4;
+  bool download_danmaku = 5;
+}
+
+message GetTaskRequest {
+  string id = 1;
+}
+
+message WatchTasksRequest {
+  repeated string ids = 1;
+}
+
+message TaskEvent {
+  Task task = 1;
+}
+
+message CancelTaskRequest {
+  string id = 1;
+}
+
+message Task {
+  string id = 1;
+  TaskKind kind = 2;
+  TaskState state = 3;
+  string source = 4;
+  string title = 5;
+  double progress = 6;
+  int64 downloaded_bytes = 7;
+  int64 total_bytes = 8;
+  string message = 9;
+  string library_item_id = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  google.protobuf.Timestamp finished_at = 13;
+}
+
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  TASK_KIND_BILIBILI_DOWNLOAD = 1;
+  TASK_KIND_LIBRARY_RESCAN = 2;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_SUCCEEDED = 3;
+  TASK_STATE_FAILED = 4;
+  TASK_STATE_CANCEL_REQUESTED = 5;
+  TASK_STATE_CANCELLED = 6;
+}
+
+message ListCacheRootsRequest {}
+
+message ListCacheRootsResponse {
+  repeated CacheRoot roots = 1;
+}
+
+message CacheRoot {
+  string id = 1;
+  string label = 2;
+  CacheRootKind kind = 3;
+  string path = 4;
+  bool writable = 5;
+  int64 free_bytes = 6;
+  int64 total_bytes = 7;
+}
+
+enum CacheRootKind {
+  CACHE_ROOT_KIND_UNSPECIFIED = 0;
+  CACHE_ROOT_KIND_LOCAL_DIRECTORY = 1;
+  CACHE_ROOT_KIND_MOUNTED_SMB = 2;
+}
+
+message DeleteLibraryItemRequest {
+  string id = 1;
+}
+
+message DeleteLibraryItemResponse {
+  bool deleted = 1;
+}
