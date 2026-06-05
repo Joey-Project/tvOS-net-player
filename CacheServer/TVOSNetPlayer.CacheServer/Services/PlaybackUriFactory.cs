@@ -31,9 +31,10 @@ public sealed class PlaybackUriFactory
     internal static string CreateMediaBaseUri(string requestAuthority, string mediaListenUrl)
     {
         var mediaUri = new Uri(mediaListenUrl);
-        var host = mediaUri.Host is "0.0.0.0" or "::" or "*" or "+"
+        var listenHost = CacheServerHost.NormalizeListenHost(mediaUri);
+        var host = listenHost is "0.0.0.0" or "::" or "*" or "+"
             ? ExtractUriHost(requestAuthority)
-            : FormatUriHost(mediaUri.Host);
+            : FormatUriHost(listenHost);
 
         return $"{mediaUri.Scheme}://{host}:{mediaUri.Port}";
     }

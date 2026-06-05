@@ -72,6 +72,7 @@ try
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
+    await AssertSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot, outsidePath);
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
     AssertListenHostNormalization();
@@ -312,6 +313,46 @@ static async System.Threading.Tasks.Task AssertSymlinkIsRejectedAsync(GrpcChanne
     AssertEqual(HttpStatusCode.NotFound, directorySymlinkResponse.StatusCode, "symlink directory media lookup");
 }
 
+static async System.Threading.Tasks.Task AssertSymlinkSwapBeforeOpenIsRejectedAsync(string rootPath, string outsidePath)
+{
+    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    {
+        return;
+    }
+
+    var mediaPath = Path.Combine(rootPath, "Movies", "Swap Clip.mp4");
+    await File.WriteAllTextAsync(mediaPath, "inside-cache-root");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeOpenMediaFileForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "swap hook media path");
+            File.Delete(mediaPath);
+            File.CreateSymbolicLink(mediaPath, outsidePath);
+        }
+    };
+
+    try
+    {
+        var openedFile = await library.OpenMediaFileAsync(CreateLocalItemId("Movies/Swap Clip.mp4"), "original", CancellationToken.None);
+        if (openedFile is not null)
+        {
+            openedFile.Stream.Dispose();
+            throw new InvalidOperationException("OpenMediaFileAsync unexpectedly opened a symlink swapped in after validation.");
+        }
+    }
+    finally
+    {
+        if (File.Exists(mediaPath))
+        {
+            File.Delete(mediaPath);
+        }
+    }
+}
+
 static async System.Threading.Tasks.Task AssertReadOnlyRootReportsNotWritableAsync(GrpcChannel channel, string rootPath)
 {
     if (OperatingSystem.IsWindows())
@@ -408,6 +449,11 @@ static void AssertPlaybackBaseUriFormatting()
         "http://[::1]:8080",
         PlaybackUriFactory.CreateMediaBaseUri("127.0.0.1:50051", "http://[::1]:8080"),
         "explicit IPv6 playback base URI");
+
+    AssertEqual(
+        "http://[::1]:8080",
+        PlaybackUriFactory.CreateMediaBaseUri("[::1]:50051", "http://[::]:8080"),
+        "bracketed IPv6 wildcard playback base URI");
 }
 
 static void AssertListenHostNormalization()

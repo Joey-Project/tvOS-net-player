@@ -43,15 +43,14 @@ public static class CacheServerHost
             LocalMediaLibrary library,
             CancellationToken cancellationToken) =>
         {
-            var mediaFile = await library.GetMediaFileAsync(itemId, variantId, cancellationToken);
+            var mediaFile = await library.OpenMediaFileAsync(itemId, variantId, cancellationToken);
             if (mediaFile is null)
             {
                 return Results.NotFound();
             }
 
-            var stream = File.OpenRead(mediaFile.Path);
             return Results.File(
-                stream,
+                mediaFile.Stream,
                 mediaFile.ContentType,
                 enableRangeProcessing: true,
                 lastModified: mediaFile.LastModified);

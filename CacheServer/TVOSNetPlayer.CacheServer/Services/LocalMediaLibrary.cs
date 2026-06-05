@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Google.Protobuf.WellKnownTypes;
+using Microsoft.Win32.SafeHandles;
 using Microsoft.Extensions.Options;
 using TVOSNetPlayer.Cache.V1;
 
@@ -10,12 +11,17 @@ public sealed class LocalMediaLibrary
 {
     private const string RootId = "default";
     private const string VariantId = "original";
+    private const int OpenReadOnly = 0;
+    private const int DarwinOpenNoFollow = 0x00000100;
+    private const int LinuxOpenNoFollow = 0x00020000;
     private readonly IOptionsMonitor<CacheServerOptions> options;
 
     public LocalMediaLibrary(IOptionsMonitor<CacheServerOptions> options)
     {
         this.options = options;
     }
+
+    internal Action<string>? BeforeOpenMediaFileForTests { get; set; }
 
     public string RootPath => Path.GetFullPath(options.CurrentValue.RootPath);
 
@@ -67,10 +73,58 @@ public sealed class LocalMediaLibrary
     public System.Threading.Tasks.Task<MediaFile?> GetMediaFileAsync(string itemId, string variantId, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        return System.Threading.Tasks.Task.FromResult(ResolveMediaFile(itemId, variantId));
+    }
 
+    public System.Threading.Tasks.Task<OpenedMediaFile?> OpenMediaFileAsync(string itemId, string variantId, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var mediaFile = ResolveMediaFile(itemId, variantId);
+        if (mediaFile is null)
+        {
+            return System.Threading.Tasks.Task.FromResult<OpenedMediaFile?>(null);
+        }
+
+        BeforeOpenMediaFileForTests?.Invoke(mediaFile.Path);
+        FileStream stream;
+        try
+        {
+            stream = OpenReadNoFollow(mediaFile.Path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return System.Threading.Tasks.Task.FromResult<OpenedMediaFile?>(null);
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(stream.SafeFileHandle);
+            if (attributes.HasFlag(FileAttributes.Directory) || attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                stream.Dispose();
+                return System.Threading.Tasks.Task.FromResult<OpenedMediaFile?>(null);
+            }
+
+            var lastWriteTimeUtc = DateTime.SpecifyKind(File.GetLastWriteTimeUtc(stream.SafeFileHandle), DateTimeKind.Utc);
+            var openedFile = new OpenedMediaFile(
+                stream,
+                mediaFile.ContentType,
+                new DateTimeOffset(lastWriteTimeUtc, TimeSpan.Zero),
+                stream.Length);
+            return System.Threading.Tasks.Task.FromResult<OpenedMediaFile?>(openedFile);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            stream.Dispose();
+            return System.Threading.Tasks.Task.FromResult<OpenedMediaFile?>(null);
+        }
+    }
+
+    private MediaFile? ResolveMediaFile(string itemId, string variantId)
+    {
         if (variantId != VariantId || !TryDecodeItemId(itemId, out var relativePath))
         {
-            return System.Threading.Tasks.Task.FromResult<MediaFile?>(null);
+            return null;
         }
 
         var rootPath = RootPath;
@@ -82,30 +136,30 @@ public sealed class LocalMediaLibrary
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            return System.Threading.Tasks.Task.FromResult<MediaFile?>(null);
+            return null;
         }
 
         if (!candidatePath.StartsWith(fullRootPath, StringComparison.Ordinal) || !File.Exists(candidatePath))
         {
-            return System.Threading.Tasks.Task.FromResult<MediaFile?>(null);
+            return null;
         }
 
         if (PathContainsLink(rootPath, candidatePath))
         {
-            return System.Threading.Tasks.Task.FromResult<MediaFile?>(null);
+            return null;
         }
 
         if (!GetAllowedExtensions().Contains(Path.GetExtension(candidatePath)))
         {
-            return System.Threading.Tasks.Task.FromResult<MediaFile?>(null);
+            return null;
         }
 
         var fileInfo = new FileInfo(candidatePath);
-        return System.Threading.Tasks.Task.FromResult<MediaFile?>(new MediaFile(
+        return new MediaFile(
             candidatePath,
             GetContentType(candidatePath),
             new DateTimeOffset(fileInfo.LastWriteTimeUtc, TimeSpan.Zero),
-            fileInfo.Length));
+            fileInfo.Length);
     }
 
     public System.Threading.Tasks.Task<CacheRoot> GetCacheRootAsync(CancellationToken cancellationToken)
@@ -382,6 +436,47 @@ public sealed class LocalMediaLibrary
         return Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
     }
 
+    private static FileStream OpenReadNoFollow(string path)
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            return OpenUnixReadNoFollow(path, DarwinOpenNoFollow);
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            return OpenUnixReadNoFollow(path, LinuxOpenNoFollow);
+        }
+
+        return new FileStream(path, new FileStreamOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.Read,
+            Options = FileOptions.SequentialScan
+        });
+    }
+
+    private static FileStream OpenUnixReadNoFollow(string path, int openNoFollow)
+    {
+        var fileDescriptor = Open(path, OpenReadOnly | openNoFollow);
+        if (fileDescriptor < 0)
+        {
+            throw new IOException($"Could not open media file without following symlinks. errno={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
+        }
+
+        var handle = new SafeFileHandle(new IntPtr(fileDescriptor), ownsHandle: true);
+        try
+        {
+            return new FileStream(handle, FileAccess.Read, bufferSize: 1);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     private static bool CanWriteToDirectory(string path)
     {
         var probePath = Path.Combine(path, $".tvnp-write-probe-{Guid.NewGuid():N}");
@@ -429,9 +524,14 @@ public sealed class LocalMediaLibrary
     {
         return OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int Open(string path, int flags);
 }
 
 public sealed record MediaFile(string Path, string ContentType, DateTimeOffset LastModified, long SizeBytes);
+
+public sealed record OpenedMediaFile(FileStream Stream, string ContentType, DateTimeOffset LastModified, long SizeBytes);
 
 public sealed record LibraryItemPage(IReadOnlyList<LibraryItem> Items, long? NextPageOffset)
 {
