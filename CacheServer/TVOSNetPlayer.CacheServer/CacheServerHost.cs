@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Options;
 using System.Net;
 using TVOSNetPlayer.CacheServer.Services;
 
@@ -40,9 +41,16 @@ public static class CacheServerHost
         app.MapMethods("/media/{itemId}/{variantId}", ["GET", "HEAD"], async (
             string itemId,
             string variantId,
+            HttpContext httpContext,
             LocalMediaLibrary library,
+            IOptionsMonitor<CacheServerOptions> options,
             CancellationToken cancellationToken) =>
         {
+            if (!IsMediaRequestPort(httpContext, options.CurrentValue.MediaListenUrl))
+            {
+                return Results.NotFound();
+            }
+
             var mediaFile = await library.OpenMediaFileAsync(itemId, variantId, cancellationToken);
             if (mediaFile is null)
             {
@@ -59,9 +67,19 @@ public static class CacheServerHost
         return app;
     }
 
+    internal static bool IsMediaRequestPort(HttpContext context, string mediaListenUrl)
+    {
+        return context.Connection.LocalPort == new Uri(mediaListenUrl).Port;
+    }
+
     private static void Listen(KestrelServerOptions options, string listenUrl, HttpProtocols protocols)
     {
         var uri = new Uri(listenUrl);
+        if (!uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Only cleartext http listen URLs are supported in this slice.");
+        }
+
         var host = NormalizeListenHost(uri);
         void Configure(ListenOptions listenOptions)
         {

@@ -87,8 +87,10 @@ Runtime shape:
 
 - gRPC services are hosted by ASP.NET Core and generated from `proto/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://0.0.0.0:50051` for gRPC/h2c and `http://0.0.0.0:8080` for HTTP media.
+- `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that Kestrel does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
+- The media route is also constrained to the configured media listener port, so the gRPC listener does not serve media bytes even though both listeners share one ASP.NET Core app in this slice.
 - Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports macOS and Linux; other platforms can list local files but do not advertise HTTP Range playback, return playable variants, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented.
 - `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
 

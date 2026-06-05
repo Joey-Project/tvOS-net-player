@@ -72,6 +72,7 @@ try
     var playback = await AssertPlaybackSourceAsync(channel, item);
     await AssertHttpRangePlaybackAsync(playback.Uri);
     await AssertHttpHeadPlaybackAsync(playback.Uri);
+    await AssertMediaEndpointIsNotServedFromGrpcPortAsync(grpcAddress, item);
     await AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(app.Services, channel, item);
     await AssertWatchTasksIsUnimplementedAsync(channel);
     await AssertTraversalIsRejectedAsync(mediaAddress);
@@ -83,6 +84,7 @@ try
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
     AssertListenHostNormalization();
+    await AssertListenUrlsMustBeCleartextAsync(tempRoot);
     await AssertSymlinkRootIsRejectedAsync(symlinkRootTarget, symlinkRoot);
 
     Console.WriteLine("Cache server integration tests passed.");
@@ -207,8 +209,10 @@ static async System.Threading.Tasks.Task AssertListSkipsDeletedFileDuringMateria
 {
     var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-list-race-{Guid.NewGuid():N}");
     Directory.CreateDirectory(rootPath);
-    var mediaPath = Path.Combine(rootPath, "Vanishing Clip.mp4");
+    var mediaPath = Path.Combine(rootPath, "A Vanishing Clip.mp4");
+    var survivorPath = Path.Combine(rootPath, "B Survivor Clip.mp4");
     await File.WriteAllTextAsync(mediaPath, "vanishing");
+    await File.WriteAllTextAsync(survivorPath, "survivor");
     var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
     {
         RootPath = rootPath
@@ -216,15 +220,19 @@ static async System.Threading.Tasks.Task AssertListSkipsDeletedFileDuringMateria
     {
         BeforeCreateLibraryItemForTests = path =>
         {
-            AssertEqual(mediaPath, path, "list materialization hook media path");
-            File.Delete(path);
+            if (path == mediaPath)
+            {
+                File.Delete(path);
+            }
         }
     };
 
     try
     {
-        var page = await library.ListItemsPageAsync(null, 0, 10, CancellationToken.None);
-        AssertEqual(0, page.Items.Count, "vanishing list item count");
+        var page = await library.ListItemsPageAsync(null, 0, 1, CancellationToken.None);
+        AssertEqual(1, page.Items.Count, "vanishing list refill item count");
+        AssertEqual("B Survivor Clip", page.Items[0].Title, "vanishing list refill title");
+        AssertEqual<long?>(null, page.NextPageOffset, "vanishing list refill next page");
     }
     finally
     {
@@ -343,6 +351,22 @@ static async System.Threading.Tasks.Task AssertHttpHeadPlaybackAsync(string play
     AssertEqual("bytes", response.Headers.AcceptRanges.Single(), "HEAD accept-ranges header");
     AssertEqual("video/mp4", response.Content.Headers.ContentType?.MediaType, "HEAD content type");
     AssertEqual(0, body.Length, "HEAD body length");
+}
+
+static async System.Threading.Tasks.Task AssertMediaEndpointIsNotServedFromGrpcPortAsync(string grpcAddress, LibraryItem item)
+{
+    using var httpClient = new HttpClient(new SocketsHttpHandler
+    {
+        EnableMultipleHttp2Connections = true
+    });
+    using var request = new HttpRequestMessage(HttpMethod.Get, $"{grpcAddress}/media/{Uri.EscapeDataString(item.Id)}/original")
+    {
+        Version = HttpVersion.Version20,
+        VersionPolicy = HttpVersionPolicy.RequestVersionExact
+    };
+
+    using var response = await httpClient.SendAsync(request);
+    AssertEqual(HttpStatusCode.NotFound, response.StatusCode, "media lookup on gRPC listener");
 }
 
 static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(IServiceProvider services, GrpcChannel channel, LibraryItem item)
@@ -700,6 +724,44 @@ static void AssertListenHostNormalization()
         "127.0.0.1",
         CacheServerHost.NormalizeListenHost(new Uri("http://127.0.0.1:8080")),
         "IPv4 listen host normalization");
+}
+
+static async System.Threading.Tasks.Task AssertListenUrlsMustBeCleartextAsync(string rootPath)
+{
+    await AssertListenUrlRejectedAsync(
+        "gRPC HTTPS listen URL",
+        [
+            "--Cache:GrpcListenUrl",
+            $"https://127.0.0.1:{GetFreePort()}",
+            "--Cache:MediaListenUrl",
+            $"http://127.0.0.1:{GetFreePort()}",
+            "--Cache:RootPath",
+            rootPath
+        ]);
+
+    await AssertListenUrlRejectedAsync(
+        "media HTTPS listen URL",
+        [
+            "--Cache:GrpcListenUrl",
+            $"http://127.0.0.1:{GetFreePort()}",
+            "--Cache:MediaListenUrl",
+            $"https://127.0.0.1:{GetFreePort()}",
+            "--Cache:RootPath",
+            rootPath
+        ]);
+}
+
+static async System.Threading.Tasks.Task AssertListenUrlRejectedAsync(string label, string[] args)
+{
+    try
+    {
+        await using var app = CacheServerHost.Create(args);
+        await app.StartAsync();
+        throw new InvalidOperationException($"{label} unexpectedly started.");
+    }
+    catch (InvalidOperationException exception) when (exception.Message.Contains("Only cleartext http listen URLs", StringComparison.Ordinal))
+    {
+    }
 }
 
 static void AssertEqual<T>(T expected, T actual, string label)

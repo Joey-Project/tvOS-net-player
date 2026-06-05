@@ -41,34 +41,50 @@ public sealed class LocalMediaLibrary
             return System.Threading.Tasks.Task.FromResult(LibraryItemPage.Empty);
         }
 
-        var retainedLimit = GetRetainedCandidateLimit(pageOffset, pageSize);
-        if (retainedLimit is null)
+        if (pageOffset < 0 || pageSize <= 0 || pageOffset > int.MaxValue)
         {
             return System.Threading.Tasks.Task.FromResult(LibraryItemPage.Empty);
         }
 
         var rootPath = RootPath;
-        var retainedCandidates = new SortedSet<MediaCandidate>(MediaCandidateComparer.Instance);
+        var candidates = new SortedSet<MediaCandidate>(MediaCandidateComparer.Instance);
         foreach (var candidate in EnumerateMediaCandidates(rootPath, filter, cancellationToken))
         {
-            retainedCandidates.Add(candidate);
-            if (retainedCandidates.Count > retainedLimit.Value)
-            {
-                retainedCandidates.Remove(retainedCandidates.Max!);
-            }
+            candidates.Add(candidate);
         }
 
-        var pageStart = (int)Math.Min(pageOffset, retainedCandidates.Count);
-        var items = retainedCandidates
-            .Skip(pageStart)
-            .Take(pageSize)
-            .Select(candidate => TryCreateLibraryItem(rootPath, candidate.Path))
-            .OfType<LibraryItem>()
-            .ToArray();
-        var nextPageOffset = GetNextPageOffset(pageOffset, pageSize);
-        var page = new LibraryItemPage(
-            items,
-            nextPageOffset is { } nextOffset && retainedCandidates.Count > nextOffset ? nextOffset : null);
+        var skippedItems = 0L;
+        var items = new List<LibraryItem>(pageSize);
+        long? nextPageOffset = null;
+        foreach (var candidate in candidates)
+        {
+            var item = TryCreateLibraryItem(rootPath, candidate.Path);
+            if (item is null)
+            {
+                continue;
+            }
+
+            if (skippedItems < pageOffset)
+            {
+                skippedItems++;
+                continue;
+            }
+
+            if (items.Count < pageSize)
+            {
+                items.Add(item);
+                continue;
+            }
+
+            if (pageOffset <= long.MaxValue - pageSize)
+            {
+                nextPageOffset = pageOffset + pageSize;
+            }
+
+            break;
+        }
+
+        var page = new LibraryItemPage(items, nextPageOffset);
         return System.Threading.Tasks.Task.FromResult(page);
     }
 
@@ -337,31 +353,6 @@ public sealed class LocalMediaLibrary
         return fullPath.EndsWith(Path.DirectorySeparatorChar) || fullPath.EndsWith(Path.AltDirectorySeparatorChar)
             ? fullPath
             : $"{fullPath}{Path.DirectorySeparatorChar}";
-    }
-
-    private static int? GetRetainedCandidateLimit(long pageOffset, int pageSize)
-    {
-        if (pageOffset < 0 || pageSize <= 0)
-        {
-            return 0;
-        }
-
-        if (pageOffset > int.MaxValue - pageSize - 1L)
-        {
-            return null;
-        }
-
-        return (int)(pageOffset + pageSize + 1L);
-    }
-
-    private static long? GetNextPageOffset(long pageOffset, int pageSize)
-    {
-        if (pageOffset < 0 || pageSize <= 0 || pageOffset > long.MaxValue - pageSize)
-        {
-            return null;
-        }
-
-        return pageOffset + pageSize;
     }
 
     private IEnumerable<MediaCandidate> EnumerateMediaCandidates(string rootPath, LibraryFilter? filter, CancellationToken cancellationToken)
