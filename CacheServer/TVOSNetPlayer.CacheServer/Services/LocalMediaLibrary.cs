@@ -24,6 +24,8 @@ public sealed class LocalMediaLibrary
     }
 
     internal Action<string>? BeforeOpenMediaFileForTests { get; set; }
+    internal Action<string>? BeforeCreateLibraryItemForTests { get; set; }
+    internal Action<string>? BeforeCreateMediaFileForTests { get; set; }
 
     public string RootPath => Path.GetFullPath(options.CurrentValue.RootPath);
 
@@ -57,7 +59,8 @@ public sealed class LocalMediaLibrary
         var items = retainedCandidates
             .Skip(pageStart)
             .Take(pageSize)
-            .Select(candidate => CreateLibraryItem(rootPath, candidate.Path))
+            .Select(candidate => TryCreateLibraryItem(rootPath, candidate.Path))
+            .OfType<LibraryItem>()
             .ToArray();
         var nextPageOffset = pageOffset + pageSize;
         var page = new LibraryItemPage(
@@ -156,14 +159,22 @@ public sealed class LocalMediaLibrary
             return null;
         }
 
-        var fileInfo = new FileInfo(candidatePath);
-        var candidateRelativePath = Path.GetRelativePath(rootPath, candidatePath);
-        return new MediaFile(
-            candidatePath,
-            candidateRelativePath,
-            GetContentType(candidatePath),
-            new DateTimeOffset(fileInfo.LastWriteTimeUtc, TimeSpan.Zero),
-            fileInfo.Length);
+        try
+        {
+            BeforeCreateMediaFileForTests?.Invoke(candidatePath);
+            var fileInfo = new FileInfo(candidatePath);
+            var candidateRelativePath = Path.GetRelativePath(rootPath, candidatePath);
+            return new MediaFile(
+                candidatePath,
+                candidateRelativePath,
+                GetContentType(candidatePath),
+                new DateTimeOffset(fileInfo.LastWriteTimeUtc, TimeSpan.Zero),
+                fileInfo.Length);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
     }
 
     public System.Threading.Tasks.Task<CacheRoot> GetCacheRootAsync(CancellationToken cancellationToken)
@@ -225,6 +236,7 @@ public sealed class LocalMediaLibrary
 
     private LibraryItem CreateLibraryItem(string rootPath, string path)
     {
+        BeforeCreateLibraryItemForTests?.Invoke(path);
         var fileInfo = new FileInfo(path);
         var relativePath = Path.GetRelativePath(rootPath, path).Replace(Path.DirectorySeparatorChar, '/');
         var item = new LibraryItem
@@ -248,6 +260,18 @@ public sealed class LocalMediaLibrary
         });
 
         return item;
+    }
+
+    private LibraryItem? TryCreateLibraryItem(string rootPath, string path)
+    {
+        try
+        {
+            return CreateLibraryItem(rootPath, path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
     }
 
     private HashSet<string> GetAllowedExtensions()

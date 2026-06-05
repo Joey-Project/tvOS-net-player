@@ -65,6 +65,8 @@ try
     await AssertLargePageTokenDoesNotOverflowAsync(channel);
     await AssertPaginatedLibraryAsync(channel, tempRoot);
     await AssertListCancellationAsync(tempRoot);
+    await AssertListSkipsDeletedFileDuringMaterializationAsync();
+    await AssertGetMediaFileReturnsNullWhenFileDisappearsAsync();
     var playback = await AssertPlaybackSourceAsync(channel, item);
     await AssertHttpRangePlaybackAsync(playback.Uri);
     await AssertHttpHeadPlaybackAsync(playback.Uri);
@@ -187,6 +189,70 @@ static async System.Threading.Tasks.Task AssertListCancellationAsync(string root
     }
     catch (OperationCanceledException)
     {
+    }
+}
+
+static async System.Threading.Tasks.Task AssertListSkipsDeletedFileDuringMaterializationAsync()
+{
+    var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-list-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(rootPath);
+    var mediaPath = Path.Combine(rootPath, "Vanishing Clip.mp4");
+    await File.WriteAllTextAsync(mediaPath, "vanishing");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeCreateLibraryItemForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "list materialization hook media path");
+            File.Delete(path);
+        }
+    };
+
+    try
+    {
+        var page = await library.ListItemsPageAsync(null, 0, 10, CancellationToken.None);
+        AssertEqual(0, page.Items.Count, "vanishing list item count");
+    }
+    finally
+    {
+        if (Directory.Exists(rootPath))
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
+    }
+}
+
+static async System.Threading.Tasks.Task AssertGetMediaFileReturnsNullWhenFileDisappearsAsync()
+{
+    var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-stat-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(rootPath);
+    var mediaPath = Path.Combine(rootPath, "Vanishing Playback.mp4");
+    await File.WriteAllTextAsync(mediaPath, "vanishing");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeCreateMediaFileForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "media file materialization hook media path");
+            File.Delete(path);
+        }
+    };
+
+    try
+    {
+        var mediaFile = await library.GetMediaFileAsync(CreateLocalItemId("Vanishing Playback.mp4"), "original", CancellationToken.None);
+        AssertEqual<MediaFile?>(null, mediaFile, "vanishing media file");
+    }
+    finally
+    {
+        if (Directory.Exists(rootPath))
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
     }
 }
 
