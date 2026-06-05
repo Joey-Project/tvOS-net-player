@@ -9,7 +9,7 @@ namespace TVOSNetPlayer.CacheServer.Services;
 
 public sealed class LocalMediaLibrary
 {
-    private const string RootId = "default";
+    internal const string RootId = "default";
     private const string VariantId = "original";
     private const int OpenReadOnly = 0;
     private const int DarwinOpenNoFollow = 0x00000100;
@@ -23,6 +23,7 @@ public sealed class LocalMediaLibrary
     }
 
     internal Action<string>? BeforeOpenMediaFileForTests { get; set; }
+    internal Action<string>? BeforeEnumerateMediaCandidatesForTests { get; set; }
     internal Action<string>? BeforeCreateLibraryItemForTests { get; set; }
     internal Action<string>? BeforeCreateMediaFileForTests { get; set; }
     internal Func<bool>? IsSecureNoFollowOpenSupportedForTests { get; set; }
@@ -47,9 +48,17 @@ public sealed class LocalMediaLibrary
 
         var rootPath = RootPath;
         var candidates = new SortedSet<MediaCandidate>(MediaCandidateComparer.Instance);
-        foreach (var candidate in EnumerateMediaCandidates(rootPath, filter, cancellationToken))
+        try
         {
-            candidates.Add(candidate);
+            BeforeEnumerateMediaCandidatesForTests?.Invoke(rootPath);
+            foreach (var candidate in EnumerateMediaCandidates(rootPath, filter, cancellationToken))
+            {
+                candidates.Add(candidate);
+            }
+        }
+        catch (Exception exception) when (IsRecoverableFileSystemException(exception))
+        {
+            return System.Threading.Tasks.Task.FromResult(LibraryItemPage.Empty);
         }
 
         var skippedItems = 0L;
@@ -211,12 +220,21 @@ public sealed class LocalMediaLibrary
         }
 
         var count = 0;
-        foreach (var _ in EnumerateMediaCandidates(RootPath, null, cancellationToken))
+        try
         {
-            if (count < int.MaxValue)
+            var rootPath = RootPath;
+            BeforeEnumerateMediaCandidatesForTests?.Invoke(rootPath);
+            foreach (var _ in EnumerateMediaCandidates(rootPath, null, cancellationToken))
             {
-                count++;
+                if (count < int.MaxValue)
+                {
+                    count++;
+                }
             }
+        }
+        catch (Exception exception) when (IsRecoverableFileSystemException(exception))
+        {
+            return 0;
         }
 
         return await System.Threading.Tasks.Task.FromResult(count);
@@ -446,6 +464,11 @@ public sealed class LocalMediaLibrary
     private static bool IsLink(FileSystemInfo fileInfo)
     {
         return fileInfo.LinkTarget is not null || fileInfo.Attributes.HasFlag(FileAttributes.ReparsePoint);
+    }
+
+    private static bool IsRecoverableFileSystemException(Exception exception)
+    {
+        return exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException;
     }
 
     private static EnumerationOptions CreateEnumerationOptions()

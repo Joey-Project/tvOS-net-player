@@ -66,6 +66,15 @@ public sealed class LibraryGrpcService : LibraryService.LibraryServiceBase
 
     public override async System.Threading.Tasks.Task<RescanLibraryResponse> RescanLibrary(RescanLibraryRequest request, ServerCallContext context)
     {
+        if (request.CacheRootIds.Count > 0)
+        {
+            var unknownRootId = request.CacheRootIds.FirstOrDefault(rootId => rootId != LocalMediaLibrary.RootId);
+            if (unknownRootId is not null)
+            {
+                throw new RpcException(new Status(StatusCode.NotFound, $"Cache root not found: {unknownRootId}."));
+            }
+        }
+
         return new RescanLibraryResponse
         {
             DiscoveredItemCount = await library.CountItemsAsync(context.CancellationToken)

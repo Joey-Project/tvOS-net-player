@@ -64,9 +64,11 @@ try
     var supportsHttpRangePlayback = SupportsSecureMediaOpenOnCurrentPlatform();
     await AssertServerInfoAsync(channel, supportsHttpRangePlayback);
     var item = await AssertLibraryAsync(channel, supportsHttpRangePlayback);
+    await AssertRescanLibraryRootFilterAsync(channel);
     await AssertLargePageTokenDoesNotOverflowAsync(channel);
     await AssertPaginatedLibraryAsync(channel, tempRoot);
     await AssertListCancellationAsync(tempRoot);
+    await AssertEnumerationStopsWhenRootDisappearsAsync();
     await AssertListSkipsDeletedFileDuringMaterializationAsync();
     await AssertGetMediaFileReturnsNullWhenFileDisappearsAsync();
     await AssertGetLibraryItemReturnsNullWhenFileDisappearsDuringMaterializationAsync();
@@ -152,6 +154,29 @@ static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcCha
     return item;
 }
 
+static async System.Threading.Tasks.Task AssertRescanLibraryRootFilterAsync(GrpcChannel channel)
+{
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var allRootsResponse = await client.RescanLibraryAsync(new RescanLibraryRequest());
+    AssertEqual(1, allRootsResponse.DiscoveredItemCount, "rescan all roots item count");
+
+    var defaultRootRequest = new RescanLibraryRequest();
+    defaultRootRequest.CacheRootIds.Add("default");
+    var defaultRootResponse = await client.RescanLibraryAsync(defaultRootRequest);
+    AssertEqual(1, defaultRootResponse.DiscoveredItemCount, "rescan default root item count");
+
+    var missingRootRequest = new RescanLibraryRequest();
+    missingRootRequest.CacheRootIds.Add("missing");
+    try
+    {
+        await client.RescanLibraryAsync(missingRootRequest);
+        throw new InvalidOperationException("RescanLibrary unexpectedly accepted an unknown cache root id.");
+    }
+    catch (RpcException exception) when (exception.StatusCode == StatusCode.NotFound)
+    {
+    }
+}
+
 static async System.Threading.Tasks.Task AssertLargePageTokenDoesNotOverflowAsync(GrpcChannel channel)
 {
     var client = new LibraryService.LibraryServiceClient(channel);
@@ -214,6 +239,65 @@ static async System.Threading.Tasks.Task AssertListCancellationAsync(string root
     }
     catch (OperationCanceledException)
     {
+    }
+}
+
+static async System.Threading.Tasks.Task AssertEnumerationStopsWhenRootDisappearsAsync()
+{
+    var listRootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-list-root-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(listRootPath);
+    await File.WriteAllTextAsync(Path.Combine(listRootPath, "Deleted Root List.mp4"), "deleted-root");
+    var listLibrary = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = listRootPath
+    }))
+    {
+        BeforeEnumerateMediaCandidatesForTests = path =>
+        {
+            AssertEqual(listRootPath, path, "list root enumeration hook path");
+            Directory.Delete(listRootPath, recursive: true);
+        }
+    };
+
+    try
+    {
+        var page = await listLibrary.ListItemsPageAsync(null, 0, 10, CancellationToken.None);
+        AssertEqual(0, page.Items.Count, "deleted root list item count");
+    }
+    finally
+    {
+        if (Directory.Exists(listRootPath))
+        {
+            Directory.Delete(listRootPath, recursive: true);
+        }
+    }
+
+    var countRootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-count-root-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(countRootPath);
+    await File.WriteAllTextAsync(Path.Combine(countRootPath, "Deleted Root Count.mp4"), "deleted-root");
+    var countLibrary = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = countRootPath
+    }))
+    {
+        BeforeEnumerateMediaCandidatesForTests = path =>
+        {
+            AssertEqual(countRootPath, path, "count root enumeration hook path");
+            Directory.Delete(countRootPath, recursive: true);
+        }
+    };
+
+    try
+    {
+        var count = await countLibrary.CountItemsAsync(CancellationToken.None);
+        AssertEqual(0, count, "deleted root rescan count");
+    }
+    finally
+    {
+        if (Directory.Exists(countRootPath))
+        {
+            Directory.Delete(countRootPath, recursive: true);
+        }
     }
 }
 
