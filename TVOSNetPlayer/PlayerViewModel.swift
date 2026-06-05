@@ -55,6 +55,11 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
+    func load(streamURLText: String) {
+        self.streamURLText = streamURLText
+        load()
+    }
+
     func stop() {
         player?.pause()
         player = nil

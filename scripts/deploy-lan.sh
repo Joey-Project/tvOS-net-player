@@ -23,6 +23,7 @@ fi
 
 xcodebuild \
   -allowProvisioningUpdates \
+  -skipPackagePluginValidation \
   -project "${PROJECT_PATH}" \
   -scheme "${SCHEME}" \
   -configuration "${CONFIGURATION}" \

@@ -21,13 +21,12 @@ superseded_by:
 ## Current State
 
 - 架构文档在 `docs/architecture/cache-server.md`。
-- 控制面 proto 草案在 `proto/tvos_net_player/v1/cache_control.proto`。
+- 控制面 proto 草案在 `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`。
 - 第一片 LAN cache server MVP 已实现：本地缓存目录扫描、gRPC library/server/cache services、面向 macOS/Mac mini 的 HTTP Range playback endpoint、integration test harness。
-- 当前 app deployment target 仍是 tvOS 17.0；若采用 gRPC Swift 2，后续需要评估是否提升到 tvOS 18.0。
+- tvOS app 已提升到 tvOS 18.0 并接入 gRPC Swift 2 cache client slice；详情见 `docs/project_journal/2026/06/2026-06-05-tvos-cache-grpc-client-c4d8a2.md`。
 
 ## Next Steps
 
-- 在 tvOS app 中接入 server 配置、library list、playback source 获取。
 - 后续再接 BBDown adapter：提交 Bilibili URL/BV，下载完成后入库。
 - Bonjour discovery 和边下边播/HLS progressive cache 放到基础链路稳定之后。
 

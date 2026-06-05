@@ -31,6 +31,7 @@ else
 fi
 
 xcodebuild \
+  -skipPackagePluginValidation \
   -project "${PROJECT_PATH}" \
   -scheme "${SCHEME}" \
   -configuration "${CONFIGURATION}" \

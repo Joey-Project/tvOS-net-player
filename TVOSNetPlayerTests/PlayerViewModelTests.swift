@@ -75,6 +75,16 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testLoadWithStreamURLTextStoresNormalizedURL() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        model.load(streamURLText: "example.com/movie.m3u8")
+
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://example.com/movie.m3u8")
+        XCTAssertEqual(model.streamURLText, "http://example.com/movie.m3u8")
+    }
+
+    @MainActor
     func testInvalidURLKeepsCurrentPlayer() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         model.streamURLText = "https://example.com/movie.m3u8"

@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="../../proto/tvos_net_player/v1/cache_control.proto" GrpcServices="Both" Link="Protos/cache_control.proto" />
+    <Protobuf Include="../../Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto" GrpcServices="Both" Link="Protos/cache_control.proto" />
   </ItemGroup>
 
   <ItemGroup>
