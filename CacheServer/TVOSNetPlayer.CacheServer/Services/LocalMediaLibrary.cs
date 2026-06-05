@@ -26,6 +26,7 @@ public sealed class LocalMediaLibrary
     internal Action<string>? BeforeOpenMediaFileForTests { get; set; }
     internal Action<string>? BeforeCreateLibraryItemForTests { get; set; }
     internal Action<string>? BeforeCreateMediaFileForTests { get; set; }
+    internal Func<bool>? IsSecureNoFollowOpenSupportedForTests { get; set; }
 
     public string RootPath => Path.GetFullPath(options.CurrentValue.RootPath);
 
@@ -62,10 +63,10 @@ public sealed class LocalMediaLibrary
             .Select(candidate => TryCreateLibraryItem(rootPath, candidate.Path))
             .OfType<LibraryItem>()
             .ToArray();
-        var nextPageOffset = pageOffset + pageSize;
+        var nextPageOffset = GetNextPageOffset(pageOffset, pageSize);
         var page = new LibraryItemPage(
             items,
-            retainedCandidates.Count > nextPageOffset ? nextPageOffset : null);
+            nextPageOffset is { } nextOffset && retainedCandidates.Count > nextOffset ? nextOffset : null);
         return System.Threading.Tasks.Task.FromResult(page);
     }
 
@@ -94,7 +95,7 @@ public sealed class LocalMediaLibrary
         FileStream stream;
         try
         {
-            stream = OpenReadNoFollow(RootPath, mediaFile.RelativePath, mediaFile.Path);
+            stream = OpenReadNoFollow(RootPath, mediaFile.RelativePath, IsSecureNoFollowOpenSupported());
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
         {
@@ -340,8 +341,22 @@ public sealed class LocalMediaLibrary
             return 0;
         }
 
-        var retainedCount = pageOffset + pageSize + 1L;
-        return retainedCount <= int.MaxValue ? (int)retainedCount : null;
+        if (pageOffset > int.MaxValue - pageSize - 1L)
+        {
+            return null;
+        }
+
+        return (int)(pageOffset + pageSize + 1L);
+    }
+
+    private static long? GetNextPageOffset(long pageOffset, int pageSize)
+    {
+        if (pageOffset < 0 || pageSize <= 0 || pageOffset > long.MaxValue - pageSize)
+        {
+            return null;
+        }
+
+        return pageOffset + pageSize;
     }
 
     private IEnumerable<MediaCandidate> EnumerateMediaCandidates(string rootPath, LibraryFilter? filter, CancellationToken cancellationToken)
@@ -464,8 +479,18 @@ public sealed class LocalMediaLibrary
         return Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
     }
 
-    private static FileStream OpenReadNoFollow(string rootPath, string relativePath, string path)
+    private bool IsSecureNoFollowOpenSupported()
     {
+        return IsSecureNoFollowOpenSupportedForTests?.Invoke() ?? (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux());
+    }
+
+    private static FileStream OpenReadNoFollow(string rootPath, string relativePath, bool isSecureNoFollowOpenSupported)
+    {
+        if (!isSecureNoFollowOpenSupported)
+        {
+            throw new NotSupportedException("Secure no-follow media open is not supported on this platform.");
+        }
+
         if (OperatingSystem.IsMacOS())
         {
             return OpenUnixReadNoFollow(rootPath, relativePath, DarwinOpenNoFollow, DarwinOpenDirectory);
@@ -476,13 +501,7 @@ public sealed class LocalMediaLibrary
             return OpenUnixReadNoFollow(rootPath, relativePath, LinuxOpenNoFollow, LinuxOpenDirectory);
         }
 
-        return new FileStream(path, new FileStreamOptions
-        {
-            Mode = FileMode.Open,
-            Access = FileAccess.Read,
-            Share = FileShare.Read,
-            Options = FileOptions.SequentialScan
-        });
+        throw new NotSupportedException("Secure no-follow media open is not implemented on this platform.");
     }
 
     private static FileStream OpenUnixReadNoFollow(string rootPath, string relativePath, int openNoFollow, int openDirectory)

@@ -76,6 +76,7 @@ try
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot, outsidePath);
     await AssertParentSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot);
+    await AssertSecureMediaOpenUnavailableFailsClosedAsync(tempRoot);
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
     AssertListenHostNormalization();
@@ -137,14 +138,21 @@ static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcCha
 static async System.Threading.Tasks.Task AssertLargePageTokenDoesNotOverflowAsync(GrpcChannel channel)
 {
     var client = new LibraryService.LibraryServiceClient(channel);
-    var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest
+    foreach (var pageToken in new[]
     {
-        PageSize = 200,
-        PageToken = int.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture)
-    });
+        int.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        long.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture)
+    })
+    {
+        var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest
+        {
+            PageSize = 200,
+            PageToken = pageToken
+        });
 
-    AssertEqual(0, response.Items.Count, "large page token item count");
-    AssertEqual("", response.NextPageToken, "large page token next page");
+        AssertEqual(0, response.Items.Count, $"large page token {pageToken} item count");
+        AssertEqual("", response.NextPageToken, $"large page token {pageToken} next page");
+    }
 }
 
 static async System.Threading.Tasks.Task AssertPaginatedLibraryAsync(GrpcChannel channel, string rootPath)
@@ -466,6 +474,36 @@ static async System.Threading.Tasks.Task AssertParentSymlinkSwapBeforeOpenIsReje
         if (Directory.Exists(outsideParentPath))
         {
             Directory.Delete(outsideParentPath, recursive: true);
+        }
+    }
+}
+
+static async System.Threading.Tasks.Task AssertSecureMediaOpenUnavailableFailsClosedAsync(string rootPath)
+{
+    var mediaPath = Path.Combine(rootPath, "Movies", "Unsupported Secure Open.mp4");
+    await File.WriteAllTextAsync(mediaPath, "inside-cache-root");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        IsSecureNoFollowOpenSupportedForTests = () => false
+    };
+
+    try
+    {
+        var openedFile = await library.OpenMediaFileAsync(CreateLocalItemId("Movies/Unsupported Secure Open.mp4"), "original", CancellationToken.None);
+        if (openedFile is not null)
+        {
+            openedFile.Stream.Dispose();
+            throw new InvalidOperationException("OpenMediaFileAsync unexpectedly opened media when secure no-follow open is unavailable.");
+        }
+    }
+    finally
+    {
+        if (File.Exists(mediaPath))
+        {
+            File.Delete(mediaPath);
         }
     }
 }

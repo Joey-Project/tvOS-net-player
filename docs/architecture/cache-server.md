@@ -89,6 +89,7 @@ Runtime shape:
 - The server uses separate cleartext listeners by default: `http://0.0.0.0:50051` for gRPC/h2c and `http://0.0.0.0:8080` for HTTP media.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
+- Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports macOS and Linux; other platforms can list local files but do not serve media bytes until equivalent no-reparse open-by-handle semantics are implemented.
 - `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
 
 Configuration:
