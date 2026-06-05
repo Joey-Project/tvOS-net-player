@@ -63,23 +63,32 @@ public static class CacheServerHost
     private static void Listen(KestrelServerOptions options, string listenUrl, HttpProtocols protocols)
     {
         var uri = new Uri(listenUrl);
+        var host = NormalizeListenHost(uri);
         void Configure(ListenOptions listenOptions)
         {
             listenOptions.Protocols = protocols;
         }
 
-        if (uri.Host is "0.0.0.0" or "::" or "*" or "+")
+        if (host is "0.0.0.0" or "::" or "*" or "+")
         {
             options.ListenAnyIP(uri.Port, Configure);
             return;
         }
 
-        if (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
         {
             options.ListenLocalhost(uri.Port, Configure);
             return;
         }
 
-        options.Listen(IPAddress.Parse(uri.Host), uri.Port, Configure);
+        options.Listen(IPAddress.Parse(host), uri.Port, Configure);
+    }
+
+    internal static string NormalizeListenHost(Uri uri)
+    {
+        var host = uri.Host;
+        return host.Length >= 2 && host[0] == '[' && host[^1] == ']'
+            ? host[1..^1]
+            : host;
     }
 }

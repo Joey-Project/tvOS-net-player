@@ -18,14 +18,12 @@ public sealed class LibraryGrpcService : LibraryService.LibraryServiceBase
     {
         var pageSize = request.PageSize <= 0 ? 50 : Math.Min(request.PageSize, 200);
         var requestedPageOffset = DecodePageToken(request.PageToken);
-        var items = await library.ListItemsAsync(request.Filter, context.CancellationToken);
-        var pageOffset = requestedPageOffset >= items.Count ? items.Count : (int)requestedPageOffset;
-        var nextPageOffset = (long)pageOffset + pageSize;
+        var page = await library.ListItemsPageAsync(request.Filter, requestedPageOffset, pageSize, context.CancellationToken);
 
         var response = new ListLibraryItemsResponse();
-        response.Items.AddRange(items.Skip(pageOffset).Take(pageSize));
+        response.Items.AddRange(page.Items);
 
-        if (nextPageOffset < items.Count)
+        if (page.NextPageOffset is { } nextPageOffset)
         {
             response.NextPageToken = nextPageOffset.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }

@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using Grpc.Core;
 using Grpc.Net.Client;
+using Microsoft.Extensions.Options;
 using TVOSNetPlayer.Cache.V1;
 using TVOSNetPlayer.CacheServer;
 using TVOSNetPlayer.CacheServer.Services;
@@ -23,6 +24,11 @@ try
     await File.WriteAllTextAsync(moviePath, "0123456789abcdef");
     await File.WriteAllTextAsync(outsidePath, "outside-cache-root");
     File.CreateSymbolicLink(Path.Combine(tempRoot, "Movies", "Linked Outside.mp4"), outsidePath);
+    if (!OperatingSystem.IsWindows())
+    {
+        File.CreateSymbolicLink(Path.Combine(tempRoot, "Movies", "Linked\\Outside.mp4"), outsidePath);
+    }
+
     Directory.CreateDirectory(outsideDirectory);
     await File.WriteAllTextAsync(Path.Combine(outsideDirectory, "Directory Escape.mp4"), "outside-cache-root-directory");
     Directory.CreateSymbolicLink(Path.Combine(tempRoot, "Linked Directory"), outsideDirectory);
@@ -57,6 +63,8 @@ try
     await AssertServerInfoAsync(channel);
     var item = await AssertLibraryAsync(channel);
     await AssertLargePageTokenDoesNotOverflowAsync(channel);
+    await AssertPaginatedLibraryAsync(channel, tempRoot);
+    await AssertListCancellationAsync(tempRoot);
     var playback = await AssertPlaybackSourceAsync(channel, item);
     await AssertHttpRangePlaybackAsync(playback.Uri);
     await AssertHttpHeadPlaybackAsync(playback.Uri);
@@ -66,6 +74,7 @@ try
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
+    AssertListenHostNormalization();
     await AssertSymlinkRootIsRejectedAsync(symlinkRootTarget, symlinkRoot);
 
     Console.WriteLine("Cache server integration tests passed.");
@@ -132,6 +141,51 @@ static async System.Threading.Tasks.Task AssertLargePageTokenDoesNotOverflowAsyn
 
     AssertEqual(0, response.Items.Count, "large page token item count");
     AssertEqual("", response.NextPageToken, "large page token next page");
+}
+
+static async System.Threading.Tasks.Task AssertPaginatedLibraryAsync(GrpcChannel channel, string rootPath)
+{
+    var moviesPath = Path.Combine(rootPath, "Movies");
+    await File.WriteAllTextAsync(Path.Combine(moviesPath, "Aardvark Clip.mp4"), "aardvark");
+    await File.WriteAllTextAsync(Path.Combine(moviesPath, "Zulu Clip.mp4"), "zulu");
+
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var firstPage = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest
+    {
+        PageSize = 1
+    });
+
+    AssertEqual(1, firstPage.Items.Count, "first page item count");
+    AssertEqual("Aardvark Clip", firstPage.Items[0].Title, "first page title");
+    AssertTrue(!string.IsNullOrEmpty(firstPage.NextPageToken), "first page next token");
+
+    var secondPage = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest
+    {
+        PageSize = 1,
+        PageToken = firstPage.NextPageToken
+    });
+
+    AssertEqual(1, secondPage.Items.Count, "second page item count");
+    AssertEqual("Sample Clip", secondPage.Items[0].Title, "second page title");
+}
+
+static async System.Threading.Tasks.Task AssertListCancellationAsync(string rootPath)
+{
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }));
+    using var cancellation = new CancellationTokenSource();
+    await cancellation.CancelAsync();
+
+    try
+    {
+        await library.ListItemsPageAsync(null, 0, 1, cancellation.Token);
+        throw new InvalidOperationException("ListItemsPageAsync unexpectedly ignored cancellation.");
+    }
+    catch (OperationCanceledException)
+    {
+    }
 }
 
 static async System.Threading.Tasks.Task<PlaybackSource> AssertPlaybackSourceAsync(GrpcChannel channel, LibraryItem item)
@@ -242,6 +296,16 @@ static async System.Threading.Tasks.Task AssertSymlinkIsRejectedAsync(GrpcChanne
 
     AssertEqual(HttpStatusCode.NotFound, mediaResponse.StatusCode, "symlink media lookup");
 
+    if (!OperatingSystem.IsWindows())
+    {
+        AssertTrue(response.Items.All(item => item.SourceId != "Movies/Linked\\Outside.mp4"), "backslash symlink is hidden from library");
+
+        var backslashSymlinkUri = $"{address}/media/{CreateLocalItemId("Movies/Linked\\Outside.mp4")}/original";
+        using var backslashSymlinkResponse = await httpClient.GetAsync(backslashSymlinkUri);
+
+        AssertEqual(HttpStatusCode.NotFound, backslashSymlinkResponse.StatusCode, "backslash symlink media lookup");
+    }
+
     var directorySymlinkUri = $"{address}/media/{CreateLocalItemId("Linked Directory/Directory Escape.mp4")}/original";
     using var directorySymlinkResponse = await httpClient.GetAsync(directorySymlinkUri);
 
@@ -346,6 +410,24 @@ static void AssertPlaybackBaseUriFormatting()
         "explicit IPv6 playback base URI");
 }
 
+static void AssertListenHostNormalization()
+{
+    AssertEqual(
+        "::1",
+        CacheServerHost.NormalizeListenHost(new Uri("http://[::1]:8080")),
+        "IPv6 loopback listen host normalization");
+
+    AssertEqual(
+        "::",
+        CacheServerHost.NormalizeListenHost(new Uri("http://[::]:8080")),
+        "IPv6 wildcard listen host normalization");
+
+    AssertEqual(
+        "127.0.0.1",
+        CacheServerHost.NormalizeListenHost(new Uri("http://127.0.0.1:8080")),
+        "IPv4 listen host normalization");
+}
+
 static void AssertEqual<T>(T expected, T actual, string label)
 {
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
@@ -375,4 +457,24 @@ static string CreateLocalItemId(string relativePath)
         .TrimEnd('=')
         .Replace('+', '-')
         .Replace('/', '_')}";
+}
+
+sealed class StaticOptionsMonitor<T> : IOptionsMonitor<T>
+{
+    public StaticOptionsMonitor(T currentValue)
+    {
+        CurrentValue = currentValue;
+    }
+
+    public T CurrentValue { get; }
+
+    public T Get(string? name)
+    {
+        return CurrentValue;
+    }
+
+    public IDisposable? OnChange(Action<T, string?> listener)
+    {
+        return null;
+    }
 }

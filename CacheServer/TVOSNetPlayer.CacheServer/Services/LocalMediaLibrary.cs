@@ -19,31 +19,43 @@ public sealed class LocalMediaLibrary
 
     public string RootPath => Path.GetFullPath(options.CurrentValue.RootPath);
 
-    public System.Threading.Tasks.Task<IReadOnlyList<LibraryItem>> ListItemsAsync(LibraryFilter? filter, CancellationToken cancellationToken)
+    public System.Threading.Tasks.Task<LibraryItemPage> ListItemsPageAsync(LibraryFilter? filter, long pageOffset, int pageSize, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!IsRootAvailable())
         {
-            return System.Threading.Tasks.Task.FromResult<IReadOnlyList<LibraryItem>>([]);
+            return System.Threading.Tasks.Task.FromResult(LibraryItemPage.Empty);
         }
 
-        var allowedExtensions = GetAllowedExtensions();
-        var requestedSources = filter?.Sources.Count > 0 ? filter.Sources.ToHashSet() : null;
-        var searchText = filter?.SearchText?.Trim();
+        var retainedLimit = GetRetainedCandidateLimit(pageOffset, pageSize);
+        if (retainedLimit is null)
+        {
+            return System.Threading.Tasks.Task.FromResult(LibraryItemPage.Empty);
+        }
+
         var rootPath = RootPath;
+        var retainedCandidates = new SortedSet<MediaCandidate>(MediaCandidateComparer.Instance);
+        foreach (var candidate in EnumerateMediaCandidates(rootPath, filter, cancellationToken))
+        {
+            retainedCandidates.Add(candidate);
+            if (retainedCandidates.Count > retainedLimit.Value)
+            {
+                retainedCandidates.Remove(retainedCandidates.Max!);
+            }
+        }
 
-        var items = Directory
-            .EnumerateFiles(rootPath, "*", CreateEnumerationOptions())
-            .Where(path => !IsLink(new FileInfo(path)))
-            .Where(path => allowedExtensions.Contains(Path.GetExtension(path)))
-            .Select(path => CreateLibraryItem(rootPath, path))
-            .Where(item => requestedSources is null || requestedSources.Contains(item.Source))
-            .Where(item => string.IsNullOrEmpty(searchText) || item.Title.Contains(searchText, StringComparison.OrdinalIgnoreCase) || item.Subtitle.Contains(searchText, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(item => item.Title, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(item => item.Subtitle, StringComparer.OrdinalIgnoreCase)
+        var pageStart = (int)Math.Min(pageOffset, retainedCandidates.Count);
+        var items = retainedCandidates
+            .Skip(pageStart)
+            .Take(pageSize)
+            .Select(candidate => CreateLibraryItem(rootPath, candidate.Path))
             .ToArray();
-
-        cancellationToken.ThrowIfCancellationRequested();
-        return System.Threading.Tasks.Task.FromResult<IReadOnlyList<LibraryItem>>(items);
+        var nextPageOffset = pageOffset + pageSize;
+        var page = new LibraryItemPage(
+            items,
+            retainedCandidates.Count > nextPageOffset ? nextPageOffset : null);
+        return System.Threading.Tasks.Task.FromResult(page);
     }
 
     public async System.Threading.Tasks.Task<LibraryItem?> GetItemAsync(string id, CancellationToken cancellationToken)
@@ -134,8 +146,23 @@ public sealed class LocalMediaLibrary
 
     public async System.Threading.Tasks.Task<int> CountItemsAsync(CancellationToken cancellationToken)
     {
-        var items = await ListItemsAsync(null, cancellationToken);
-        return items.Count;
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!IsRootAvailable())
+        {
+            return 0;
+        }
+
+        var count = 0;
+        foreach (var _ in EnumerateMediaCandidates(RootPath, null, cancellationToken))
+        {
+            if (count < int.MaxValue)
+            {
+                count++;
+            }
+        }
+
+        return await System.Threading.Tasks.Task.FromResult(count);
     }
 
     private LibraryItem CreateLibraryItem(string rootPath, string path)
@@ -193,7 +220,7 @@ public sealed class LocalMediaLibrary
             relativePath = Encoding.UTF8.GetString(Base64UrlDecode(itemId[prefix.Length..]));
             return relativePath.IndexOfAny(Path.GetInvalidPathChars()) < 0
                 && !Path.IsPathRooted(relativePath)
-                && !relativePath.Split(['/', '\\']).Any(segment => segment is ".." or ".");
+                && !relativePath.Split(GetPathSegmentSeparators()).Any(segment => segment is ".." or ".");
         }
         catch (Exception exception) when (exception is FormatException or ArgumentException or NotSupportedException or PathTooLongException)
         {
@@ -219,9 +246,69 @@ public sealed class LocalMediaLibrary
     private static string EnsureTrailingSeparator(string path)
     {
         var fullPath = Path.GetFullPath(path);
-        return fullPath.EndsWith(Path.DirectorySeparatorChar)
+        return fullPath.EndsWith(Path.DirectorySeparatorChar) || fullPath.EndsWith(Path.AltDirectorySeparatorChar)
             ? fullPath
             : $"{fullPath}{Path.DirectorySeparatorChar}";
+    }
+
+    private static int? GetRetainedCandidateLimit(long pageOffset, int pageSize)
+    {
+        if (pageOffset < 0 || pageSize <= 0)
+        {
+            return 0;
+        }
+
+        var retainedCount = pageOffset + pageSize + 1L;
+        return retainedCount <= int.MaxValue ? (int)retainedCount : null;
+    }
+
+    private IEnumerable<MediaCandidate> EnumerateMediaCandidates(string rootPath, LibraryFilter? filter, CancellationToken cancellationToken)
+    {
+        var requestedSources = filter?.Sources.Count > 0 ? filter.Sources.ToHashSet() : null;
+        if (requestedSources is not null && !requestedSources.Contains(LibrarySource.LocalCache))
+        {
+            yield break;
+        }
+
+        var allowedExtensions = GetAllowedExtensions();
+        var searchText = filter?.SearchText?.Trim();
+        foreach (var path in Directory.EnumerateFiles(rootPath, "*", CreateEnumerationOptions()))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!TryCreateMediaCandidate(rootPath, path, allowedExtensions, out var candidate))
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(searchText)
+                && !candidate.Title.Contains(searchText, StringComparison.OrdinalIgnoreCase)
+                && !candidate.Subtitle.Contains(searchText, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            yield return candidate;
+        }
+    }
+
+    private static bool TryCreateMediaCandidate(string rootPath, string path, HashSet<string> allowedExtensions, out MediaCandidate candidate)
+    {
+        candidate = default!;
+        try
+        {
+            if (IsLink(new FileInfo(path)) || !allowedExtensions.Contains(Path.GetExtension(path)))
+            {
+                return false;
+            }
+
+            var relativePath = Path.GetRelativePath(rootPath, path).Replace(Path.DirectorySeparatorChar, '/');
+            candidate = new MediaCandidate(path, Path.GetFileNameWithoutExtension(path), relativePath);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
     }
 
     private static string GetContentType(string path)
@@ -254,23 +341,32 @@ public sealed class LocalMediaLibrary
         try
         {
             var fullRootPath = Path.GetFullPath(rootPath);
+            var fullCandidatePath = Path.GetFullPath(candidatePath);
             if (IsLink(new DirectoryInfo(fullRootPath)))
             {
                 return true;
             }
 
-            var relativePath = Path.GetRelativePath(fullRootPath, candidatePath);
-            var currentPath = fullRootPath;
-            foreach (var segment in relativePath.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
+            if (!IsWithinRoot(fullRootPath, fullCandidatePath))
             {
-                currentPath = Path.Combine(currentPath, segment);
-                var fileSystemInfo = Directory.Exists(currentPath)
-                    ? new DirectoryInfo(currentPath)
-                    : new FileInfo(currentPath) as FileSystemInfo;
-                if (IsLink(fileSystemInfo))
+                return true;
+            }
+
+            var currentPath = fullCandidatePath;
+            while (!PathsEqual(currentPath, fullRootPath))
+            {
+                if (IsLink(CreateFileSystemInfo(currentPath)))
                 {
                     return true;
                 }
+
+                var parent = Directory.GetParent(currentPath);
+                if (parent is null)
+                {
+                    return true;
+                }
+
+                currentPath = parent.FullName;
             }
 
             return false;
@@ -279,6 +375,11 @@ public sealed class LocalMediaLibrary
         {
             return true;
         }
+    }
+
+    private static FileSystemInfo CreateFileSystemInfo(string path)
+    {
+        return Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
     }
 
     private static bool CanWriteToDirectory(string path)
@@ -304,6 +405,71 @@ public sealed class LocalMediaLibrary
             }
         }
     }
+
+    private static char[] GetPathSegmentSeparators()
+    {
+        return Path.DirectorySeparatorChar == Path.AltDirectorySeparatorChar
+            ? [Path.DirectorySeparatorChar]
+            : [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
+    }
+
+    private static bool IsWithinRoot(string fullRootPath, string fullCandidatePath)
+    {
+        var comparison = PathStringComparison();
+        return fullCandidatePath.Equals(fullRootPath, comparison)
+            || fullCandidatePath.StartsWith(EnsureTrailingSeparator(fullRootPath), comparison);
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        return Path.GetFullPath(left).Equals(Path.GetFullPath(right), PathStringComparison());
+    }
+
+    private static StringComparison PathStringComparison()
+    {
+        return OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    }
 }
 
 public sealed record MediaFile(string Path, string ContentType, DateTimeOffset LastModified, long SizeBytes);
+
+public sealed record LibraryItemPage(IReadOnlyList<LibraryItem> Items, long? NextPageOffset)
+{
+    public static LibraryItemPage Empty { get; } = new([], null);
+}
+
+internal sealed record MediaCandidate(string Path, string Title, string Subtitle);
+
+internal sealed class MediaCandidateComparer : IComparer<MediaCandidate>
+{
+    public static MediaCandidateComparer Instance { get; } = new();
+
+    public int Compare(MediaCandidate? x, MediaCandidate? y)
+    {
+        if (ReferenceEquals(x, y))
+        {
+            return 0;
+        }
+
+        if (x is null)
+        {
+            return -1;
+        }
+
+        if (y is null)
+        {
+            return 1;
+        }
+
+        var titleComparison = StringComparer.OrdinalIgnoreCase.Compare(x.Title, y.Title);
+        if (titleComparison != 0)
+        {
+            return titleComparison;
+        }
+
+        var subtitleComparison = StringComparer.OrdinalIgnoreCase.Compare(x.Subtitle, y.Subtitle);
+        return subtitleComparison != 0
+            ? subtitleComparison
+            : StringComparer.Ordinal.Compare(x.Path, y.Path);
+    }
+}
