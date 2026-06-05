@@ -1,0 +1,348 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using Grpc.Core;
+using Grpc.Net.Client;
+using TVOSNetPlayer.Cache.V1;
+using TVOSNetPlayer.CacheServer;
+using TVOSNetPlayer.CacheServer.Services;
+
+AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+
+var tempRoot = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-tests-{Guid.NewGuid():N}");
+var outsidePath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-outside-{Guid.NewGuid():N}.mp4");
+var outsideDirectory = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-outside-dir-{Guid.NewGuid():N}");
+var symlinkRootTarget = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-root-target-{Guid.NewGuid():N}");
+var symlinkRoot = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-linked-root-{Guid.NewGuid():N}");
+Directory.CreateDirectory(tempRoot);
+
+try
+{
+    var moviePath = Path.Combine(tempRoot, "Movies", "Sample Clip.mp4");
+    Directory.CreateDirectory(Path.GetDirectoryName(moviePath)!);
+    await File.WriteAllTextAsync(moviePath, "0123456789abcdef");
+    await File.WriteAllTextAsync(outsidePath, "outside-cache-root");
+    File.CreateSymbolicLink(Path.Combine(tempRoot, "Movies", "Linked Outside.mp4"), outsidePath);
+    Directory.CreateDirectory(outsideDirectory);
+    await File.WriteAllTextAsync(Path.Combine(outsideDirectory, "Directory Escape.mp4"), "outside-cache-root-directory");
+    Directory.CreateSymbolicLink(Path.Combine(tempRoot, "Linked Directory"), outsideDirectory);
+
+    var grpcAddress = $"http://127.0.0.1:{GetFreePort()}";
+    var mediaAddress = $"http://127.0.0.1:{GetFreePort()}";
+
+    await using var app = CacheServerHost.Create(
+    [
+        "--Cache:GrpcListenUrl",
+        grpcAddress,
+        "--Cache:MediaListenUrl",
+        mediaAddress,
+        "--Cache:RootPath",
+        tempRoot,
+        "--Cache:ServerName",
+        "Test Cache",
+        "--Logging:LogLevel:Default",
+        "Warning"
+    ]);
+
+    await app.StartAsync();
+
+    using var channel = GrpcChannel.ForAddress(grpcAddress, new GrpcChannelOptions
+    {
+        HttpHandler = new SocketsHttpHandler
+        {
+            EnableMultipleHttp2Connections = true
+        }
+    });
+
+    await AssertServerInfoAsync(channel);
+    var item = await AssertLibraryAsync(channel);
+    await AssertLargePageTokenDoesNotOverflowAsync(channel);
+    var playback = await AssertPlaybackSourceAsync(channel, item);
+    await AssertHttpRangePlaybackAsync(playback.Uri);
+    await AssertTraversalIsRejectedAsync(mediaAddress);
+    await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
+    await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
+    await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
+    AssertPlaybackBaseUriFormatting();
+    await AssertSymlinkRootIsRejectedAsync(symlinkRootTarget, symlinkRoot);
+
+    Console.WriteLine("Cache server integration tests passed.");
+}
+finally
+{
+    Directory.Delete(tempRoot, recursive: true);
+    if (Directory.Exists(symlinkRoot))
+    {
+        Directory.Delete(symlinkRoot);
+    }
+
+    if (Directory.Exists(symlinkRootTarget))
+    {
+        Directory.Delete(symlinkRootTarget, recursive: true);
+    }
+
+    if (Directory.Exists(outsideDirectory))
+    {
+        Directory.Delete(outsideDirectory, recursive: true);
+    }
+
+    if (File.Exists(outsidePath))
+    {
+        File.Delete(outsidePath);
+    }
+}
+
+static async System.Threading.Tasks.Task AssertServerInfoAsync(GrpcChannel channel)
+{
+    var client = new ServerService.ServerServiceClient(channel);
+    var info = await client.GetServerInfoAsync(new GetServerInfoRequest());
+
+    AssertEqual("Test Cache", info.Name, "server name");
+    AssertTrue(info.Capabilities.Contains(ServerCapability.HttpRange), "server advertises HTTP range playback");
+}
+
+static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcChannel channel)
+{
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest());
+
+    AssertEqual(1, response.Items.Count, "library item count");
+    var item = response.Items[0];
+    AssertEqual("Sample Clip", item.Title, "library title");
+    AssertEqual("Movies/Sample Clip.mp4", item.Subtitle, "library subtitle");
+    AssertEqual(LibrarySource.LocalCache, item.Source, "library source");
+    AssertEqual(1, item.Variants.Count, "variant count");
+    AssertEqual("original", item.Variants[0].Id, "variant id");
+    AssertEqual(PlaybackProtocol.HttpFile, item.Variants[0].Protocol, "variant protocol");
+    AssertEqual("mp4", item.Variants[0].Container, "variant container");
+
+    return item;
+}
+
+static async System.Threading.Tasks.Task AssertLargePageTokenDoesNotOverflowAsync(GrpcChannel channel)
+{
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest
+    {
+        PageSize = 200,
+        PageToken = int.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture)
+    });
+
+    AssertEqual(0, response.Items.Count, "large page token item count");
+    AssertEqual("", response.NextPageToken, "large page token next page");
+}
+
+static async System.Threading.Tasks.Task<PlaybackSource> AssertPlaybackSourceAsync(GrpcChannel channel, LibraryItem item)
+{
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var playback = await client.GetPlaybackSourceAsync(new GetPlaybackSourceRequest
+    {
+        ItemId = item.Id,
+        VariantId = "original"
+    });
+
+    AssertEqual(item.Id, playback.ItemId, "playback item id");
+    AssertEqual("original", playback.VariantId, "playback variant id");
+    AssertEqual(PlaybackProtocol.HttpFile, playback.Protocol, "playback protocol");
+    AssertTrue(playback.Uri.StartsWith("http://127.0.0.1:", StringComparison.Ordinal), "playback URL uses local HTTP endpoint");
+    AssertTrue(playback.Uri.Contains($"/media/{Uri.EscapeDataString(item.Id)}/original", StringComparison.Ordinal), "playback URL points at media endpoint");
+
+    return playback;
+}
+
+static async System.Threading.Tasks.Task AssertHttpRangePlaybackAsync(string playbackUri)
+{
+    using var httpClient = new HttpClient();
+    using var request = new HttpRequestMessage(HttpMethod.Get, playbackUri);
+    request.Headers.Range = new RangeHeaderValue(2, 5);
+
+    using var response = await httpClient.SendAsync(request);
+    var body = await response.Content.ReadAsStringAsync();
+
+    AssertEqual(HttpStatusCode.PartialContent, response.StatusCode, "range status");
+    AssertEqual("2345", body, "range body");
+    AssertEqual("bytes", response.Headers.AcceptRanges.Single(), "accept-ranges header");
+    AssertEqual("video/mp4", response.Content.Headers.ContentType?.MediaType, "content type");
+}
+
+static async System.Threading.Tasks.Task AssertTraversalIsRejectedAsync(string address)
+{
+    var uri = $"{address}/media/{CreateLocalItemId("../secret.mp4")}/original";
+
+    using var httpClient = new HttpClient();
+    using var response = await httpClient.GetAsync(uri);
+
+    AssertEqual(HttpStatusCode.NotFound, response.StatusCode, "path traversal media lookup");
+}
+
+static async System.Threading.Tasks.Task AssertInvalidPathItemIdIsRejectedAsync(GrpcChannel channel, string address)
+{
+    var invalidItemId = CreateLocalItemId("bad\0path.mp4");
+    var client = new LibraryService.LibraryServiceClient(channel);
+
+    try
+    {
+        await client.GetPlaybackSourceAsync(new GetPlaybackSourceRequest
+        {
+            ItemId = invalidItemId,
+            VariantId = "original"
+        });
+        throw new InvalidOperationException("invalid path item id unexpectedly returned a playback source");
+    }
+    catch (RpcException exception) when (exception.StatusCode == StatusCode.NotFound)
+    {
+    }
+
+    using var httpClient = new HttpClient();
+    using var response = await httpClient.GetAsync($"{address}/media/{invalidItemId}/original");
+
+    AssertEqual(HttpStatusCode.NotFound, response.StatusCode, "invalid path media lookup");
+}
+
+static async System.Threading.Tasks.Task AssertSymlinkIsRejectedAsync(GrpcChannel channel, string address)
+{
+    var client = new LibraryService.LibraryServiceClient(channel);
+    var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest());
+    AssertTrue(response.Items.All(item => item.Title != "Linked Outside"), "symlink is hidden from library");
+
+    var uri = $"{address}/media/{CreateLocalItemId("Movies/Linked Outside.mp4")}/original";
+
+    using var httpClient = new HttpClient();
+    using var mediaResponse = await httpClient.GetAsync(uri);
+
+    AssertEqual(HttpStatusCode.NotFound, mediaResponse.StatusCode, "symlink media lookup");
+
+    var directorySymlinkUri = $"{address}/media/{CreateLocalItemId("Linked Directory/Directory Escape.mp4")}/original";
+    using var directorySymlinkResponse = await httpClient.GetAsync(directorySymlinkUri);
+
+    AssertEqual(HttpStatusCode.NotFound, directorySymlinkResponse.StatusCode, "symlink directory media lookup");
+}
+
+static async System.Threading.Tasks.Task AssertReadOnlyRootReportsNotWritableAsync(GrpcChannel channel, string rootPath)
+{
+    if (OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    File.SetUnixFileMode(
+        rootPath,
+        UnixFileMode.UserRead | UnixFileMode.UserExecute |
+        UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+        UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+    try
+    {
+        var client = new CacheService.CacheServiceClient(channel);
+        var response = await client.ListCacheRootsAsync(new ListCacheRootsRequest());
+
+        AssertEqual(1, response.Roots.Count, "cache root count");
+        AssertEqual(false, response.Roots[0].Writable, "read-only cache root writable flag");
+    }
+    finally
+    {
+        File.SetUnixFileMode(
+            rootPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+            UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+}
+
+static async System.Threading.Tasks.Task AssertSymlinkRootIsRejectedAsync(string symlinkRootTarget, string symlinkRoot)
+{
+    Directory.CreateDirectory(symlinkRootTarget);
+    await File.WriteAllTextAsync(Path.Combine(symlinkRootTarget, "Root Link Movie.mp4"), "linked-root");
+    Directory.CreateSymbolicLink(symlinkRoot, symlinkRootTarget);
+
+    var grpcAddress = $"http://127.0.0.1:{GetFreePort()}";
+    var mediaAddress = $"http://127.0.0.1:{GetFreePort()}";
+
+    await using var app = CacheServerHost.Create(
+    [
+        "--Cache:GrpcListenUrl",
+        grpcAddress,
+        "--Cache:MediaListenUrl",
+        mediaAddress,
+        "--Cache:RootPath",
+        symlinkRoot,
+        "--Logging:LogLevel:Default",
+        "Warning"
+    ]);
+
+    await app.StartAsync();
+
+    using var channel = GrpcChannel.ForAddress(grpcAddress, new GrpcChannelOptions
+    {
+        HttpHandler = new SocketsHttpHandler
+        {
+            EnableMultipleHttp2Connections = true
+        }
+    });
+
+    var serverClient = new ServerService.ServerServiceClient(channel);
+    var health = await serverClient.CheckHealthAsync(new CheckHealthRequest());
+    AssertEqual(HealthState.Degraded, health.State, "symlink root health");
+
+    var libraryClient = new LibraryService.LibraryServiceClient(channel);
+    var listResponse = await libraryClient.ListLibraryItemsAsync(new ListLibraryItemsRequest());
+    AssertEqual(0, listResponse.Items.Count, "symlink root item count");
+
+    using var httpClient = new HttpClient();
+    using var mediaResponse = await httpClient.GetAsync($"{mediaAddress}/media/{CreateLocalItemId("Root Link Movie.mp4")}/original");
+    AssertEqual(HttpStatusCode.NotFound, mediaResponse.StatusCode, "symlink root media lookup");
+}
+
+static void AssertPlaybackBaseUriFormatting()
+{
+    AssertEqual(
+        "http://127.0.0.1:8080",
+        PlaybackUriFactory.CreateMediaBaseUri("127.0.0.1:50051", "http://0.0.0.0:8080"),
+        "IPv4 wildcard playback base URI");
+
+    AssertEqual(
+        "http://mac-mini.local:8080",
+        PlaybackUriFactory.CreateMediaBaseUri("mac-mini.local:50051", "http://0.0.0.0:8080"),
+        "DNS wildcard playback base URI");
+
+    AssertEqual(
+        "http://[::1]:8080",
+        PlaybackUriFactory.CreateMediaBaseUri("[::1]:50051", "http://0.0.0.0:8080"),
+        "bracketed IPv6 wildcard playback base URI");
+
+    AssertEqual(
+        "http://[::1]:8080",
+        PlaybackUriFactory.CreateMediaBaseUri("127.0.0.1:50051", "http://[::1]:8080"),
+        "explicit IPv6 playback base URI");
+}
+
+static void AssertEqual<T>(T expected, T actual, string label)
+{
+    if (!EqualityComparer<T>.Default.Equals(expected, actual))
+    {
+        throw new InvalidOperationException($"{label}: expected {expected}, got {actual}");
+    }
+}
+
+static void AssertTrue(bool condition, string label)
+{
+    if (!condition)
+    {
+        throw new InvalidOperationException($"Assertion failed: {label}");
+    }
+}
+
+static int GetFreePort()
+{
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    return ((IPEndPoint)listener.LocalEndpoint).Port;
+}
+
+static string CreateLocalItemId(string relativePath)
+{
+    return $"local.default.{Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(relativePath))
+        .TrimEnd('=')
+        .Replace('+', '-')
+        .Replace('/', '_')}";
+}

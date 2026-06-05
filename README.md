@@ -4,8 +4,9 @@
 
 - SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
 - 手动 URL v0 工作流：保存上次播放地址，支持停止、清空和输入校验。
+- LAN cache server MVP：用 gRPC 提供控制面，用 HTTP Range endpoint 提供 `AVPlayer` 可播放媒体 URL。
 - Swift package core tests：覆盖 URL 规范化逻辑，不依赖本机 tvOS simulator runtime。
-- GitHub Actions CI：pre-commit checks、tvOS simulator build、tvOS XCTest target、core tests。
+- GitHub Actions CI：pre-commit checks、tvOS simulator build、LAN cache server build、tvOS XCTest target、core tests、cache server integration tests。
 - LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
 - Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
 
@@ -23,12 +24,14 @@ just ci
 just lint
 just format
 just build
+just build-cache-server
 just build-for-testing
 just test-tvos
 just test
+just test-cache-server
 ```
 
-`just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）和 `swift-format lint --strict`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码。
+`just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict` 和 `dotnet format --verify-no-changes`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `dotnet format` 格式化 cache server C# 源码。
 
 `just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core tests，不需要本机安装 tvOS simulator runtime。
 
@@ -99,12 +102,14 @@ xcrun devicectl device install app --device "$TVOS_DEVICE_ID" build/DerivedData/
 ```bash
 scripts/pre-commit.sh
 scripts/build.sh
+scripts/build-cache-server.sh
 scripts/build-for-testing.sh
 scripts/test-tvos-simulator.sh
 scripts/test.sh
+scripts/test-cache-server.sh
 ```
 
-其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
+其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 .NET LAN cache server，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-cache-server.sh` 启动真实 Kestrel server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
 
 后续设置 required checks 时，建议至少 gate：
 

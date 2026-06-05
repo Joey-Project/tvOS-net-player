@@ -4,6 +4,8 @@
 .codex-tmp/
 .swiftpm/
 .build/
+**/bin/
+**/obj/
 DerivedData/
 xcuserdata/
 *.xcuserstate

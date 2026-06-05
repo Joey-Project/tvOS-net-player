@@ -73,8 +73,28 @@ Playback sources intentionally return URLs instead of media bytes.
 
 ## First Implementation Slice
 
-1. Implement a minimal LAN cache server with a local cache directory, gRPC control plane, and HTTP Range media endpoint.
+1. Implement a minimal LAN cache server with a local cache directory, gRPC control plane, and HTTP Range media endpoint. Done in the first implementation slice.
 2. Add a tvOS gRPC client and simple library screen.
 3. Add Bilibili task creation through a BBDown adapter.
 4. Add Bonjour discovery once the manual server URL path works.
 5. Add HLS/progressive caching for weaker network conditions.
+
+## First Slice Notes
+
+The first server slice intentionally implements only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili tasks, task cancellation, cache deletion, Bonjour discovery, and HLS playlist/segment management remain follow-up work.
+
+Runtime shape:
+
+- gRPC services are hosted by ASP.NET Core and generated from `proto/tvos_net_player/v1/cache_control.proto`.
+- The server uses separate cleartext listeners by default: `http://0.0.0.0:50051` for gRPC/h2c and `http://0.0.0.0:8080` for HTTP media.
+- `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
+- `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
+- `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
+
+Configuration:
+
+- `Cache:RootPath`: local cache directory. Defaults to `cache` under the app base directory.
+- `Cache:ServerName`: friendly server name returned by `ServerService.GetServerInfo`.
+- `Cache:GrpcListenUrl`: gRPC listen URL. Defaults to `http://0.0.0.0:50051`.
+- `Cache:MediaListenUrl`: HTTP media listen URL. Defaults to `http://0.0.0.0:8080`.
+- `Cache:PublicMediaBaseUri`: optional public base URL for playback URLs when the server sits behind a proxy.
