@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using Grpc.Core;
 using Grpc.Net.Client;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using TVOSNetPlayer.Cache.V1;
 using TVOSNetPlayer.CacheServer;
@@ -67,9 +68,11 @@ try
     await AssertListCancellationAsync(tempRoot);
     await AssertListSkipsDeletedFileDuringMaterializationAsync();
     await AssertGetMediaFileReturnsNullWhenFileDisappearsAsync();
+    await AssertGetLibraryItemReturnsNullWhenFileDisappearsDuringMaterializationAsync();
     var playback = await AssertPlaybackSourceAsync(channel, item);
     await AssertHttpRangePlaybackAsync(playback.Uri);
     await AssertHttpHeadPlaybackAsync(playback.Uri);
+    await AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(app.Services, channel, item);
     await AssertWatchTasksIsUnimplementedAsync(channel);
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
@@ -264,6 +267,38 @@ static async System.Threading.Tasks.Task AssertGetMediaFileReturnsNullWhenFileDi
     }
 }
 
+static async System.Threading.Tasks.Task AssertGetLibraryItemReturnsNullWhenFileDisappearsDuringMaterializationAsync()
+{
+    var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-get-item-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(rootPath);
+    var mediaPath = Path.Combine(rootPath, "Vanishing Detail.mp4");
+    await File.WriteAllTextAsync(mediaPath, "vanishing");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeCreateLibraryItemForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "get item materialization hook media path");
+            File.Delete(path);
+        }
+    };
+
+    try
+    {
+        var item = await library.GetItemAsync(CreateLocalItemId("Vanishing Detail.mp4"), CancellationToken.None);
+        AssertEqual<LibraryItem?>(null, item, "vanishing library item");
+    }
+    finally
+    {
+        if (Directory.Exists(rootPath))
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
+    }
+}
+
 static async System.Threading.Tasks.Task<PlaybackSource> AssertPlaybackSourceAsync(GrpcChannel channel, LibraryItem item)
 {
     var client = new LibraryService.LibraryServiceClient(channel);
@@ -308,6 +343,44 @@ static async System.Threading.Tasks.Task AssertHttpHeadPlaybackAsync(string play
     AssertEqual("bytes", response.Headers.AcceptRanges.Single(), "HEAD accept-ranges header");
     AssertEqual("video/mp4", response.Content.Headers.ContentType?.MediaType, "HEAD content type");
     AssertEqual(0, body.Length, "HEAD body length");
+}
+
+static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(IServiceProvider services, GrpcChannel channel, LibraryItem item)
+{
+    var library = services.GetRequiredService<LocalMediaLibrary>();
+    var serverClient = new ServerService.ServerServiceClient(channel);
+    var libraryClient = new LibraryService.LibraryServiceClient(channel);
+    library.IsSecureNoFollowOpenSupportedForTests = () => false;
+
+    try
+    {
+        var serverInfo = await serverClient.GetServerInfoAsync(new GetServerInfoRequest());
+        AssertTrue(!serverInfo.Capabilities.Contains(ServerCapability.HttpRange), "unsupported secure open omits HTTP range capability");
+
+        var listResponse = await libraryClient.ListLibraryItemsAsync(new ListLibraryItemsRequest());
+        var listedItem = listResponse.Items.Single(candidate => candidate.Id == item.Id);
+        AssertEqual(0, listedItem.Variants.Count, "unsupported secure open variants");
+
+        try
+        {
+            await libraryClient.GetPlaybackSourceAsync(new GetPlaybackSourceRequest
+            {
+                ItemId = item.Id,
+                VariantId = "original"
+            });
+            throw new InvalidOperationException("GetPlaybackSource unexpectedly returned a URL when secure no-follow open is unavailable.");
+        }
+        catch (RpcException exception) when (exception.StatusCode == StatusCode.FailedPrecondition)
+        {
+        }
+    }
+    finally
+    {
+        library.IsSecureNoFollowOpenSupportedForTests = null;
+    }
+
+    var restoredServerInfo = await serverClient.GetServerInfoAsync(new GetServerInfoRequest());
+    AssertTrue(restoredServerInfo.Capabilities.Contains(ServerCapability.HttpRange), "restored HTTP range capability");
 }
 
 static async System.Threading.Tasks.Task AssertWatchTasksIsUnimplementedAsync(GrpcChannel channel)

@@ -30,6 +30,8 @@ public sealed class LocalMediaLibrary
 
     public string RootPath => Path.GetFullPath(options.CurrentValue.RootPath);
 
+    public bool SupportsHttpRangePlayback => IsSecureNoFollowOpenSupported();
+
     public System.Threading.Tasks.Task<LibraryItemPage> ListItemsPageAsync(LibraryFilter? filter, long pageOffset, int pageSize, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -73,7 +75,7 @@ public sealed class LocalMediaLibrary
     public async System.Threading.Tasks.Task<LibraryItem?> GetItemAsync(string id, CancellationToken cancellationToken)
     {
         var mediaFile = await GetMediaFileAsync(id, VariantId, cancellationToken);
-        return mediaFile is null ? null : CreateLibraryItem(RootPath, mediaFile.Path);
+        return mediaFile is null ? null : TryCreateLibraryItem(RootPath, mediaFile.Path);
     }
 
     public System.Threading.Tasks.Task<MediaFile?> GetMediaFileAsync(string itemId, string variantId, CancellationToken cancellationToken)
@@ -251,14 +253,17 @@ public sealed class LocalMediaLibrary
             UpdatedAt = Timestamp.FromDateTime(DateTime.SpecifyKind(fileInfo.LastWriteTimeUtc, DateTimeKind.Utc))
         };
 
-        item.Variants.Add(new MediaVariant
+        if (SupportsHttpRangePlayback)
         {
-            Id = VariantId,
-            Label = "Original",
-            Protocol = PlaybackProtocol.HttpFile,
-            Container = Path.GetExtension(path).TrimStart('.').ToLowerInvariant(),
-            SizeBytes = fileInfo.Length
-        });
+            item.Variants.Add(new MediaVariant
+            {
+                Id = VariantId,
+                Label = "Original",
+                Protocol = PlaybackProtocol.HttpFile,
+                Container = Path.GetExtension(path).TrimStart('.').ToLowerInvariant(),
+                SizeBytes = fileInfo.Length
+            });
+        }
 
         return item;
     }

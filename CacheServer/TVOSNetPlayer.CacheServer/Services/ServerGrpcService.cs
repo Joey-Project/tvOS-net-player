@@ -25,12 +25,16 @@ public sealed class ServerGrpcService : ServerService.ServerServiceBase
             Version = "0.1.0"
         };
 
-        if (!string.IsNullOrWhiteSpace(options.CurrentValue.PublicMediaBaseUri))
+        if (library.SupportsHttpRangePlayback && !string.IsNullOrWhiteSpace(options.CurrentValue.PublicMediaBaseUri))
         {
             serverInfo.MediaBaseUris.Add(options.CurrentValue.PublicMediaBaseUri);
         }
 
-        serverInfo.Capabilities.Add(ServerCapability.HttpRange);
+        if (library.SupportsHttpRangePlayback)
+        {
+            serverInfo.Capabilities.Add(ServerCapability.HttpRange);
+        }
+
         return System.Threading.Tasks.Task.FromResult(serverInfo);
     }
 

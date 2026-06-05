@@ -44,6 +44,11 @@ public sealed class LibraryGrpcService : LibraryService.LibraryServiceBase
 
     public override async System.Threading.Tasks.Task<PlaybackSource> GetPlaybackSource(GetPlaybackSourceRequest request, ServerCallContext context)
     {
+        if (!library.SupportsHttpRangePlayback)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, "HTTP range playback is unavailable on this platform."));
+        }
+
         var mediaFile = await library.GetMediaFileAsync(request.ItemId, request.VariantId, context.CancellationToken);
         if (mediaFile is null)
         {
