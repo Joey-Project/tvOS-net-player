@@ -14,6 +14,7 @@ public static class CacheServerHost
         {
             var cacheOptions = new CacheServerOptions();
             context.Configuration.GetSection("Cache").Bind(cacheOptions);
+            ValidateDistinctListenerPorts(cacheOptions);
 
             Listen(options, cacheOptions.GrpcListenUrl, HttpProtocols.Http2);
             Listen(options, cacheOptions.MediaListenUrl, HttpProtocols.Http1);
@@ -70,6 +71,16 @@ public static class CacheServerHost
     internal static bool IsMediaRequestPort(HttpContext context, string mediaListenUrl)
     {
         return context.Connection.LocalPort == new Uri(mediaListenUrl).Port;
+    }
+
+    private static void ValidateDistinctListenerPorts(CacheServerOptions options)
+    {
+        var grpcListenUri = new Uri(options.GrpcListenUrl);
+        var mediaListenUri = new Uri(options.MediaListenUrl);
+        if (grpcListenUri.Port == mediaListenUri.Port)
+        {
+            throw new InvalidOperationException("gRPC and media listen URLs must use distinct ports in this slice.");
+        }
     }
 
     private static void Listen(KestrelServerOptions options, string listenUrl, HttpProtocols protocols)

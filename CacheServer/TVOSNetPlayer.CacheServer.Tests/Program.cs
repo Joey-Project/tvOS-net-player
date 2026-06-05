@@ -96,6 +96,7 @@ try
     AssertListenHostNormalization();
     AssertDefaultListenUrlsAreLoopback();
     await AssertListenUrlsMustBeCleartextAsync(tempRoot);
+    await AssertListenUrlsMustUseDistinctPortsAsync(tempRoot);
     await AssertSymlinkRootIsRejectedAsync(symlinkRootTarget, symlinkRoot);
 
     Console.WriteLine("Cache server integration tests passed.");
@@ -718,6 +719,12 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
 
     try
     {
+        var page = await library.ListItemsPageAsync(null, 0, 50, CancellationToken.None);
+        AssertTrue(page.Items.All(item => item.Title != "Named Pipe"), "special file is hidden from library");
+
+        var mediaFile = await library.GetMediaFileAsync(CreateLocalItemId("Movies/Named Pipe.mp4"), "original", CancellationToken.None);
+        AssertEqual<MediaFile?>(null, mediaFile, "special media file metadata");
+
         var openedFile = await library
             .OpenMediaFileAsync(CreateLocalItemId("Movies/Named Pipe.mp4"), "original", CancellationToken.None)
             .WaitAsync(TimeSpan.FromSeconds(2));
@@ -1009,7 +1016,26 @@ static async System.Threading.Tasks.Task AssertListenUrlsMustBeCleartextAsync(st
         ]);
 }
 
-static async System.Threading.Tasks.Task AssertListenUrlRejectedAsync(string label, string[] args)
+static async System.Threading.Tasks.Task AssertListenUrlsMustUseDistinctPortsAsync(string rootPath)
+{
+    var sharedPort = GetFreePort();
+    await AssertListenUrlRejectedAsync(
+        "shared gRPC and media listen port",
+        [
+            "--Cache:GrpcListenUrl",
+            $"http://127.0.0.1:{sharedPort}",
+            "--Cache:MediaListenUrl",
+            $"http://0.0.0.0:{sharedPort}",
+            "--Cache:RootPath",
+            rootPath
+        ],
+        "gRPC and media listen URLs must use distinct ports");
+}
+
+static async System.Threading.Tasks.Task AssertListenUrlRejectedAsync(
+    string label,
+    string[] args,
+    string expectedMessage = "Only cleartext http listen URLs")
 {
     try
     {
@@ -1017,7 +1043,7 @@ static async System.Threading.Tasks.Task AssertListenUrlRejectedAsync(string lab
         await app.StartAsync();
         throw new InvalidOperationException($"{label} unexpectedly started.");
     }
-    catch (InvalidOperationException exception) when (exception.Message.Contains("Only cleartext http listen URLs", StringComparison.Ordinal))
+    catch (InvalidOperationException exception) when (exception.Message.Contains(expectedMessage, StringComparison.Ordinal))
     {
     }
 }
