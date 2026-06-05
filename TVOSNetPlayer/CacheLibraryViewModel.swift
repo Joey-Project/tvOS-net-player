@@ -5,7 +5,11 @@ import TVOSNetPlayerCacheClient
 final class CacheLibraryViewModel: ObservableObject {
     static let serverAddressDefaultsKey = "CacheServerAddress"
 
-    @Published var serverAddressText: String
+    @Published var serverAddressText: String {
+        didSet {
+            clearLoadedLibraryIfNeeded(previousValue: oldValue)
+        }
+    }
     @Published private(set) var serverName: String = "LAN cache"
     @Published private(set) var statusMessage: String = "Cache server not connected."
     @Published private(set) var errorMessage: String?
@@ -14,6 +18,8 @@ final class CacheLibraryViewModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
+    private var loadedEndpoint: CacheServerEndpoint?
+    private var refreshSequence = 0
 
     init(
         defaultServerAddressText: String? = nil,
@@ -33,9 +39,14 @@ final class CacheLibraryViewModel: ObservableObject {
     }
 
     func refresh() async {
+        refreshSequence += 1
+        let requestSequence = refreshSequence
+
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
-            errorMessage = "Use a host and optional port, such as mac-mini.local:50051."
-            statusMessage = "Cache server address is invalid."
+            clearLoadedLibrary(
+                statusMessage: "Cache server address is invalid.",
+                errorMessage: "Use a host and optional port, such as mac-mini.local:50051."
+            )
             return
         }
 
@@ -48,12 +59,24 @@ final class CacheLibraryViewModel: ObservableObject {
             let serverInfo = try await client.getServerInfo()
             let libraryItems = try await client.listLibraryItems(pageSize: 50)
 
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return
+            }
+
+            loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
             items = libraryItems
             serverAddressText = endpoint.displayAddress
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
             statusMessage = "Loaded \(libraryItems.count) cached item(s) from \(serverName)."
         } catch {
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return
+            }
+
+            loadedEndpoint = nil
+            items = []
+            serverName = "LAN cache"
             errorMessage = error.localizedDescription
             statusMessage = "Could not load cache library."
         }
@@ -68,6 +91,15 @@ final class CacheLibraryViewModel: ObservableObject {
             return nil
         }
 
+        guard loadedEndpoint == endpoint else {
+            clearLoadedLibrary(
+                statusMessage: "Refresh cache server to load videos.",
+                errorMessage: nil
+            )
+            return nil
+        }
+
+        let requestSequence = refreshSequence
         isLoading = true
         errorMessage = nil
         statusMessage = "Preparing \(item.displayTitle)..."
@@ -77,6 +109,10 @@ final class CacheLibraryViewModel: ObservableObject {
                 itemID: item.id,
                 variantID: item.primaryVariantID
             )
+
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return nil
+            }
 
             guard let url = StreamURLNormalizer.normalizedHTTPURL(from: source.uri) else {
                 errorMessage = "Cache server returned a non-HTTP playback URL."
@@ -89,10 +125,46 @@ final class CacheLibraryViewModel: ObservableObject {
             isLoading = false
             return url
         } catch {
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return nil
+            }
+
             errorMessage = error.localizedDescription
             statusMessage = "Could not prepare \(item.displayTitle)."
             isLoading = false
             return nil
         }
+    }
+
+    private func clearLoadedLibraryIfNeeded(previousValue: String) {
+        guard serverAddressText != previousValue else {
+            return
+        }
+
+        let currentEndpoint = CacheServerEndpoint.normalized(from: serverAddressText)
+        guard currentEndpoint != loadedEndpoint else {
+            return
+        }
+
+        refreshSequence += 1
+        clearLoadedLibrary(
+            statusMessage: serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Cache server not connected."
+                : "Refresh cache server to load videos.",
+            errorMessage: nil
+        )
+    }
+
+    private func clearLoadedLibrary(statusMessage: String, errorMessage: String?) {
+        loadedEndpoint = nil
+        items = []
+        serverName = "LAN cache"
+        isLoading = false
+        self.statusMessage = statusMessage
+        self.errorMessage = errorMessage
+    }
+
+    private func isCurrentRefresh(_ requestSequence: Int, endpoint: CacheServerEndpoint) -> Bool {
+        requestSequence == refreshSequence && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
     }
 }

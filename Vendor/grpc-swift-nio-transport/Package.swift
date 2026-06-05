@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Modified in tvOS-net-player: GRPCNIOTransportCore declares explicit NIOHTTP1
+// and NIOTLS product dependencies so Xcode links the tvOS TransportServices client.
 
 import PackageDescription
 

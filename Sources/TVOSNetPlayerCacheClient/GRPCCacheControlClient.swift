@@ -30,10 +30,17 @@ public final class GRPCCacheControlClient: CacheControlClient {
             )
         ) { client in
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
-            var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
-            request.pageSize = Int32(clamping: pageSize)
-            let response = try await service.listLibraryItems(request)
-            return response.items.map(CacheLibraryItem.init)
+            return try await collectCacheLibraryItems { pageToken in
+                var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
+                request.pageSize = Int32(clamping: max(1, pageSize))
+                request.pageToken = pageToken
+
+                let response = try await service.listLibraryItems(request)
+                return CacheLibraryItemsPage(
+                    items: response.items.map(CacheLibraryItem.init),
+                    nextPageToken: response.nextPageToken
+                )
+            }
         }
     }
 
@@ -53,6 +60,38 @@ public final class GRPCCacheControlClient: CacheControlClient {
             let response = try await service.getPlaybackSource(request)
             return CachePlaybackSource(response)
         }
+    }
+}
+
+struct CacheLibraryItemsPage: Equatable, Sendable {
+    let items: [CacheLibraryItem]
+    let nextPageToken: String
+}
+
+enum CacheLibraryPaginationError: Error, Equatable {
+    case repeatedPageToken(String)
+}
+
+func collectCacheLibraryItems(
+    fetchPage: (String) async throws -> CacheLibraryItemsPage
+) async throws -> [CacheLibraryItem] {
+    var allItems: [CacheLibraryItem] = []
+    var pageToken = ""
+    var seenNextPageTokens = Set<String>()
+
+    while true {
+        let page = try await fetchPage(pageToken)
+        allItems.append(contentsOf: page.items)
+
+        guard !page.nextPageToken.isEmpty else {
+            return allItems
+        }
+
+        guard seenNextPageTokens.insert(page.nextPageToken).inserted else {
+            throw CacheLibraryPaginationError.repeatedPageToken(page.nextPageToken)
+        }
+
+        pageToken = page.nextPageToken
     }
 }
 

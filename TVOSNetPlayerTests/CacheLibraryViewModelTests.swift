@@ -68,6 +68,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
             variants: [.fixture(id: "original")]
         )
 
+        await model.refresh()
         let url = await model.playbackURL(for: item)
 
         XCTAssertEqual(url?.absoluteString, "http://mac-mini.local:8080/media/item-1/original")
@@ -92,24 +93,133 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let getServerInfoCallCount = await client.getServerInfoCallCount
         XCTAssertEqual(getServerInfoCallCount, 0)
     }
+
+    @MainActor
+    func testServerAddressChangeClearsLoadedLibraryItems() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+
+        model.serverAddressText = "server-b.local:50051"
+
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Refresh cache server to load videos.")
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testRefreshFailureClearsLoadedLibraryItems() async {
+        let loadingClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let failingClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server B"),
+            items: [.fixture(id: "item-b", title: "Server B item")],
+            playbackSource: .fixture(),
+            getServerInfoError: FakeCacheError.serverUnavailable
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.host == "server-a.local" ? loadingClient : failingClient
+            }
+        )
+
+        await model.refresh()
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+
+        model.serverAddressText = "server-b.local:50051"
+        await model.refresh()
+
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Could not load cache library.")
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testStaleRefreshResultDoesNotOverwriteNewEndpoint() async {
+        let slowClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            getServerInfoDelayNanoseconds: 100_000_000
+        )
+        let fastClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server B"),
+            items: [.fixture(id: "item-b", title: "Server B item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.host == "server-a.local" ? slowClient : fastClient
+            }
+        )
+
+        let staleRefresh = Task {
+            await model.refresh()
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+
+        model.serverAddressText = "server-b.local:50051"
+        await model.refresh()
+        await staleRefresh.value
+
+        XCTAssertEqual(model.serverAddressText, "server-b.local:50051")
+        XCTAssertEqual(model.serverName, "Server B")
+        XCTAssertEqual(model.items.map(\.id), ["item-b"])
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) from Server B.")
+    }
 }
 
 private actor FakeCacheControlClient: CacheControlClient {
     let serverInfo: CacheServerSummary
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
+    let getServerInfoDelayNanoseconds: UInt64
+    let getServerInfoError: FakeCacheError?
 
     private(set) var getServerInfoCallCount = 0
     private(set) var requestedPlayback: (itemID: String, variantID: String?)?
 
-    init(serverInfo: CacheServerSummary, items: [CacheLibraryItem], playbackSource: CachePlaybackSource) {
+    init(
+        serverInfo: CacheServerSummary,
+        items: [CacheLibraryItem],
+        playbackSource: CachePlaybackSource,
+        getServerInfoDelayNanoseconds: UInt64 = 0,
+        getServerInfoError: FakeCacheError? = nil
+    ) {
         self.serverInfo = serverInfo
         self.items = items
         self.playbackSource = playbackSource
+        self.getServerInfoDelayNanoseconds = getServerInfoDelayNanoseconds
+        self.getServerInfoError = getServerInfoError
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
         getServerInfoCallCount += 1
+        if getServerInfoDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: getServerInfoDelayNanoseconds)
+        }
+        if let getServerInfoError {
+            throw getServerInfoError
+        }
         return serverInfo
     }
 
@@ -123,9 +233,13 @@ private actor FakeCacheControlClient: CacheControlClient {
     }
 }
 
+private enum FakeCacheError: Error {
+    case serverUnavailable
+}
+
 extension CacheServerSummary {
-    fileprivate static func fixture() -> Self {
-        Self(id: "server-1", name: "Mac mini cache", version: "0.1.0", mediaBaseURIs: [], capabilities: [])
+    fileprivate static func fixture(name: String = "Mac mini cache") -> Self {
+        Self(id: "server-1", name: name, version: "0.1.0", mediaBaseURIs: [], capabilities: [])
     }
 }
 
