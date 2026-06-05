@@ -8,6 +8,7 @@
 ## Recovery Pointers
 
 - 初始 setup workstream：`docs/project_journal/2026/05/2026-05-31-initial-tvos-setup-a1b2c3.md`
+- LAN cache server 控制面 workstream：`docs/project_journal/2026/06/2026-06-04-cache-server-control-plane-b7c9e1.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
@@ -16,5 +17,6 @@
 
 ## Notes
 
+- 下一阶段架构决策：gRPC 只做控制面；媒体面继续使用 `AVPlayer` 可直接播放的 HTTP/HLS/Range URL。
 - CI 不保存 Apple Developer secrets；设备刷新只在本机通过 `scripts/deploy-lan.sh` 执行。
 - 本地 hook 用 `just install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。

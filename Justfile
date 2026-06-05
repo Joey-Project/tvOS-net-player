@@ -6,10 +6,13 @@ default:
 build:
     scripts/build.sh
 
+build-cache-server:
+    scripts/build-cache-server.sh
+
 build-for-testing:
     scripts/build-for-testing.sh
 
-ci: lint build build-for-testing test-tvos test
+ci: lint build build-cache-server build-for-testing test-tvos test test-cache-server
 
 deploy:
     scripts/deploy-lan.sh
@@ -28,6 +31,9 @@ pre-commit:
 
 test:
     scripts/test.sh
+
+test-cache-server:
+    scripts/test-cache-server.sh
 
 test-tvos:
     scripts/test-tvos-simulator.sh
