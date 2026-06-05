@@ -92,7 +92,7 @@ Runtime shape:
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
 - The media route is also constrained to the configured media listener port, so the gRPC listener does not serve media bytes even though both listeners share one ASP.NET Core app in this slice.
-- Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports macOS and Linux; other platforms can list local files but do not advertise HTTP Range playback, return playable variants, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented.
+- Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports HTTP Range playback on macOS, matching the Mac mini deployment target. Linux and other platforms can list basic local item identities, but they do not advertise HTTP Range playback, return playable variants, expose file size/mtime metadata, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented and covered per architecture.
 - `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
 
 Configuration:

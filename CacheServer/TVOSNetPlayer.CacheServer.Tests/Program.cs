@@ -61,19 +61,26 @@ try
         }
     });
 
-    await AssertServerInfoAsync(channel);
-    var item = await AssertLibraryAsync(channel);
+    var supportsHttpRangePlayback = SupportsSecureMediaOpenOnCurrentPlatform();
+    await AssertServerInfoAsync(channel, supportsHttpRangePlayback);
+    var item = await AssertLibraryAsync(channel, supportsHttpRangePlayback);
     await AssertLargePageTokenDoesNotOverflowAsync(channel);
     await AssertPaginatedLibraryAsync(channel, tempRoot);
     await AssertListCancellationAsync(tempRoot);
     await AssertListSkipsDeletedFileDuringMaterializationAsync();
     await AssertGetMediaFileReturnsNullWhenFileDisappearsAsync();
     await AssertGetLibraryItemReturnsNullWhenFileDisappearsDuringMaterializationAsync();
-    var playback = await AssertPlaybackSourceAsync(channel, item);
-    await AssertHttpRangePlaybackAsync(playback.Uri);
-    await AssertHttpHeadPlaybackAsync(playback.Uri);
-    await AssertMediaEndpointIsNotServedFromGrpcPortAsync(grpcAddress, item);
-    await AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(app.Services, channel, item);
+    await AssertListRejectsParentSymlinkSwapDuringMaterializationAsync();
+    await AssertGetMediaFileRejectsParentSymlinkSwapDuringMaterializationAsync();
+    if (supportsHttpRangePlayback)
+    {
+        var playback = await AssertPlaybackSourceAsync(channel, item);
+        await AssertHttpRangePlaybackAsync(playback.Uri);
+        await AssertHttpHeadPlaybackAsync(playback.Uri);
+        await AssertMediaEndpointIsNotServedFromGrpcPortAsync(grpcAddress, item);
+    }
+
+    await AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(app.Services, channel, item, supportsHttpRangePlayback);
     await AssertWatchTasksIsUnimplementedAsync(channel);
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
@@ -115,16 +122,16 @@ finally
     }
 }
 
-static async System.Threading.Tasks.Task AssertServerInfoAsync(GrpcChannel channel)
+static async System.Threading.Tasks.Task AssertServerInfoAsync(GrpcChannel channel, bool supportsHttpRangePlayback)
 {
     var client = new ServerService.ServerServiceClient(channel);
     var info = await client.GetServerInfoAsync(new GetServerInfoRequest());
 
     AssertEqual("Test Cache", info.Name, "server name");
-    AssertTrue(info.Capabilities.Contains(ServerCapability.HttpRange), "server advertises HTTP range playback");
+    AssertEqual(supportsHttpRangePlayback, info.Capabilities.Contains(ServerCapability.HttpRange), "server HTTP range playback capability");
 }
 
-static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcChannel channel)
+static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcChannel channel, bool supportsHttpRangePlayback)
 {
     var client = new LibraryService.LibraryServiceClient(channel);
     var response = await client.ListLibraryItemsAsync(new ListLibraryItemsRequest());
@@ -134,10 +141,13 @@ static async System.Threading.Tasks.Task<LibraryItem> AssertLibraryAsync(GrpcCha
     AssertEqual("Sample Clip", item.Title, "library title");
     AssertEqual("Movies/Sample Clip.mp4", item.Subtitle, "library subtitle");
     AssertEqual(LibrarySource.LocalCache, item.Source, "library source");
-    AssertEqual(1, item.Variants.Count, "variant count");
-    AssertEqual("original", item.Variants[0].Id, "variant id");
-    AssertEqual(PlaybackProtocol.HttpFile, item.Variants[0].Protocol, "variant protocol");
-    AssertEqual("mp4", item.Variants[0].Container, "variant container");
+    AssertEqual(supportsHttpRangePlayback ? 1 : 0, item.Variants.Count, "variant count");
+    if (supportsHttpRangePlayback)
+    {
+        AssertEqual("original", item.Variants[0].Id, "variant id");
+        AssertEqual(PlaybackProtocol.HttpFile, item.Variants[0].Protocol, "variant protocol");
+        AssertEqual("mp4", item.Variants[0].Container, "variant container");
+    }
 
     return item;
 }
@@ -309,6 +319,110 @@ static async System.Threading.Tasks.Task AssertGetLibraryItemReturnsNullWhenFile
     }
 }
 
+static async System.Threading.Tasks.Task AssertListRejectsParentSymlinkSwapDuringMaterializationAsync()
+{
+    if (!SupportsSecureMediaOpenOnCurrentPlatform())
+    {
+        return;
+    }
+
+    var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-list-parent-race-{Guid.NewGuid():N}");
+    var parentPath = Path.Combine(rootPath, "Race Parent");
+    var mediaPath = Path.Combine(parentPath, "Metadata Swap.mp4");
+    var outsideParentPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-list-parent-target-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(parentPath);
+    Directory.CreateDirectory(outsideParentPath);
+    await File.WriteAllTextAsync(mediaPath, "inside-cache-root");
+    await File.WriteAllTextAsync(Path.Combine(outsideParentPath, "Metadata Swap.mp4"), "outside-cache-root");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeCreateLibraryItemForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "list parent swap hook media path");
+            Directory.Delete(parentPath, recursive: true);
+            Directory.CreateSymbolicLink(parentPath, outsideParentPath);
+        }
+    };
+
+    try
+    {
+        var page = await library.ListItemsPageAsync(null, 0, 10, CancellationToken.None);
+        AssertEqual(0, page.Items.Count, "parent symlink swap list item count");
+    }
+    finally
+    {
+        if (Directory.Exists(parentPath))
+        {
+            Directory.Delete(parentPath);
+        }
+
+        if (Directory.Exists(rootPath))
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
+
+        if (Directory.Exists(outsideParentPath))
+        {
+            Directory.Delete(outsideParentPath, recursive: true);
+        }
+    }
+}
+
+static async System.Threading.Tasks.Task AssertGetMediaFileRejectsParentSymlinkSwapDuringMaterializationAsync()
+{
+    if (!SupportsSecureMediaOpenOnCurrentPlatform())
+    {
+        return;
+    }
+
+    var rootPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-media-parent-race-{Guid.NewGuid():N}");
+    var parentPath = Path.Combine(rootPath, "Race Parent");
+    var mediaPath = Path.Combine(parentPath, "Metadata Swap.mp4");
+    var outsideParentPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-media-parent-target-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(parentPath);
+    Directory.CreateDirectory(outsideParentPath);
+    await File.WriteAllTextAsync(mediaPath, "inside-cache-root");
+    await File.WriteAllTextAsync(Path.Combine(outsideParentPath, "Metadata Swap.mp4"), "outside-cache-root");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeCreateMediaFileForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "media parent swap hook media path");
+            Directory.Delete(parentPath, recursive: true);
+            Directory.CreateSymbolicLink(parentPath, outsideParentPath);
+        }
+    };
+
+    try
+    {
+        var mediaFile = await library.GetMediaFileAsync(CreateLocalItemId("Race Parent/Metadata Swap.mp4"), "original", CancellationToken.None);
+        AssertEqual<MediaFile?>(null, mediaFile, "parent symlink swap media file");
+    }
+    finally
+    {
+        if (Directory.Exists(parentPath))
+        {
+            Directory.Delete(parentPath);
+        }
+
+        if (Directory.Exists(rootPath))
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
+
+        if (Directory.Exists(outsideParentPath))
+        {
+            Directory.Delete(outsideParentPath, recursive: true);
+        }
+    }
+}
+
 static async System.Threading.Tasks.Task<PlaybackSource> AssertPlaybackSourceAsync(GrpcChannel channel, LibraryItem item)
 {
     var client = new LibraryService.LibraryServiceClient(channel);
@@ -371,7 +485,11 @@ static async System.Threading.Tasks.Task AssertMediaEndpointIsNotServedFromGrpcP
     AssertEqual(HttpStatusCode.NotFound, response.StatusCode, "media lookup on gRPC listener");
 }
 
-static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(IServiceProvider services, GrpcChannel channel, LibraryItem item)
+static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(
+    IServiceProvider services,
+    GrpcChannel channel,
+    LibraryItem item,
+    bool supportsHttpRangePlayback)
 {
     var library = services.GetRequiredService<LocalMediaLibrary>();
     var serverClient = new ServerService.ServerServiceClient(channel);
@@ -406,7 +524,10 @@ static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenS
     }
 
     var restoredServerInfo = await serverClient.GetServerInfoAsync(new GetServerInfoRequest());
-    AssertTrue(restoredServerInfo.Capabilities.Contains(ServerCapability.HttpRange), "restored HTTP range capability");
+    AssertEqual(
+        supportsHttpRangePlayback,
+        restoredServerInfo.Capabilities.Contains(ServerCapability.HttpRange),
+        "restored HTTP range capability");
 }
 
 static async System.Threading.Tasks.Task AssertWatchTasksIsUnimplementedAsync(GrpcChannel channel)
@@ -489,7 +610,7 @@ static async System.Threading.Tasks.Task AssertSymlinkIsRejectedAsync(GrpcChanne
 
 static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(string rootPath)
 {
-    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    if (!SupportsSecureMediaOpenOnCurrentPlatform())
     {
         return;
     }
@@ -500,7 +621,6 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
         throw new InvalidOperationException($"mkfifo failed: errno={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
     }
 
-    var beforeOpenCalled = false;
     var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
     {
         RootPath = rootPath
@@ -508,7 +628,6 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
     {
         BeforeOpenMediaFileForTests = path =>
         {
-            beforeOpenCalled = true;
             AssertEqual(fifoPath, path, "special file hook media path");
         }
     };
@@ -523,8 +642,6 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
             openedFile.Stream.Dispose();
             throw new InvalidOperationException("OpenMediaFileAsync unexpectedly opened a FIFO media file.");
         }
-
-        AssertTrue(beforeOpenCalled, "special file reached secure open path");
     }
     finally
     {
@@ -537,7 +654,7 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
 
 static async System.Threading.Tasks.Task AssertSymlinkSwapBeforeOpenIsRejectedAsync(string rootPath, string outsidePath)
 {
-    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    if (!SupportsSecureMediaOpenOnCurrentPlatform())
     {
         return;
     }
@@ -577,7 +694,7 @@ static async System.Threading.Tasks.Task AssertSymlinkSwapBeforeOpenIsRejectedAs
 
 static async System.Threading.Tasks.Task AssertParentSymlinkSwapBeforeOpenIsRejectedAsync(string rootPath)
 {
-    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    if (!SupportsSecureMediaOpenOnCurrentPlatform())
     {
         return;
     }
@@ -850,6 +967,11 @@ static string CreateLocalItemId(string relativePath)
         .TrimEnd('=')
         .Replace('+', '-')
         .Replace('/', '_')}";
+}
+
+static bool SupportsSecureMediaOpenOnCurrentPlatform()
+{
+    return OperatingSystem.IsMacOS();
 }
 
 [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "mkfifo", SetLastError = true)]

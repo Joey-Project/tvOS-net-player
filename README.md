@@ -58,7 +58,7 @@ dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- \
   --Cache:MediaListenUrl http://0.0.0.0:8080
 ```
 
-当前第一片只支持 cleartext `http://` listener，认证、TLS、Bonjour discovery 和 BBDown task adapter 都是后续工作。
+当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS、Bonjour discovery、BBDown task adapter 和其他服务端平台的安全媒体打开都是后续工作。
 
 ## Pre-commit Hook
 
