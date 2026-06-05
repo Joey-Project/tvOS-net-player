@@ -78,12 +78,14 @@ try
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
+    await AssertSpecialMediaFileIsRejectedAsync(tempRoot);
     await AssertSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot, outsidePath);
     await AssertParentSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot);
     await AssertSecureMediaOpenUnavailableFailsClosedAsync(tempRoot);
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
     AssertListenHostNormalization();
+    AssertDefaultListenUrlsAreLoopback();
     await AssertListenUrlsMustBeCleartextAsync(tempRoot);
     await AssertSymlinkRootIsRejectedAsync(symlinkRootTarget, symlinkRoot);
 
@@ -485,6 +487,54 @@ static async System.Threading.Tasks.Task AssertSymlinkIsRejectedAsync(GrpcChanne
     AssertEqual(HttpStatusCode.NotFound, directorySymlinkResponse.StatusCode, "symlink directory media lookup");
 }
 
+static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(string rootPath)
+{
+    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    {
+        return;
+    }
+
+    var fifoPath = Path.Combine(rootPath, "Movies", "Named Pipe.mp4");
+    if (MkFifo(fifoPath, 0x1A4) != 0)
+    {
+        throw new InvalidOperationException($"mkfifo failed: errno={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
+    }
+
+    var beforeOpenCalled = false;
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeOpenMediaFileForTests = path =>
+        {
+            beforeOpenCalled = true;
+            AssertEqual(fifoPath, path, "special file hook media path");
+        }
+    };
+
+    try
+    {
+        var openedFile = await library
+            .OpenMediaFileAsync(CreateLocalItemId("Movies/Named Pipe.mp4"), "original", CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+        if (openedFile is not null)
+        {
+            openedFile.Stream.Dispose();
+            throw new InvalidOperationException("OpenMediaFileAsync unexpectedly opened a FIFO media file.");
+        }
+
+        AssertTrue(beforeOpenCalled, "special file reached secure open path");
+    }
+    finally
+    {
+        if (File.Exists(fifoPath))
+        {
+            File.Delete(fifoPath);
+        }
+    }
+}
+
 static async System.Threading.Tasks.Task AssertSymlinkSwapBeforeOpenIsRejectedAsync(string rootPath, string outsidePath)
 {
     if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
@@ -726,6 +776,13 @@ static void AssertListenHostNormalization()
         "IPv4 listen host normalization");
 }
 
+static void AssertDefaultListenUrlsAreLoopback()
+{
+    var options = new CacheServerOptions();
+    AssertEqual("http://localhost:50051", options.GrpcListenUrl, "default gRPC listen URL");
+    AssertEqual("http://localhost:8080", options.MediaListenUrl, "default media listen URL");
+}
+
 static async System.Threading.Tasks.Task AssertListenUrlsMustBeCleartextAsync(string rootPath)
 {
     await AssertListenUrlRejectedAsync(
@@ -794,6 +851,9 @@ static string CreateLocalItemId(string relativePath)
         .Replace('+', '-')
         .Replace('/', '_')}";
 }
+
+[System.Runtime.InteropServices.DllImport("libc", EntryPoint = "mkfifo", SetLastError = true)]
+static extern int MkFifo(string path, uint mode);
 
 sealed class StaticOptionsMonitor<T> : IOptionsMonitor<T>
 {

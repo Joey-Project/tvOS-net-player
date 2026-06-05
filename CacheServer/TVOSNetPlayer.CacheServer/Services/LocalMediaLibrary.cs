@@ -14,8 +14,15 @@ public sealed class LocalMediaLibrary
     private const int OpenReadOnly = 0;
     private const int DarwinOpenNoFollow = 0x00000100;
     private const int DarwinOpenDirectory = 0x00100000;
+    private const int DarwinOpenNonBlock = 0x00000004;
     private const int LinuxOpenNoFollow = 0x00020000;
     private const int LinuxOpenDirectory = 0x00010000;
+    private const int LinuxOpenNonBlock = 0x00000800;
+    private const int StatBufferSize = 256;
+    private const int DarwinStatModeOffset = 4;
+    private const int LinuxStatModeOffset = 24;
+    private const uint UnixFileTypeMask = 0xF000;
+    private const uint UnixRegularFileType = 0x8000;
     private readonly IOptionsMonitor<CacheServerOptions> options;
 
     public LocalMediaLibrary(IOptionsMonitor<CacheServerOptions> options)
@@ -489,18 +496,18 @@ public sealed class LocalMediaLibrary
 
         if (OperatingSystem.IsMacOS())
         {
-            return OpenUnixReadNoFollow(rootPath, relativePath, DarwinOpenNoFollow, DarwinOpenDirectory);
+            return OpenUnixReadNoFollow(rootPath, relativePath, DarwinOpenNoFollow, DarwinOpenDirectory, DarwinOpenNonBlock);
         }
 
         if (OperatingSystem.IsLinux())
         {
-            return OpenUnixReadNoFollow(rootPath, relativePath, LinuxOpenNoFollow, LinuxOpenDirectory);
+            return OpenUnixReadNoFollow(rootPath, relativePath, LinuxOpenNoFollow, LinuxOpenDirectory, LinuxOpenNonBlock);
         }
 
         throw new NotSupportedException("Secure no-follow media open is not implemented on this platform.");
     }
 
-    private static FileStream OpenUnixReadNoFollow(string rootPath, string relativePath, int openNoFollow, int openDirectory)
+    private static FileStream OpenUnixReadNoFollow(string rootPath, string relativePath, int openNoFollow, int openDirectory, int openNonBlock)
     {
         var segments = relativePath.Split(GetPathSegmentSeparators(), StringSplitOptions.RemoveEmptyEntries);
         if (segments.Length == 0)
@@ -524,9 +531,10 @@ public sealed class LocalMediaLibrary
                 directoryHandle = nextDirectoryHandle;
             }
 
-            var fileHandle = OpenUnixHandleAt(directoryHandle, segments[^1], OpenReadOnly | openNoFollow);
+            var fileHandle = OpenUnixHandleAt(directoryHandle, segments[^1], OpenReadOnly | openNoFollow | openNonBlock);
             try
             {
+                EnsureUnixRegularFile(fileHandle, segments[^1]);
                 return new FileStream(fileHandle, FileAccess.Read, bufferSize: 1);
             }
             catch
@@ -541,6 +549,22 @@ public sealed class LocalMediaLibrary
             {
                 directoryHandle.Dispose();
             }
+        }
+    }
+
+    private static void EnsureUnixRegularFile(SafeFileHandle handle, string path)
+    {
+        var statBuffer = new byte[StatBufferSize];
+        if (FStat(ToFileDescriptor(handle), statBuffer) < 0)
+        {
+            throw CreateOpenException(path);
+        }
+
+        var modeOffset = OperatingSystem.IsMacOS() ? DarwinStatModeOffset : LinuxStatModeOffset;
+        var mode = BitConverter.ToUInt32(statBuffer, modeOffset);
+        if ((mode & UnixFileTypeMask) != UnixRegularFileType)
+        {
+            throw new IOException($"Could not open media file because it is not a regular file: {path}.");
         }
     }
 
@@ -629,6 +653,9 @@ public sealed class LocalMediaLibrary
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "openat", SetLastError = true)]
     private static extern int OpenAt(int directoryFileDescriptor, string path, int flags);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fstat", SetLastError = true)]
+    private static extern int FStat(int fileDescriptor, [System.Runtime.InteropServices.Out] byte[] stat);
 }
 
 public sealed record MediaFile(string Path, string RelativePath, string ContentType, DateTimeOffset LastModified, long SizeBytes);

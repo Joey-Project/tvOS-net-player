@@ -86,7 +86,8 @@ The first server slice intentionally implements only local cache browsing and HT
 Runtime shape:
 
 - gRPC services are hosted by ASP.NET Core and generated from `proto/tvos_net_player/v1/cache_control.proto`.
-- The server uses separate cleartext listeners by default: `http://0.0.0.0:50051` for gRPC/h2c and `http://0.0.0.0:8080` for HTTP media.
+- The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
+- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. The first slice does not implement authentication.
 - `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that Kestrel does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
@@ -98,6 +99,6 @@ Configuration:
 
 - `Cache:RootPath`: local cache directory. Defaults to `cache` under the app base directory.
 - `Cache:ServerName`: friendly server name returned by `ServerService.GetServerInfo`.
-- `Cache:GrpcListenUrl`: gRPC listen URL. Defaults to `http://0.0.0.0:50051`.
-- `Cache:MediaListenUrl`: HTTP media listen URL. Defaults to `http://0.0.0.0:8080`.
+- `Cache:GrpcListenUrl`: gRPC listen URL. Defaults to `http://localhost:50051`.
+- `Cache:MediaListenUrl`: HTTP media listen URL. Defaults to `http://localhost:8080`.
 - `Cache:PublicMediaBaseUri`: optional public base URL for playback URLs when the server sits behind a proxy.

@@ -41,6 +41,25 @@ just test-cache-server
 TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
 
+## LAN Cache Server
+
+cache server 默认只监听本机 loopback，适合本机开发：
+
+```bash
+dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- --Cache:RootPath /path/to/cache
+```
+
+如果要给同一局域网内的 Apple TV 访问，需要在可信 LAN 上显式绑定：
+
+```bash
+dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- \
+  --Cache:RootPath /path/to/cache \
+  --Cache:GrpcListenUrl http://0.0.0.0:50051 \
+  --Cache:MediaListenUrl http://0.0.0.0:8080
+```
+
+当前第一片只支持 cleartext `http://` listener，认证、TLS、Bonjour discovery 和 BBDown task adapter 都是后续工作。
+
 ## Pre-commit Hook
 
 安装本仓库自带的 Git hook：
