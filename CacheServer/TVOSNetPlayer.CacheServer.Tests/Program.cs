@@ -722,6 +722,9 @@ static async System.Threading.Tasks.Task AssertSpecialMediaFileIsRejectedAsync(s
         var page = await library.ListItemsPageAsync(null, 0, 50, CancellationToken.None);
         AssertTrue(page.Items.All(item => item.Title != "Named Pipe"), "special file is hidden from library");
 
+        var count = await library.CountItemsAsync(CancellationToken.None);
+        AssertEqual(page.Items.Count, count, "special file rescan count");
+
         var mediaFile = await library.GetMediaFileAsync(CreateLocalItemId("Movies/Named Pipe.mp4"), "original", CancellationToken.None);
         AssertEqual<MediaFile?>(null, mediaFile, "special media file metadata");
 

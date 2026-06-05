@@ -224,8 +224,14 @@ public sealed class LocalMediaLibrary
         {
             var rootPath = RootPath;
             BeforeEnumerateMediaCandidatesForTests?.Invoke(rootPath);
-            foreach (var _ in EnumerateMediaCandidates(rootPath, null, cancellationToken))
+            foreach (var candidate in EnumerateMediaCandidates(rootPath, null, cancellationToken))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (TryCreateMediaFile(rootPath, candidate.Path, beforeCreateMediaFile: null) is null)
+                {
+                    continue;
+                }
+
                 if (count < int.MaxValue)
                 {
                     count++;
