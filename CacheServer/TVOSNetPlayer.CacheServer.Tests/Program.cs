@@ -73,6 +73,7 @@ try
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot, outsidePath);
+    await AssertParentSymlinkSwapBeforeOpenIsRejectedAsync(tempRoot);
     await AssertReadOnlyRootReportsNotWritableAsync(channel, tempRoot);
     AssertPlaybackBaseUriFormatting();
     AssertListenHostNormalization();
@@ -349,6 +350,56 @@ static async System.Threading.Tasks.Task AssertSymlinkSwapBeforeOpenIsRejectedAs
         if (File.Exists(mediaPath))
         {
             File.Delete(mediaPath);
+        }
+    }
+}
+
+static async System.Threading.Tasks.Task AssertParentSymlinkSwapBeforeOpenIsRejectedAsync(string rootPath)
+{
+    if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+    {
+        return;
+    }
+
+    var parentPath = Path.Combine(rootPath, "Race Parent");
+    var mediaPath = Path.Combine(parentPath, "Parent Swap Clip.mp4");
+    var outsideParentPath = Path.Combine(Path.GetTempPath(), $"tvnp-cache-server-parent-race-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(parentPath);
+    Directory.CreateDirectory(outsideParentPath);
+    await File.WriteAllTextAsync(mediaPath, "inside-cache-root");
+    await File.WriteAllTextAsync(Path.Combine(outsideParentPath, "Parent Swap Clip.mp4"), "outside-cache-root");
+    var library = new LocalMediaLibrary(new StaticOptionsMonitor<CacheServerOptions>(new CacheServerOptions
+    {
+        RootPath = rootPath
+    }))
+    {
+        BeforeOpenMediaFileForTests = path =>
+        {
+            AssertEqual(mediaPath, path, "parent swap hook media path");
+            Directory.Delete(parentPath, recursive: true);
+            Directory.CreateSymbolicLink(parentPath, outsideParentPath);
+        }
+    };
+
+    try
+    {
+        var openedFile = await library.OpenMediaFileAsync(CreateLocalItemId("Race Parent/Parent Swap Clip.mp4"), "original", CancellationToken.None);
+        if (openedFile is not null)
+        {
+            openedFile.Stream.Dispose();
+            throw new InvalidOperationException("OpenMediaFileAsync unexpectedly followed a parent symlink swapped in after validation.");
+        }
+    }
+    finally
+    {
+        if (Directory.Exists(parentPath))
+        {
+            Directory.Delete(parentPath);
+        }
+
+        if (Directory.Exists(outsideParentPath))
+        {
+            Directory.Delete(outsideParentPath, recursive: true);
         }
     }
 }

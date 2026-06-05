@@ -13,7 +13,9 @@ public sealed class LocalMediaLibrary
     private const string VariantId = "original";
     private const int OpenReadOnly = 0;
     private const int DarwinOpenNoFollow = 0x00000100;
+    private const int DarwinOpenDirectory = 0x00100000;
     private const int LinuxOpenNoFollow = 0x00020000;
+    private const int LinuxOpenDirectory = 0x00010000;
     private readonly IOptionsMonitor<CacheServerOptions> options;
 
     public LocalMediaLibrary(IOptionsMonitor<CacheServerOptions> options)
@@ -89,7 +91,7 @@ public sealed class LocalMediaLibrary
         FileStream stream;
         try
         {
-            stream = OpenReadNoFollow(mediaFile.Path);
+            stream = OpenReadNoFollow(RootPath, mediaFile.RelativePath, mediaFile.Path);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
         {
@@ -155,8 +157,10 @@ public sealed class LocalMediaLibrary
         }
 
         var fileInfo = new FileInfo(candidatePath);
+        var candidateRelativePath = Path.GetRelativePath(rootPath, candidatePath);
         return new MediaFile(
             candidatePath,
+            candidateRelativePath,
             GetContentType(candidatePath),
             new DateTimeOffset(fileInfo.LastWriteTimeUtc, TimeSpan.Zero),
             fileInfo.Length);
@@ -436,16 +440,16 @@ public sealed class LocalMediaLibrary
         return Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
     }
 
-    private static FileStream OpenReadNoFollow(string path)
+    private static FileStream OpenReadNoFollow(string rootPath, string relativePath, string path)
     {
         if (OperatingSystem.IsMacOS())
         {
-            return OpenUnixReadNoFollow(path, DarwinOpenNoFollow);
+            return OpenUnixReadNoFollow(rootPath, relativePath, DarwinOpenNoFollow, DarwinOpenDirectory);
         }
 
         if (OperatingSystem.IsLinux())
         {
-            return OpenUnixReadNoFollow(path, LinuxOpenNoFollow);
+            return OpenUnixReadNoFollow(rootPath, relativePath, LinuxOpenNoFollow, LinuxOpenDirectory);
         }
 
         return new FileStream(path, new FileStreamOptions
@@ -457,24 +461,80 @@ public sealed class LocalMediaLibrary
         });
     }
 
-    private static FileStream OpenUnixReadNoFollow(string path, int openNoFollow)
+    private static FileStream OpenUnixReadNoFollow(string rootPath, string relativePath, int openNoFollow, int openDirectory)
     {
-        var fileDescriptor = Open(path, OpenReadOnly | openNoFollow);
-        if (fileDescriptor < 0)
+        var segments = relativePath.Split(GetPathSegmentSeparators(), StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0)
         {
-            throw new IOException($"Could not open media file without following symlinks. errno={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
+            throw new IOException("Could not open media file with an empty relative path.");
         }
 
-        var handle = new SafeFileHandle(new IntPtr(fileDescriptor), ownsHandle: true);
+        using var rootHandle = OpenUnixHandle(rootPath, OpenReadOnly | openNoFollow | openDirectory);
+        SafeFileHandle? directoryHandle = null;
         try
         {
-            return new FileStream(handle, FileAccess.Read, bufferSize: 1);
+            directoryHandle = rootHandle;
+            for (var index = 0; index < segments.Length - 1; index++)
+            {
+                var nextDirectoryHandle = OpenUnixHandleAt(directoryHandle, segments[index], OpenReadOnly | openNoFollow | openDirectory);
+                if (!ReferenceEquals(directoryHandle, rootHandle))
+                {
+                    directoryHandle.Dispose();
+                }
+
+                directoryHandle = nextDirectoryHandle;
+            }
+
+            var fileHandle = OpenUnixHandleAt(directoryHandle, segments[^1], OpenReadOnly | openNoFollow);
+            try
+            {
+                return new FileStream(fileHandle, FileAccess.Read, bufferSize: 1);
+            }
+            catch
+            {
+                fileHandle.Dispose();
+                throw;
+            }
         }
-        catch
+        finally
         {
-            handle.Dispose();
-            throw;
+            if (directoryHandle is not null && !ReferenceEquals(directoryHandle, rootHandle))
+            {
+                directoryHandle.Dispose();
+            }
         }
+    }
+
+    private static SafeFileHandle OpenUnixHandle(string path, int flags)
+    {
+        var fileDescriptor = Open(path, flags);
+        if (fileDescriptor < 0)
+        {
+            throw CreateOpenException(path);
+        }
+
+        return new SafeFileHandle(new IntPtr(fileDescriptor), ownsHandle: true);
+    }
+
+    private static SafeFileHandle OpenUnixHandleAt(SafeFileHandle directoryHandle, string path, int flags)
+    {
+        var fileDescriptor = OpenAt(ToFileDescriptor(directoryHandle), path, flags);
+        if (fileDescriptor < 0)
+        {
+            throw CreateOpenException(path);
+        }
+
+        return new SafeFileHandle(new IntPtr(fileDescriptor), ownsHandle: true);
+    }
+
+    private static int ToFileDescriptor(SafeFileHandle handle)
+    {
+        return handle.DangerousGetHandle().ToInt32();
+    }
+
+    private static IOException CreateOpenException(string path)
+    {
+        return new IOException($"Could not open media file without following symlinks: {path}. errno={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
     }
 
     private static bool CanWriteToDirectory(string path)
@@ -527,9 +587,12 @@ public sealed class LocalMediaLibrary
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "open", SetLastError = true)]
     private static extern int Open(string path, int flags);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "openat", SetLastError = true)]
+    private static extern int OpenAt(int directoryFileDescriptor, string path, int flags);
 }
 
-public sealed record MediaFile(string Path, string ContentType, DateTimeOffset LastModified, long SizeBytes);
+public sealed record MediaFile(string Path, string RelativePath, string ContentType, DateTimeOffset LastModified, long SizeBytes);
 
 public sealed record OpenedMediaFile(FileStream Stream, string ContentType, DateTimeOffset LastModified, long SizeBytes);
 
