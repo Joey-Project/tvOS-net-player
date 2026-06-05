@@ -59,6 +59,8 @@ try
     await AssertLargePageTokenDoesNotOverflowAsync(channel);
     var playback = await AssertPlaybackSourceAsync(channel, item);
     await AssertHttpRangePlaybackAsync(playback.Uri);
+    await AssertHttpHeadPlaybackAsync(playback.Uri);
+    await AssertWatchTasksIsUnimplementedAsync(channel);
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
@@ -163,6 +165,34 @@ static async System.Threading.Tasks.Task AssertHttpRangePlaybackAsync(string pla
     AssertEqual("2345", body, "range body");
     AssertEqual("bytes", response.Headers.AcceptRanges.Single(), "accept-ranges header");
     AssertEqual("video/mp4", response.Content.Headers.ContentType?.MediaType, "content type");
+}
+
+static async System.Threading.Tasks.Task AssertHttpHeadPlaybackAsync(string playbackUri)
+{
+    using var httpClient = new HttpClient();
+    using var request = new HttpRequestMessage(HttpMethod.Head, playbackUri);
+    using var response = await httpClient.SendAsync(request);
+    var body = await response.Content.ReadAsByteArrayAsync();
+
+    AssertEqual(HttpStatusCode.OK, response.StatusCode, "HEAD status");
+    AssertEqual("bytes", response.Headers.AcceptRanges.Single(), "HEAD accept-ranges header");
+    AssertEqual("video/mp4", response.Content.Headers.ContentType?.MediaType, "HEAD content type");
+    AssertEqual(0, body.Length, "HEAD body length");
+}
+
+static async System.Threading.Tasks.Task AssertWatchTasksIsUnimplementedAsync(GrpcChannel channel)
+{
+    var client = new TaskService.TaskServiceClient(channel);
+    using var call = client.WatchTasks(new WatchTasksRequest());
+
+    try
+    {
+        await call.ResponseStream.MoveNext(CancellationToken.None);
+        throw new InvalidOperationException("WatchTasks unexpectedly returned a successful stream.");
+    }
+    catch (RpcException exception) when (exception.StatusCode == StatusCode.Unimplemented)
+    {
+    }
 }
 
 static async System.Threading.Tasks.Task AssertTraversalIsRejectedAsync(string address)

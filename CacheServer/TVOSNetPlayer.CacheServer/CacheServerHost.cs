@@ -37,7 +37,7 @@ public static class CacheServerHost
             mediaPlane = "HTTP"
         }));
 
-        app.MapGet("/media/{itemId}/{variantId}", async (
+        app.MapMethods("/media/{itemId}/{variantId}", ["GET", "HEAD"], async (
             string itemId,
             string variantId,
             LocalMediaLibrary library,
