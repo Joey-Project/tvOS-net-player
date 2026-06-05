@@ -119,6 +119,31 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testClearingServerAddressRemovesSavedAddress() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        XCTAssertEqual(defaults.string(forKey: CacheLibraryViewModel.serverAddressDefaultsKey), "server-a.local:50051")
+
+        model.serverAddressText = " "
+
+        XCTAssertNil(defaults.string(forKey: CacheLibraryViewModel.serverAddressDefaultsKey))
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Cache server not connected.")
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
     func testRefreshFailureClearsLoadedLibraryItems() async {
         let loadingClient = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),

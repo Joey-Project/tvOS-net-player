@@ -142,6 +142,11 @@ final class CacheLibraryViewModel: ObservableObject {
             return
         }
 
+        let trimmedAddress = serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedAddress.isEmpty {
+            defaults.removeObject(forKey: Self.serverAddressDefaultsKey)
+        }
+
         let currentEndpoint = CacheServerEndpoint.normalized(from: serverAddressText)
         guard currentEndpoint != loadedEndpoint else {
             return
@@ -149,7 +154,7 @@ final class CacheLibraryViewModel: ObservableObject {
 
         refreshSequence += 1
         clearLoadedLibrary(
-            statusMessage: serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            statusMessage: trimmedAddress.isEmpty
                 ? "Cache server not connected."
                 : "Refresh cache server to load videos.",
             errorMessage: nil
