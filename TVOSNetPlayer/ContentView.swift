@@ -170,7 +170,7 @@ struct ContentView: View {
             return
         }
 
-        model.load(streamURLText: url.absoluteString)
+        model.loadTransient(streamURLText: url.absoluteString)
     }
 }
 

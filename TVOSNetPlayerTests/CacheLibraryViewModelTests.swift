@@ -156,6 +156,36 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaybackURLRejectsUnsupportedVariantProtocol() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(
+            for: .fixture(
+                id: "item-with-unsupported-variant",
+                title: "Unsupported variant item",
+                variants: [.fixture(id: "dash", playbackProtocol: "dash")]
+            )
+        )
+
+        XCTAssertNil(url)
+        let requestedPlayback = await client.requestedPlayback
+        XCTAssertNil(requestedPlayback)
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Cannot play Unsupported variant item.")
+        XCTAssertEqual(model.errorMessage, "Cached item has no playable media variants.")
+    }
+
+    @MainActor
     func testInvalidServerAddressDoesNotCallClient() async {
         let client = FakeCacheControlClient(serverInfo: .fixture(), items: [], playbackSource: .fixture())
         let model = CacheLibraryViewModel(
@@ -338,7 +368,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let getServerInfoError: FakeCacheError?
 
     private(set) var getServerInfoCallCount = 0
-    private(set) var requestedPlayback: (itemID: String, variantID: String?)?
+    private(set) var requestedPlayback: (itemID: String, variantID: String)?
 
     init(
         serverInfo: CacheServerSummary,
@@ -373,7 +403,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         items
     }
 
-    func getPlaybackSource(itemID: String, variantID: String?) async throws -> CachePlaybackSource {
+    func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         requestedPlayback = (itemID, variantID)
         if let delay = getPlaybackSourceDelayNanosecondsByItemID[itemID], delay > 0 {
             try await Task.sleep(nanoseconds: delay)
@@ -412,11 +442,11 @@ extension CacheLibraryItem {
 }
 
 extension CacheMediaVariant {
-    fileprivate static func fixture(id: String = "original") -> Self {
+    fileprivate static func fixture(id: String = "original", playbackProtocol: String = "httpFile") -> Self {
         Self(
             id: id,
             label: "Original",
-            playbackProtocol: "httpFile",
+            playbackProtocol: playbackProtocol,
             container: "mp4",
             videoCodec: "",
             audioCodec: "",

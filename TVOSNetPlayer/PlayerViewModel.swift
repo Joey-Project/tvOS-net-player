@@ -42,22 +42,38 @@ final class PlayerViewModel: ObservableObject {
             return
         }
 
-        let nextPlayer = AVPlayer(url: url)
-        player = nextPlayer
-        loadedURL = url
-        validationMessage = nil
-        streamURLText = url.absoluteString
-        defaults.set(url.absoluteString, forKey: Self.lastStreamURLDefaultsKey)
-        statusMessage = "Playing \(url.absoluteString)"
-
-        if autoplay {
-            nextPlayer.play()
-        }
+        load(url: url, persist: true)
     }
 
     func load(streamURLText: String) {
         self.streamURLText = streamURLText
         load()
+    }
+
+    func loadTransient(streamURLText: String) {
+        guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
+            validationMessage = "Use an HTTP or HTTPS URL."
+            statusMessage = "Cannot load this stream."
+            return
+        }
+
+        load(url: url, persist: false)
+    }
+
+    private func load(url: URL, persist: Bool) {
+        let nextPlayer = AVPlayer(url: url)
+        player = nextPlayer
+        loadedURL = url
+        validationMessage = nil
+        if persist {
+            streamURLText = url.absoluteString
+            defaults.set(url.absoluteString, forKey: Self.lastStreamURLDefaultsKey)
+        }
+        statusMessage = "Playing \(url.absoluteString)"
+
+        if autoplay {
+            nextPlayer.play()
+        }
     }
 
     func stop() {

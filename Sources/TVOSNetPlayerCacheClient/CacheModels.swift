@@ -94,7 +94,7 @@ public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
     public var primaryVariantID: String? {
         for variant in variants {
             let id = variant.id.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !id.isEmpty {
+            if !id.isEmpty && variant.isPlayableByTVOSClient {
                 return id
             }
         }
@@ -153,6 +153,21 @@ public struct CacheMediaVariant: Identifiable, Equatable, Sendable {
         }
 
         return id
+    }
+
+    public var isPlayableByTVOSClient: Bool {
+        switch playbackProtocol.normalizedCacheProtocolName {
+        case "httpfile":
+            true
+        default:
+            false
+        }
+    }
+}
+
+extension String {
+    fileprivate var normalizedCacheProtocolName: String {
+        lowercased().filter(\.isLetter)
     }
 }
 

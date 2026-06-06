@@ -44,7 +44,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
-    public func getPlaybackSource(itemID: String, variantID: String? = nil) async throws -> CachePlaybackSource {
+    public func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: .dns(host: endpoint.host, port: endpoint.port),
@@ -54,9 +54,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
             var request = TvosNetPlayer_V1_GetPlaybackSourceRequest()
             request.itemID = itemID
-            if let variantID {
-                request.variantID = variantID
-            }
+            request.variantID = variantID
             let response = try await service.getPlaybackSource(request)
             return CachePlaybackSource(response)
         }
