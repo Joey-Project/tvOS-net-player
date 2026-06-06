@@ -1,6 +1,7 @@
 use std::{net::TcpListener, path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(target_os = "macos")]
 use reqwest::StatusCode;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -11,13 +12,16 @@ use tvos_net_player_cache_server::{
     generated::tvos_net_player::v1::{
         CancelTaskRequest, CheckHealthRequest, CreateBilibiliTaskRequest, GetLibraryItemRequest,
         GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, LibrarySource,
-        ListCacheRootsRequest, ListLibraryItemsRequest, PlaybackProtocol, RescanLibraryRequest,
-        ServerCapability, TaskState, WatchTasksRequest, cache_service_client::CacheServiceClient,
+        ListCacheRootsRequest, ListLibraryItemsRequest, RescanLibraryRequest, ServerCapability,
+        TaskState, WatchTasksRequest, cache_service_client::CacheServiceClient,
         library_service_client::LibraryServiceClient, server_service_client::ServerServiceClient,
         task_service_client::TaskServiceClient,
     },
     run_grpc_server, run_media_server,
 };
+
+#[cfg(target_os = "macos")]
+use tvos_net_player_cache_server::generated::tvos_net_player::v1::PlaybackProtocol;
 
 #[tokio::test]
 async fn serves_library_control_plane_and_http_range_media() {
@@ -35,8 +39,15 @@ async fn serves_library_control_plane_and_http_range_media() {
         info.capabilities
             .contains(&(ServerCapability::BilibiliTasks as i32))
     );
+    #[cfg(target_os = "macos")]
     assert!(
         info.capabilities
+            .contains(&(ServerCapability::HttpRange as i32))
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        !info
+            .capabilities
             .contains(&(ServerCapability::HttpRange as i32))
     );
 
@@ -61,50 +72,67 @@ async fn serves_library_control_plane_and_http_range_media() {
     assert_eq!("Sample Clip", item.title);
     assert_eq!("Movies/Sample Clip.mp4", item.subtitle);
     assert_eq!(LibrarySource::LocalCache as i32, item.source);
-    assert_eq!(1, item.variants.len());
-    assert_eq!(PlaybackProtocol::HttpFile as i32, item.variants[0].protocol);
 
-    let playback = library_client
-        .get_playback_source(GetPlaybackSourceRequest {
-            item_id: item.id.clone(),
-            variant_id: "original".to_owned(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(PlaybackProtocol::HttpFile as i32, playback.protocol);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(1, item.variants.len());
+        assert_eq!(PlaybackProtocol::HttpFile as i32, item.variants[0].protocol);
 
-    let http = reqwest::Client::new();
-    let range_response = http
-        .get(&playback.uri)
-        .header(reqwest::header::RANGE, "bytes=4-7")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(StatusCode::PARTIAL_CONTENT, range_response.status());
-    assert_eq!("bytes", range_response.headers()["accept-ranges"]);
-    assert_eq!("bytes 4-7/16", range_response.headers()["content-range"]);
-    assert_eq!("4567", range_response.text().await.unwrap());
+        let playback = library_client
+            .get_playback_source(GetPlaybackSourceRequest {
+                item_id: item.id.clone(),
+                variant_id: "original".to_owned(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(PlaybackProtocol::HttpFile as i32, playback.protocol);
 
-    let head_response = http.head(&playback.uri).send().await.unwrap();
-    assert_eq!(StatusCode::OK, head_response.status());
-    assert_eq!("16", head_response.headers()["content-length"]);
-    assert_eq!(0, head_response.bytes().await.unwrap().len());
+        let http = reqwest::Client::new();
+        let range_response = http
+            .get(&playback.uri)
+            .header(reqwest::header::RANGE, "bytes=4-7")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::PARTIAL_CONTENT, range_response.status());
+        assert_eq!("bytes", range_response.headers()["accept-ranges"]);
+        assert_eq!("bytes 4-7/16", range_response.headers()["content-range"]);
+        assert_eq!("4567", range_response.text().await.unwrap());
 
-    let wrong_port_response = http
-        .get(format!(
-            "{}/media/{}/original",
-            server.grpc_url,
-            urlencoding::encode(&item.id)
-        ))
-        .send()
-        .await;
-    assert!(
-        wrong_port_response
-            .map(|response| !response.status().is_success())
-            .unwrap_or(true),
-        "media must not be served from the gRPC listener"
-    );
+        let head_response = http.head(&playback.uri).send().await.unwrap();
+        assert_eq!(StatusCode::OK, head_response.status());
+        assert_eq!("16", head_response.headers()["content-length"]);
+        assert_eq!(0, head_response.bytes().await.unwrap().len());
+
+        let wrong_port_response = http
+            .get(format!(
+                "{}/media/{}/original",
+                server.grpc_url,
+                urlencoding::encode(&item.id)
+            ))
+            .send()
+            .await;
+        assert!(
+            wrong_port_response
+                .map(|response| !response.status().is_success())
+                .unwrap_or(true),
+            "media must not be served from the gRPC listener"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(item.variants.is_empty());
+        let error = library_client
+            .get_playback_source(GetPlaybackSourceRequest {
+                item_id: item.id.clone(),
+                variant_id: "original".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(Code::FailedPrecondition, error.code());
+    }
 }
 
 #[tokio::test]
@@ -121,6 +149,7 @@ async fn rejects_path_escape_and_symlink_media() {
     assert_eq!(Code::NotFound, traversal_error.code());
 
     let linked_id = item_id("Movies/Linked Outside.mp4");
+    #[cfg(target_os = "macos")]
     let linked_error = library_client
         .get_playback_source(GetPlaybackSourceRequest {
             item_id: linked_id,
@@ -128,9 +157,21 @@ async fn rejects_path_escape_and_symlink_media() {
         })
         .await
         .unwrap_err();
+    #[cfg(not(target_os = "macos"))]
+    let linked_error = library_client
+        .get_playback_source(GetPlaybackSourceRequest {
+            item_id: linked_id,
+            variant_id: "original".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    #[cfg(target_os = "macos")]
     assert_eq!(Code::NotFound, linked_error.code());
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(Code::FailedPrecondition, linked_error.code());
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn derives_playback_host_from_grpc_local_addr_for_wildcard_media_listener() {
     let server = TestServer::start_with_media_listen_host("0.0.0.0").await;
