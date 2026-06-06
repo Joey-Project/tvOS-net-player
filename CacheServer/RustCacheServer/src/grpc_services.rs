@@ -240,7 +240,12 @@ impl TaskService for TaskGrpcService {
             }
 
             loop {
-                match subscription.recv().await {
+                let result = tokio::select! {
+                    _ = sender.closed() => return,
+                    result = subscription.recv() => result,
+                };
+
+                match result {
                     Ok(task) => {
                         if sender
                             .send(Ok(TaskEvent { task: Some(task) }))
