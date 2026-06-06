@@ -72,9 +72,82 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let url = await model.playbackURL(for: item)
 
         XCTAssertEqual(url?.absoluteString, "http://mac-mini.local:8080/media/item-1/original")
+        XCTAssertEqual(model.statusMessage, "Prepared Cached video from Mac mini cache.")
         let requestedPlayback = await client.requestedPlayback
         XCTAssertEqual(requestedPlayback?.itemID, "item-1")
         XCTAssertEqual(requestedPlayback?.variantID, "original")
+    }
+
+    @MainActor
+    func testConfirmedPreparedPlaybackUpdatesPlayingStatus() async throws {
+        let item = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server A item",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(
+                itemID: "item-a",
+                uri: "http://mac-mini.local:8080/media/item-a/original"
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(for: item)
+        let playerModel = PlayerViewModel(defaults: defaults, autoplay: false)
+        let sequence = playerModel.manualInteractionSequence
+        let didStartPlayback = playerModel.loadTransient(
+            streamURLText: try XCTUnwrap(url).absoluteString,
+            ifManualInteractionSequenceMatches: sequence
+        )
+        model.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+
+        XCTAssertTrue(didStartPlayback)
+        XCTAssertEqual(model.statusMessage, "Playing Server A item from Server A.")
+    }
+
+    @MainActor
+    func testPreparedPlaybackRejectedAfterManualInteractionDoesNotShowPlayingStatus() async throws {
+        let item = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server A item",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(
+                itemID: "item-a",
+                uri: "http://mac-mini.local:8080/media/item-a/original"
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(for: item)
+        let playerModel = PlayerViewModel(defaults: defaults, autoplay: false)
+        let staleSequence = playerModel.manualInteractionSequence
+        playerModel.load(streamURLText: "example.com/manual.m3u8")
+        let didStartPlayback = playerModel.loadTransient(
+            streamURLText: try XCTUnwrap(url).absoluteString,
+            ifManualInteractionSequenceMatches: staleSequence
+        )
+        model.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+
+        XCTAssertFalse(didStartPlayback)
+        XCTAssertEqual(playerModel.loadedURL?.absoluteString, "http://example.com/manual.m3u8")
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) from Server A.")
     }
 
     @MainActor
@@ -125,7 +198,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertNil(staleURL)
         XCTAssertEqual(latestURL?.absoluteString, "http://mac-mini.local:8080/media/item-b/original")
         XCTAssertFalse(model.isLoading)
-        XCTAssertEqual(model.statusMessage, "Playing Second cached video from Server A.")
+        XCTAssertEqual(model.statusMessage, "Prepared Second cached video from Server A.")
     }
 
     @MainActor

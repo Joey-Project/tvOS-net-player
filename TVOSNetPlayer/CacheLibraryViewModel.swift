@@ -168,7 +168,7 @@ final class CacheLibraryViewModel: ObservableObject {
                 return nil
             }
 
-            statusMessage = "Playing \(item.displayTitle) from \(serverName)."
+            statusMessage = "Prepared \(item.displayTitle) from \(serverName)."
             isLoading = false
             return url
         } catch {
@@ -183,6 +183,20 @@ final class CacheLibraryViewModel: ObservableObject {
             statusMessage = "Could not prepare \(item.displayTitle)."
             isLoading = false
             return nil
+        }
+    }
+
+    func finishPreparedPlayback(for item: CacheLibraryItem, didStartPlayback: Bool) {
+        guard items.contains(where: { $0.id == item.id }) else {
+            return
+        }
+
+        isLoading = false
+        errorMessage = nil
+        if didStartPlayback {
+            statusMessage = "Playing \(item.displayTitle) from \(serverName)."
+        } else {
+            statusMessage = "Loaded \(items.count) cached item(s) from \(serverName)."
         }
     }
 

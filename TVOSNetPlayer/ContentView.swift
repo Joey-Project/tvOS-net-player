@@ -171,10 +171,11 @@ struct ContentView: View {
             return
         }
 
-        model.loadTransient(
+        let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
+        cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
     }
 }
 
