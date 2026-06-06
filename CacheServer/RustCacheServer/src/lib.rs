@@ -14,6 +14,7 @@ use generated::tvos_net_player::v1::{
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tonic::transport::Server;
 
 use crate::{
@@ -60,19 +61,26 @@ pub async fn run(
 pub async fn run_with_state(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let grpc_addr = state.options.grpc_listen_addr()?;
-    let media_addr = state.options.media_listen_addr()?;
+    let grpc_addrs = state.options.grpc_listen_addrs()?;
+    let media_addrs = state.options.media_listen_addrs()?;
     let grpc_state = state.clone();
     let media_state = state.clone();
 
-    let grpc_server = run_grpc_server(grpc_addr, grpc_state);
-    let media_server = run_media_server(media_addr, media_state);
+    let grpc_server = run_grpc_servers(grpc_addrs, grpc_state);
+    let media_server = run_media_servers(media_addrs, media_state);
 
     tokio::select! {
         result = grpc_server => result,
         result = media_server => result,
         _ = shutdown_signal() => Ok(()),
     }
+}
+
+pub async fn run_grpc_servers(
+    addrs: Vec<SocketAddr>,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_servers(addrs, state, run_grpc_server).await
 }
 
 pub async fn run_grpc_server(
@@ -93,6 +101,13 @@ pub async fn run_grpc_server(
     Ok(())
 }
 
+pub async fn run_media_servers(
+    addrs: Vec<SocketAddr>,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_servers(addrs, state, run_media_server).await
+}
+
 pub async fn run_media_server(
     addr: SocketAddr,
     state: AppState,
@@ -108,6 +123,33 @@ pub async fn run_media_server(
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn run_servers<F, Fut>(
+    addrs: Vec<SocketAddr>,
+    state: AppState,
+    run_one: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(SocketAddr, AppState) -> Fut + Copy + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+        + Send
+        + 'static,
+{
+    let mut servers = JoinSet::new();
+    for addr in addrs {
+        let state = state.clone();
+        servers.spawn(async move { run_one(addr, state).await });
+    }
+
+    match servers
+        .join_next()
+        .await
+        .expect("at least one listen address is required")
+    {
+        Ok(result) => result,
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 async fn root() -> axum::Json<serde_json::Value> {

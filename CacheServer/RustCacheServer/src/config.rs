@@ -1,6 +1,6 @@
 use std::{
     env,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
 };
 
@@ -68,11 +68,25 @@ impl CacheServerOptions {
     }
 
     pub fn grpc_listen_addr(&self) -> Result<SocketAddr, ConfigError> {
-        listen_addr(&self.grpc_listen_url)
+        listen_addrs(&self.grpc_listen_url)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ConfigError::new("listen URL produced no socket addresses"))
+    }
+
+    pub fn grpc_listen_addrs(&self) -> Result<Vec<SocketAddr>, ConfigError> {
+        listen_addrs(&self.grpc_listen_url)
     }
 
     pub fn media_listen_addr(&self) -> Result<SocketAddr, ConfigError> {
-        listen_addr(&self.media_listen_url)
+        listen_addrs(&self.media_listen_url)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ConfigError::new("listen URL produced no socket addresses"))
+    }
+
+    pub fn media_listen_addrs(&self) -> Result<Vec<SocketAddr>, ConfigError> {
+        listen_addrs(&self.media_listen_url)
     }
 
     fn apply(&mut self, key: &str, value: String) -> Result<(), ConfigError> {
@@ -109,24 +123,30 @@ pub fn normalize_listen_host(url: &Url) -> String {
         .to_owned()
 }
 
-fn listen_addr(listen_url: &str) -> Result<SocketAddr, ConfigError> {
+fn listen_addrs(listen_url: &str) -> Result<Vec<SocketAddr>, ConfigError> {
     let url = parse_http_url(listen_url)?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ConfigError::new(format!("missing port in listen URL: {listen_url}")))?;
     let host = normalize_listen_host(&url);
-    let ip = match host.as_str() {
-        "localhost" => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        "0.0.0.0" | "*" | "+" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        "::" => "::".parse().expect("IPv6 unspecified address must parse"),
-        _ => host.parse().map_err(|_| {
+    let ips = match host.as_str() {
+        "localhost" => vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ],
+        "0.0.0.0" | "*" | "+" => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
+        "::" => vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)],
+        _ => vec![host.parse().map_err(|_| {
             ConfigError::new(format!(
                 "listen host must be localhost or an IP address: {host}"
             ))
-        })?,
+        })?],
     };
 
-    Ok(SocketAddr::new(ip, port))
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
 }
 
 fn parse_http_url(value: &str) -> Result<Url, ConfigError> {
@@ -206,5 +226,18 @@ mod tests {
         };
 
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn localhost_listen_urls_bind_ipv4_and_ipv6_loopback() {
+        let options = CacheServerOptions::default();
+
+        assert_eq!(
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50051),
+            ],
+            options.grpc_listen_addrs().unwrap()
+        );
     }
 }
