@@ -379,8 +379,9 @@ impl TestServer {
 
     async fn start_with_media_listen_host(media_listen_host: &str) -> Self {
         let temp_root = tempfile::tempdir().unwrap();
+        let root_path = temp_root.path().canonicalize().unwrap();
         let outside_root = tempfile::tempdir().unwrap();
-        let movie_dir = temp_root.path().join("Movies");
+        let movie_dir = root_path.join("Movies");
         std::fs::create_dir_all(&movie_dir).unwrap();
         std::fs::write(movie_dir.join("Sample Clip.mp4"), b"0123456789abcdef").unwrap();
 
@@ -395,7 +396,7 @@ impl TestServer {
         let media_url = format!("http://127.0.0.1:{media_port}");
         let state = AppState::new(CacheServerOptions {
             server_name: "Test Cache".to_owned(),
-            root_path: temp_root.path().to_path_buf(),
+            root_path,
             grpc_listen_url: grpc_url.clone(),
             media_listen_url,
             ..CacheServerOptions::default()

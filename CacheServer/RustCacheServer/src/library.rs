@@ -225,8 +225,8 @@ impl LocalMediaLibrary {
 
     fn is_root_available_blocking(&self) -> bool {
         let root_path = self.root_path();
-        fs::symlink_metadata(&root_path)
-            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        fs::metadata(&root_path)
+            .map(|metadata| metadata.is_dir() && !path_has_link_component(&root_path))
             .unwrap_or(false)
     }
 
@@ -655,7 +655,9 @@ fn timestamp_from_system_time(value: SystemTime) -> Timestamp {
 fn path_contains_link(root_path: &Path, candidate_path: &Path) -> bool {
     let full_root_path = absolute_path(root_path);
     let full_candidate_path = absolute_path(candidate_path);
-    if is_link(&full_root_path) || !is_within_root(&full_root_path, &full_candidate_path) {
+    if path_has_link_component(&full_root_path)
+        || !is_within_root(&full_root_path, &full_candidate_path)
+    {
         return true;
     }
 
@@ -669,6 +671,23 @@ fn path_contains_link(root_path: &Path, candidate_path: &Path) -> bool {
             return true;
         };
         current_path = parent.to_path_buf();
+    }
+
+    false
+}
+
+fn path_has_link_component(path: &Path) -> bool {
+    let full_path = absolute_path(path);
+    let mut current_path = PathBuf::new();
+
+    for component in full_path.components() {
+        current_path.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        if is_link(&current_path) {
+            return true;
+        }
     }
 
     false
@@ -858,5 +877,29 @@ mod tests {
         );
 
         assert_eq!(io::ErrorKind::Interrupted, result.unwrap_err().kind());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_availability_rejects_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real-parent");
+        let real_root = real_parent.join("cache");
+        fs::create_dir_all(&real_root).unwrap();
+        let link_parent = temp.path().join("link-parent");
+        symlink(&real_parent, &link_parent).unwrap();
+
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: link_parent.join("cache"),
+            ..CacheServerOptions::default()
+        }));
+
+        assert!(!library.is_root_available_blocking());
+        assert!(path_contains_link(
+            &library.root_path(),
+            &library.root_path().join("Movie.mp4")
+        ));
     }
 }
