@@ -39,7 +39,29 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
-    public func listLibraryItems(pageSize: Int = 50) async throws -> [CacheLibraryItem] {
+    public func listLibraryItemsPage(
+        pageToken: String = "",
+        pageSize: Int = 50,
+        searchText: String? = nil
+    ) async throws -> CacheLibraryItemsPage {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
+            let request = Self.listLibraryItemsRequest(
+                pageToken: pageToken,
+                pageSize: pageSize,
+                searchText: searchText
+            )
+            let response = try await service.listLibraryItems(request, options: callOptions)
+            return CacheLibraryItemsPage(response)
+        }
+    }
+
+    public func listLibraryItems(pageSize: Int = 50, searchText: String? = nil) async throws -> [CacheLibraryItem] {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
@@ -52,15 +74,13 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 maxItems: maxLibraryItems,
                 allowPartialResults: allowPartialLibraryResults
             ) { pageToken in
-                var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
-                request.pageSize = Int32(clamping: max(1, min(pageSize, 200)))
-                request.pageToken = pageToken
-
-                let response = try await service.listLibraryItems(request, options: callOptions)
-                return CacheLibraryItemsPage(
-                    items: response.items.map(CacheLibraryItem.init),
-                    nextPageToken: response.nextPageToken
+                let request = Self.listLibraryItemsRequest(
+                    pageToken: pageToken,
+                    pageSize: pageSize,
+                    searchText: searchText
                 )
+                let response = try await service.listLibraryItems(request, options: callOptions)
+                return CacheLibraryItemsPage(response)
             }
         }
     }
@@ -86,6 +106,23 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options.timeout = rpcTimeout
         return options
     }
+
+    private static func listLibraryItemsRequest(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) -> TvosNetPlayer_V1_ListLibraryItemsRequest {
+        var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
+        request.pageSize = Int32(clamping: max(1, min(pageSize, 200)))
+        request.pageToken = pageToken
+
+        let trimmedSearchText = searchText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedSearchText.isEmpty {
+            request.filter.searchText = trimmedSearchText
+        }
+
+        return request
+    }
 }
 
 extension CacheServerEndpoint {
@@ -96,11 +133,6 @@ extension CacheServerEndpoint {
 
         return .dns(host: host, port: port)
     }
-}
-
-struct CacheLibraryItemsPage: Equatable, Sendable {
-    let items: [CacheLibraryItem]
-    let nextPageToken: String
 }
 
 enum CacheLibraryPaginationError: Error, Equatable {
@@ -171,6 +203,15 @@ extension CacheLibraryItem {
             sourceID: proto.sourceID,
             posterURI: proto.posterUri,
             variants: proto.variants.map(CacheMediaVariant.init)
+        )
+    }
+}
+
+extension CacheLibraryItemsPage {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ListLibraryItemsResponse) {
+        self.init(
+            items: proto.items.map(CacheLibraryItem.init),
+            nextPageToken: proto.nextPageToken
         )
     }
 }

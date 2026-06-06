@@ -576,9 +576,13 @@ private actor FakeCacheControlClient: CacheControlClient {
         return serverInfo
     }
 
-    func listLibraryItems(pageSize: Int) async throws -> [CacheLibraryItem] {
+    func listLibraryItemsPage(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) async throws -> CacheLibraryItemsPage {
         requestedLibraryPageSizes.append(pageSize)
-        return items
+        return CacheLibraryItemsPage(items: items, nextPageToken: "")
     }
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {

@@ -71,8 +71,8 @@ final class CacheLibraryViewModel: ObservableObject {
             let serverInfo = try await Self.withOperationTimeout(operationTimeout) {
                 try await client.getServerInfo()
             }
-            let libraryItems = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.listLibraryItems(pageSize: Self.libraryPreviewPageSize)
+            let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listLibraryItemsPage(pageSize: Self.libraryPreviewPageSize)
             }
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
@@ -81,10 +81,10 @@ final class CacheLibraryViewModel: ObservableObject {
 
             loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
-            items = libraryItems
+            items = libraryPage.items
             serverAddressText = endpoint.displayAddress
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
-            statusMessage = "Loaded \(libraryItems.count) cached item(s) from \(serverName)."
+            statusMessage = "Loaded \(libraryPage.items.count) cached item(s) from \(serverName)."
         } catch {
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
                 return

@@ -2,6 +2,20 @@ import XCTest
 @testable import TVOSNetPlayerCacheClient
 
 final class CacheLibraryPaginationTests: XCTestCase {
+    func testCacheControlClientPageContractExposesNextTokenAndSearch() async throws {
+        let client: any CacheControlClient = FakePagedCacheControlClient()
+
+        let page = try await client.listLibraryItemsPage(
+            pageToken: "page-1",
+            pageSize: 25,
+            searchText: "cached clip"
+        )
+
+        XCTAssertEqual(page.items.map(\.id), ["item-1"])
+        XCTAssertEqual(page.nextPageToken, "page-2")
+        XCTAssertTrue(page.hasMoreItems)
+    }
+
     func testCollectsItemsAcrossAllPages() async throws {
         var requestedPageTokens: [String] = []
         let pages = [
@@ -94,6 +108,40 @@ final class CacheLibraryPaginationTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+}
+
+private actor FakePagedCacheControlClient: CacheControlClient {
+    func getServerInfo() async throws -> CacheServerSummary {
+        CacheServerSummary(
+            id: "server-1",
+            name: "Test cache",
+            version: "0.1.0",
+            mediaBaseURIs: [],
+            capabilities: []
+        )
+    }
+
+    func listLibraryItemsPage(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) async throws -> CacheLibraryItemsPage {
+        XCTAssertEqual(pageToken, "page-1")
+        XCTAssertEqual(pageSize, 25)
+        XCTAssertEqual(searchText, "cached clip")
+        return CacheLibraryItemsPage(
+            items: [.fixture(id: "item-1")],
+            nextPageToken: "page-2"
+        )
+    }
+
+    func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+}
+
+private enum FakePagedCacheControlClientError: Error {
+    case notImplemented
 }
 
 extension CacheLibraryItem {

@@ -25,8 +25,8 @@ superseded_by:
 - Media bytes still flow through ordinary HTTP URLs returned by the cache server; gRPC remains control-plane only.
 - The client uses `GRPCNIOTransportHTTP2TransportServices` for Network.framework-backed plaintext h2c on the trusted LAN.
 - `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` with a manifest-only patch that adds direct `NIOHTTP1` and `NIOTLS` dependencies required by Xcode package product linking.
-- The tvOS refresh path loads a bounded first-page library preview of up to 200 items. Full pagination/search remains a follow-up UI task.
-- Xcode package resolution is locked with both root and Xcode workspace `Package.resolved` files; `xcodebuild` scripts use `-onlyUsePackageVersionsFromResolvedFile`.
+- The tvOS refresh path loads a bounded first-page library preview of up to 200 items. The cache client contract exposes page tokens and search text, so full pagination/search remains a follow-up UI task rather than a protocol break.
+- Xcode package resolution is locked with both root and Xcode workspace `Package.resolved` files; `xcodebuild` scripts use `-onlyUsePackageVersionsFromResolvedFile`, and Swift package tests run with automatic resolution disabled.
 
 ## Next Steps
 
