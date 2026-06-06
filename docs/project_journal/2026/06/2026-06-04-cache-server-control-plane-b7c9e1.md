@@ -3,7 +3,7 @@ id: 20260604-b7c9e1
 title: LAN Cache Server Control Plane
 status: active
 created: 2026-06-04
-updated: 2026-06-05
+updated: 2026-06-06
 branch: architecture-cache-control-plane
 pr:
 supersedes: []
@@ -23,6 +23,7 @@ superseded_by:
 - 架构文档在 `docs/architecture/cache-server.md`。
 - 控制面 proto 草案在 `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`。
 - 第一片 LAN cache server MVP 已实现：本地缓存目录扫描、gRPC library/server/cache services、面向 macOS/Mac mini 的 HTTP Range playback endpoint、integration test harness。
+- server runtime 已从 .NET/ASP.NET Core 迁移到 Rust/tonic/axum；迁移记录见 `docs/project_journal/2026/06/2026-06-06-rust-cache-server-runtime-f2a4c7.md`。
 - tvOS app 已提升到 tvOS 18.0 并接入 gRPC Swift 2 cache client slice；详情见 `docs/project_journal/2026/06/2026-06-05-tvos-cache-grpc-client-c4d8a2.md`。
 
 ## Next Steps

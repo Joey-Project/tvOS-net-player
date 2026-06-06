@@ -14,6 +14,7 @@
 ## 本地环境
 
 - Xcode 26 或更新版本。
+- Rust 1.95.0 toolchain with `rustfmt` and `clippy`; `rust-toolchain.toml` pins this for Cargo/rustup.
 - `just` task runner。
 - Apple TV 开启开发者模式，并在 Xcode / Devices and Simulators 中和这台 Mac 配对。
 - Xcode 里登录 Apple ID；物理设备安装时需要能生成 tvOS development provisioning profile。
@@ -32,7 +33,7 @@ just test
 just test-cache-server
 ```
 
-`just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict` 和 `dotnet format --verify-no-changes`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `dotnet format` 格式化 cache server C# 源码。
+`just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict`、`cargo fmt --check` 和 `cargo clippy -D warnings`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `cargo fmt` 格式化 Rust cache server 源码。
 
 `just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core/cache client tests，不需要本机安装 tvOS simulator runtime。
 
@@ -47,13 +48,13 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 cache server 默认只监听本机 loopback，适合本机开发：
 
 ```bash
-dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- --Cache:RootPath /path/to/cache
+cargo run --package tvos-net-player-cache-server -- --Cache:RootPath /path/to/cache
 ```
 
 如果要给同一局域网内的 Apple TV 访问，需要在可信 LAN 上显式绑定：
 
 ```bash
-dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- \
+cargo run --package tvos-net-player-cache-server -- \
   --Cache:RootPath /path/to/cache \
   --Cache:GrpcListenUrl http://0.0.0.0:50051 \
   --Cache:MediaListenUrl http://0.0.0.0:8080
@@ -131,7 +132,7 @@ scripts/test.sh
 scripts/test-cache-server.sh
 ```
 
-其中 pre-commit 检查包括 Swift formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 .NET LAN cache server，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-cache-server.sh` 启动真实 Kestrel server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
+其中 pre-commit 检查包括 Swift formatter/linter、Rust formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 Rust LAN cache server，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-cache-server.sh` 启动真实 Rust server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
 
 后续设置 required checks 时，建议至少 gate：
 

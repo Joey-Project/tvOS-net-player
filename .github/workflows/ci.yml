@@ -27,16 +27,17 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-
       - name: Install shellcheck
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             brew install shellcheck
           fi
+
+      - name: Show Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
 
       - name: Run pre-commit checks
         run: scripts/pre-commit.sh
