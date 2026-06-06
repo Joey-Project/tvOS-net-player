@@ -4,12 +4,16 @@ use std::{
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost_types::Timestamp;
+use tokio::sync::Semaphore;
 
 use crate::{
     config::CacheServerOptions,
@@ -21,15 +25,20 @@ use crate::{
 
 pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
+const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
 
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
     options: Arc<CacheServerOptions>,
+    blocking_jobs: Arc<Semaphore>,
 }
 
 impl LocalMediaLibrary {
     pub fn new(options: Arc<CacheServerOptions>) -> Self {
-        Self { options }
+        Self {
+            options,
+            blocking_jobs: Arc::new(Semaphore::new(MAX_BLOCKING_LIBRARY_JOBS)),
+        }
     }
 
     pub fn root_path(&self) -> PathBuf {
@@ -46,16 +55,93 @@ impl LocalMediaLibrary {
         page_offset: i64,
         page_size: usize,
     ) -> LibraryItemPage {
+        let filter = filter.cloned();
+        self.run_blocking(move |library, cancellation| {
+            library.list_items_page_blocking(filter.as_ref(), page_offset, page_size, cancellation)
+        })
+        .await
+    }
+
+    pub async fn get_item(&self, id: &str) -> Option<LibraryItem> {
+        let id = id.to_owned();
+        self.run_blocking(move |library, _| library.get_item_blocking(&id))
+            .await
+    }
+
+    pub async fn get_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
+        let item_id = item_id.to_owned();
+        let variant_id = variant_id.to_owned();
+        self.run_blocking(move |library, _| library.get_media_file_blocking(&item_id, &variant_id))
+            .await
+    }
+
+    pub async fn open_media_file(
+        &self,
+        item_id: &str,
+        variant_id: &str,
+    ) -> Option<OpenedMediaFile> {
+        let item_id = item_id.to_owned();
+        let variant_id = variant_id.to_owned();
+        self.run_blocking(move |library, _| library.open_media_file_blocking(&item_id, &variant_id))
+            .await
+    }
+
+    pub async fn cache_root(&self) -> CacheRoot {
+        self.run_blocking(|library, _| library.cache_root_blocking())
+            .await
+    }
+
+    pub async fn is_root_available(&self) -> bool {
+        self.run_blocking(|library, _| library.is_root_available_blocking())
+            .await
+    }
+
+    pub async fn count_items(&self) -> i32 {
+        self.run_blocking(|library, cancellation| library.count_items_blocking(cancellation))
+            .await
+    }
+
+    async fn run_blocking<T, F>(&self, job: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Self, BlockingCancellation) -> T + Send + 'static,
+    {
+        let permit = Arc::clone(&self.blocking_jobs)
+            .acquire_owned()
+            .await
+            .expect("library blocking semaphore must stay open");
+        let library = self.clone();
+        let cancellation = BlockingCancellation::default();
+        let cancellation_guard = cancellation.guard();
+        let worker_cancellation = cancellation.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            job(library, worker_cancellation)
+        })
+        .await
+        .expect("library blocking task panicked");
+        drop(cancellation_guard);
+        result
+    }
+
+    fn list_items_page_blocking(
+        &self,
+        filter: Option<&LibraryFilter>,
+        page_offset: i64,
+        page_size: usize,
+        cancellation: BlockingCancellation,
+    ) -> LibraryItemPage {
         if page_offset < 0
             || page_size == 0
             || page_offset > i32::MAX.into()
-            || !self.is_root_available()
+            || !self.is_root_available_blocking()
         {
             return LibraryItemPage::empty();
         }
 
         let root_path = self.root_path();
-        let candidates = match self.enumerate_media_candidates(&root_path, filter) {
+        let candidates = match self.enumerate_media_candidates(&root_path, filter, &cancellation) {
             Ok(candidates) => candidates,
             Err(_) => return LibraryItemPage::empty(),
         };
@@ -64,6 +150,9 @@ impl LocalMediaLibrary {
         let mut items = Vec::with_capacity(page_size);
         let mut next_page_offset = None;
         for candidate in candidates {
+            if cancellation.is_cancelled() {
+                return LibraryItemPage::empty();
+            }
             let Some(item) = self.try_create_library_item(&root_path, &candidate.path) else {
                 continue;
             };
@@ -88,20 +177,16 @@ impl LocalMediaLibrary {
         }
     }
 
-    pub async fn get_item(&self, id: &str) -> Option<LibraryItem> {
+    fn get_item_blocking(&self, id: &str) -> Option<LibraryItem> {
         let media_file = self.resolve_media_file(id, VARIANT_ID)?;
         Some(self.create_library_item(&media_file))
     }
 
-    pub async fn get_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
+    fn get_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
         self.resolve_media_file(item_id, variant_id)
     }
 
-    pub async fn open_media_file(
-        &self,
-        item_id: &str,
-        variant_id: &str,
-    ) -> Option<OpenedMediaFile> {
+    fn open_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<OpenedMediaFile> {
         let media_file = self.resolve_media_file(item_id, variant_id)?;
         let file = open_read_no_follow(&self.root_path(), &media_file.relative_path).ok()?;
         let metadata = file.metadata().ok()?;
@@ -117,9 +202,9 @@ impl LocalMediaLibrary {
         })
     }
 
-    pub async fn cache_root(&self) -> CacheRoot {
+    fn cache_root_blocking(&self) -> CacheRoot {
         let root_path = self.root_path();
-        let writable = self.is_root_available() && can_write_to_directory(&root_path);
+        let writable = self.is_root_available_blocking() && can_write_to_directory(&root_path);
         let mut root = CacheRoot {
             id: ROOT_ID.to_owned(),
             label: "Local Cache".to_owned(),
@@ -138,20 +223,21 @@ impl LocalMediaLibrary {
         root
     }
 
-    pub fn is_root_available(&self) -> bool {
+    fn is_root_available_blocking(&self) -> bool {
         let root_path = self.root_path();
         fs::symlink_metadata(&root_path)
             .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
             .unwrap_or(false)
     }
 
-    pub async fn count_items(&self) -> i32 {
-        if !self.is_root_available() {
+    fn count_items_blocking(&self, cancellation: BlockingCancellation) -> i32 {
+        if !self.is_root_available_blocking() {
             return 0;
         }
 
         let root_path = self.root_path();
-        let Ok(candidates) = self.enumerate_media_candidates(&root_path, None) else {
+        let Ok(candidates) = self.enumerate_media_candidates(&root_path, None, &cancellation)
+        else {
             return 0;
         };
 
@@ -279,6 +365,7 @@ impl LocalMediaLibrary {
         &self,
         root_path: &Path,
         filter: Option<&LibraryFilter>,
+        cancellation: &BlockingCancellation,
     ) -> io::Result<Vec<MediaCandidate>> {
         if let Some(filter) = filter {
             let requested_sources = filter.sources.to_vec();
@@ -299,6 +386,7 @@ impl LocalMediaLibrary {
             root_path,
             &allowed_extensions,
             &search_text,
+            cancellation,
             &mut candidates,
         )?;
         candidates.sort();
@@ -319,6 +407,33 @@ impl LocalMediaLibrary {
                 }
             })
             .collect()
+    }
+}
+
+#[derive(Clone, Default)]
+struct BlockingCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl BlockingCancellation {
+    fn guard(&self) -> BlockingCancellationGuard {
+        BlockingCancellationGuard {
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::Relaxed)
+    }
+}
+
+struct BlockingCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for BlockingCancellationGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, AtomicOrdering::Relaxed);
     }
 }
 
@@ -385,8 +500,16 @@ fn collect_media_candidates(
     directory: &Path,
     allowed_extensions: &[String],
     search_text: &Option<String>,
+    cancellation: &BlockingCancellation,
     candidates: &mut Vec<MediaCandidate>,
 ) -> io::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "library scan cancelled",
+        ));
+    }
+
     for entry in match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error)
@@ -399,6 +522,13 @@ fn collect_media_candidates(
         }
         Err(error) => return Err(error),
     } {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "library scan cancelled",
+            ));
+        }
+
         let Ok(entry) = entry else {
             continue;
         };
@@ -417,6 +547,7 @@ fn collect_media_candidates(
                 &path,
                 allowed_extensions,
                 search_text,
+                cancellation,
                 candidates,
             )?;
             continue;
@@ -708,5 +839,24 @@ mod tests {
         assert!(decode_item_id(&create_item_id("../escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("/escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("./escape.mp4")).is_none());
+    }
+
+    #[test]
+    fn cancelled_scan_returns_interrupted() {
+        let cancellation = BlockingCancellation::default();
+        let guard = cancellation.guard();
+        drop(guard);
+
+        let mut candidates = Vec::new();
+        let result = collect_media_candidates(
+            Path::new("."),
+            Path::new("."),
+            &[".mp4".to_owned()],
+            &None,
+            &cancellation,
+            &mut candidates,
+        );
+
+        assert_eq!(io::ErrorKind::Interrupted, result.unwrap_err().kind());
     }
 }

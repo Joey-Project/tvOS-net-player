@@ -66,7 +66,7 @@ impl ServerService for ServerGrpcService {
         &self,
         _request: Request<CheckHealthRequest>,
     ) -> Result<Response<HealthStatus>, Status> {
-        let root_available = self.state.library.is_root_available();
+        let root_available = self.state.library.is_root_available().await;
         Ok(Response::new(HealthStatus {
             state: if root_available {
                 HealthState::Serving.into()
