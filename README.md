@@ -1,11 +1,12 @@
 # TVOS Net Player
 
-这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本先提供最小可运行骨架：
+这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本提供手动播放和 LAN cache control-plane 第一片：
 
 - SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
 - 手动 URL v0 工作流：保存上次播放地址，支持停止、清空和输入校验。
+- LAN cache client v0：输入 Mac mini cache server 地址，刷新 gRPC library 首屏预览，选择可播放 variant，并把 HTTP/HLS playback source 交给 `AVPlayer`。
 - LAN cache server MVP：用 gRPC 提供控制面，用 HTTP Range endpoint 提供 `AVPlayer` 可播放媒体 URL。
-- Swift package core tests：覆盖 URL 规范化逻辑，不依赖本机 tvOS simulator runtime。
+- Swift package tests：覆盖 core URL 规范化和 cache client model/pagination 行为，不依赖本机 tvOS simulator runtime。
 - GitHub Actions CI：pre-commit checks、tvOS simulator build、LAN cache server build、tvOS XCTest target、core tests、cache server integration tests。
 - LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
 - Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
@@ -33,7 +34,7 @@ just test-cache-server
 
 `just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict` 和 `dotnet format --verify-no-changes`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `dotnet format` 格式化 cache server C# 源码。
 
-`just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core tests，不需要本机安装 tvOS simulator runtime。
+`just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core/cache client tests，不需要本机安装 tvOS simulator runtime。
 
 如果要跑 Xcode/tvOS simulator XCTest target：
 
@@ -59,6 +60,8 @@ dotnet run --project CacheServer/TVOSNetPlayer.CacheServer -- \
 ```
 
 当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS、Bonjour discovery、BBDown task adapter 和其他服务端平台的安全媒体打开都是后续工作。
+
+tvOS app 目前只在刷新时请求首屏 library preview（最多 200 条），避免在服务端每页重新扫描本地 cache root 的第一片实现上触发多次全量目录枚举。cache client contract 已暴露 page token 和 search text；完整分页浏览和搜索会随后续 library UI 一起补齐。
 
 ## Pre-commit Hook
 

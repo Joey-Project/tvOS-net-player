@@ -9,6 +9,8 @@ DESTINATION="${TVOS_SIMULATOR_DESTINATION:-generic/platform=tvOS Simulator}"
 DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-${ROOT_DIR}/build/DerivedData}"
 
 xcodebuild \
+  -onlyUsePackageVersionsFromResolvedFile \
+  -skipPackagePluginValidation \
   -project "${PROJECT_PATH}" \
   -scheme "${SCHEME}" \
   -configuration "${CONFIGURATION}" \

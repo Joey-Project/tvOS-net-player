@@ -75,6 +75,79 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testLoadWithStreamURLTextStoresNormalizedURL() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        model.load(streamURLText: "example.com/movie.m3u8")
+
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://example.com/movie.m3u8")
+        XCTAssertEqual(model.streamURLText, "http://example.com/movie.m3u8")
+    }
+
+    @MainActor
+    func testTransientLoadDoesNotPersistOrReplaceManualURLText() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.streamURLText = "example.com/manual.m3u8"
+
+        let didLoad = model.loadTransient(streamURLText: "mac-mini.local:8080/media/item-a/original")
+
+        XCTAssertTrue(didLoad)
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/media/item-a/original")
+        XCTAssertEqual(model.streamURLText, "example.com/manual.m3u8")
+        XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
+        XCTAssertNil(model.validationMessage)
+    }
+
+    @MainActor
+    func testTransientLoadWithMatchingManualSequenceStartsPlayback() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        let sequence = model.manualInteractionSequence
+
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/media/item-a/original",
+            ifManualInteractionSequenceMatches: sequence
+        )
+
+        XCTAssertTrue(didLoad)
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/media/item-a/original")
+        XCTAssertNil(model.validationMessage)
+    }
+
+    @MainActor
+    func testTransientLoadWithStaleManualSequenceDoesNotReplaceManualPlayback() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        let staleSequence = model.manualInteractionSequence
+
+        model.load(streamURLText: "example.com/manual.m3u8")
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/media/item-a/original",
+            ifManualInteractionSequenceMatches: staleSequence
+        )
+
+        XCTAssertFalse(didLoad)
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://example.com/manual.m3u8")
+        XCTAssertEqual(model.streamURLText, "http://example.com/manual.m3u8")
+    }
+
+    @MainActor
+    func testTransientLoadWithStaleManualSequenceDoesNotRestartAfterClear() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.load(streamURLText: "example.com/manual.m3u8")
+        let staleSequence = model.manualInteractionSequence
+
+        model.clear()
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/media/item-a/original",
+            ifManualInteractionSequenceMatches: staleSequence
+        )
+
+        XCTAssertFalse(didLoad)
+        XCTAssertNil(model.loadedURL)
+        XCTAssertNil(model.player)
+        XCTAssertEqual(model.statusMessage, "Ready for an HTTP or HTTPS stream on your network.")
+    }
+
+    @MainActor
     func testInvalidURLKeepsCurrentPlayer() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         model.streamURLText = "https://example.com/movie.m3u8"

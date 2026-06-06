@@ -1,0 +1,15 @@
+{
+  "generate": {
+    "servers": false,
+    "clients": true,
+    "messages": true
+  },
+  "generatedSource": {
+    "accessLevel": "internal"
+  },
+  "protoc": {
+    "importPaths": [
+      "."
+    ]
+  }
+}

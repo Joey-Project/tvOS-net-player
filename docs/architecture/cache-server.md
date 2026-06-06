@@ -54,7 +54,7 @@ Important limitations to hide behind our server boundary:
 
 ## Protocol Shape
 
-The control plane starts from `proto/tvos_net_player/v1/cache_control.proto`.
+The control plane starts from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 
 Initial services:
 
@@ -67,14 +67,16 @@ Playback sources intentionally return URLs instead of media bytes.
 
 ## Deployment Notes
 
-- gRPC Swift 2 is the preferred tvOS client library if the app can move to tvOS 18.0 or newer.
-- The current app deployment target is tvOS 17.0, so adopting gRPC Swift 2 likely requires raising the deployment target.
+- gRPC Swift 2 is the tvOS client library for the control plane.
+- The app deployment target is tvOS 18.0 because generated gRPC Swift 2 client code is available on tvOS 18.0 or newer.
+- The tvOS client uses the Network.framework-backed `GRPCNIOTransportHTTP2TransportServices` transport with plaintext h2c to the trusted LAN cache server.
+- `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` at the 2.7.0 source level with a manifest-only Xcode linkage patch for `GRPCNIOTransportCore` direct dependencies. Remove the vendor and return to the upstream package URL once upstream declares the same direct dependencies and Xcode package product linking succeeds without the local patch.
 - The server can be implemented in .NET because BBDown is already .NET and the Mac mini can run the downloader, ffmpeg, and filesystem watchers locally.
 
 ## First Implementation Slice
 
 1. Implement a minimal LAN cache server with a local cache directory, gRPC control plane, and HTTP Range media endpoint. Done in the first implementation slice.
-2. Add a tvOS gRPC client and simple library screen.
+2. Add a tvOS gRPC client and simple library screen. Done in the tvOS client slice.
 3. Add Bilibili task creation through a BBDown adapter.
 4. Add Bonjour discovery once the manual server URL path works.
 5. Add HLS/progressive caching for weaker network conditions.
@@ -85,7 +87,8 @@ The first server slice intentionally implements only local cache browsing and HT
 
 Runtime shape:
 
-- gRPC services are hosted by ASP.NET Core and generated from `proto/tvos_net_player/v1/cache_control.proto`.
+- The canonical proto lives under `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto` so the Swift package plugin and .NET server share one schema source.
+- gRPC services are hosted by ASP.NET Core and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
 - LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. The first slice does not implement authentication.
 - `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that Kestrel does not actually serve.
@@ -94,6 +97,7 @@ Runtime shape:
 - The media route is also constrained to the configured media listener port, so the gRPC listener does not serve media bytes even though both listeners share one ASP.NET Core app in this slice.
 - Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports HTTP Range playback on macOS, matching the Mac mini deployment target. Linux and other platforms can list basic local item identities, but they do not advertise HTTP Range playback, return playable variants, expose file size/mtime metadata, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented and covered per architecture.
 - `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
+- The tvOS client currently loads a bounded first-page library preview, capped at the server page-size limit of 200 items. The cache client API exposes page tokens and search text, so full library pagination/search should be added in the next library UI iteration instead of making refresh collect every page.
 
 Configuration:
 
