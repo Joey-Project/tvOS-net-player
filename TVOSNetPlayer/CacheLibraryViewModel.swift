@@ -147,17 +147,32 @@ final class CacheLibraryViewModel: ObservableObject {
             defaults.removeObject(forKey: Self.serverAddressDefaultsKey)
         }
 
+        let previousEndpoint = CacheServerEndpoint.normalized(from: previousValue)
         let currentEndpoint = CacheServerEndpoint.normalized(from: serverAddressText)
-        guard currentEndpoint != loadedEndpoint else {
+        let endpointChanged = currentEndpoint != previousEndpoint
+        let loadedEndpointChanged = loadedEndpoint != nil && currentEndpoint != loadedEndpoint
+        let unusableAddress = currentEndpoint == nil
+        guard endpointChanged || loadedEndpointChanged || unusableAddress else {
             return
         }
 
         refreshSequence += 1
+        let nextStatusMessage: String
+        let nextErrorMessage: String?
+        if trimmedAddress.isEmpty {
+            nextStatusMessage = "Cache server not connected."
+            nextErrorMessage = nil
+        } else if currentEndpoint == nil {
+            nextStatusMessage = "Cache server address is invalid."
+            nextErrorMessage = "Use a host and optional port, such as mac-mini.local:50051."
+        } else {
+            nextStatusMessage = "Refresh cache server to load videos."
+            nextErrorMessage = nil
+        }
+
         clearLoadedLibrary(
-            statusMessage: trimmedAddress.isEmpty
-                ? "Cache server not connected."
-                : "Refresh cache server to load videos.",
-            errorMessage: nil
+            statusMessage: nextStatusMessage,
+            errorMessage: nextErrorMessage
         )
     }
 

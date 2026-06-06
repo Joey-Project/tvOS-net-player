@@ -144,6 +144,43 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testInvalidAddressDuringInitialRefreshClearsLoadingState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            getServerInfoDelayNanoseconds: 100_000_000
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let initialRefresh = Task {
+            await model.refresh()
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertTrue(model.isLoading)
+
+        model.serverAddressText = "https://server-a.local:50051"
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Cache server address is invalid.")
+        XCTAssertNotNil(model.errorMessage)
+
+        await initialRefresh.value
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Cache server address is invalid.")
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    @MainActor
     func testRefreshFailureClearsLoadedLibraryItems() async {
         let loadingClient = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
