@@ -267,14 +267,14 @@ private final class CacheLibraryOperationTimeoutRace<Value: Sendable>: @unchecke
         timeout: Duration,
         operation: @Sendable @escaping () async throws -> Value
     ) {
-        operationTask = Task.detached {
+        let operationTask = Task.detached {
             do {
                 self.complete(.success(try await operation()))
             } catch {
                 self.complete(.failure(error))
             }
         }
-        timeoutTask = Task.detached {
+        let timeoutTask = Task.detached {
             do {
                 try await Task.sleep(for: timeout)
                 self.complete(.failure(CacheLibraryOperationError.timedOut))
@@ -282,6 +282,18 @@ private final class CacheLibraryOperationTimeoutRace<Value: Sendable>: @unchecke
                 // The timeout task is expected to be cancelled when the operation wins.
             }
         }
+
+        lock.lock()
+        if continuation == nil {
+            lock.unlock()
+            operationTask.cancel()
+            timeoutTask.cancel()
+            return
+        }
+
+        self.operationTask = operationTask
+        self.timeoutTask = timeoutTask
+        lock.unlock()
     }
 
     private func complete(_ result: Result<Value, Error>) {
