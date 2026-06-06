@@ -3,8 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cargo build \
+cargo fmt \
   --manifest-path "${ROOT_DIR}/Cargo.toml" \
-  --package tvos-net-player-cache-server \
-  --release \
-  --locked
+  --all
+

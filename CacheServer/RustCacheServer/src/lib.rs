@@ -1,0 +1,317 @@
+pub mod config;
+pub mod generated;
+pub mod grpc_services;
+pub mod library;
+pub mod media;
+pub mod playback;
+pub mod task_registry;
+
+use std::{io, net::SocketAddr, sync::Arc};
+
+use axum::{Router, routing::get};
+use generated::tvos_net_player::v1::{
+    cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
+    server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
+};
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
+
+use crate::{
+    config::CacheServerOptions,
+    grpc_services::{CacheGrpcService, LibraryGrpcService, ServerGrpcService, TaskGrpcService},
+    library::LocalMediaLibrary,
+    media::{MediaState, media_get, media_head},
+    playback::PlaybackUriFactory,
+    task_registry::BilibiliTaskRegistry,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub options: Arc<CacheServerOptions>,
+    pub library: Arc<LocalMediaLibrary>,
+    pub playback_uri_factory: Arc<PlaybackUriFactory>,
+    pub tasks: Arc<BilibiliTaskRegistry>,
+}
+
+impl AppState {
+    pub fn new(options: CacheServerOptions) -> Self {
+        options.validate().expect("invalid cache server options");
+        let options = Arc::new(options);
+        let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
+        let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
+        let tasks = Arc::new(BilibiliTaskRegistry::default());
+
+        Self {
+            options,
+            library,
+            playback_uri_factory,
+            tasks,
+        }
+    }
+}
+
+pub async fn run(
+    options: CacheServerOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = AppState::new(options);
+    run_with_state(state).await
+}
+
+pub async fn run_with_state(
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let grpc_addrs = state.options.grpc_listen_addrs()?;
+    let media_addrs = state.options.media_listen_addrs()?;
+    let grpc_state = state.clone();
+    let media_state = state.clone();
+
+    let grpc_server = run_grpc_servers(grpc_addrs, grpc_state);
+    let media_server = run_media_servers(media_addrs, media_state);
+
+    tokio::select! {
+        result = grpc_server => result,
+        result = media_server => result,
+        _ = shutdown_signal() => Ok(()),
+    }
+}
+
+pub async fn run_grpc_servers(
+    addrs: Vec<SocketAddr>,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listeners = bind_listener_group(addrs).await?;
+    run_servers(listeners, state, run_grpc_listener).await
+}
+
+pub async fn run_grpc_server(
+    addr: SocketAddr,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_tcp_listener(addr).await?;
+    run_grpc_listener(listener, state).await
+}
+
+async fn run_grpc_listener(
+    listener: TcpListener,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Server::builder()
+        .add_service(ServerServiceServer::new(ServerGrpcService::new(
+            state.clone(),
+        )))
+        .add_service(LibraryServiceServer::new(LibraryGrpcService::new(
+            state.clone(),
+        )))
+        .add_service(TaskServiceServer::new(TaskGrpcService::new(state.clone())))
+        .add_service(CacheServiceServer::new(CacheGrpcService::new(state)))
+        .serve_with_incoming(TcpListenerStream::new(listener))
+        .await?;
+    Ok(())
+}
+
+pub async fn run_media_servers(
+    addrs: Vec<SocketAddr>,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listeners = bind_listener_group(addrs).await?;
+    run_servers(listeners, state, run_media_listener).await
+}
+
+pub async fn run_media_server(
+    addr: SocketAddr,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_tcp_listener(addr).await?;
+    run_media_listener(listener, state).await
+}
+
+async fn run_media_listener(
+    listener: TcpListener,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let router = Router::new()
+        .route("/", get(root))
+        .route(
+            "/media/{item_id}/{variant_id}",
+            get(media_get).head(media_head),
+        )
+        .with_state(MediaState::new(state));
+
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+async fn run_servers<F, Fut>(
+    listeners: Vec<TcpListener>,
+    state: AppState,
+    run_one: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(TcpListener, AppState) -> Fut + Copy + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+        + Send
+        + 'static,
+{
+    let mut servers = JoinSet::new();
+    for listener in listeners {
+        let state = state.clone();
+        servers.spawn(async move { run_one(listener, state).await });
+    }
+
+    match servers
+        .join_next()
+        .await
+        .expect("at least one listen address is required")
+    {
+        Ok(result) => result,
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+async fn root() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "service": "TVOSNetPlayer.CacheServer",
+        "controlPlane": "gRPC",
+        "mediaPlane": "HTTP"
+    }))
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn bind_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    const TCP_BACKLOG: i32 = 1024;
+
+    let socket = match addr {
+        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
+        SocketAddr::V6(_) => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_only_v6(true)?;
+            socket
+        }
+    };
+
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket
+        .listen(TCP_BACKLOG)
+        .and_then(|()| TcpListener::from_std(socket.into()))
+}
+
+async fn bind_listener_group(addrs: Vec<SocketAddr>) -> io::Result<Vec<TcpListener>> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one listen address is required",
+        ));
+    }
+
+    let allow_optional_family_skip = addrs.len() > 1;
+    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut first_optional_error = None;
+
+    for addr in addrs {
+        match bind_tcp_listener(addr).await {
+            Ok(listener) => listeners.push(listener),
+            Err(error)
+                if allow_optional_family_skip && is_optional_address_family_unavailable(&error) =>
+            {
+                if first_optional_error.is_none() {
+                    first_optional_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if listeners.is_empty() {
+        return Err(first_optional_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no listen address is usable",
+            )
+        }));
+    }
+
+    Ok(listeners)
+}
+
+fn is_optional_address_family_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
+        let port = match free_port() {
+            Ok(port) => port,
+            Err(error) if is_listener_unavailable(&error) => return,
+            Err(error) => panic!("free port probe should bind: {error}"),
+        };
+        let ipv4_listener =
+            bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+                .await
+                .expect("IPv4 wildcard listener should bind");
+
+        match bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
+            Ok(ipv6_listener) => {
+                assert_eq!(port, ipv6_listener.local_addr().unwrap().port());
+                drop(ipv6_listener);
+            }
+            Err(error) if is_listener_unavailable(&error) => {}
+            Err(error) => panic!("IPv6 wildcard listener should bind with v6-only mode: {error}"),
+        }
+
+        drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn listener_group_keeps_available_family_when_other_family_is_unavailable() {
+        let port = match free_port() {
+            Ok(port) => port,
+            Err(error) if is_listener_unavailable(&error) => return,
+            Err(error) => panic!("free port probe should bind: {error}"),
+        };
+        let listeners = bind_listener_group(vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new("2001:db8::1".parse().unwrap(), port),
+        ])
+        .await
+        .expect("listener group should keep the available address family");
+
+        assert_eq!(1, listeners.len());
+        assert_eq!(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            listeners[0].local_addr().unwrap()
+        );
+    }
+
+    fn free_port() -> io::Result<u16> {
+        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    }
+
+    fn is_listener_unavailable(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::Unsupported
+        )
+    }
+}

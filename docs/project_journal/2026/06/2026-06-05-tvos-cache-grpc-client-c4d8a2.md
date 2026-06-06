@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 
 - Added the first tvOS cache client slice: manual LAN cache server address, gRPC server/library calls, cached item list, playback source lookup, and handoff to the existing `AVPlayer` URL loader.
-- Moved the shared cache control proto under `Sources/TVOSNetPlayerCacheClient/Protos/` so Swift package generation and the .NET cache server share one schema source.
+- Moved the shared cache control proto under `Sources/TVOSNetPlayerCacheClient/Protos/` so Swift package generation and the cache server share one schema source.
 - Raised the app deployment target to tvOS 18.0 to support gRPC Swift 2 generated client code.
 
 ## Current State

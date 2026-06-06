@@ -71,7 +71,7 @@ Playback sources intentionally return URLs instead of media bytes.
 - The app deployment target is tvOS 18.0 because generated gRPC Swift 2 client code is available on tvOS 18.0 or newer.
 - The tvOS client uses the Network.framework-backed `GRPCNIOTransportHTTP2TransportServices` transport with plaintext h2c to the trusted LAN cache server.
 - `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` at the 2.7.0 source level with a manifest-only Xcode linkage patch for `GRPCNIOTransportCore` direct dependencies. Remove the vendor and return to the upstream package URL once upstream declares the same direct dependencies and Xcode package product linking succeeds without the local patch.
-- The server can be implemented in .NET because BBDown is already .NET and the Mac mini can run the downloader, ffmpeg, and filesystem watchers locally.
+- The server runtime is Rust. `tonic` hosts the gRPC h2c control plane, and `axum` hosts the HTTP media listener. BBDown remains behind an adapter boundary and is not part of the server runtime contract.
 
 ## First Implementation Slice
 
@@ -84,19 +84,20 @@ Playback sources intentionally return URLs instead of media bytes.
 
 ## First Slice Notes
 
-The first server slice intentionally implements only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili tasks, task cancellation, cache deletion, Bonjour discovery, and HLS playlist/segment management remain follow-up work.
+The first server slice intentionally implements only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation exists as an in-memory pre-adapter queue. Cache deletion, Bonjour discovery, real BBDown download execution, and HLS playlist/segment management remain follow-up work.
 
 Runtime shape:
 
-- The canonical proto lives under `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto` so the Swift package plugin and .NET server share one schema source.
-- gRPC services are hosted by ASP.NET Core and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
+- The canonical proto lives under `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto` so the Swift package plugin and Rust server build share one schema source.
+- gRPC services are hosted by `tonic` and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
-- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. The first slice does not implement authentication.
-- `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that Kestrel does not actually serve.
+- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) try to open both IPv4 and IPv6 listeners, and continue when one address family is unavailable but the other is bound; use a concrete LAN IP to restrict address family or interface. The first slice does not implement authentication.
+- `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that the server does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
-- The media route is also constrained to the configured media listener port, so the gRPC listener does not serve media bytes even though both listeners share one ASP.NET Core app in this slice.
+- The media route is hosted only on the configured media listener. The gRPC listener does not serve media bytes.
 - Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports HTTP Range playback on macOS, matching the Mac mini deployment target. Linux and other platforms can list basic local item identities, but they do not advertise HTTP Range playback, return playable variants, expose file size/mtime metadata, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented and covered per architecture.
+- `Cache:RootPath` is treated as a security boundary and must not contain symlink path components; use the real canonical directory path when a shell alias such as `/tmp` or `/var` would resolve through a system symlink.
 - `TaskService` accepts Bilibili URL/BV task intake into an in-memory queue, returns active duplicate submissions as the same task, streams task snapshots and updates through `WatchTasks`, and supports idempotent cancellation before a download adapter starts.
 - Submitted Bilibili tasks intentionally remain queued in this slice. The next server slice should add the BBDown adapter worker behind the same task boundary rather than exposing BBDown's JSON API directly to tvOS.
 - The tvOS client currently loads a bounded first-page library preview, capped at the server page-size limit of 200 items. The cache client API exposes page tokens and search text, so full library pagination/search should be added in the next library UI iteration instead of making refresh collect every page.
