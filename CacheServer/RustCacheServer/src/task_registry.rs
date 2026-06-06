@@ -118,6 +118,7 @@ impl BilibiliTaskRegistry {
             watched_ids.insert(normalized_id);
         }
 
+        let receiver = self.updates.subscribe();
         let inner = self.inner.lock().expect("task registry lock poisoned");
         let mut snapshots = inner
             .tasks_by_id
@@ -131,7 +132,7 @@ impl BilibiliTaskRegistry {
         Ok(TaskSubscription {
             watched_ids,
             snapshots,
-            receiver: self.updates.subscribe(),
+            receiver,
         })
     }
 }

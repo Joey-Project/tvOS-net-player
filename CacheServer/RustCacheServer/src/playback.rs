@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use tonic::Request;
 use url::Url;
@@ -28,7 +28,11 @@ impl PlaybackUriFactory {
                     .get("host")
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("localhost");
-                Self::create_media_base_uri(authority, &self.options.media_listen_url)
+                Self::create_media_base_uri_for_request(
+                    authority,
+                    request.local_addr().map(|addr| addr.ip()),
+                    &self.options.media_listen_url,
+                )
             });
 
         format!(
@@ -40,10 +44,21 @@ impl PlaybackUriFactory {
     }
 
     pub fn create_media_base_uri(request_authority: &str, media_listen_url: &str) -> String {
+        Self::create_media_base_uri_for_request(request_authority, None, media_listen_url)
+    }
+
+    pub fn create_media_base_uri_for_request(
+        request_authority: &str,
+        local_ip: Option<IpAddr>,
+        media_listen_url: &str,
+    ) -> String {
         let media_uri = Url::parse(media_listen_url).expect("media listen URL must be valid");
         let listen_host = normalize_listen_host(&media_uri);
         let host = match listen_host.as_str() {
-            "0.0.0.0" | "::" | "*" | "+" => extract_uri_host(request_authority),
+            "0.0.0.0" | "::" | "*" | "+" => local_ip
+                .filter(|ip| !ip.is_unspecified())
+                .map(|ip| format_uri_host(&ip.to_string()))
+                .unwrap_or_else(|| extract_uri_host(request_authority)),
             _ => format_uri_host(&listen_host),
         };
         let port = media_uri
@@ -100,6 +115,18 @@ mod tests {
         assert_eq!(
             "http://192.168.1.10:8080",
             PlaybackUriFactory::create_media_base_uri("192.168.1.10:50051", "http://0.0.0.0:8080")
+        );
+    }
+
+    #[test]
+    fn prefers_local_socket_address_for_wildcard_listeners() {
+        assert_eq!(
+            "http://10.0.0.5:8080",
+            PlaybackUriFactory::create_media_base_uri_for_request(
+                "localhost:50051",
+                Some("10.0.0.5".parse().unwrap()),
+                "http://0.0.0.0:8080",
+            )
         );
     }
 

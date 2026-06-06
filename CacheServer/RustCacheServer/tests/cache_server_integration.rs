@@ -132,6 +132,36 @@ async fn rejects_path_escape_and_symlink_media() {
 }
 
 #[tokio::test]
+async fn derives_playback_host_from_grpc_local_addr_for_wildcard_media_listener() {
+    let server = TestServer::start_with_media_listen_host("0.0.0.0").await;
+    let channel = server.channel().await;
+    let mut library_client = LibraryServiceClient::new(channel);
+    let library = library_client
+        .list_library_items(ListLibraryItemsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let item = &library.items[0];
+
+    let playback = library_client
+        .get_playback_source(GetPlaybackSourceRequest {
+            item_id: item.id.clone(),
+            variant_id: "original".to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        playback
+            .uri
+            .starts_with(&format!("{}/media/", server.media_url)),
+        "playback uri should use the gRPC socket local address: {}",
+        playback.uri
+    );
+}
+
+#[tokio::test]
 async fn supports_cache_roots_rescan_and_bilibili_task_lifecycle() {
     let server = TestServer::start().await;
     let channel = server.channel().await;
@@ -296,13 +326,17 @@ struct TestServer {
     _temp_root: TempDir,
     _outside_root: TempDir,
     grpc_url: String,
-    _media_url: String,
+    media_url: String,
     _grpc_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     _media_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_media_listen_host("127.0.0.1").await
+    }
+
+    async fn start_with_media_listen_host(media_listen_host: &str) -> Self {
         let temp_root = tempfile::tempdir().unwrap();
         let outside_root = tempfile::tempdir().unwrap();
         let movie_dir = temp_root.path().join("Movies");
@@ -316,12 +350,13 @@ impl TestServer {
         let grpc_port = free_port();
         let media_port = free_port();
         let grpc_url = format!("http://127.0.0.1:{grpc_port}");
+        let media_listen_url = format!("http://{media_listen_host}:{media_port}");
         let media_url = format!("http://127.0.0.1:{media_port}");
         let state = AppState::new(CacheServerOptions {
             server_name: "Test Cache".to_owned(),
             root_path: temp_root.path().to_path_buf(),
             grpc_listen_url: grpc_url.clone(),
-            media_listen_url: media_url.clone(),
+            media_listen_url,
             ..CacheServerOptions::default()
         });
 
@@ -339,7 +374,7 @@ impl TestServer {
             _temp_root: temp_root,
             _outside_root: outside_root,
             grpc_url,
-            _media_url: media_url,
+            media_url,
             _grpc_task: grpc_task,
             _media_task: media_task,
         }
