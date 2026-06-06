@@ -52,7 +52,7 @@ impl BilibiliTaskRegistry {
             total_bytes: 0,
             message: QUEUED_MESSAGE.to_owned(),
             library_item_id: String::new(),
-            created_at: Some(now),
+            created_at: Some(copy_timestamp(&now)),
             updated_at: Some(now),
             finished_at: None,
         };
@@ -90,8 +90,9 @@ impl BilibiliTaskRegistry {
 
             task.state = TaskState::Cancelled.into();
             task.message = CANCELLED_MESSAGE.to_owned();
-            task.updated_at = Some(current_timestamp());
-            task.finished_at = task.updated_at;
+            let updated_at = current_timestamp();
+            task.updated_at = Some(copy_timestamp(&updated_at));
+            task.finished_at = Some(updated_at);
 
             (task.clone(), task.source.clone(), task.id.clone())
         };
@@ -272,6 +273,13 @@ pub fn current_timestamp() -> Timestamp {
     Timestamp {
         seconds: now.as_secs().try_into().unwrap_or(i64::MAX),
         nanos: now.subsec_nanos().try_into().unwrap_or(i32::MAX),
+    }
+}
+
+fn copy_timestamp(timestamp: &Timestamp) -> Timestamp {
+    Timestamp {
+        seconds: timestamp.seconds,
+        nanos: timestamp.nanos,
     }
 }
 
