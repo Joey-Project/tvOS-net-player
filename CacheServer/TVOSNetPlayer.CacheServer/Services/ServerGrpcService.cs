@@ -30,6 +30,8 @@ public sealed class ServerGrpcService : ServerService.ServerServiceBase
             serverInfo.MediaBaseUris.Add(options.CurrentValue.PublicMediaBaseUri);
         }
 
+        serverInfo.Capabilities.Add(ServerCapability.BilibiliTasks);
+
         if (library.SupportsHttpRangePlayback)
         {
             serverInfo.Capabilities.Add(ServerCapability.HttpRange);

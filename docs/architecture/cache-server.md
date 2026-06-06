@@ -77,9 +77,10 @@ Playback sources intentionally return URLs instead of media bytes.
 
 1. Implement a minimal LAN cache server with a local cache directory, gRPC control plane, and HTTP Range media endpoint. Done in the first implementation slice.
 2. Add a tvOS gRPC client and simple library screen. Done in the tvOS client slice.
-3. Add Bilibili task creation through a BBDown adapter.
-4. Add Bonjour discovery once the manual server URL path works.
-5. Add HLS/progressive caching for weaker network conditions.
+3. Add Bilibili task intake, lookup, watching, and pre-adapter cancellation. Done in the task-intake slice.
+4. Add the real BBDown adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library.
+5. Add Bonjour discovery once the manual server URL path works.
+6. Add HLS/progressive caching for weaker network conditions.
 
 ## First Slice Notes
 
@@ -96,7 +97,8 @@ Runtime shape:
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
 - The media route is also constrained to the configured media listener port, so the gRPC listener does not serve media bytes even though both listeners share one ASP.NET Core app in this slice.
 - Media file opens are fail-closed unless the host platform supports no-follow, root-anchored file opens. The first slice supports HTTP Range playback on macOS, matching the Mac mini deployment target. Linux and other platforms can list basic local item identities, but they do not advertise HTTP Range playback, return playable variants, expose file size/mtime metadata, or serve media bytes until equivalent no-reparse open-by-handle semantics are implemented and covered per architecture.
-- `TaskService` returns `UNIMPLEMENTED` for Bilibili task creation and cancellation until the BBDown adapter lands.
+- `TaskService` accepts Bilibili URL/BV task intake into an in-memory queue, returns active duplicate submissions as the same task, streams task snapshots and updates through `WatchTasks`, and supports idempotent cancellation before a download adapter starts.
+- Submitted Bilibili tasks intentionally remain queued in this slice. The next server slice should add the BBDown adapter worker behind the same task boundary rather than exposing BBDown's JSON API directly to tvOS.
 - The tvOS client currently loads a bounded first-page library preview, capped at the server page-size limit of 200 items. The cache client API exposes page tokens and search text, so full library pagination/search should be added in the next library UI iteration instead of making refresh collect every page.
 
 Configuration:

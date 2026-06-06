@@ -24,6 +24,7 @@ public static class CacheServerHost
         builder.Services.Configure<CacheServerOptions>(builder.Configuration.GetSection("Cache"));
         builder.Services.AddSingleton<LocalMediaLibrary>();
         builder.Services.AddSingleton<PlaybackUriFactory>();
+        builder.Services.AddSingleton<BilibiliTaskRegistry>();
 
         var app = builder.Build();
 
