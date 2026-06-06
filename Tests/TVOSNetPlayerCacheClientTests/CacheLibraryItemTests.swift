@@ -15,6 +15,21 @@ final class CacheLibraryItemTests: XCTestCase {
         XCTAssertTrue(item.hasPlayableVariant)
     }
 
+    func testHLSVariantProtocolsArePlayable() {
+        let protocolNames = ["hls", "HLS", "PLAYBACK_PROTOCOL_HLS"]
+
+        for protocolName in protocolNames {
+            let item = CacheLibraryItem.fixture(
+                variants: [
+                    .fixture(id: "hls-variant", playbackProtocol: protocolName)
+                ]
+            )
+
+            XCTAssertEqual(item.primaryVariantID, "hls-variant", "Expected \(protocolName) to be playable.")
+            XCTAssertTrue(item.hasPlayableVariant, "Expected \(protocolName) to be playable.")
+        }
+    }
+
     func testItemWithoutSupportedProtocolIsNotPlayable() {
         let item = CacheLibraryItem.fixture(
             variants: [
@@ -25,6 +40,21 @@ final class CacheLibraryItemTests: XCTestCase {
 
         XCTAssertNil(item.primaryVariantID)
         XCTAssertFalse(item.hasPlayableVariant)
+    }
+
+    func testPlaybackSourceSupportsHTTPFileAndHLSProtocols() {
+        let protocolNames = ["httpFile", "PLAYBACK_PROTOCOL_HTTP_FILE", "hls", "PLAYBACK_PROTOCOL_HLS"]
+
+        for protocolName in protocolNames {
+            let source = CachePlaybackSource.fixture(playbackProtocol: protocolName)
+            XCTAssertTrue(source.isPlayableByTVOSClient, "Expected \(protocolName) to be playable.")
+        }
+    }
+
+    func testPlaybackSourceRejectsUnsupportedProtocol() {
+        let source = CachePlaybackSource.fixture(playbackProtocol: "PLAYBACK_PROTOCOL_UNSPECIFIED")
+
+        XCTAssertFalse(source.isPlayableByTVOSClient)
     }
 }
 
@@ -55,6 +85,17 @@ extension CacheMediaVariant {
             height: 1080,
             bitrate: 0,
             sizeBytes: 0
+        )
+    }
+}
+
+extension CachePlaybackSource {
+    fileprivate static func fixture(playbackProtocol: String) -> Self {
+        Self(
+            itemID: "item-1",
+            variantID: "original",
+            playbackProtocol: playbackProtocol,
+            uri: "http://mac-mini.local:8080/media/item-1/original"
         )
     }
 }

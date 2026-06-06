@@ -19,6 +19,10 @@ public struct CacheServerEndpoint: Equatable, Sendable {
         return "\(host):\(port)"
     }
 
+    var isIPv6Literal: Bool {
+        host.contains(":")
+    }
+
     public static func normalized(from text: String, defaultPort: Int = Self.defaultPort) -> Self? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -29,9 +33,16 @@ public struct CacheServerEndpoint: Equatable, Sendable {
         guard
             let components = URLComponents(string: candidate),
             components.scheme?.lowercased() == "http",
-            let host = components.host?.trimmingCharacters(in: .whitespacesAndNewlines),
-            !host.isEmpty
+            var host = components.host?.trimmingCharacters(in: .whitespacesAndNewlines)
         else {
+            return nil
+        }
+
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+
+        guard !host.isEmpty else {
             return nil
         }
 
@@ -156,18 +167,7 @@ public struct CacheMediaVariant: Identifiable, Equatable, Sendable {
     }
 
     public var isPlayableByTVOSClient: Bool {
-        switch playbackProtocol.normalizedCacheProtocolName {
-        case "httpfile":
-            true
-        default:
-            false
-        }
-    }
-}
-
-extension String {
-    fileprivate var normalizedCacheProtocolName: String {
-        lowercased().filter(\.isLetter)
+        CachePlaybackProtocolSupport.isPlayable(playbackProtocol)
     }
 }
 
@@ -182,5 +182,35 @@ public struct CachePlaybackSource: Equatable, Sendable {
         self.variantID = variantID
         self.playbackProtocol = playbackProtocol
         self.uri = uri
+    }
+
+    public var isPlayableByTVOSClient: Bool {
+        CachePlaybackProtocolSupport.isPlayable(playbackProtocol)
+    }
+}
+
+private enum CachePlaybackProtocolSupport {
+    static func isPlayable(_ playbackProtocol: String) -> Bool {
+        switch playbackProtocol.normalizedCacheProtocolName.removingPlaybackProtocolPrefix {
+        case "httpfile", "hls":
+            true
+        default:
+            false
+        }
+    }
+}
+
+extension String {
+    fileprivate var normalizedCacheProtocolName: String {
+        lowercased().filter(\.isLetter)
+    }
+
+    fileprivate var removingPlaybackProtocolPrefix: String {
+        let prefix = "playbackprotocol"
+        guard hasPrefix(prefix) else {
+            return self
+        }
+
+        return String(dropFirst(prefix.count))
     }
 }

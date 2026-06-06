@@ -22,6 +22,14 @@ final class CacheServerEndpointTests: XCTestCase {
         XCTAssertEqual(endpoint, CacheServerEndpoint(host: "mac-mini.local", port: 50_052))
     }
 
+    func testNormalizesBracketedIPv6Host() {
+        let endpoint = CacheServerEndpoint.normalized(from: "[fd00::1]:6000")
+
+        XCTAssertEqual(endpoint, CacheServerEndpoint(host: "fd00::1", port: 6000))
+        XCTAssertEqual(endpoint?.displayAddress, "[fd00::1]:6000")
+        XCTAssertEqual(endpoint?.isIPv6Literal, true)
+    }
+
     func testRejectsUnsupportedScheme() {
         XCTAssertNil(CacheServerEndpoint.normalized(from: "https://mac-mini.local:50051"))
     }

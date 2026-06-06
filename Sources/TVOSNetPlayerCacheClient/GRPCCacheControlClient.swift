@@ -12,7 +12,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
     public func getServerInfo() async throws -> CacheServerSummary {
         try await withGRPCClient(
             transport: .http2NIOTS(
-                target: .dns(host: endpoint.host, port: endpoint.port),
+                target: endpoint.grpcTarget,
                 transportSecurity: .plaintext
             )
         ) { client in
@@ -25,7 +25,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
     public func listLibraryItems(pageSize: Int = 50) async throws -> [CacheLibraryItem] {
         try await withGRPCClient(
             transport: .http2NIOTS(
-                target: .dns(host: endpoint.host, port: endpoint.port),
+                target: endpoint.grpcTarget,
                 transportSecurity: .plaintext
             )
         ) { client in
@@ -47,7 +47,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
     public func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         try await withGRPCClient(
             transport: .http2NIOTS(
-                target: .dns(host: endpoint.host, port: endpoint.port),
+                target: endpoint.grpcTarget,
                 transportSecurity: .plaintext
             )
         ) { client in
@@ -58,6 +58,16 @@ public final class GRPCCacheControlClient: CacheControlClient {
             let response = try await service.getPlaybackSource(request)
             return CachePlaybackSource(response)
         }
+    }
+}
+
+extension CacheServerEndpoint {
+    var grpcTarget: any ResolvableTarget {
+        if isIPv6Literal {
+            return .ipv6(address: host, port: port)
+        }
+
+        return .dns(host: host, port: port)
     }
 }
 

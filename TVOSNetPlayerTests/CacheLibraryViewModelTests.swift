@@ -186,6 +186,37 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaybackURLRejectsUnsupportedPlaybackSourceProtocol() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(playbackProtocol: "dash")
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(
+            for: .fixture(
+                id: "item-with-unsupported-source",
+                title: "Unsupported source item",
+                variants: [.fixture(id: "original", playbackProtocol: "httpFile")]
+            )
+        )
+
+        XCTAssertNil(url)
+        let requestedPlayback = await client.requestedPlayback
+        XCTAssertEqual(requestedPlayback?.itemID, "item-with-unsupported-source")
+        XCTAssertEqual(requestedPlayback?.variantID, "original")
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Cannot play Unsupported source item.")
+        XCTAssertEqual(model.errorMessage, "Cache server returned an unsupported playback protocol.")
+    }
+
+    @MainActor
     func testInvalidServerAddressDoesNotCallClient() async {
         let client = FakeCacheControlClient(serverInfo: .fixture(), items: [], playbackSource: .fixture())
         let model = CacheLibraryViewModel(
@@ -462,8 +493,9 @@ extension CachePlaybackSource {
     fileprivate static func fixture(
         itemID: String = "item-1",
         variantID: String = "original",
+        playbackProtocol: String = "httpFile",
         uri: String = "http://mac-mini.local:8080/media/item-1/original"
     ) -> Self {
-        Self(itemID: itemID, variantID: variantID, playbackProtocol: "httpFile", uri: uri)
+        Self(itemID: itemID, variantID: variantID, playbackProtocol: playbackProtocol, uri: uri)
     }
 }

@@ -131,6 +131,13 @@ final class CacheLibraryViewModel: ObservableObject {
                 return nil
             }
 
+            guard source.isPlayableByTVOSClient else {
+                errorMessage = "Cache server returned an unsupported playback protocol."
+                statusMessage = "Cannot play \(item.displayTitle)."
+                isLoading = false
+                return nil
+            }
+
             guard let url = StreamURLNormalizer.normalizedHTTPURL(from: source.uri) else {
                 errorMessage = "Cache server returned a non-HTTP playback URL."
                 statusMessage = "Cannot play \(item.displayTitle)."
