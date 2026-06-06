@@ -6,15 +6,17 @@ pub mod media;
 pub mod playback;
 pub mod task_registry;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use axum::{Router, routing::get};
 use generated::tvos_net_player::v1::{
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use crate::{
@@ -87,6 +89,14 @@ pub async fn run_grpc_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_tcp_listener(addr).await?;
+    run_grpc_listener(listener, state).await
+}
+
+async fn run_grpc_listener(
+    listener: TcpListener,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Server::builder()
         .add_service(ServerServiceServer::new(ServerGrpcService::new(
             state.clone(),
@@ -96,7 +106,7 @@ pub async fn run_grpc_server(
         )))
         .add_service(TaskServiceServer::new(TaskGrpcService::new(state.clone())))
         .add_service(CacheServiceServer::new(CacheGrpcService::new(state)))
-        .serve(addr)
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
 }
@@ -112,6 +122,14 @@ pub async fn run_media_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = bind_tcp_listener(addr).await?;
+    run_media_listener(listener, state).await
+}
+
+async fn run_media_listener(
+    listener: TcpListener,
+    state: AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let router = Router::new()
         .route("/", get(root))
         .route(
@@ -120,7 +138,6 @@ pub async fn run_media_server(
         )
         .with_state(MediaState::new(state));
 
-    let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -162,4 +179,71 @@ async fn root() -> axum::Json<serde_json::Value> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn bind_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    const TCP_BACKLOG: i32 = 1024;
+
+    let socket = match addr {
+        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
+        SocketAddr::V6(_) => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_only_v6(true)?;
+            socket
+        }
+    };
+
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket
+        .listen(TCP_BACKLOG)
+        .and_then(|()| TcpListener::from_std(socket.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
+        let port = match free_port() {
+            Ok(port) => port,
+            Err(error) if is_listener_unavailable(&error) => return,
+            Err(error) => panic!("free port probe should bind: {error}"),
+        };
+        let ipv4_listener =
+            bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+                .await
+                .expect("IPv4 wildcard listener should bind");
+
+        match bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
+            Ok(ipv6_listener) => {
+                assert_eq!(port, ipv6_listener.local_addr().unwrap().port());
+                drop(ipv6_listener);
+            }
+            Err(error) if is_listener_unavailable(&error) => {}
+            Err(error) => panic!("IPv6 wildcard listener should bind with v6-only mode: {error}"),
+        }
+
+        drop(ipv4_listener);
+    }
+
+    fn free_port() -> io::Result<u16> {
+        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    }
+
+    fn is_listener_unavailable(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::Unsupported
+        )
+    }
 }

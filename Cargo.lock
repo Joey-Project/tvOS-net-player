@@ -1584,6 +1584,7 @@ dependencies = [
  "protoc-bin-vendored",
  "reqwest",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-stream",

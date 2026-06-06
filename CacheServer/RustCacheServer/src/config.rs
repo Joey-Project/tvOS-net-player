@@ -134,8 +134,10 @@ fn listen_addrs(listen_url: &str) -> Result<Vec<SocketAddr>, ConfigError> {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ],
-        "0.0.0.0" | "*" | "+" => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
-        "::" => vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)],
+        "0.0.0.0" | "::" | "*" | "+" => vec![
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ],
         _ => vec![host.parse().map_err(|_| {
             ConfigError::new(format!(
                 "listen host must be localhost or an IP address: {host}"
@@ -239,5 +241,23 @@ mod tests {
             ],
             options.grpc_listen_addrs().unwrap()
         );
+    }
+
+    #[test]
+    fn wildcard_listen_urls_bind_ipv4_and_ipv6_unspecified() {
+        for host in ["0.0.0.0", "[::]", "*", "+"] {
+            let options = CacheServerOptions {
+                grpc_listen_url: format!("http://{host}:50051"),
+                ..CacheServerOptions::default()
+            };
+
+            assert_eq!(
+                vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50051),
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 50051),
+                ],
+                options.grpc_listen_addrs().unwrap()
+            );
+        }
     }
 }
