@@ -116,17 +116,6 @@ let targets: [Target] = [
     ],
     swiftSettings: defaultSwiftSettings
   ),
-  .testTarget(
-    name: "GRPCNIOTransportCoreTests",
-    dependencies: [
-      .target(name: "GRPCNIOTransportCore"),
-      .product(name: "NIOCore", package: "swift-nio"),
-      .product(name: "NIOEmbedded", package: "swift-nio"),
-      .product(name: "NIOTestUtils", package: "swift-nio"),
-    ],
-    swiftSettings: defaultSwiftSettings
-  ),
-
   // NIOPosix variant of the HTTP/2 transports.
   .target(
     name: "GRPCNIOTransportHTTP2Posix",
@@ -159,16 +148,6 @@ let targets: [Target] = [
     dependencies: [
       .target(name: "GRPCNIOTransportHTTP2Posix"),
       .target(name: "GRPCNIOTransportHTTP2TransportServices"),
-    ],
-    swiftSettings: defaultSwiftSettings
-  ),
-  .testTarget(
-    name: "GRPCNIOTransportHTTP2Tests",
-    dependencies: [
-      .target(name: "GRPCNIOTransportHTTP2"),
-      .product(name: "GRPCCore", package: "grpc-swift-2"),
-      .product(name: "X509", package: "swift-certificates"),
-      .product(name: "NIOSSL", package: "swift-nio-ssl"),
     ],
     swiftSettings: defaultSwiftSettings
   ),

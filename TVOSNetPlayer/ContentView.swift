@@ -189,7 +189,7 @@ private struct CacheLibraryRow: View {
                     .lineLimit(1)
             }
             HStack(spacing: 10) {
-                if let primaryVariant = item.variants.first {
+                if let primaryVariant = item.primaryVariant {
                     Text(primaryVariant.displayLabel)
                 }
                 Text(item.source)

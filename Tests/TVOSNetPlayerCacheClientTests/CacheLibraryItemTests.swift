@@ -12,7 +12,20 @@ final class CacheLibraryItemTests: XCTestCase {
         )
 
         XCTAssertEqual(item.primaryVariantID, "original")
+        XCTAssertEqual(item.primaryVariant?.id, "original")
         XCTAssertTrue(item.hasPlayableVariant)
+    }
+
+    func testPrimaryVariantReturnsPlayableVariantForDisplay() {
+        let item = CacheLibraryItem.fixture(
+            variants: [
+                .fixture(id: "dash", label: "DASH", playbackProtocol: "dash"),
+                .fixture(id: "hls", label: "HLS", playbackProtocol: "hls"),
+            ]
+        )
+
+        XCTAssertEqual(item.primaryVariant?.displayLabel, "HLS")
+        XCTAssertEqual(item.primaryVariantID, "hls")
     }
 
     func testHLSVariantProtocolsArePlayable() {
@@ -73,10 +86,10 @@ extension CacheLibraryItem {
 }
 
 extension CacheMediaVariant {
-    fileprivate static func fixture(id: String, playbackProtocol: String) -> Self {
+    fileprivate static func fixture(id: String, label: String = "Original", playbackProtocol: String) -> Self {
         Self(
             id: id,
-            label: "Original",
+            label: label,
             playbackProtocol: playbackProtocol,
             container: "mp4",
             videoCodec: "",

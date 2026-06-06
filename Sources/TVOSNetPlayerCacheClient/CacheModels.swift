@@ -102,15 +102,19 @@ public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
         title.isEmpty ? id : title
     }
 
-    public var primaryVariantID: String? {
+    public var primaryVariant: CacheMediaVariant? {
         for variant in variants {
             let id = variant.id.trimmingCharacters(in: .whitespacesAndNewlines)
             if !id.isEmpty && variant.isPlayableByTVOSClient {
-                return id
+                return variant
             }
         }
 
         return nil
+    }
+
+    public var primaryVariantID: String? {
+        primaryVariant?.id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public var hasPlayableVariant: Bool {
