@@ -103,9 +103,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
                     uri: "http://mac-mini.local:8080/media/item-b/original"
                 ),
             ],
-            getPlaybackSourceDelayNanosecondsByItemID: [
-                "item-a": 100_000_000
-            ]
+            suspendedPlaybackItemIDs: ["item-a"]
         )
         let model = CacheLibraryViewModel(
             defaultServerAddressText: "server-a.local:50051",
@@ -118,9 +116,10 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let stalePlayback = Task {
             await model.playbackURL(for: firstItem)
         }
-        try? await Task.sleep(nanoseconds: 10_000_000)
+        await client.waitForPlaybackSourceRequest(itemID: "item-a")
 
         let latestURL = await model.playbackURL(for: secondItem)
+        await client.releasePlaybackSourceRequest(itemID: "item-a")
         let staleURL = await stalePlayback.value
 
         XCTAssertNil(staleURL)
@@ -326,7 +325,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
             serverInfo: .fixture(name: "Server A"),
             items: [.fixture(id: "item-a", title: "Server A item")],
             playbackSource: .fixture(),
-            getServerInfoDelayNanoseconds: 100_000_000
+            suspendServerInfoUntilReleased: true
         )
         let model = CacheLibraryViewModel(
             defaultServerAddressText: "server-a.local:50051",
@@ -337,7 +336,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let initialRefresh = Task {
             await model.refresh()
         }
-        try? await Task.sleep(nanoseconds: 10_000_000)
+        await client.waitForServerInfoRequest()
         XCTAssertTrue(model.isLoading)
 
         model.serverAddressText = "https://server-a.local:50051"
@@ -348,6 +347,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertEqual(model.statusMessage, "Cache server address is invalid.")
         XCTAssertNotNil(model.errorMessage)
 
+        await client.releaseServerInfoRequests()
         await initialRefresh.value
 
         XCTAssertFalse(model.isLoading)
@@ -496,7 +496,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
             serverInfo: .fixture(name: "Server A"),
             items: [.fixture(id: "item-a", title: "Server A item")],
             playbackSource: .fixture(),
-            getServerInfoDelayNanoseconds: 100_000_000
+            suspendServerInfoUntilReleased: true
         )
         let fastClient = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server B"),
@@ -514,10 +514,11 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let staleRefresh = Task {
             await model.refresh()
         }
-        try? await Task.sleep(nanoseconds: 10_000_000)
+        await slowClient.waitForServerInfoRequest()
 
         model.serverAddressText = "server-b.local:50051"
         await model.refresh()
+        await slowClient.releaseServerInfoRequests()
         await staleRefresh.value
 
         XCTAssertEqual(model.serverAddressText, "server-b.local:50051")
@@ -536,10 +537,19 @@ private actor FakeCacheControlClient: CacheControlClient {
     let playbackSourcesByItemID: [String: CachePlaybackSource]
     let getServerInfoError: FakeCacheError?
     let getServerInfoIgnoresCancellation: Bool
+    let suspendServerInfoUntilReleased: Bool
+    let suspendedPlaybackItemIDs: Set<String>
 
     private(set) var getServerInfoCallCount = 0
     private(set) var requestedLibraryPageSizes: [Int] = []
     private(set) var requestedPlayback: (itemID: String, variantID: String)?
+    private var getServerInfoWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var serverInfoReleaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var serverInfoRequestsReleased = false
+    private var playbackStartedItemIDs: [String] = []
+    private var playbackWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
+    private var playbackReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var releasedPlaybackItemIDs: Set<String> = []
 
     init(
         serverInfo: CacheServerSummary,
@@ -549,7 +559,9 @@ private actor FakeCacheControlClient: CacheControlClient {
         playbackSourcesByItemID: [String: CachePlaybackSource] = [:],
         getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64] = [:],
         getServerInfoError: FakeCacheError? = nil,
-        getServerInfoIgnoresCancellation: Bool = false
+        getServerInfoIgnoresCancellation: Bool = false,
+        suspendServerInfoUntilReleased: Bool = false,
+        suspendedPlaybackItemIDs: Set<String> = []
     ) {
         self.serverInfo = serverInfo
         self.items = items
@@ -559,10 +571,16 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.getPlaybackSourceDelayNanosecondsByItemID = getPlaybackSourceDelayNanosecondsByItemID
         self.getServerInfoError = getServerInfoError
         self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
+        self.suspendServerInfoUntilReleased = suspendServerInfoUntilReleased
+        self.suspendedPlaybackItemIDs = suspendedPlaybackItemIDs
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
         getServerInfoCallCount += 1
+        notifyServerInfoWaiters()
+        if suspendServerInfoUntilReleased {
+            await waitForServerInfoRelease()
+        }
         if getServerInfoDelayNanoseconds > 0 {
             if getServerInfoIgnoresCancellation {
                 await sleepIgnoringCancellation(nanoseconds: getServerInfoDelayNanoseconds)
@@ -587,11 +605,95 @@ private actor FakeCacheControlClient: CacheControlClient {
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         requestedPlayback = (itemID, variantID)
+        playbackStartedItemIDs.append(itemID)
+        notifyPlaybackWaiters(for: itemID)
+        if suspendedPlaybackItemIDs.contains(itemID) {
+            await waitForPlaybackRelease(itemID: itemID)
+        }
         if let delay = getPlaybackSourceDelayNanosecondsByItemID[itemID], delay > 0 {
             try await Task.sleep(nanoseconds: delay)
         }
 
         return playbackSourcesByItemID[itemID] ?? playbackSource
+    }
+
+    func waitForServerInfoRequest(minimumCallCount: Int = 1) async {
+        guard getServerInfoCallCount < minimumCallCount else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            getServerInfoWaiters.append((minimumCallCount, continuation))
+        }
+    }
+
+    func releaseServerInfoRequests() {
+        serverInfoRequestsReleased = true
+        let continuations = serverInfoReleaseContinuations
+        serverInfoReleaseContinuations = []
+        continuations.forEach { $0.resume() }
+    }
+
+    func waitForPlaybackSourceRequest(itemID: String) async {
+        guard !playbackStartedItemIDs.contains(itemID) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            playbackWaiters.append((itemID, continuation))
+        }
+    }
+
+    func releasePlaybackSourceRequest(itemID: String) {
+        releasedPlaybackItemIDs.insert(itemID)
+        let continuations = playbackReleaseContinuations.removeValue(forKey: itemID) ?? []
+        continuations.forEach { $0.resume() }
+    }
+
+    private func notifyServerInfoWaiters() {
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        getServerInfoWaiters.removeAll { waiter in
+            guard getServerInfoCallCount >= waiter.minimumCallCount else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
+    }
+
+    private func waitForServerInfoRelease() async {
+        guard !serverInfoRequestsReleased else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            serverInfoReleaseContinuations.append(continuation)
+        }
+    }
+
+    private func notifyPlaybackWaiters(for itemID: String) {
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        playbackWaiters.removeAll { waiter in
+            guard waiter.itemID == itemID else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
+    }
+
+    private func waitForPlaybackRelease(itemID: String) async {
+        guard !releasedPlaybackItemIDs.contains(itemID) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            playbackReleaseContinuations[itemID, default: []].append(continuation)
+        }
     }
 
     private func sleepIgnoringCancellation(nanoseconds: UInt64) async {
