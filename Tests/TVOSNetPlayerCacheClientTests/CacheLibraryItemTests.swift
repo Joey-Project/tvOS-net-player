@@ -69,6 +69,41 @@ final class CacheLibraryItemTests: XCTestCase {
 
         XCTAssertFalse(source.isPlayableByTVOSClient)
     }
+
+    func testPlaybackSourceAcceptsExplicitHTTPPlaybackURLs() {
+        let cases = [
+            (
+                "http://mac-mini.local:8080/media/item-1/original",
+                "http://mac-mini.local:8080/media/item-1/original"
+            ),
+            (
+                " https://mac-mini.local/cache/item-1/original.m3u8 ",
+                "https://mac-mini.local/cache/item-1/original.m3u8"
+            ),
+        ]
+
+        for (uri, expectedURL) in cases {
+            let source = CachePlaybackSource.fixture(uri: uri)
+
+            XCTAssertEqual(source.explicitHTTPURL?.absoluteString, expectedURL)
+        }
+    }
+
+    func testPlaybackSourceRejectsRelativeAndSchemelessPlaybackURLs() {
+        let invalidURIs = [
+            "mac-mini.local:8080/media/item-1/original",
+            "media/item-1/original",
+            "/media/item-1/original",
+            "file:///tmp/movie.mp4",
+            "http:///media/item-1/original",
+        ]
+
+        for uri in invalidURIs {
+            let source = CachePlaybackSource.fixture(uri: uri)
+
+            XCTAssertNil(source.explicitHTTPURL, "Expected \(uri) to be rejected.")
+        }
+    }
 }
 
 extension CacheLibraryItem {
@@ -103,12 +138,15 @@ extension CacheMediaVariant {
 }
 
 extension CachePlaybackSource {
-    fileprivate static func fixture(playbackProtocol: String) -> Self {
+    fileprivate static func fixture(
+        playbackProtocol: String = "httpFile",
+        uri: String = "http://mac-mini.local:8080/media/item-1/original"
+    ) -> Self {
         Self(
             itemID: "item-1",
             variantID: "original",
             playbackProtocol: playbackProtocol,
-            uri: "http://mac-mini.local:8080/media/item-1/original"
+            uri: uri
         )
     }
 }

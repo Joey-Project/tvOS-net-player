@@ -208,6 +208,22 @@ public struct CachePlaybackSource: Equatable, Sendable {
     public var isPlayableByTVOSClient: Bool {
         CachePlaybackProtocolSupport.isPlayable(playbackProtocol)
     }
+
+    public var explicitHTTPURL: URL? {
+        let trimmedURI = uri.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            let components = URLComponents(string: trimmedURI),
+            let scheme = components.scheme?.lowercased(),
+            ["http", "https"].contains(scheme),
+            let host = components.host,
+            !host.isEmpty,
+            let url = components.url
+        else {
+            return nil
+        }
+
+        return url
+    }
 }
 
 private enum CachePlaybackProtocolSupport {

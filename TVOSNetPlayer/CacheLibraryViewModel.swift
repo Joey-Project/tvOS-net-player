@@ -24,6 +24,8 @@ final class CacheLibraryViewModel: ObservableObject {
     private var loadedEndpoint: CacheServerEndpoint?
     private var refreshSequence = 0
     private var playbackSequence = 0
+    private var pendingPlaybackItemID: String?
+    private var activePlaybackItemID: String?
 
     init(
         defaultServerAddressText: String? = nil,
@@ -52,6 +54,8 @@ final class CacheLibraryViewModel: ObservableObject {
     func refresh() async {
         refreshSequence += 1
         playbackSequence += 1
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
         let requestSequence = refreshSequence
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
@@ -84,7 +88,7 @@ final class CacheLibraryViewModel: ObservableObject {
             items = libraryPage.items
             serverAddressText = endpoint.displayAddress
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
-            statusMessage = "Loaded \(libraryPage.items.count) cached item(s) from \(serverName)."
+            statusMessage = loadedLibraryStatusMessage
         } catch {
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
                 return
@@ -102,6 +106,8 @@ final class CacheLibraryViewModel: ObservableObject {
 
     func playbackURL(for item: CacheLibraryItem) async -> URL? {
         playbackSequence += 1
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
         let playbackRequestSequence = playbackSequence
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
@@ -127,6 +133,7 @@ final class CacheLibraryViewModel: ObservableObject {
         }
 
         let requestSequence = refreshSequence
+        pendingPlaybackItemID = item.id
         isLoading = true
         errorMessage = nil
         statusMessage = "Preparing \(item.displayTitle)..."
@@ -148,6 +155,7 @@ final class CacheLibraryViewModel: ObservableObject {
             }
 
             guard source.itemID == item.id && source.variantID == variantID else {
+                pendingPlaybackItemID = nil
                 errorMessage = "Cache server returned a mismatched playback source."
                 statusMessage = "Cannot play \(item.displayTitle)."
                 isLoading = false
@@ -155,19 +163,22 @@ final class CacheLibraryViewModel: ObservableObject {
             }
 
             guard source.isPlayableByTVOSClient else {
+                pendingPlaybackItemID = nil
                 errorMessage = "Cache server returned an unsupported playback protocol."
                 statusMessage = "Cannot play \(item.displayTitle)."
                 isLoading = false
                 return nil
             }
 
-            guard let url = StreamURLNormalizer.normalizedHTTPURL(from: source.uri) else {
+            guard let url = source.explicitHTTPURL else {
+                pendingPlaybackItemID = nil
                 errorMessage = "Cache server returned a non-HTTP playback URL."
                 statusMessage = "Cannot play \(item.displayTitle)."
                 isLoading = false
                 return nil
             }
 
+            pendingPlaybackItemID = nil
             statusMessage = "Prepared \(item.displayTitle) from \(serverName)."
             isLoading = false
             return url
@@ -179,6 +190,7 @@ final class CacheLibraryViewModel: ObservableObject {
                 return nil
             }
 
+            pendingPlaybackItemID = nil
             errorMessage = error.localizedDescription
             statusMessage = "Could not prepare \(item.displayTitle)."
             isLoading = false
@@ -194,10 +206,29 @@ final class CacheLibraryViewModel: ObservableObject {
         isLoading = false
         errorMessage = nil
         if didStartPlayback {
+            activePlaybackItemID = item.id
             statusMessage = "Playing \(item.displayTitle) from \(serverName)."
         } else {
-            statusMessage = "Loaded \(items.count) cached item(s) from \(serverName)."
+            activePlaybackItemID = nil
+            statusMessage = loadedLibraryStatusMessage
         }
+    }
+
+    func clearPlaybackStatus() {
+        guard pendingPlaybackItemID != nil || activePlaybackItemID != nil else {
+            return
+        }
+
+        playbackSequence += 1
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
+        isLoading = false
+        errorMessage = nil
+        statusMessage = loadedLibraryStatusMessage
+    }
+
+    private var loadedLibraryStatusMessage: String {
+        "Loaded \(items.count) cached item(s) from \(serverName)."
     }
 
     private func clearLoadedLibraryIfNeeded(previousValue: String) {
@@ -241,6 +272,8 @@ final class CacheLibraryViewModel: ObservableObject {
 
     private func clearLoadedLibrary(statusMessage: String, errorMessage: String?) {
         loadedEndpoint = nil
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
         items = []
         serverName = "LAN cache"
         isLoading = false

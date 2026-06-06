@@ -119,7 +119,7 @@ struct ContentView: View {
             TextField("http://192.168.1.10:8080/video.mp4", text: $model.streamURLText)
                 .keyboardType(.URL)
                 .submitLabel(.go)
-                .onSubmit(model.load)
+                .onSubmit(loadManualStream)
                 .focused($focusedControl, equals: .urlField)
 
             if let validationMessage = model.validationMessage {
@@ -129,18 +129,18 @@ struct ContentView: View {
             }
 
             HStack(spacing: 18) {
-                Button(action: model.load) {
+                Button(action: loadManualStream) {
                     Label("Play", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .focused($focusedControl, equals: .playButton)
 
-                Button(action: model.stop) {
+                Button(action: stopManualStream) {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .disabled(model.player == nil)
 
-                Button(action: model.clear) {
+                Button(action: clearManualStream) {
                     Label("Clear", systemImage: "xmark.circle")
                 }
                 .disabled(!model.canClear)
@@ -176,6 +176,21 @@ struct ContentView: View {
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func loadManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.load()
+    }
+
+    private func stopManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.stop()
+    }
+
+    private func clearManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.clear()
     }
 }
 

@@ -27,6 +27,8 @@ superseded_by:
 - `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` with a manifest-only patch that adds direct `NIOHTTP1` and `NIOTLS` dependencies required by Xcode package product linking.
 - The tvOS refresh path loads a bounded first-page library preview of up to 200 items. The cache client contract exposes page tokens and search text, so full pagination/search remains a follow-up UI task rather than a protocol break.
 - Xcode package resolution is locked with both root and Xcode workspace `Package.resolved` files; `xcodebuild` scripts use `-onlyUsePackageVersionsFromResolvedFile`, and Swift package tests run with automatic resolution disabled.
+- Cache playback sources must return explicit `http` or `https` URLs with a host; user-entered manual stream URLs still keep the more forgiving bare-host normalization.
+- Manual Play, Stop, and Clear actions cancel pending cache playback state and clear active cached playback status before the manual player state takes over.
 
 ## Next Steps
 
