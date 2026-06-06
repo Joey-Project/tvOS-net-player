@@ -106,7 +106,7 @@ struct ContentView: View {
                                 CacheLibraryRow(item: item)
                             }
                             .buttonStyle(.bordered)
-                            .disabled(cacheModel.isLoading)
+                            .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
                         }
                     }
                 }

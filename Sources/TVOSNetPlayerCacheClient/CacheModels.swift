@@ -92,7 +92,18 @@ public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
     }
 
     public var primaryVariantID: String? {
-        variants.first?.id
+        for variant in variants {
+            let id = variant.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !id.isEmpty {
+                return id
+            }
+        }
+
+        return nil
+    }
+
+    public var hasPlayableVariant: Bool {
+        primaryVariantID != nil
     }
 }
 

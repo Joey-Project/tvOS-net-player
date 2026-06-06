@@ -78,6 +78,84 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testStalePlaybackResultDoesNotReturnURLForEarlierSelection() async {
+        let firstItem = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "First cached video",
+            variants: [.fixture(id: "original")]
+        )
+        let secondItem = CacheLibraryItem.fixture(
+            id: "item-b",
+            title: "Second cached video",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [firstItem, secondItem],
+            playbackSource: .fixture(),
+            playbackSourcesByItemID: [
+                "item-a": .fixture(
+                    itemID: "item-a",
+                    uri: "http://mac-mini.local:8080/media/item-a/original"
+                ),
+                "item-b": .fixture(
+                    itemID: "item-b",
+                    uri: "http://mac-mini.local:8080/media/item-b/original"
+                ),
+            ],
+            getPlaybackSourceDelayNanosecondsByItemID: [
+                "item-a": 100_000_000
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+
+        let stalePlayback = Task {
+            await model.playbackURL(for: firstItem)
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+
+        let latestURL = await model.playbackURL(for: secondItem)
+        let staleURL = await stalePlayback.value
+
+        XCTAssertNil(staleURL)
+        XCTAssertEqual(latestURL?.absoluteString, "http://mac-mini.local:8080/media/item-b/original")
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Playing Second cached video from Server A.")
+    }
+
+    @MainActor
+    func testPlaybackURLRejectsItemsWithoutPlayableVariants() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(
+            for: .fixture(id: "item-without-variants", title: "No variant item", variants: [])
+        )
+
+        XCTAssertNil(url)
+        let requestedPlayback = await client.requestedPlayback
+        XCTAssertNil(requestedPlayback)
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Cannot play No variant item.")
+        XCTAssertEqual(model.errorMessage, "Cached item has no playable media variants.")
+    }
+
+    @MainActor
     func testInvalidServerAddressDoesNotCallClient() async {
         let client = FakeCacheControlClient(serverInfo: .fixture(), items: [], playbackSource: .fixture())
         let model = CacheLibraryViewModel(
@@ -255,6 +333,8 @@ private actor FakeCacheControlClient: CacheControlClient {
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
     let getServerInfoDelayNanoseconds: UInt64
+    let getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64]
+    let playbackSourcesByItemID: [String: CachePlaybackSource]
     let getServerInfoError: FakeCacheError?
 
     private(set) var getServerInfoCallCount = 0
@@ -265,12 +345,16 @@ private actor FakeCacheControlClient: CacheControlClient {
         items: [CacheLibraryItem],
         playbackSource: CachePlaybackSource,
         getServerInfoDelayNanoseconds: UInt64 = 0,
+        playbackSourcesByItemID: [String: CachePlaybackSource] = [:],
+        getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64] = [:],
         getServerInfoError: FakeCacheError? = nil
     ) {
         self.serverInfo = serverInfo
         self.items = items
         self.playbackSource = playbackSource
         self.getServerInfoDelayNanoseconds = getServerInfoDelayNanoseconds
+        self.playbackSourcesByItemID = playbackSourcesByItemID
+        self.getPlaybackSourceDelayNanosecondsByItemID = getPlaybackSourceDelayNanosecondsByItemID
         self.getServerInfoError = getServerInfoError
     }
 
@@ -291,7 +375,11 @@ private actor FakeCacheControlClient: CacheControlClient {
 
     func getPlaybackSource(itemID: String, variantID: String?) async throws -> CachePlaybackSource {
         requestedPlayback = (itemID, variantID)
-        return playbackSource
+        if let delay = getPlaybackSourceDelayNanosecondsByItemID[itemID], delay > 0 {
+            try await Task.sleep(nanoseconds: delay)
+        }
+
+        return playbackSourcesByItemID[itemID] ?? playbackSource
     }
 }
 
@@ -341,7 +429,11 @@ extension CacheMediaVariant {
 }
 
 extension CachePlaybackSource {
-    fileprivate static func fixture(uri: String = "http://mac-mini.local:8080/media/item-1/original") -> Self {
-        Self(itemID: "item-1", variantID: "original", playbackProtocol: "httpFile", uri: uri)
+    fileprivate static func fixture(
+        itemID: String = "item-1",
+        variantID: String = "original",
+        uri: String = "http://mac-mini.local:8080/media/item-1/original"
+    ) -> Self {
+        Self(itemID: itemID, variantID: variantID, playbackProtocol: "httpFile", uri: uri)
     }
 }

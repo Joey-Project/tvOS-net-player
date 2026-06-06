@@ -21,6 +21,7 @@ final class CacheLibraryViewModel: ObservableObject {
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private var loadedEndpoint: CacheServerEndpoint?
     private var refreshSequence = 0
+    private var playbackSequence = 0
 
     init(
         defaultServerAddressText: String? = nil,
@@ -41,6 +42,7 @@ final class CacheLibraryViewModel: ObservableObject {
 
     func refresh() async {
         refreshSequence += 1
+        playbackSequence += 1
         let requestSequence = refreshSequence
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
@@ -86,7 +88,11 @@ final class CacheLibraryViewModel: ObservableObject {
     }
 
     func playbackURL(for item: CacheLibraryItem) async -> URL? {
+        playbackSequence += 1
+        let playbackRequestSequence = playbackSequence
+
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
+            isLoading = false
             errorMessage = "Use a host and optional port, such as mac-mini.local:50051."
             statusMessage = "Cache server address is invalid."
             return nil
@@ -100,6 +106,13 @@ final class CacheLibraryViewModel: ObservableObject {
             return nil
         }
 
+        guard let variantID = item.primaryVariantID else {
+            isLoading = false
+            errorMessage = "Cached item has no playable media variants."
+            statusMessage = "Cannot play \(item.displayTitle)."
+            return nil
+        }
+
         let requestSequence = refreshSequence
         isLoading = true
         errorMessage = nil
@@ -108,10 +121,13 @@ final class CacheLibraryViewModel: ObservableObject {
         do {
             let source = try await clientFactory(endpoint).getPlaybackSource(
                 itemID: item.id,
-                variantID: item.primaryVariantID
+                variantID: variantID
             )
 
-            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            guard
+                isCurrentRefresh(requestSequence, endpoint: endpoint),
+                isCurrentPlayback(playbackRequestSequence)
+            else {
                 return nil
             }
 
@@ -126,7 +142,10 @@ final class CacheLibraryViewModel: ObservableObject {
             isLoading = false
             return url
         } catch {
-            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            guard
+                isCurrentRefresh(requestSequence, endpoint: endpoint),
+                isCurrentPlayback(playbackRequestSequence)
+            else {
                 return nil
             }
 
@@ -187,5 +206,9 @@ final class CacheLibraryViewModel: ObservableObject {
 
     private func isCurrentRefresh(_ requestSequence: Int, endpoint: CacheServerEndpoint) -> Bool {
         requestSequence == refreshSequence && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
+    }
+
+    private func isCurrentPlayback(_ requestSequence: Int) -> Bool {
+        requestSequence == playbackSequence
     }
 }
