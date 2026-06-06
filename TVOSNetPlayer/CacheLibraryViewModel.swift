@@ -131,6 +131,13 @@ final class CacheLibraryViewModel: ObservableObject {
                 return nil
             }
 
+            guard source.itemID == item.id && source.variantID == variantID else {
+                errorMessage = "Cache server returned a mismatched playback source."
+                statusMessage = "Cannot play \(item.displayTitle)."
+                isLoading = false
+                return nil
+            }
+
             guard source.isPlayableByTVOSClient else {
                 errorMessage = "Cache server returned an unsupported playback protocol."
                 statusMessage = "Cannot play \(item.displayTitle)."

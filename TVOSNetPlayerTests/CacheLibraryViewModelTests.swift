@@ -190,7 +190,10 @@ final class CacheLibraryViewModelTests: XCTestCase {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(),
             items: [.fixture(id: "item-a", title: "Server A item")],
-            playbackSource: .fixture(playbackProtocol: "dash")
+            playbackSource: .fixture(
+                itemID: "item-with-unsupported-source",
+                playbackProtocol: "dash"
+            )
         )
         let model = CacheLibraryViewModel(
             defaultServerAddressText: "server-a.local:50051",
@@ -214,6 +217,41 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertFalse(model.isLoading)
         XCTAssertEqual(model.statusMessage, "Cannot play Unsupported source item.")
         XCTAssertEqual(model.errorMessage, "Cache server returned an unsupported playback protocol.")
+    }
+
+    @MainActor
+    func testPlaybackURLRejectsMismatchedPlaybackSourceIdentity() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(
+                itemID: "different-item",
+                variantID: "different-variant",
+                uri: "http://mac-mini.local:8080/media/different-item/different-variant"
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(
+            for: .fixture(
+                id: "item-a",
+                title: "Server A item",
+                variants: [.fixture(id: "original", playbackProtocol: "httpFile")]
+            )
+        )
+
+        XCTAssertNil(url)
+        let requestedPlayback = await client.requestedPlayback
+        XCTAssertEqual(requestedPlayback?.itemID, "item-a")
+        XCTAssertEqual(requestedPlayback?.variantID, "original")
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Cannot play Server A item.")
+        XCTAssertEqual(model.errorMessage, "Cache server returned a mismatched playback source.")
     }
 
     @MainActor
