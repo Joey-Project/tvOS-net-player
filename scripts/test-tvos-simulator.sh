@@ -31,6 +31,7 @@ else
 fi
 
 xcodebuild \
+  -onlyUsePackageVersionsFromResolvedFile \
   -skipPackagePluginValidation \
   -project "${PROJECT_PATH}" \
   -scheme "${SCHEME}" \
