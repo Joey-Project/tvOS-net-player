@@ -7,17 +7,20 @@ public final class GRPCCacheControlClient: CacheControlClient {
     private let rpcTimeout: Duration
     private let maxLibraryPages: Int
     private let maxLibraryItems: Int
+    private let allowPartialLibraryResults: Bool
 
     public init(
         endpoint: CacheServerEndpoint,
         rpcTimeout: Duration = .seconds(10),
         maxLibraryPages: Int = 100,
-        maxLibraryItems: Int = 5_000
+        maxLibraryItems: Int = 5_000,
+        allowPartialLibraryResults: Bool = false
     ) {
         self.endpoint = endpoint
         self.rpcTimeout = rpcTimeout
-        self.maxLibraryPages = maxLibraryPages
-        self.maxLibraryItems = maxLibraryItems
+        self.maxLibraryPages = max(1, maxLibraryPages)
+        self.maxLibraryItems = max(1, maxLibraryItems)
+        self.allowPartialLibraryResults = allowPartialLibraryResults
     }
 
     public func getServerInfo() async throws -> CacheServerSummary {
@@ -46,10 +49,11 @@ public final class GRPCCacheControlClient: CacheControlClient {
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
             return try await collectCacheLibraryItems(
                 maxPages: maxLibraryPages,
-                maxItems: maxLibraryItems
+                maxItems: maxLibraryItems,
+                allowPartialResults: allowPartialLibraryResults
             ) { pageToken in
                 var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
-                request.pageSize = Int32(clamping: max(1, pageSize))
+                request.pageSize = Int32(clamping: max(1, min(pageSize, 200)))
                 request.pageToken = pageToken
 
                 let response = try await service.listLibraryItems(request, options: callOptions)
@@ -108,6 +112,7 @@ enum CacheLibraryPaginationError: Error, Equatable {
 func collectCacheLibraryItems(
     maxPages: Int = 100,
     maxItems: Int = 5_000,
+    allowPartialResults: Bool = false,
     fetchPage: (String) async throws -> CacheLibraryItemsPage
 ) async throws -> [CacheLibraryItem] {
     var allItems: [CacheLibraryItem] = []
@@ -129,6 +134,10 @@ func collectCacheLibraryItems(
         }
 
         guard pageCount < maxPages else {
+            if allowPartialResults {
+                return allItems
+            }
+
             throw CacheLibraryPaginationError.exceededPageLimit(maxPages)
         }
 

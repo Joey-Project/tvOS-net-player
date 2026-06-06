@@ -53,6 +53,28 @@ final class CacheLibraryPaginationTests: XCTestCase {
         }
     }
 
+    func testReturnsPartialResultsWhenAllowedAtPageLimit() async {
+        var requestedPageTokens: [String] = []
+
+        do {
+            let items = try await collectCacheLibraryItems(
+                maxPages: 1,
+                allowPartialResults: true
+            ) { pageToken in
+                requestedPageTokens.append(pageToken)
+                return CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-1")],
+                    nextPageToken: "page-1"
+                )
+            }
+
+            XCTAssertEqual(items.map(\.id), ["item-1"])
+            XCTAssertEqual(requestedPageTokens, [""])
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testThrowsWhenServerReturnsTooManyItems() async {
         do {
             _ = try await collectCacheLibraryItems(maxItems: 2) { _ in

@@ -358,6 +358,25 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshRequestsPreviewPageSize() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+
+        let requestedPageSizes = await client.requestedLibraryPageSizes
+        XCTAssertEqual(requestedPageSizes, [200])
+    }
+
+    @MainActor
     func testRefreshTimeoutClearsLoadingState() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -377,6 +396,32 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertFalse(model.isLoading)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Could not load cache library.")
+        XCTAssertEqual(model.errorMessage, "Cache server request timed out.")
+    }
+
+    @MainActor
+    func testRefreshTimeoutDoesNotWaitForNonCooperativeClient() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            getServerInfoDelayNanoseconds: 750_000_000,
+            getServerInfoIgnoresCancellation: true
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            operationTimeout: .milliseconds(10),
+            clientFactory: { _ in client }
+        )
+
+        let start = Date()
+        await model.refresh()
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertLessThan(elapsed, 0.5)
+        XCTAssertFalse(model.isLoading)
         XCTAssertEqual(model.statusMessage, "Could not load cache library.")
         XCTAssertEqual(model.errorMessage, "Cache server request timed out.")
     }
@@ -490,8 +535,10 @@ private actor FakeCacheControlClient: CacheControlClient {
     let getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64]
     let playbackSourcesByItemID: [String: CachePlaybackSource]
     let getServerInfoError: FakeCacheError?
+    let getServerInfoIgnoresCancellation: Bool
 
     private(set) var getServerInfoCallCount = 0
+    private(set) var requestedLibraryPageSizes: [Int] = []
     private(set) var requestedPlayback: (itemID: String, variantID: String)?
 
     init(
@@ -501,7 +548,8 @@ private actor FakeCacheControlClient: CacheControlClient {
         getServerInfoDelayNanoseconds: UInt64 = 0,
         playbackSourcesByItemID: [String: CachePlaybackSource] = [:],
         getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64] = [:],
-        getServerInfoError: FakeCacheError? = nil
+        getServerInfoError: FakeCacheError? = nil,
+        getServerInfoIgnoresCancellation: Bool = false
     ) {
         self.serverInfo = serverInfo
         self.items = items
@@ -510,12 +558,17 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.playbackSourcesByItemID = playbackSourcesByItemID
         self.getPlaybackSourceDelayNanosecondsByItemID = getPlaybackSourceDelayNanosecondsByItemID
         self.getServerInfoError = getServerInfoError
+        self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
         getServerInfoCallCount += 1
         if getServerInfoDelayNanoseconds > 0 {
-            try await Task.sleep(nanoseconds: getServerInfoDelayNanoseconds)
+            if getServerInfoIgnoresCancellation {
+                await sleepIgnoringCancellation(nanoseconds: getServerInfoDelayNanoseconds)
+            } else {
+                try await Task.sleep(nanoseconds: getServerInfoDelayNanoseconds)
+            }
         }
         if let getServerInfoError {
             throw getServerInfoError
@@ -524,7 +577,8 @@ private actor FakeCacheControlClient: CacheControlClient {
     }
 
     func listLibraryItems(pageSize: Int) async throws -> [CacheLibraryItem] {
-        items
+        requestedLibraryPageSizes.append(pageSize)
+        return items
     }
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
@@ -534,6 +588,23 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
 
         return playbackSourcesByItemID[itemID] ?? playbackSource
+    }
+
+    private func sleepIgnoringCancellation(nanoseconds: UInt64) async {
+        let deadline = Date().addingTimeInterval(Double(nanoseconds) / 1_000_000_000)
+        while Date() < deadline {
+            let remainingNanoseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000)
+            let interval = min(remainingNanoseconds, 10_000_000)
+            guard interval > 0 else {
+                return
+            }
+
+            do {
+                try await Task.sleep(nanoseconds: interval)
+            } catch {
+                continue
+            }
+        }
     }
 }
 

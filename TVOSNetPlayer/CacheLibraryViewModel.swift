@@ -5,6 +5,7 @@ import TVOSNetPlayerCacheClient
 @MainActor
 final class CacheLibraryViewModel: ObservableObject {
     static let serverAddressDefaultsKey = "CacheServerAddress"
+    private static let libraryPreviewPageSize = 200
 
     @Published var serverAddressText: String {
         didSet {
@@ -29,7 +30,12 @@ final class CacheLibraryViewModel: ObservableObject {
         defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
-            GRPCCacheControlClient(endpoint: $0)
+            GRPCCacheControlClient(
+                endpoint: $0,
+                maxLibraryPages: 1,
+                maxLibraryItems: 200,
+                allowPartialLibraryResults: true
+            )
         }
     ) {
         self.defaults = defaults
@@ -66,7 +72,7 @@ final class CacheLibraryViewModel: ObservableObject {
                 try await client.getServerInfo()
             }
             let libraryItems = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.listLibraryItems(pageSize: 50)
+                try await client.listLibraryItems(pageSize: Self.libraryPreviewPageSize)
             }
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
@@ -240,22 +246,61 @@ final class CacheLibraryViewModel: ObservableObject {
         _ timeout: Duration,
         operation: @Sendable @escaping () async throws -> Value
     ) async throws -> Value {
-        try await withThrowingTaskGroup(of: Value.self) { group in
-            defer {
-                group.cancelAll()
-            }
-
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw CacheLibraryOperationError.timedOut
-            }
-
-            let value = try await group.next()!
-            return value
+        try await withCheckedThrowingContinuation { continuation in
+            let race = CacheLibraryOperationTimeoutRace(continuation: continuation)
+            race.start(timeout: timeout, operation: operation)
         }
+    }
+}
+
+private final class CacheLibraryOperationTimeoutRace<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    init(continuation: CheckedContinuation<Value, Error>) {
+        self.continuation = continuation
+    }
+
+    func start(
+        timeout: Duration,
+        operation: @Sendable @escaping () async throws -> Value
+    ) {
+        operationTask = Task.detached {
+            do {
+                self.complete(.success(try await operation()))
+            } catch {
+                self.complete(.failure(error))
+            }
+        }
+        timeoutTask = Task.detached {
+            do {
+                try await Task.sleep(for: timeout)
+                self.complete(.failure(CacheLibraryOperationError.timedOut))
+            } catch {
+                // The timeout task is expected to be cancelled when the operation wins.
+            }
+        }
+    }
+
+    private func complete(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+
+        self.continuation = nil
+        let operationTask = operationTask
+        let timeoutTask = timeoutTask
+        self.operationTask = nil
+        self.timeoutTask = nil
+        lock.unlock()
+
+        operationTask?.cancel()
+        timeoutTask?.cancel()
+        continuation.resume(with: result)
     }
 }
 
