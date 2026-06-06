@@ -83,7 +83,9 @@ try
     }
 
     await AssertMediaControlPlaneUnavailableWhenSecureOpenUnsupportedAsync(app.Services, channel, item, supportsHttpRangePlayback);
-    await AssertWatchTasksIsUnimplementedAsync(channel);
+    await AssertBilibiliTaskControlPlaneAsync(channel);
+    await AssertBilibiliTaskErrorsAsync(channel);
+    await AssertWatchTasksStreamsCompleteLargeSnapshotAsync(channel);
     await AssertTraversalIsRejectedAsync(mediaAddress);
     await AssertInvalidPathItemIdIsRejectedAsync(channel, mediaAddress);
     await AssertSymlinkIsRejectedAsync(channel, mediaAddress);
@@ -131,6 +133,7 @@ static async System.Threading.Tasks.Task AssertServerInfoAsync(GrpcChannel chann
     var info = await client.GetServerInfoAsync(new GetServerInfoRequest());
 
     AssertEqual("Test Cache", info.Name, "server name");
+    AssertTrue(info.Capabilities.Contains(ServerCapability.BilibiliTasks), "server Bilibili task capability");
     AssertEqual(supportsHttpRangePlayback, info.Capabilities.Contains(ServerCapability.HttpRange), "server HTTP range playback capability");
 }
 
@@ -615,17 +618,203 @@ static async System.Threading.Tasks.Task AssertMediaControlPlaneUnavailableWhenS
         "restored HTTP range capability");
 }
 
-static async System.Threading.Tasks.Task AssertWatchTasksIsUnimplementedAsync(GrpcChannel channel)
+static async System.Threading.Tasks.Task AssertBilibiliTaskControlPlaneAsync(GrpcChannel channel)
 {
     var client = new TaskService.TaskServiceClient(channel);
+    var source = "https://www.bilibili.com/video/BV1taskintake";
+    var task = await client.CreateBilibiliTaskAsync(new CreateBilibiliTaskRequest
+    {
+        UrlOrId = $"  {source}  ",
+        Options = new BilibiliDownloadOptions
+        {
+            QualityPreference = "1080p",
+            EncodingPreference = "hevc",
+            PreferTvApi = true,
+            DownloadSubtitles = true,
+            DownloadDanmaku = false
+        }
+    });
+
+    AssertTrue(task.Id.StartsWith("bilibili-", StringComparison.Ordinal), "Bilibili task id prefix");
+    AssertEqual(TaskKind.BilibiliDownload, task.Kind, "Bilibili task kind");
+    AssertEqual(TaskState.Queued, task.State, "Bilibili task state");
+    AssertEqual(source, task.Source, "Bilibili task source");
+    AssertEqual("Queued for the BBDown adapter.", task.Message, "Bilibili task message");
+    AssertEqual(0d, task.Progress, "Bilibili task progress");
+    AssertTrue(task.CreatedAt is not null, "Bilibili task created timestamp");
+    AssertTrue(task.UpdatedAt is not null, "Bilibili task updated timestamp");
+
+    var duplicateTask = await client.CreateBilibiliTaskAsync(new CreateBilibiliTaskRequest
+    {
+        UrlOrId = source
+    });
+    AssertEqual(task.Id, duplicateTask.Id, "duplicate active Bilibili task id");
+
+    var fetchedTask = await client.GetTaskAsync(new GetTaskRequest
+    {
+        Id = $" {task.Id} "
+    });
+    AssertEqual(task.Id, fetchedTask.Id, "fetched Bilibili task id");
+    AssertEqual(TaskState.Queued, fetchedTask.State, "fetched Bilibili task state");
+
+    using var call = client.WatchTasks(new WatchTasksRequest
+    {
+        Ids = { task.Id }
+    });
+
+    var snapshotEvent = await ReadTaskEventAsync(call, "Bilibili task watch snapshot");
+    AssertEqual(task.Id, snapshotEvent.Task.Id, "watched Bilibili task snapshot id");
+    AssertEqual(TaskState.Queued, snapshotEvent.Task.State, "watched Bilibili task snapshot state");
+
+    var cancelledTask = await client.CancelTaskAsync(new CancelTaskRequest
+    {
+        Id = task.Id
+    });
+    AssertEqual(task.Id, cancelledTask.Id, "cancelled Bilibili task id");
+    AssertEqual(TaskState.Cancelled, cancelledTask.State, "cancelled Bilibili task state");
+    AssertEqual("Cancelled before the download adapter started.", cancelledTask.Message, "cancelled Bilibili task message");
+    AssertTrue(cancelledTask.FinishedAt is not null, "cancelled Bilibili task finished timestamp");
+
+    var cancelEvent = await ReadTaskEventAsync(call, "Bilibili task watch cancellation");
+    AssertEqual(task.Id, cancelEvent.Task.Id, "watched Bilibili task cancellation id");
+    AssertEqual(TaskState.Cancelled, cancelEvent.Task.State, "watched Bilibili task cancellation state");
+
+    var cancelledAgainTask = await client.CancelTaskAsync(new CancelTaskRequest
+    {
+        Id = task.Id
+    });
+    AssertEqual(TaskState.Cancelled, cancelledAgainTask.State, "idempotent Bilibili task cancellation");
+
+    var newTask = await client.CreateBilibiliTaskAsync(new CreateBilibiliTaskRequest
+    {
+        UrlOrId = source
+    });
+    AssertTrue(!string.Equals(task.Id, newTask.Id, StringComparison.Ordinal), "cancelled Bilibili source can be queued again");
+}
+
+static async System.Threading.Tasks.Task AssertBilibiliTaskErrorsAsync(GrpcChannel channel)
+{
+    var client = new TaskService.TaskServiceClient(channel);
+
+    await AssertRpcStatusAsync(
+        StatusCode.InvalidArgument,
+        async () => await client.CreateBilibiliTaskAsync(new CreateBilibiliTaskRequest
+        {
+            UrlOrId = " "
+        }),
+        "empty Bilibili task source");
+    await AssertRpcStatusAsync(
+        StatusCode.InvalidArgument,
+        async () => await client.GetTaskAsync(new GetTaskRequest()),
+        "empty task id");
+    await AssertWatchTasksRpcStatusAsync(
+        client,
+        new WatchTasksRequest
+        {
+            Ids = { " " }
+        },
+        StatusCode.InvalidArgument,
+        "empty watch task id");
+    await AssertRpcStatusAsync(
+        StatusCode.NotFound,
+        async () => await client.GetTaskAsync(new GetTaskRequest
+        {
+            Id = "missing-task"
+        }),
+        "missing task get");
+    await AssertRpcStatusAsync(
+        StatusCode.NotFound,
+        async () => await client.CancelTaskAsync(new CancelTaskRequest
+        {
+            Id = "missing-task"
+        }),
+        "missing task cancel");
+}
+
+static async System.Threading.Tasks.Task AssertWatchTasksStreamsCompleteLargeSnapshotAsync(GrpcChannel channel)
+{
+    var client = new TaskService.TaskServiceClient(channel);
+    var expectedIds = new HashSet<string>(StringComparer.Ordinal);
+    for (var index = 0; index < 130; index += 1)
+    {
+        var task = await client.CreateBilibiliTaskAsync(new CreateBilibiliTaskRequest
+        {
+            UrlOrId = $"BV1largeSnapshot{index:D3}"
+        });
+        expectedIds.Add(task.Id);
+    }
+
     using var call = client.WatchTasks(new WatchTasksRequest());
+    var seenIds = new HashSet<string>(StringComparer.Ordinal);
+    for (var attempts = 0; attempts < 256 && !expectedIds.IsSubsetOf(seenIds); attempts += 1)
+    {
+        var taskEvent = await ReadTaskEventAsync(call, "large Bilibili task watch snapshot");
+        if (expectedIds.Contains(taskEvent.Task.Id))
+        {
+            seenIds.Add(taskEvent.Task.Id);
+        }
+    }
+
+    AssertEqual(expectedIds.Count, seenIds.Count, "large Bilibili task watch snapshot count");
+}
+
+static async System.Threading.Tasks.Task<TaskEvent> ReadTaskEventAsync(AsyncServerStreamingCall<TaskEvent> call, string label)
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
     try
     {
-        await call.ResponseStream.MoveNext(CancellationToken.None);
-        throw new InvalidOperationException("WatchTasks unexpectedly returned a successful stream.");
+        if (!await call.ResponseStream.MoveNext(timeout.Token))
+        {
+            throw new InvalidOperationException($"{label}: stream completed before the expected task event.");
+        }
+
+        return call.ResponseStream.Current;
     }
-    catch (RpcException exception) when (exception.StatusCode == StatusCode.Unimplemented)
+    catch (OperationCanceledException)
+    {
+        throw new InvalidOperationException($"{label}: timed out waiting for the expected task event.");
+    }
+}
+
+static async System.Threading.Tasks.Task AssertWatchTasksRpcStatusAsync(
+    TaskService.TaskServiceClient client,
+    WatchTasksRequest request,
+    StatusCode expectedStatus,
+    string label)
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    using var call = client.WatchTasks(request);
+
+    try
+    {
+        if (await call.ResponseStream.MoveNext(timeout.Token))
+        {
+            throw new InvalidOperationException($"{label}: expected {expectedStatus}, but the stream returned an event.");
+        }
+
+        throw new InvalidOperationException($"{label}: expected {expectedStatus}, but the stream completed.");
+    }
+    catch (RpcException exception) when (exception.StatusCode == expectedStatus)
+    {
+    }
+    catch (OperationCanceledException)
+    {
+        throw new InvalidOperationException($"{label}: timed out waiting for {expectedStatus}.");
+    }
+}
+
+static async System.Threading.Tasks.Task AssertRpcStatusAsync(
+    StatusCode expectedStatus,
+    Func<System.Threading.Tasks.Task> action,
+    string label)
+{
+    try
+    {
+        await action();
+        throw new InvalidOperationException($"{label}: expected {expectedStatus}, but the call succeeded.");
+    }
+    catch (RpcException exception) when (exception.StatusCode == expectedStatus)
     {
     }
 }
