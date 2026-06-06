@@ -91,7 +91,7 @@ Runtime shape:
 - The canonical proto lives under `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto` so the Swift package plugin and Rust server build share one schema source.
 - gRPC services are hosted by `tonic` and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
-- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) open both IPv4 and IPv6 listeners; use a concrete LAN IP to restrict address family or interface. The first slice does not implement authentication.
+- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) try to open both IPv4 and IPv6 listeners, and continue when one address family is unavailable but the other is bound; use a concrete LAN IP to restrict address family or interface. The first slice does not implement authentication.
 - `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that the server does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.

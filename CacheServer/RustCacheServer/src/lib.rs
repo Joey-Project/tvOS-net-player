@@ -82,7 +82,8 @@ pub async fn run_grpc_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_servers(addrs, state, run_grpc_server).await
+    let listeners = bind_listener_group(addrs).await?;
+    run_servers(listeners, state, run_grpc_listener).await
 }
 
 pub async fn run_grpc_server(
@@ -115,7 +116,8 @@ pub async fn run_media_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_servers(addrs, state, run_media_server).await
+    let listeners = bind_listener_group(addrs).await?;
+    run_servers(listeners, state, run_media_listener).await
 }
 
 pub async fn run_media_server(
@@ -143,20 +145,20 @@ async fn run_media_listener(
 }
 
 async fn run_servers<F, Fut>(
-    addrs: Vec<SocketAddr>,
+    listeners: Vec<TcpListener>,
     state: AppState,
     run_one: F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    F: Fn(SocketAddr, AppState) -> Fut + Copy + Send + Sync + 'static,
+    F: Fn(TcpListener, AppState) -> Fut + Copy + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
         + Send
         + 'static,
 {
     let mut servers = JoinSet::new();
-    for addr in addrs {
+    for listener in listeners {
         let state = state.clone();
-        servers.spawn(async move { run_one(addr, state).await });
+        servers.spawn(async move { run_one(listener, state).await });
     }
 
     match servers
@@ -201,6 +203,51 @@ async fn bind_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
         .and_then(|()| TcpListener::from_std(socket.into()))
 }
 
+async fn bind_listener_group(addrs: Vec<SocketAddr>) -> io::Result<Vec<TcpListener>> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one listen address is required",
+        ));
+    }
+
+    let allow_optional_family_skip = addrs.len() > 1;
+    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut first_optional_error = None;
+
+    for addr in addrs {
+        match bind_tcp_listener(addr).await {
+            Ok(listener) => listeners.push(listener),
+            Err(error)
+                if allow_optional_family_skip && is_optional_address_family_unavailable(&error) =>
+            {
+                if first_optional_error.is_none() {
+                    first_optional_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if listeners.is_empty() {
+        return Err(first_optional_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no listen address is usable",
+            )
+        }));
+    }
+
+    Ok(listeners)
+}
+
+fn is_optional_address_family_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -232,6 +279,27 @@ mod tests {
         }
 
         drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn listener_group_keeps_available_family_when_other_family_is_unavailable() {
+        let port = match free_port() {
+            Ok(port) => port,
+            Err(error) if is_listener_unavailable(&error) => return,
+            Err(error) => panic!("free port probe should bind: {error}"),
+        };
+        let listeners = bind_listener_group(vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new("2001:db8::1".parse().unwrap(), port),
+        ])
+        .await
+        .expect("listener group should keep the available address family");
+
+        assert_eq!(1, listeners.len());
+        assert_eq!(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            listeners[0].local_addr().unwrap()
+        );
     }
 
     fn free_port() -> io::Result<u16> {

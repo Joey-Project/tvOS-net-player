@@ -60,7 +60,7 @@ cargo run --package tvos-net-player-cache-server -- \
   --Cache:MediaListenUrl http://0.0.0.0:8080
 ```
 
-`0.0.0.0`、`[::]`、`*` 和 `+` 都会展开为 IPv4/IPv6 双栈 wildcard listener；如果只想暴露某个地址族或某个网卡，请改用具体 LAN IP。
+`0.0.0.0`、`[::]`、`*` 和 `+` 都会尝试展开为 IPv4/IPv6 双栈 wildcard listener；如果系统不支持某个地址族，只要另一个地址族可用就会继续启动。如果只想暴露某个地址族或某个网卡，请改用具体 LAN IP。
 
 当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS、Bonjour discovery、BBDown task adapter 和其他服务端平台的安全媒体打开都是后续工作。
 
