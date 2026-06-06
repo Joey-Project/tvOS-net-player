@@ -15,6 +15,7 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var player: AVPlayer?
     @Published private(set) var statusMessage: String
     @Published private(set) var validationMessage: String?
+    private(set) var manualInteractionSequence = 0
 
     private let defaults: UserDefaults
     private let autoplay: Bool
@@ -36,6 +37,7 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func load() {
+        markManualInteraction()
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
             statusMessage = "Cannot load this stream."
@@ -50,14 +52,25 @@ final class PlayerViewModel: ObservableObject {
         load()
     }
 
-    func loadTransient(streamURLText: String) {
+    @discardableResult
+    func loadTransient(streamURLText: String) -> Bool {
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
             statusMessage = "Cannot load this stream."
-            return
+            return false
         }
 
         load(url: url, persist: false)
+        return true
+    }
+
+    @discardableResult
+    func loadTransient(streamURLText: String, ifManualInteractionSequenceMatches expectedSequence: Int) -> Bool {
+        guard manualInteractionSequence == expectedSequence else {
+            return false
+        }
+
+        return loadTransient(streamURLText: streamURLText)
     }
 
     private func load(url: URL, persist: Bool) {
@@ -77,6 +90,7 @@ final class PlayerViewModel: ObservableObject {
     }
 
     func stop() {
+        markManualInteraction()
         player?.pause()
         player = nil
         loadedURL = nil
@@ -92,6 +106,8 @@ final class PlayerViewModel: ObservableObject {
     }
 
     private func syncStateAfterInputChange() {
+        markManualInteraction()
+
         if let url = Self.normalizedHTTPURL(from: streamURLText) {
             if validationMessage != nil {
                 validationMessage = nil
@@ -111,6 +127,10 @@ final class PlayerViewModel: ObservableObject {
             loadedURL = nil
             statusMessage = "Ready for an HTTP or HTTPS stream on your network."
         }
+    }
+
+    private func markManualInteraction() {
+        manualInteractionSequence += 1
     }
 
     nonisolated static func normalizedHTTPURL(from text: String) -> URL? {

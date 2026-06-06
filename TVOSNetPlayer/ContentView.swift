@@ -166,11 +166,15 @@ struct ContentView: View {
     }
 
     private func playCachedItem(_ item: CacheLibraryItem) async {
+        let manualInteractionSequence = model.manualInteractionSequence
         guard let url = await cacheModel.playbackURL(for: item) else {
             return
         }
 
-        model.loadTransient(streamURLText: url.absoluteString)
+        model.loadTransient(
+            streamURLText: url.absoluteString,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
     }
 }
 
