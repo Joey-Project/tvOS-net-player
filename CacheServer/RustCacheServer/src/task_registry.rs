@@ -1,10 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 
 use prost_types::Timestamp;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -15,8 +18,7 @@ const CANCELLED_MESSAGE: &str = "Cancelled before the download adapter started."
 const WATCHER_EVENT_BUFFER_CAPACITY: usize = 128;
 
 pub struct BilibiliTaskRegistry {
-    inner: Mutex<RegistryInner>,
-    updates: broadcast::Sender<Task>,
+    inner: Arc<Mutex<RegistryInner>>,
 }
 
 impl BilibiliTaskRegistry {
@@ -60,7 +62,7 @@ impl BilibiliTaskRegistry {
             .insert(normalized_source, task.id.clone());
         inner.tasks_by_id.insert(task.id.clone(), task.clone());
         drop(inner);
-        let _ = self.updates.send(task.clone());
+        self.publish(task.clone());
         Ok(task)
     }
 
@@ -103,7 +105,7 @@ impl BilibiliTaskRegistry {
         }
 
         drop(inner);
-        let _ = self.updates.send(task.clone());
+        self.publish(task.clone());
         Ok(task)
     }
 
@@ -118,8 +120,18 @@ impl BilibiliTaskRegistry {
             watched_ids.insert(normalized_id);
         }
 
-        let receiver = self.updates.subscribe();
-        let inner = self.inner.lock().expect("task registry lock poisoned");
+        let (sender, receiver) = mpsc::channel(WATCHER_EVENT_BUFFER_CAPACITY);
+        let watcher_id = Uuid::new_v4();
+        let lagged = Arc::new(AtomicBool::new(false));
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        inner.watchers.insert(
+            watcher_id,
+            TaskWatcher {
+                watched_ids: watched_ids.clone(),
+                sender,
+                lagged: Arc::clone(&lagged),
+            },
+        );
         let mut snapshots = inner
             .tasks_by_id
             .values()
@@ -130,27 +142,54 @@ impl BilibiliTaskRegistry {
         drop(inner);
 
         Ok(TaskSubscription {
-            watched_ids,
+            inner: Arc::clone(&self.inner),
+            watcher_id,
+            lagged,
             snapshots,
             receiver,
         })
+    }
+
+    fn publish(&self, task: Task) {
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let mut inactive_watchers = Vec::new();
+        for (watcher_id, watcher) in &inner.watchers {
+            if !watcher.matches(&task) {
+                continue;
+            }
+
+            match watcher.sender.try_send(task.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    watcher.lagged.store(true, AtomicOrdering::Relaxed);
+                    inactive_watchers.push(*watcher_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    inactive_watchers.push(*watcher_id);
+                }
+            }
+        }
+
+        for watcher_id in inactive_watchers {
+            inner.watchers.remove(&watcher_id);
+        }
     }
 }
 
 impl Default for BilibiliTaskRegistry {
     fn default() -> Self {
-        let (updates, _) = broadcast::channel(WATCHER_EVENT_BUFFER_CAPACITY);
         Self {
-            inner: Mutex::new(RegistryInner::default()),
-            updates,
+            inner: Arc::new(Mutex::new(RegistryInner::default())),
         }
     }
 }
 
 pub struct TaskSubscription {
-    watched_ids: HashSet<String>,
+    inner: Arc<Mutex<RegistryInner>>,
+    watcher_id: Uuid,
+    lagged: Arc<AtomicBool>,
     snapshots: Vec<Task>,
-    receiver: broadcast::Receiver<Task>,
+    receiver: mpsc::Receiver<Task>,
 }
 
 impl TaskSubscription {
@@ -159,19 +198,20 @@ impl TaskSubscription {
     }
 
     pub async fn recv(&mut self) -> Result<Task, Status> {
-        loop {
-            match self.receiver.recv().await {
-                Ok(task) if self.watched_ids.is_empty() || self.watched_ids.contains(&task.id) => {
-                    return Ok(task);
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    return Err(Status::resource_exhausted("Task watcher fell behind."));
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err(Status::unavailable("Task watcher closed."));
-                }
+        match self.receiver.recv().await {
+            Some(task) => Ok(task),
+            None if self.lagged.load(AtomicOrdering::Relaxed) => {
+                Err(Status::resource_exhausted("Task watcher fell behind."))
             }
+            None => Err(Status::unavailable("Task watcher closed.")),
+        }
+    }
+}
+
+impl Drop for TaskSubscription {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.watchers.remove(&self.watcher_id);
         }
     }
 }
@@ -180,6 +220,19 @@ impl TaskSubscription {
 struct RegistryInner {
     tasks_by_id: HashMap<String, Task>,
     active_task_ids_by_source: HashMap<String, String>,
+    watchers: HashMap<Uuid, TaskWatcher>,
+}
+
+struct TaskWatcher {
+    watched_ids: HashSet<String>,
+    sender: mpsc::Sender<Task>,
+    lagged: Arc<AtomicBool>,
+}
+
+impl TaskWatcher {
+    fn matches(&self, task: &Task) -> bool {
+        self.watched_ids.is_empty() || self.watched_ids.contains(&task.id)
+    }
 }
 
 fn normalize(value: &str) -> String {
@@ -258,5 +311,33 @@ mod tests {
             .create_bilibili_task("BV1yy", None)
             .expect("source can be queued after cancellation");
         assert_ne!(first.id, requeued.id);
+    }
+
+    #[tokio::test]
+    async fn unrelated_updates_do_not_lag_filtered_subscriptions() {
+        let registry = BilibiliTaskRegistry::default();
+        let watched = registry
+            .create_bilibili_task("BV1watched", None)
+            .expect("watched task should be created");
+        let mut subscription = registry
+            .subscribe(std::slice::from_ref(&watched.id))
+            .expect("subscription should be created");
+
+        for index in 0..=WATCHER_EVENT_BUFFER_CAPACITY {
+            registry
+                .create_bilibili_task(&format!("BV1unrelated-{index}"), None)
+                .expect("unrelated task should be created");
+        }
+
+        let cancelled = registry
+            .cancel_task(&watched.id)
+            .expect("watched task should be cancelled");
+        let event = subscription
+            .recv()
+            .await
+            .expect("filtered subscription should not lag on unrelated updates");
+
+        assert_eq!(cancelled.id, event.id);
+        assert_eq!(TaskState::Cancelled, event.state());
     }
 }
