@@ -61,8 +61,8 @@ impl BilibiliTaskRegistry {
             .active_task_ids_by_source
             .insert(normalized_source, task.id.clone());
         inner.tasks_by_id.insert(task.id.clone(), task.clone());
+        Self::publish_locked(&mut inner, task.clone());
         drop(inner);
-        self.publish(task.clone());
         Ok(task)
     }
 
@@ -104,8 +104,8 @@ impl BilibiliTaskRegistry {
             inner.active_task_ids_by_source.remove(&source);
         }
 
+        Self::publish_locked(&mut inner, task.clone());
         drop(inner);
-        self.publish(task.clone());
         Ok(task)
     }
 
@@ -150,8 +150,7 @@ impl BilibiliTaskRegistry {
         })
     }
 
-    fn publish(&self, task: Task) {
-        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+    fn publish_locked(inner: &mut RegistryInner, task: Task) {
         let mut inactive_watchers = Vec::new();
         for (watcher_id, watcher) in &inner.watchers {
             if !watcher.matches(&task) {
