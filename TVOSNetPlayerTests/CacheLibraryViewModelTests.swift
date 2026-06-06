@@ -358,6 +358,61 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshTimeoutClearsLoadingState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            getServerInfoDelayNanoseconds: 1_000_000_000
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            operationTimeout: .milliseconds(10),
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.serverName, "LAN cache")
+        XCTAssertEqual(model.statusMessage, "Could not load cache library.")
+        XCTAssertEqual(model.errorMessage, "Cache server request timed out.")
+    }
+
+    @MainActor
+    func testPlaybackTimeoutClearsLoadingState() async {
+        let item = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server A item",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(itemID: "item-a"),
+            getPlaybackSourceDelayNanosecondsByItemID: [
+                "item-a": 1_000_000_000
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            operationTimeout: .milliseconds(10),
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let url = await model.playbackURL(for: item)
+
+        XCTAssertNil(url)
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Could not prepare Server A item.")
+        XCTAssertEqual(model.errorMessage, "Cache server request timed out.")
+    }
+
+    @MainActor
     func testRefreshFailureClearsLoadedLibraryItems() async {
         let loadingClient = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),

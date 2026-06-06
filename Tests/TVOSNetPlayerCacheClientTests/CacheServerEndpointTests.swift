@@ -30,6 +30,14 @@ final class CacheServerEndpointTests: XCTestCase {
         XCTAssertEqual(endpoint?.isIPv6Literal, true)
     }
 
+    func testNormalizesBareIPv6HostWithDefaultPort() {
+        let endpoint = CacheServerEndpoint.normalized(from: "fd00::1")
+
+        XCTAssertEqual(endpoint, CacheServerEndpoint(host: "fd00::1", port: 50_051))
+        XCTAssertEqual(endpoint?.displayAddress, "[fd00::1]:50051")
+        XCTAssertEqual(endpoint?.isIPv6Literal, true)
+    }
+
     func testRejectsUnsupportedScheme() {
         XCTAssertNil(CacheServerEndpoint.normalized(from: "https://mac-mini.local:50051"))
     }

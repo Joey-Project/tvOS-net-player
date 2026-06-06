@@ -19,6 +19,7 @@ final class CacheLibraryViewModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
+    private let operationTimeout: Duration
     private var loadedEndpoint: CacheServerEndpoint?
     private var refreshSequence = 0
     private var playbackSequence = 0
@@ -26,12 +27,14 @@ final class CacheLibraryViewModel: ObservableObject {
     init(
         defaultServerAddressText: String? = nil,
         defaults: UserDefaults = .standard,
+        operationTimeout: Duration = .seconds(10),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
         }
     ) {
         self.defaults = defaults
         self.clientFactory = clientFactory
+        self.operationTimeout = operationTimeout
         serverAddressText =
             defaultServerAddressText ?? defaults.string(forKey: Self.serverAddressDefaultsKey) ?? ""
     }
@@ -59,8 +62,12 @@ final class CacheLibraryViewModel: ObservableObject {
 
         do {
             let client = clientFactory(endpoint)
-            let serverInfo = try await client.getServerInfo()
-            let libraryItems = try await client.listLibraryItems(pageSize: 50)
+            let serverInfo = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.getServerInfo()
+            }
+            let libraryItems = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listLibraryItems(pageSize: 50)
+            }
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
                 return
@@ -119,10 +126,13 @@ final class CacheLibraryViewModel: ObservableObject {
         statusMessage = "Preparing \(item.displayTitle)..."
 
         do {
-            let source = try await clientFactory(endpoint).getPlaybackSource(
-                itemID: item.id,
-                variantID: variantID
-            )
+            let client = clientFactory(endpoint)
+            let source = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.getPlaybackSource(
+                    itemID: item.id,
+                    variantID: variantID
+                )
+            }
 
             guard
                 isCurrentRefresh(requestSequence, endpoint: endpoint),
@@ -224,5 +234,35 @@ final class CacheLibraryViewModel: ObservableObject {
 
     private func isCurrentPlayback(_ requestSequence: Int) -> Bool {
         requestSequence == playbackSequence
+    }
+
+    private static func withOperationTimeout<Value: Sendable>(
+        _ timeout: Duration,
+        operation: @Sendable @escaping () async throws -> Value
+    ) async throws -> Value {
+        try await withThrowingTaskGroup(of: Value.self) { group in
+            defer {
+                group.cancelAll()
+            }
+
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw CacheLibraryOperationError.timedOut
+            }
+
+            let value = try await group.next()!
+            return value
+        }
+    }
+}
+
+private enum CacheLibraryOperationError: LocalizedError {
+    case timedOut
+
+    var errorDescription: String? {
+        "Cache server request timed out."
     }
 }

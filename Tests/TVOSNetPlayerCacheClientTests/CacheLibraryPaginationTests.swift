@@ -31,6 +31,47 @@ final class CacheLibraryPaginationTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+
+    func testThrowsWhenServerReturnsTooManyUniquePages() async {
+        var requestedPageTokens: [String] = []
+        var pageIndex = 0
+
+        do {
+            _ = try await collectCacheLibraryItems(maxPages: 3) { pageToken in
+                requestedPageTokens.append(pageToken)
+                pageIndex += 1
+                return CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-\(pageIndex)")],
+                    nextPageToken: "page-\(pageIndex)"
+                )
+            }
+            XCTFail("Expected page limit error.")
+        } catch CacheLibraryPaginationError.exceededPageLimit(3) {
+            XCTAssertEqual(requestedPageTokens, ["", "page-1", "page-2"])
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testThrowsWhenServerReturnsTooManyItems() async {
+        do {
+            _ = try await collectCacheLibraryItems(maxItems: 2) { _ in
+                CacheLibraryItemsPage(
+                    items: [
+                        .fixture(id: "item-1"),
+                        .fixture(id: "item-2"),
+                        .fixture(id: "item-3"),
+                    ],
+                    nextPageToken: ""
+                )
+            }
+            XCTFail("Expected item limit error.")
+        } catch CacheLibraryPaginationError.exceededItemLimit(2) {
+            return
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
 }
 
 extension CacheLibraryItem {

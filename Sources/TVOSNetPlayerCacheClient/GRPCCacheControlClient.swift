@@ -4,9 +4,20 @@ import GRPCNIOTransportHTTP2TransportServices
 
 public final class GRPCCacheControlClient: CacheControlClient {
     private let endpoint: CacheServerEndpoint
+    private let rpcTimeout: Duration
+    private let maxLibraryPages: Int
+    private let maxLibraryItems: Int
 
-    public init(endpoint: CacheServerEndpoint) {
+    public init(
+        endpoint: CacheServerEndpoint,
+        rpcTimeout: Duration = .seconds(10),
+        maxLibraryPages: Int = 100,
+        maxLibraryItems: Int = 5_000
+    ) {
         self.endpoint = endpoint
+        self.rpcTimeout = rpcTimeout
+        self.maxLibraryPages = maxLibraryPages
+        self.maxLibraryItems = maxLibraryItems
     }
 
     public func getServerInfo() async throws -> CacheServerSummary {
@@ -17,7 +28,10 @@ public final class GRPCCacheControlClient: CacheControlClient {
             )
         ) { client in
             let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
-            let response = try await service.getServerInfo(TvosNetPlayer_V1_GetServerInfoRequest())
+            let response = try await service.getServerInfo(
+                TvosNetPlayer_V1_GetServerInfoRequest(),
+                options: callOptions
+            )
             return CacheServerSummary(response)
         }
     }
@@ -30,12 +44,15 @@ public final class GRPCCacheControlClient: CacheControlClient {
             )
         ) { client in
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
-            return try await collectCacheLibraryItems { pageToken in
+            return try await collectCacheLibraryItems(
+                maxPages: maxLibraryPages,
+                maxItems: maxLibraryItems
+            ) { pageToken in
                 var request = TvosNetPlayer_V1_ListLibraryItemsRequest()
                 request.pageSize = Int32(clamping: max(1, pageSize))
                 request.pageToken = pageToken
 
-                let response = try await service.listLibraryItems(request)
+                let response = try await service.listLibraryItems(request, options: callOptions)
                 return CacheLibraryItemsPage(
                     items: response.items.map(CacheLibraryItem.init),
                     nextPageToken: response.nextPageToken
@@ -55,9 +72,15 @@ public final class GRPCCacheControlClient: CacheControlClient {
             var request = TvosNetPlayer_V1_GetPlaybackSourceRequest()
             request.itemID = itemID
             request.variantID = variantID
-            let response = try await service.getPlaybackSource(request)
+            let response = try await service.getPlaybackSource(request, options: callOptions)
             return CachePlaybackSource(response)
         }
+    }
+
+    private var callOptions: CallOptions {
+        var options = CallOptions.defaults
+        options.timeout = rpcTimeout
+        return options
     }
 }
 
@@ -78,21 +101,35 @@ struct CacheLibraryItemsPage: Equatable, Sendable {
 
 enum CacheLibraryPaginationError: Error, Equatable {
     case repeatedPageToken(String)
+    case exceededPageLimit(Int)
+    case exceededItemLimit(Int)
 }
 
 func collectCacheLibraryItems(
+    maxPages: Int = 100,
+    maxItems: Int = 5_000,
     fetchPage: (String) async throws -> CacheLibraryItemsPage
 ) async throws -> [CacheLibraryItem] {
     var allItems: [CacheLibraryItem] = []
     var pageToken = ""
     var seenNextPageTokens = Set<String>()
+    var pageCount = 0
 
     while true {
+        pageCount += 1
         let page = try await fetchPage(pageToken)
         allItems.append(contentsOf: page.items)
 
+        guard allItems.count <= maxItems else {
+            throw CacheLibraryPaginationError.exceededItemLimit(maxItems)
+        }
+
         guard !page.nextPageToken.isEmpty else {
             return allItems
+        }
+
+        guard pageCount < maxPages else {
+            throw CacheLibraryPaginationError.exceededPageLimit(maxPages)
         }
 
         guard seenNextPageTokens.insert(page.nextPageToken).inserted else {

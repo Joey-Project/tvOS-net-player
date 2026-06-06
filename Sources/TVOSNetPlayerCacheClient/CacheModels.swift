@@ -29,6 +29,10 @@ public struct CacheServerEndpoint: Equatable, Sendable {
             return nil
         }
 
+        if let endpoint = unbracketedIPv6Endpoint(from: trimmed, defaultPort: defaultPort) {
+            return endpoint
+        }
+
         let candidate = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
         guard
             let components = URLComponents(string: candidate),
@@ -52,6 +56,19 @@ public struct CacheServerEndpoint: Equatable, Sendable {
         }
 
         return Self(host: host, port: port)
+    }
+
+    private static func unbracketedIPv6Endpoint(from text: String, defaultPort: Int) -> Self? {
+        guard
+            !text.contains("://"),
+            !text.hasPrefix("["),
+            !text.contains("/"),
+            text.filter({ $0 == ":" }).count > 1
+        else {
+            return nil
+        }
+
+        return Self(host: text, port: defaultPort)
     }
 }
 
