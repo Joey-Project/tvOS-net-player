@@ -396,6 +396,7 @@ impl TestServer {
         let media_url = format!("http://127.0.0.1:{media_port}");
         let state = AppState::new(CacheServerOptions {
             server_name: "Test Cache".to_owned(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             grpc_listen_url: grpc_url.clone(),
             media_listen_url,

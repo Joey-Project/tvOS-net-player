@@ -1,3 +1,4 @@
+pub mod bilibili_worker;
 pub mod config;
 pub mod generated;
 pub mod grpc_services;
@@ -5,17 +6,19 @@ pub mod library;
 pub mod media;
 pub mod playback;
 pub mod task_registry;
+mod task_store;
 
 use std::{io, net::SocketAddr, sync::Arc};
 
 use axum::{Router, routing::get};
+use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
@@ -39,10 +42,11 @@ pub struct AppState {
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
         options.validate().expect("invalid cache server options");
+        let task_state_path = options.task_state_path();
         let options = Arc::new(options);
         let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
-        let tasks = Arc::new(BilibiliTaskRegistry::default());
+        let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path(task_state_path));
 
         Self {
             options,
@@ -50,6 +54,18 @@ impl AppState {
             playback_uri_factory,
             tasks,
         }
+    }
+
+    pub fn spawn_bilibili_task_worker(
+        &self,
+        adapter: Arc<dyn BilibiliDownloadAdapter>,
+        max_concurrent_tasks: usize,
+    ) -> JoinHandle<()> {
+        tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&self.tasks),
+            adapter,
+            max_concurrent_tasks,
+        ))
     }
 }
 

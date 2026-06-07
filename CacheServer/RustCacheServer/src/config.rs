@@ -1,7 +1,7 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use url::Url;
@@ -14,21 +14,21 @@ pub struct CacheServerOptions {
     pub grpc_listen_url: String,
     pub media_listen_url: String,
     pub public_media_base_uri: Option<String>,
+    pub task_state_path: PathBuf,
     pub allowed_extensions: Vec<String>,
 }
 
 impl Default for CacheServerOptions {
     fn default() -> Self {
+        let app_base_path = default_app_base_path();
         Self {
             server_id: "default".to_owned(),
             server_name: "TVOS Net Player Cache".to_owned(),
-            root_path: env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.join("cache")))
-                .unwrap_or_else(|| PathBuf::from("cache")),
+            root_path: app_base_path.join("cache"),
             grpc_listen_url: "http://localhost:50051".to_owned(),
             media_listen_url: "http://localhost:8080".to_owned(),
             public_media_base_uri: None,
+            task_state_path: app_base_path.join("cache-server-state").join("tasks.json"),
             allowed_extensions: vec![".mp4".to_owned(), ".m4v".to_owned(), ".mov".to_owned()],
         }
     }
@@ -89,6 +89,10 @@ impl CacheServerOptions {
         listen_addrs(&self.media_listen_url)
     }
 
+    pub fn task_state_path(&self) -> PathBuf {
+        self.task_state_path.clone()
+    }
+
     fn apply(&mut self, key: &str, value: String) -> Result<(), ConfigError> {
         match key {
             "Cache:ServerId" => self.server_id = value,
@@ -97,6 +101,7 @@ impl CacheServerOptions {
             "Cache:GrpcListenUrl" => self.grpc_listen_url = value,
             "Cache:MediaListenUrl" => self.media_listen_url = value,
             "Cache:PublicMediaBaseUri" => self.public_media_base_uri = Some(value),
+            "Cache:TaskStatePath" => self.task_state_path = PathBuf::from(value),
             "Cache:AllowedExtensions" => {
                 self.allowed_extensions = value
                     .split(',')
@@ -163,6 +168,13 @@ fn parse_http_url(value: &str) -> Result<Url, ConfigError> {
     Ok(url)
 }
 
+fn default_app_base_path() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[derive(Debug)]
 pub struct ConfigError {
     message: String,
@@ -197,6 +209,8 @@ mod tests {
             "http://127.0.0.1:51001".to_owned(),
             "--Cache:RootPath".to_owned(),
             "/tmp/cache".to_owned(),
+            "--Cache:TaskStatePath".to_owned(),
+            "/tmp/cache-state/tasks.json".to_owned(),
             "--Cache:ServerName".to_owned(),
             "Test Cache".to_owned(),
         ])
@@ -204,6 +218,10 @@ mod tests {
 
         assert_eq!("Test Cache", options.server_name);
         assert_eq!(PathBuf::from("/tmp/cache"), options.root_path);
+        assert_eq!(
+            PathBuf::from("/tmp/cache-state/tasks.json"),
+            options.task_state_path
+        );
         assert_eq!(
             "127.0.0.1:51000".parse::<SocketAddr>().unwrap(),
             options.grpc_listen_addr().unwrap()
