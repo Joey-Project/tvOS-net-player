@@ -1,3 +1,4 @@
+mod bbdown_adapter;
 pub mod bilibili_worker;
 pub mod config;
 pub mod generated;
@@ -11,6 +12,7 @@ mod task_store;
 use std::{io, net::SocketAddr, sync::Arc};
 
 use axum::{Router, routing::get};
+use bbdown_adapter::BbdownBilibiliAdapter;
 use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
@@ -31,6 +33,8 @@ use crate::{
     task_registry::BilibiliTaskRegistry,
 };
 
+const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
+
 #[derive(Clone)]
 pub struct AppState {
     pub options: Arc<CacheServerOptions>,
@@ -41,6 +45,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
+        options.validate().expect("invalid cache server options");
+        let options = options.normalized_for_runtime();
         options.validate().expect("invalid cache server options");
         let task_state_path = options.task_state_path();
         let options = Arc::new(options);
@@ -67,6 +73,20 @@ impl AppState {
             max_concurrent_tasks,
         ))
     }
+
+    pub fn spawn_configured_bilibili_task_worker(&self) -> Option<JoinHandle<()>> {
+        if !self.options.bilibili_worker_enabled {
+            return None;
+        }
+
+        Some(self.spawn_bilibili_task_worker(
+            Arc::new(BbdownBilibiliAdapter::new(
+                Arc::clone(&self.options),
+                Arc::clone(&self.library),
+            )),
+            BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
+        ))
+    }
 }
 
 pub async fn run(
@@ -86,6 +106,7 @@ pub async fn run_with_state(
 
     let grpc_server = run_grpc_servers(grpc_addrs, grpc_state);
     let media_server = run_media_servers(media_addrs, media_state);
+    let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
 
     tokio::select! {
         result = grpc_server => result,

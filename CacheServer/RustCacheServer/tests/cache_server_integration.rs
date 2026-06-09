@@ -400,6 +400,7 @@ impl TestServer {
             root_path,
             grpc_listen_url: grpc_url.clone(),
             media_listen_url,
+            bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
 

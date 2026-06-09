@@ -68,6 +68,12 @@ impl LocalMediaLibrary {
             .await
     }
 
+    pub async fn item_id_for_media_path(&self, path: impl Into<PathBuf>) -> Option<String> {
+        let path = path.into();
+        self.run_blocking(move |library, _| library.item_id_for_media_path_blocking(&path))
+            .await
+    }
+
     pub async fn get_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
         let item_id = item_id.to_owned();
         let variant_id = variant_id.to_owned();
@@ -180,6 +186,12 @@ impl LocalMediaLibrary {
     fn get_item_blocking(&self, id: &str) -> Option<LibraryItem> {
         let media_file = self.resolve_media_file(id, VARIANT_ID)?;
         Some(self.create_library_item(&media_file))
+    }
+
+    fn item_id_for_media_path_blocking(&self, path: &Path) -> Option<String> {
+        let root_path = self.root_path();
+        let media_file = self.try_create_media_file(&root_path, path)?;
+        Some(create_item_id(&media_file.relative_path))
     }
 
     fn get_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
@@ -613,6 +625,15 @@ pub fn decode_item_id(item_id: &str) -> Option<PathBuf> {
 
 fn relative_path(root_path: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root_path).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
     Some(
         relative
             .to_string_lossy()
@@ -858,6 +879,54 @@ mod tests {
         assert!(decode_item_id(&create_item_id("../escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("/escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("./escape.mp4")).is_none());
+    }
+
+    #[test]
+    fn media_paths_map_to_validated_item_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let movie_dir = root_path.join("Movies");
+        fs::create_dir_all(&movie_dir).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let movie_dir = root_path.join("Movies");
+        let movie_path = movie_dir.join("Sample.mp4");
+        fs::write(&movie_path, b"sample").unwrap();
+        let ignored_path = movie_dir.join("Sample.txt");
+        fs::write(&ignored_path, b"sample").unwrap();
+
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            ..CacheServerOptions::default()
+        }));
+
+        let item_id = library
+            .item_id_for_media_path_blocking(&movie_path)
+            .expect("mp4 path should map to an item id");
+        assert_eq!(
+            PathBuf::from("Movies/Sample.mp4"),
+            decode_item_id(&item_id).unwrap()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&ignored_path)
+                .is_none()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&temp.path().join("Outside.mp4"))
+                .is_none()
+        );
+
+        let escaped_dir = root_path.join("Bilibili");
+        fs::create_dir_all(&escaped_dir).unwrap();
+        let escaped_target = root_path.parent().unwrap().join("Escaped.mp4");
+        fs::write(&escaped_target, b"sample").unwrap();
+        let escaped_path = escaped_dir.join("../../Escaped.mp4");
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&escaped_path)
+                .is_none()
+        );
     }
 
     #[test]
