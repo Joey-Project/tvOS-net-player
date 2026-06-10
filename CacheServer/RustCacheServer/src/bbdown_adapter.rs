@@ -1,10 +1,17 @@
-use std::{fmt::Display, path::PathBuf, sync::Arc};
+use std::{
+    ffi::OsString,
+    fmt::Display,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 
 use bbdown_core::{
     BiliClient, ClientConfig, DownloadArchive, DownloadFileKind, DownloadOptions, DownloadReport,
-    DuplicateDecision, Input, MuxOptions, Selection, StreamSelection,
+    DuplicateDecision, EntryDownloadReport, Input, MuxOptions, MuxReport, Selection,
+    StreamSelection,
 };
-use tokio::sync::Mutex;
+use tokio::{fs, process::Command, sync::Mutex};
 
 use crate::{
     bilibili_worker::{
@@ -93,6 +100,20 @@ impl BbdownBilibiliAdapter {
 
         let downloaded_bytes = downloaded_bytes(&report);
         context.report_progress(BilibiliTaskProgress {
+            progress: Some(0.80),
+            downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
+            total_bytes: Some(to_i64_saturating(downloaded_bytes)),
+            message: Some("Muxing downloaded media for local playback.".to_owned()),
+        });
+        let report = mux_download_report(report, &self.ffmpeg_path).await?;
+
+        if context.is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled after BBDown muxing completed.".to_owned(),
+            ));
+        }
+
+        context.report_progress(BilibiliTaskProgress {
             progress: Some(0.95),
             downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
             total_bytes: Some(to_i64_saturating(downloaded_bytes)),
@@ -128,7 +149,7 @@ impl BbdownBilibiliAdapter {
             .with_stream_selection(stream_selection_from_options(options))
             .with_subtitles(options.is_some_and(|options| options.download_subtitles))
             .with_danmaku(options.is_some_and(|options| options.download_danmaku))
-            .with_mux(MuxOptions::ffmpeg(self.ffmpeg_path.clone()))
+            .with_mux(MuxOptions::Disabled)
     }
 }
 
@@ -209,6 +230,173 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
         }
     }
     candidates
+}
+
+async fn mux_download_report(
+    mut report: DownloadReport,
+    ffmpeg_path: &Path,
+) -> Result<DownloadReport, BilibiliDownloadError> {
+    for entry in &mut report.entries {
+        if entry.mux.is_some() {
+            continue;
+        }
+        if let Some(mux) = mux_entry_media(entry, ffmpeg_path).await? {
+            entry.mux = Some(mux);
+        }
+    }
+    Ok(report)
+}
+
+async fn mux_entry_media(
+    entry: &EntryDownloadReport,
+    ffmpeg_path: &Path,
+) -> Result<Option<MuxReport>, BilibiliDownloadError> {
+    let media_files = entry
+        .files
+        .iter()
+        .filter(|file| is_media_kind(&file.kind))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if media_files.is_empty() {
+        return Ok(None);
+    }
+
+    fs::create_dir_all(&entry.directory).await.map_err(failed)?;
+    let output_path = entry.directory.join("cache-server-playback.mp4");
+    let mux_output_path = temporary_mux_output_path(&output_path);
+    remove_file_if_exists(&mux_output_path).await?;
+
+    let mut args = Vec::new();
+    args.push(OsString::from("-y"));
+    args.push(OsString::from("-nostdin"));
+    if only_flv_segments(entry) {
+        let list_path = entry.directory.join("cache-server-ffmpeg-concat.txt");
+        fs::write(&list_path, concat_file_list(&media_files))
+            .await
+            .map_err(failed)?;
+        args.extend([
+            OsString::from("-f"),
+            OsString::from("concat"),
+            OsString::from("-safe"),
+            OsString::from("0"),
+            OsString::from("-i"),
+            list_path.into_os_string(),
+        ]);
+    } else {
+        for media_file in &media_files {
+            args.push(OsString::from("-i"));
+            args.push(media_file.as_os_str().to_os_string());
+        }
+    }
+    args.extend([
+        OsString::from("-c"),
+        OsString::from("copy"),
+        mux_output_path.as_os_str().to_os_string(),
+    ]);
+
+    let output = Command::new(ffmpeg_path)
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(failed)?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&mux_output_path).await;
+        return Err(BilibiliDownloadError::Failed(format!(
+            "BBDown adapter ffmpeg mux failed with status {}: {}",
+            output.status.code().map_or_else(
+                || "terminated by signal".to_owned(),
+                |code| code.to_string()
+            ),
+            stderr_tail(&output.stderr)
+        )));
+    }
+
+    let metadata = fs::metadata(&mux_output_path).await.map_err(failed)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        let _ = fs::remove_file(&mux_output_path).await;
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown adapter ffmpeg mux produced no playable output.".to_owned(),
+        ));
+    }
+
+    if let Err(error) = fs::rename(&mux_output_path, &output_path).await {
+        if output_path.exists() {
+            fs::remove_file(&output_path).await.map_err(failed)?;
+            fs::rename(&mux_output_path, &output_path)
+                .await
+                .map_err(failed)?;
+        } else {
+            return Err(failed(error));
+        }
+    }
+
+    Ok(Some(MuxReport {
+        output_path,
+        command: command_report(ffmpeg_path, &args),
+    }))
+}
+
+fn is_media_kind(kind: &DownloadFileKind) -> bool {
+    matches!(
+        kind,
+        DownloadFileKind::Video | DownloadFileKind::Audio | DownloadFileKind::FlvSegment
+    )
+}
+
+fn only_flv_segments(entry: &EntryDownloadReport) -> bool {
+    entry
+        .files
+        .iter()
+        .filter(|file| is_media_kind(&file.kind))
+        .all(|file| file.kind == DownloadFileKind::FlvSegment)
+}
+
+fn temporary_mux_output_path(output_path: &Path) -> PathBuf {
+    output_path.with_file_name(".cache-server-playback.tmp.mp4")
+}
+
+fn concat_file_list(media_files: &[PathBuf]) -> String {
+    media_files
+        .iter()
+        .map(|path| {
+            format!(
+                "file '{}'\n",
+                path.display().to_string().replace('\'', "'\\''")
+            )
+        })
+        .collect()
+}
+
+fn command_report(ffmpeg_path: &Path, args: &[OsString]) -> Vec<String> {
+    std::iter::once(ffmpeg_path.as_os_str().to_string_lossy().into_owned())
+        .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
+        .collect()
+}
+
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    let max_chars = 1200;
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_owned();
+    }
+
+    format!(
+        "...{}",
+        text.chars()
+            .skip(char_count.saturating_sub(max_chars))
+            .collect::<String>()
+    )
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 fn downloaded_bytes(report: &DownloadReport) -> u64 {
@@ -301,5 +489,82 @@ mod tests {
             ]
         );
         assert_eq!(downloaded_bytes(&report), 18);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_download_report_uses_mp4_temporary_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let video_path = entry_dir.join("video.m4s");
+        let audio_path = entry_dir.join("audio.m4s");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir.clone(),
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: video_path,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: audio_path,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+
+        let report = mux_download_report(report, &ffmpeg).await.unwrap();
+        let mux = report.entries[0].mux.as_ref().unwrap();
+        let output_path = entry_dir.join("cache-server-playback.mp4");
+        assert_eq!(output_path, mux.output_path);
+        assert_eq!(b"muxed", std::fs::read(&output_path).unwrap().as_slice());
+
+        let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log")).unwrap();
+        let args = args_log.lines().collect::<Vec<_>>();
+        let mux_temp_arg = args.last().unwrap();
+        assert!(mux_temp_arg.ends_with(".mp4"));
+        assert!(mux_temp_arg.contains(".tmp."));
+    }
+
+    #[cfg(unix)]
+    fn write_fake_ffmpeg(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+args_log="$script_dir/ffmpeg-args.log"
+: > "$args_log"
+last=
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$args_log"
+  last=$arg
+done
+printf muxed > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 }
