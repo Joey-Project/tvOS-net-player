@@ -81,7 +81,7 @@ impl BbdownBilibiliAdapter {
             0.10,
             format!("Downloading {} Bilibili entry(s).", plan.entries.len()),
         ));
-        let download_options = self.download_options(request.options.as_ref());
+        let download_options = self.download_options(request.options.as_ref())?;
         let _archive_guard = self.archive_lock.lock().await;
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -161,12 +161,16 @@ impl BbdownBilibiliAdapter {
         )))
     }
 
-    fn download_options(&self, options: Option<&BilibiliDownloadOptions>) -> DownloadOptions {
-        DownloadOptions::new(self.output_dir.clone())
+    fn download_options(
+        &self,
+        options: Option<&BilibiliDownloadOptions>,
+    ) -> Result<DownloadOptions, BilibiliDownloadError> {
+        validate_supported_download_options(options)?;
+        Ok(DownloadOptions::new(self.output_dir.clone())
             .with_stream_selection(stream_selection_from_options(options))
             .with_subtitles(options.is_some_and(|options| options.download_subtitles))
             .with_danmaku(options.is_some_and(|options| options.download_danmaku))
-            .with_mux(MuxOptions::Disabled)
+            .with_mux(MuxOptions::Disabled))
     }
 }
 
@@ -222,6 +226,30 @@ fn default_selection_for_input(input: &Input) -> Option<Selection> {
             Some(Selection::Current)
         }
     }
+}
+
+fn validate_supported_download_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<(), BilibiliDownloadError> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+
+    let encoding_preference = options.encoding_preference.trim();
+    if !encoding_preference.is_empty() {
+        return Err(BilibiliDownloadError::Failed(format!(
+            "BBDown adapter does not support encoding_preference yet; received {encoding_preference:?}."
+        )));
+    }
+
+    if options.prefer_tv_api {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown adapter does not support prefer_tv_api yet; set prefer_tv_api=false."
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn stream_selection_from_options(options: Option<&BilibiliDownloadOptions>) -> StreamSelection {
@@ -555,6 +583,55 @@ mod tests {
         assert_eq!(video_quality_preference("4k"), Some(120));
         assert_eq!(video_quality_preference("80"), Some(80));
         assert_eq!(video_quality_preference("best"), None);
+    }
+
+    #[test]
+    fn accepts_supported_download_options() {
+        let options = BilibiliDownloadOptions {
+            quality_preference: "1080p".to_owned(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: true,
+            download_danmaku: false,
+        };
+
+        assert!(validate_supported_download_options(Some(&options)).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_encoding_preference() {
+        let options = BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: "hevc".to_owned(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+        };
+
+        let result = validate_supported_download_options(Some(&options));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("does not support encoding_preference")
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_tv_api_preference() {
+        let options = BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: String::new(),
+            prefer_tv_api: true,
+            download_subtitles: false,
+            download_danmaku: false,
+        };
+
+        let result = validate_supported_download_options(Some(&options));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("does not support prefer_tv_api")
+        ));
     }
 
     #[test]
