@@ -24,10 +24,10 @@ superseded_by:
 - `Cache:BilibiliWorkerEnabled` defaults to `true` in normal server runtime; integration tests disable it to keep control-plane tests offline and deterministic.
 - `bbdown-core` is pinned to commit `55c764d660996f6547225957d680500b481c31bb`.
 - The adapter writes downloads under `Cache:RootPath/Bilibili` by default and stores BBDown archive state beside the task snapshot as `bbdown-archive.json`.
-- Startup validation rejects BBDown output paths outside `Cache:RootPath`, `..` parent components, and existing symlink components under that root before handing paths to BBDown.
+- Startup validation rejects enabled or explicitly configured BBDown output paths outside `Cache:RootPath`, `..` parent components, and existing symlink components under that root before handing paths to BBDown.
 - Runtime setup canonicalizes existing root/output prefixes before constructing the media library and BBDown adapter, keeping their path boundary checks aligned.
 - The real BBDown adapter currently caps effective worker concurrency at `1` because archive updates are serialized around the core download call.
-- The adapter lets `bbdown-core` handle planning/download/archive state, then runs server-owned `ffmpeg` muxing into an `.mp4`-suffixed temporary output before publishing `cache-server-playback.mp4` for library indexing. This avoids ffmpeg container inference failures on extensionless core mux temp paths.
+- The adapter lets `bbdown-core` handle planning/download/archive state, then runs server-owned `ffmpeg` muxing into a hidden non-indexed temporary output before publishing a title-preserving `.mp4` for library indexing. This avoids ffmpeg container inference failures without exposing partial mux outputs to library scans.
 - The mux phase checks task cancellation before starting and while `ffmpeg` is running; cancellation kills and reaps the child process before returning a cancelled task result.
 - BV/av inputs default to current/first page, while ss/md inputs default to latest episode because the task result schema currently exposes one `library_item_id`.
 - Progress is coarse-grained until BBDown core exposes chunk-level download progress and native download cancellation hooks.

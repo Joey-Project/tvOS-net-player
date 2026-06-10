@@ -58,12 +58,12 @@ Important limitations to hide behind our server boundary:
 Current Rust crate adapter behavior:
 
 - Worker startup is controlled by `Cache:BilibiliWorkerEnabled`; it defaults to enabled in the normal server runtime.
-- Downloads go to `Cache:BBDownOutputDir`, which must be inside `Cache:RootPath` with no `..` parent components and no existing symlink components under the root, and defaults to `Cache:RootPath/Bilibili`.
+- Downloads go to `Cache:BBDownOutputDir`, which defaults to `Cache:RootPath/Bilibili`; this path is validated when the worker is enabled or when the output path is explicitly configured, and must be inside `Cache:RootPath` with no `..` parent components and no existing symlink components under the root.
 - At runtime, existing root/output path prefixes are canonicalized before constructing the media library and BBDown adapter so common symlink ancestors such as `/tmp` do not make BBDown download to a path the library later rejects.
 - Download archive state goes to `Cache:BBDownArchivePath`, defaulting to `bbdown-archive.json` beside `Cache:TaskStatePath`.
-- The adapter requires `ffmpeg` and passes `MuxOptions::ffmpeg(...)` so BBDown materializes `.mp4` outputs that the current local media library can index.
+- The adapter requires `ffmpeg`; BBDown core downloads the selected media streams, and the server runs its own `ffmpeg` mux step to publish a title-preserving `.mp4` output that the current local media library can index.
 - The adapter defaults BV/av inputs to current/first page and ss/md inputs to latest episode because the current task result schema has only one `library_item_id`.
-- `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. `encoding_preference` and `prefer_tv_api` are accepted by the proto but are not yet implemented by the adapter.
+- `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. `encoding_preference` and `prefer_tv_api` remain in the proto but are rejected until the adapter implements them.
 - BBDown core currently does not expose a chunk-level progress callback or cancellation hook. The worker reports coarse phases and marks late cancellation as cancelled after the core call returns; files may already exist on disk and can be discovered by library rescan.
 
 ## Protocol Shape
@@ -128,7 +128,7 @@ Configuration:
 - `Cache:TaskStatePath`: JSON task snapshot path. Defaults to `cache-server-state/tasks.json` next to the server executable.
 - `Cache:BilibiliWorkerEnabled`: starts the real BBDown worker when true. Defaults to `true`.
 - `Cache:BilibiliWorkerMaxConcurrentTasks`: maximum task worker concurrency. Defaults to `1`; the real BBDown adapter currently caps effective concurrency at `1` to avoid concurrent writes to the same archive.
-- `Cache:BBDownOutputDir`: BBDown download output directory. It must be inside `Cache:RootPath`, with no `..` parent components and no existing symlink components under the root, and defaults to `Cache:RootPath/Bilibili`.
+- `Cache:BBDownOutputDir`: BBDown download output directory. It defaults to `Cache:RootPath/Bilibili`; when the worker is enabled or this path is explicitly configured, it must be inside `Cache:RootPath`, with no `..` parent components and no existing symlink components under the root.
 - Existing root/output prefixes are canonicalized at runtime before the media library and BBDown adapter are built.
 - `Cache:BBDownArchivePath`: BBDown archive JSON path. Defaults to `bbdown-archive.json` beside `Cache:TaskStatePath`.
 - `Cache:BBDownFfmpegPath`: `ffmpeg` executable path. Defaults to `ffmpeg` from `PATH`.

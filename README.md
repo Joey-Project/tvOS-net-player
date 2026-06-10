@@ -80,11 +80,11 @@ BBDown adapter 相关配置：
 
 - `Cache:BilibiliWorkerEnabled`: 是否启动真实 worker。默认 `true`；测试或只想保留排队 control-plane 时可设为 `false`。
 - `Cache:BilibiliWorkerMaxConcurrentTasks`: worker 最大并发 task 数。默认 `1`。当前真实 BBDown adapter 会把有效并发限制为 `1`，避免并发写同一个 archive；更高并发等 BBDown archive 语义明确后再放开。
-- `Cache:BBDownOutputDir`: BBDown 输出目录，必须位于 `Cache:RootPath` 内，不能包含 `..` parent components，且 root 内已经存在的输出路径组件不能是 symlink。默认是 `Cache:RootPath/Bilibili`。
+- `Cache:BBDownOutputDir`: BBDown 输出目录，默认是 `Cache:RootPath/Bilibili`；当 worker 启用或显式配置该路径时，它必须位于 `Cache:RootPath` 内，不能包含 `..` parent components，且 root 内已经存在的输出路径组件不能是 symlink。
 - `Cache:BBDownArchivePath`: BBDown 下载 archive JSON。默认和 `Cache:TaskStatePath` 同目录，文件名为 `bbdown-archive.json`。
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。
 
-启动时 server 会把 `Cache:RootPath` 和 BBDown output 的已存在路径前缀 canonicalize，再交给 media library 和 BBDown adapter 使用，避免 symlink ancestor 造成下载路径和索引边界不一致。
+启动时 server 会把 `Cache:RootPath` 和启用中的 BBDown output 的已存在路径前缀 canonicalize，再交给 media library 和 BBDown adapter 使用，避免 symlink ancestor 造成下载路径和索引边界不一致。
 
 当前 task result 仍然只有一个 `library_item_id`。因此 adapter 默认把普通 BV/av 输入解析为当前/第一页，把 `ss`/`md` 输入解析为最新一集；全集缓存需要后续扩展 task options 或 result schema。
 

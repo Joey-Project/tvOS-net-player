@@ -79,26 +79,28 @@ impl CacheServerOptions {
                 "Bilibili worker max concurrent tasks must be greater than zero.",
             ));
         }
-        if self
-            .bbdown_output_dir
-            .as_deref()
-            .is_some_and(path_contains_parent_component)
-        {
-            return Err(ConfigError::new(
-                "BBDown output directory must not contain parent directory components.",
-            ));
-        }
-        let root_path = self.normalized_root_path();
-        let bbdown_output_dir = self.bbdown_output_dir();
-        if !bbdown_output_dir.starts_with(&root_path) {
-            return Err(ConfigError::new(
-                "BBDown output directory must be inside Cache:RootPath.",
-            ));
-        }
-        if bbdown_output_dir_contains_link(&root_path, &bbdown_output_dir)? {
-            return Err(ConfigError::new(
-                "BBDown output directory must not include symlink components inside Cache:RootPath.",
-            ));
+        if self.bilibili_worker_enabled || self.bbdown_output_dir.is_some() {
+            if self
+                .bbdown_output_dir
+                .as_deref()
+                .is_some_and(path_contains_parent_component)
+            {
+                return Err(ConfigError::new(
+                    "BBDown output directory must not contain parent directory components.",
+                ));
+            }
+            let root_path = self.normalized_root_path();
+            let bbdown_output_dir = self.bbdown_output_dir();
+            if !bbdown_output_dir.starts_with(&root_path) {
+                return Err(ConfigError::new(
+                    "BBDown output directory must be inside Cache:RootPath.",
+                ));
+            }
+            if bbdown_output_dir_contains_link(&root_path, &bbdown_output_dir)? {
+                return Err(ConfigError::new(
+                    "BBDown output directory must not include symlink components inside Cache:RootPath.",
+                ));
+            }
         }
 
         Ok(())
@@ -529,6 +531,27 @@ mod tests {
         };
 
         assert!(options.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allows_disabled_worker_with_default_bbdown_output_dir_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache-root");
+        let outside_path = temp.path().join("outside");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::create_dir_all(&outside_path).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        symlink(&outside_path, root_path.join("Bilibili")).unwrap();
+        let options = CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+
+        assert!(options.validate().is_ok());
     }
 
     #[cfg(unix)]
