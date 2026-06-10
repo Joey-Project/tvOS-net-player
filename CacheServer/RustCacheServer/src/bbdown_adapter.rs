@@ -415,11 +415,26 @@ where
             return Err(failed(error));
         }
     }
+    cleanup_mux_source_files(&media_files, &output_path, &mux_output_path).await?;
 
     Ok(Some(MuxReport {
         output_path,
         command: command_report(ffmpeg_path, &args),
     }))
+}
+
+async fn cleanup_mux_source_files(
+    media_files: &[PathBuf],
+    output_path: &Path,
+    mux_output_path: &Path,
+) -> Result<(), BilibiliDownloadError> {
+    for media_file in media_files {
+        if media_file == output_path || media_file == mux_output_path {
+            continue;
+        }
+        remove_file_if_exists(media_file).await?;
+    }
+    Ok(())
 }
 
 struct FfmpegMuxOutput {
@@ -848,8 +863,10 @@ mod tests {
         std::fs::create_dir_all(&entry_dir).unwrap();
         let video_path = entry_dir.join("video.m4s");
         let audio_path = entry_dir.join("audio.m4s");
+        let subtitle_path = entry_dir.join("subtitle.srt");
         std::fs::write(&video_path, b"video").unwrap();
         std::fs::write(&audio_path, b"audio").unwrap();
+        std::fs::write(&subtitle_path, b"subtitle").unwrap();
         let ffmpeg = write_fake_ffmpeg(temp.path());
 
         let report = DownloadReport {
@@ -862,13 +879,19 @@ mod tests {
                 files: vec![
                     DownloadedFile {
                         kind: DownloadFileKind::Video,
-                        path: video_path,
+                        path: video_path.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
                     DownloadedFile {
                         kind: DownloadFileKind::Audio,
-                        path: audio_path,
+                        path: audio_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Subtitle,
+                        path: subtitle_path.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
@@ -885,6 +908,9 @@ mod tests {
         let output_path = entry_dir.join("Entry_ Episode 1.mp4");
         assert_eq!(output_path, mux.output_path);
         assert_eq!(b"muxed", std::fs::read(&output_path).unwrap().as_slice());
+        assert!(!video_path.exists());
+        assert!(!audio_path.exists());
+        assert!(subtitle_path.exists());
 
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log")).unwrap();
         let args = args_log.lines().collect::<Vec<_>>();
