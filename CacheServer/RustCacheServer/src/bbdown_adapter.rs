@@ -230,7 +230,7 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     for entry in &report.entries {
         for file in &entry.files {
             if matches!(
-                file.kind,
+                &file.kind,
                 DownloadFileKind::Video | DownloadFileKind::FlvSegment
             ) {
                 candidates.push(file.path.clone());
