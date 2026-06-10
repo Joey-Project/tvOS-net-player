@@ -105,6 +105,7 @@ impl BbdownBilibiliAdapter {
 
         let downloaded_bytes = downloaded_bytes(&report);
         if context.is_cancel_requested() {
+            cleanup_downloaded_media_sources(&report).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled before BBDown muxing started.".to_owned(),
             ));
@@ -333,12 +334,7 @@ async fn mux_entry_media<F>(
 where
     F: Fn() -> bool,
 {
-    let media_files = entry
-        .files
-        .iter()
-        .filter(|file| is_media_kind(&file.kind))
-        .map(|file| file.path.clone())
-        .collect::<Vec<_>>();
+    let media_files = mux_source_files(entry);
     if media_files.is_empty() {
         return Ok(None);
     }
@@ -381,12 +377,12 @@ where
     let output = match run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await {
         Ok(output) => output,
         Err(error) => {
-            let _ = fs::remove_file(&mux_output_path).await;
+            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
             return Err(error);
         }
     };
     if !output.status.success() {
-        let _ = fs::remove_file(&mux_output_path).await;
+        cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
         return Err(BilibiliDownloadError::Failed(format!(
             "BBDown adapter ffmpeg mux failed with status {}: {}",
             output.status.code().map_or_else(
@@ -397,9 +393,15 @@ where
         )));
     }
 
-    let metadata = fs::metadata(&mux_output_path).await.map_err(failed)?;
+    let metadata = match fs::metadata(&mux_output_path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+            return Err(failed(error));
+        }
+    };
     if !metadata.is_file() || metadata.len() == 0 {
-        let _ = fs::remove_file(&mux_output_path).await;
+        cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
         return Err(BilibiliDownloadError::Failed(
             "BBDown adapter ffmpeg mux produced no playable output.".to_owned(),
         ));
@@ -407,11 +409,16 @@ where
 
     if let Err(error) = fs::rename(&mux_output_path, &output_path).await {
         if output_path.exists() {
-            fs::remove_file(&output_path).await.map_err(failed)?;
-            fs::rename(&mux_output_path, &output_path)
-                .await
-                .map_err(failed)?;
+            if let Err(error) = fs::remove_file(&output_path).await {
+                cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+                return Err(failed(error));
+            }
+            if let Err(error) = fs::rename(&mux_output_path, &output_path).await {
+                cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+                return Err(failed(error));
+            }
         } else {
+            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
             return Err(failed(error));
         }
     }
@@ -421,6 +428,33 @@ where
         output_path,
         command: command_report(ffmpeg_path, &args),
     }))
+}
+
+fn mux_source_files(entry: &EntryDownloadReport) -> Vec<PathBuf> {
+    entry
+        .files
+        .iter()
+        .filter(|file| is_media_kind(&file.kind))
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+async fn cleanup_downloaded_media_sources(report: &DownloadReport) {
+    for entry in &report.entries {
+        let media_files = mux_source_files(entry);
+        let output_path = playback_output_path(entry);
+        let mux_output_path = temporary_mux_output_path(&output_path);
+        let _ = cleanup_mux_source_files(&media_files, &output_path, &mux_output_path).await;
+    }
+}
+
+async fn cleanup_failed_mux_files(
+    media_files: &[PathBuf],
+    output_path: &Path,
+    mux_output_path: &Path,
+) {
+    let _ = fs::remove_file(mux_output_path).await;
+    let _ = cleanup_mux_source_files(media_files, output_path, mux_output_path).await;
 }
 
 async fn cleanup_mux_source_files(
@@ -958,13 +992,13 @@ mod tests {
                 files: vec![
                     DownloadedFile {
                         kind: DownloadFileKind::Video,
-                        path: video_path,
+                        path: video_path.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
                     DownloadedFile {
                         kind: DownloadFileKind::Audio,
-                        path: audio_path,
+                        path: audio_path.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
@@ -1000,7 +1034,69 @@ mod tests {
         ));
         assert!(!output_path.exists());
         assert!(!temp_output_path.exists());
+        assert!(!video_path.exists());
+        assert!(!audio_path.exists());
         wait_for_process_exit(pid).await;
+    }
+
+    #[tokio::test]
+    async fn mux_download_report_cleans_source_streams_when_ffmpeg_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let video_path = entry_dir.join("video.m4s");
+        let audio_path = entry_dir.join("audio.m4s");
+        let subtitle_path = entry_dir.join("subtitle.srt");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+        std::fs::write(&subtitle_path, b"subtitle").unwrap();
+        let output_path = entry_dir.join("Entry.mp4");
+        let temp_output_path = temporary_mux_output_path(&output_path);
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: video_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: audio_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Subtitle,
+                        path: subtitle_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+
+        let never_cancelled = || false;
+        let result = mux_download_report(
+            report,
+            &temp.path().join("missing-ffmpeg"),
+            &never_cancelled,
+        )
+        .await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert!(!output_path.exists());
+        assert!(!temp_output_path.exists());
+        assert!(!video_path.exists());
+        assert!(!audio_path.exists());
+        assert!(subtitle_path.exists());
     }
 
     #[cfg(unix)]
