@@ -64,7 +64,12 @@ impl BbdownBilibiliAdapter {
         ));
         let input = Input::parse(&request.source).map_err(failed)?;
         let selection = default_selection_for_input(&input);
-        let plan = self.client.plan(input, selection).await.map_err(failed)?;
+        let plan = run_bbdown_until_cancelled(
+            self.client.plan(input, selection),
+            || context.is_cancel_requested(),
+            "Cancelled while BBDown planning was running.",
+        )
+        .await?;
 
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -570,6 +575,19 @@ mod tests {
 
     #[tokio::test]
     async fn cancellable_bbdown_future_drops_running_operation() {
+        assert_cancellable_bbdown_future_drops_running_operation(
+            "Cancelled while BBDown planning was running.",
+        )
+        .await;
+        assert_cancellable_bbdown_future_drops_running_operation(
+            "Cancelled while the BBDown download was running.",
+        )
+        .await;
+    }
+
+    async fn assert_cancellable_bbdown_future_drops_running_operation(
+        cancellation_message: &'static str,
+    ) {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -601,7 +619,7 @@ mod tests {
             run_bbdown_until_cancelled(
                 future,
                 || cancel_probe.load(Ordering::SeqCst),
-                "Cancelled while the BBDown download was running.",
+                cancellation_message,
             )
             .await
         });
@@ -622,7 +640,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(BilibiliDownloadError::Cancelled(message))
-                if message == "Cancelled while the BBDown download was running."
+                if message == cancellation_message
         ));
         assert!(dropped.load(Ordering::SeqCst));
     }
