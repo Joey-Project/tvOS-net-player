@@ -28,8 +28,9 @@ superseded_by:
 - Runtime setup canonicalizes existing root/output prefixes before constructing the media library and BBDown adapter, keeping their path boundary checks aligned.
 - The real BBDown adapter currently caps effective worker concurrency at `1` because archive updates are serialized around the core download call.
 - The adapter lets `bbdown-core` handle planning/download/archive state, then runs server-owned `ffmpeg` muxing into an `.mp4`-suffixed temporary output before publishing `cache-server-playback.mp4` for library indexing. This avoids ffmpeg container inference failures on extensionless core mux temp paths.
+- The mux phase checks task cancellation before starting and while `ffmpeg` is running; cancellation kills and reaps the child process before returning a cancelled task result.
 - BV/av inputs default to current/first page, while ss/md inputs default to latest episode because the task result schema currently exposes one `library_item_id`.
-- Progress is coarse-grained until BBDown core exposes chunk-level progress and cancellation hooks.
+- Progress is coarse-grained until BBDown core exposes chunk-level download progress and native download cancellation hooks.
 
 ## Next Steps
 

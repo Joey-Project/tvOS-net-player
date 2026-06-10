@@ -2,8 +2,9 @@ use std::{
     ffi::OsString,
     fmt::Display,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use bbdown_core::{
@@ -11,7 +12,7 @@ use bbdown_core::{
     DuplicateDecision, EntryDownloadReport, Input, MuxOptions, MuxReport, Selection,
     StreamSelection,
 };
-use tokio::{fs, process::Command, sync::Mutex};
+use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
 
 use crate::{
     bilibili_worker::{
@@ -99,13 +100,20 @@ impl BbdownBilibiliAdapter {
         };
 
         let downloaded_bytes = downloaded_bytes(&report);
+        if context.is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled before BBDown muxing started.".to_owned(),
+            ));
+        }
+
         context.report_progress(BilibiliTaskProgress {
             progress: Some(0.80),
             downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
             total_bytes: Some(to_i64_saturating(downloaded_bytes)),
             message: Some("Muxing downloaded media for local playback.".to_owned()),
         });
-        let report = mux_download_report(report, &self.ffmpeg_path).await?;
+        let is_cancel_requested = || context.is_cancel_requested();
+        let report = mux_download_report(report, &self.ffmpeg_path, &is_cancel_requested).await?;
 
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -232,25 +240,38 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     candidates
 }
 
-async fn mux_download_report(
+async fn mux_download_report<F>(
     mut report: DownloadReport,
     ffmpeg_path: &Path,
-) -> Result<DownloadReport, BilibiliDownloadError> {
+    is_cancel_requested: &F,
+) -> Result<DownloadReport, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
     for entry in &mut report.entries {
         if entry.mux.is_some() {
             continue;
         }
-        if let Some(mux) = mux_entry_media(entry, ffmpeg_path).await? {
+        if is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled before BBDown muxing started.".to_owned(),
+            ));
+        }
+        if let Some(mux) = mux_entry_media(entry, ffmpeg_path, is_cancel_requested).await? {
             entry.mux = Some(mux);
         }
     }
     Ok(report)
 }
 
-async fn mux_entry_media(
+async fn mux_entry_media<F>(
     entry: &EntryDownloadReport,
     ffmpeg_path: &Path,
-) -> Result<Option<MuxReport>, BilibiliDownloadError> {
+    is_cancel_requested: &F,
+) -> Result<Option<MuxReport>, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
     let media_files = entry
         .files
         .iter()
@@ -294,12 +315,7 @@ async fn mux_entry_media(
         mux_output_path.as_os_str().to_os_string(),
     ]);
 
-    let output = Command::new(ffmpeg_path)
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(failed)?;
+    let output = run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await?;
     if !output.status.success() {
         let _ = fs::remove_file(&mux_output_path).await;
         return Err(BilibiliDownloadError::Failed(format!(
@@ -335,6 +351,74 @@ async fn mux_entry_media(
         output_path,
         command: command_report(ffmpeg_path, &args),
     }))
+}
+
+struct FfmpegMuxOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
+}
+
+async fn run_ffmpeg_mux<F>(
+    ffmpeg_path: &Path,
+    args: &[OsString],
+    is_cancel_requested: &F,
+) -> Result<FfmpegMuxOutput, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    if is_cancel_requested() {
+        return Err(BilibiliDownloadError::Cancelled(
+            "Cancelled before BBDown muxing started.".to_owned(),
+        ));
+    }
+
+    let mut child = Command::new(ffmpeg_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(failed)?;
+
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| failed("ffmpeg stderr pipe was not captured"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    loop {
+        if is_cancel_requested() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stderr_task.await;
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled while BBDown muxing was running.".to_owned(),
+            ));
+        }
+
+        if let Some(status) = child.try_wait().map_err(failed)? {
+            return Ok(FfmpegMuxOutput {
+                status,
+                stderr: collect_stderr(stderr_task).await?,
+            });
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn collect_stderr(
+    stderr_task: tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+) -> Result<Vec<u8>, BilibiliDownloadError> {
+    match stderr_task.await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(failed(error)),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 fn is_media_kind(kind: &DownloadFileKind) -> bool {
@@ -528,7 +612,10 @@ mod tests {
             }],
         };
 
-        let report = mux_download_report(report, &ffmpeg).await.unwrap();
+        let never_cancelled = || false;
+        let report = mux_download_report(report, &ffmpeg, &never_cancelled)
+            .await
+            .unwrap();
         let mux = report.entries[0].mux.as_ref().unwrap();
         let output_path = entry_dir.join("cache-server-playback.mp4");
         assert_eq!(output_path, mux.output_path);
@@ -539,6 +626,104 @@ mod tests {
         let mux_temp_arg = args.last().unwrap();
         assert!(mux_temp_arg.ends_with(".mp4"));
         assert!(mux_temp_arg.contains(".tmp."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_download_report_cancels_running_ffmpeg() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let video_path = entry_dir.join("video.m4s");
+        let audio_path = entry_dir.join("audio.m4s");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
+        let output_path = entry_dir.join("cache-server-playback.mp4");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: video_path,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: audio_path,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_probe = Arc::clone(&cancelled);
+        let ffmpeg_for_task = ffmpeg.clone();
+        let mux_task = tokio::spawn(async move {
+            let is_cancel_requested = || cancel_probe.load(Ordering::SeqCst);
+            mux_download_report(report, &ffmpeg_for_task, &is_cancel_requested).await
+        });
+
+        wait_for_path(&temp.path().join("ffmpeg-started")).await;
+        let pid = std::fs::read_to_string(temp.path().join("ffmpeg.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        cancelled.store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), mux_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Cancelled(message))
+                if message == "Cancelled while BBDown muxing was running."
+        ));
+        assert!(!output_path.exists());
+        wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..40 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32) {
+        for _ in 0..40 {
+            if !process_is_running(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("process {pid} was still running after cancellation");
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 
     #[cfg(unix)]
@@ -559,6 +744,30 @@ for arg in "$@"; do
   last=$arg
 done
 printf muxed > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_blocking_fake_ffmpeg(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("blocking-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+printf '%s\n' "$$" > "$script_dir/ffmpeg.pid"
+: > "$script_dir/ffmpeg-started"
+while :; do
+  sleep 1
+done
 "#,
         )
         .unwrap();
