@@ -343,7 +343,7 @@ where
     }
 
     fs::create_dir_all(&entry.directory).await.map_err(failed)?;
-    let output_path = entry.directory.join("cache-server-playback.mp4");
+    let output_path = playback_output_path(entry);
     let mux_output_path = temporary_mux_output_path(&output_path);
     remove_file_if_exists(&mux_output_path).await?;
 
@@ -372,6 +372,8 @@ where
     args.extend([
         OsString::from("-c"),
         OsString::from("copy"),
+        OsString::from("-f"),
+        OsString::from("mp4"),
         mux_output_path.as_os_str().to_os_string(),
     ]);
 
@@ -503,7 +505,37 @@ fn only_flv_segments(entry: &EntryDownloadReport) -> bool {
 }
 
 fn temporary_mux_output_path(output_path: &Path) -> PathBuf {
-    output_path.with_file_name(".cache-server-playback.tmp.mp4")
+    let file_name = output_path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "cache-server-playback.mp4".into());
+    output_path.with_file_name(format!(".{file_name}.cache-server-mux-tmp"))
+}
+
+fn playback_output_path(entry: &EntryDownloadReport) -> PathBuf {
+    entry
+        .directory
+        .join(format!("{}.mp4", safe_playback_stem(entry)))
+}
+
+fn safe_playback_stem(entry: &EntryDownloadReport) -> String {
+    let cleaned = entry
+        .title
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect::<String>();
+    let trimmed = cleaned.trim_matches(|character: char| {
+        character.is_whitespace() || character == '.' || character == '_'
+    });
+    if trimmed.is_empty() {
+        format!("Entry {}", entry.index)
+    } else {
+        trimmed.chars().take(120).collect()
+    }
 }
 
 fn concat_file_list(media_files: &[PathBuf]) -> String {
@@ -764,7 +796,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mux_download_report_uses_mp4_temporary_output() {
+    async fn mux_download_report_uses_entry_title_and_non_indexed_temporary_output() {
         let temp = tempfile::tempdir().unwrap();
         let entry_dir = temp.path().join("entry");
         std::fs::create_dir_all(&entry_dir).unwrap();
@@ -779,7 +811,7 @@ mod tests {
             output_dir: temp.path().to_path_buf(),
             entries: vec![EntryDownloadReport {
                 index: 1,
-                title: "Entry".to_owned(),
+                title: "Entry: Episode 1?".to_owned(),
                 directory: entry_dir.clone(),
                 files: vec![
                     DownloadedFile {
@@ -804,15 +836,26 @@ mod tests {
             .await
             .unwrap();
         let mux = report.entries[0].mux.as_ref().unwrap();
-        let output_path = entry_dir.join("cache-server-playback.mp4");
+        let output_path = entry_dir.join("Entry_ Episode 1.mp4");
         assert_eq!(output_path, mux.output_path);
         assert_eq!(b"muxed", std::fs::read(&output_path).unwrap().as_slice());
 
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log")).unwrap();
         let args = args_log.lines().collect::<Vec<_>>();
         let mux_temp_arg = args.last().unwrap();
-        assert!(mux_temp_arg.ends_with(".mp4"));
-        assert!(mux_temp_arg.contains(".tmp."));
+        assert_eq!(&["-f", "mp4"], &args[args.len() - 3..args.len() - 1]);
+        assert_eq!(
+            Some("cache-server-mux-tmp"),
+            Path::new(mux_temp_arg)
+                .extension()
+                .and_then(|value| value.to_str())
+        );
+        assert!(
+            Path::new(mux_temp_arg)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with('.'))
+        );
     }
 
     #[cfg(unix)]
@@ -831,7 +874,7 @@ mod tests {
         std::fs::write(&video_path, b"video").unwrap();
         std::fs::write(&audio_path, b"audio").unwrap();
         let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
-        let output_path = entry_dir.join("cache-server-playback.mp4");
+        let output_path = entry_dir.join("Entry.mp4");
         let temp_output_path = temporary_mux_output_path(&output_path);
         let report = DownloadReport {
             title: "Example".to_owned(),
