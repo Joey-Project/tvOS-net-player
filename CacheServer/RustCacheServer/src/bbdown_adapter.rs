@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     fmt::Display,
+    future::Future,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -76,28 +77,25 @@ impl BbdownBilibiliAdapter {
             format!("Downloading {} Bilibili entry(s).", plan.entries.len()),
         ));
         let download_options = self.download_options(request.options.as_ref());
-        let report = {
-            let _archive_guard = self.archive_lock.lock().await;
-            if context.is_cancel_requested() {
-                return Err(BilibiliDownloadError::Cancelled(
-                    "Cancelled before the BBDown download started.".to_owned(),
-                ));
-            }
+        let _archive_guard = self.archive_lock.lock().await;
+        if context.is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled before the BBDown download started.".to_owned(),
+            ));
+        }
 
-            let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
-            let report = self
-                .client
-                .download_plan_with_archive_decision(
-                    &plan,
-                    download_options,
-                    &mut archive,
-                    DuplicateDecision::KeepBoth,
-                )
-                .await
-                .map_err(failed)?;
-            archive.save(&self.archive_path).map_err(failed)?;
-            report
-        };
+        let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
+        let report = run_bbdown_until_cancelled(
+            self.client.download_plan_with_archive_decision(
+                &plan,
+                download_options,
+                &mut archive,
+                DuplicateDecision::KeepBoth,
+            ),
+            || context.is_cancel_requested(),
+            "Cancelled while the BBDown download was running.",
+        )
+        .await?;
 
         let downloaded_bytes = downloaded_bytes(&report);
         if context.is_cancel_requested() {
@@ -139,6 +137,12 @@ impl BbdownBilibiliAdapter {
             if let Some(library_item_id) =
                 self.library.item_id_for_media_path(candidate.clone()).await
             {
+                if context.is_cancel_requested() {
+                    return Err(BilibiliDownloadError::Cancelled(
+                        "Cancelled before committing the BBDown archive.".to_owned(),
+                    ));
+                }
+                archive.save(&self.archive_path).map_err(failed)?;
                 return Ok(BilibiliDownloadOutput {
                     library_item_id,
                     message: success_message(&report),
@@ -168,6 +172,29 @@ impl BilibiliDownloadAdapter for BbdownBilibiliAdapter {
         context: BilibiliDownloadContext,
     ) -> BilibiliDownloadFuture<'a> {
         Box::pin(async move { self.run_inner(request, context).await })
+    }
+}
+
+async fn run_bbdown_until_cancelled<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+    is_cancel_requested: impl Fn() -> bool,
+    cancellation_message: &'static str,
+) -> Result<T, BilibiliDownloadError>
+where
+    E: Display,
+{
+    tokio::pin!(future);
+    loop {
+        if is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                cancellation_message.to_owned(),
+            ));
+        }
+
+        tokio::select! {
+            result = &mut future => return result.map_err(failed),
+            () = sleep(Duration::from_millis(100)) => {}
+        }
     }
 }
 
@@ -539,6 +566,65 @@ mod tests {
             default_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())),
             Some(Selection::Current)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellable_bbdown_future_drops_running_operation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let started_for_future = Arc::clone(&started);
+        let dropped_for_future = Arc::clone(&dropped);
+        let future = async move {
+            let _drop_probe = DropProbe(dropped_for_future);
+            started_for_future.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok::<(), &'static str>(())
+        };
+
+        let cancel_probe = Arc::clone(&cancelled);
+        let task = tokio::spawn(async move {
+            run_bbdown_until_cancelled(
+                future,
+                || cancel_probe.load(Ordering::SeqCst),
+                "Cancelled while the BBDown download was running.",
+            )
+            .await
+        });
+
+        for _ in 0..40 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(started.load(Ordering::SeqCst));
+
+        cancelled.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Cancelled(message))
+                if message == "Cancelled while the BBDown download was running."
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
