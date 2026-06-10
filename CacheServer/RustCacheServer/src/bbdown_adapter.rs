@@ -58,11 +58,13 @@ impl BbdownBilibiliAdapter {
             ));
         }
 
+        let input = Input::parse(&request.source).map_err(failed)?;
+        let download_options = self.download_options(request.options.as_ref())?;
+
         context.report_progress(progress(
             0.02,
             "Planning Bilibili download with BBDown core.",
         ));
-        let input = Input::parse(&request.source).map_err(failed)?;
         let selection = default_selection_for_input(&input);
         let plan = run_bbdown_until_cancelled(
             self.client.plan(input, selection),
@@ -81,7 +83,6 @@ impl BbdownBilibiliAdapter {
             0.10,
             format!("Downloading {} Bilibili entry(s).", plan.entries.len()),
         ));
-        let download_options = self.download_options(request.options.as_ref())?;
         let _archive_guard = self.archive_lock.lock().await;
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -504,18 +505,24 @@ fn only_flv_segments(entry: &EntryDownloadReport) -> bool {
         .all(|file| file.kind == DownloadFileKind::FlvSegment)
 }
 
+const MAX_FILE_NAME_BYTES: usize = 255;
+const PLAYBACK_EXTENSION: &str = ".mp4";
+const MUX_TEMP_SUFFIX: &str = ".cache-server-mux-tmp";
+const PLAYBACK_STEM_BYTE_BUDGET: usize =
+    MAX_FILE_NAME_BYTES - 1 - PLAYBACK_EXTENSION.len() - MUX_TEMP_SUFFIX.len();
+
 fn temporary_mux_output_path(output_path: &Path) -> PathBuf {
     let file_name = output_path
         .file_name()
         .map(|value| value.to_string_lossy())
         .unwrap_or_else(|| "cache-server-playback.mp4".into());
-    output_path.with_file_name(format!(".{file_name}.cache-server-mux-tmp"))
+    output_path.with_file_name(format!(".{file_name}{MUX_TEMP_SUFFIX}"))
 }
 
 fn playback_output_path(entry: &EntryDownloadReport) -> PathBuf {
     entry
         .directory
-        .join(format!("{}.mp4", safe_playback_stem(entry)))
+        .join(format!("{}{PLAYBACK_EXTENSION}", safe_playback_stem(entry)))
 }
 
 fn safe_playback_stem(entry: &EntryDownloadReport) -> String {
@@ -534,8 +541,22 @@ fn safe_playback_stem(entry: &EntryDownloadReport) -> String {
     if trimmed.is_empty() {
         format!("Entry {}", entry.index)
     } else {
-        trimmed.chars().take(120).collect()
+        truncate_utf8_bytes(trimmed, PLAYBACK_STEM_BYTE_BUDGET)
     }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    let mut used_bytes = 0usize;
+    for character in value.chars() {
+        let character_bytes = character.len_utf8();
+        if used_bytes + character_bytes > max_bytes {
+            break;
+        }
+        output.push(character);
+        used_bytes += character_bytes;
+    }
+    output
 }
 
 fn concat_file_list(media_files: &[PathBuf]) -> String {
@@ -792,6 +813,31 @@ mod tests {
             ]
         );
         assert_eq!(downloaded_bytes(&report), 18);
+    }
+
+    #[test]
+    fn playback_file_names_fit_common_name_max_with_multibyte_titles() {
+        let entry = EntryDownloadReport {
+            index: 1,
+            title: "标题🙂".repeat(120),
+            directory: PathBuf::from("out/entry"),
+            files: Vec::new(),
+            mux: None,
+        };
+
+        let output_path = playback_output_path(&entry);
+        let file_name = output_path.file_name().unwrap().to_str().unwrap();
+        let temp_file_name = temporary_mux_output_path(&output_path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(file_name.ends_with(PLAYBACK_EXTENSION));
+        assert!(file_name.len() <= MAX_FILE_NAME_BYTES);
+        assert!(temp_file_name.len() <= MAX_FILE_NAME_BYTES);
+        assert!(file_name.is_char_boundary(file_name.trim_end_matches(PLAYBACK_EXTENSION).len()));
     }
 
     #[cfg(unix)]
