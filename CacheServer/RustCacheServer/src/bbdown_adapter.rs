@@ -315,7 +315,13 @@ where
         mux_output_path.as_os_str().to_os_string(),
     ]);
 
-    let output = run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await?;
+    let output = match run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&mux_output_path).await;
+            return Err(error);
+        }
+    };
     if !output.status.success() {
         let _ = fs::remove_file(&mux_output_path).await;
         return Err(BilibiliDownloadError::Failed(format!(
@@ -645,6 +651,7 @@ mod tests {
         std::fs::write(&audio_path, b"audio").unwrap();
         let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
         let output_path = entry_dir.join("cache-server-playback.mp4");
+        let temp_output_path = temporary_mux_output_path(&output_path);
         let report = DownloadReport {
             title: "Example".to_owned(),
             output_dir: temp.path().to_path_buf(),
@@ -696,6 +703,7 @@ mod tests {
                 if message == "Cancelled while BBDown muxing was running."
         ));
         assert!(!output_path.exists());
+        assert!(!temp_output_path.exists());
         wait_for_process_exit(pid).await;
     }
 
@@ -764,6 +772,11 @@ printf muxed > "$last"
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 printf '%s\n' "$$" > "$script_dir/ffmpeg.pid"
+last=
+for arg in "$@"; do
+  last=$arg
+done
+printf partial > "$last"
 : > "$script_dir/ffmpeg-started"
 while :; do
   sleep 1
