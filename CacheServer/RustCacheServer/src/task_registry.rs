@@ -64,7 +64,8 @@ impl BilibiliTaskRegistry {
         }
 
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        if let Some(active_task_id) = inner.active_task_ids_by_source.get(&normalized_source)
+        let active_key = ActiveBilibiliTaskKey::new(&normalized_source, options.as_ref());
+        if let Some(active_task_id) = inner.active_task_ids_by_key.get(&active_key)
             && let Some(active_task) = inner.tasks_by_id.get(active_task_id)
             && is_active(active_task.state())
         {
@@ -89,8 +90,8 @@ impl BilibiliTaskRegistry {
         };
 
         inner
-            .active_task_ids_by_source
-            .insert(normalized_source, task.id.clone());
+            .active_task_ids_by_key
+            .insert(active_key, task.id.clone());
         inner
             .task_options_by_id
             .insert(task.id.clone(), options.clone());
@@ -159,7 +160,7 @@ impl BilibiliTaskRegistry {
                 .clone());
         }
 
-        let (task, terminal_task) = {
+        let task = {
             let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
                 return Err(task_not_found());
             };
@@ -170,14 +171,9 @@ impl BilibiliTaskRegistry {
             task.updated_at = Some(copy_timestamp(&updated_at));
             task.finished_at = Some(updated_at);
 
-            (
-                task.clone(),
-                TerminalTask {
-                    id: task.id.clone(),
-                    source: task.source.clone(),
-                },
-            )
+            task.clone()
         };
+        let terminal_task = Self::terminal_task_locked(&inner, &task);
 
         Self::clear_active_task_locked(&mut inner, &terminal_task);
 
@@ -356,7 +352,7 @@ impl BilibiliTaskRegistry {
         debug_assert!(is_terminal(state));
         let normalized_id = normalize_required_id(id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        let (task, terminal_task) = {
+        let task = {
             let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
                 return Err(task_not_found());
             };
@@ -393,14 +389,9 @@ impl BilibiliTaskRegistry {
             task.updated_at = Some(copy_timestamp(&finished_at));
             task.finished_at = Some(finished_at);
 
-            (
-                task.clone(),
-                TerminalTask {
-                    id: task.id.clone(),
-                    source: task.source.clone(),
-                },
-            )
+            task.clone()
         };
+        let terminal_task = Self::terminal_task_locked(&inner, &task);
 
         Self::clear_active_task_locked(&mut inner, &terminal_task);
         let snapshot = self.persistence_snapshot_locked(&mut inner);
@@ -422,14 +413,14 @@ impl BilibiliTaskRegistry {
 
             let is_active_task = is_active(task.state());
             let task_id = task.id.clone();
-            let task_source = task.source.clone();
+            let active_key = ActiveBilibiliTaskKey::new(&task.source, options.as_ref());
             if is_active_task {
-                if inner.active_task_ids_by_source.contains_key(&task_source) {
+                if inner.active_task_ids_by_key.contains_key(&active_key) {
                     continue;
                 }
                 inner
-                    .active_task_ids_by_source
-                    .insert(task_source, task_id.clone());
+                    .active_task_ids_by_key
+                    .insert(active_key, task_id.clone());
                 inner.queued_task_ids.push_back(task_id.clone());
                 inner.task_options_by_id.insert(task_id.clone(), options);
             }
@@ -473,14 +464,27 @@ impl BilibiliTaskRegistry {
 
     fn clear_active_task_locked(inner: &mut RegistryInner, task: &TerminalTask) {
         if inner
-            .active_task_ids_by_source
-            .get(&task.source)
+            .active_task_ids_by_key
+            .get(&task.active_key)
             .is_some_and(|active_task_id| active_task_id == &task.id)
         {
-            inner.active_task_ids_by_source.remove(&task.source);
+            inner.active_task_ids_by_key.remove(&task.active_key);
         }
         inner.running_cancellations_by_id.remove(&task.id);
         inner.task_options_by_id.remove(&task.id);
+    }
+
+    fn terminal_task_locked(inner: &RegistryInner, task: &Task) -> TerminalTask {
+        TerminalTask {
+            id: task.id.clone(),
+            active_key: ActiveBilibiliTaskKey::new(
+                &task.source,
+                inner
+                    .task_options_by_id
+                    .get(&task.id)
+                    .and_then(Option::as_ref),
+            ),
+        }
     }
 
     fn publish_locked(inner: &mut RegistryInner, task: Task) {
@@ -580,7 +584,7 @@ impl Drop for TaskSubscription {
 struct RegistryInner {
     tasks_by_id: HashMap<String, Task>,
     task_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
-    active_task_ids_by_source: HashMap<String, String>,
+    active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
     queued_task_ids: VecDeque<String>,
     running_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     watchers: HashMap<Uuid, TaskWatcher>,
@@ -632,7 +636,47 @@ struct TaskPersistenceSnapshot {
 
 struct TerminalTask {
     id: String,
+    active_key: ActiveBilibiliTaskKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ActiveBilibiliTaskKey {
     source: String,
+    options: ActiveBilibiliTaskOptionsKey,
+}
+
+impl ActiveBilibiliTaskKey {
+    fn new(source: &str, options: Option<&BilibiliDownloadOptions>) -> Self {
+        Self {
+            source: normalize(source),
+            options: ActiveBilibiliTaskOptionsKey::new(options),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+struct ActiveBilibiliTaskOptionsKey {
+    quality_preference: String,
+    encoding_preference: String,
+    prefer_tv_api: bool,
+    download_subtitles: bool,
+    download_danmaku: bool,
+}
+
+impl ActiveBilibiliTaskOptionsKey {
+    fn new(options: Option<&BilibiliDownloadOptions>) -> Self {
+        let Some(options) = options else {
+            return Self::default();
+        };
+
+        Self {
+            quality_preference: normalize_option_string(&options.quality_preference),
+            encoding_preference: normalize_option_string(&options.encoding_preference),
+            prefer_tv_api: options.prefer_tv_api,
+            download_subtitles: options.download_subtitles,
+            download_danmaku: options.download_danmaku,
+        }
+    }
 }
 
 struct TaskWatcher {
@@ -649,6 +693,10 @@ impl TaskWatcher {
 
 fn normalize(value: &str) -> String {
     value.trim().to_owned()
+}
+
+fn normalize_option_string(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn normalize_required_id(id: &str) -> Result<String, Status> {
@@ -761,16 +809,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dedupes_active_tasks_by_source() {
+    fn dedupes_active_tasks_by_source_and_options() {
         let registry = BilibiliTaskRegistry::default();
         let first = registry
-            .create_bilibili_task("  BV1xx  ", None)
+            .create_bilibili_task("  BV1xx  ", Some(download_options("720P", false)))
             .expect("task should be created");
         let duplicate = registry
-            .create_bilibili_task("BV1xx", None)
+            .create_bilibili_task("BV1xx", Some(download_options("720p", false)))
             .expect("duplicate task should be returned");
+        let different_quality = registry
+            .create_bilibili_task("BV1xx", Some(download_options("1080p", false)))
+            .expect("task with different options should be created");
+        let different_subtitles = registry
+            .create_bilibili_task("BV1xx", Some(download_options("720p", true)))
+            .expect("task with different subtitle options should be created");
 
         assert_eq!(first.id, duplicate.id);
+        assert_ne!(first.id, different_quality.id);
+        assert_ne!(first.id, different_subtitles.id);
     }
 
     #[test]
@@ -925,6 +981,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restores_active_task_dedupe_by_source_and_options() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let first = registry
+            .create_bilibili_task("BV1persist-dedupe", Some(download_options("720p", false)))
+            .expect("task should be created");
+        let second = registry
+            .create_bilibili_task("BV1persist-dedupe", Some(download_options("1080p", false)))
+            .expect("task with different options should be created");
+        assert_ne!(first.id, second.id);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        let duplicate = restored
+            .create_bilibili_task("BV1persist-dedupe", Some(download_options("720P", false)))
+            .expect("duplicate active task should be returned");
+        let different_subtitles = restored
+            .create_bilibili_task("BV1persist-dedupe", Some(download_options("720p", true)))
+            .expect("task with different options should be created");
+
+        assert_eq!(first.id, duplicate.id);
+        assert_ne!(first.id, different_subtitles.id);
+    }
+
+    #[tokio::test]
     async fn restores_running_task_as_queued_after_restart() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
@@ -1057,6 +1138,19 @@ mod tests {
                 finished_at: None,
             },
             options: None,
+        }
+    }
+
+    fn download_options(
+        quality_preference: &str,
+        download_subtitles: bool,
+    ) -> BilibiliDownloadOptions {
+        BilibiliDownloadOptions {
+            quality_preference: quality_preference.to_owned(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles,
+            download_danmaku: false,
         }
     }
 }

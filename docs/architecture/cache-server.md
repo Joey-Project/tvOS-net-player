@@ -38,13 +38,13 @@ tvOS should not talk to SMB directly in the first design. Keeping SMB behind the
 
 ## BBDown Adapter
 
-The local BBDown checkout already contains a `serve` mode with a JSON task API. It can add tasks, report running and finished tasks, and return saved output paths.
+The cache server integrates the Rust `bbdown-core` crate from `https://github.com/Joey-Project/BBDown-rust` behind the server-local `BilibiliDownloadAdapter` trait. The dependency is pinned by git commit in `CacheServer/RustCacheServer/Cargo.toml` so CI does not float with the upstream `master` branch.
 
-For this project, BBDown should be treated as an adapter behind the LAN cache server rather than the API the tvOS app talks to directly. The preferred integration boundary is the Rust `bbdown` crate running inside the Mac mini cache server process. CLI execution should remain a fallback or diagnostic path, not the primary app integration model.
+For this project, BBDown remains an adapter behind the LAN cache server rather than an API the tvOS app talks to directly. The Rust crate runs inside the Mac mini cache server process. CLI execution should remain a fallback or diagnostic path, not the primary app integration model.
 
 The cache server can either:
 
-- Call the Rust `bbdown` crate through a server-local adapter trait.
+- Call the Rust `bbdown-core` crate through a server-local adapter trait.
 - Call the BBDown CLI as a fallback adapter.
 - Proxy to BBDown `serve` for compatibility experiments.
 - Later replace BBDown internals with another resolver without changing the tvOS app.
@@ -54,6 +54,17 @@ Important limitations to hide behind our server boundary:
 - Adapter implementations must report typed task progress instead of forcing the cache server to parse CLI logs.
 - Cancellation after a task starts must be observable by the adapter, even if a specific adapter can only finish best-effort cleanup.
 - Adapter output paths need to be normalized into stable library item IDs and HTTP playback URLs.
+
+Current Rust crate adapter behavior:
+
+- Worker startup is controlled by `Cache:BilibiliWorkerEnabled`; it defaults to enabled in the normal server runtime.
+- Downloads go to `Cache:BBDownOutputDir`, which defaults to `Cache:RootPath/Bilibili`; this path is validated when the worker is enabled or when the output path is explicitly configured, and must be inside `Cache:RootPath` with no `..` parent components and no existing symlink components under the root.
+- At runtime, existing root/output path prefixes are canonicalized before constructing the media library and BBDown adapter so common symlink ancestors such as `/tmp` do not make BBDown download to a path the library later rejects.
+- Download archive state goes to `Cache:BBDownArchivePath`, defaulting to `bbdown-archive.json` beside `Cache:TaskStatePath`.
+- The adapter requires `ffmpeg`; BBDown core downloads the selected media streams, and the server runs its own `ffmpeg` mux step to publish a title-preserving `.mp4` output that the current local media library can index.
+- The adapter defaults BV/av inputs to current/first page and ss/md inputs to latest episode because the current task result schema has only one `library_item_id`.
+- `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. `encoding_preference` and `prefer_tv_api` remain in the proto but are rejected until the adapter implements them.
+- BBDown core currently does not expose a chunk-level progress callback or cancellation hook. The worker reports coarse phases and marks late cancellation as cancelled after the core call returns; files may already exist on disk and can be discovered by library rescan.
 
 ## Protocol Shape
 
@@ -82,13 +93,13 @@ Playback sources intentionally return URLs instead of media bytes.
 2. Add a tvOS gRPC client and simple library screen. Done in the tvOS client slice.
 3. Add Bilibili task intake, lookup, watching, and pre-adapter cancellation. Done in the task-intake slice.
 4. Add the server-side task worker foundation, adapter boundary, and persisted task state. Done in the worker-foundation slice.
-5. Add the real BBDown crate adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library.
+5. Add the real BBDown crate adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library. Done in the BBDown Rust adapter slice.
 6. Add Bonjour discovery once the manual server URL path works.
 7. Add HLS/progressive caching for weaker network conditions.
 
 ## First Slice Notes
 
-The first server slice intentionally implements only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation exists as a persisted pre-adapter queue. Cache deletion, Bonjour discovery, real BBDown download execution, and HLS playlist/segment management remain follow-up work.
+The first server slice intentionally implements only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter. Cache deletion, Bonjour discovery, tvOS task submission UI, richer BBDown option mapping, and HLS playlist/segment management remain follow-up work.
 
 Runtime shape:
 
@@ -104,8 +115,7 @@ Runtime shape:
 - `Cache:RootPath` is treated as a security boundary and must not contain symlink path components; use the real canonical directory path when a shell alias such as `/tmp` or `/var` would resolve through a system symlink.
 - `TaskService` accepts Bilibili URL/BV task intake into a persisted queue, returns active duplicate submissions as the same task, streams task snapshots and updates through `WatchTasks`, and supports idempotent queued cancellation plus running cancellation requests.
 - Durable task lifecycle state is written as a JSON snapshot to `Cache:TaskStatePath` after queue, claim, cancellation, and completion mutations. High-frequency progress updates remain in memory and on `WatchTasks` instead of forcing a disk sync per update. Lifecycle mutations generate immutable snapshots under the registry lock, then serialize snapshot write/fsync outside that lock through a generation-ordered persistence coordinator so stale snapshots cannot overwrite newer state. On restart, terminal tasks remain terminal, queued tasks remain queued, `running` tasks are conservatively restored as `queued`, and `cancel_requested` tasks are restored as `cancelled` because the interrupted worker is gone and the user's cancellation intent should not be retried as new work. If the snapshot cannot be loaded because it is malformed or from an unsupported schema, the server starts with an empty in-memory registry and disables task-state writeback so the original file is preserved for repair.
-- The server has a worker-facing task state machine and `BilibiliDownloadAdapter` trait. The default app state does not start a worker yet, so submitted Bilibili tasks intentionally remain queued until a real adapter is configured. Tests use mock adapters to cover `queued -> running -> succeeded/failed/cancelled` transitions, progress updates, bounded worker concurrency, adapter-visible cancellation, and restart recovery.
-- The next server slice should implement the real BBDown Rust crate adapter behind the same boundary rather than exposing BBDown's JSON API directly to tvOS.
+- The server has a worker-facing task state machine and `BilibiliDownloadAdapter` trait. The default app state starts the real BBDown Rust crate adapter unless `Cache:BilibiliWorkerEnabled=false`. Tests use mock adapters and disabled real-worker integration servers to cover `queued -> running -> succeeded/failed/cancelled` transitions, progress updates, bounded worker concurrency, adapter-visible cancellation, restart recovery, and control-plane behavior without relying on live Bilibili network access.
 - The tvOS client currently loads a bounded first-page library preview, capped at the server page-size limit of 200 items. The cache client API exposes page tokens and search text, so full library pagination/search should be added in the next library UI iteration instead of making refresh collect every page.
 
 Configuration:
@@ -116,3 +126,9 @@ Configuration:
 - `Cache:MediaListenUrl`: HTTP media listen URL. Defaults to `http://localhost:8080`.
 - `Cache:PublicMediaBaseUri`: optional public base URL for playback URLs when the server sits behind a proxy.
 - `Cache:TaskStatePath`: JSON task snapshot path. Defaults to `cache-server-state/tasks.json` next to the server executable.
+- `Cache:BilibiliWorkerEnabled`: starts the real BBDown worker when true. Defaults to `true`.
+- `Cache:BilibiliWorkerMaxConcurrentTasks`: maximum task worker concurrency. Defaults to `1`; the real BBDown adapter currently caps effective concurrency at `1` to avoid concurrent writes to the same archive.
+- `Cache:BBDownOutputDir`: BBDown download output directory. It defaults to `Cache:RootPath/Bilibili`; when the worker is enabled or this path is explicitly configured, it must be inside `Cache:RootPath`, with no `..` parent components and no existing symlink components under the root.
+- Existing root/output prefixes are canonicalized at runtime before the media library and BBDown adapter are built.
+- `Cache:BBDownArchivePath`: BBDown archive JSON path. Defaults to `bbdown-archive.json` beside `Cache:TaskStatePath`.
+- `Cache:BBDownFfmpegPath`: `ffmpeg` executable path. Defaults to `ffmpeg` from `PATH`.

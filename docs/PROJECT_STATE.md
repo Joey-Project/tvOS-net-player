@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake control plane、可落盘恢复的 server-side task worker foundation、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake control plane、可落盘恢复的 server-side task worker、真实 BBDown Rust crate adapter、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -13,6 +13,7 @@
 - Bilibili task intake workstream：`docs/project_journal/2026/06/2026-06-06-bilibili-task-intake-e5f1a9.md`
 - Rust cache server runtime workstream：`docs/project_journal/2026/06/2026-06-06-rust-cache-server-runtime-f2a4c7.md`
 - Bilibili task worker foundation workstream：`docs/project_journal/2026/06/2026-06-07-bilibili-task-worker-foundation-9a3d2f.md`
+- BBDown Rust adapter workstream：`docs/project_journal/2026/06/2026-06-09-bbdown-rust-adapter-b4e2c8.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
