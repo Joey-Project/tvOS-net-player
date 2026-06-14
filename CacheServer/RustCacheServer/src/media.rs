@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState,
-    hls::{HlsMediaResource, mp4_initialization_length},
+    hls::{HlsMediaResource, mp4_initialization_length, should_forward_media_request_header},
     library::OpenedMediaFile,
 };
 
@@ -316,6 +316,9 @@ fn hls_upstream_request_builder(
 ) -> reqwest::RequestBuilder {
     let mut request = state.state.hls_upstream_client.request(method, url);
     for header in &resource.request.headers {
+        if !should_forward_media_request_header(&header.name, &resource.request.url, url) {
+            continue;
+        }
         request = request.header(header.name.as_str(), header.value.as_str());
     }
     request

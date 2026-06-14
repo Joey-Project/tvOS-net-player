@@ -105,32 +105,21 @@ impl AppState {
             .map(|session| session.id.clone())
             .collect();
         let restorable_completed_session_ids = hls_cache.completed_session_ids();
-        let failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
+        let _failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
             &restorable_playback_session_ids,
             &restorable_completed_session_ids,
         );
-        let mut hls_session_ids_to_remove = HashSet::new();
         if tasks.persistence_available() {
-            hls_session_ids_to_remove.extend(failed_hls_session_ids);
-            for session in &restored_hls_sessions {
-                if !restored_hls_session_is_authorized(
+            restored_hls_sessions.retain(|session| {
+                restored_hls_session_is_authorized(
                     &tasks,
                     &session.id,
                     &restorable_completed_session_ids,
-                ) {
-                    hls_session_ids_to_remove.insert(session.id.clone());
-                }
-            }
+                )
+            });
         } else {
             restored_hls_sessions.clear();
         }
-        for session_id in &hls_session_ids_to_remove {
-            hls_sessions.remove(session_id);
-            if let Err(error) = hls_cache.remove_session(session_id) {
-                eprintln!("Failed to remove unrestorable HLS cache session {session_id}: {error}");
-            }
-        }
-        restored_hls_sessions.retain(|session| !hls_session_ids_to_remove.contains(&session.id));
         for session in &restored_hls_sessions {
             hls_sessions.insert(session.clone());
         }

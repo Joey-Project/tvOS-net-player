@@ -696,7 +696,6 @@ pub(crate) async fn run_hls_cache_finalization(
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
                     state.hls_sessions.remove(&task_id);
-                    let _ = state.hls_cache.remove_session(&task_id);
                     if let Err(status) = state.tasks.fail_playback_task_after_cache_restore(
                         &task_id,
                         format!("Failed to restore offline HLS cache after restart: {error}"),
@@ -1332,7 +1331,7 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_none()
         );
-        assert!(!hls_session_dir.exists());
+        assert!(hls_session_dir.exists());
 
         let second_corrupted_restore =
             AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
@@ -1347,6 +1346,7 @@ mod tests {
                 .get(&completed.id)
                 .is_none()
         );
+        assert!(hls_session_dir.exists());
     }
 
     #[tokio::test]
@@ -1541,7 +1541,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            !root_path
+            root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)
@@ -1631,7 +1631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_state_removes_cancelled_hls_cache_session_after_restart() {
+    async fn app_state_hides_cancelled_hls_cache_session_after_restart() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -1711,7 +1711,7 @@ mod tests {
             restored
                 .hls_cache
                 .get_completed_library_item(&expected_item_id)
-                .is_none()
+                .is_some()
         );
         let restored_library = LibraryGrpcService::new(restored.clone())
             .list_library_items(Request::new(ListLibraryItemsRequest {
@@ -1727,7 +1727,7 @@ mod tests {
             .into_inner();
         assert!(restored_library.items.is_empty());
         assert!(
-            !root_path
+            root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)

@@ -20,7 +20,10 @@ use crate::{
     generated::tvos_net_player::v1::{
         LibraryItem, LibrarySource, MediaVariant, PlaybackProtocol, PlaybackSource,
     },
-    hls::{HlsMediaResource, HlsPlaybackSession, HlsVariant, mp4_initialization_length},
+    hls::{
+        HlsMediaResource, HlsPlaybackSession, HlsVariant, mp4_initialization_length,
+        should_forward_media_request_header,
+    },
     library::OpenedMediaFile,
 };
 
@@ -49,6 +52,10 @@ impl HlsCacheStore {
             &session_dir.join("session.json"),
             &PersistedHlsSession::from(session.clone()),
         )
+    }
+
+    fn save_completed_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
+        self.save_session(&sanitized_completed_session(session))
     }
 
     pub(crate) fn remove_session(&self, session_id: &str) -> io::Result<()> {
@@ -207,6 +214,7 @@ impl HlsCacheStore {
             self.cache_resource(client, &session.id, audio, &should_cancel)
                 .await?;
         }
+        self.save_completed_session(session)?;
 
         Ok(Self::completed_library_item_id(&session.id))
     }
@@ -471,6 +479,9 @@ async fn download_resource(
         if header.name.eq_ignore_ascii_case("range") {
             requested_range = true;
         }
+        if !should_forward_media_request_header(&header.name, &resource.request.url, url) {
+            continue;
+        }
         request = request.header(header.name.as_str(), header.value.as_str());
     }
     if requested_range {
@@ -562,6 +573,21 @@ fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
     }
     urls.extend(resource.request.backup_urls.clone());
     urls
+}
+
+fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
+    let mut session = session.clone();
+    sanitize_completed_resource(&mut session.variant.video);
+    if let Some(audio) = session.variant.audio.as_mut() {
+        sanitize_completed_resource(audio);
+    }
+    session
+}
+
+fn sanitize_completed_resource(resource: &mut HlsMediaResource) {
+    resource.request.url.clear();
+    resource.request.backup_urls.clear();
+    resource.request.headers.clear();
 }
 
 fn session_id_from_library_item_id(item_id: &str) -> Option<String> {
@@ -1054,6 +1080,85 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    #[tokio::test]
+    async fn does_not_forward_sensitive_headers_to_cross_origin_backup_url() {
+        let (primary_url, _primary_task) = start_invalid_mp4_upstream().await;
+        let (backup_url, _backup_task) = start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_mp4_reject_sensitive_headers)),
+        )
+        .await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let mut session = sample_session("session-sensitive-backup", &primary_url);
+        session.variant.video.request.backup_urls = vec![backup_url];
+        session.variant.video.request.headers.extend([
+            BilibiliHttpHeader {
+                name: "authorization".to_owned(),
+                value: "Bearer secret-token".to_owned(),
+            },
+            BilibiliHttpHeader {
+                name: "cookie".to_owned(),
+                value: "SESSDATA=secret-cookie".to_owned(),
+            },
+        ]);
+        let client = reqwest::Client::new();
+
+        let item_id = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("cross-origin backup should not receive sensitive primary headers");
+        let cached = store
+            .cached_resource("session-sensitive-backup", "video.m4s")
+            .expect("backup resource should be cached");
+
+        assert_eq!("bilibili.hls.session-sensitive-backup", item_id);
+        assert_eq!(fake_mp4().len() as u64, cached.total_length);
+    }
+
+    #[tokio::test]
+    async fn completed_session_manifest_scrubs_upstream_request_data() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let mut session = sample_session("session-scrubbed", &upstream_url);
+        let backup_url = "https://cdn-backup.example.test/video.m4s".to_owned();
+        session.variant.video.request.backup_urls = vec![backup_url.clone()];
+        session.variant.video.request.headers.extend([
+            BilibiliHttpHeader {
+                name: "authorization".to_owned(),
+                value: "Bearer secret-token".to_owned(),
+            },
+            BilibiliHttpHeader {
+                name: "cookie".to_owned(),
+                value: "SESSDATA=secret-cookie".to_owned(),
+            },
+        ]);
+        let client = reqwest::Client::new();
+
+        let item_id = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("session resources should cache");
+        let manifest_path = store
+            .session_dir("session-scrubbed")
+            .expect("session dir should be valid")
+            .join("session.json");
+        let manifest = std::fs::read_to_string(manifest_path)
+            .expect("completed session manifest should remain readable");
+        let sessions = store.load_sessions();
+
+        assert!(!manifest.contains(&upstream_url));
+        assert!(!manifest.contains(&backup_url));
+        assert!(!manifest.contains("secret-token"));
+        assert!(!manifest.contains("SESSDATA"));
+        assert_eq!(1, sessions.len());
+        let request = &sessions[0].variant.video.request;
+        assert!(request.url.is_empty());
+        assert!(request.backup_urls.is_empty());
+        assert!(request.headers.is_empty());
+        assert!(store.get_completed_library_item(&item_id).is_some());
+    }
+
     async fn start_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_mp4))).await
     }
@@ -1148,6 +1253,17 @@ mod tests {
             .header(CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn upstream_mp4_reject_sensitive_headers(headers: HeaderMap) -> Response<Body> {
+        if headers.contains_key("authorization") || headers.contains_key("cookie") {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        upstream_mp4(headers).await
     }
 
     fn sample_session(id: &str, url: &str) -> HlsPlaybackSession {

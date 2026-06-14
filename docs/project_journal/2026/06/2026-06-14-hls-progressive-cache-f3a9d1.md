@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-14
 updated: 2026-06-14
 branch: wip/offline-cache-finalization
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/12
 supersedes: []
 superseded_by:
 ---
@@ -135,18 +135,24 @@ superseded_by:
   - Startup restore now clears stale `library_item_id` values when a previously completed HLS cache task can no longer restore its offline library item.
   - Startup restore now removes unrestorable completed HLS sessions from the runtime registry so corrupted offline sessions do not leave active media routes.
   - Runtime HLS playback now remains `PLAYABLE` if manifest persistence fails, and offline HLS finalizers now use bounded concurrency plus task-state cancellation checks.
-  - Restart-resumed HLS finalizers now fail and clean up restored `PLAYABLE` tasks when offline cache finalization cannot complete.
+  - Restart-resumed HLS finalizers now fail restored `PLAYABLE` tasks and hide their runtime routes when offline cache finalization cannot complete, while preserving disk session data for retry/inspection.
   - HLS cache identifiers now reject `.` and `..` dot segments before path construction.
-  - Startup restore now removes disk HLS cache sessions for unrestorable completed/playable tasks so corrupted sessions cannot reappear on a later restart.
   - Completed offline HLS playback tasks now rewrite transient playback sources to the offline `library_item_id` so polling clients keep a playback entrypoint.
-  - Startup restore now removes cancelled, failed, and orphaned disk HLS sessions when task state is readable, while hiding cached HLS items and runtime routes if task state is unavailable.
+  - Startup restore now hides unauthorized cancelled, failed, corrupted, and orphaned disk HLS sessions from runtime routes and library listings instead of deleting their manifests/resources; explicit cancel paths still clean up cache data.
   - HLS cache finalization now retries backup URLs after a downloaded MP4 fails local initialization validation.
+  - HLS cache finalization and runtime HLS media requests now filter host-scoped sensitive headers such as `Authorization` and `Cookie` when retrying cross-origin backup URLs.
+  - Completed offline HLS session manifests now scrub upstream URLs, backup URLs, and request headers after the selected resources are fully cached.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_fails_restored_hls_task_when_cache_finalization_fails -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked rejects_dot_segments_as_hls_cache_ids -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked completed_progressive_playback_cache_rewrites_runtime_source_to_library_item -- --nocapture`
-  - `cargo test --package tvos-net-player-cache-server --locked app_state_removes_cancelled_hls_cache_session_after_restart -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_hides_cancelled_hls_cache_session_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_hides_hls_cache_when_task_state_snapshot_is_unreadable -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked tries_backup_url_after_cached_initialization_is_invalid -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked filters_sensitive_media_request_headers_for_cross_origin_backups -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked does_not_forward_sensitive_headers_to_cross_origin_backup_url -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked completed_session_manifest_scrubs_upstream_request_data -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked`
+  - `just ci` after independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-fixes.log`

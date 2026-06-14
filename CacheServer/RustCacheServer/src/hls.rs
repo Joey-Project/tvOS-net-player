@@ -8,6 +8,7 @@ use crate::bbdown_adapter::{
     BilibiliMediaRequest, BilibiliPlaybackVariant as AdapterPlaybackVariant,
     BilibiliPlaybackVariantKind,
 };
+use url::Url;
 
 const VIDEO_PLAYLIST_ID: &str = "video.m3u8";
 const AUDIO_PLAYLIST_ID: &str = "audio.m3u8";
@@ -221,6 +222,35 @@ impl HlsMediaResource {
     }
 }
 
+pub(crate) fn should_forward_media_request_header(
+    header_name: &str,
+    primary_url: &str,
+    target_url: &str,
+) -> bool {
+    if media_request_origins_match(primary_url, target_url) {
+        return true;
+    }
+
+    is_cross_origin_safe_media_header(header_name)
+}
+
+fn media_request_origins_match(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (Url::parse(left), Url::parse(right)) else {
+        return false;
+    };
+
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn is_cross_origin_safe_media_header(header_name: &str) -> bool {
+    matches!(
+        header_name.to_ascii_lowercase().as_str(),
+        "accept" | "accept-language" | "origin" | "referer" | "referrer" | "user-agent"
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HlsSessionError {
     message: String,
@@ -347,6 +377,30 @@ mod tests {
             "Progressive HLS playback requires a DASH playback variant.",
             error.to_string()
         );
+    }
+
+    #[test]
+    fn filters_sensitive_media_request_headers_for_cross_origin_backups() {
+        assert!(should_forward_media_request_header(
+            "authorization",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-a.example.test/video.m4s"
+        ));
+        assert!(!should_forward_media_request_header(
+            "authorization",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
+        assert!(!should_forward_media_request_header(
+            "cookie",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
+        assert!(should_forward_media_request_header(
+            "referer",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
     }
 
     fn dash_variant() -> BilibiliPlaybackVariant {
