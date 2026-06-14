@@ -37,7 +37,7 @@ use crate::{
         TaskGrpcService,
     },
     hls::HlsPlaybackRegistry,
-    hls_cache::HlsCacheStore,
+    hls_cache::{HlsCacheStore, sanitized_completed_session},
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
@@ -167,11 +167,23 @@ impl AppState {
                 continue;
             }
             if completed_session_ids.contains(&session.id) {
-                let _ = self.tasks.complete_playback_cached(
-                    &session.id,
-                    HlsCacheStore::completed_library_item_id(&session.id),
-                );
-                continue;
+                self.hls_sessions
+                    .insert(sanitized_completed_session(session));
+                match self.hls_cache.save_completed_session(session) {
+                    Ok(()) => {
+                        let _ = self.tasks.complete_playback_cached(
+                            &session.id,
+                            HlsCacheStore::completed_library_item_id(&session.id),
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
+                            session.id
+                        );
+                    }
+                }
             }
 
             handle.spawn(crate::grpc_services::run_hls_cache_finalization(

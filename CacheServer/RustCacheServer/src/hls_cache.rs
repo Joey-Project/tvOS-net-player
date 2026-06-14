@@ -54,7 +54,7 @@ impl HlsCacheStore {
         )
     }
 
-    fn save_completed_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
+    pub(crate) fn save_completed_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
         self.save_session(&sanitized_completed_session(session))
     }
 
@@ -575,7 +575,7 @@ fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
     urls
 }
 
-fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
+pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {

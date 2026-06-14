@@ -142,6 +142,8 @@ superseded_by:
   - HLS cache finalization now retries backup URLs after a downloaded MP4 fails local initialization validation.
   - HLS cache finalization and runtime HLS media requests now filter host-scoped sensitive headers such as `Authorization` and `Cookie` when retrying cross-origin backup URLs.
   - Completed offline HLS session manifests now scrub upstream URLs, backup URLs, and request headers after the selected resources are fully cached.
+  - Startup restore now rewrites fully cached crash-window HLS manifests to the scrubbed completed form before marking tasks `COMPLETED`.
+  - Successful HLS cache finalization now replaces the in-memory runtime HLS session with a cache-only session so completed offline playback cannot fall back to upstream proxying with original request credentials.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -156,3 +158,7 @@ superseded_by:
   - `cargo test --package tvos-net-player-cache-server --locked completed_session_manifest_scrubs_upstream_request_data -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked`
   - `just ci` after independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-fixes.log`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_scrubs_completed_hls_manifest_during_restart_recovery -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_cache_finalizer_sanitizes_runtime_session_after_completion -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked`
+  - `just ci` after second independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-rerun-fixes.log`
