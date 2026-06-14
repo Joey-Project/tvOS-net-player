@@ -242,6 +242,43 @@ impl Display for HlsSessionError {
 
 impl std::error::Error for HlsSessionError {}
 
+pub(crate) fn mp4_initialization_length(bytes: &[u8]) -> Option<u64> {
+    let mut offset = 0_usize;
+    while offset.checked_add(8)? <= bytes.len() {
+        let size32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let box_type = &bytes[offset + 4..offset + 8];
+        let (header_length, box_size) = match size32 {
+            0 => return None,
+            1 => {
+                if offset.checked_add(16)? > bytes.len() {
+                    return None;
+                }
+                (
+                    16_u64,
+                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?),
+                )
+            }
+            size => (8_u64, u64::from(size)),
+        };
+        if box_size < header_length {
+            return None;
+        }
+        let end = u64::try_from(offset).ok()?.checked_add(box_size)?;
+        if end > u64::try_from(bytes.len()).ok()? {
+            return None;
+        }
+        if box_type == b"moov" {
+            return Some(end);
+        }
+        if matches!(box_type, b"moof" | b"mdat") {
+            return None;
+        }
+        offset = usize::try_from(end).ok()?;
+    }
+
+    None
+}
+
 fn escape_quoted(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }

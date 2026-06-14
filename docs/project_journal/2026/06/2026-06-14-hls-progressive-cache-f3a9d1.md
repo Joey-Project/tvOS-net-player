@@ -1,10 +1,10 @@
 ---
 id: 20260614-f3a9d1
 title: HLS Progressive Cache
-status: active
+status: completed
 created: 2026-06-14
 updated: 2026-06-14
-branch: wip/hls-progressive-media-pipeline
+branch: wip/offline-cache-finalization
 pr:
 supersedes: []
 superseded_by:
@@ -24,9 +24,10 @@ superseded_by:
 - The current LAN cache server adapter still uses the older complete-download path: BBDown core downloads selected media, then the server muxes a completed MP4 and publishes it as a library item.
 - The cache server now has a BBDown playback-planning adapter foundation that maps core playback plans into server-owned DTOs and selects AVPlayer-friendly variants for later progressive sessions.
 - The cache server now exposes progressive playback through `TaskService.CreateBilibiliPlaybackTask`: it creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it in `preparing` state immediately, while BBDown playback planning runs in the background.
-- The runtime HLS media path registers an in-memory HLS session after planning succeeds, publishes a `playable` task with `BilibiliPlaybackSession` metadata plus a HLS `PlaybackSource`, serves master/media playlists under `/hls/{session_id}`, and proxies selected DASH video/audio requests with BBDown headers and client Range.
+- The runtime HLS media path persists a server-owned HLS session manifest after planning succeeds, registers a runtime HLS session, publishes a `playable` task with `BilibiliPlaybackSession` metadata plus a HLS `PlaybackSource`, serves master/media playlists under `/hls/{session_id}`, and proxies selected DASH video/audio requests with BBDown headers and client Range when no local cached resource exists.
+- The HLS cache finalizer stores selected video/audio resources under `Cache:RootPath/.tvos-net-player/hls/{session_id}`, records per-resource size/init-range/cache-key metadata, marks fully cached tasks `completed`, and exposes offline Bilibili HLS library items as `bilibili.hls.<session_id>`.
+- Startup now restores HLS session manifests into the runtime HLS registry. Persisted `playable`/`completed` progressive tasks remain usable when their manifest exists; only tasks missing a matching manifest are failed during startup reconcile.
 - The Swift cache client exposes `getTask(id:)` and `watchTasks(ids:)` so tvOS code can track background playback planning to a playable HLS source without repeating create calls.
-- Runtime HLS passthrough does not persist media manifests yet. Restored `playable` tasks are marked failed after restart so callers can retry instead of receiving stale HLS URLs; PR 4 owns durable manifests and offline recovery.
 - Playback planning rejects Bilibili short links until `bbdown-core` exposes a resolved-input API that lets the server choose the correct default selection after short-link expansion.
 - Existing architecture already reserves HLS playlists and segments over HTTP as the media-plane direction, so progressive playback should extend the current boundary rather than introduce gRPC media streaming or direct tvOS BBDown integration.
 
@@ -52,7 +53,7 @@ superseded_by:
 
 ### PR 3: HLS Progressive Media Pipeline
 
-- Status: implemented by this slice.
+- Status: merged in PR #11.
 - Build the server-side pipeline that consumes `MediaRequestSpec` URLs and headers, fetches Bilibili media, and produces AVPlayer-compatible HLS playlists and segments.
 - Start with runtime passthrough HLS for selected DASH MP4 video/audio requests. Transmuxing/transcoding remains a later expansion once the runtime URL path is proven.
 - Support backup URLs, source retry, and deterministic fixture-based e2e tests so CI does not depend on live Bilibili availability.
@@ -60,15 +61,16 @@ superseded_by:
 
 ### PR 4: Offline Cache Finalization + Recovery
 
-- Persist segment/cache manifests and restore playable or completed progressive items after server restart.
-- Finalize progressive sessions into stable offline library items for weak-network or disconnected LAN playback.
-- Add cache integrity checks, partial-item cleanup, and basic eviction metadata hooks.
+- Status: implemented by this slice.
+- Persist HLS session manifests and restore playable or completed progressive items after server restart.
+- Finalize selected progressive media resources into stable offline Bilibili HLS library items for weak-network or disconnected LAN playback.
+- Add cached-resource size/init-range/cache-key metadata as integrity checks, partial retry cleanup, and basic eviction metadata hooks.
 - Update user-facing architecture docs and run the full local and remote merge gates.
 
 ## Next Steps
 
-- After PR 3 lands, continue with PR 4 durable HLS/cache manifests and offline recovery.
-- Keep the existing complete-download adapter path as the fallback until progressive HLS is proven by tests.
+- Keep the existing complete-download adapter path as the fallback until progressive HLS is proven on physical Apple TV and real Bilibili sources.
+- Add explicit cache eviction policy, cache management UI/API, and optional LAN-side transmux/transcode in later work.
 - Do not merge a PR while required CI is failing, review findings remain actionable, or GitHub reports unresolved review conversations.
 
 ## Evidence
@@ -111,3 +113,40 @@ superseded_by:
   - HLS media playlist probing now caps initialization body reads to the advertised 1 MiB scan window, even when upstream omits `Content-Length`.
   - HLS segment proxying now rejects ranged upstream responses that ignore `Range`, omit `Content-Range`, or return a `Content-Range` that does not match the requested byte range, and treats them as retryable backup URL failures.
   - HLS upstream fetches now use bounded connect/read timeouts so stalled CDN attempts fail over to backup URLs or 502 instead of holding playlist/segment handlers indefinitely.
+- PR 3 merged on 2026-06-14 as `3ac607d`.
+- PR 4 focused local validation:
+  - `cargo test --package tvos-net-player-cache-server --locked hls_cache -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked cached -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked playback_task_finalizes_cached_hls_library_item_and_restores_after_restart -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked list_library_items_paginates_from_hls_cache_to_local_library -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_cache_finalizer_removes_cache_when_task_was_cancelled -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked playable_progressive -- --nocapture`
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --package tvos-net-player-cache-server --all-targets --locked -- -D warnings`
+  - `cargo test --package tvos-net-player-cache-server --locked`
+  - `just ci`
+- PR 4 review fixes:
+  - Startup restore now keeps `PLAYABLE` tasks restorable with a session manifest, but requires `COMPLETED` tasks to have a complete HLS cache item.
+  - Offline HLS finalization now rejects range-only media requests, unsolicited partial responses, and cached bodies whose size does not match BBDown/Core metadata or `Content-Length`.
+  - Startup restore now resumes cache finalization for manifest-backed `PLAYABLE` HLS sessions that had not reached a completed offline library item before restart.
+  - Offline HLS finalization now removes temporary resource files when post-download MP4 initialization validation fails.
+  - Startup restore now repairs the crash window where HLS resources were fully cached but the progressive task had not yet persisted its `COMPLETED` state.
+  - Startup restore now clears stale `library_item_id` values when a previously completed HLS cache task can no longer restore its offline library item.
+  - Startup restore now removes unrestorable completed HLS sessions from the runtime registry so corrupted offline sessions do not leave active media routes.
+  - Runtime HLS playback now remains `PLAYABLE` if manifest persistence fails, and offline HLS finalizers now use bounded concurrency plus task-state cancellation checks.
+  - Restart-resumed HLS finalizers now fail and clean up restored `PLAYABLE` tasks when offline cache finalization cannot complete.
+  - HLS cache identifiers now reject `.` and `..` dot segments before path construction.
+  - Startup restore now removes disk HLS cache sessions for unrestorable completed/playable tasks so corrupted sessions cannot reappear on a later restart.
+  - Completed offline HLS playback tasks now rewrite transient playback sources to the offline `library_item_id` so polling clients keep a playback entrypoint.
+  - Startup restore now removes cancelled, failed, and orphaned disk HLS sessions when task state is readable, while hiding cached HLS items and runtime routes if task state is unavailable.
+  - HLS cache finalization now retries backup URLs after a downloaded MP4 fails local initialization validation.
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_fails_restored_hls_task_when_cache_finalization_fails -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked rejects_dot_segments_as_hls_cache_ids -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked completed_progressive_playback_cache_rewrites_runtime_source_to_library_item -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_removes_cancelled_hls_cache_session_after_restart -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked app_state_hides_hls_cache_when_task_state_snapshot_is_unreadable -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked tries_backup_url_after_cached_initialization_is_invalid -- --nocapture`
