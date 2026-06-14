@@ -108,5 +108,6 @@ superseded_by:
   - `just ci`
 - PR 3 review fixes:
   - Repeated progressive playback creates are request-scoped. They now create fresh `preparing` tasks instead of deduping against active playback tasks, so each HLS `PlaybackSource.uri` is derived from the current gRPC request.
-  - HLS segment proxying now rejects ranged upstream responses that ignore `Range` or omit `Content-Range`, and treats them as retryable backup URL failures.
+  - HLS media playlist probing now caps initialization body reads to the advertised 1 MiB scan window, even when upstream omits `Content-Length`.
+  - HLS segment proxying now rejects ranged upstream responses that ignore `Range`, omit `Content-Range`, or return a `Content-Range` that does not match the requested byte range, and treats them as retryable backup URL failures.
   - HLS upstream fetches now use bounded connect/read timeouts so stalled CDN attempts fail over to backup URLs or 502 instead of holding playlist/segment handlers indefinitely.

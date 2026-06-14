@@ -11,6 +11,7 @@ use axum::{
         },
     },
 };
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
@@ -245,7 +246,7 @@ async fn send_hls_upstream_request(
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_headers = upstream.headers().clone();
-    if range_response_invalid(headers.get(RANGE).is_some(), status, &upstream_headers) {
+    if range_response_invalid(headers.get(RANGE), status, &upstream_headers) {
         return Ok(text_response(
             StatusCode::BAD_GATEWAY,
             "HLS upstream ignored byte range request.\n",
@@ -295,10 +296,29 @@ fn should_retry_hls_upstream_status(status: StatusCode) -> bool {
         )
 }
 
-fn range_response_invalid(range_requested: bool, status: StatusCode, headers: &HeaderMap) -> bool {
-    range_requested && status.is_success() && {
-        status != StatusCode::PARTIAL_CONTENT || !headers.contains_key(CONTENT_RANGE)
+fn range_response_invalid(
+    requested_range: Option<&HeaderValue>,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> bool {
+    let Some(requested_range) = requested_range else {
+        return false;
+    };
+    if !status.is_success() {
+        return false;
     }
+    if status != StatusCode::PARTIAL_CONTENT {
+        return true;
+    }
+
+    let Some((returned_range, total_length)) = content_range_byte_range(headers) else {
+        return true;
+    };
+    let Ok(Some(expected_range)) = parse_range(Some(requested_range), total_length) else {
+        return true;
+    };
+
+    returned_range != expected_range
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,8 +371,11 @@ async fn load_hls_mp4_initialization_from_url(
     {
         return Err(());
     }
-    let total_length = content_range_total_length(&headers).ok_or(())?;
-    let bytes = upstream.bytes().await.map_err(|_| ())?;
+    let (returned_range, total_length) = content_range_byte_range(&headers).ok_or(())?;
+    if returned_range.start != 0 || returned_range.length() > HLS_INITIALIZATION_SCAN_BYTES {
+        return Err(());
+    }
+    let bytes = read_hls_initialization_probe(upstream).await?;
     let length = mp4_initialization_length(&bytes).ok_or(())?;
     if length == 0 || length >= total_length {
         return Err(());
@@ -364,13 +387,41 @@ async fn load_hls_mp4_initialization_from_url(
     })
 }
 
-fn content_range_total_length(headers: &HeaderMap) -> Option<u64> {
+async fn read_hls_initialization_probe(upstream: reqwest::Response) -> Result<Vec<u8>, ()> {
+    let max_bytes = usize::try_from(HLS_INITIALIZATION_SCAN_BYTES).map_err(|_| ())?;
+    let mut bytes = Vec::new();
+    let mut stream = upstream.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        let next_len = bytes.len().checked_add(chunk.len()).ok_or(())?;
+        if next_len > max_bytes {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
+}
+
+fn content_range_byte_range(headers: &HeaderMap) -> Option<(ByteRange, u64)> {
     let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
-    let (_, total) = value.rsplit_once('/')?;
+    let spec = value.strip_prefix("bytes ")?;
+    let (range, total) = spec.rsplit_once('/')?;
     if total == "*" {
         return None;
     }
-    total.parse().ok()
+    let total = total.parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let range = ByteRange {
+        start: start.parse().ok()?,
+        end: end.parse().ok()?,
+    };
+    if total == 0 || range.start > range.end || range.end >= total {
+        return None;
+    }
+
+    Some((range, total))
 }
 
 fn mp4_initialization_length(bytes: &[u8]) -> Option<u64> {
@@ -747,8 +798,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_segment_rejects_upstream_that_shifts_segment_range() {
+        let (upstream_url, _upstream_task) = start_hls_shifted_range_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        state
+            .hls_sessions
+            .insert(hls_session("session-1", &upstream_url));
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_GATEWAY, response.status());
+    }
+
+    #[tokio::test]
     async fn hls_media_playlist_rejects_upstream_that_ignores_initialization_range() {
         let (upstream_url, _upstream_task) = start_hls_range_ignored_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        state
+            .hls_sessions
+            .insert(hls_session("session-1", &upstream_url));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_GATEWAY, response.status());
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_rejects_oversized_chunked_initialization_probe() {
+        let (upstream_url, _upstream_task) = start_hls_oversized_chunked_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
         let root_path = temp.path().canonicalize().unwrap();
         let state = AppState::new(CacheServerOptions {
@@ -846,6 +949,46 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_shifted_range_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(upstream_shifted_range).head(upstream_shifted_range),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
+    async fn start_hls_oversized_chunked_mp4_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(upstream_oversized_chunked_mp4).head(upstream_oversized_chunked_mp4),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_forbidden_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -896,6 +1039,37 @@ mod tests {
             )
             .body(Body::empty())
             .expect("range-ignored upstream response should build")
+    }
+
+    async fn upstream_shifted_range() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_RANGE, "bytes 0-2/10")
+            .body(Body::from("vid"))
+            .expect("shifted-range upstream response should build")
+    }
+
+    async fn upstream_oversized_chunked_mp4() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(
+                CONTENT_RANGE,
+                format!(
+                    "bytes 0-{}/{}",
+                    HLS_INITIALIZATION_SCAN_BYTES,
+                    2 * 1024 * 1024
+                ),
+            )
+            .body(Body::from(vec![
+                0_u8;
+                usize::try_from(
+                    HLS_INITIALIZATION_SCAN_BYTES + 1
+                )
+                .unwrap()
+            ]))
+            .expect("oversized chunked upstream response should build")
     }
 
     fn upstream_media_response(headers: HeaderMap, head_only: bool) -> Response<Body> {
