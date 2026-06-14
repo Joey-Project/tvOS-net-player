@@ -433,6 +433,19 @@ async fn run_bilibili_playback_planning(
             () = sleep(Duration::from_millis(100)) => {}
         }
     };
+    if cancellation.is_cancel_requested() {
+        if state
+            .tasks
+            .complete_task_cancelled(
+                &task_id,
+                "Cancelled before playback planning started.".to_owned(),
+            )
+            .is_ok()
+        {
+            cleanup.disarm();
+        }
+        return;
+    }
     let planning_request = BilibiliPlaybackPlanningRequest {
         source,
         options,
@@ -936,6 +949,61 @@ mod tests {
             .send(Ok(sample_playback_plan()))
             .expect("second plan should be delivered");
         wait_for_task_state(&tasks, &recreated.id, TaskState::Planned).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_playback_task_before_permit_release_does_not_start_planner() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner, mut starts, _results) = SourceControlledPlaybackPlanner::new(["BV1race"]);
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let held_permit = Arc::clone(&state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .expect("test should acquire the only planning permit");
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let mut started = starts.remove("BV1race").expect("start signal should exist");
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1race".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut started)
+                .await
+                .is_err(),
+            "planner should wait while the only planning permit is held"
+        );
+
+        tasks
+            .cancel_task(&created.id)
+            .expect("task should be cancellable while waiting for permit");
+        drop(held_permit);
+
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        assert!(cancelled.playback_session.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut started)
+                .await
+                .is_err(),
+            "cancelled task should not start the planner after acquiring a permit"
+        );
     }
 
     struct EmptyPlaybackPlanner;
