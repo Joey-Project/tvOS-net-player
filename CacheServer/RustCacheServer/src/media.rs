@@ -245,6 +245,14 @@ async fn send_hls_upstream_request(
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_headers = upstream.headers().clone();
+    if range_response_invalid(headers.get(RANGE).is_some(), status, &upstream_headers) {
+        return Ok(text_response(
+            StatusCode::BAD_GATEWAY,
+            "HLS upstream ignored byte range request.\n",
+            head_only,
+        ));
+    }
+
     let mut response = Response::builder()
         .status(status)
         .body(if head_only {
@@ -285,6 +293,12 @@ fn should_retry_hls_upstream_status(status: StatusCode) -> bool {
                 | StatusCode::NOT_FOUND
                 | StatusCode::TOO_MANY_REQUESTS
         )
+}
+
+fn range_response_invalid(range_requested: bool, status: StatusCode, headers: &HeaderMap) -> bool {
+    range_requested && status.is_success() && {
+        status != StatusCode::PARTIAL_CONTENT || !headers.contains_key(CONTENT_RANGE)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -670,6 +684,66 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(b"video-data", &body[..]);
+    }
+
+    #[tokio::test]
+    async fn hls_segment_retries_backup_url_after_ignored_range() {
+        let (primary_url, _primary_task) = start_hls_range_ignored_upstream().await;
+        let (backup_url, _backup_task) = start_hls_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        state.hls_sessions.insert(hls_session_with_backups(
+            "session-1",
+            &primary_url,
+            vec![backup_url],
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!("bytes 1-3/10", response.headers()[CONTENT_RANGE]);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(b"ide", &body[..]);
+    }
+
+    #[tokio::test]
+    async fn hls_segment_rejects_upstream_that_ignores_segment_range() {
+        let (upstream_url, _upstream_task) = start_hls_range_ignored_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        state
+            .hls_sessions
+            .insert(hls_session("session-1", &upstream_url));
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_GATEWAY, response.status());
     }
 
     #[tokio::test]
