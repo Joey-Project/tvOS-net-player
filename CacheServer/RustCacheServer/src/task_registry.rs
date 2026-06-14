@@ -464,6 +464,7 @@ impl BilibiliTaskRegistry {
         };
         if task.state() == TaskState::Playable {
             inner.planning_cancellations_by_id.remove(&normalized_id);
+            Self::clear_active_duplicate_key_locked(&mut inner, &task);
         }
         if is_terminal(task.state()) {
             let terminal_task = Self::terminal_task_locked(&inner, &task);
@@ -679,6 +680,27 @@ impl BilibiliTaskRegistry {
         inner.planning_cancellations_by_id.remove(&task.id);
         inner.download_options_by_id.remove(&task.id);
         inner.playback_options_by_id.remove(&task.id);
+    }
+
+    fn clear_active_duplicate_key_locked(inner: &mut RegistryInner, task: &Task) {
+        let active_key = active_key_for_task(
+            task,
+            inner
+                .download_options_by_id
+                .get(&task.id)
+                .and_then(Option::as_ref),
+            inner
+                .playback_options_by_id
+                .get(&task.id)
+                .and_then(Option::as_ref),
+        );
+        if inner
+            .active_task_ids_by_key
+            .get(&active_key)
+            .is_some_and(|active_task_id| active_task_id == &task.id)
+        {
+            inner.active_task_ids_by_key.remove(&active_key);
+        }
     }
 
     fn terminal_task_locked(inner: &RegistryInner, task: &Task) -> TerminalTask {
@@ -959,7 +981,6 @@ fn is_active(state: TaskState) -> bool {
             | TaskState::CancelRequested
             | TaskState::Planned
             | TaskState::Preparing
-            | TaskState::Playable
     )
 }
 
@@ -1401,6 +1422,32 @@ mod tests {
         );
         assert!(restored_task.playback_source.is_none());
         assert_ne!(playable.id, requeued.task.id);
+    }
+
+    #[test]
+    fn playable_progressive_playback_task_does_not_dedupe_future_playback_requests() {
+        let registry = BilibiliTaskRegistry::default();
+        let options = playback_options("1080p");
+        let created = registry
+            .create_bilibili_playback_task("BV1playable", Some(options.clone()))
+            .expect("playback task should be created");
+        let playable = registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+
+        let recreated = registry
+            .create_bilibili_playback_task("BV1playable", Some(options))
+            .expect("playable source should not block replanning");
+
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(recreated.created);
+        assert_eq!(TaskState::Preparing, recreated.task.state());
+        assert_ne!(playable.id, recreated.task.id);
     }
 
     #[test]
