@@ -5,7 +5,7 @@ status: active
 created: 2026-06-14
 updated: 2026-06-14
 branch: wip/progressive-playback-control-plane
-pr:
+pr: 10
 supersedes: []
 superseded_by:
 ---
