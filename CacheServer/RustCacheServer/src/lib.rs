@@ -11,7 +11,7 @@ pub mod playback;
 pub mod task_registry;
 mod task_store;
 
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
@@ -42,6 +42,9 @@ use crate::{
 };
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
+const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -86,7 +89,7 @@ impl AppState {
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
         let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path(task_state_path));
         let hls_sessions = HlsPlaybackRegistry::default();
-        let hls_upstream_client = reqwest::Client::new();
+        let hls_upstream_client = build_hls_upstream_client();
         let playback_planner = playback_planner_factory(Arc::clone(&options), Arc::clone(&library));
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
@@ -129,6 +132,17 @@ impl AppState {
             BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
         ))
     }
+}
+
+fn build_hls_upstream_client() -> reqwest::Client {
+    // Use a read timeout instead of a whole-request timeout so long segment streams
+    // can continue as long as the upstream keeps making progress.
+    reqwest::Client::builder()
+        .connect_timeout(HLS_UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(HLS_UPSTREAM_READ_TIMEOUT)
+        .pool_idle_timeout(Some(HLS_UPSTREAM_POOL_IDLE_TIMEOUT))
+        .build()
+        .expect("HLS upstream client should build")
 }
 
 pub async fn run(
