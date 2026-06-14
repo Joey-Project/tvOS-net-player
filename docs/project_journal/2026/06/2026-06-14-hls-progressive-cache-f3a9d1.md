@@ -106,3 +106,6 @@ superseded_by:
   - `cargo clippy --package tvos-net-player-cache-server --all-targets --locked -- -D warnings`
   - `scripts/test.sh`
   - `just ci`
+- PR 3 review fixes:
+  - Repeated progressive playback creates are request-scoped. They now create fresh `preparing` tasks instead of deduping against active playback tasks, so each HLS `PlaybackSource.uri` is derived from the current gRPC request.
+  - HLS segment proxying now rejects ranged upstream responses that ignore `Range` or omit `Content-Range`, and treats them as retryable backup URL failures.

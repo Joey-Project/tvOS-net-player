@@ -128,18 +128,6 @@ impl BilibiliTaskRegistry {
         }
 
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        let active_key = ActiveBilibiliTaskKey::playback(&normalized_source, options.as_ref());
-        if let Some(active_task_id) = inner.active_task_ids_by_key.get(&active_key)
-            && let Some(active_task) = inner.tasks_by_id.get(active_task_id)
-            && is_active(active_task.state())
-        {
-            return Ok(BilibiliPlaybackTaskCreation {
-                task: active_task.clone(),
-                created: false,
-                cancellation: None,
-            });
-        }
-
         let now = current_timestamp();
         let task = Task {
             id: format!("bilibili-playback-{}", Uuid::new_v4().simple()),
@@ -159,9 +147,6 @@ impl BilibiliTaskRegistry {
             playback_session: None,
         };
 
-        inner
-            .active_task_ids_by_key
-            .insert(active_key, task.id.clone());
         inner
             .playback_options_by_id
             .insert(task.id.clone(), options.clone());
@@ -609,26 +594,27 @@ impl BilibiliTaskRegistry {
 
             let is_active_task = is_active(task.state());
             let task_id = task.id.clone();
-            let active_key =
-                active_key_for_task(&task, download_options.as_ref(), playback_options.as_ref());
-            if is_active_task {
+            if is_active_task && task.kind() == TaskKind::BilibiliDownload {
+                let active_key = active_key_for_task(
+                    &task,
+                    download_options.as_ref(),
+                    playback_options.as_ref(),
+                );
                 if inner.active_task_ids_by_key.contains_key(&active_key) {
                     continue;
                 }
                 inner
                     .active_task_ids_by_key
                     .insert(active_key, task_id.clone());
-                if task.kind() == TaskKind::BilibiliDownload {
-                    inner.queued_task_ids.push_back(task_id.clone());
-                    inner
-                        .download_options_by_id
-                        .insert(task_id.clone(), download_options);
-                }
-                if task.kind() == TaskKind::BilibiliProgressivePlayback {
-                    inner
-                        .playback_options_by_id
-                        .insert(task_id.clone(), playback_options);
-                }
+                inner.queued_task_ids.push_back(task_id.clone());
+                inner
+                    .download_options_by_id
+                    .insert(task_id.clone(), download_options);
+            }
+            if is_active_task && task.kind() == TaskKind::BilibiliProgressivePlayback {
+                inner
+                    .playback_options_by_id
+                    .insert(task_id.clone(), playback_options);
             }
             inner.tasks_by_id.insert(task_id, task);
         }
@@ -1145,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupes_progressive_playback_tasks_without_colliding_with_downloads() {
+    fn creates_request_scoped_progressive_playback_tasks_without_colliding_with_downloads() {
         let registry = BilibiliTaskRegistry::default();
         let download = registry
             .create_bilibili_task("BV1play", None)
@@ -1153,17 +1139,17 @@ mod tests {
         let playback = registry
             .create_bilibili_playback_task("BV1play", Some(playback_options("720P")))
             .expect("playback task should be created");
-        let duplicate_playback = registry
+        let repeated_playback = registry
             .create_bilibili_playback_task("  BV1play  ", Some(playback_options("720p")))
-            .expect("duplicate playback task should be returned");
+            .expect("repeated playback task should be created");
         let different_playback = registry
             .create_bilibili_playback_task("BV1play", Some(playback_options("1080p")))
             .expect("different playback task should be created");
 
         assert_ne!(download.id, playback.task.id);
         assert!(playback.created);
-        assert!(!duplicate_playback.created);
-        assert_eq!(playback.task.id, duplicate_playback.task.id);
+        assert!(repeated_playback.created);
+        assert_ne!(playback.task.id, repeated_playback.task.id);
         assert_ne!(playback.task.id, different_playback.task.id);
     }
 
@@ -1360,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn restores_planned_progressive_playback_task_from_disk() {
+    fn restores_planned_progressive_playback_task_without_deduping_new_requests() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
         let options = playback_options("1080p");
@@ -1380,14 +1366,14 @@ mod tests {
         let restored_task = restored.get_task(&planned.id).expect("task should restore");
         let duplicate = restored
             .create_bilibili_playback_task("BV1planned", Some(options))
-            .expect("duplicate planned playback task should be returned");
+            .expect("new request-scoped playback task should be created");
 
         assert_eq!(TaskState::Planned, restored_task.state());
         assert!(restored_task.playback_source.is_none());
         assert_eq!("cid-1", restored_task.playback_session.unwrap().content_id);
         assert!(!registry.is_cancel_requested(&planned.id));
-        assert_eq!(planned.id, duplicate.task.id);
-        assert!(!duplicate.created);
+        assert_ne!(planned.id, duplicate.task.id);
+        assert!(duplicate.created);
     }
 
     #[test]

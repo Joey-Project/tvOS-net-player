@@ -856,6 +856,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_bilibili_playback_task_does_not_dedupe_pending_request_scoped_tasks() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(PendingPlaybackPlanner),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let first = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1pending-duplicate".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("first playback task should be created")
+            .into_inner();
+        let second = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1pending-duplicate".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("second playback task should be created")
+            .into_inner();
+
+        assert_eq!(TaskState::Preparing, first.state());
+        assert_eq!(TaskState::Preparing, second.state());
+        assert_ne!(first.id, second.id);
+
+        tasks
+            .cancel_task(&first.id)
+            .expect("first pending task should be cancellable");
+        tasks
+            .cancel_task(&second.id)
+            .expect("second pending task should be cancellable");
+        wait_for_task_state(&tasks, &first.id, TaskState::Cancelled).await;
+        wait_for_task_state(&tasks, &second.id, TaskState::Cancelled).await;
+    }
+
+    #[tokio::test]
     async fn create_bilibili_playback_task_limits_background_planning_concurrency() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -1085,6 +1135,25 @@ mod tests {
                     title: "Empty".to_owned(),
                     entries: Vec::new(),
                 })
+            })
+        }
+    }
+
+    struct PendingPlaybackPlanner;
+
+    impl BilibiliPlaybackPlanner for PendingPlaybackPlanner {
+        fn plan<'a>(
+            &'a self,
+            request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            Box::pin(async move {
+                while !request.cancellation.is_cancel_requested() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+
+                Err(BilibiliDownloadError::Cancelled(
+                    "Playback planning was cancelled.".to_owned(),
+                ))
             })
         }
     }
