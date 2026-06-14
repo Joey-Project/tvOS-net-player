@@ -105,17 +105,22 @@ final class CacheLibraryItemTests: XCTestCase {
         }
     }
 
-    func testProgressivePlaybackTaskExposesPlanningMetadataWithoutPlayableSource() {
+    func testProgressivePlaybackTaskExposesPlayableHLSSourceAndMetadata() {
         let task = CacheTask(
             id: "bilibili-playback-1",
             kind: "TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK",
-            state: "TASK_STATE_PLANNED",
+            state: "TASK_STATE_PLAYABLE",
             source: "BV1planned",
             title: "Planned video",
             progress: 0,
-            message: "Bilibili playback plan is ready.",
+            message: "Bilibili playback session is playable.",
             libraryItemID: "",
-            playbackSource: nil,
+            playbackSource: CachePlaybackSource(
+                itemID: "bilibili-playback-1",
+                variantID: "h264",
+                playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
+                uri: "http://mac-mini.local:8080/hls/bilibili-playback-1/master.m3u8"
+            ),
             playbackSession: CacheBilibiliPlaybackSession(
                 id: "bilibili-playback-1",
                 title: "Planned video",
@@ -130,7 +135,11 @@ final class CacheLibraryItemTests: XCTestCase {
         )
 
         XCTAssertTrue(task.isProgressivePlayback)
-        XCTAssertNil(task.playbackSource)
+        XCTAssertTrue(task.playbackSource?.isPlayableByTVOSClient == true)
+        XCTAssertEqual(
+            task.playbackSource?.explicitHTTPURL?.absoluteString,
+            "http://mac-mini.local:8080/hls/bilibili-playback-1/master.m3u8"
+        )
         XCTAssertEqual(task.playbackSession?.selectedVariant?.videoCodec, "avc1.640028")
         XCTAssertEqual(task.playbackSession?.variants.map(\.id), ["h264", "hevc"])
     }
