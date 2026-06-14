@@ -11,8 +11,9 @@ use std::{
 use bbdown_core::{
     BiliClient, ClientConfig, DownloadArchive, DownloadFileKind, DownloadOptions, DownloadReport,
     DuplicateDecision, EntryDownloadReport, HttpHeaderSpec, Input, MediaRequestKind,
-    MediaRequestSpec, MuxOptions, MuxReport, PlaybackCodecPreference, PlaybackPlan,
-    PlaybackVariant, PlaybackVariantKind, Selection, StreamSelection,
+    MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
+    PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
+    PlaybackVariantKind, Selection, StreamSelection,
 };
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
 
@@ -54,6 +55,7 @@ pub(crate) struct BilibiliPlaybackEntry {
     pub title: String,
     pub content_id: String,
     pub duration_seconds: Option<u32>,
+    pub abr: BilibiliPlaybackAbrMetadata,
     pub selected_variant: Option<BilibiliSelectedPlaybackVariant>,
     pub variants: Vec<BilibiliPlaybackVariant>,
 }
@@ -78,9 +80,43 @@ pub(crate) struct BilibiliPlaybackVariant {
     pub height: Option<u32>,
     pub frame_rate: Option<String>,
     pub duration_seconds: Option<u32>,
+    pub abr: Option<BilibiliPlaybackAbrLevel>,
     pub video: Option<BilibiliMediaRequest>,
     pub audio: Option<BilibiliMediaRequest>,
     pub flv_segments: Vec<BilibiliMediaRequest>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrMetadata {
+    pub groups: Vec<BilibiliPlaybackAbrGroup>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrGroup {
+    pub id: String,
+    pub kind: BilibiliPlaybackAbrGroupKind,
+    pub variant_ids: Vec<String>,
+    pub level_count: u32,
+    pub min_bandwidth: Option<u64>,
+    pub max_bandwidth: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BilibiliPlaybackAbrGroupKind {
+    DashVideo,
+    DashAudioOnly,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrLevel {
+    pub group_id: String,
+    pub level_index: u32,
+    pub level_count: u32,
+    pub switchable: bool,
 }
 
 #[allow(dead_code)]
@@ -450,6 +486,7 @@ impl BilibiliPlaybackEntry {
             title: entry.title.clone(),
             content_id: entry.cache_key.content_id.clone(),
             duration_seconds: entry.duration_seconds,
+            abr: BilibiliPlaybackAbrMetadata::from_core(&entry.abr),
             selected_variant,
             variants: entry
                 .variants
@@ -474,6 +511,10 @@ impl BilibiliPlaybackVariant {
             height: variant.height,
             frame_rate: variant.frame_rate.clone(),
             duration_seconds: variant.duration_seconds,
+            abr: variant
+                .abr
+                .as_ref()
+                .map(BilibiliPlaybackAbrLevel::from_core),
             video: variant.video.as_ref().map(BilibiliMediaRequest::from_core),
             audio: variant.audio.as_ref().map(BilibiliMediaRequest::from_core),
             flv_segments: variant
@@ -481,6 +522,45 @@ impl BilibiliPlaybackVariant {
                 .iter()
                 .map(BilibiliMediaRequest::from_core)
                 .collect(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrMetadata {
+    fn from_core(metadata: &PlaybackAbrMetadata) -> Self {
+        Self {
+            groups: metadata
+                .groups
+                .iter()
+                .map(BilibiliPlaybackAbrGroup::from_core)
+                .collect(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrGroup {
+    fn from_core(group: &PlaybackAbrGroup) -> Self {
+        Self {
+            id: group.id.clone(),
+            kind: BilibiliPlaybackAbrGroupKind::from(group.kind),
+            variant_ids: group.variant_ids.clone(),
+            level_count: group.level_count,
+            min_bandwidth: group.min_bandwidth,
+            max_bandwidth: group.max_bandwidth,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrLevel {
+    fn from_core(level: &PlaybackAbrLevel) -> Self {
+        Self {
+            group_id: level.group_id.clone(),
+            level_index: level.level_index,
+            level_count: level.level_count,
+            switchable: level.switchable,
         }
     }
 }
@@ -523,6 +603,15 @@ impl BilibiliHttpHeader {
         Self {
             name: header.name.clone(),
             value: header.value.clone(),
+        }
+    }
+}
+
+impl From<PlaybackAbrGroupKind> for BilibiliPlaybackAbrGroupKind {
+    fn from(kind: PlaybackAbrGroupKind) -> Self {
+        match kind {
+            PlaybackAbrGroupKind::DashVideo => Self::DashVideo,
+            PlaybackAbrGroupKind::DashAudioOnly => Self::DashAudioOnly,
         }
     }
 }
@@ -1337,13 +1426,52 @@ mod tests {
 
     #[test]
     fn maps_playback_plan_and_selects_avplayer_default_variant() {
-        let mapped = BilibiliPlaybackPlan::from_core(sample_playback_plan(), None).unwrap();
+        let core_plan = sample_playback_plan();
+        let core_entry = &core_plan.entries[0];
+        let core_h264_group = core_entry
+            .abr
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .variant_ids
+                    .iter()
+                    .any(|variant_id| variant_id == "h264")
+            })
+            .unwrap()
+            .clone();
+        let core_h264_abr = core_entry
+            .variants
+            .iter()
+            .find(|variant| variant.id == "h264")
+            .and_then(|variant| variant.abr.as_ref())
+            .unwrap()
+            .clone();
+
+        let mapped = BilibiliPlaybackPlan::from_core(core_plan, None).unwrap();
 
         assert_eq!(mapped.title, "Example");
         assert_eq!(mapped.entries.len(), 1);
         let entry = &mapped.entries[0];
         assert_eq!(entry.content_id, "BV1test-cid2");
         assert_eq!(entry.variants.len(), 3);
+        let h264_group = entry
+            .abr
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .variant_ids
+                    .iter()
+                    .any(|variant_id| variant_id == "h264")
+            })
+            .unwrap();
+        assert_eq!(h264_group.id, core_h264_group.id);
+        assert_eq!(h264_group.kind, BilibiliPlaybackAbrGroupKind::DashVideo);
+        assert_eq!(h264_group.variant_ids, core_h264_group.variant_ids);
+        assert_eq!(h264_group.level_count, core_h264_group.level_count);
+        assert_eq!(h264_group.min_bandwidth, core_h264_group.min_bandwidth);
+        assert_eq!(h264_group.max_bandwidth, core_h264_group.max_bandwidth);
 
         let selected = entry.selected_variant.as_ref().unwrap();
         assert_eq!(selected.variant.id, "h264");
@@ -1352,6 +1480,11 @@ mod tests {
             BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault
         );
         assert_eq!(selected.selection.codec_rank, Some(1_001));
+        let h264_abr = selected.variant.abr.as_ref().unwrap();
+        assert_eq!(h264_abr.group_id, core_h264_abr.group_id);
+        assert_eq!(h264_abr.level_index, core_h264_abr.level_index);
+        assert_eq!(h264_abr.level_count, core_h264_abr.level_count);
+        assert_eq!(h264_abr.switchable, core_h264_abr.switchable);
 
         let video = selected.variant.video.as_ref().unwrap();
         assert_eq!(video.kind, BilibiliMediaRequestKind::Video);
