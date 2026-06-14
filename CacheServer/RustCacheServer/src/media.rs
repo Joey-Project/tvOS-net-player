@@ -44,6 +44,26 @@ pub async fn media_head(
     media_response(state, item_id, variant_id, headers, true).await
 }
 
+pub async fn hls_master_playlist_get(Path(session_id): Path<String>) -> Response<Body> {
+    reserved_hls_response(session_id, false)
+}
+
+pub async fn hls_master_playlist_head(Path(session_id): Path<String>) -> Response<Body> {
+    reserved_hls_response(session_id, true)
+}
+
+pub async fn hls_segment_get(
+    Path((_session_id, _segment_id)): Path<(String, String)>,
+) -> Response<Body> {
+    reserved_hls_segment_response(false)
+}
+
+pub async fn hls_segment_head(
+    Path((_session_id, _segment_id)): Path<(String, String)>,
+) -> Response<Body> {
+    reserved_hls_segment_response(true)
+}
+
 async fn media_response(
     state: MediaState,
     item_id: String,
@@ -74,6 +94,35 @@ async fn media_response(
     };
 
     build_file_response(opened_file, range, head_only).await
+}
+
+fn reserved_hls_response(session_id: String, head_only: bool) -> Response<Body> {
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from(format!(
+            "#EXTM3U\n# Progressive playback session {session_id} is planned, but the HLS media pipeline is not implemented yet.\n"
+        ))
+    };
+
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+        .body(body)
+        .expect("reserved HLS response should build")
+}
+
+fn reserved_hls_segment_response(head_only: bool) -> Response<Body> {
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from("HLS segment generation is not implemented yet.\n")
+    };
+
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .body(body)
+        .expect("reserved HLS segment response should build")
 }
 
 async fn build_file_response(

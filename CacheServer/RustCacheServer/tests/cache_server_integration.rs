@@ -203,6 +203,46 @@ async fn derives_playback_host_from_grpc_local_addr_for_wildcard_media_listener(
 }
 
 #[tokio::test]
+async fn reserves_hls_routes_for_progressive_playback_pipeline() {
+    let server = TestServer::start().await;
+    let http = reqwest::Client::new();
+
+    let playlist_response = http
+        .get(format!("{}/hls/session-1/master.m3u8", server.media_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        playlist_response.status()
+    );
+    assert_eq!(
+        "application/vnd.apple.mpegurl",
+        playlist_response.headers()["content-type"]
+    );
+    assert!(
+        playlist_response
+            .text()
+            .await
+            .unwrap()
+            .contains("HLS media pipeline is not implemented yet")
+    );
+
+    let segment_response = http
+        .head(format!(
+            "{}/hls/session-1/segments/segment-1.ts",
+            server.media_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        segment_response.status()
+    );
+}
+
+#[tokio::test]
 async fn supports_cache_roots_rescan_and_bilibili_task_lifecycle() {
     let server = TestServer::start().await;
     let channel = server.channel().await;

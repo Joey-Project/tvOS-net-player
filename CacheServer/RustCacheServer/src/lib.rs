@@ -1,4 +1,5 @@
 mod bbdown_adapter;
+mod bilibili_playback;
 pub mod bilibili_worker;
 pub mod config;
 pub mod generated;
@@ -20,15 +21,20 @@ use generated::tvos_net_player::v1::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use crate::{
+    bilibili_playback::BilibiliPlaybackPlanner,
     config::CacheServerOptions,
     grpc_services::{CacheGrpcService, LibraryGrpcService, ServerGrpcService, TaskGrpcService},
     library::LocalMediaLibrary,
-    media::{MediaState, media_get, media_head},
+    media::{
+        MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
+        hls_segment_head, media_get, media_head,
+    },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
 };
@@ -41,10 +47,32 @@ pub struct AppState {
     pub library: Arc<LocalMediaLibrary>,
     pub playback_uri_factory: Arc<PlaybackUriFactory>,
     pub tasks: Arc<BilibiliTaskRegistry>,
+    pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
+    pub(crate) playback_planning_permits: Arc<Semaphore>,
 }
 
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
+        Self::new_with_playback_planner_factory(options, |options, library| {
+            Arc::new(BbdownBilibiliAdapter::new(options, library))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_playback_planner(
+        options: CacheServerOptions,
+        playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
+    ) -> Self {
+        Self::new_with_playback_planner_factory(options, |_options, _library| playback_planner)
+    }
+
+    fn new_with_playback_planner_factory(
+        options: CacheServerOptions,
+        playback_planner_factory: impl FnOnce(
+            Arc<CacheServerOptions>,
+            Arc<LocalMediaLibrary>,
+        ) -> Arc<dyn BilibiliPlaybackPlanner>,
+    ) -> Self {
         options.validate().expect("invalid cache server options");
         let options = options.normalized_for_runtime();
         options.validate().expect("invalid cache server options");
@@ -53,12 +81,18 @@ impl AppState {
         let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
         let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path(task_state_path));
+        let playback_planner = playback_planner_factory(Arc::clone(&options), Arc::clone(&library));
+        let playback_planning_permits = Arc::new(Semaphore::new(
+            options.bilibili_worker_max_concurrent_tasks.max(1),
+        ));
 
         Self {
             options,
             library,
             playback_uri_factory,
             tasks,
+            playback_planner,
+            playback_planning_permits,
         }
     }
 
@@ -174,6 +208,14 @@ async fn run_media_listener(
         .route(
             "/media/{item_id}/{variant_id}",
             get(media_get).head(media_head),
+        )
+        .route(
+            "/hls/{session_id}/master.m3u8",
+            get(hls_master_playlist_get).head(hls_master_playlist_head),
+        )
+        .route(
+            "/hls/{session_id}/segments/{segment_id}",
+            get(hls_segment_get).head(hls_segment_head),
         )
         .with_state(MediaState::new(state));
 
