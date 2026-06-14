@@ -10,8 +10,10 @@ use std::{
 
 use bbdown_core::{
     BiliClient, ClientConfig, DownloadArchive, DownloadFileKind, DownloadOptions, DownloadReport,
-    DuplicateDecision, EntryDownloadReport, Input, MuxOptions, MuxReport, Selection,
-    StreamSelection,
+    DuplicateDecision, EntryDownloadReport, HttpHeaderSpec, Input, MediaRequestKind,
+    MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
+    PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
+    PlaybackVariantKind, Selection, StreamSelection,
 };
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
 
@@ -33,6 +35,173 @@ pub struct BbdownBilibiliAdapter {
     archive_path: PathBuf,
     ffmpeg_path: PathBuf,
     archive_lock: Arc<Mutex<()>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackPlan {
+    pub title: String,
+    pub entries: Vec<BilibiliPlaybackEntry>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackEntry {
+    pub index: u32,
+    pub aid: u64,
+    pub bvid: Option<String>,
+    pub cid: u64,
+    pub epid: Option<u64>,
+    pub title: String,
+    pub content_id: String,
+    pub duration_seconds: Option<u32>,
+    pub abr: BilibiliPlaybackAbrMetadata,
+    pub selected_variant: Option<BilibiliSelectedPlaybackVariant>,
+    pub variants: Vec<BilibiliPlaybackVariant>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliSelectedPlaybackVariant {
+    pub variant: BilibiliPlaybackVariant,
+    pub selection: BilibiliPlaybackVariantSelection,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackVariant {
+    pub id: String,
+    pub kind: BilibiliPlaybackVariantKind,
+    pub content_id: String,
+    pub bandwidth: Option<u64>,
+    pub codecs: Vec<String>,
+    pub mime_types: Vec<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frame_rate: Option<String>,
+    pub duration_seconds: Option<u32>,
+    pub abr: Option<BilibiliPlaybackAbrLevel>,
+    pub video: Option<BilibiliMediaRequest>,
+    pub audio: Option<BilibiliMediaRequest>,
+    pub flv_segments: Vec<BilibiliMediaRequest>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrMetadata {
+    pub groups: Vec<BilibiliPlaybackAbrGroup>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrGroup {
+    pub id: String,
+    pub kind: BilibiliPlaybackAbrGroupKind,
+    pub variant_ids: Vec<String>,
+    pub level_count: u32,
+    pub min_bandwidth: Option<u64>,
+    pub max_bandwidth: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BilibiliPlaybackAbrGroupKind {
+    DashVideo,
+    DashAudioOnly,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackAbrLevel {
+    pub group_id: String,
+    pub level_index: u32,
+    pub level_count: u32,
+    pub switchable: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliMediaRequest {
+    pub kind: BilibiliMediaRequestKind,
+    pub stream_id: Option<u32>,
+    pub url: String,
+    pub backup_urls: Vec<String>,
+    pub headers: Vec<BilibiliHttpHeader>,
+    pub mime_type: Option<String>,
+    pub codecs: Option<String>,
+    pub bandwidth: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frame_rate: Option<String>,
+    pub size: Option<u64>,
+    pub duration_seconds: Option<u32>,
+    pub cache_key: BilibiliMediaCacheKey,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliHttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliMediaCacheKey {
+    pub content_id: String,
+    pub media_kind: BilibiliMediaRequestKind,
+    pub stream_id: Option<u32>,
+    pub codecs: Option<String>,
+    pub source_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BilibiliPlaybackVariantKind {
+    Dash,
+    Flv,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BilibiliMediaRequestKind {
+    Video,
+    Audio,
+    FlvSegment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliPlaybackVariantSelection {
+    pub policy: BilibiliPlaybackVariantSelectionPolicy,
+    pub codec_rank: Option<usize>,
+    pub score: i32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BilibiliPlaybackVariantSelectionPolicy {
+    AvPlayerDefault,
+    ExplicitEncodingPreference,
+    H264AacFallback,
+    AvPlayerHintFallback,
+}
+
+#[allow(dead_code)]
+struct PlaybackCodecPreferenceCandidate {
+    policy: BilibiliPlaybackVariantSelectionPolicy,
+    preference: PlaybackCodecPreference,
+}
+
+#[allow(dead_code)]
+struct PlaybackVariantPreferences {
+    codec_candidates: Vec<PlaybackCodecPreferenceCandidate>,
+    quality_preference: Option<u32>,
+    allow_avplayer_hint_fallback: bool,
+    encoding_preference: Option<String>,
+}
+
+#[allow(dead_code)]
+struct SelectedCorePlaybackVariant<'a> {
+    variant: &'a PlaybackVariant,
+    selection: BilibiliPlaybackVariantSelection,
 }
 
 impl BbdownBilibiliAdapter {
@@ -174,6 +343,25 @@ impl BbdownBilibiliAdapter {
             .with_danmaku(options.is_some_and(|options| options.download_danmaku))
             .with_mux(MuxOptions::Disabled))
     }
+
+    #[allow(dead_code)]
+    pub(crate) async fn plan_playback(
+        &self,
+        source: &str,
+        options: Option<&BilibiliDownloadOptions>,
+        is_cancel_requested: impl Fn() -> bool,
+    ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
+        let preferences = playback_variant_preferences_from_options(options)?;
+        let input = playback_input_for_planning(source)?;
+        let selection = default_selection_for_input(&input);
+        let plan = run_bbdown_until_cancelled(
+            self.client.plan_playback_input(input, selection),
+            is_cancel_requested,
+            "Cancelled while BBDown playback planning was running.",
+        )
+        .await?;
+        BilibiliPlaybackPlan::from_core_with_preferences(plan, &preferences)
+    }
 }
 
 impl BilibiliDownloadAdapter for BbdownBilibiliAdapter {
@@ -223,11 +411,461 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
 
 fn default_selection_for_input(input: &Input) -> Option<Selection> {
     match input {
-        Input::Season(_) | Input::Media(_) => Some(Selection::Latest),
-        Input::Aid(_) | Input::Bvid(_) | Input::Episode(_) | Input::IntlEpisode(_) => {
-            Some(Selection::Current)
+        Input::Season(_)
+        | Input::Media(_)
+        | Input::CheeseSeason(_)
+        | Input::SpaceVideos(_)
+        | Input::FavoriteList { .. }
+        | Input::CollectionList(_)
+        | Input::SeriesList(_)
+        | Input::SpaceCollectionList { .. }
+        | Input::SpaceSeriesList { .. } => Some(Selection::Latest),
+        Input::Aid(_)
+        | Input::Bvid(_)
+        | Input::Episode(_)
+        | Input::CheeseEpisode(_)
+        | Input::IntlEpisode(_) => Some(Selection::Current),
+        Input::ShortLink(_) => None,
+    }
+}
+
+fn playback_input_for_planning(source: &str) -> Result<Input, BilibiliDownloadError> {
+    let input = Input::parse(source).map_err(failed)?;
+    if matches!(input, Input::ShortLink(_)) {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown playback planning does not support short links yet; expand the b23.tv URL before submitting it.".to_owned(),
+        ));
+    }
+    Ok(input)
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackPlan {
+    fn from_core(
+        plan: PlaybackPlan,
+        options: Option<&BilibiliDownloadOptions>,
+    ) -> Result<Self, BilibiliDownloadError> {
+        let preferences = playback_variant_preferences_from_options(options)?;
+        Self::from_core_with_preferences(plan, &preferences)
+    }
+
+    fn from_core_with_preferences(
+        plan: PlaybackPlan,
+        preferences: &PlaybackVariantPreferences,
+    ) -> Result<Self, BilibiliDownloadError> {
+        Ok(Self {
+            title: plan.title,
+            entries: plan
+                .entries
+                .iter()
+                .map(|entry| BilibiliPlaybackEntry::from_core(entry, preferences))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackEntry {
+    fn from_core(
+        entry: &bbdown_core::PlaybackEntry,
+        preferences: &PlaybackVariantPreferences,
+    ) -> Result<Self, BilibiliDownloadError> {
+        let selected_variant =
+            select_playback_variant(&entry.variants, preferences)?.map(|selected| {
+                BilibiliSelectedPlaybackVariant {
+                    variant: BilibiliPlaybackVariant::from_core(selected.variant),
+                    selection: selected.selection,
+                }
+            });
+        Ok(Self {
+            index: entry.index,
+            aid: entry.aid,
+            bvid: entry.bvid.clone(),
+            cid: entry.cid,
+            epid: entry.epid,
+            title: entry.title.clone(),
+            content_id: entry.cache_key.content_id.clone(),
+            duration_seconds: entry.duration_seconds,
+            abr: BilibiliPlaybackAbrMetadata::from_core(&entry.abr),
+            selected_variant,
+            variants: entry
+                .variants
+                .iter()
+                .map(BilibiliPlaybackVariant::from_core)
+                .collect(),
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackVariant {
+    fn from_core(variant: &PlaybackVariant) -> Self {
+        Self {
+            id: variant.id.clone(),
+            kind: BilibiliPlaybackVariantKind::from(variant.kind),
+            content_id: variant.cache_key.content_id.clone(),
+            bandwidth: variant.bandwidth,
+            codecs: variant.codecs.clone(),
+            mime_types: variant.mime_types.clone(),
+            width: variant.width,
+            height: variant.height,
+            frame_rate: variant.frame_rate.clone(),
+            duration_seconds: variant.duration_seconds,
+            abr: variant
+                .abr
+                .as_ref()
+                .map(BilibiliPlaybackAbrLevel::from_core),
+            video: variant.video.as_ref().map(BilibiliMediaRequest::from_core),
+            audio: variant.audio.as_ref().map(BilibiliMediaRequest::from_core),
+            flv_segments: variant
+                .flv_segments
+                .iter()
+                .map(BilibiliMediaRequest::from_core)
+                .collect(),
         }
     }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrMetadata {
+    fn from_core(metadata: &PlaybackAbrMetadata) -> Self {
+        Self {
+            groups: metadata
+                .groups
+                .iter()
+                .map(BilibiliPlaybackAbrGroup::from_core)
+                .collect(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrGroup {
+    fn from_core(group: &PlaybackAbrGroup) -> Self {
+        Self {
+            id: group.id.clone(),
+            kind: BilibiliPlaybackAbrGroupKind::from(group.kind),
+            variant_ids: group.variant_ids.clone(),
+            level_count: group.level_count,
+            min_bandwidth: group.min_bandwidth,
+            max_bandwidth: group.max_bandwidth,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliPlaybackAbrLevel {
+    fn from_core(level: &PlaybackAbrLevel) -> Self {
+        Self {
+            group_id: level.group_id.clone(),
+            level_index: level.level_index,
+            level_count: level.level_count,
+            switchable: level.switchable,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliMediaRequest {
+    fn from_core(request: &MediaRequestSpec) -> Self {
+        Self {
+            kind: BilibiliMediaRequestKind::from(request.kind),
+            stream_id: request.stream_id,
+            url: request.url.clone(),
+            backup_urls: request.backup_urls.clone(),
+            headers: request
+                .headers
+                .iter()
+                .map(BilibiliHttpHeader::from_core)
+                .collect(),
+            mime_type: request.mime_type.clone(),
+            codecs: request.codecs.clone(),
+            bandwidth: request.bandwidth,
+            width: request.width,
+            height: request.height,
+            frame_rate: request.frame_rate.clone(),
+            size: request.size,
+            duration_seconds: request.duration_seconds,
+            cache_key: BilibiliMediaCacheKey {
+                content_id: request.cache_key.content_id.clone(),
+                media_kind: BilibiliMediaRequestKind::from(request.cache_key.media_kind),
+                stream_id: request.cache_key.stream_id,
+                codecs: request.cache_key.codecs.clone(),
+                source_hash: request.cache_key.source_hash.clone(),
+            },
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl BilibiliHttpHeader {
+    fn from_core(header: &HttpHeaderSpec) -> Self {
+        Self {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        }
+    }
+}
+
+impl From<PlaybackAbrGroupKind> for BilibiliPlaybackAbrGroupKind {
+    fn from(kind: PlaybackAbrGroupKind) -> Self {
+        match kind {
+            PlaybackAbrGroupKind::DashVideo => Self::DashVideo,
+            PlaybackAbrGroupKind::DashAudioOnly => Self::DashAudioOnly,
+        }
+    }
+}
+
+impl From<PlaybackVariantKind> for BilibiliPlaybackVariantKind {
+    fn from(kind: PlaybackVariantKind) -> Self {
+        match kind {
+            PlaybackVariantKind::Dash => Self::Dash,
+            PlaybackVariantKind::Flv => Self::Flv,
+        }
+    }
+}
+
+impl From<MediaRequestKind> for BilibiliMediaRequestKind {
+    fn from(kind: MediaRequestKind) -> Self {
+        match kind {
+            MediaRequestKind::Video => Self::Video,
+            MediaRequestKind::Audio => Self::Audio,
+            MediaRequestKind::FlvSegment => Self::FlvSegment,
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn playback_variant_preferences_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<PlaybackVariantPreferences, BilibiliDownloadError> {
+    let encoding_preference = playback_explicit_encoding_preference(options).map(str::to_owned);
+    Ok(PlaybackVariantPreferences {
+        codec_candidates: playback_codec_preferences_from_options(options)?,
+        quality_preference: playback_quality_preference_from_options(options)?,
+        allow_avplayer_hint_fallback: encoding_preference.is_none(),
+        encoding_preference,
+    })
+}
+
+#[allow(dead_code)]
+fn playback_explicit_encoding_preference(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Option<&str> {
+    let options = options?;
+    let normalized = normalized_preference_token(&options.encoding_preference);
+    if matches!(normalized.as_str(), "" | "auto" | "default" | "best") {
+        None
+    } else {
+        Some(options.encoding_preference.trim())
+    }
+}
+
+#[allow(dead_code)]
+fn playback_codec_preferences_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<Vec<PlaybackCodecPreferenceCandidate>, BilibiliDownloadError> {
+    if options.is_some_and(|options| options.prefer_tv_api) {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown playback planning does not support prefer_tv_api yet; set prefer_tv_api=false."
+                .to_owned(),
+        ));
+    }
+
+    let encoding_preference = options
+        .map(|options| normalized_preference_token(&options.encoding_preference))
+        .unwrap_or_default();
+    let preferences = match encoding_preference.as_str() {
+        "" | "auto" | "default" | "best" => vec![
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault,
+                preference: PlaybackCodecPreference::avplayer_default(),
+            },
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::H264AacFallback,
+                preference: PlaybackCodecPreference::h264_aac(),
+            },
+        ],
+        "h264" | "avc" | "avc1" => vec![PlaybackCodecPreferenceCandidate {
+            policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
+            preference: PlaybackCodecPreference::h264_aac(),
+        }],
+        "hevc" | "h265" | "hev1" | "hvc1" => vec![
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
+                preference: PlaybackCodecPreference::hevc_aac(),
+            },
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::H264AacFallback,
+                preference: PlaybackCodecPreference::h264_aac(),
+            },
+        ],
+        "av1" | "av01" => vec![
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
+                preference: PlaybackCodecPreference::av1_aac(),
+            },
+            PlaybackCodecPreferenceCandidate {
+                policy: BilibiliPlaybackVariantSelectionPolicy::H264AacFallback,
+                preference: PlaybackCodecPreference::h264_aac(),
+            },
+        ],
+        _ => {
+            return Err(BilibiliDownloadError::Failed(format!(
+                "BBDown playback planning does not support encoding_preference {encoding_preference:?}."
+            )));
+        }
+    };
+    Ok(preferences)
+}
+
+#[allow(dead_code)]
+fn playback_quality_preference_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<Option<u32>, BilibiliDownloadError> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+
+    let quality_preference = normalized_preference_token(&options.quality_preference);
+    if matches!(
+        quality_preference.as_str(),
+        "" | "auto" | "default" | "best"
+    ) {
+        return Ok(None);
+    }
+
+    video_quality_preference(&options.quality_preference).map(Some).ok_or_else(|| {
+        BilibiliDownloadError::Failed(format!(
+            "BBDown playback planning does not support quality_preference {quality_preference:?}."
+        ))
+    })
+}
+
+#[allow(dead_code)]
+fn select_playback_variant<'a>(
+    variants: &'a [PlaybackVariant],
+    preferences: &PlaybackVariantPreferences,
+) -> Result<Option<SelectedCorePlaybackVariant<'a>>, BilibiliDownloadError> {
+    let candidate_variants =
+        playback_variants_matching_quality(variants, preferences.quality_preference)?;
+
+    for candidate in &preferences.codec_candidates {
+        if let Some((variant, codec_rank)) = candidate_variants
+            .iter()
+            .copied()
+            .filter(|variant| variant.selection_hints.avplayer.playable)
+            .filter_map(|variant| {
+                variant
+                    .codec_preference_rank(&candidate.preference)
+                    .map(|rank| (variant, rank))
+            })
+            .min_by(|(left, left_rank), (right, right_rank)| {
+                compare_playback_variants(left, *left_rank, right, *right_rank)
+            })
+        {
+            return Ok(Some(SelectedCorePlaybackVariant {
+                variant,
+                selection: BilibiliPlaybackVariantSelection {
+                    policy: candidate.policy,
+                    codec_rank: Some(codec_rank),
+                    score: variant.selection_hints.avplayer.score,
+                },
+            }));
+        }
+    }
+
+    if !preferences.allow_avplayer_hint_fallback {
+        let encoding_preference = preferences
+            .encoding_preference
+            .as_deref()
+            .unwrap_or("explicit encoding");
+        return Err(BilibiliDownloadError::Failed(format!(
+            "BBDown playback planning found no variant matching encoding_preference {encoding_preference:?}."
+        )));
+    }
+
+    Ok(candidate_variants
+        .iter()
+        .copied()
+        .filter(|variant| variant.selection_hints.avplayer.playable)
+        .min_by(|left, right| compare_playback_variants(left, 0, right, 0))
+        .map(|variant| SelectedCorePlaybackVariant {
+            variant,
+            selection: BilibiliPlaybackVariantSelection {
+                policy: BilibiliPlaybackVariantSelectionPolicy::AvPlayerHintFallback,
+                codec_rank: None,
+                score: variant.selection_hints.avplayer.score,
+            },
+        }))
+}
+
+#[allow(dead_code)]
+fn playback_variants_matching_quality(
+    variants: &[PlaybackVariant],
+    quality_preference: Option<u32>,
+) -> Result<Vec<&PlaybackVariant>, BilibiliDownloadError> {
+    let Some(quality_preference) = quality_preference else {
+        return Ok(variants.iter().collect());
+    };
+
+    let matches = variants
+        .iter()
+        .filter(|variant| playback_variant_stream_id(variant) == Some(quality_preference))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(BilibiliDownloadError::Failed(format!(
+            "BBDown playback planning found no variant matching quality_preference {quality_preference}."
+        )));
+    }
+
+    Ok(matches)
+}
+
+#[allow(dead_code)]
+fn playback_variant_stream_id(variant: &PlaybackVariant) -> Option<u32> {
+    variant
+        .video
+        .as_ref()
+        .and_then(|video| video.stream_id)
+        .or_else(|| {
+            variant
+                .flv_segments
+                .iter()
+                .find_map(|segment| segment.stream_id)
+        })
+}
+
+#[allow(dead_code)]
+fn compare_playback_variants(
+    left: &PlaybackVariant,
+    left_rank: usize,
+    right: &PlaybackVariant,
+    right_rank: usize,
+) -> std::cmp::Ordering {
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| {
+            right
+                .selection_hints
+                .avplayer
+                .preferred
+                .cmp(&left.selection_hints.avplayer.preferred)
+        })
+        .then_with(|| {
+            right
+                .selection_hints
+                .avplayer
+                .score
+                .cmp(&left.selection_hints.avplayer.score)
+        })
+        .then_with(|| {
+            right
+                .bandwidth
+                .unwrap_or(0)
+                .cmp(&left.bandwidth.unwrap_or(0))
+        })
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn validate_supported_download_options(
@@ -262,10 +900,7 @@ fn stream_selection_from_options(options: Option<&BilibiliDownloadOptions>) -> S
 }
 
 fn video_quality_preference(value: &str) -> Option<u32> {
-    let normalized = value
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '_', '-'], "");
+    let normalized = normalized_preference_token(value);
     match normalized.as_str() {
         "" | "auto" | "default" | "best" => None,
         "360" | "360p" => Some(16),
@@ -280,6 +915,13 @@ fn video_quality_preference(value: &str) -> Option<u32> {
         "8k" | "4320" | "4320p" => Some(127),
         _ => normalized.parse().ok(),
     }
+}
+
+fn normalized_preference_token(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-'], "")
 }
 
 fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
@@ -750,6 +1392,261 @@ mod tests {
             default_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())),
             Some(Selection::Current)
         );
+        assert_eq!(
+            default_selection_for_input(&Input::CheeseSeason(202)),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::FavoriteList {
+                media_id: Some(456),
+                owner_mid: None,
+            }),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::SpaceVideos(123)),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::CheeseEpisode(101)),
+            Some(Selection::Current)
+        );
+    }
+
+    #[test]
+    fn playback_planning_rejects_short_links_before_core_planning() {
+        let result = playback_input_for_planning("https://b23.tv/demo");
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("does not support short links")
+        ));
+    }
+
+    #[test]
+    fn maps_playback_plan_and_selects_avplayer_default_variant() {
+        let core_plan = sample_playback_plan();
+        let core_entry = &core_plan.entries[0];
+        let core_h264_group = core_entry
+            .abr
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .variant_ids
+                    .iter()
+                    .any(|variant_id| variant_id == "h264")
+            })
+            .unwrap()
+            .clone();
+        let core_h264_abr = core_entry
+            .variants
+            .iter()
+            .find(|variant| variant.id == "h264")
+            .and_then(|variant| variant.abr.as_ref())
+            .unwrap()
+            .clone();
+
+        let mapped = BilibiliPlaybackPlan::from_core(core_plan, None).unwrap();
+
+        assert_eq!(mapped.title, "Example");
+        assert_eq!(mapped.entries.len(), 1);
+        let entry = &mapped.entries[0];
+        assert_eq!(entry.content_id, "BV1test-cid2");
+        assert_eq!(entry.variants.len(), 3);
+        let h264_group = entry
+            .abr
+            .groups
+            .iter()
+            .find(|group| {
+                group
+                    .variant_ids
+                    .iter()
+                    .any(|variant_id| variant_id == "h264")
+            })
+            .unwrap();
+        assert_eq!(h264_group.id, core_h264_group.id);
+        assert_eq!(h264_group.kind, BilibiliPlaybackAbrGroupKind::DashVideo);
+        assert_eq!(h264_group.variant_ids, core_h264_group.variant_ids);
+        assert_eq!(h264_group.level_count, core_h264_group.level_count);
+        assert_eq!(h264_group.min_bandwidth, core_h264_group.min_bandwidth);
+        assert_eq!(h264_group.max_bandwidth, core_h264_group.max_bandwidth);
+
+        let selected = entry.selected_variant.as_ref().unwrap();
+        assert_eq!(selected.variant.id, "h264");
+        assert_eq!(
+            selected.selection.policy,
+            BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault
+        );
+        assert_eq!(selected.selection.codec_rank, Some(1_001));
+        let h264_abr = selected.variant.abr.as_ref().unwrap();
+        assert_eq!(h264_abr.group_id, core_h264_abr.group_id);
+        assert_eq!(h264_abr.level_index, core_h264_abr.level_index);
+        assert_eq!(h264_abr.level_count, core_h264_abr.level_count);
+        assert_eq!(h264_abr.switchable, core_h264_abr.switchable);
+
+        let video = selected.variant.video.as_ref().unwrap();
+        assert_eq!(video.kind, BilibiliMediaRequestKind::Video);
+        assert_eq!(video.url, "https://example.test/h264.m4s");
+        assert_eq!(video.backup_urls, vec!["https://backup.test/h264.m4s"]);
+        assert_eq!(
+            video.headers,
+            vec![BilibiliHttpHeader {
+                name: "referer".to_owned(),
+                value: "https://www.bilibili.com".to_owned(),
+            }]
+        );
+        assert_eq!(video.cache_key.content_id, "BV1test-cid2");
+        assert_eq!(video.cache_key.media_kind, BilibiliMediaRequestKind::Video);
+    }
+
+    #[test]
+    fn playback_selection_honors_explicit_encoding_preference() {
+        let options = bilibili_options_with_encoding("hevc");
+        let mapped =
+            BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options)).unwrap();
+
+        let selected = mapped.entries[0].selected_variant.as_ref().unwrap();
+        assert_eq!(selected.variant.id, "hevc");
+        assert_eq!(
+            selected.selection.policy,
+            BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference
+        );
+    }
+
+    #[test]
+    fn playback_selection_falls_back_to_h264_for_unsupported_explicit_preference() {
+        let mut plan = sample_playback_plan();
+        plan.entries[0]
+            .variants
+            .retain(|variant| variant.id == "h264");
+        let options = bilibili_options_with_encoding("hevc");
+
+        let mapped = BilibiliPlaybackPlan::from_core(plan, Some(&options)).unwrap();
+
+        let selected = mapped.entries[0].selected_variant.as_ref().unwrap();
+        assert_eq!(selected.variant.id, "h264");
+        assert_eq!(
+            selected.selection.policy,
+            BilibiliPlaybackVariantSelectionPolicy::H264AacFallback
+        );
+    }
+
+    #[test]
+    fn playback_selection_rejects_explicit_encoding_without_matching_candidate() {
+        let mut plan = sample_playback_plan();
+        plan.entries[0]
+            .variants
+            .retain(|variant| variant.id != "h264");
+        let options = bilibili_options_with_encoding("h264");
+
+        let result = BilibiliPlaybackPlan::from_core(plan, Some(&options));
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("encoding_preference \"h264\"")
+        ));
+    }
+
+    #[test]
+    fn playback_selection_rejects_non_playable_explicit_encoding_candidate() {
+        let mut plan = sample_playback_plan();
+        plan.entries[0]
+            .variants
+            .retain(|variant| variant.id == "h264");
+        plan.entries[0].variants[0]
+            .selection_hints
+            .avplayer
+            .playable = false;
+        let options = bilibili_options_with_encoding("h264");
+
+        let result = BilibiliPlaybackPlan::from_core(plan, Some(&options));
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("encoding_preference \"h264\"")
+        ));
+    }
+
+    #[test]
+    fn playback_selection_rejects_unknown_encoding_preference() {
+        let options = bilibili_options_with_encoding("vp9");
+
+        let result = BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options));
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("encoding_preference")
+        ));
+    }
+
+    #[test]
+    fn playback_selection_honors_quality_preference() {
+        let options = bilibili_options_with_quality("4k");
+
+        let mapped =
+            BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options)).unwrap();
+
+        let selected = mapped.entries[0].selected_variant.as_ref().unwrap();
+        assert_eq!(selected.variant.id, "av1");
+        assert_eq!(
+            selected.selection.policy,
+            BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault
+        );
+    }
+
+    #[test]
+    fn playback_selection_rejects_unmatched_quality_preference() {
+        let options = bilibili_options_with_quality("8k");
+
+        let result = BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options));
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("quality_preference 127")
+        ));
+    }
+
+    #[test]
+    fn playback_selection_rejects_unknown_quality_preference() {
+        let options = bilibili_options_with_quality("cinema");
+
+        let result = BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options));
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("quality_preference")
+        ));
+    }
+
+    #[test]
+    fn playback_preferences_reject_invalid_options_before_planning() {
+        let mut options = bilibili_options_with_quality("cinema");
+        assert!(matches!(
+            playback_variant_preferences_from_options(Some(&options)),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("quality_preference")
+        ));
+
+        options = bilibili_options_with_encoding("vp9");
+        assert!(matches!(
+            playback_variant_preferences_from_options(Some(&options)),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("encoding_preference")
+        ));
+
+        options.prefer_tv_api = true;
+        assert!(matches!(
+            playback_variant_preferences_from_options(Some(&options)),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("prefer_tv_api")
+        ));
     }
 
     #[tokio::test]
@@ -1097,6 +1994,235 @@ mod tests {
         assert!(!video_path.exists());
         assert!(!audio_path.exists());
         assert!(subtitle_path.exists());
+    }
+
+    fn bilibili_options_with_encoding(encoding_preference: &str) -> BilibiliDownloadOptions {
+        BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: encoding_preference.to_owned(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+        }
+    }
+
+    fn bilibili_options_with_quality(quality_preference: &str) -> BilibiliDownloadOptions {
+        BilibiliDownloadOptions {
+            quality_preference: quality_preference.to_owned(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+        }
+    }
+
+    fn sample_playback_plan() -> PlaybackPlan {
+        serde_json::from_str(
+            r#"{
+              "title": "Example",
+              "entries": [
+                {
+                  "index": 1,
+                  "aid": 1,
+                  "bvid": "BV1test",
+                  "cid": 2,
+                  "epid": null,
+                  "title": "Episode 1",
+                  "cover_url": null,
+                  "source": "normal_web",
+                  "qualities": [],
+                  "duration_seconds": 90,
+                  "variants": [
+                    {
+                      "id": "hevc",
+                      "kind": "dash",
+                      "video": {
+                        "kind": "video",
+                        "stream_id": 80,
+                        "url": "https://example.test/hevc.m4s",
+                        "backup_urls": [],
+                        "headers": [
+                          {
+                            "name": "referer",
+                            "value": "https://www.bilibili.com"
+                          }
+                        ],
+                        "mime_type": "video/mp4",
+                        "codecs": "hev1.1.6.L120.90",
+                        "codec_family": "hevc",
+                        "bandwidth": 800000,
+                        "width": 1920,
+                        "height": 1080,
+                        "frame_rate": "60",
+                        "size": 1000,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "video",
+                          "stream_id": 80,
+                          "codecs": "hev1.1.6.L120.90",
+                          "source_hash": "hevc0001"
+                        }
+                      },
+                      "audio": {
+                        "kind": "audio",
+                        "stream_id": 30280,
+                        "url": "https://example.test/audio.m4s",
+                        "backup_urls": [],
+                        "headers": [],
+                        "mime_type": "audio/mp4",
+                        "codecs": "mp4a.40.2",
+                        "codec_family": "aac",
+                        "bandwidth": 128000,
+                        "width": null,
+                        "height": null,
+                        "frame_rate": null,
+                        "size": 100,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "audio",
+                          "stream_id": 30280,
+                          "codecs": "mp4a.40.2",
+                          "source_hash": "audio001"
+                        }
+                      },
+                      "flv_segments": [],
+                      "bandwidth": 928000,
+                      "codecs": ["hev1.1.6.L120.90", "mp4a.40.2"],
+                      "mime_types": ["video/mp4", "audio/mp4"],
+                      "width": 1920,
+                      "height": 1080,
+                      "frame_rate": "60",
+                      "duration_seconds": 90
+                    },
+                    {
+                      "id": "h264",
+                      "kind": "dash",
+                      "video": {
+                        "kind": "video",
+                        "stream_id": 64,
+                        "url": "https://example.test/h264.m4s",
+                        "backup_urls": ["https://backup.test/h264.m4s"],
+                        "headers": [
+                          {
+                            "name": "referer",
+                            "value": "https://www.bilibili.com"
+                          }
+                        ],
+                        "mime_type": "video/mp4",
+                        "codecs": "avc1.640028",
+                        "codec_family": "h264",
+                        "bandwidth": 1200000,
+                        "width": 1920,
+                        "height": 1080,
+                        "frame_rate": "60",
+                        "size": 1200,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "video",
+                          "stream_id": 64,
+                          "codecs": "avc1.640028",
+                          "source_hash": "h2640001"
+                        }
+                      },
+                      "audio": {
+                        "kind": "audio",
+                        "stream_id": 30280,
+                        "url": "https://example.test/audio.m4s",
+                        "backup_urls": [],
+                        "headers": [],
+                        "mime_type": "audio/mp4",
+                        "codecs": "mp4a.40.2",
+                        "codec_family": "aac",
+                        "bandwidth": 128000,
+                        "width": null,
+                        "height": null,
+                        "frame_rate": null,
+                        "size": 100,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "audio",
+                          "stream_id": 30280,
+                          "codecs": "mp4a.40.2",
+                          "source_hash": "audio001"
+                        }
+                      },
+                      "flv_segments": [],
+                      "bandwidth": 1328000,
+                      "codecs": ["avc1.640028", "mp4a.40.2"],
+                      "mime_types": ["video/mp4", "audio/mp4"],
+                      "width": 1920,
+                      "height": 1080,
+                      "frame_rate": "60",
+                      "duration_seconds": 90
+                    },
+                    {
+                      "id": "av1",
+                      "kind": "dash",
+                      "video": {
+                        "kind": "video",
+                        "stream_id": 120,
+                        "url": "https://example.test/av1.m4s",
+                        "backup_urls": [],
+                        "headers": [],
+                        "mime_type": "video/mp4",
+                        "codecs": "av01.0.08M.08",
+                        "codec_family": "av1",
+                        "bandwidth": 600000,
+                        "width": 1920,
+                        "height": 1080,
+                        "frame_rate": "60",
+                        "size": 900,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "video",
+                          "stream_id": 120,
+                          "codecs": "av01.0.08M.08",
+                          "source_hash": "av100001"
+                        }
+                      },
+                      "audio": {
+                        "kind": "audio",
+                        "stream_id": 30280,
+                        "url": "https://example.test/audio.m4s",
+                        "backup_urls": [],
+                        "headers": [],
+                        "mime_type": "audio/mp4",
+                        "codecs": "mp4a.40.2",
+                        "codec_family": "aac",
+                        "bandwidth": 128000,
+                        "width": null,
+                        "height": null,
+                        "frame_rate": null,
+                        "size": 100,
+                        "duration_seconds": 90,
+                        "cache_key": {
+                          "content_id": "BV1test-cid2",
+                          "media_kind": "audio",
+                          "stream_id": 30280,
+                          "codecs": "mp4a.40.2",
+                          "source_hash": "audio001"
+                        }
+                      },
+                      "flv_segments": [],
+                      "bandwidth": 728000,
+                      "codecs": ["av01.0.08M.08", "mp4a.40.2"],
+                      "mime_types": ["video/mp4", "audio/mp4"],
+                      "width": 1920,
+                      "height": 1080,
+                      "frame_rate": "60",
+                      "duration_seconds": 90
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .unwrap()
     }
 
     #[cfg(unix)]
