@@ -237,6 +237,10 @@ impl BilibiliTaskRegistry {
             let updated_at = current_timestamp();
             task.updated_at = Some(copy_timestamp(&updated_at));
             task.finished_at = Some(updated_at);
+            if task.kind() == TaskKind::BilibiliProgressivePlayback {
+                task.playback_source = None;
+                task.playback_session = None;
+            }
 
             task.clone()
         };
@@ -1433,6 +1437,42 @@ mod tests {
         assert_eq!(TaskState::Playable, playable.state());
         assert!(recreated.created);
         assert_eq!(TaskState::Preparing, recreated.task.state());
+        assert_ne!(playable.id, recreated.task.id);
+    }
+
+    #[test]
+    fn cancelling_playable_progressive_playback_task_clears_runtime_source() {
+        let registry = BilibiliTaskRegistry::default();
+        let options = playback_options("1080p");
+        let created = registry
+            .create_bilibili_playback_task("BV1cancel-playable", Some(options.clone()))
+            .expect("playback task should be created");
+        let playable = registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+
+        let cancelled = registry
+            .cancel_task(&playable.id)
+            .expect("playable task should be cancellable");
+        let stored = registry
+            .get_task(&playable.id)
+            .expect("cancelled task should still be readable");
+        let recreated = registry
+            .create_bilibili_playback_task("BV1cancel-playable", Some(options))
+            .expect("cancelled source should be requeueable");
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(cancelled.playback_source.is_none());
+        assert!(cancelled.playback_session.is_none());
+        assert_eq!(TaskState::Cancelled, stored.state());
+        assert!(stored.playback_source.is_none());
+        assert!(stored.playback_session.is_none());
+        assert!(recreated.created);
         assert_ne!(playable.id, recreated.task.id);
     }
 
