@@ -1,7 +1,7 @@
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use futures_core::Stream;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::sleep};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -394,23 +394,43 @@ async fn run_bilibili_playback_planning(
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) {
     let mut cleanup = PlaybackPlanningCleanup::new(Arc::clone(&state.tasks), task_id.clone());
-    let _permit = match Arc::clone(&state.playback_planning_permits)
-        .acquire_owned()
-        .await
-    {
-        Ok(permit) => permit,
-        Err(_) => {
+    let permit_request = Arc::clone(&state.playback_planning_permits).acquire_owned();
+    tokio::pin!(permit_request);
+    let _permit = loop {
+        if cancellation.is_cancel_requested() {
             if state
                 .tasks
-                .complete_task_failed(
+                .complete_task_cancelled(
                     &task_id,
-                    "Playback planning concurrency limiter is unavailable.".to_owned(),
+                    "Cancelled before playback planning started.".to_owned(),
                 )
                 .is_ok()
             {
                 cleanup.disarm();
             }
             return;
+        }
+
+        tokio::select! {
+            permit = &mut permit_request => {
+                match permit {
+                    Ok(permit) => break permit,
+                    Err(_) => {
+                        if state
+                            .tasks
+                            .complete_task_failed(
+                                &task_id,
+                                "Playback planning concurrency limiter is unavailable.".to_owned(),
+                            )
+                            .is_ok()
+                        {
+                            cleanup.disarm();
+                        }
+                        return;
+                    }
+                }
+            }
+            () = sleep(Duration::from_millis(100)) => {}
         }
     };
     let planning_request = BilibiliPlaybackPlanningRequest {
@@ -828,6 +848,94 @@ mod tests {
             .send(Ok(sample_playback_plan()))
             .expect("second plan should be delivered");
         wait_for_task_state(&tasks, &second.id, TaskState::Planned).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_playback_task_waiting_for_planning_permit_finishes_without_planner_start() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner, mut starts, mut results) =
+            SourceControlledPlaybackPlanner::new(["BV1first", "BV1second"]);
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let first_started = starts
+            .remove("BV1first")
+            .expect("first start signal should exist");
+        let mut second_started = starts
+            .remove("BV1second")
+            .expect("second start signal should exist");
+        let first_result = results
+            .remove("BV1first")
+            .expect("first result sender should exist");
+        let second_result = results
+            .remove("BV1second")
+            .expect("second result sender should exist");
+
+        let first = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1first".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("first playback task should be created")
+            .into_inner();
+        first_started
+            .await
+            .expect("first background planner should start");
+        let second = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1second".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("second playback task should be created")
+            .into_inner();
+
+        tasks
+            .cancel_task(&second.id)
+            .expect("second task should be cancellable while waiting for permit");
+        let cancelled = wait_for_task_state(&tasks, &second.id, TaskState::Cancelled).await;
+        assert!(cancelled.playback_session.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_started)
+                .await
+                .is_err(),
+            "cancelled task should not start the planner after it was waiting for a permit"
+        );
+
+        let recreated = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1second".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("cancelled playback task should allow retry")
+            .into_inner();
+        assert_ne!(second.id, recreated.id);
+
+        first_result
+            .send(Ok(sample_playback_plan()))
+            .expect("first plan should be delivered");
+        wait_for_task_state(&tasks, &first.id, TaskState::Planned).await;
+        second_started
+            .await
+            .expect("recreated second planner should start after permit is released");
+        second_result
+            .send(Ok(sample_playback_plan()))
+            .expect("second plan should be delivered");
+        wait_for_task_state(&tasks, &recreated.id, TaskState::Planned).await;
     }
 
     struct EmptyPlaybackPlanner;

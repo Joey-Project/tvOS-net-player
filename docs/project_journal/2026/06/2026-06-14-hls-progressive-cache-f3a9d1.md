@@ -94,3 +94,5 @@ superseded_by:
   - `.codex-tmp/isolated-review-41b1nakv` found that PR 2 should not expose a playable HLS `PlaybackSource` before the HLS media route is implemented.
   - `.codex-tmp/isolated-review-cfh3mc19` found that background playback planning needed a global concurrency limit.
   - `.codex-tmp/isolated-review-f6jd79bj` returned `LGTM` after the planned-source and concurrency fixes.
+  - `.codex-tmp/pr10-independent-codex-pr-review.md` found that cancellation while waiting for the planning semaphore left the task active until a permit became available, and found stale architecture wording that still described returning a HLS `PlaybackSource` in PR 2.
+  - The PR 2 fix polls cancellation while waiting for the planning permit, adds a regression test for cancelled waiters, and updates the architecture doc to match the `PREPARING` -> `PLANNED` metadata-only contract.

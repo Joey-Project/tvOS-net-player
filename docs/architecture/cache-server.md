@@ -73,8 +73,8 @@ Playback planning foundation:
 - Variant selection starts with BBDown's `PlaybackCodecPreference::avplayer_default()` ranking, supports explicit H.264/HEVC/AV1 preferences for future progressive requests, and falls back to H.264/AAC when an explicit non-H.264 preference is not available.
 - Playback planning currently rejects Bilibili short links because `bbdown-core` resolves them internally after the caller must already choose a default selection. Supporting short links without incorrect season/collection behavior requires a core API that exposes the resolved `Input` before planning.
 - BBDown remains a resolver and metadata provider for progressive playback. The LAN cache server owns source fetch retry, HLS playlist/segment generation, cache layout, recovery, and optional LAN-side transcoding.
-- The cache server exposes the first progressive control-plane slice through `TaskService.CreateBilibiliPlaybackTask`. The RPC creates a `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task, calls the playback planner, persists `PlaybackSource` and `BilibiliPlaybackSession` metadata into the existing task snapshot, and returns a planned HLS playlist URL.
-- Progressive playback states extend the shared task model with `PLANNED`, `PREPARING`, `PLAYABLE`, and `COMPLETED`. `PREPARING` records an in-flight synchronous planning call; `PLANNED` means BBDown metadata and a stable HLS URL are available; `PLAYABLE` and `COMPLETED` are reserved for the media pipeline and offline finalization slices.
+- The cache server exposes the first progressive control-plane slice through `TaskService.CreateBilibiliPlaybackTask`. The RPC creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it immediately in `PREPARING`; BBDown playback planning runs in the background and later publishes persisted `BilibiliPlaybackSession` metadata through `GetTask` and `WatchTasks`.
+- Progressive playback states extend the shared task model with `PLANNED`, `PREPARING`, `PLAYABLE`, and `COMPLETED`. `PREPARING` records in-flight background planning; `PLANNED` means BBDown session metadata is available but no playable HLS `PlaybackSource` is exposed yet; `PLAYABLE` and `COMPLETED` are reserved for the media pipeline and offline finalization slices.
 - The reserved HLS HTTP routes are `/hls/{session_id}/master.m3u8` and `/hls/{session_id}/segments/{segment_id}`. They intentionally return `501 Not Implemented` until the HLS media pipeline lands, so the control-plane URL contract is stable without pretending media bytes are available.
 - The existing complete-download MP4 path remains the runtime playable path until the progressive HLS media pipeline lands.
 
@@ -87,7 +87,7 @@ Initial services:
 - `ServerService`: server info and health.
 - `LibraryService`: list items, get item details, rescan cache roots, and request playback sources.
 - `TaskService`: create Bilibili cache tasks, read task state, watch task events, and request cancellation.
-- `TaskService.CreateBilibiliPlaybackTask`: create a progressive Bilibili playback planning task and return planned HLS playback metadata once BBDown planning succeeds.
+- `TaskService.CreateBilibiliPlaybackTask`: create a progressive Bilibili playback planning task, return it in `PREPARING`, and publish planned metadata later through task reads or watches.
 - `CacheService`: list cache roots and delete cached items.
 
 Playback sources intentionally return URLs instead of media bytes.
