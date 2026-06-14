@@ -597,13 +597,6 @@ async fn run_bilibili_playback_planning(
         }
     };
 
-    if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
-        eprintln!(
-            "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"
-        );
-    }
-
-    state.hls_sessions.insert(metadata.hls_session.clone());
     let playback_source = PlaybackSource {
         item_id: task_id.clone(),
         variant_id: metadata.playback_session.selected_variant_id.clone(),
@@ -622,6 +615,12 @@ async fn run_bilibili_playback_planning(
                 state.hls_sessions.remove(&task_id);
                 let _ = state.hls_cache.remove_session(&task_id);
             } else {
+                state.hls_sessions.insert(metadata.hls_session.clone());
+                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
+                    eprintln!(
+                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"
+                    );
+                }
                 tokio::spawn(run_hls_cache_finalization(
                     state.clone(),
                     task_id.clone(),
@@ -687,7 +686,10 @@ pub(crate) async fn run_hls_cache_finalization(
                 }
             }
         }
-        Err(crate::hls_cache::HlsCacheError::Cancelled) => {}
+        Err(crate::hls_cache::HlsCacheError::Cancelled) => {
+            state.hls_sessions.remove(&task_id);
+            let _ = state.hls_cache.remove_session(&task_id);
+        }
         Err(error) => {
             if !state.tasks.is_playback_task_playable(&task_id) {
                 return;
@@ -963,6 +965,60 @@ mod tests {
 
         assert_eq!(TaskState::Cancelled, cancelled.state());
         assert!(service.state.hls_sessions.get(&task.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_playback_planning_does_not_persist_hls_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state.clone());
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1cancel-before-manifest".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        planner_started
+            .await
+            .expect("background playback planner should start");
+        tasks
+            .cancel_task(&created.id)
+            .expect("task should be cancellable while planner is pending");
+        plan_sender
+            .send(Ok(sample_playback_plan()))
+            .expect("test should send playback plan");
+
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+
+        assert!(cancelled.playback_source.is_none());
+        assert!(cancelled.playback_session.is_none());
+        assert!(state.hls_sessions.get(&created.id).is_none());
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&created.id)
+                .join("session.json")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -2262,6 +2318,13 @@ mod tests {
                 .join("hls")
                 .join(&creation.task.id)
                 .join("video.m4s.tmp")
+                .exists()
+        );
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&creation.task.id)
                 .exists()
         );
     }

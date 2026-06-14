@@ -26,6 +26,8 @@ use crate::{
 pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
+const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
+const INTERNAL_HLS_CACHE_DIR: &str = "hls";
 
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
@@ -554,6 +556,9 @@ fn collect_media_candidates(
         }
 
         if file_type.is_dir() {
+            if is_internal_hls_cache_dir(root_path, &path) {
+                continue;
+            }
             collect_media_candidates(
                 root_path,
                 &path,
@@ -591,6 +596,15 @@ fn collect_media_candidates(
     }
 
     Ok(())
+}
+
+fn is_internal_hls_cache_dir(root_path: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root_path) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
+        && matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_HLS_CACHE_DIR)
 }
 
 fn create_item_id(relative_path: &str) -> String {
@@ -927,6 +941,30 @@ mod tests {
                 .item_id_for_media_path_blocking(&escaped_path)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn local_scan_excludes_internal_hls_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(root_path.join(".tvos-net-player/hls/session-1")).unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/hls/session-1/video.m4s"),
+            b"hls",
+        )
+        .unwrap();
+        fs::write(root_path.join("Visible.m4s"), b"media").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+
+        let page = library.list_items_page_blocking(None, 0, 50, BlockingCancellation::default());
+
+        assert_eq!(1, page.items.len());
+        assert_eq!("Visible.m4s", page.items[0].subtitle);
     }
 
     #[test]

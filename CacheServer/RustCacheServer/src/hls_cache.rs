@@ -205,18 +205,26 @@ impl HlsCacheStore {
         F: Fn() -> bool + Send + Sync,
     {
         if should_cancel() {
+            let _ = self.remove_session(&session.id);
             return Err(HlsCacheError::Cancelled);
         }
-        self.save_session(session)?;
-        self.cache_resource(client, &session.id, &session.variant.video, &should_cancel)
-            .await?;
-        if let Some(audio) = &session.variant.audio {
-            self.cache_resource(client, &session.id, audio, &should_cancel)
+        let result = async {
+            self.save_session(session)?;
+            self.cache_resource(client, &session.id, &session.variant.video, &should_cancel)
                 .await?;
-        }
-        self.save_completed_session(session)?;
+            if let Some(audio) = &session.variant.audio {
+                self.cache_resource(client, &session.id, audio, &should_cancel)
+                    .await?;
+            }
+            self.save_completed_session(session)?;
 
-        Ok(Self::completed_library_item_id(&session.id))
+            Ok(Self::completed_library_item_id(&session.id))
+        }
+        .await;
+        if matches!(&result, Err(HlsCacheError::Cancelled)) {
+            let _ = self.remove_session(&session.id);
+        }
+        result
     }
 
     fn completed_library_item(&self, session: &HlsPlaybackSession) -> Option<LibraryItem> {
@@ -357,7 +365,14 @@ impl HlsCacheStore {
                         ));
                         continue;
                     }
+                    if should_cancel() {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(HlsCacheError::Cancelled);
+                    }
                     tokio::fs::rename(&temp_path, &resource_path).await?;
+                    if should_cancel() {
+                        return Err(HlsCacheError::Cancelled);
+                    }
                     let metadata = PersistedHlsCachedResource {
                         schema_version: HLS_CACHE_SCHEMA_VERSION,
                         id: resource.id.clone(),
@@ -372,6 +387,9 @@ impl HlsCacheStore {
                         &self.resource_metadata_path(session_id, &resource.id)?,
                         &metadata,
                     )?;
+                    if should_cancel() {
+                        return Err(HlsCacheError::Cancelled);
+                    }
                     return Ok(());
                 }
                 Err(error) => {
@@ -1159,6 +1177,41 @@ mod tests {
         assert!(store.get_completed_library_item(&item_id).is_some());
     }
 
+    #[tokio::test]
+    async fn cancellation_after_committed_resource_removes_partial_session() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session_with_audio("session-cancel-after-video", &upstream_url);
+        let client = reqwest::Client::new();
+        let store_for_cancel = store.clone();
+        let session_id = session.id.clone();
+
+        let error = store
+            .cache_session_resources_until(&client, &session, move || {
+                store_for_cancel
+                    .cached_resource(&session_id, "video.m4s")
+                    .is_some()
+            })
+            .await
+            .expect_err("cancellation after video commit should stop finalization");
+
+        assert!(matches!(error, HlsCacheError::Cancelled));
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
+        assert!(store.cached_resource(&session.id, "audio.m4s").is_none());
+        assert!(
+            store
+                .get_completed_library_item(&format!("bilibili.hls.{}", session.id))
+                .is_none()
+        );
+        assert!(
+            !store
+                .session_dir(&session.id)
+                .expect("session dir should be valid")
+                .exists()
+        );
+    }
+
     async fn start_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_mp4))).await
     }
@@ -1308,6 +1361,18 @@ mod tests {
                 audio: None,
             },
         }
+    }
+
+    fn sample_session_with_audio(id: &str, url: &str) -> HlsPlaybackSession {
+        let mut session = sample_session(id, url);
+        let mut audio = session.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = BilibiliMediaRequestKind::Audio;
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
+        session.variant.audio = Some(audio);
+        session
     }
 
     fn fake_mp4() -> Vec<u8> {

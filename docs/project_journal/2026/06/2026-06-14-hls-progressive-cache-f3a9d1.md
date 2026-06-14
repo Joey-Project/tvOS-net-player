@@ -144,6 +144,9 @@ superseded_by:
   - Completed offline HLS session manifests now scrub upstream URLs, backup URLs, and request headers after the selected resources are fully cached.
   - Startup restore now rewrites fully cached crash-window HLS manifests to the scrubbed completed form before marking tasks `COMPLETED`.
   - Successful HLS cache finalization now replaces the in-memory runtime HLS session with a cache-only session so completed offline playback cannot fall back to upstream proxying with original request credentials.
+  - Playback planning now marks progressive tasks `PLAYABLE` before persisting the upstream HLS session manifest, so cancelled or failed planning cannot leave unowned URL/header-bearing manifests on disk.
+  - HLS cache cancellation now performs idempotent session cleanup after committed resources and in the finalizer cancellation branch, preventing partially cached video/audio resources from surviving cancellation races.
+  - Local library enumeration now excludes the internal `.tvos-net-player/hls` cache tree even when `.m4s` is explicitly allowed as a local-media extension.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -160,5 +163,10 @@ superseded_by:
   - `just ci` after independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-fixes.log`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_scrubs_completed_hls_manifest_during_restart_recovery -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked hls_cache_finalizer_sanitizes_runtime_session_after_completion -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked cancelled_playback_planning_does_not_persist_hls_manifest -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked cancellation_after_committed_resource_removes_partial_session -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked local_scan_excludes_internal_hls_cache_files -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_cache_finalizer_stops_when_task_is_cancelled_during_download -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked`
   - `just ci` after second independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-rerun-fixes.log`
+  - `just ci` after third independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-third-fixes-rerun.log`
