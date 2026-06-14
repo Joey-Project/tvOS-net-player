@@ -8,7 +8,10 @@ use std::{
 use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::generated::tvos_net_player::v1::{BilibiliDownloadOptions, Task};
+use crate::generated::tvos_net_player::v1::{
+    BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
+    BilibiliPlaybackVariant, PlaybackSource, Task,
+};
 
 const TASK_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -81,6 +84,7 @@ impl TaskStateStore {
 pub(crate) struct PersistedTaskRecord {
     pub(crate) task: Task,
     pub(crate) options: Option<BilibiliDownloadOptions>,
+    pub(crate) playback_options: Option<BilibiliPlaybackOptions>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,7 +109,14 @@ struct PersistedTaskFile {
     created_at: Option<PersistedTimestamp>,
     updated_at: Option<PersistedTimestamp>,
     finished_at: Option<PersistedTimestamp>,
+    #[serde(default)]
+    playback_source: Option<PersistedPlaybackSource>,
+    #[serde(default)]
+    playback_session: Option<PersistedBilibiliPlaybackSession>,
+    #[serde(default)]
     bilibili_options: Option<PersistedBilibiliDownloadOptions>,
+    #[serde(default)]
+    bilibili_playback_options: Option<PersistedBilibiliPlaybackOptions>,
 }
 
 impl From<PersistedTaskRecord> for PersistedTaskFile {
@@ -125,7 +136,14 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
             created_at: task.created_at.map(PersistedTimestamp::from),
             updated_at: task.updated_at.map(PersistedTimestamp::from),
             finished_at: task.finished_at.map(PersistedTimestamp::from),
+            playback_source: task.playback_source.map(PersistedPlaybackSource::from),
+            playback_session: task
+                .playback_session
+                .map(PersistedBilibiliPlaybackSession::from),
             bilibili_options: record.options.map(PersistedBilibiliDownloadOptions::from),
+            bilibili_playback_options: record
+                .playback_options
+                .map(PersistedBilibiliPlaybackOptions::from),
         }
     }
 }
@@ -147,8 +165,13 @@ impl From<PersistedTaskFile> for PersistedTaskRecord {
                 created_at: file.created_at.map(Timestamp::from),
                 updated_at: file.updated_at.map(Timestamp::from),
                 finished_at: file.finished_at.map(Timestamp::from),
+                playback_source: file.playback_source.map(PlaybackSource::from),
+                playback_session: file.playback_session.map(BilibiliPlaybackSession::from),
             },
             options: file.bilibili_options.map(BilibiliDownloadOptions::from),
+            playback_options: file
+                .bilibili_playback_options
+                .map(BilibiliPlaybackOptions::from),
         }
     }
 }
@@ -157,6 +180,134 @@ impl From<PersistedTaskFile> for PersistedTaskRecord {
 struct PersistedTimestamp {
     seconds: i64,
     nanos: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedPlaybackSource {
+    item_id: String,
+    variant_id: String,
+    protocol: i32,
+    uri: String,
+    expires_at: Option<PersistedTimestamp>,
+}
+
+impl From<PlaybackSource> for PersistedPlaybackSource {
+    fn from(source: PlaybackSource) -> Self {
+        Self {
+            item_id: source.item_id,
+            variant_id: source.variant_id,
+            protocol: source.protocol,
+            uri: source.uri,
+            expires_at: source.expires_at.map(PersistedTimestamp::from),
+        }
+    }
+}
+
+impl From<PersistedPlaybackSource> for PlaybackSource {
+    fn from(source: PersistedPlaybackSource) -> Self {
+        Self {
+            item_id: source.item_id,
+            variant_id: source.variant_id,
+            protocol: source.protocol,
+            uri: source.uri,
+            expires_at: source.expires_at.map(Timestamp::from),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliPlaybackSession {
+    id: String,
+    title: String,
+    content_id: String,
+    selected_variant_id: String,
+    selected_variant: Option<PersistedBilibiliPlaybackVariant>,
+    #[serde(default)]
+    variants: Vec<PersistedBilibiliPlaybackVariant>,
+}
+
+impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
+    fn from(session: BilibiliPlaybackSession) -> Self {
+        Self {
+            id: session.id,
+            title: session.title,
+            content_id: session.content_id,
+            selected_variant_id: session.selected_variant_id,
+            selected_variant: session
+                .selected_variant
+                .map(PersistedBilibiliPlaybackVariant::from),
+            variants: session
+                .variants
+                .into_iter()
+                .map(PersistedBilibiliPlaybackVariant::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<PersistedBilibiliPlaybackSession> for BilibiliPlaybackSession {
+    fn from(session: PersistedBilibiliPlaybackSession) -> Self {
+        Self {
+            id: session.id,
+            title: session.title,
+            content_id: session.content_id,
+            selected_variant_id: session.selected_variant_id,
+            selected_variant: session.selected_variant.map(BilibiliPlaybackVariant::from),
+            variants: session
+                .variants
+                .into_iter()
+                .map(BilibiliPlaybackVariant::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliPlaybackVariant {
+    id: String,
+    label: String,
+    source_kind: String,
+    container: String,
+    video_codec: String,
+    audio_codec: String,
+    width: i32,
+    height: i32,
+    bitrate: i64,
+    size_bytes: i64,
+}
+
+impl From<BilibiliPlaybackVariant> for PersistedBilibiliPlaybackVariant {
+    fn from(variant: BilibiliPlaybackVariant) -> Self {
+        Self {
+            id: variant.id,
+            label: variant.label,
+            source_kind: variant.source_kind,
+            container: variant.container,
+            video_codec: variant.video_codec,
+            audio_codec: variant.audio_codec,
+            width: variant.width,
+            height: variant.height,
+            bitrate: variant.bitrate,
+            size_bytes: variant.size_bytes,
+        }
+    }
+}
+
+impl From<PersistedBilibiliPlaybackVariant> for BilibiliPlaybackVariant {
+    fn from(variant: PersistedBilibiliPlaybackVariant) -> Self {
+        Self {
+            id: variant.id,
+            label: variant.label,
+            source_kind: variant.source_kind,
+            container: variant.container,
+            video_codec: variant.video_codec,
+            audio_codec: variant.audio_codec,
+            width: variant.width,
+            height: variant.height,
+            bitrate: variant.bitrate,
+            size_bytes: variant.size_bytes,
+        }
+    }
 }
 
 impl From<Timestamp> for PersistedTimestamp {
@@ -206,6 +357,33 @@ impl From<PersistedBilibiliDownloadOptions> for BilibiliDownloadOptions {
             prefer_tv_api: options.prefer_tv_api,
             download_subtitles: options.download_subtitles,
             download_danmaku: options.download_danmaku,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliPlaybackOptions {
+    quality_preference: String,
+    encoding_preference: String,
+    prefer_tv_api: bool,
+}
+
+impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
+    fn from(options: BilibiliPlaybackOptions) -> Self {
+        Self {
+            quality_preference: options.quality_preference,
+            encoding_preference: options.encoding_preference,
+            prefer_tv_api: options.prefer_tv_api,
+        }
+    }
+}
+
+impl From<PersistedBilibiliPlaybackOptions> for BilibiliPlaybackOptions {
+    fn from(options: PersistedBilibiliPlaybackOptions) -> Self {
+        Self {
+            quality_preference: options.quality_preference,
+            encoding_preference: options.encoding_preference,
+            prefer_tv_api: options.prefer_tv_api,
         }
     }
 }

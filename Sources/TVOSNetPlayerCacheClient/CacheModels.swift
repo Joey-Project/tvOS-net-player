@@ -226,6 +226,125 @@ public struct CachePlaybackSource: Equatable, Sendable {
     }
 }
 
+public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
+    public let qualityPreference: String
+    public let encodingPreference: String
+    public let preferTVAPI: Bool
+
+    public init(
+        qualityPreference: String = "",
+        encodingPreference: String = "",
+        preferTVAPI: Bool = false
+    ) {
+        self.qualityPreference = qualityPreference
+        self.encodingPreference = encodingPreference
+        self.preferTVAPI = preferTVAPI
+    }
+}
+
+public struct CacheTask: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let kind: String
+    public let state: String
+    public let source: String
+    public let title: String
+    public let progress: Double
+    public let message: String
+    public let libraryItemID: String
+    public let playbackSource: CachePlaybackSource?
+    public let playbackSession: CacheBilibiliPlaybackSession?
+
+    public init(
+        id: String,
+        kind: String,
+        state: String,
+        source: String,
+        title: String,
+        progress: Double,
+        message: String,
+        libraryItemID: String,
+        playbackSource: CachePlaybackSource?,
+        playbackSession: CacheBilibiliPlaybackSession?
+    ) {
+        self.id = id
+        self.kind = kind
+        self.state = state
+        self.source = source
+        self.title = title
+        self.progress = progress
+        self.message = message
+        self.libraryItemID = libraryItemID
+        self.playbackSource = playbackSource
+        self.playbackSession = playbackSession
+    }
+
+    public var isProgressivePlayback: Bool {
+        kind.normalizedCacheProtocolName.contains("bilibiliprogressiveplayback")
+    }
+}
+
+public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let contentID: String
+    public let selectedVariantID: String
+    public let selectedVariant: CacheBilibiliPlaybackVariant?
+    public let variants: [CacheBilibiliPlaybackVariant]
+
+    public init(
+        id: String,
+        title: String,
+        contentID: String,
+        selectedVariantID: String,
+        selectedVariant: CacheBilibiliPlaybackVariant?,
+        variants: [CacheBilibiliPlaybackVariant]
+    ) {
+        self.id = id
+        self.title = title
+        self.contentID = contentID
+        self.selectedVariantID = selectedVariantID
+        self.selectedVariant = selectedVariant
+        self.variants = variants
+    }
+}
+
+public struct CacheBilibiliPlaybackVariant: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let label: String
+    public let sourceKind: String
+    public let container: String
+    public let videoCodec: String
+    public let audioCodec: String
+    public let width: Int
+    public let height: Int
+    public let bitrate: Int64
+    public let sizeBytes: Int64
+
+    public init(
+        id: String,
+        label: String,
+        sourceKind: String,
+        container: String,
+        videoCodec: String,
+        audioCodec: String,
+        width: Int,
+        height: Int,
+        bitrate: Int64,
+        sizeBytes: Int64
+    ) {
+        self.id = id
+        self.label = label
+        self.sourceKind = sourceKind
+        self.container = container
+        self.videoCodec = videoCodec
+        self.audioCodec = audioCodec
+        self.width = width
+        self.height = height
+        self.bitrate = bitrate
+        self.sizeBytes = sizeBytes
+    }
+}
+
 private enum CachePlaybackProtocolSupport {
     static func isPlayable(_ playbackProtocol: String) -> Bool {
         switch playbackProtocol.normalizedCacheProtocolName.removingPlaybackProtocolPrefix {

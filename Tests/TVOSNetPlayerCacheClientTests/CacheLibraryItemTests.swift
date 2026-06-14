@@ -104,6 +104,36 @@ final class CacheLibraryItemTests: XCTestCase {
             XCTAssertNil(source.explicitHTTPURL, "Expected \(uri) to be rejected.")
         }
     }
+
+    func testProgressivePlaybackTaskExposesPlanningMetadataWithoutPlayableSource() {
+        let task = CacheTask(
+            id: "bilibili-playback-1",
+            kind: "TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK",
+            state: "TASK_STATE_PLANNED",
+            source: "BV1planned",
+            title: "Planned video",
+            progress: 0,
+            message: "Bilibili playback plan is ready.",
+            libraryItemID: "",
+            playbackSource: nil,
+            playbackSession: CacheBilibiliPlaybackSession(
+                id: "bilibili-playback-1",
+                title: "Planned video",
+                contentID: "BV1planned-cid1",
+                selectedVariantID: "h264",
+                selectedVariant: CacheBilibiliPlaybackVariant.fixture(id: "h264"),
+                variants: [
+                    .fixture(id: "h264"),
+                    .fixture(id: "hevc", videoCodec: "hvc1.1.6.L120.90"),
+                ]
+            )
+        )
+
+        XCTAssertTrue(task.isProgressivePlayback)
+        XCTAssertNil(task.playbackSource)
+        XCTAssertEqual(task.playbackSession?.selectedVariant?.videoCodec, "avc1.640028")
+        XCTAssertEqual(task.playbackSession?.variants.map(\.id), ["h264", "hevc"])
+    }
 }
 
 extension CacheLibraryItem {
@@ -147,6 +177,26 @@ extension CachePlaybackSource {
             variantID: "original",
             playbackProtocol: playbackProtocol,
             uri: uri
+        )
+    }
+}
+
+extension CacheBilibiliPlaybackVariant {
+    fileprivate static func fixture(
+        id: String,
+        videoCodec: String = "avc1.640028"
+    ) -> Self {
+        Self(
+            id: id,
+            label: "1920x1080",
+            sourceKind: "dash",
+            container: "mp4",
+            videoCodec: videoCodec,
+            audioCodec: "mp4a.40.2",
+            width: 1920,
+            height: 1080,
+            bitrate: 1_000_000,
+            sizeBytes: 10_000_000
         )
     }
 }

@@ -838,6 +838,23 @@ private actor FakeCacheControlClient: CacheControlClient {
         return playbackSourcesByItemID[itemID] ?? playbackSource
     }
 
+    func getTask(id: String) async throws -> CacheTask {
+        throw FakeCacheError.serverUnavailable
+    }
+
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: FakeCacheError.serverUnavailable)
+        }
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        throw FakeCacheError.serverUnavailable
+    }
+
     func waitForServerInfoRequest(minimumCallCount: Int = 1) async {
         guard getServerInfoCallCount < minimumCallCount else {
             return

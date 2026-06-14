@@ -20,6 +20,12 @@ public protocol CacheControlClient: Sendable {
         searchText: String?
     ) async throws -> CacheLibraryItemsPage
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource
+    func getTask(id: String) async throws -> CacheTask
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error>
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask
 }
 
 public extension CacheControlClient {
@@ -28,5 +34,18 @@ public extension CacheControlClient {
         searchText: String? = nil
     ) async throws -> CacheLibraryItemsPage {
         try await listLibraryItemsPage(pageToken: "", pageSize: pageSize, searchText: searchText)
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String
+    ) async throws -> CacheTask {
+        try await createBilibiliPlaybackTask(
+            urlOrID: urlOrID,
+            options: BilibiliPlaybackTaskOptions()
+        )
+    }
+
+    func watchTask(id: String) async -> AsyncThrowingStream<CacheTask, Error> {
+        await watchTasks(ids: [id])
     }
 }

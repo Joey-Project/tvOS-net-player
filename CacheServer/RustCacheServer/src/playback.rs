@@ -16,8 +16,28 @@ impl PlaybackUriFactory {
     }
 
     pub fn create<T>(&self, request: &Request<T>, item_id: &str, variant_id: &str) -> String {
-        let base_uri = self
-            .options
+        let base_uri = self.create_base_uri(request);
+
+        format!(
+            "{}/media/{}/{}",
+            base_uri.trim_end_matches('/'),
+            urlencoding::encode(item_id),
+            urlencoding::encode(variant_id)
+        )
+    }
+
+    pub fn create_hls_master_playlist<T>(&self, request: &Request<T>, session_id: &str) -> String {
+        let base_uri = self.create_base_uri(request);
+
+        format!(
+            "{}/hls/{}/master.m3u8",
+            base_uri.trim_end_matches('/'),
+            urlencoding::encode(session_id)
+        )
+    }
+
+    fn create_base_uri<T>(&self, request: &Request<T>) -> String {
+        self.options
             .public_media_base_uri
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -33,14 +53,7 @@ impl PlaybackUriFactory {
                     request.local_addr().map(|addr| addr.ip()),
                     &self.options.media_listen_url,
                 )
-            });
-
-        format!(
-            "{}/media/{}/{}",
-            base_uri.trim_end_matches('/'),
-            urlencoding::encode(item_id),
-            urlencoding::encode(variant_id)
-        )
+            })
     }
 
     pub fn create_media_base_uri(request_authority: &str, media_listen_url: &str) -> String {

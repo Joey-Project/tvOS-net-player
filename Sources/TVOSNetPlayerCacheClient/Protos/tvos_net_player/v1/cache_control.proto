@@ -24,6 +24,7 @@ service LibraryService {
 
 service TaskService {
   rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
+  rpc CreateBilibiliPlaybackTask(CreateBilibiliPlaybackTaskRequest) returns (Task);
   rpc GetTask(GetTaskRequest) returns (Task);
   rpc WatchTasks(WatchTasksRequest) returns (stream TaskEvent);
   rpc CancelTask(CancelTaskRequest) returns (Task);
@@ -159,6 +160,17 @@ message BilibiliDownloadOptions {
   bool download_danmaku = 5;
 }
 
+message CreateBilibiliPlaybackTaskRequest {
+  string url_or_id = 1;
+  BilibiliPlaybackOptions options = 2;
+}
+
+message BilibiliPlaybackOptions {
+  string quality_preference = 1;
+  string encoding_preference = 2;
+  bool prefer_tv_api = 3;
+}
+
 message GetTaskRequest {
   string id = 1;
 }
@@ -189,12 +201,15 @@ message Task {
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
   google.protobuf.Timestamp finished_at = 13;
+  PlaybackSource playback_source = 14;
+  BilibiliPlaybackSession playback_session = 15;
 }
 
 enum TaskKind {
   TASK_KIND_UNSPECIFIED = 0;
   TASK_KIND_BILIBILI_DOWNLOAD = 1;
   TASK_KIND_LIBRARY_RESCAN = 2;
+  TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK = 3;
 }
 
 enum TaskState {
@@ -205,6 +220,32 @@ enum TaskState {
   TASK_STATE_FAILED = 4;
   TASK_STATE_CANCEL_REQUESTED = 5;
   TASK_STATE_CANCELLED = 6;
+  TASK_STATE_PLANNED = 7;
+  TASK_STATE_PREPARING = 8;
+  TASK_STATE_PLAYABLE = 9;
+  TASK_STATE_COMPLETED = 10;
+}
+
+message BilibiliPlaybackSession {
+  string id = 1;
+  string title = 2;
+  string content_id = 3;
+  string selected_variant_id = 4;
+  BilibiliPlaybackVariant selected_variant = 5;
+  repeated BilibiliPlaybackVariant variants = 6;
+}
+
+message BilibiliPlaybackVariant {
+  string id = 1;
+  string label = 2;
+  string source_kind = 3;
+  string container = 4;
+  string video_codec = 5;
+  string audio_codec = 6;
+  int32 width = 7;
+  int32 height = 8;
+  int64 bitrate = 9;
+  int64 size_bytes = 10;
 }
 
 message ListCacheRootsRequest {}

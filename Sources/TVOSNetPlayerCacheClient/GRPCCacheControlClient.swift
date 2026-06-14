@@ -101,10 +101,79 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
+    ) async throws -> CacheTask {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+            var request = TvosNetPlayer_V1_CreateBilibiliPlaybackTaskRequest()
+            request.urlOrID = urlOrID
+            request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+            let response = try await service.createBilibiliPlaybackTask(request, options: callOptions)
+            return CacheTask(response)
+        }
+    }
+
+    public func getTask(id: String) async throws -> CacheTask {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+            var request = TvosNetPlayer_V1_GetTaskRequest()
+            request.id = id
+            let response = try await service.getTask(request, options: callOptions)
+            return CacheTask(response)
+        }
+    }
+
+    public func watchTasks(ids: [String] = []) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            let streamTask = Task {
+                do {
+                    try await withGRPCClient(
+                        transport: .http2NIOTS(
+                            target: endpoint.grpcTarget,
+                            transportSecurity: .plaintext
+                        )
+                    ) { client in
+                        let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                        var request = TvosNetPlayer_V1_WatchTasksRequest()
+                        request.ids = ids
+                        try await service.watchTasks(request, options: streamCallOptions) { response in
+                            for try await event in response.messages where event.hasTask {
+                                continuation.yield(CacheTask(event.task))
+                            }
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                streamTask.cancel()
+            }
+        }
+    }
+
     private var callOptions: CallOptions {
         var options = CallOptions.defaults
         options.timeout = rpcTimeout
         return options
+    }
+
+    private var streamCallOptions: CallOptions {
+        CallOptions.defaults
     }
 
     private static func listLibraryItemsRequest(
@@ -241,5 +310,63 @@ extension CachePlaybackSource {
             playbackProtocol: String(describing: proto.`protocol`),
             uri: proto.uri
         )
+    }
+}
+
+extension CacheTask {
+    fileprivate init(_ proto: TvosNetPlayer_V1_Task) {
+        self.init(
+            id: proto.id,
+            kind: String(describing: proto.kind),
+            state: String(describing: proto.state),
+            source: proto.source,
+            title: proto.title,
+            progress: proto.progress,
+            message: proto.message,
+            libraryItemID: proto.libraryItemID,
+            playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
+            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil
+        )
+    }
+}
+
+extension CacheBilibiliPlaybackSession {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliPlaybackSession) {
+        self.init(
+            id: proto.id,
+            title: proto.title,
+            contentID: proto.contentID,
+            selectedVariantID: proto.selectedVariantID,
+            selectedVariant: proto.hasSelectedVariant
+                ? CacheBilibiliPlaybackVariant(proto.selectedVariant)
+                : nil,
+            variants: proto.variants.map(CacheBilibiliPlaybackVariant.init)
+        )
+    }
+}
+
+extension CacheBilibiliPlaybackVariant {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliPlaybackVariant) {
+        self.init(
+            id: proto.id,
+            label: proto.label,
+            sourceKind: proto.sourceKind,
+            container: proto.container,
+            videoCodec: proto.videoCodec,
+            audioCodec: proto.audioCodec,
+            width: Int(proto.width),
+            height: Int(proto.height),
+            bitrate: proto.bitrate,
+            sizeBytes: proto.sizeBytes
+        )
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
+    fileprivate init(_ options: BilibiliPlaybackTaskOptions) {
+        self.init()
+        qualityPreference = options.qualityPreference
+        encodingPreference = options.encodingPreference
+        preferTvApi = options.preferTVAPI
     }
 }

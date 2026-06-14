@@ -138,6 +138,23 @@ private actor FakePagedCacheControlClient: CacheControlClient {
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
         throw FakePagedCacheControlClientError.notImplemented
     }
+
+    func getTask(id: String) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: FakePagedCacheControlClientError.notImplemented)
+        }
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
 }
 
 private enum FakePagedCacheControlClientError: Error {
