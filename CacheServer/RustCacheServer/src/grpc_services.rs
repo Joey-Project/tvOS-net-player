@@ -21,10 +21,11 @@ use crate::{
         HealthState, HealthStatus, LibraryItem, ListCacheRootsRequest, ListCacheRootsResponse,
         ListLibraryItemsRequest, ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource,
         RescanLibraryRequest, RescanLibraryResponse, ServerCapability, ServerInfo, Task, TaskEvent,
-        WatchTasksRequest, cache_service_server::CacheService,
+        TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
         library_service_server::LibraryService, server_service_server::ServerService,
         task_service_server::TaskService,
     },
+    hls::HlsPlaybackSession,
     library::ROOT_ID,
     task_registry::{BilibiliTaskRegistry, current_timestamp},
 };
@@ -54,7 +55,10 @@ impl ServerService for ServerGrpcService {
             name: self.state.options.server_name.clone(),
             version: "0.1.0".to_owned(),
             media_base_uris: Vec::new(),
-            capabilities: vec![ServerCapability::BilibiliTasks.into()],
+            capabilities: vec![
+                ServerCapability::BilibiliTasks.into(),
+                ServerCapability::Hls.into(),
+            ],
         };
 
         if self.state.library.supports_http_range_playback() {
@@ -230,16 +234,21 @@ impl TaskService for TaskGrpcService {
         &self,
         request: Request<CreateBilibiliPlaybackTaskRequest>,
     ) -> Result<Response<Task>, Status> {
-        let request = request.into_inner();
+        let url_or_id = request.get_ref().url_or_id.clone();
+        let options = request.get_ref().options.clone();
         let creation = self
             .state
             .tasks
-            .create_bilibili_playback_task(&request.url_or_id, request.options.clone())?;
+            .create_bilibili_playback_task(&url_or_id, options.clone())?;
         if !creation.created {
             return Ok(Response::new(creation.task));
         }
 
         let task_id = creation.task.id.clone();
+        let playback_source_uri = self
+            .state
+            .playback_uri_factory
+            .create_hls_master_playlist(&request, &task_id);
         let cancellation = creation
             .cancellation
             .expect("new playback task should include a planning cancellation token");
@@ -248,7 +257,8 @@ impl TaskService for TaskGrpcService {
             state,
             task_id,
             creation.task.source.clone(),
-            request.options,
+            options,
+            playback_source_uri,
             cancellation,
         ));
 
@@ -311,7 +321,13 @@ impl TaskService for TaskGrpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(self.state.tasks.cancel_task(&request.id)?))
+        let task = self.state.tasks.cancel_task(&request.id)?;
+        if task.kind() == TaskKind::BilibiliProgressivePlayback
+            && task.state() != TaskState::Playable
+        {
+            self.state.hls_sessions.remove(&task.id);
+        }
+        Ok(Response::new(task))
     }
 }
 
@@ -391,6 +407,7 @@ async fn run_bilibili_playback_planning(
     task_id: String,
     source: String,
     options: Option<BilibiliPlaybackOptions>,
+    playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) {
     let mut cleanup = PlaybackPlanningCleanup::new(Arc::clone(&state.tasks), task_id.clone());
@@ -464,7 +481,7 @@ async fn run_bilibili_playback_planning(
             return;
         }
     };
-    let (title, playback_session) = match playback_task_metadata(&task_id, plan) {
+    let metadata = match playback_task_metadata(&task_id, plan) {
         Ok(metadata) => metadata,
         Err(error) => {
             if state
@@ -477,19 +494,41 @@ async fn run_bilibili_playback_planning(
             return;
         }
     };
-    if state
-        .tasks
-        .complete_playback_planned(&task_id, title, playback_session)
-        .is_ok()
-    {
-        cleanup.disarm();
+
+    state.hls_sessions.insert(metadata.hls_session);
+    let playback_source = PlaybackSource {
+        item_id: task_id.clone(),
+        variant_id: metadata.playback_session.selected_variant_id.clone(),
+        protocol: PlaybackProtocol::Hls.into(),
+        uri: playback_source_uri,
+        expires_at: None,
+    };
+    match state.tasks.complete_playback_playable(
+        &task_id,
+        metadata.title,
+        playback_source,
+        metadata.playback_session,
+    ) {
+        Ok(task) => {
+            if task.state() != crate::generated::tvos_net_player::v1::TaskState::Playable {
+                state.hls_sessions.remove(&task_id);
+            }
+            cleanup.disarm();
+        }
+        Err(_) => state.hls_sessions.remove(&task_id),
     }
+}
+
+struct PlaybackTaskMetadata {
+    title: String,
+    playback_session: BilibiliPlaybackSession,
+    hls_session: HlsPlaybackSession,
 }
 
 fn playback_task_metadata(
     task_id: &str,
     plan: BilibiliPlaybackPlan,
-) -> Result<(String, BilibiliPlaybackSession), Status> {
+) -> Result<PlaybackTaskMetadata, Status> {
     let entry = plan
         .entries
         .first()
@@ -503,6 +542,8 @@ fn playback_task_metadata(
         entry.title.clone()
     };
     let selected_variant = playback_variant_from_adapter(&selected.variant);
+    let hls_session = HlsPlaybackSession::from_selected_variant(task_id, &title, &selected.variant)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let playback_session = BilibiliPlaybackSession {
         id: task_id.to_owned(),
         title: title.clone(),
@@ -516,7 +557,11 @@ fn playback_task_metadata(
             .collect(),
     };
 
-    Ok((title, playback_session))
+    Ok(PlaybackTaskMetadata {
+        title,
+        playback_session,
+        hls_session,
+    })
 }
 
 fn playback_variant_from_adapter(variant: &AdapterPlaybackVariant) -> BilibiliPlaybackVariant {
@@ -681,10 +726,20 @@ mod tests {
         plan_sender
             .send(Ok(sample_playback_plan()))
             .expect("test should send playback plan");
-        let task = wait_for_task_state(&tasks, &created.id, TaskState::Planned).await;
+        let task = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
 
         assert_eq!("Episode 1", task.title);
-        assert!(task.playback_source.is_none());
+        let playback_source = task
+            .playback_source
+            .as_ref()
+            .expect("playable task should expose an HLS source");
+        assert_eq!(task.id, playback_source.item_id);
+        assert_eq!("h264", playback_source.variant_id);
+        assert_eq!(PlaybackProtocol::Hls as i32, playback_source.protocol);
+        assert_eq!(
+            format!("http://media.example.test:8080/hls/{}/master.m3u8", task.id),
+            playback_source.uri
+        );
         let session = task
             .playback_session
             .expect("playback session should exist");
@@ -693,6 +748,18 @@ mod tests {
         assert_eq!("h264", session.selected_variant_id);
         assert_eq!(2, session.variants.len());
         assert_eq!("dash", session.selected_variant.unwrap().source_kind);
+        assert!(service.state.hls_sessions.get(&task.id).is_some());
+
+        let cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task.id.clone(),
+            }))
+            .await
+            .expect("playable playback task should cancel")
+            .into_inner();
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(service.state.hls_sessions.get(&task.id).is_none());
     }
 
     #[tokio::test]
@@ -784,8 +851,8 @@ mod tests {
         plan_sender
             .send(Ok(sample_playback_plan()))
             .expect("test should send playback plan");
-        let planned = wait_for_task_state(&tasks, &created.id, TaskState::Planned).await;
-        assert_eq!(TaskState::Planned, planned.state());
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+        assert_eq!(TaskState::Playable, playable.state());
     }
 
     #[tokio::test]
@@ -853,14 +920,14 @@ mod tests {
         first_result
             .send(Ok(sample_playback_plan()))
             .expect("first plan should be delivered");
-        wait_for_task_state(&tasks, &first.id, TaskState::Planned).await;
+        wait_for_task_state(&tasks, &first.id, TaskState::Playable).await;
         second_started
             .await
             .expect("second planner should start after first completes");
         second_result
             .send(Ok(sample_playback_plan()))
             .expect("second plan should be delivered");
-        wait_for_task_state(&tasks, &second.id, TaskState::Planned).await;
+        wait_for_task_state(&tasks, &second.id, TaskState::Playable).await;
     }
 
     #[tokio::test]
@@ -941,14 +1008,14 @@ mod tests {
         first_result
             .send(Ok(sample_playback_plan()))
             .expect("first plan should be delivered");
-        wait_for_task_state(&tasks, &first.id, TaskState::Planned).await;
+        wait_for_task_state(&tasks, &first.id, TaskState::Playable).await;
         second_started
             .await
             .expect("recreated second planner should start after permit is released");
         second_result
             .send(Ok(sample_playback_plan()))
             .expect("second plan should be delivered");
-        wait_for_task_state(&tasks, &recreated.id, TaskState::Planned).await;
+        wait_for_task_state(&tasks, &recreated.id, TaskState::Playable).await;
     }
 
     #[tokio::test]

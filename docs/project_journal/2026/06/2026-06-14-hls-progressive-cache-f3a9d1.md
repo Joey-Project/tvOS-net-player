@@ -4,8 +4,8 @@ title: HLS Progressive Cache
 status: active
 created: 2026-06-14
 updated: 2026-06-14
-branch: wip/progressive-playback-control-plane
-pr: 10
+branch: wip/hls-progressive-media-pipeline
+pr:
 supersedes: []
 superseded_by:
 ---
@@ -23,10 +23,10 @@ superseded_by:
 - `BBDown-rust` `v0.2.0` exposes playback planning with media URLs, backup URLs, request headers, codec/mime metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
 - The current LAN cache server adapter still uses the older complete-download path: BBDown core downloads selected media, then the server muxes a completed MP4 and publishes it as a library item.
 - The cache server now has a BBDown playback-planning adapter foundation that maps core playback plans into server-owned DTOs and selects AVPlayer-friendly variants for later progressive sessions.
-- The cache server now exposes a progressive playback control-plane slice: `TaskService.CreateBilibiliPlaybackTask` creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it in `preparing` state immediately, while BBDown playback planning runs in the background and publishes planned `BilibiliPlaybackSession` metadata through `GetTask`/`WatchTasks`.
-- The planned state intentionally does not expose a playable HLS `PlaybackSource` while the reserved HLS routes still return `501`; PR 3 owns the media pipeline and the transition to a playable source.
-- The Swift cache client now exposes `getTask(id:)` and `watchTasks(ids:)` so tvOS code can track background playback planning to the planned HLS metadata without repeating create calls.
-- Progressive HLS playlist and segment HTTP routes are reserved and intentionally return `501 Not Implemented` until the PR 3 media pipeline lands.
+- The cache server now exposes progressive playback through `TaskService.CreateBilibiliPlaybackTask`: it creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it in `preparing` state immediately, while BBDown playback planning runs in the background.
+- The runtime HLS media path registers an in-memory HLS session after planning succeeds, publishes a `playable` task with `BilibiliPlaybackSession` metadata plus a HLS `PlaybackSource`, serves master/media playlists under `/hls/{session_id}`, and proxies selected DASH video/audio requests with BBDown headers and client Range.
+- The Swift cache client exposes `getTask(id:)` and `watchTasks(ids:)` so tvOS code can track background playback planning to a playable HLS source without repeating create calls.
+- Runtime HLS passthrough does not persist media manifests yet. Restored `playable` tasks are marked failed after restart so callers can retry instead of receiving stale HLS URLs; PR 4 owns durable manifests and offline recovery.
 - Playback planning rejects Bilibili short links until `bbdown-core` exposes a resolved-input API that lets the server choose the correct default selection after short-link expansion.
 - Existing architecture already reserves HLS playlists and segments over HTTP as the media-plane direction, so progressive playback should extend the current boundary rather than introduce gRPC media streaming or direct tvOS BBDown integration.
 
@@ -43,7 +43,7 @@ superseded_by:
 
 ### PR 2: Progressive Playback Control Plane
 
-- Status: implemented in this branch.
+- Status: merged in PR #10.
 - Extend the gRPC schema and task state model for progressive playback tasks and playback URLs.
 - Persist progressive task/session metadata so planning and early playback state can survive server restart.
 - Add task lifecycle states for planned, preparing, playable, completed, and failed progressive sessions.
@@ -52,8 +52,9 @@ superseded_by:
 
 ### PR 3: HLS Progressive Media Pipeline
 
+- Status: implemented by this slice.
 - Build the server-side pipeline that consumes `MediaRequestSpec` URLs and headers, fetches Bilibili media, and produces AVPlayer-compatible HLS playlists and segments.
-- Prefer transmuxing when source codecs are already tvOS-friendly; allow LAN-side transcoding as a fallback capability.
+- Start with runtime passthrough HLS for selected DASH MP4 video/audio requests. Transmuxing/transcoding remains a later expansion once the runtime URL path is proven.
 - Support backup URLs, source retry, and deterministic fixture-based e2e tests so CI does not depend on live Bilibili availability.
 - Add a local tvOS simulator AVPlayer smoke test when practical.
 
@@ -66,7 +67,7 @@ superseded_by:
 
 ## Next Steps
 
-- After PR 2 merges, update `master` and start PR 3 on a fresh branch for the HLS progressive media pipeline.
+- After PR 3 lands, continue with PR 4 durable HLS/cache manifests and offline recovery.
 - Keep the existing complete-download adapter path as the fallback until progressive HLS is proven by tests.
 - Do not merge a PR while required CI is failing, review findings remain actionable, or GitHub reports unresolved review conversations.
 
@@ -96,3 +97,12 @@ superseded_by:
   - `.codex-tmp/isolated-review-f6jd79bj` returned `LGTM` after the planned-source and concurrency fixes.
   - `.codex-tmp/pr10-independent-codex-pr-review.md` found that cancellation while waiting for the planning semaphore left the task active until a permit became available, and found stale architecture wording that still described returning a HLS `PlaybackSource` in PR 2.
   - The PR 2 fix polls cancellation while waiting for the planning permit, adds a regression test for cancelled waiters, and updates the architecture doc to match the `PREPARING` -> `PLANNED` metadata-only contract.
+  - PR #10 merged on 2026-06-14 as `88578f8`.
+- PR 3 local gate:
+  - `scripts/format.sh`
+  - `cargo test --package tvos-net-player-cache-server --locked hls -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_segment_proxies_upstream_media_with_required_headers_and_range -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked`
+  - `cargo clippy --package tvos-net-player-cache-server --all-targets --locked -- -D warnings`
+  - `scripts/test.sh`
+  - `just ci`

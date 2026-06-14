@@ -39,6 +39,7 @@ async fn serves_library_control_plane_and_http_range_media() {
         info.capabilities
             .contains(&(ServerCapability::BilibiliTasks as i32))
     );
+    assert!(info.capabilities.contains(&(ServerCapability::Hls as i32)));
     #[cfg(target_os = "macos")]
     assert!(
         info.capabilities
@@ -203,7 +204,7 @@ async fn derives_playback_host_from_grpc_local_addr_for_wildcard_media_listener(
 }
 
 #[tokio::test]
-async fn reserves_hls_routes_for_progressive_playback_pipeline() {
+async fn returns_not_found_for_missing_hls_playback_session() {
     let server = TestServer::start().await;
     let http = reqwest::Client::new();
 
@@ -212,21 +213,7 @@ async fn reserves_hls_routes_for_progressive_playback_pipeline() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        playlist_response.status()
-    );
-    assert_eq!(
-        "application/vnd.apple.mpegurl",
-        playlist_response.headers()["content-type"]
-    );
-    assert!(
-        playlist_response
-            .text()
-            .await
-            .unwrap()
-            .contains("HLS media pipeline is not implemented yet")
-    );
+    assert_eq!(reqwest::StatusCode::NOT_FOUND, playlist_response.status());
 
     let segment_response = http
         .head(format!(
@@ -236,10 +223,7 @@ async fn reserves_hls_routes_for_progressive_playback_pipeline() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        segment_response.status()
-    );
+    assert_eq!(reqwest::StatusCode::NOT_FOUND, segment_response.status());
 }
 
 #[tokio::test]
