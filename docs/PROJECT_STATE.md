@@ -14,6 +14,7 @@
 - Rust cache server runtime workstream：`docs/project_journal/2026/06/2026-06-06-rust-cache-server-runtime-f2a4c7.md`
 - Bilibili task worker foundation workstream：`docs/project_journal/2026/06/2026-06-07-bilibili-task-worker-foundation-9a3d2f.md`
 - BBDown Rust adapter workstream：`docs/project_journal/2026/06/2026-06-09-bbdown-rust-adapter-b4e2c8.md`
+- HLS progressive cache workstream：`docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
