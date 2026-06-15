@@ -158,6 +158,67 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testCancelClearsActivePlaybackStatus() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.playableFixture(source: "BV1ready"))
+            ],
+            cancelResponsesByID: [
+                "bilibili-playback-1": .fixture(source: "BV1ready", state: "TASK_STATE_CANCELLED")
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1ready",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.finishPreparedPlayback(didStartPlayback: true)
+        XCTAssertEqual(model.statusMessage, "Playing Ready video.")
+
+        await model.cancel(serverAddressText: "mac-mini.local:50051")
+
+        let cancelledIDs = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(cancelledIDs, ["bilibili-playback-1"])
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
+        XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
+
+        model.clearTask()
+    }
+
+    func testLateCancelResponseDoesNotOverwriteTerminalWatchUpdate() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1race", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1race",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.setSuspendsCancelResponses(true)
+
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+        XCTAssertTrue(model.isCancelling)
+
+        await client.yield(.fixture(source: "BV1race", state: "TASK_STATE_CANCELLED"))
+        await waitUntil(model.currentTask?.state == "TASK_STATE_CANCELLED")
+        await client.completeNextCancel(
+            with: .success(
+                .fixture(source: "BV1race", state: "TASK_STATE_CANCEL_REQUESTED", message: "Cancelling task.")))
+        await cancelTask.value
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
+        XCTAssertFalse(model.isCancelling)
+        XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
+
+        model.clearTask()
+    }
+
     func testCancelUpdatesCurrentTask() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [
@@ -197,6 +258,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await client.waitForWatchSubscription()
         await client.yield(.fixture(source: "BV1original", state: "TASK_STATE_FAILED", message: "Planning failed."))
         await waitUntil(model.canRetry)
+        XCTAssertEqual(model.statusMessage, "Planning failed.")
+        XCTAssertEqual(model.errorMessage, "Planning failed.")
         model.sourceText = "BV1different"
 
         await model.retry(serverAddressText: "mac-mini.local:50051")
@@ -227,10 +290,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var createResponses: [Result<CacheTask, Error>]
     private let cancelResponsesByID: [String: CacheTask]
     private var suspendsCreateResponses: Bool
+    private var suspendsCancelResponses = false
     private var createdRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
     private var cancelledIDs: [String] = []
     private var pendingCreateContinuations: [CheckedContinuation<CacheTask, Error>] = []
+    private var pendingCancelContinuations: [CheckedContinuation<CacheTask, Error>] = []
     private var createRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var cancelRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var watchContinuations: [AsyncThrowingStream<CacheTask, Error>.Continuation] = []
     private var watchWaiters: [CheckedContinuation<Void, Never>] = []
     private var watchTerminationCount = 0
@@ -281,6 +347,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func cancelTask(id: String) async throws -> CacheTask {
         cancelledIDs.append(id)
+        resumeCancelRequestWaiters()
+        if suspendsCancelResponses {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingCancelContinuations.append(continuation)
+            }
+        }
+
         return cancelResponsesByID[id] ?? .fixture(state: "TASK_STATE_CANCEL_REQUESTED")
     }
 
@@ -312,12 +385,24 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         self.suspendsCreateResponses = suspendsCreateResponses
     }
 
+    func setSuspendsCancelResponses(_ suspendsCancelResponses: Bool) {
+        self.suspendsCancelResponses = suspendsCancelResponses
+    }
+
     func completeNextCreate(with result: Result<CacheTask, Error>) {
         guard !pendingCreateContinuations.isEmpty else {
             return
         }
 
         pendingCreateContinuations.removeFirst().resume(with: result)
+    }
+
+    func completeNextCancel(with result: Result<CacheTask, Error>) {
+        guard !pendingCancelContinuations.isEmpty else {
+            return
+        }
+
+        pendingCancelContinuations.removeFirst().resume(with: result)
     }
 
     func createdRequestsSnapshot() -> [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] {
@@ -335,6 +420,16 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
         await withCheckedContinuation { continuation in
             createRequestWaiters.append((count, continuation))
+        }
+    }
+
+    func waitForCancelRequestCount(_ count: Int) async {
+        guard cancelledIDs.count < count else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            cancelRequestWaiters.append((count, continuation))
         }
     }
 
@@ -365,6 +460,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private func resumeCreateRequestWaiters() {
         let ready = createRequestWaiters.filter { $0.count <= createdRequests.count }
         createRequestWaiters.removeAll { $0.count <= createdRequests.count }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    private func resumeCancelRequestWaiters() {
+        let ready = cancelRequestWaiters.filter { $0.count <= cancelledIDs.count }
+        cancelRequestWaiters.removeAll { $0.count <= cancelledIDs.count }
         ready.forEach { $0.continuation.resume() }
     }
 

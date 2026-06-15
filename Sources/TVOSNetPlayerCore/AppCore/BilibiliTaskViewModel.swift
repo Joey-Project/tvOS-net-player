@@ -180,6 +180,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         let targetTaskID = currentTask.id
+        if activePlaybackTaskID == targetTaskID {
+            activePlaybackTaskID = nil
+        }
         isCancelling = true
         errorMessage = nil
         statusMessage = "Cancelling \(currentTask.bilibiliDisplayTitle)..."
@@ -192,6 +195,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             guard sequence == operationSequence, self.currentTask?.id == targetTaskID else {
+                return
+            }
+
+            if let currentTask = self.currentTask,
+                currentTask.isTerminalBilibiliTaskState,
+                !task.isTerminalBilibiliTaskState
+            {
+                statusMessage = Self.statusMessage(for: currentTask)
+                isCancelling = false
                 return
             }
 
@@ -275,6 +287,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         currentTask = task
+        if activePlaybackTaskID == task.id, !task.isPlayableBilibiliTaskState {
+            activePlaybackTaskID = nil
+        }
+        if task.isFailedBilibiliTaskState {
+            errorMessage = Self.failureMessage(for: task)
+        }
+
         if activePlaybackTaskID == task.id {
             statusMessage = "Playing \(task.bilibiliDisplayTitle)."
         } else {
@@ -311,7 +330,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if task.isFailedBilibiliTaskState {
-            return "\(task.bilibiliDisplayTitle) failed."
+            return failureMessage(for: task)
         }
 
         if task.isCancelledBilibiliTaskState {
@@ -323,6 +342,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         return "Preparing \(task.bilibiliDisplayTitle)..."
+    }
+
+    private static func failureMessage(for task: CacheTask) -> String {
+        let message = task.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !message.isEmpty {
+            return message
+        }
+
+        return "\(task.bilibiliDisplayTitle) failed."
     }
 
     private static func withOperationTimeout<Value: Sendable>(
