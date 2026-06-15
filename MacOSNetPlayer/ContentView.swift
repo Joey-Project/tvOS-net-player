@@ -307,7 +307,7 @@ struct ContentView: View {
 
                     Button {
                         Task {
-                            await cacheModel.deleteItem(selectedItem)
+                            await deleteCachedItem(selectedItem)
                         }
                     } label: {
                         Label(
@@ -355,6 +355,13 @@ struct ContentView: View {
         )
         bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func deleteCachedItem(_ item: CacheLibraryItem) async {
+        let didRemove = await cacheModel.deleteItem(item)
+        if didRemove {
+            bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
+        }
     }
 
     private func playBilibiliTask() async {

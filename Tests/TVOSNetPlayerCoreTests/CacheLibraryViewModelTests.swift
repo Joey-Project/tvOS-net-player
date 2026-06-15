@@ -169,7 +169,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
-    func testDeleteItemReportsAlreadyDeletedWithoutRemovingLocalRow() async {
+    func testDeleteItemRemovesStaleRowWhenServerReportsAlreadyDeleted() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -186,11 +186,107 @@ final class CacheLibraryViewModelTests: XCTestCase {
         await model.refresh()
         let deleted = await model.deleteItem(item)
 
+        XCTAssertTrue(deleted)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(
+            model.statusMessage,
+            "Removed stale Server A item from Server A. Loaded 0 cached item(s) from Server A."
+        )
+    }
+
+    @MainActor
+    func testLoadMoreDisablesDeleteUntilPageCompletes() async {
+        let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(items: [item], nextPageToken: "1"),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+            ],
+            suspendedLibraryPageTokens: ["1"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let loadMoreTask = Task {
+            await model.loadMore()
+        }
+        await client.waitForLibraryPageRequest(pageToken: "1")
+
+        XCTAssertTrue(model.isLoadingMore)
+        XCTAssertFalse(model.canDelete(item))
+        let deleted = await model.deleteItem(item)
+
         XCTAssertFalse(deleted)
         XCTAssertEqual(model.items.map(\.id), ["item-a"])
-        XCTAssertTrue(model.deletingItemIDs.isEmpty)
-        XCTAssertEqual(model.errorMessage, "Cached item was already deleted.")
-        XCTAssertEqual(model.statusMessage, "Could not delete Server A item.")
+        let requestedDeleteItemIDs = await client.requestedDeleteItemIDs
+        XCTAssertTrue(requestedDeleteItemIDs.isEmpty)
+
+        await client.releaseLibraryPageRequest(pageToken: "1")
+        await loadMoreTask.value
+
+        XCTAssertFalse(model.isLoadingMore)
+        XCTAssertTrue(model.canDelete(item))
+        XCTAssertEqual(model.items.map(\.id), ["item-a", "item-b"])
+    }
+
+    @MainActor
+    func testDeleteDisablesLoadMoreUntilDeleteCompletes() async {
+        let firstItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let secondItem = CacheLibraryItem.fixture(id: "item-b", title: "Server B item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPageResponsesByToken: [
+                "": [
+                    CacheLibraryItemsPage(items: [firstItem], nextPageToken: "1"),
+                    CacheLibraryItemsPage(items: [secondItem], nextPageToken: ""),
+                ],
+                "1": [
+                    CacheLibraryItemsPage(items: [secondItem], nextPageToken: "")
+                ],
+            ],
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let deleteTask = Task {
+            await model.deleteItem(firstItem)
+        }
+        await client.waitForDeleteRequest(itemID: "item-a")
+
+        XCTAssertTrue(model.deletingItemIDs.contains("item-a"))
+        XCTAssertFalse(model.canLoadMore)
+        await model.loadMore()
+
+        let requestedPageTokensBeforeDeleteCompletes = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokensBeforeDeleteCompletes, [""])
+
+        await client.releaseDeleteRequest(itemID: "item-a")
+        let deleted = await deleteTask.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertFalse(model.deletingItemIDs.contains("item-a"))
+        XCTAssertEqual(model.items.map(\.id), ["item-b"])
+        let requestedPageTokensAfterDeleteCompletes = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokensAfterDeleteCompletes, ["", ""])
     }
 
     @MainActor
@@ -1361,6 +1457,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let suspendedServerInfoCallCounts: Set<Int>
     let suspendedLibraryPageTokens: Set<String>
     let suspendedPlaybackItemIDs: Set<String>
+    let suspendedDeleteItemIDs: Set<String>
 
     private(set) var getServerInfoCallCount = 0
     private(set) var requestedLibraryPageSizes: [Int] = []
@@ -1382,6 +1479,10 @@ private actor FakeCacheControlClient: CacheControlClient {
     private var playbackWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
     private var playbackReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var releasedPlaybackItemIDs: Set<String> = []
+    private var deleteStartedItemIDs: [String] = []
+    private var deleteWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
+    private var deleteReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var releasedDeleteItemIDs: Set<String> = []
 
     init(
         serverInfo: CacheServerSummary,
@@ -1401,7 +1502,8 @@ private actor FakeCacheControlClient: CacheControlClient {
         suspendServerInfoUntilReleased: Bool = false,
         suspendedServerInfoCallCounts: Set<Int> = [],
         suspendedLibraryPageTokens: Set<String> = [],
-        suspendedPlaybackItemIDs: Set<String> = []
+        suspendedPlaybackItemIDs: Set<String> = [],
+        suspendedDeleteItemIDs: Set<String> = []
     ) {
         self.serverInfo = serverInfo
         self.items = items
@@ -1421,6 +1523,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.suspendedServerInfoCallCounts = suspendedServerInfoCallCounts
         self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
         self.suspendedPlaybackItemIDs = suspendedPlaybackItemIDs
+        self.suspendedDeleteItemIDs = suspendedDeleteItemIDs
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
@@ -1498,6 +1601,11 @@ private actor FakeCacheControlClient: CacheControlClient {
 
     func deleteLibraryItem(id: String) async throws -> Bool {
         requestedDeleteItemIDs.append(id)
+        deleteStartedItemIDs.append(id)
+        notifyDeleteWaiters(for: id)
+        if suspendedDeleteItemIDs.contains(id) {
+            await waitForDeleteRelease(itemID: id)
+        }
         if let deleteError {
             throw deleteError
         }
@@ -1581,6 +1689,22 @@ private actor FakeCacheControlClient: CacheControlClient {
         continuations.forEach { $0.resume() }
     }
 
+    func waitForDeleteRequest(itemID: String) async {
+        guard !deleteStartedItemIDs.contains(itemID) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            deleteWaiters.append((itemID, continuation))
+        }
+    }
+
+    func releaseDeleteRequest(itemID: String) {
+        releasedDeleteItemIDs.insert(itemID)
+        let continuations = deleteReleaseContinuations.removeValue(forKey: itemID) ?? []
+        continuations.forEach { $0.resume() }
+    }
+
     private func notifyServerInfoWaiters() {
         var readyContinuations: [CheckedContinuation<Void, Never>] = []
         getServerInfoWaiters.removeAll { waiter in
@@ -1657,6 +1781,29 @@ private actor FakeCacheControlClient: CacheControlClient {
 
         await withCheckedContinuation { continuation in
             playbackReleaseContinuations[itemID, default: []].append(continuation)
+        }
+    }
+
+    private func notifyDeleteWaiters(for itemID: String) {
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        deleteWaiters.removeAll { waiter in
+            guard waiter.itemID == itemID else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
+    }
+
+    private func waitForDeleteRelease(itemID: String) async {
+        guard !releasedDeleteItemIDs.contains(itemID) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            deleteReleaseContinuations[itemID, default: []].append(continuation)
         }
     }
 

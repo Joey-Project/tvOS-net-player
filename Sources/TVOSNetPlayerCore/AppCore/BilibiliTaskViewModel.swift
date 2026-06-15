@@ -267,6 +267,19 @@ public final class BilibiliTaskViewModel: ObservableObject {
         statusMessage = "No Bilibili playback task submitted."
     }
 
+    @discardableResult
+    public func clearTaskIfCachedLibraryItemDeleted(id libraryItemID: String) -> Bool {
+        guard let currentTask,
+            !libraryItemID.isEmpty,
+            currentTask.libraryItemID == libraryItemID
+        else {
+            return false
+        }
+
+        clearTask()
+        return true
+    }
+
     private func startWatching(taskID: String, endpoint: CacheServerEndpoint, sequence: Int) {
         stopWatching()
         isWatching = true

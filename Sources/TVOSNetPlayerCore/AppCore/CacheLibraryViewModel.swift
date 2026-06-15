@@ -64,7 +64,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     public var canLoadMore: Bool {
-        loadedEndpoint != nil && hasMoreItems && !isLoading && !isLoadingMore
+        loadedEndpoint != nil && hasMoreItems && !isLoading && !isLoadingMore && deletingItemIDs.isEmpty
     }
 
     public var cacheRootSummary: String {
@@ -87,6 +87,8 @@ public final class CacheLibraryViewModel: ObservableObject {
             && canDeleteLibraryItems
             && items.contains(where: { $0.id == item.id })
             && !deletingItemIDs.contains(item.id)
+            && !isLoading
+            && !isLoadingMore
     }
 
     public func refresh() async {
@@ -285,11 +287,6 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         deletingItemIDs.remove(item.id)
-        guard deleted else {
-            errorMessage = "Cached item was already deleted."
-            statusMessage = "Could not delete \(item.displayTitle)."
-            return false
-        }
 
         clearPlaybackIfNeeded(forDeletedItemID: item.id)
         if nextPageToken.isEmpty {
@@ -320,12 +317,18 @@ public final class CacheLibraryViewModel: ObservableObject {
                 nextPageToken = ""
                 requestedLibraryPageTokens = []
                 errorMessage = error.localizedDescription
-                statusMessage = "Deleted \(item.displayTitle), but refresh cache server to load more videos."
+                statusMessage =
+                    deleted
+                    ? "Deleted \(item.displayTitle), but refresh cache server to load more videos."
+                    : "Removed stale \(item.displayTitle), but refresh cache server to load more videos."
                 return true
             }
         }
 
-        statusMessage = "Deleted \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
+        statusMessage =
+            deleted
+            ? "Deleted \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
+            : "Removed stale \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
         return true
     }
 
