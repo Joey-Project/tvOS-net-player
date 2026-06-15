@@ -15,7 +15,11 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::{AppState, hls::HlsMediaResource, library::OpenedMediaFile};
+use crate::{
+    AppState,
+    hls::{HlsMediaResource, mp4_initialization_length, should_forward_media_request_header},
+    library::OpenedMediaFile,
+};
 
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
 
@@ -115,7 +119,7 @@ fn hls_master_playlist_response(
     session_id: String,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_sessions.get(&session_id) else {
+    let Some(session) = state.state.hls_playback_session(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
@@ -140,7 +144,7 @@ async fn hls_segment_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_sessions.get(&session_id) else {
+    let Some(session) = state.state.hls_playback_session(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
@@ -148,12 +152,24 @@ async fn hls_segment_response(
         let Some(resource) = session.media_playlist_resource(&segment_id) else {
             return empty_response(StatusCode::NOT_FOUND);
         };
-        let Ok(initialization) = load_hls_mp4_initialization(&state, &resource).await else {
-            return text_response(
-                StatusCode::BAD_GATEWAY,
-                "HLS upstream MP4 initialization probe failed.\n",
-                head_only,
-            );
+        let initialization = if let Some(cached) = state
+            .state
+            .hls_cache
+            .cached_resource(&session_id, &resource.id)
+        {
+            Mp4Initialization {
+                length: cached.initialization_length,
+                total_length: cached.total_length,
+            }
+        } else {
+            let Ok(initialization) = load_hls_mp4_initialization(&state, &resource).await else {
+                return text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "HLS upstream MP4 initialization probe failed.\n",
+                    head_only,
+                );
+            };
+            initialization
         };
         let Some(playlist) = session.media_playlist(
             &segment_id,
@@ -182,6 +198,26 @@ async fn hls_segment_response(
     let Some(resource) = session.media_resource(&segment_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+
+    if let Some(opened_file) = state
+        .state
+        .hls_cache
+        .open_cached_resource(&session_id, &resource.id)
+    {
+        let range = match parse_range(headers.get(RANGE), opened_file.size_bytes) {
+            Ok(range) => range,
+            Err(_) => {
+                let mut response = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+                response.headers_mut().insert(
+                    CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{}", opened_file.size_bytes))
+                        .expect("content range header should be valid"),
+                );
+                return response;
+            }
+        };
+        return build_file_response(opened_file, range, head_only).await;
+    }
 
     proxy_hls_media_resource(&state, resource, &headers, head_only).await
 }
@@ -280,6 +316,9 @@ fn hls_upstream_request_builder(
 ) -> reqwest::RequestBuilder {
     let mut request = state.state.hls_upstream_client.request(method, url);
     for header in &resource.request.headers {
+        if !should_forward_media_request_header(&header.name, &resource.request.url, url) {
+            continue;
+        }
         request = request.header(header.name.as_str(), header.value.as_str());
     }
     request
@@ -424,43 +463,6 @@ fn content_range_byte_range(headers: &HeaderMap) -> Option<(ByteRange, u64)> {
     Some((range, total))
 }
 
-fn mp4_initialization_length(bytes: &[u8]) -> Option<u64> {
-    let mut offset = 0_usize;
-    while offset.checked_add(8)? <= bytes.len() {
-        let size32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?);
-        let box_type = &bytes[offset + 4..offset + 8];
-        let (header_length, box_size) = match size32 {
-            0 => return None,
-            1 => {
-                if offset.checked_add(16)? > bytes.len() {
-                    return None;
-                }
-                (
-                    16_u64,
-                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?),
-                )
-            }
-            size => (8_u64, u64::from(size)),
-        };
-        if box_size < header_length {
-            return None;
-        }
-        let end = u64::try_from(offset).ok()?.checked_add(box_size)?;
-        if end > u64::try_from(bytes.len()).ok()? {
-            return None;
-        }
-        if box_type == b"moov" {
-            return Some(end);
-        }
-        if matches!(box_type, b"moof" | b"mdat") {
-            return None;
-        }
-        offset = usize::try_from(end).ok()?;
-    }
-
-    None
-}
-
 fn copy_hls_upstream_headers(
     source: &HeaderMap,
     target: &mut HeaderMap,
@@ -521,7 +523,10 @@ async fn build_file_response(
 
     let mut response = Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, opened_file.content_type)
+        .header(
+            CONTENT_TYPE,
+            content_type_header_value(&opened_file.content_type),
+        )
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, length.to_string())
         .header(
@@ -708,6 +713,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_media_playlist_uses_cached_initialization_without_upstream_probe() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let cached_session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &cached_session)
+            .await
+            .expect("session should cache");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"28@0\""));
+    }
+
+    #[tokio::test]
+    async fn hls_segment_serves_cached_resource_with_range() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let cached_session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &cached_session)
+            .await
+            .expect("session should cache");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            format!("bytes 1-3/{}", fake_mp4().len()),
+            response.headers()[CONTENT_RANGE]
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&fake_mp4()[1..=3], &body[..]);
+    }
+
+    #[tokio::test]
     async fn hls_segment_retries_backup_url_after_retryable_status() {
         let (primary_url, _primary_task) = start_hls_forbidden_upstream().await;
         let (backup_url, _backup_task) = start_hls_upstream().await;
@@ -882,6 +962,23 @@ mod tests {
         copy_hls_upstream_headers(&source, &mut target, "video/mp4\nx-invalid: nope");
 
         assert_eq!("application/octet-stream", target[CONTENT_TYPE]);
+    }
+
+    #[tokio::test]
+    async fn cached_file_response_invalid_content_type_uses_octet_stream() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("video.m4s");
+        std::fs::write(&path, b"media").expect("media file should be written");
+        let opened_file = OpenedMediaFile {
+            file: std::fs::File::open(&path).expect("media file should open"),
+            content_type: "video/mp4\nx-invalid: nope".to_owned(),
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+            size_bytes: 5,
+        };
+
+        let response = build_file_response(opened_file, None, true).await;
+
+        assert_eq!("application/octet-stream", response.headers()[CONTENT_TYPE]);
     }
 
     #[test]
@@ -1206,7 +1303,7 @@ mod tests {
             width: Some(1920),
             height: Some(1080),
             frame_rate: Some("60".to_owned()),
-            size: Some(10),
+            size: Some(fake_mp4().len() as u64),
             duration_seconds: Some(60),
             cache_key: BilibiliMediaCacheKey {
                 content_id: "content-1".to_owned(),

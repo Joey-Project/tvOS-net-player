@@ -28,7 +28,30 @@ impl PlaybackUriFactory {
 
     pub fn create_hls_master_playlist<T>(&self, request: &Request<T>, session_id: &str) -> String {
         let base_uri = self.create_base_uri(request);
+        Self::hls_master_playlist_uri(&base_uri, session_id)
+    }
 
+    pub fn create_hls_master_playlist_for_runtime(&self, session_id: &str) -> String {
+        let base_uri = self.configured_base_uri();
+        Self::hls_master_playlist_uri(&base_uri, session_id)
+    }
+
+    pub fn create_hls_master_playlist_for_restored_task(
+        &self,
+        session_id: &str,
+        existing_uri: Option<&str>,
+    ) -> String {
+        if let Some(base_uri) = self.configured_public_media_base_uri() {
+            return Self::hls_master_playlist_uri(&base_uri, session_id);
+        }
+
+        existing_uri
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.create_hls_master_playlist_for_runtime(session_id))
+    }
+
+    fn hls_master_playlist_uri(base_uri: &str, session_id: &str) -> String {
         format!(
             "{}/hls/{}/master.m3u8",
             base_uri.trim_end_matches('/'),
@@ -54,6 +77,20 @@ impl PlaybackUriFactory {
                     &self.options.media_listen_url,
                 )
             })
+    }
+
+    fn configured_base_uri(&self) -> String {
+        self.configured_public_media_base_uri().unwrap_or_else(|| {
+            Self::create_media_base_uri("localhost", &self.options.media_listen_url)
+        })
+    }
+
+    fn configured_public_media_base_uri(&self) -> Option<String> {
+        self.options
+            .public_media_base_uri
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
     }
 
     pub fn create_media_base_uri(request_authority: &str, media_listen_url: &str) -> String {
@@ -140,6 +177,43 @@ mod tests {
                 Some("10.0.0.5".parse().unwrap()),
                 "http://0.0.0.0:8080",
             )
+        );
+    }
+
+    #[test]
+    fn preserves_existing_restored_hls_uri_without_public_media_base() {
+        let options = CacheServerOptions {
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: None,
+            ..CacheServerOptions::default()
+        };
+        let factory = PlaybackUriFactory::new(Arc::new(options));
+
+        let uri = factory.create_hls_master_playlist_for_restored_task(
+            "session-1",
+            Some("http://10.0.0.5:8080/hls/session-1/master.m3u8"),
+        );
+
+        assert_eq!("http://10.0.0.5:8080/hls/session-1/master.m3u8", uri);
+    }
+
+    #[test]
+    fn refreshes_restored_hls_uri_with_public_media_base() {
+        let options = CacheServerOptions {
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: Some("http://media.example.test:9090".to_owned()),
+            ..CacheServerOptions::default()
+        };
+        let factory = PlaybackUriFactory::new(Arc::new(options));
+
+        let uri = factory.create_hls_master_playlist_for_restored_task(
+            "session-1",
+            Some("http://10.0.0.5:8080/hls/session-1/master.m3u8"),
+        );
+
+        assert_eq!(
+            "http://media.example.test:9090/hls/session-1/master.m3u8",
+            uri
         );
     }
 

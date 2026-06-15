@@ -3,7 +3,7 @@ use std::{
     ffi::CString,
     fs::{self, File},
     io,
-    path::{Component, Path, PathBuf},
+    path::{Component, Components, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -26,6 +26,8 @@ use crate::{
 pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
+const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
+const INTERNAL_HLS_CACHE_DIR: &str = "hls";
 
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
@@ -346,6 +348,9 @@ impl LocalMediaLibrary {
         }
 
         let relative_path = relative_path(root_path, &full_candidate_path)?;
+        if is_internal_hls_cache_path(&relative_path) {
+            return None;
+        }
         if !self.supports_http_range_playback() {
             return Some(MediaFile {
                 path: full_candidate_path,
@@ -554,6 +559,9 @@ fn collect_media_candidates(
         }
 
         if file_type.is_dir() {
+            if is_internal_hls_cache_dir(root_path, &path) {
+                continue;
+            }
             collect_media_candidates(
                 root_path,
                 &path,
@@ -591,6 +599,22 @@ fn collect_media_candidates(
     }
 
     Ok(())
+}
+
+fn is_internal_hls_cache_dir(root_path: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root_path) else {
+        return false;
+    };
+    is_internal_hls_cache_components(relative.components())
+}
+
+fn is_internal_hls_cache_path(relative_path: &str) -> bool {
+    is_internal_hls_cache_components(Path::new(relative_path).components())
+}
+
+fn is_internal_hls_cache_components(mut components: Components<'_>) -> bool {
+    matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
+        && matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_HLS_CACHE_DIR)
 }
 
 fn create_item_id(relative_path: &str) -> String {
@@ -726,18 +750,18 @@ fn is_within_root(root_path: &Path, candidate_path: &Path) -> bool {
     candidate_path == root_path || candidate_path.starts_with(root_path)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn supports_secure_no_follow_open() -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn supports_secure_no_follow_open() -> bool {
     false
 }
 
-#[cfg(target_os = "macos")]
-fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
+#[cfg(unix)]
+pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
     let segments = Path::new(relative_path)
@@ -778,15 +802,15 @@ fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File
     )
 }
 
-#[cfg(not(target_os = "macos"))]
-fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io::Result<File> {
+#[cfg(not(unix))]
+pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow media open is not implemented on this platform",
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_path(path: &Path, flags: i32) -> io::Result<File> {
     use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
 
@@ -802,7 +826,7 @@ fn open_path(path: &Path, flags: i32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_at(directory_fd: i32, path: &CString, flags: i32) -> io::Result<File> {
     use std::os::fd::FromRawFd;
 
@@ -925,6 +949,59 @@ mod tests {
         assert!(
             library
                 .item_id_for_media_path_blocking(&escaped_path)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_scan_excludes_internal_hls_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(root_path.join(".tvos-net-player/hls/session-1")).unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/hls/session-1/video.m4s"),
+            b"hls",
+        )
+        .unwrap();
+        fs::write(root_path.join("Visible.m4s"), b"media").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+
+        let page = library.list_items_page_blocking(None, 0, 50, BlockingCancellation::default());
+
+        assert_eq!(1, page.items.len());
+        assert_eq!("Visible.m4s", page.items[0].subtitle);
+    }
+
+    #[test]
+    fn local_direct_lookup_excludes_internal_hls_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
+        fs::write(&internal_path, b"hls").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+
+        assert!(library.get_item_blocking(&item_id).is_none());
+        assert!(
+            library
+                .get_media_file_blocking(&item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&internal_path)
                 .is_none()
         );
     }

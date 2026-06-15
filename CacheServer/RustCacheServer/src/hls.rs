@@ -8,6 +8,7 @@ use crate::bbdown_adapter::{
     BilibiliMediaRequest, BilibiliPlaybackVariant as AdapterPlaybackVariant,
     BilibiliPlaybackVariantKind,
 };
+use url::Url;
 
 const VIDEO_PLAYLIST_ID: &str = "video.m3u8";
 const AUDIO_PLAYLIST_ID: &str = "audio.m3u8";
@@ -221,6 +222,35 @@ impl HlsMediaResource {
     }
 }
 
+pub(crate) fn should_forward_media_request_header(
+    header_name: &str,
+    primary_url: &str,
+    target_url: &str,
+) -> bool {
+    if media_request_origins_match(primary_url, target_url) {
+        return true;
+    }
+
+    is_cross_origin_safe_media_header(header_name)
+}
+
+fn media_request_origins_match(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (Url::parse(left), Url::parse(right)) else {
+        return false;
+    };
+
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn is_cross_origin_safe_media_header(header_name: &str) -> bool {
+    matches!(
+        header_name.to_ascii_lowercase().as_str(),
+        "accept" | "accept-language" | "origin" | "referer" | "referrer" | "user-agent"
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HlsSessionError {
     message: String,
@@ -241,6 +271,43 @@ impl Display for HlsSessionError {
 }
 
 impl std::error::Error for HlsSessionError {}
+
+pub(crate) fn mp4_initialization_length(bytes: &[u8]) -> Option<u64> {
+    let mut offset = 0_usize;
+    while offset.checked_add(8)? <= bytes.len() {
+        let size32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let box_type = &bytes[offset + 4..offset + 8];
+        let (header_length, box_size) = match size32 {
+            0 => return None,
+            1 => {
+                if offset.checked_add(16)? > bytes.len() {
+                    return None;
+                }
+                (
+                    16_u64,
+                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?),
+                )
+            }
+            size => (8_u64, u64::from(size)),
+        };
+        if box_size < header_length {
+            return None;
+        }
+        let end = u64::try_from(offset).ok()?.checked_add(box_size)?;
+        if end > u64::try_from(bytes.len()).ok()? {
+            return None;
+        }
+        if box_type == b"moov" {
+            return Some(end);
+        }
+        if matches!(box_type, b"moof" | b"mdat") {
+            return None;
+        }
+        offset = usize::try_from(end).ok()?;
+    }
+
+    None
+}
 
 fn escape_quoted(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -310,6 +377,30 @@ mod tests {
             "Progressive HLS playback requires a DASH playback variant.",
             error.to_string()
         );
+    }
+
+    #[test]
+    fn filters_sensitive_media_request_headers_for_cross_origin_backups() {
+        assert!(should_forward_media_request_header(
+            "authorization",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-a.example.test/video.m4s"
+        ));
+        assert!(!should_forward_media_request_header(
+            "authorization",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
+        assert!(!should_forward_media_request_header(
+            "cookie",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
+        assert!(should_forward_media_request_header(
+            "referer",
+            "https://cdn-a.example.test/video.m4s",
+            "https://cdn-b.example.test/video.m4s"
+        ));
     }
 
     fn dash_variant() -> BilibiliPlaybackVariant {
