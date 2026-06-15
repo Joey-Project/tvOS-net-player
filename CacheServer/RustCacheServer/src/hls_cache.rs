@@ -81,8 +81,12 @@ impl HlsCacheStore {
 
         let mut sessions = Vec::new();
         for entry in entries.flatten() {
-            let path = entry.path().join("session.json");
-            let Ok(bytes) = fs::read(path) else {
+            let session_dir = entry.path();
+            if self.reject_cache_path_symlink(&session_dir).is_err() {
+                continue;
+            }
+            let path = session_dir.join("session.json");
+            let Some(bytes) = self.read_cache_file(&path) else {
                 continue;
             };
             let Ok(persisted) = serde_json::from_slice::<PersistedHlsSession>(&bytes) else {
@@ -172,6 +176,7 @@ impl HlsCacheStore {
     ) -> Option<CachedHlsResource> {
         let metadata = self.read_resource_metadata(session_id, resource_id)?;
         let file_path = self.resource_path(session_id, resource_id).ok()?;
+        self.reject_cache_path_symlink(&file_path).ok()?;
         let file_metadata = fs::symlink_metadata(&file_path).ok()?;
         if file_metadata.file_type().is_symlink()
             || !file_metadata.is_file()
@@ -335,7 +340,7 @@ impl HlsCacheStore {
 
     fn load_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
         let path = self.session_dir(session_id).ok()?.join("session.json");
-        let bytes = fs::read(path).ok()?;
+        let bytes = self.read_cache_file(&path)?;
         let persisted = serde_json::from_slice::<PersistedHlsSession>(&bytes).ok()?;
         if persisted.schema_version != HLS_CACHE_SCHEMA_VERSION {
             return None;
@@ -434,7 +439,8 @@ impl HlsCacheStore {
         session_id: &str,
         resource_id: &str,
     ) -> Option<PersistedHlsCachedResource> {
-        let bytes = fs::read(self.resource_metadata_path(session_id, resource_id).ok()?).ok()?;
+        let bytes =
+            self.read_cache_file(&self.resource_metadata_path(session_id, resource_id).ok()?)?;
         let metadata = serde_json::from_slice::<PersistedHlsCachedResource>(&bytes).ok()?;
         (metadata.schema_version == HLS_CACHE_SCHEMA_VERSION && metadata.id == resource_id)
             .then_some(metadata)
@@ -528,6 +534,11 @@ impl HlsCacheStore {
             ));
         }
         Ok(())
+    }
+
+    fn read_cache_file(&self, path: &Path) -> Option<Vec<u8>> {
+        self.reject_cache_path_symlink(path).ok()?;
+        fs::read(path).ok()
     }
 }
 
@@ -1386,6 +1397,60 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn load_sessions_skips_symlinked_hls_cache_session_directory_for_reads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let store_root = temp.path().join(".tvos-net-player").join("hls");
+        let outside_dir = temp.path().join("outside-session-read");
+        let session = sample_session("session-read-link", "https://example.test/video.m4s");
+        std::fs::create_dir_all(&store_root).expect("store root should be created");
+        std::fs::create_dir(&outside_dir).expect("outside target should be created");
+        write_pretty_json(
+            &outside_dir.join("session.json"),
+            &PersistedHlsSession::from(session.clone()),
+        );
+        symlink(&outside_dir, store_root.join(&session.id))
+            .expect("session dir symlink should be made");
+
+        let sessions = store.load_sessions().expect("cache scan should succeed");
+
+        assert!(sessions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_session_rejects_symlinked_hls_cache_session_manifest_for_reads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-manifest-link", "https://example.test/video.m4s");
+        let session_dir = store
+            .session_dir(&session.id)
+            .expect("session dir should be valid");
+        std::fs::create_dir_all(&session_dir).expect("session dir should be created");
+        let outside_manifest = temp.path().join("outside-session.json");
+        write_pretty_json(
+            &outside_manifest,
+            &PersistedHlsSession::from(session.clone()),
+        );
+        symlink(&outside_manifest, session_dir.join("session.json"))
+            .expect("session manifest symlink should be made");
+
+        let sessions = store.load_sessions().expect("cache scan should succeed");
+
+        assert!(sessions.is_empty());
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-manifest-link")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlinked_hls_cache_store_root_for_reads() {
         use std::os::unix::fs::symlink;
 
@@ -1402,6 +1467,69 @@ mod tests {
             .expect_err("symlinked HLS store root should be rejected");
 
         assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_hls_cache_metadata_file_for_reads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-metadata-link", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&session.id, "video.m4s")
+                .expect("resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("resource should be written");
+        let outside_metadata = temp.path().join("outside-video.m4s.json");
+        write_pretty_json(
+            &outside_metadata,
+            &cached_metadata_for_session(&session, "video.m4s"),
+        );
+        symlink(
+            &outside_metadata,
+            store
+                .resource_metadata_path(&session.id, "video.m4s")
+                .expect("metadata path should be valid"),
+        )
+        .expect("metadata symlink should be made");
+
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-metadata-link")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_resource_rejects_symlinked_hls_cache_session_directory_for_reads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let store_root = temp.path().join(".tvos-net-player").join("hls");
+        let outside_dir = temp.path().join("outside-session-resource");
+        let session = sample_session("session-resource-link", "https://example.test/video.m4s");
+        std::fs::create_dir_all(&store_root).expect("store root should be created");
+        std::fs::create_dir(&outside_dir).expect("outside target should be created");
+        std::fs::write(outside_dir.join("video.m4s"), fake_mp4())
+            .expect("outside resource should be written");
+        write_pretty_json(
+            &outside_dir.join("video.m4s.json"),
+            &cached_metadata_for_session(&session, "video.m4s"),
+        );
+        symlink(&outside_dir, store_root.join(&session.id))
+            .expect("session dir symlink should be made");
+
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
     }
 
     #[cfg(unix)]
@@ -1745,5 +1873,27 @@ mod tests {
         bytes.extend(kind);
         bytes.extend(payload);
         bytes
+    }
+
+    fn cached_metadata_for_session(
+        session: &HlsPlaybackSession,
+        resource_id: &str,
+    ) -> PersistedHlsCachedResource {
+        PersistedHlsCachedResource {
+            schema_version: HLS_CACHE_SCHEMA_VERSION,
+            id: resource_id.to_owned(),
+            content_type: session.variant.video.content_type().to_owned(),
+            total_length: fake_mp4().len() as u64,
+            initialization_length: 28,
+            cache_key: PersistedBilibiliMediaCacheKey::from(
+                session.variant.video.request.cache_key.clone(),
+            ),
+        }
+    }
+
+    fn write_pretty_json<T: Serialize>(path: &Path, value: &T) {
+        let mut bytes = serde_json::to_vec_pretty(value).expect("test JSON should serialize");
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).expect("test JSON should be written");
     }
 }
