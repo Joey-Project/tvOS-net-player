@@ -104,10 +104,65 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
         await client.waitForWatchSubscription()
-        await client.yield(.playableFixture(source: "BV1done", state: "TASK_STATE_COMPLETED"))
+        await client.yield(
+            .playableFixture(
+                source: "BV1done",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: "cached-bilibili-playback-1",
+                playbackSourceItemID: "cached-bilibili-playback-1"
+            )
+        )
         await waitUntil(model.currentTask?.state == "TASK_STATE_COMPLETED")
 
         XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.statusMessage, "Ready video is cached for LAN playback.")
+
+        model.clearTask()
+    }
+
+    func testPlayableTaskRejectsMismatchedPlaybackSourceOwner() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1wrong",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.yield(.playableFixture(source: "BV1wrong", playbackSourceItemID: "different-task"))
+        await waitUntil(model.currentTask?.state == "TASK_STATE_PLAYABLE")
+
+        XCTAssertNil(model.playableURL)
+        XCTAssertFalse(model.canPlay)
+
+        model.clearTask()
+    }
+
+    func testCompletedTaskRejectsMismatchedPlaybackSourceOwner() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1cachedWrong",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.yield(
+            .playableFixture(
+                source: "BV1cachedWrong",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: "cached-bilibili-playback-1",
+                playbackSourceItemID: "different-library-item"
+            )
+        )
+        await waitUntil(model.currentTask?.state == "TASK_STATE_COMPLETED")
+
+        XCTAssertNil(model.playableURL)
+        XCTAssertFalse(model.canPlay)
         XCTAssertEqual(model.statusMessage, "Ready video is cached for LAN playback.")
 
         model.clearTask()
@@ -229,6 +284,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         await client.yield(.fixture(source: "BV1race", state: "TASK_STATE_CANCELLED"))
         await waitUntil(model.currentTask?.state == "TASK_STATE_CANCELLED")
+        XCTAssertFalse(model.isCancelling)
         await client.completeNextCancel(
             with: .success(
                 .fixture(source: "BV1race", state: "TASK_STATE_CANCEL_REQUESTED", message: "Cancelling task.")))
@@ -237,6 +293,38 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
         XCTAssertFalse(model.isCancelling)
         XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
+
+        model.clearTask()
+    }
+
+    func testWatchUpdateClearsTransientCancelErrorWhenTaskRecovers() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1recover", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1recover",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.setSuspendsCancelResponses(true)
+
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+        await client.completeNextCancel(with: .failure(FakeBilibiliCacheControlClientError.cancelFailed))
+        await cancelTask.value
+
+        XCTAssertNotNil(model.errorMessage)
+
+        await client.yield(.playableFixture(source: "BV1recover"))
+        await waitUntil(model.currentTask?.state == "TASK_STATE_PLAYABLE")
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Ready video is ready to play.")
+        XCTAssertTrue(model.canPlay)
 
         model.clearTask()
     }
@@ -580,6 +668,7 @@ private extension CacheTask {
         state: String,
         progress: Double = 0.25,
         message: String = "Preparing playback.",
+        libraryItemID: String = "",
         playbackSource: CachePlaybackSource? = nil,
         playbackSession: CacheBilibiliPlaybackSession? = nil
     ) -> Self {
@@ -591,7 +680,7 @@ private extension CacheTask {
             title: title,
             progress: progress,
             message: message,
-            libraryItemID: "",
+            libraryItemID: libraryItemID,
             playbackSource: playbackSource,
             playbackSession: playbackSession
         )
@@ -600,19 +689,23 @@ private extension CacheTask {
     static func playableFixture(
         id: String = "bilibili-playback-1",
         source: String = "BV1test",
-        state: String = "TASK_STATE_PLAYABLE"
+        state: String = "TASK_STATE_PLAYABLE",
+        libraryItemID: String = "",
+        playbackSourceItemID: String? = nil
     ) -> Self {
-        .fixture(
+        let resolvedPlaybackSourceItemID = playbackSourceItemID ?? id
+        return .fixture(
             id: id,
             source: source,
             state: state,
             progress: 1,
             message: "Bilibili playback session is playable.",
+            libraryItemID: libraryItemID,
             playbackSource: CachePlaybackSource(
-                itemID: id,
+                itemID: resolvedPlaybackSourceItemID,
                 variantID: "h264",
                 playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
-                uri: "http://mac-mini.local:8080/hls/\(id)/master.m3u8"
+                uri: "http://mac-mini.local:8080/hls/\(resolvedPlaybackSourceItemID)/master.m3u8"
             ),
             playbackSession: CacheBilibiliPlaybackSession(
                 id: id,

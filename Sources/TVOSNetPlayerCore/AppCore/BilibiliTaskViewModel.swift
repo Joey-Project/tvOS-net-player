@@ -301,6 +301,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
         if task.isFailedBilibiliTaskState {
             errorMessage = Self.failureMessage(for: task)
+        } else {
+            errorMessage = nil
         }
 
         if activePlaybackTaskID == task.id {
@@ -309,6 +311,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             statusMessage = Self.statusMessage(for: task)
         }
         if task.isTerminalBilibiliTaskState {
+            isCancelling = false
             stopWatching()
         }
     }
@@ -393,11 +396,23 @@ private extension CacheTask {
             return nil
         }
 
-        guard playbackSource?.isPlayableByTVOSClient == true else {
+        guard let playbackSource, playbackSource.isPlayableByTVOSClient else {
             return nil
         }
 
-        return playbackSource?.explicitHTTPURL
+        guard let expectedItemID = expectedBilibiliPlaybackSourceItemID,
+            playbackSource.itemID == expectedItemID
+        else {
+            return nil
+        }
+
+        return playbackSource.explicitHTTPURL
+    }
+
+    var expectedBilibiliPlaybackSourceItemID: String? {
+        let itemID = isCompletedBilibiliTaskState ? libraryItemID : id
+        let trimmedItemID = itemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedItemID.isEmpty ? nil : trimmedItemID
     }
 
     var isPlayableBilibiliTaskState: Bool {
