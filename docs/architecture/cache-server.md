@@ -97,6 +97,7 @@ Playback sources intentionally return URLs instead of media bytes.
 Cache deletion contract:
 
 - `CacheService.DeleteLibraryItem` accepts the stable library item id visible in `LibraryService` responses and returns `deleted=false` when the item is already gone.
+- `DeleteLibraryItem` is disabled unless `Cache:AllowLibraryItemDelete=true`; when disabled the server returns `permission_denied` and omits `SERVER_CAPABILITY_LIBRARY_ITEM_DELETE` from `ServerInfo`.
 - Local cache items delete the validated media file under `Cache:RootPath`; internal `.tvos-net-player/hls` files are not addressable as local library items.
 - Completed Bilibili HLS items with ids shaped as `bilibili.hls.<session_id>` delete the HLS cache session directory, remove the runtime HLS session, and remove the persisted completed progressive playback task that authorized the virtual library item.
 - Active or playable-but-not-completed progressive HLS sessions are still controlled through task cancellation, not library item deletion.
@@ -129,6 +130,7 @@ Runtime shape:
 - gRPC services are hosted by `tonic` and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
 - LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) try to open both IPv4 and IPv6 listeners, and continue when one address family is unavailable but the other is bound; use a concrete LAN IP to restrict address family or interface. The first slice does not implement authentication.
+- Destructive library deletion is opt-in with `Cache:AllowLibraryItemDelete=true` and otherwise returns `permission_denied`.
 - `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that the server does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
 - `/media/{itemId}/{variantId}` serves files from the configured cache root with Range support enabled.
@@ -150,6 +152,7 @@ Configuration:
 - `Cache:TaskStatePath`: JSON task snapshot path. Defaults to `cache-server-state/tasks.json` next to the server executable.
 - `Cache:TaskRetentionMaxTerminalTasks`: maximum ordinary terminal task records to retain in the persisted task snapshot. Defaults to `200`; set `0` to disable this limit.
 - `Cache:TaskRetentionTerminalAgeDays`: maximum age in days for ordinary terminal task records in the persisted task snapshot. Defaults to `30`; set `0` to disable this limit.
+- `Cache:AllowLibraryItemDelete`: enables destructive cache library deletion RPCs and the matching `SERVER_CAPABILITY_LIBRARY_ITEM_DELETE` capability. Defaults to `false` while the control plane is cleartext and unauthenticated.
 - `Cache:BilibiliWorkerEnabled`: starts the real BBDown worker when true. Defaults to `true`.
 - `Cache:BilibiliWorkerMaxConcurrentTasks`: maximum task worker concurrency. Defaults to `1`; the real BBDown adapter currently caps effective concurrency at `1` to avoid concurrent writes to the same archive.
 - `Cache:BBDownOutputDir`: BBDown download output directory. It defaults to `Cache:RootPath/Bilibili`; when the worker is enabled or this path is explicitly configured, it must be inside `Cache:RootPath`, with no `..` parent components and no existing symlink components under the root.

@@ -26,6 +26,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     @Published public private(set) var items: [CacheLibraryItem] = []
     @Published public private(set) var cacheRoots: [CacheRoot] = []
     @Published public private(set) var deletingItemIDs: Set<String> = []
+    @Published public private(set) var canDeleteLibraryItems = false
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
@@ -83,6 +84,7 @@ public final class CacheLibraryViewModel: ObservableObject {
 
     public func canDelete(_ item: CacheLibraryItem) -> Bool {
         loadedEndpoint != nil
+            && canDeleteLibraryItems
             && items.contains(where: { $0.id == item.id })
             && !deletingItemIDs.contains(item.id)
     }
@@ -133,6 +135,7 @@ public final class CacheLibraryViewModel: ObservableObject {
 
             loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
+            canDeleteLibraryItems = serverInfo.supportsLibraryItemDelete
             self.cacheRoots = cacheRoots
             items = libraryPage.items
             nextPageToken = libraryPage.nextPageToken
@@ -150,6 +153,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             items = []
             cacheRoots = []
             deletingItemIDs = []
+            canDeleteLibraryItems = false
             nextPageToken = ""
             requestedLibraryPageTokens = []
             activeSearchText = ""
@@ -259,27 +263,12 @@ public final class CacheLibraryViewModel: ObservableObject {
         errorMessage = nil
         statusMessage = "Deleting \(item.displayTitle)..."
 
+        let client = clientFactory(endpoint)
+        let deleted: Bool
         do {
-            let client = clientFactory(endpoint)
-            let deleted = try await Self.withOperationTimeout(operationTimeout) {
+            deleted = try await Self.withOperationTimeout(operationTimeout) {
                 try await client.deleteLibraryItem(id: item.id)
             }
-
-            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
-                return false
-            }
-
-            deletingItemIDs.remove(item.id)
-            guard deleted else {
-                errorMessage = "Cached item was already deleted."
-                statusMessage = "Could not delete \(item.displayTitle)."
-                return false
-            }
-
-            items.removeAll { $0.id == item.id }
-            clearPlaybackIfNeeded(forDeletedItemID: item.id)
-            statusMessage = "Deleted \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
-            return true
         } catch {
             guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
                 return false
@@ -290,6 +279,54 @@ public final class CacheLibraryViewModel: ObservableObject {
             statusMessage = "Could not delete \(item.displayTitle)."
             return false
         }
+
+        guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            return false
+        }
+
+        deletingItemIDs.remove(item.id)
+        guard deleted else {
+            errorMessage = "Cached item was already deleted."
+            statusMessage = "Could not delete \(item.displayTitle)."
+            return false
+        }
+
+        clearPlaybackIfNeeded(forDeletedItemID: item.id)
+        if nextPageToken.isEmpty {
+            items.removeAll { $0.id == item.id }
+        } else {
+            do {
+                let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
+                    try await client.listLibraryItemsPage(
+                        pageToken: "",
+                        pageSize: Self.libraryPageSize,
+                        searchText: Self.searchTextForRequest(self.activeSearchText)
+                    )
+                }
+
+                guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                    return false
+                }
+
+                items = libraryPage.items
+                nextPageToken = libraryPage.nextPageToken
+                requestedLibraryPageTokens = [""]
+            } catch {
+                guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                    return false
+                }
+
+                items.removeAll { $0.id == item.id }
+                nextPageToken = ""
+                requestedLibraryPageTokens = []
+                errorMessage = error.localizedDescription
+                statusMessage = "Deleted \(item.displayTitle), but refresh cache server to load more videos."
+                return true
+            }
+        }
+
+        statusMessage = "Deleted \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
+        return true
     }
 
     public func playbackURL(for item: CacheLibraryItem) async -> URL? {
@@ -485,6 +522,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         items = []
         cacheRoots = []
         deletingItemIDs = []
+        canDeleteLibraryItems = false
         nextPageToken = ""
         requestedLibraryPageTokens = []
         activeSearchText = ""

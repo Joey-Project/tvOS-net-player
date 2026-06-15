@@ -2,6 +2,13 @@ import XCTest
 @testable import TVOSNetPlayerCacheClient
 
 final class CacheLibraryPaginationTests: XCTestCase {
+    func testGeneratedDeleteCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.libraryItemDelete),
+            CacheServerCapability.libraryItemDelete
+        )
+    }
+
     func testCacheControlClientPageContractExposesNextTokenAndSearch() async throws {
         let client: any CacheControlClient = FakePagedCacheControlClient()
 

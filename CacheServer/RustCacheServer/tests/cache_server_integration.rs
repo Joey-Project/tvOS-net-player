@@ -40,6 +40,10 @@ async fn serves_library_control_plane_and_http_range_media() {
             .contains(&(ServerCapability::BilibiliTasks as i32))
     );
     assert!(info.capabilities.contains(&(ServerCapability::Hls as i32)));
+    assert!(
+        info.capabilities
+            .contains(&(ServerCapability::LibraryItemDelete as i32))
+    );
     #[cfg(target_os = "macos")]
     assert!(
         info.capabilities
@@ -455,6 +459,7 @@ impl TestServer {
             root_path,
             grpc_listen_url: grpc_url.clone(),
             media_listen_url,
+            allow_library_item_delete: true,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });

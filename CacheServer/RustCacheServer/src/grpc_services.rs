@@ -80,6 +80,10 @@ impl ServerService for ServerGrpcService {
                 info.media_base_uris.push(base_uri.to_owned());
             }
         }
+        if self.state.options.allow_library_item_delete {
+            info.capabilities
+                .push(ServerCapability::LibraryItemDelete.into());
+        }
 
         Ok(Response::new(info))
     }
@@ -434,6 +438,11 @@ impl CacheService for CacheGrpcService {
         let id = request.id.trim();
         if id.is_empty() {
             return Err(Status::invalid_argument("Library item id is required."));
+        }
+        if !self.state.options.allow_library_item_delete {
+            return Err(Status::permission_denied(
+                "Library item deletion is not enabled on this cache server.",
+            ));
         }
 
         if let Some(deleted) = self.state.delete_completed_hls_library_item(id)? {
@@ -896,6 +905,32 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    #[tokio::test]
+    async fn delete_library_item_requires_explicit_enablement() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        fs::write(root_path.join("sample.mp4"), b"sample").expect("media file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = CacheGrpcService::new(state);
+
+        let error = service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: "local.default.c2FtcGxlLm1wNA".to_owned(),
+            }))
+            .await
+            .expect_err("delete should require explicit enablement");
+
+        assert_eq!(tonic::Code::PermissionDenied, error.code());
+        assert!(root_path.join("sample.mp4").exists());
+    }
 
     #[tokio::test]
     async fn create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background() {
@@ -1454,6 +1489,7 @@ mod tests {
             root_path: root_path.clone(),
             task_state_path: root_path.join(".state").join("tasks.json"),
             public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            allow_library_item_delete: true,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         };

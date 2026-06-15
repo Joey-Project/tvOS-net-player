@@ -74,6 +74,30 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDeleteItemRequiresServerCapability() async {
+        let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A", capabilities: []),
+            items: [item],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let deleted = await model.deleteItem(item)
+
+        XCTAssertFalse(deleted)
+        XCTAssertFalse(model.canDelete(item))
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        let requestedDeleteItemIDs = await client.requestedDeleteItemIDs
+        XCTAssertTrue(requestedDeleteItemIDs.isEmpty)
+    }
+
+    @MainActor
     func testDeleteItemRemovesLoadedItemAndCallsClient() async {
         let firstItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let secondItem = CacheLibraryItem.fixture(id: "item-b", title: "Server B item")
@@ -99,6 +123,49 @@ final class CacheLibraryViewModelTests: XCTestCase {
             model.statusMessage, "Deleted Server A item from Server A. Loaded 1 cached item(s) from Server A.")
         let requestedDeleteItemIDs = await client.requestedDeleteItemIDs
         XCTAssertEqual(requestedDeleteItemIDs, ["item-a"])
+    }
+
+    @MainActor
+    func testDeleteItemReloadsFirstPageWhenMoreItemsAreAvailable() async {
+        let firstItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let secondItem = CacheLibraryItem.fixture(id: "item-b", title: "Server B item")
+        let thirdItem = CacheLibraryItem.fixture(id: "item-c", title: "Server C item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPageResponsesByToken: [
+                "": [
+                    CacheLibraryItemsPage(items: [firstItem, secondItem], nextPageToken: "2"),
+                    CacheLibraryItemsPage(items: [secondItem, thirdItem], nextPageToken: ""),
+                ],
+                "2": [
+                    CacheLibraryItemsPage(items: [thirdItem], nextPageToken: "")
+                ],
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        XCTAssertEqual(model.items.map(\.id), ["item-a", "item-b"])
+        XCTAssertTrue(model.hasMoreItems)
+
+        let deleted = await model.deleteItem(firstItem)
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(model.items.map(\.id), ["item-b", "item-c"])
+        XCTAssertFalse(model.hasMoreItems)
+        let requestedPageTokens = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokens, ["", ""])
+
+        await model.loadMore()
+
+        let requestedPageTokensAfterLoadMore = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokensAfterLoadMore, ["", ""])
     }
 
     @MainActor
@@ -1284,6 +1351,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let deleteError: FakeCacheError?
     let libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage]
     let libraryPagesByToken: [String: CacheLibraryItemsPage]
+    let libraryPageResponsesByToken: [String: [CacheLibraryItemsPage]]
     let getServerInfoDelayNanoseconds: UInt64
     let getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64]
     let playbackSourcesByItemID: [String: CachePlaybackSource]
@@ -1309,6 +1377,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     private var libraryPageReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var requestedLibraryPageTokenSet: Set<String> = []
     private var releasedLibraryPageTokens: Set<String> = []
+    private var libraryPageResponseIndexesByToken: [String: Int] = [:]
     private var playbackStartedItemIDs: [String] = []
     private var playbackWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
     private var playbackReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
@@ -1323,6 +1392,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         deleteError: FakeCacheError? = nil,
         libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage] = [:],
         libraryPagesByToken: [String: CacheLibraryItemsPage] = [:],
+        libraryPageResponsesByToken: [String: [CacheLibraryItemsPage]] = [:],
         getServerInfoDelayNanoseconds: UInt64 = 0,
         playbackSourcesByItemID: [String: CachePlaybackSource] = [:],
         getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64] = [:],
@@ -1341,6 +1411,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.deleteError = deleteError
         self.libraryPagesByRequest = libraryPagesByRequest
         self.libraryPagesByToken = libraryPagesByToken
+        self.libraryPageResponsesByToken = libraryPageResponsesByToken
         self.getServerInfoDelayNanoseconds = getServerInfoDelayNanoseconds
         self.playbackSourcesByItemID = playbackSourcesByItemID
         self.getPlaybackSourceDelayNanosecondsByItemID = getPlaybackSourceDelayNanosecondsByItemID
@@ -1396,6 +1467,12 @@ private actor FakeCacheControlClient: CacheControlClient {
         let requestKey = LibraryPageRequestKey(pageToken: pageToken, searchText: searchText)
         if let page = libraryPagesByRequest[requestKey] {
             return page
+        }
+
+        if let pages = libraryPageResponsesByToken[pageToken], !pages.isEmpty {
+            let index = libraryPageResponseIndexesByToken[pageToken, default: 0]
+            libraryPageResponseIndexesByToken[pageToken] = index + 1
+            return pages[min(index, pages.count - 1)]
         }
 
         if let page = libraryPagesByToken[pageToken] {
@@ -1606,8 +1683,11 @@ private enum FakeCacheError: Error {
 }
 
 extension CacheServerSummary {
-    fileprivate static func fixture(name: String = "Mac mini cache") -> Self {
-        Self(id: "server-1", name: name, version: "0.1.0", mediaBaseURIs: [], capabilities: [])
+    fileprivate static func fixture(
+        name: String = "Mac mini cache",
+        capabilities: [String] = [CacheServerCapability.libraryItemDelete]
+    ) -> Self {
+        Self(id: "server-1", name: name, version: "0.1.0", mediaBaseURIs: [], capabilities: capabilities)
     }
 }
 

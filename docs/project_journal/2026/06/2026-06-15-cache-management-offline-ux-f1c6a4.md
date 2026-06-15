@@ -21,8 +21,9 @@ superseded_by:
 ## Current State
 
 - `CacheService.ListCacheRoots` is surfaced through the Swift client and `CacheLibraryViewModel`.
-- Local cache items can be deleted from the server-local cache root by their stable library item id.
-- Completed Bilibili HLS virtual items can be deleted with their HLS cache directory and persisted authorization task record.
+- Local cache items can be deleted from the server-local cache root by their stable library item id when the server explicitly enables library deletion.
+- Completed Bilibili HLS virtual items can be deleted with their HLS cache directory and persisted authorization task record when the server explicitly enables library deletion.
+- Destructive library deletion defaults off for the cleartext unauthenticated control plane; the Swift clients only show delete actions when `ServerInfo` advertises the delete capability.
 - tvOS and macOS show cache root capacity when available and label completed Bilibili HLS items as offline HLS cache entries.
 - Bonjour discovery remains split out because it needs server-side mDNS advertisement, client browsing, and Local Network permission UX as a focused follow-up.
 

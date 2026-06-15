@@ -86,6 +86,14 @@ public struct CacheServerSummary: Equatable, Sendable {
         self.mediaBaseURIs = mediaBaseURIs
         self.capabilities = capabilities
     }
+
+    public var supportsLibraryItemDelete: Bool {
+        capabilities.contains(CacheServerCapability.libraryItemDelete)
+    }
+}
+
+public enum CacheServerCapability {
+    public static let libraryItemDelete = "libraryItemDelete"
 }
 
 public struct CacheRoot: Identifiable, Equatable, Sendable {
