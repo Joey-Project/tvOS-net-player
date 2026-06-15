@@ -48,6 +48,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var canCancel: Bool {
+        guard !isSubmitting else {
+            return false
+        }
+
         guard let currentTask else {
             return false
         }
@@ -93,10 +97,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func submit(serverAddressText: String) async {
-        operationSequence += 1
-        activePlaybackTaskID = nil
-        let sequence = operationSequence
-
         guard canSubmit else {
             return
         }
@@ -113,6 +113,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             statusMessage = "Bilibili input is required."
             return
         }
+
+        operationSequence += 1
+        activePlaybackTaskID = nil
+        let sequence = operationSequence
 
         stopWatching()
         activeEndpoint = endpoint
@@ -164,6 +168,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard let currentTask else {
             return
         }
+        guard canCancel else {
+            return
+        }
 
         let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
         guard let endpoint else {
@@ -172,6 +179,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
+        let targetTaskID = currentTask.id
         isCancelling = true
         errorMessage = nil
         statusMessage = "Cancelling \(currentTask.bilibiliDisplayTitle)..."
@@ -183,7 +191,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 try await client.cancelTask(id: currentTask.id)
             }
 
-            guard sequence == operationSequence else {
+            guard sequence == operationSequence, self.currentTask?.id == targetTaskID else {
                 return
             }
 
@@ -246,11 +254,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
             let stream = await client.watchTask(id: taskID)
             do {
                 for try await task in stream {
-                    await self?.applyWatchedTask(task, sequence: sequence)
+                    self?.applyWatchedTask(task, sequence: sequence)
                 }
-                await self?.finishWatching(sequence: sequence, error: nil)
+                self?.finishWatching(sequence: sequence, error: nil)
             } catch {
-                await self?.finishWatching(sequence: sequence, error: error)
+                self?.finishWatching(sequence: sequence, error: error)
             }
         }
     }
@@ -273,7 +281,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             statusMessage = Self.statusMessage(for: task)
         }
         if task.isTerminalBilibiliTaskState {
-            isWatching = false
+            stopWatching()
         }
     }
 
