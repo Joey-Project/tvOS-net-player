@@ -167,7 +167,7 @@ scripts/test-cache-server.sh
 
 后续设置 required checks 时，建议至少 gate：
 
-- `CI / Apple platform build and tests`
+- `CI / tvOS build and tests`
 - `codex/review-gate`
 
 ## Codex Review Gate
