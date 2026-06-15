@@ -202,6 +202,8 @@ impl HlsCacheStore {
         if file_metadata.file_type().is_symlink()
             || !file_metadata.is_file()
             || file_metadata.len() != metadata.total_length
+            || metadata.initialization_length == 0
+            || metadata.initialization_length >= metadata.total_length
         {
             return None;
         }
@@ -1348,6 +1350,34 @@ mod tests {
                 .cached_resource("session-cache-key", "video.m4s")
                 .is_none()
         );
+        assert!(store.get_completed_library_item(&item_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_resource_rejects_invalid_initialization_length_metadata() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-invalid-init-range", &upstream_url);
+        let client = reqwest::Client::new();
+        let item_id = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("session resources should cache");
+        let metadata_path = store
+            .resource_metadata_path(&session.id, "video.m4s")
+            .expect("metadata path should be valid");
+        let mut metadata = cached_metadata_for_session(&session, "video.m4s");
+        metadata.initialization_length = metadata.total_length;
+        write_pretty_json(&metadata_path, &metadata);
+
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
+        assert!(store.get_completed_library_item(&item_id).is_none());
+
+        metadata.initialization_length = 0;
+        write_pretty_json(&metadata_path, &metadata);
+
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
         assert!(store.get_completed_library_item(&item_id).is_none());
     }
 

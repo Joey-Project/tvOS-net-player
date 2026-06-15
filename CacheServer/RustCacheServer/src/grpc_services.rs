@@ -1889,6 +1889,129 @@ mod tests {
         assert!(restored.hls_sessions.get(&creation.task.id).is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_completed_hls_task_fails_after_cache_scan_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1scan-stale", None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        creation.task.id
+                    ),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &metadata.hls_session)
+            .await
+            .expect("HLS resources should cache");
+        state
+            .tasks
+            .complete_playback_cached(
+                &creation.task.id,
+                HlsCacheStore::completed_library_item_id(&creation.task.id),
+            )
+            .expect("task should become completed");
+
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(&task_state_path).expect("task snapshot should be readable"),
+        )
+        .expect("task snapshot should be valid JSON");
+        let task = snapshot["tasks"]
+            .as_array_mut()
+            .expect("task snapshot should contain tasks")
+            .iter_mut()
+            .find(|task| task["id"].as_str() == Some(creation.task.id.as_str()))
+            .expect("completed task should be persisted");
+        task["library_item_id"] = serde_json::Value::String("bilibili.hls.stale".to_owned());
+        fs::write(
+            &task_state_path,
+            serde_json::to_vec_pretty(&snapshot).expect("task snapshot should serialize"),
+        )
+        .expect("task snapshot should be overwritten");
+
+        let hls_root = root_path.join(".tvos-net-player").join("hls");
+        let mut unreadable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should exist")
+            .permissions();
+        unreadable_permissions.set_mode(0o000);
+        fs::set_permissions(&hls_root, unreadable_permissions)
+            .expect("HLS cache root should become unreadable");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let preserved = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("stale completed task should remain readable until cache can be checked");
+        assert_eq!(TaskState::Completed, preserved.state());
+        assert_eq!("bilibili.hls.stale", preserved.library_item_id);
+
+        let mut readable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should remain present")
+            .permissions();
+        readable_permissions.set_mode(0o700);
+        fs::set_permissions(&hls_root, readable_permissions)
+            .expect("HLS cache root should become readable again");
+
+        let direct_master = crate::media::hls_master_playlist_get(
+            State(crate::media::MediaState::new(restored.clone())),
+            AxumPath(creation.task.id.clone()),
+        )
+        .await;
+        assert_eq!(StatusCode::NOT_FOUND, direct_master.status());
+        let failed = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("stale task should remain readable after failure");
+        assert_eq!(TaskState::Failed, failed.state());
+        assert!(failed.library_item_id.is_empty());
+        assert!(failed.playback_source.is_none());
+        assert!(failed.playback_session.is_none());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_none());
+    }
+
     #[tokio::test]
     async fn app_state_resumes_incomplete_hls_cache_finalization_after_restart() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;

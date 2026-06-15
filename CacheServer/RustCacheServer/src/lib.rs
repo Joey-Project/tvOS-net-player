@@ -308,10 +308,16 @@ impl AppState {
             return false;
         };
 
-        task.kind() == TaskKind::BilibiliProgressivePlayback
-            && task.state() == TaskState::Completed
-            && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
-            && self.ensure_completed_hls_session_registered(session_id)
+        if task.kind() != TaskKind::BilibiliProgressivePlayback
+            || task.state() != TaskState::Completed
+        {
+            return false;
+        }
+        if task.library_item_id != HlsCacheStore::completed_library_item_id(session_id) {
+            self.fail_completed_hls_task_after_cache_restore(session_id);
+            return false;
+        }
+        self.ensure_completed_hls_session_registered(session_id)
     }
 
     pub(crate) fn supports_completed_hls_cache_playback(&self) -> bool {
@@ -347,9 +353,14 @@ impl AppState {
                 true
             }
             TaskState::Completed => {
-                self.supports_completed_hls_cache_playback()
-                    && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
-                    && self.ensure_completed_hls_session_registered(session_id)
+                if !self.supports_completed_hls_cache_playback() {
+                    return false;
+                }
+                if task.library_item_id != HlsCacheStore::completed_library_item_id(session_id) {
+                    self.fail_completed_hls_task_after_cache_restore(session_id);
+                    return false;
+                }
+                self.ensure_completed_hls_session_registered(session_id)
             }
             _ => false,
         }
@@ -365,6 +376,19 @@ impl AppState {
         self.hls_sessions
             .insert(sanitized_completed_session(&session));
         true
+    }
+
+    fn fail_completed_hls_task_after_cache_restore(&self, session_id: &str) {
+        self.hls_sessions.remove(session_id);
+        if let Err(status) = self.tasks.fail_completed_playback_task_after_cache_restore(
+            session_id,
+            "Restored completed HLS cache item did not match the persisted playback task."
+                .to_owned(),
+        ) {
+            eprintln!(
+                "Failed to mark completed HLS playback task {session_id} failed after cache restore validation: {status}"
+            );
+        }
     }
 }
 

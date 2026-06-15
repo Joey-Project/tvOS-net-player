@@ -605,6 +605,45 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    pub fn fail_completed_playback_task_after_cache_restore(
+        &self,
+        id: &str,
+        message: String,
+    ) -> Result<Task, Status> {
+        let normalized_id = normalize_required_id(id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = {
+            let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
+                return Err(task_not_found());
+            };
+            if task.kind() != TaskKind::BilibiliProgressivePlayback {
+                return Err(Status::failed_precondition(
+                    "Task is not a Bilibili progressive playback task.",
+                ));
+            }
+            if task.state() != TaskState::Completed {
+                return Ok(task.clone());
+            }
+
+            let finished_at = current_timestamp();
+            task.state = TaskState::Failed.into();
+            task.message = message;
+            task.library_item_id.clear();
+            task.playback_source = None;
+            task.playback_session = None;
+            task.updated_at = Some(copy_timestamp(&finished_at));
+            task.finished_at = Some(finished_at);
+            task.clone()
+        };
+        let terminal_task = Self::terminal_task_locked(&inner, &task);
+        Self::clear_active_task_locked(&mut inner, &terminal_task);
+        let snapshot = self.persistence_snapshot_locked(&mut inner);
+        Self::publish_locked(&mut inner, task.clone());
+        drop(inner);
+        self.persist_snapshot(snapshot);
+        Ok(task)
+    }
+
     pub fn complete_task_cancelled(&self, id: &str, message: String) -> Result<Task, Status> {
         self.complete_task(id, TaskState::Cancelled, message, None, None)
     }
