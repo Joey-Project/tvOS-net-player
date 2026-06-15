@@ -83,6 +83,8 @@ BBDown adapter 相关配置：
 
 - `Cache:BilibiliWorkerEnabled`: 是否启动真实 worker。默认 `true`；测试或只想保留排队 control-plane 时可设为 `false`。
 - `Cache:BilibiliWorkerMaxConcurrentTasks`: worker 最大并发 task 数。默认 `1`。当前真实 BBDown adapter 会把有效并发限制为 `1`，避免并发写同一个 archive；更高并发等 BBDown archive 语义明确后再放开。
+- `Cache:TaskRetentionMaxTerminalTasks`: 持久化 task snapshot 里最多保留的普通 terminal task 数。默认 `200`；设为 `0` 可关闭数量限制。
+- `Cache:TaskRetentionTerminalAgeDays`: 持久化 task snapshot 里普通 terminal task 的最长保留天数。默认 `30`；设为 `0` 可关闭时间限制。
 - `Cache:BBDownOutputDir`: BBDown 输出目录，默认是 `Cache:RootPath/Bilibili`；当 worker 启用或显式配置该路径时，它必须位于 `Cache:RootPath` 内，不能包含 `..` parent components，且 root 内已经存在的输出路径组件不能是 symlink。
 - `Cache:BBDownArchivePath`: BBDown 下载 archive JSON。默认和 `Cache:TaskStatePath` 同目录，文件名为 `bbdown-archive.json`。
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。

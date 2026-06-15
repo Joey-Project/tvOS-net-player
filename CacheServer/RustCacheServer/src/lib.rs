@@ -94,10 +94,14 @@ impl AppState {
         let options = options.normalized_for_runtime();
         options.validate().expect("invalid cache server options");
         let task_state_path = options.task_state_path();
+        let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
         let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
-        let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path(task_state_path));
+        let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path_and_retention(
+            task_state_path,
+            task_retention_policy,
+        ));
         let hls_sessions = HlsPlaybackRegistry::default();
         let hls_cache = HlsCacheStore::new(library.root_path());
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()

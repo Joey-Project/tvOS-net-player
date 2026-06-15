@@ -18,6 +18,7 @@
 - BBDown 0.3.0 and product UX roadmap：`docs/project_journal/2026/06/2026-06-15-bbdown-030-product-roadmap-c8f4d2.md`
 - Bilibili task UI workstream：`docs/project_journal/2026/06/2026-06-15-bilibili-task-ui-a6b9e4.md`
 - Cache library pagination/search workstream：`docs/project_journal/2026/06/2026-06-15-cache-library-pagination-search-d2f8a1.md`
+- Task retention cleanup workstream：`docs/project_journal/2026/06/2026-06-15-task-retention-cleanup-e7c2b5.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
