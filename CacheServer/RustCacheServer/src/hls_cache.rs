@@ -82,6 +82,12 @@ impl HlsCacheStore {
         let mut sessions = Vec::new();
         for entry in entries.flatten() {
             let session_dir = entry.path();
+            let Some(directory_session_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_cache_id(&directory_session_id).is_err() {
+                continue;
+            }
             if self.reject_cache_path_symlink(&session_dir).is_err() {
                 continue;
             }
@@ -93,6 +99,9 @@ impl HlsCacheStore {
                 continue;
             };
             if persisted.schema_version != HLS_CACHE_SCHEMA_VERSION {
+                continue;
+            }
+            if persisted.id != directory_session_id {
                 continue;
             }
             if let Ok(session) = HlsPlaybackSession::try_from(persisted) {
@@ -1111,6 +1120,27 @@ mod tests {
         let sessions = store.load_sessions().expect("session manifest should load");
 
         assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn load_sessions_skips_manifest_with_mismatched_directory_id() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-1", "https://example.test/video.m4s");
+        let mismatched_dir = temp
+            .path()
+            .join(".tvos-net-player")
+            .join("hls")
+            .join("orphan");
+        std::fs::create_dir_all(&mismatched_dir).expect("session dir should be created");
+        write_pretty_json(
+            &mismatched_dir.join("session.json"),
+            &PersistedHlsSession::from(session),
+        );
+
+        let sessions = store.load_sessions().expect("cache scan should succeed");
+
+        assert!(sessions.is_empty());
     }
 
     #[test]
