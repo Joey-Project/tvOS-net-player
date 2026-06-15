@@ -53,6 +53,25 @@ struct ContentView: View {
                 .disabled(!cacheModel.canRefresh)
             }
 
+            HStack(spacing: 8) {
+                TextField("Search cached videos", text: $cacheModel.searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await cacheModel.refresh()
+                        }
+                    }
+
+                Button {
+                    Task {
+                        await cacheModel.refresh()
+                    }
+                } label: {
+                    Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
+                }
+                .disabled(!cacheModel.canRefresh)
+            }
+
             if let errorMessage = cacheModel.errorMessage {
                 Text(errorMessage)
                     .font(.callout)
@@ -63,19 +82,45 @@ struct ContentView: View {
             Divider()
 
             if cacheModel.items.isEmpty {
-                ContentUnavailableView("No Cached Videos", systemImage: "externaldrive")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 8) {
+                    ContentUnavailableView("No Cached Videos", systemImage: "externaldrive")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    cacheLoadMoreButton
+                }
             } else {
-                List(selection: $selectedItemID) {
-                    ForEach(cacheModel.items) { item in
-                        CacheLibraryRow(item: item)
-                            .tag(item.id)
+                VStack(spacing: 8) {
+                    List(selection: $selectedItemID) {
+                        ForEach(cacheModel.items) { item in
+                            CacheLibraryRow(item: item)
+                                .tag(item.id)
+                        }
                     }
+
+                    cacheLoadMoreButton
                 }
             }
         }
         .padding(16)
         .navigationTitle(cacheModel.serverName)
+    }
+
+    @ViewBuilder
+    private var cacheLoadMoreButton: some View {
+        if cacheModel.hasMoreItems {
+            Button {
+                Task {
+                    await cacheModel.loadMore()
+                }
+            } label: {
+                Label(
+                    cacheModel.isLoadingMore ? "Loading More" : "Load More",
+                    systemImage: "chevron.down.circle"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .disabled(!cacheModel.canLoadMore)
+        }
     }
 
     private var detailPane: some View {

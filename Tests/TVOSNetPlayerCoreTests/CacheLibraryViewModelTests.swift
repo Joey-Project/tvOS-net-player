@@ -546,7 +546,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
-    func testRefreshRequestsPreviewPageSize() async {
+    func testRefreshRequestsFirstLibraryPage() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
             items: [.fixture(id: "item-a", title: "Server A item")],
@@ -561,7 +561,437 @@ final class CacheLibraryViewModelTests: XCTestCase {
         await model.refresh()
 
         let requestedPageSizes = await client.requestedLibraryPageSizes
-        XCTAssertEqual(requestedPageSizes, [200])
+        let requestedPageTokens = await client.requestedLibraryPageTokens
+        let requestedSearchTexts = await client.requestedLibrarySearchTexts
+        XCTAssertEqual(requestedPageSizes, [50])
+        XCTAssertEqual(requestedPageTokens, [""])
+        XCTAssertEqual(requestedSearchTexts, [nil])
+    }
+
+    @MainActor
+    func testRefreshAppliesSearchTextToFirstLibraryPage() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        model.searchText = "  ocean clip  "
+        await model.refresh()
+
+        let requestedSearchTexts = await client.requestedLibrarySearchTexts
+        XCTAssertEqual(requestedSearchTexts, ["ocean clip"])
+        XCTAssertEqual(model.activeSearchText, "ocean clip")
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) matching \"ocean clip\" from Server A.")
+    }
+
+    @MainActor
+    func testLoadMoreAppendsNextLibraryPage() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-a", title: "Server A item")],
+                    nextPageToken: "1"
+                ),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        model.searchText = "clip"
+        await model.refresh()
+
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertTrue(model.hasMoreItems)
+        XCTAssertTrue(model.canLoadMore)
+        XCTAssertEqual(
+            model.statusMessage, "Loaded 1 cached item(s) matching \"clip\" from Server A. More items available.")
+
+        await model.loadMore()
+
+        let requestedPageTokens = await client.requestedLibraryPageTokens
+        let requestedSearchTexts = await client.requestedLibrarySearchTexts
+        XCTAssertEqual(requestedPageTokens, ["", "1"])
+        XCTAssertEqual(requestedSearchTexts, ["clip", "clip"])
+        XCTAssertEqual(model.items.map(\.id), ["item-a", "item-b"])
+        XCTAssertFalse(model.hasMoreItems)
+        XCTAssertFalse(model.canLoadMore)
+        XCTAssertEqual(model.statusMessage, "Loaded 2 cached item(s) matching \"clip\" from Server A.")
+    }
+
+    @MainActor
+    func testLoadMoreAppendsAfterEmptyPageWithNextPageToken() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [],
+                    nextPageToken: "1"
+                ),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertTrue(model.hasMoreItems)
+        XCTAssertTrue(model.canLoadMore)
+        XCTAssertEqual(model.statusMessage, "Loaded 0 cached item(s) from Server A. More items available.")
+
+        await model.loadMore()
+
+        let requestedPageTokens = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokens, ["", "1"])
+        XCTAssertEqual(model.items.map(\.id), ["item-b"])
+        XCTAssertFalse(model.hasMoreItems)
+        XCTAssertFalse(model.canLoadMore)
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) from Server A.")
+    }
+
+    @MainActor
+    func testLoadMoreRejectsRepeatedNextPageToken() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-a", title: "Server A item")],
+                    nextPageToken: "1"
+                ),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: "1"
+                ),
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        await model.loadMore()
+
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertFalse(model.hasMoreItems)
+        XCTAssertFalse(model.canLoadMore)
+        XCTAssertEqual(model.errorMessage, "Cache server returned a repeated library page token.")
+        XCTAssertEqual(model.statusMessage, "Could not load more cached videos.")
+    }
+
+    @MainActor
+    func testRefreshSupersedesLoadMoreAndClearsLoadingMoreState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-a", title: "Server A item")],
+                    nextPageToken: "1"
+                ),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+            ],
+            suspendedLibraryPageTokens: ["1"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertTrue(model.canLoadMore)
+
+        let loadMoreTask = Task {
+            await model.loadMore()
+        }
+        await client.waitForLibraryPageRequest(pageToken: "1")
+        XCTAssertTrue(model.isLoading)
+        XCTAssertTrue(model.isLoadingMore)
+
+        await model.refresh()
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertFalse(model.isLoadingMore)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+
+        await client.releaseLibraryPageRequest(pageToken: "1")
+        await loadMoreTask.value
+
+        let requestedPageTokens = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokens, ["", "1", ""])
+        XCTAssertFalse(model.isLoading)
+        XCTAssertFalse(model.isLoadingMore)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+    }
+
+    @MainActor
+    func testStaleLoadMoreDoesNotClearNewLoadMoreState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByRequest: [
+                LibraryPageRequestKey(pageToken: "", searchText: nil): CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-a", title: "Server A item")],
+                    nextPageToken: "1"
+                ),
+                LibraryPageRequestKey(pageToken: "1", searchText: nil): CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+                LibraryPageRequestKey(pageToken: "", searchText: "new query"): CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-c", title: "Server C item")],
+                    nextPageToken: "2"
+                ),
+                LibraryPageRequestKey(pageToken: "2", searchText: "new query"): CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-d", title: "Server D item")],
+                    nextPageToken: ""
+                ),
+            ],
+            suspendedLibraryPageTokens: ["1", "2"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let staleLoadMore = Task {
+            await model.loadMore()
+        }
+        await client.waitForLibraryPageRequest(pageToken: "1")
+        XCTAssertTrue(model.isLoadingMore)
+
+        model.searchText = "new query"
+        await model.refresh()
+        XCTAssertEqual(model.items.map(\.id), ["item-c"])
+        XCTAssertTrue(model.canLoadMore)
+        XCTAssertFalse(model.isLoadingMore)
+
+        let currentLoadMore = Task {
+            await model.loadMore()
+        }
+        await client.waitForLibraryPageRequest(pageToken: "2")
+        XCTAssertTrue(model.isLoadingMore)
+
+        await client.releaseLibraryPageRequest(pageToken: "1")
+        await staleLoadMore.value
+
+        XCTAssertTrue(model.isLoading)
+        XCTAssertTrue(model.isLoadingMore)
+        XCTAssertEqual(model.items.map(\.id), ["item-c"])
+
+        await client.releaseLibraryPageRequest(pageToken: "2")
+        await currentLoadMore.value
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertFalse(model.isLoadingMore)
+        XCTAssertEqual(model.items.map(\.id), ["item-c", "item-d"])
+    }
+
+    @MainActor
+    func testClearPlaybackStatusDoesNotEnableConcurrentLoadMore() async {
+        let item = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server A item",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(
+                itemID: "item-a",
+                uri: "http://mac-mini.local:8080/media/item-a/original"
+            ),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [item],
+                    nextPageToken: "1"
+                ),
+                "1": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-b", title: "Server B item")],
+                    nextPageToken: ""
+                ),
+            ],
+            suspendedLibraryPageTokens: ["1"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let playbackURL = await model.playbackURL(for: item)
+        XCTAssertNotNil(playbackURL)
+        model.finishPreparedPlayback(for: item, didStartPlayback: true)
+
+        let loadMore = Task {
+            await model.loadMore()
+        }
+        await client.waitForLibraryPageRequest(pageToken: "1")
+        XCTAssertTrue(model.isLoadingMore)
+        XCTAssertFalse(model.canLoadMore)
+
+        model.clearPlaybackStatus()
+
+        XCTAssertTrue(model.isLoading)
+        XCTAssertTrue(model.isLoadingMore)
+        XCTAssertFalse(model.canLoadMore)
+        XCTAssertEqual(model.statusMessage, "Loading more cached videos...")
+        await model.loadMore()
+
+        let requestedPageTokensBeforeRelease = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokensBeforeRelease, ["", "1"])
+
+        await client.releaseLibraryPageRequest(pageToken: "1")
+        await loadMore.value
+
+        let requestedPageTokensAfterRelease = await client.requestedLibraryPageTokens
+        XCTAssertEqual(requestedPageTokensAfterRelease, ["", "1"])
+        XCTAssertFalse(model.isLoading)
+        XCTAssertFalse(model.isLoadingMore)
+        XCTAssertEqual(model.items.map(\.id), ["item-a", "item-b"])
+    }
+
+    @MainActor
+    func testChangingSearchTextMarksLoadedResultsPendingAndDisablesLoadMore() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            libraryPagesByToken: [
+                "": CacheLibraryItemsPage(
+                    items: [.fixture(id: "item-a", title: "Server A item")],
+                    nextPageToken: "1"
+                )
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        XCTAssertTrue(model.hasMoreItems)
+
+        model.searchText = "new query"
+
+        XCTAssertTrue(model.hasPendingSearch)
+        XCTAssertFalse(model.hasMoreItems)
+        XCTAssertFalse(model.canLoadMore)
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.statusMessage, "Search cache library to update results.")
+    }
+
+    @MainActor
+    func testSearchChangeDuringInitialRefreshClearsLoadingState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            suspendServerInfoUntilReleased: true
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let initialRefresh = Task {
+            await model.refresh()
+        }
+        await client.waitForServerInfoRequest()
+        XCTAssertTrue(model.isLoading)
+
+        model.searchText = "later query"
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.statusMessage, "Refresh cache server to load videos.")
+
+        await client.releaseServerInfoRequests()
+        await initialRefresh.value
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.statusMessage, "Refresh cache server to load videos.")
+    }
+
+    @MainActor
+    func testWhitespaceOnlySearchEditDoesNotCancelInFlightRefresh() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture(),
+            suspendedServerInfoCallCounts: [2]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        model.searchText = "clip"
+        await model.refresh()
+        XCTAssertFalse(model.hasPendingSearch)
+        XCTAssertEqual(model.activeSearchText, "clip")
+
+        let reload = Task {
+            await model.refresh()
+        }
+        await client.waitForServerInfoRequest(minimumCallCount: 2)
+        XCTAssertTrue(model.isLoading)
+
+        model.searchText = "  clip  "
+
+        XCTAssertTrue(model.isLoading)
+        XCTAssertFalse(model.hasPendingSearch)
+
+        await client.releaseServerInfoRequest(callCount: 2)
+        await reload.value
+
+        let requestedSearchTexts = await client.requestedLibrarySearchTexts
+        XCTAssertEqual(requestedSearchTexts, ["clip", "clip"])
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.activeSearchText, "clip")
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
     }
 
     @MainActor
@@ -749,24 +1179,41 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 }
 
+private struct LibraryPageRequestKey: Hashable {
+    let pageToken: String
+    let searchText: String?
+}
+
 private actor FakeCacheControlClient: CacheControlClient {
     let serverInfo: CacheServerSummary
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
+    let libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage]
+    let libraryPagesByToken: [String: CacheLibraryItemsPage]
     let getServerInfoDelayNanoseconds: UInt64
     let getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64]
     let playbackSourcesByItemID: [String: CachePlaybackSource]
     let getServerInfoError: FakeCacheError?
     let getServerInfoIgnoresCancellation: Bool
     let suspendServerInfoUntilReleased: Bool
+    let suspendedServerInfoCallCounts: Set<Int>
+    let suspendedLibraryPageTokens: Set<String>
     let suspendedPlaybackItemIDs: Set<String>
 
     private(set) var getServerInfoCallCount = 0
     private(set) var requestedLibraryPageSizes: [Int] = []
+    private(set) var requestedLibraryPageTokens: [String] = []
+    private(set) var requestedLibrarySearchTexts: [String?] = []
     private(set) var requestedPlayback: (itemID: String, variantID: String)?
     private var getServerInfoWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var serverInfoReleaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var serverInfoCallReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var serverInfoRequestsReleased = false
+    private var releasedServerInfoCallCounts: Set<Int> = []
+    private var libraryPageWaiters: [(pageToken: String, continuation: CheckedContinuation<Void, Never>)] = []
+    private var libraryPageReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var requestedLibraryPageTokenSet: Set<String> = []
+    private var releasedLibraryPageTokens: Set<String> = []
     private var playbackStartedItemIDs: [String] = []
     private var playbackWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
     private var playbackReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
@@ -776,31 +1223,43 @@ private actor FakeCacheControlClient: CacheControlClient {
         serverInfo: CacheServerSummary,
         items: [CacheLibraryItem],
         playbackSource: CachePlaybackSource,
+        libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage] = [:],
+        libraryPagesByToken: [String: CacheLibraryItemsPage] = [:],
         getServerInfoDelayNanoseconds: UInt64 = 0,
         playbackSourcesByItemID: [String: CachePlaybackSource] = [:],
         getPlaybackSourceDelayNanosecondsByItemID: [String: UInt64] = [:],
         getServerInfoError: FakeCacheError? = nil,
         getServerInfoIgnoresCancellation: Bool = false,
         suspendServerInfoUntilReleased: Bool = false,
+        suspendedServerInfoCallCounts: Set<Int> = [],
+        suspendedLibraryPageTokens: Set<String> = [],
         suspendedPlaybackItemIDs: Set<String> = []
     ) {
         self.serverInfo = serverInfo
         self.items = items
         self.playbackSource = playbackSource
+        self.libraryPagesByRequest = libraryPagesByRequest
+        self.libraryPagesByToken = libraryPagesByToken
         self.getServerInfoDelayNanoseconds = getServerInfoDelayNanoseconds
         self.playbackSourcesByItemID = playbackSourcesByItemID
         self.getPlaybackSourceDelayNanosecondsByItemID = getPlaybackSourceDelayNanosecondsByItemID
         self.getServerInfoError = getServerInfoError
         self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
         self.suspendServerInfoUntilReleased = suspendServerInfoUntilReleased
+        self.suspendedServerInfoCallCounts = suspendedServerInfoCallCounts
+        self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
         self.suspendedPlaybackItemIDs = suspendedPlaybackItemIDs
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
         getServerInfoCallCount += 1
+        let callCount = getServerInfoCallCount
         notifyServerInfoWaiters()
         if suspendServerInfoUntilReleased {
             await waitForServerInfoRelease()
+        }
+        if suspendedServerInfoCallCounts.contains(callCount) {
+            await waitForServerInfoRelease(callCount: callCount)
         }
         if getServerInfoDelayNanoseconds > 0 {
             if getServerInfoIgnoresCancellation {
@@ -820,7 +1279,24 @@ private actor FakeCacheControlClient: CacheControlClient {
         pageSize: Int,
         searchText: String?
     ) async throws -> CacheLibraryItemsPage {
+        requestedLibraryPageTokens.append(pageToken)
+        requestedLibraryPageTokenSet.insert(pageToken)
         requestedLibraryPageSizes.append(pageSize)
+        requestedLibrarySearchTexts.append(searchText)
+        notifyLibraryPageWaiters(for: pageToken)
+        if suspendedLibraryPageTokens.contains(pageToken) {
+            await waitForLibraryPageRelease(pageToken: pageToken)
+        }
+
+        let requestKey = LibraryPageRequestKey(pageToken: pageToken, searchText: searchText)
+        if let page = libraryPagesByRequest[requestKey] {
+            return page
+        }
+
+        if let page = libraryPagesByToken[pageToken] {
+            return page
+        }
+
         return CacheLibraryItemsPage(items: items, nextPageToken: "")
     }
 
@@ -876,6 +1352,28 @@ private actor FakeCacheControlClient: CacheControlClient {
         continuations.forEach { $0.resume() }
     }
 
+    func releaseServerInfoRequest(callCount: Int) {
+        releasedServerInfoCallCounts.insert(callCount)
+        let continuations = serverInfoCallReleaseContinuations.removeValue(forKey: callCount) ?? []
+        continuations.forEach { $0.resume() }
+    }
+
+    func waitForLibraryPageRequest(pageToken: String) async {
+        guard !requestedLibraryPageTokenSet.contains(pageToken) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            libraryPageWaiters.append((pageToken, continuation))
+        }
+    }
+
+    func releaseLibraryPageRequest(pageToken: String) {
+        releasedLibraryPageTokens.insert(pageToken)
+        let continuations = libraryPageReleaseContinuations.removeValue(forKey: pageToken) ?? []
+        continuations.forEach { $0.resume() }
+    }
+
     func waitForPlaybackSourceRequest(itemID: String) async {
         guard !playbackStartedItemIDs.contains(itemID) else {
             return
@@ -912,6 +1410,39 @@ private actor FakeCacheControlClient: CacheControlClient {
 
         await withCheckedContinuation { continuation in
             serverInfoReleaseContinuations.append(continuation)
+        }
+    }
+
+    private func waitForServerInfoRelease(callCount: Int) async {
+        guard !releasedServerInfoCallCounts.contains(callCount) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            serverInfoCallReleaseContinuations[callCount, default: []].append(continuation)
+        }
+    }
+
+    private func notifyLibraryPageWaiters(for pageToken: String) {
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        libraryPageWaiters.removeAll { waiter in
+            guard waiter.pageToken == pageToken else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
+    }
+
+    private func waitForLibraryPageRelease(pageToken: String) async {
+        guard !releasedLibraryPageTokens.contains(pageToken) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            libraryPageReleaseContinuations[pageToken, default: []].append(continuation)
         }
     }
 
