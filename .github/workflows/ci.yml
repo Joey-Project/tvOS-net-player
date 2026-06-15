@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   apple-platforms:
-    name: Apple platform build and tests
+    name: tvOS build and tests
     runs-on: macos-26
     timeout-minutes: 30
     steps:
