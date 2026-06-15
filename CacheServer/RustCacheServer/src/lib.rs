@@ -65,6 +65,7 @@ pub struct AppState {
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) completed_hls_cache_playback_supported: bool,
 }
 
 impl AppState {
@@ -113,8 +114,12 @@ impl AppState {
             .iter()
             .map(|session| session.id.clone())
             .collect();
-        let restorable_completed_session_ids =
-            hls_cache.completed_session_ids(&restored_hls_sessions);
+        let completed_hls_cache_playback_supported = library.supports_http_range_playback();
+        let restorable_completed_session_ids = if completed_hls_cache_playback_supported {
+            hls_cache.completed_session_ids(&restored_hls_sessions)
+        } else {
+            HashSet::new()
+        };
         if hls_cache_scan_succeeded {
             let _failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
                 &restorable_playback_session_ids,
@@ -164,6 +169,7 @@ impl AppState {
             playback_planner,
             playback_planning_permits,
             hls_cache_finalization_permits,
+            completed_hls_cache_playback_supported,
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
@@ -177,6 +183,9 @@ impl AppState {
         restored_sessions: &[crate::hls::HlsPlaybackSession],
         completed_session_ids: &HashSet<String>,
     ) {
+        if !self.supports_completed_hls_cache_playback() {
+            return;
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -244,6 +253,9 @@ impl AppState {
     }
 
     pub(crate) fn list_completed_hls_library_items(&self) -> Vec<LibraryItem> {
+        if !self.supports_completed_hls_cache_playback() {
+            return Vec::new();
+        }
         self.hls_cache
             .list_completed_library_items()
             .into_iter()
@@ -252,6 +264,9 @@ impl AppState {
     }
 
     pub(crate) fn get_completed_hls_library_item(&self, item_id: &str) -> Option<LibraryItem> {
+        if !self.supports_completed_hls_cache_playback() {
+            return None;
+        }
         let session_id = HlsCacheStore::session_id_from_library_item_id(item_id)?;
         if !self.completed_hls_task_is_authorized(&session_id) {
             return None;
@@ -265,6 +280,9 @@ impl AppState {
         variant_id: &str,
         uri: String,
     ) -> Option<PlaybackSource> {
+        if !self.supports_completed_hls_cache_playback() {
+            return None;
+        }
         let session_id = HlsCacheStore::session_id_from_library_item_id(item_id)?;
         if !self.completed_hls_task_is_authorized(&session_id) {
             return None;
@@ -274,6 +292,9 @@ impl AppState {
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
+        if !self.supports_completed_hls_cache_playback() {
+            return false;
+        }
         let Ok(task) = self.tasks.get_task(session_id) else {
             return false;
         };
@@ -281,6 +302,10 @@ impl AppState {
         task.kind() == TaskKind::BilibiliProgressivePlayback
             && task.state() == TaskState::Completed
             && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+    }
+
+    pub(crate) fn supports_completed_hls_cache_playback(&self) -> bool {
+        self.completed_hls_cache_playback_supported
     }
 }
 

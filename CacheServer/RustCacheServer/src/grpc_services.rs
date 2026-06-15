@@ -643,6 +643,9 @@ pub(crate) async fn run_hls_cache_finalization(
     session: HlsPlaybackSession,
     failure_mode: HlsCacheFinalizationFailureMode,
 ) {
+    if !state.supports_completed_hls_cache_playback() {
+        return;
+    }
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
@@ -866,8 +869,9 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliPlaybackOptions, CreateBilibiliPlaybackTaskRequest, GetPlaybackSourceRequest,
-            LibraryFilter, LibrarySource, ListLibraryItemsRequest, TaskKind, TaskState,
+            BilibiliPlaybackOptions, CreateBilibiliPlaybackTaskRequest, GetLibraryItemRequest,
+            GetPlaybackSourceRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
+            TaskKind, TaskState,
         },
     };
     use axum::{
@@ -1423,6 +1427,150 @@ mod tests {
                 .is_none()
         );
         assert!(hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn completed_hls_items_are_hidden_when_cache_playback_is_unsupported() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
+        let mut state = AppState::new_with_playback_planner(options, Arc::new(planner));
+        let task_service = TaskGrpcService::new(state.clone());
+
+        let created = task_service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1offline".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        planner_started
+            .await
+            .expect("background playback planner should start");
+        plan_sender
+            .send(Ok(sample_playback_plan_with_video_url(&upstream_url)))
+            .expect("test should send playback plan");
+
+        let completed = wait_for_task_state(&state.tasks, &created.id, TaskState::Completed).await;
+        let expected_item_id = format!("bilibili.hls.{}", completed.id);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+
+        state.completed_hls_cache_playback_supported = false;
+        let library_service = LibraryGrpcService::new(state.clone());
+
+        let library = library_service
+            .list_library_items(Request::new(ListLibraryItemsRequest {
+                page_token: String::new(),
+                page_size: 50,
+                filter: Some(LibraryFilter {
+                    sources: vec![LibrarySource::Bilibili.into()],
+                    search_text: String::new(),
+                }),
+            }))
+            .await
+            .expect("library list should succeed")
+            .into_inner();
+        assert!(library.items.is_empty());
+        assert!(
+            state
+                .get_completed_hls_library_item(&expected_item_id)
+                .is_none()
+        );
+        assert!(
+            state
+                .create_completed_hls_playback_source(
+                    &expected_item_id,
+                    "h264",
+                    "http://media.example.test:8080/hls/blocked/master.m3u8".to_owned(),
+                )
+                .is_none()
+        );
+
+        let item_error = library_service
+            .get_library_item(Request::new(GetLibraryItemRequest {
+                id: expected_item_id.clone(),
+            }))
+            .await
+            .expect_err("completed HLS item should be hidden");
+        assert_eq!(tonic::Code::NotFound, item_error.code());
+
+        let source_error = library_service
+            .get_playback_source(Request::new(GetPlaybackSourceRequest {
+                item_id: expected_item_id,
+                variant_id: "h264".to_owned(),
+            }))
+            .await
+            .expect_err("completed HLS playback source should be hidden");
+        assert_eq!(tonic::Code::NotFound, source_error.code());
+    }
+
+    #[tokio::test]
+    async fn playback_task_stays_playable_when_cache_playback_is_unsupported() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
+        let mut state = AppState::new_with_playback_planner(options, Arc::new(planner));
+        state.completed_hls_cache_playback_supported = false;
+        let task_service = TaskGrpcService::new(state.clone());
+
+        let created = task_service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1runtime".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        planner_started
+            .await
+            .expect("background playback planner should start");
+        plan_sender
+            .send(Ok(sample_playback_plan_with_video_url(&upstream_url)))
+            .expect("test should send playback plan");
+
+        let playable = wait_for_task_state(&state.tasks, &created.id, TaskState::Playable).await;
+        assert!(playable.playback_source.is_some());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let still_playable = state
+            .tasks
+            .get_task(&created.id)
+            .expect("playback task should remain readable");
+        assert_eq!(TaskState::Playable, still_playable.state());
+        assert!(still_playable.library_item_id.is_empty());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&format!("bilibili.hls.{}", created.id))
+                .is_none()
+        );
     }
 
     #[tokio::test]
