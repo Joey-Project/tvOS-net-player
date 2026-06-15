@@ -115,11 +115,20 @@ impl AppState {
             .map(|session| session.id.clone())
             .collect();
         let completed_hls_cache_playback_supported = library.supports_http_range_playback();
-        let restorable_completed_session_ids = if completed_hls_cache_playback_supported {
+        let completed_cache_session_ids = if completed_hls_cache_playback_supported {
             hls_cache.completed_session_ids(&restored_hls_sessions)
         } else {
             HashSet::new()
         };
+        let restorable_completed_session_ids = completed_cache_session_ids
+            .iter()
+            .filter(|session_id| {
+                tasks.get_task(session_id).is_ok_and(|task| {
+                    task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+                })
+            })
+            .cloned()
+            .collect();
         if hls_cache_scan_succeeded {
             let _failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
                 &restorable_playback_session_ids,
@@ -173,7 +182,7 @@ impl AppState {
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
-            &restorable_completed_session_ids,
+            &completed_cache_session_ids,
         );
         state
     }
@@ -302,10 +311,23 @@ impl AppState {
         task.kind() == TaskKind::BilibiliProgressivePlayback
             && task.state() == TaskState::Completed
             && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+            && self.ensure_completed_hls_session_registered(session_id)
     }
 
     pub(crate) fn supports_completed_hls_cache_playback(&self) -> bool {
         self.completed_hls_cache_playback_supported
+    }
+
+    fn ensure_completed_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_sessions.get(session_id).is_some() {
+            return true;
+        }
+        let Some(session) = self.hls_cache.completed_session(session_id) else {
+            return false;
+        };
+        self.hls_sessions
+            .insert(sanitized_completed_session(&session));
+        true
     }
 }
 

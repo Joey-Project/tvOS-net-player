@@ -150,6 +150,11 @@ impl HlsCacheStore {
         self.completed_library_item(&session)
     }
 
+    pub(crate) fn completed_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
+        let session = self.load_session(session_id)?;
+        self.session_is_complete(&session).then_some(session)
+    }
+
     pub(crate) fn create_playback_source(
         &self,
         item_id: &str,
