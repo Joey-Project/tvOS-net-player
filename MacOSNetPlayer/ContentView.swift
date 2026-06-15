@@ -6,6 +6,7 @@ import TVOSNetPlayerCore
 struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
+    @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
 
     var body: some View {
@@ -90,7 +91,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text("\(model.statusMessage) \(cacheModel.statusMessage)")
+                Text("\(model.statusMessage) \(cacheModel.statusMessage) \(bilibiliModel.statusMessage)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -98,6 +99,7 @@ struct ContentView: View {
             }
 
             manualStreamControls
+            bilibiliControls
             selectedCacheItemControls
             playerSurface
         }
@@ -137,6 +139,98 @@ struct ContentView: View {
             .padding(.top, 4)
         } label: {
             Label("Stream URL", systemImage: "link")
+        }
+    }
+
+    private var bilibiliControls: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                        }
+                    }
+
+                HStack(spacing: 10) {
+                    TextField("Quality", text: $bilibiliModel.qualityPreference)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+
+                    TextField("Codec", text: $bilibiliModel.encodingPreference)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+
+                    Spacer()
+                }
+
+                if let errorMessage = bilibiliModel.errorMessage {
+                    Text(errorMessage)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                }
+
+                if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView(value: bilibiliModel.progress)
+                        Text(bilibiliModel.statusMessage)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                        }
+                    } label: {
+                        Label(bilibiliModel.isSubmitting ? "Submitting" : "Submit", systemImage: "plus.circle.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!bilibiliModel.canSubmit)
+
+                    Button {
+                        Task {
+                            await playBilibiliTask()
+                        }
+                    } label: {
+                        Label("Play", systemImage: "play.fill")
+                    }
+                    .disabled(!bilibiliModel.canPlay)
+
+                    Button {
+                        Task {
+                            await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
+                        }
+                    } label: {
+                        Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
+                    }
+                    .disabled(!bilibiliModel.canCancel)
+
+                    Button {
+                        Task {
+                            await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
+                        }
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!bilibiliModel.canRetry)
+
+                    Button {
+                        bilibiliModel.clearTask()
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .disabled(bilibiliModel.currentTask == nil && bilibiliModel.errorMessage == nil)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Bilibili", systemImage: "play.tv")
         }
     }
 
@@ -194,21 +288,39 @@ struct ContentView: View {
             streamURLText: url.absoluteString,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
+        bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func playBilibiliTask() async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let url = bilibiliModel.playableURL else {
+            return
+        }
+
+        cacheModel.clearPlaybackStatus()
+        let didStartPlayback = model.loadTransient(
+            streamURLText: url.absoluteString,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
     }
 
     private func loadManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.load()
     }
 
     private func stopManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.stop()
     }
 
     private func clearManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.clear()
     }
 

@@ -16,6 +16,7 @@
 - BBDown Rust adapter workstream：`docs/project_journal/2026/06/2026-06-09-bbdown-rust-adapter-b4e2c8.md`
 - HLS progressive cache workstream：`docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - BBDown 0.3.0 and product UX roadmap：`docs/project_journal/2026/06/2026-06-15-bbdown-030-product-roadmap-c8f4d2.md`
+- Bilibili task UI workstream：`docs/project_journal/2026/06/2026-06-15-bilibili-task-ui-a6b9e4.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
