@@ -2,9 +2,14 @@ use std::{
     env, fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use url::Url;
+
+use crate::task_registry::TaskRetentionPolicy;
+
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheServerOptions {
@@ -15,6 +20,8 @@ pub struct CacheServerOptions {
     pub media_listen_url: String,
     pub public_media_base_uri: Option<String>,
     pub task_state_path: PathBuf,
+    pub task_retention_max_terminal_tasks: usize,
+    pub task_retention_terminal_age_days: u64,
     pub allowed_extensions: Vec<String>,
     pub bilibili_worker_enabled: bool,
     pub bilibili_worker_max_concurrent_tasks: usize,
@@ -35,6 +42,8 @@ impl Default for CacheServerOptions {
             media_listen_url: "http://localhost:8080".to_owned(),
             public_media_base_uri: None,
             task_state_path: state_path.join("tasks.json"),
+            task_retention_max_terminal_tasks: 200,
+            task_retention_terminal_age_days: 30,
             allowed_extensions: vec![".mp4".to_owned(), ".m4v".to_owned(), ".mov".to_owned()],
             bilibili_worker_enabled: true,
             bilibili_worker_max_concurrent_tasks: 1,
@@ -140,6 +149,19 @@ impl CacheServerOptions {
         self.task_state_path.clone()
     }
 
+    pub fn task_retention_policy(&self) -> TaskRetentionPolicy {
+        let max_terminal_tasks = (self.task_retention_max_terminal_tasks > 0)
+            .then_some(self.task_retention_max_terminal_tasks);
+        let max_terminal_task_age = (self.task_retention_terminal_age_days > 0).then(|| {
+            Duration::from_secs(
+                self.task_retention_terminal_age_days
+                    .saturating_mul(SECONDS_PER_DAY),
+            )
+        });
+
+        TaskRetentionPolicy::new(max_terminal_tasks, max_terminal_task_age)
+    }
+
     pub fn normalized_root_path(&self) -> PathBuf {
         normalize_existing_path_prefix(&self.root_path)
     }
@@ -173,6 +195,20 @@ impl CacheServerOptions {
             "Cache:MediaListenUrl" => self.media_listen_url = value,
             "Cache:PublicMediaBaseUri" => self.public_media_base_uri = Some(value),
             "Cache:TaskStatePath" => self.task_state_path = PathBuf::from(value),
+            "Cache:TaskRetentionMaxTerminalTasks" => {
+                self.task_retention_max_terminal_tasks = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:TaskRetentionMaxTerminalTasks: {value}"
+                    ))
+                })?;
+            }
+            "Cache:TaskRetentionTerminalAgeDays" => {
+                self.task_retention_terminal_age_days = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:TaskRetentionTerminalAgeDays: {value}"
+                    ))
+                })?;
+            }
             "Cache:AllowedExtensions" => {
                 self.allowed_extensions = value
                     .split(',')
@@ -417,6 +453,10 @@ mod tests {
             "off".to_owned(),
             "--Cache:BilibiliWorkerMaxConcurrentTasks".to_owned(),
             "2".to_owned(),
+            "--Cache:TaskRetentionMaxTerminalTasks".to_owned(),
+            "25".to_owned(),
+            "--Cache:TaskRetentionTerminalAgeDays".to_owned(),
+            "7".to_owned(),
             "--Cache:BBDownOutputDir".to_owned(),
             "/tmp/cache/bilibili".to_owned(),
             "--Cache:BBDownArchivePath".to_owned(),
@@ -428,6 +468,12 @@ mod tests {
 
         assert!(!options.bilibili_worker_enabled);
         assert_eq!(2, options.bilibili_worker_max_concurrent_tasks);
+        assert_eq!(25, options.task_retention_max_terminal_tasks);
+        assert_eq!(7, options.task_retention_terminal_age_days);
+        assert_eq!(
+            TaskRetentionPolicy::new(Some(25), Some(Duration::from_secs(7 * SECONDS_PER_DAY))),
+            options.task_retention_policy()
+        );
         assert_eq!(
             normalize_existing_path_prefix(Path::new("/tmp/cache/bilibili")),
             options.bbdown_output_dir()
@@ -439,6 +485,22 @@ mod tests {
         assert_eq!(
             PathBuf::from("/opt/homebrew/bin/ffmpeg"),
             options.bbdown_ffmpeg_path
+        );
+    }
+
+    #[test]
+    fn zero_task_retention_args_disable_individual_limits() {
+        let options = CacheServerOptions::from_args([
+            "--Cache:TaskRetentionMaxTerminalTasks".to_owned(),
+            "0".to_owned(),
+            "--Cache:TaskRetentionTerminalAgeDays".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect("options should parse");
+
+        assert_eq!(
+            TaskRetentionPolicy::new(None, None),
+            options.task_retention_policy()
         );
     }
 

@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
+    time::Duration,
 };
 
 use prost_types::Timestamp;
@@ -37,15 +38,25 @@ const CANCEL_REQUESTED_MESSAGE: &str = "Cancellation requested.";
 const CANCELLED_BY_REQUEST_MESSAGE: &str = "Cancelled by request.";
 const CANCELLED_MESSAGE: &str = "Cancelled before the download adapter started.";
 const WATCHER_EVENT_BUFFER_CAPACITY: usize = 128;
+const DEFAULT_MAX_TERMINAL_TASKS: usize = 200;
+const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub struct BilibiliTaskRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     queue_notify: Arc<Notify>,
     persistence: Option<TaskStatePersistence>,
+    retention_policy: TaskRetentionPolicy,
 }
 
 impl BilibiliTaskRegistry {
     pub fn with_persistence_path(path: impl Into<PathBuf>) -> Self {
+        Self::with_persistence_path_and_retention(path, TaskRetentionPolicy::default())
+    }
+
+    pub fn with_persistence_path_and_retention(
+        path: impl Into<PathBuf>,
+        retention_policy: TaskRetentionPolicy,
+    ) -> Self {
         let store = TaskStateStore::new(path);
         let records = match store.load() {
             Ok(records) => records,
@@ -54,11 +65,11 @@ impl BilibiliTaskRegistry {
                     "Failed to load persisted Bilibili task state from {}; task state writeback is disabled until the snapshot is repaired: {error}",
                     store.path().display()
                 );
-                return Self::from_persisted_records(Vec::new(), None);
+                return Self::from_persisted_records(Vec::new(), None, retention_policy);
             }
         };
         let should_rewrite_snapshot = !records.is_empty();
-        let registry = Self::from_persisted_records(records, Some(store));
+        let registry = Self::from_persisted_records(records, Some(store), retention_policy);
         if should_rewrite_snapshot {
             registry.persist_current_state();
         }
@@ -817,6 +828,7 @@ impl BilibiliTaskRegistry {
     fn from_persisted_records(
         records: Vec<PersistedTaskRecord>,
         store: Option<TaskStateStore>,
+        retention_policy: TaskRetentionPolicy,
     ) -> Self {
         let mut inner = RegistryInner::default();
         for record in records {
@@ -856,6 +868,7 @@ impl BilibiliTaskRegistry {
             inner: Arc::new(Mutex::new(inner)),
             queue_notify: Arc::new(Notify::new()),
             persistence: store.map(TaskStatePersistence::new),
+            retention_policy,
         }
     }
 
@@ -872,6 +885,7 @@ impl BilibiliTaskRegistry {
         inner: &mut RegistryInner,
     ) -> Option<TaskPersistenceSnapshot> {
         self.persistence.as_ref()?;
+        prune_terminal_tasks_locked(inner, &self.retention_policy, &current_timestamp());
         inner.persistence_generation += 1;
         Some(TaskPersistenceSnapshot {
             generation: inner.persistence_generation,
@@ -966,7 +980,31 @@ impl BilibiliTaskRegistry {
 
 impl Default for BilibiliTaskRegistry {
     fn default() -> Self {
-        Self::from_persisted_records(Vec::new(), None)
+        Self::from_persisted_records(Vec::new(), None, TaskRetentionPolicy::default())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRetentionPolicy {
+    pub max_terminal_tasks: Option<usize>,
+    pub max_terminal_task_age: Option<Duration>,
+}
+
+impl TaskRetentionPolicy {
+    pub fn new(max_terminal_tasks: Option<usize>, max_terminal_task_age: Option<Duration>) -> Self {
+        Self {
+            max_terminal_tasks,
+            max_terminal_task_age,
+        }
+    }
+}
+
+impl Default for TaskRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_terminal_tasks: Some(DEFAULT_MAX_TERMINAL_TASKS),
+            max_terminal_task_age: Some(DEFAULT_TERMINAL_TASK_RETENTION),
+        }
     }
 }
 
@@ -1313,6 +1351,93 @@ fn persisted_records_locked(inner: &RegistryInner) -> Vec<PersistedTaskRecord> {
             task,
         })
         .collect()
+}
+
+fn prune_terminal_tasks_locked(
+    inner: &mut RegistryInner,
+    policy: &TaskRetentionPolicy,
+    now: &Timestamp,
+) {
+    let mut prunable_tasks = inner
+        .tasks_by_id
+        .values()
+        .filter(|task| is_retention_prunable_terminal_task(task))
+        .map(|task| {
+            (
+                task.id.clone(),
+                timestamp_sort_key(terminal_task_retention_timestamp(task)),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut prune_ids = HashSet::new();
+    if let Some(max_age) = policy.max_terminal_task_age {
+        prune_ids.extend(
+            inner
+                .tasks_by_id
+                .values()
+                .filter(|task| {
+                    is_retention_prunable_terminal_task(task)
+                        && terminal_task_age_exceeds(task, now, max_age)
+                })
+                .map(|task| task.id.clone()),
+        );
+    }
+
+    if let Some(max_terminal_tasks) = policy.max_terminal_tasks {
+        prunable_tasks.retain(|(task_id, _)| !prune_ids.contains(task_id));
+        if prunable_tasks.len() > max_terminal_tasks {
+            prunable_tasks
+                .sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+            let remove_count = prunable_tasks.len() - max_terminal_tasks;
+            prune_ids.extend(
+                prunable_tasks
+                    .into_iter()
+                    .take(remove_count)
+                    .map(|(task_id, _)| task_id),
+            );
+        }
+    }
+
+    for task_id in prune_ids {
+        inner.tasks_by_id.remove(&task_id);
+        inner.download_options_by_id.remove(&task_id);
+        inner.playback_options_by_id.remove(&task_id);
+        inner.running_cancellations_by_id.remove(&task_id);
+        inner.planning_cancellations_by_id.remove(&task_id);
+    }
+}
+
+fn is_retention_prunable_terminal_task(task: &Task) -> bool {
+    is_terminal(task.state())
+        && !(task.kind() == TaskKind::BilibiliProgressivePlayback
+            && task.state() == TaskState::Completed)
+}
+
+fn terminal_task_retention_timestamp(task: &Task) -> Option<&Timestamp> {
+    task.finished_at
+        .as_ref()
+        .or(task.updated_at.as_ref())
+        .or(task.created_at.as_ref())
+}
+
+fn terminal_task_age_exceeds(task: &Task, now: &Timestamp, max_age: Duration) -> bool {
+    let Some(reference) = terminal_task_retention_timestamp(task) else {
+        return false;
+    };
+    timestamp_age_nanos(now, reference).is_some_and(|age| age >= duration_nanos(max_age))
+}
+
+fn timestamp_age_nanos(now: &Timestamp, reference: &Timestamp) -> Option<i128> {
+    timestamp_nanos(now).checked_sub(timestamp_nanos(reference))
+}
+
+fn timestamp_nanos(timestamp: &Timestamp) -> i128 {
+    i128::from(timestamp.seconds) * 1_000_000_000 + i128::from(timestamp.nanos)
+}
+
+fn duration_nanos(duration: Duration) -> i128 {
+    i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
 }
 
 fn timestamp_sort_key(timestamp: Option<&Timestamp>) -> (i64, i32) {
@@ -1942,6 +2067,123 @@ mod tests {
     }
 
     #[test]
+    fn retention_prunes_oldest_terminal_tasks_from_persisted_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        TaskStateStore::new(path.clone())
+            .save(&[
+                persisted_task_record_with_state(
+                    "terminal-old",
+                    "BV1old",
+                    TaskKind::BilibiliDownload,
+                    TaskState::Cancelled,
+                    10,
+                ),
+                persisted_task_record_with_state(
+                    "terminal-mid",
+                    "BV1mid",
+                    TaskKind::BilibiliDownload,
+                    TaskState::Failed,
+                    20,
+                ),
+                persisted_task_record_with_state(
+                    "terminal-new",
+                    "BV1new",
+                    TaskKind::BilibiliDownload,
+                    TaskState::Succeeded,
+                    30,
+                ),
+            ])
+            .expect("task state should persist");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_and_retention(
+            &path,
+            TaskRetentionPolicy::new(Some(2), None),
+        );
+
+        assert!(registry.get_task("terminal-old").is_err());
+        assert_eq!(
+            TaskState::Failed,
+            registry
+                .get_task("terminal-mid")
+                .expect("mid task should be retained")
+                .state()
+        );
+        assert_eq!(
+            TaskState::Succeeded,
+            registry
+                .get_task("terminal-new")
+                .expect("new task should be retained")
+                .state()
+        );
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("task state should reload");
+        let task_ids = records
+            .into_iter()
+            .map(|record| record.task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["terminal-mid", "terminal-new"], task_ids);
+    }
+
+    #[test]
+    fn retention_prunes_old_terminal_tasks_but_keeps_active_and_completed_hls_tasks() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        TaskStateStore::new(path.clone())
+            .save(&[
+                persisted_task_record_with_state(
+                    "queued-old",
+                    "BV1queued",
+                    TaskKind::BilibiliDownload,
+                    TaskState::Queued,
+                    10,
+                ),
+                persisted_task_record_with_state(
+                    "cancelled-old",
+                    "BV1cancelled",
+                    TaskKind::BilibiliDownload,
+                    TaskState::Cancelled,
+                    20,
+                ),
+                persisted_completed_playback_task_record("playback-completed-old", 30),
+            ])
+            .expect("task state should persist");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_and_retention(
+            &path,
+            TaskRetentionPolicy::new(None, Some(Duration::from_secs(1))),
+        );
+
+        assert_eq!(
+            TaskState::Queued,
+            registry
+                .get_task("queued-old")
+                .expect("active queued task should be retained")
+                .state()
+        );
+        assert!(registry.get_task("cancelled-old").is_err());
+        let completed = registry
+            .get_task("playback-completed-old")
+            .expect("completed HLS playback task should be retained");
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(
+            "bilibili.hls.playback-completed-old",
+            completed.library_item_id
+        );
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("task state should reload");
+        let task_ids = records
+            .into_iter()
+            .map(|record| record.task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["queued-old", "playback-completed-old"], task_ids);
+    }
+
+    #[test]
     fn restores_terminal_task_without_active_source_dedupe() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
@@ -1966,11 +2208,44 @@ mod tests {
 
     fn persisted_task_record(id: &str, source: &str) -> PersistedTaskRecord {
         let now = current_timestamp();
+        persisted_task_record_with_timestamp(
+            id,
+            source,
+            TaskKind::BilibiliDownload,
+            TaskState::Queued,
+            now,
+        )
+    }
+
+    fn persisted_task_record_with_state(
+        id: &str,
+        source: &str,
+        kind: TaskKind,
+        state: TaskState,
+        seconds: i64,
+    ) -> PersistedTaskRecord {
+        persisted_task_record_with_timestamp(
+            id,
+            source,
+            kind,
+            state,
+            Timestamp { seconds, nanos: 0 },
+        )
+    }
+
+    fn persisted_task_record_with_timestamp(
+        id: &str,
+        source: &str,
+        kind: TaskKind,
+        state: TaskState,
+        timestamp: Timestamp,
+    ) -> PersistedTaskRecord {
+        let finished_at = is_terminal(state).then(|| copy_timestamp(&timestamp));
         PersistedTaskRecord {
             task: Task {
                 id: id.to_owned(),
-                kind: TaskKind::BilibiliDownload.into(),
-                state: TaskState::Queued.into(),
+                kind: kind.into(),
+                state: state.into(),
                 source: source.to_owned(),
                 title: String::new(),
                 progress: 0.0,
@@ -1978,15 +2253,37 @@ mod tests {
                 total_bytes: 0,
                 message: QUEUED_MESSAGE.to_owned(),
                 library_item_id: String::new(),
-                created_at: Some(copy_timestamp(&now)),
-                updated_at: Some(now),
-                finished_at: None,
+                created_at: Some(copy_timestamp(&timestamp)),
+                updated_at: Some(copy_timestamp(&timestamp)),
+                finished_at,
                 playback_source: None,
                 playback_session: None,
             },
             options: None,
             playback_options: None,
         }
+    }
+
+    fn persisted_completed_playback_task_record(id: &str, seconds: i64) -> PersistedTaskRecord {
+        let library_item_id = format!("bilibili.hls.{id}");
+        let mut record = persisted_task_record_with_state(
+            id,
+            "BV1completed-old",
+            TaskKind::BilibiliProgressivePlayback,
+            TaskState::Completed,
+            seconds,
+        );
+        record.task.message = PLAYBACK_COMPLETED_MESSAGE.to_owned();
+        record.task.library_item_id = library_item_id.clone();
+        record.task.playback_source = Some(PlaybackSource {
+            item_id: id.to_owned(),
+            variant_id: "h264".to_owned(),
+            protocol: crate::generated::tvos_net_player::v1::PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{id}/master.m3u8"),
+            expires_at: Some(Timestamp { seconds, nanos: 0 }),
+        });
+        record.task.playback_session = Some(playback_session(id));
+        record
     }
 
     fn download_options(
