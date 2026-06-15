@@ -24,7 +24,7 @@ use crate::{
         HlsMediaResource, HlsPlaybackSession, HlsVariant, mp4_initialization_length,
         should_forward_media_request_header,
     },
-    library::OpenedMediaFile,
+    library::{OpenedMediaFile, open_read_no_follow},
 };
 
 const HLS_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -67,9 +67,13 @@ impl HlsCacheStore {
         }
     }
 
-    pub(crate) fn load_sessions(&self) -> Vec<HlsPlaybackSession> {
-        let Ok(entries) = fs::read_dir(self.store_root()) else {
-            return Vec::new();
+    pub(crate) fn load_sessions(&self) -> io::Result<Vec<HlsPlaybackSession>> {
+        let entries = match fs::read_dir(self.store_root()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && self.root_path.is_dir() => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
         };
 
         let mut sessions = Vec::new();
@@ -90,21 +94,30 @@ impl HlsCacheStore {
         }
 
         sessions.sort_by(|left, right| left.id.cmp(&right.id));
-        sessions
+        Ok(sessions)
     }
 
-    pub(crate) fn completed_session_ids(&self) -> HashSet<String> {
-        self.load_sessions()
-            .into_iter()
-            .filter_map(|session| self.completed_library_item(&session).map(|_| session.id))
+    pub(crate) fn completed_session_ids(&self, sessions: &[HlsPlaybackSession]) -> HashSet<String> {
+        sessions
+            .iter()
+            .filter_map(|session| {
+                self.completed_library_item(session)
+                    .map(|_| session.id.clone())
+            })
             .collect()
     }
 
     pub(crate) fn list_completed_library_items(&self) -> Vec<LibraryItem> {
-        let mut items = self
-            .load_sessions()
-            .into_iter()
-            .filter_map(|session| self.completed_library_item(&session))
+        let sessions = match self.load_sessions() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("Failed to scan completed HLS cache sessions: {error}");
+                return Vec::new();
+            }
+        };
+        let mut items = sessions
+            .iter()
+            .filter_map(|session| self.completed_library_item(session))
             .collect::<Vec<_>>();
         items.sort_by(|left, right| {
             left.title
@@ -156,8 +169,11 @@ impl HlsCacheStore {
     ) -> Option<CachedHlsResource> {
         let metadata = self.read_resource_metadata(session_id, resource_id)?;
         let file_path = self.resource_path(session_id, resource_id).ok()?;
-        let file_metadata = fs::metadata(&file_path).ok()?;
-        if !file_metadata.is_file() || file_metadata.len() != metadata.total_length {
+        let file_metadata = fs::symlink_metadata(&file_path).ok()?;
+        if file_metadata.file_type().is_symlink()
+            || !file_metadata.is_file()
+            || file_metadata.len() != metadata.total_length
+        {
             return None;
         }
 
@@ -176,7 +192,8 @@ impl HlsCacheStore {
         resource_id: &str,
     ) -> Option<OpenedMediaFile> {
         let cached = self.cached_resource(session_id, resource_id)?;
-        let file = File::open(&cached.path).ok()?;
+        let relative_path = self.resource_relative_path(session_id, resource_id).ok()?;
+        let file = open_read_no_follow(self.root_path.as_ref(), &relative_path).ok()?;
         Some(OpenedMediaFile {
             file,
             content_type: cached.content_type,
@@ -427,6 +444,12 @@ impl HlsCacheStore {
     fn resource_path(&self, session_id: &str, resource_id: &str) -> io::Result<PathBuf> {
         validate_cache_id(resource_id)?;
         Ok(self.session_dir(session_id)?.join(resource_id))
+    }
+
+    fn resource_relative_path(&self, session_id: &str, resource_id: &str) -> io::Result<String> {
+        validate_cache_id(session_id)?;
+        validate_cache_id(resource_id)?;
+        Ok(format!("{HLS_CACHE_DIR}/{session_id}/{resource_id}"))
     }
 
     fn resource_metadata_path(&self, session_id: &str, resource_id: &str) -> io::Result<PathBuf> {
@@ -953,9 +976,24 @@ mod tests {
         store
             .save_session(&session)
             .expect("session manifest should save");
-        let sessions = store.load_sessions();
+        let sessions = store.load_sessions().expect("session manifest should load");
 
         assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn load_sessions_reports_unreadable_store_path() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let store_root = temp.path().join(".tvos-net-player").join("hls");
+        std::fs::create_dir_all(store_root.parent().unwrap()).unwrap();
+        std::fs::write(&store_root, b"not a directory").unwrap();
+
+        let error = store
+            .load_sessions()
+            .expect_err("non-directory store root should be reported");
+
+        assert_eq!(io::ErrorKind::NotADirectory, error.kind());
     }
 
     #[test]
@@ -1163,7 +1201,9 @@ mod tests {
             .join("session.json");
         let manifest = std::fs::read_to_string(manifest_path)
             .expect("completed session manifest should remain readable");
-        let sessions = store.load_sessions();
+        let sessions = store
+            .load_sessions()
+            .expect("completed session manifest should load");
 
         assert!(!manifest.contains(&upstream_url));
         assert!(!manifest.contains(&backup_url));
@@ -1175,6 +1215,61 @@ mod tests {
         assert!(request.backup_urls.is_empty());
         assert!(request.headers.is_empty());
         assert!(store.get_completed_library_item(&item_id).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_cached_resource() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-symlink", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let target_path = temp.path().join("outside.mp4");
+        std::fs::write(&target_path, fake_mp4()).expect("target file should be written");
+        symlink(
+            &target_path,
+            store
+                .resource_path("session-symlink", "video.m4s")
+                .expect("resource path should be valid"),
+        )
+        .expect("resource symlink should be created");
+        let metadata = PersistedHlsCachedResource {
+            schema_version: HLS_CACHE_SCHEMA_VERSION,
+            id: "video.m4s".to_owned(),
+            content_type: session.variant.video.content_type().to_owned(),
+            total_length: fake_mp4().len() as u64,
+            initialization_length: 28,
+            cache_key: PersistedBilibiliMediaCacheKey::from(
+                session.variant.video.request.cache_key.clone(),
+            ),
+        };
+        write_json_atomically(
+            &store
+                .resource_metadata_path("session-symlink", "video.m4s")
+                .expect("metadata path should be valid"),
+            &metadata,
+        )
+        .expect("resource metadata should save");
+
+        assert!(
+            store
+                .cached_resource("session-symlink", "video.m4s")
+                .is_none()
+        );
+        assert!(
+            store
+                .open_cached_resource("session-symlink", "video.m4s")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-symlink")
+                .is_none()
+        );
     }
 
     #[tokio::test]

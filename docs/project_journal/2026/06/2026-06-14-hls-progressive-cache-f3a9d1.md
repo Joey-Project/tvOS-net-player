@@ -147,6 +147,10 @@ superseded_by:
   - Playback planning now marks progressive tasks `PLAYABLE` before persisting the upstream HLS session manifest, so cancelled or failed planning cannot leave unowned URL/header-bearing manifests on disk.
   - HLS cache cancellation now performs idempotent session cleanup after committed resources and in the finalizer cancellation branch, preventing partially cached video/audio resources from surviving cancellation races.
   - Local library enumeration now excludes the internal `.tvos-net-player/hls` cache tree even when `.m4s` is explicitly allowed as a local-media extension.
+  - Startup restore now treats HLS cache scan failures as indeterminate instead of empty, preserving persisted progressive tasks until the cache root is readable again.
+  - Restored HLS playback tasks now refresh persisted `PlaybackSource.uri` values from the current media base, avoiding stale host/base URLs after restart or config changes.
+  - Cached HLS resources now reject symlinked resource files and open cached media through the same no-follow file-open helper used by local media playback.
+  - Local library direct item resolution now rejects internal `.tvos-net-player/hls` cache paths, not only recursive enumeration.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -168,5 +172,9 @@ superseded_by:
   - `cargo test --package tvos-net-player-cache-server --locked local_scan_excludes_internal_hls_cache_files -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked hls_cache_finalizer_stops_when_task_is_cancelled_during_download -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked`
+  - `cargo test --package tvos-net-player-cache-server --locked` after GitHub Codex review-gate fixes: 128 lib tests and 6 integration tests passed.
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
   - `just ci` after second independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-rerun-fixes.log`
   - `just ci` after third independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-third-fixes-rerun.log`
+  - `just ci` after GitHub Codex review-gate fixes; log: `.codex-tmp/pr4-final-just-ci-after-github-codex-gate-fixes.log`

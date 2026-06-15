@@ -3,7 +3,7 @@ use std::{
     ffi::CString,
     fs::{self, File},
     io,
-    path::{Component, Path, PathBuf},
+    path::{Component, Components, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -348,6 +348,9 @@ impl LocalMediaLibrary {
         }
 
         let relative_path = relative_path(root_path, &full_candidate_path)?;
+        if is_internal_hls_cache_path(&relative_path) {
+            return None;
+        }
         if !self.supports_http_range_playback() {
             return Some(MediaFile {
                 path: full_candidate_path,
@@ -602,7 +605,14 @@ fn is_internal_hls_cache_dir(root_path: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root_path) else {
         return false;
     };
-    let mut components = relative.components();
+    is_internal_hls_cache_components(relative.components())
+}
+
+fn is_internal_hls_cache_path(relative_path: &str) -> bool {
+    is_internal_hls_cache_components(Path::new(relative_path).components())
+}
+
+fn is_internal_hls_cache_components(mut components: Components<'_>) -> bool {
     matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
         && matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_HLS_CACHE_DIR)
 }
@@ -751,7 +761,7 @@ fn supports_secure_no_follow_open() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
+pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
     let segments = Path::new(relative_path)
@@ -793,7 +803,7 @@ fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io::Result<File> {
+pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow media open is not implemented on this platform",
@@ -965,6 +975,35 @@ mod tests {
 
         assert_eq!(1, page.items.len());
         assert_eq!("Visible.m4s", page.items[0].subtitle);
+    }
+
+    #[test]
+    fn local_direct_lookup_excludes_internal_hls_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
+        fs::write(&internal_path, b"hls").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+
+        assert!(library.get_item_blocking(&item_id).is_none());
+        assert!(
+            library
+                .get_media_file_blocking(&item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&internal_path)
+                .is_none()
+        );
     }
 
     #[test]

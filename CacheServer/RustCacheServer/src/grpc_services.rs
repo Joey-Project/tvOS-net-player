@@ -1346,8 +1346,12 @@ mod tests {
                 .is_some()
         );
 
+        let restored_options = CacheServerOptions {
+            public_media_base_uri: Some("http://restored-media.example.test:9090".to_owned()),
+            ..options.clone()
+        };
         let restored =
-            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+            AppState::new_with_playback_planner(restored_options, Arc::new(EmptyPlaybackPlanner));
         let restored_task = restored
             .tasks
             .get_task(&completed.id)
@@ -1360,6 +1364,17 @@ mod tests {
                 .as_ref()
                 .expect("restored completed task should keep offline source")
                 .item_id
+        );
+        assert_eq!(
+            format!(
+                "http://restored-media.example.test:9090/hls/{}/master.m3u8",
+                completed.id
+            ),
+            restored_task
+                .playback_source
+                .as_ref()
+                .expect("restored completed task should keep offline source")
+                .uri
         );
         assert!(restored.hls_sessions.get(&completed.id).is_some());
         assert!(
@@ -1455,6 +1470,69 @@ mod tests {
             .get_task(&created.id)
             .expect("playback task should remain readable");
         assert_eq!(TaskState::Playable, still_playable.state());
+    }
+
+    #[tokio::test]
+    async fn app_state_preserves_hls_tasks_when_cache_scan_fails() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1scan-error", None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        creation.task.id
+                    ),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        let hls_root = root_path.join(".tvos-net-player").join("hls");
+        fs::remove_dir_all(&hls_root).expect("HLS cache root should be removable");
+        fs::write(&hls_root, b"not a directory").expect("HLS cache root probe file should save");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should remain persisted when cache scan fails");
+
+        assert_eq!(TaskState::Playable, restored_task.state());
+        assert!(restored_task.playback_source.is_some());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_none());
     }
 
     #[tokio::test]

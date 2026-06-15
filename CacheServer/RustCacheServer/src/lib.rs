@@ -18,9 +18,9 @@ use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
 use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
-    LibraryItem, PlaybackSource, TaskKind, TaskState, cache_service_server::CacheServiceServer,
-    library_service_server::LibraryServiceServer, server_service_server::ServerServiceServer,
-    task_service_server::TaskServiceServer,
+    LibraryItem, PlaybackProtocol, PlaybackSource, TaskKind, TaskState,
+    cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
+    server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
@@ -99,17 +99,29 @@ impl AppState {
         let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path(task_state_path));
         let hls_sessions = HlsPlaybackRegistry::default();
         let hls_cache = HlsCacheStore::new(library.root_path());
-        let mut restored_hls_sessions = hls_cache.load_sessions();
+        let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
+        {
+            Ok(sessions) => (sessions, true),
+            Err(error) => {
+                eprintln!(
+                    "Failed to scan HLS cache sessions during startup; preserving persisted playback tasks until the cache root is readable: {error}"
+                );
+                (Vec::new(), false)
+            }
+        };
         let restorable_playback_session_ids = restored_hls_sessions
             .iter()
             .map(|session| session.id.clone())
             .collect();
-        let restorable_completed_session_ids = hls_cache.completed_session_ids();
-        let _failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
-            &restorable_playback_session_ids,
-            &restorable_completed_session_ids,
-        );
-        if tasks.persistence_available() {
+        let restorable_completed_session_ids =
+            hls_cache.completed_session_ids(&restored_hls_sessions);
+        if hls_cache_scan_succeeded {
+            let _failed_hls_session_ids = tasks.fail_unrestorable_playback_tasks(
+                &restorable_playback_session_ids,
+                &restorable_completed_session_ids,
+            );
+        }
+        if tasks.persistence_available() && hls_cache_scan_succeeded {
             restored_hls_sessions.retain(|session| {
                 restored_hls_session_is_authorized(
                     &tasks,
@@ -121,7 +133,17 @@ impl AppState {
             restored_hls_sessions.clear();
         }
         for session in &restored_hls_sessions {
-            hls_sessions.insert(session.clone());
+            refresh_restored_hls_playback_source(
+                &tasks,
+                &playback_uri_factory,
+                session,
+                &restorable_completed_session_ids,
+            );
+            if restorable_completed_session_ids.contains(&session.id) {
+                hls_sessions.insert(sanitized_completed_session(session));
+            } else {
+                hls_sessions.insert(session.clone());
+            }
         }
         let hls_upstream_client = build_hls_upstream_client();
         let playback_planner = playback_planner_factory(Arc::clone(&options), Arc::clone(&library));
@@ -259,6 +281,42 @@ impl AppState {
         task.kind() == TaskKind::BilibiliProgressivePlayback
             && task.state() == TaskState::Completed
             && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+    }
+}
+
+fn refresh_restored_hls_playback_source(
+    tasks: &BilibiliTaskRegistry,
+    playback_uri_factory: &PlaybackUriFactory,
+    session: &crate::hls::HlsPlaybackSession,
+    completed_session_ids: &HashSet<String>,
+) {
+    let Ok(task) = tasks.get_task(&session.id) else {
+        return;
+    };
+    if task.kind() != TaskKind::BilibiliProgressivePlayback {
+        return;
+    }
+
+    let item_id = match task.state() {
+        TaskState::Playable => session.id.clone(),
+        TaskState::Completed if completed_session_ids.contains(&session.id) => {
+            HlsCacheStore::completed_library_item_id(&session.id)
+        }
+        _ => return,
+    };
+    let playback_source = PlaybackSource {
+        item_id,
+        variant_id: session.variant.id.clone(),
+        protocol: PlaybackProtocol::Hls.into(),
+        uri: playback_uri_factory.create_hls_master_playlist_for_runtime(&session.id),
+        expires_at: None,
+    };
+
+    if let Err(status) = tasks.refresh_playback_source(&session.id, playback_source) {
+        eprintln!(
+            "Failed to refresh restored HLS playback source for task {}: {status}",
+            session.id
+        );
     }
 }
 

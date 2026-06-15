@@ -532,6 +532,36 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    pub fn refresh_playback_source(
+        &self,
+        id: &str,
+        playback_source: PlaybackSource,
+    ) -> Result<Task, Status> {
+        let normalized_id = normalize_required_id(id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = {
+            let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
+                return Err(task_not_found());
+            };
+            if task.kind() != TaskKind::BilibiliProgressivePlayback {
+                return Err(Status::failed_precondition(
+                    "Task is not a Bilibili progressive playback task.",
+                ));
+            }
+            if !matches!(task.state(), TaskState::Playable | TaskState::Completed) {
+                return Ok(task.clone());
+            }
+
+            task.playback_source = Some(playback_source);
+            task.clone()
+        };
+        let snapshot = self.persistence_snapshot_locked(&mut inner);
+        Self::publish_locked(&mut inner, task.clone());
+        drop(inner);
+        self.persist_snapshot(snapshot);
+        Ok(task)
+    }
+
     pub fn complete_task_failed(&self, id: &str, message: String) -> Result<Task, Status> {
         self.complete_task(id, TaskState::Failed, message, None, None)
     }
@@ -1611,6 +1641,34 @@ mod tests {
             .as_ref()
             .expect("restored completed playback should keep a source");
         assert_eq!("bilibili.hls.completed", restored_source.item_id);
+    }
+
+    #[test]
+    fn refresh_playback_source_updates_restored_progressive_task_uri() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1refresh", Some(playback_options("1080p")))
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        let mut refreshed_source = playback_source(&created.task.id);
+        refreshed_source.uri = format!(
+            "http://restored.example.test:9090/hls/{}/master.m3u8",
+            created.task.id
+        );
+
+        let refreshed = registry
+            .refresh_playback_source(&created.task.id, refreshed_source.clone())
+            .expect("playback source should refresh");
+
+        assert_eq!(TaskState::Playable, refreshed.state());
+        assert_eq!(Some(refreshed_source), refreshed.playback_source);
     }
 
     #[test]

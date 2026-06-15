@@ -28,7 +28,15 @@ impl PlaybackUriFactory {
 
     pub fn create_hls_master_playlist<T>(&self, request: &Request<T>, session_id: &str) -> String {
         let base_uri = self.create_base_uri(request);
+        Self::hls_master_playlist_uri(&base_uri, session_id)
+    }
 
+    pub fn create_hls_master_playlist_for_runtime(&self, session_id: &str) -> String {
+        let base_uri = self.configured_base_uri();
+        Self::hls_master_playlist_uri(&base_uri, session_id)
+    }
+
+    fn hls_master_playlist_uri(base_uri: &str, session_id: &str) -> String {
         format!(
             "{}/hls/{}/master.m3u8",
             base_uri.trim_end_matches('/'),
@@ -53,6 +61,17 @@ impl PlaybackUriFactory {
                     request.local_addr().map(|addr| addr.ip()),
                     &self.options.media_listen_url,
                 )
+            })
+    }
+
+    fn configured_base_uri(&self) -> String {
+        self.options
+            .public_media_base_uri
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                Self::create_media_base_uri("localhost", &self.options.media_listen_url)
             })
     }
 
