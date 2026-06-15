@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-15
 updated: 2026-06-15
 branch: wip/macos-frontend
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/14
 supersedes: []
 superseded_by:
 ---
@@ -78,3 +78,4 @@ superseded_by:
   - `plutil -lint TVOSNetPlayer.xcodeproj/project.pbxproj MacOSNetPlayer/Info.plist TVOSNetPlayer/Info.plist`
   - `xmllint --noout TVOSNetPlayer.xcodeproj/xcshareddata/xcschemes/MacOSNetPlayer.xcscheme TVOSNetPlayer.xcodeproj/xcshareddata/xcschemes/TVOSNetPlayer.xcscheme`
   - `project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+- PR 2: https://github.com/Joey-Project/tvOS-net-player/pull/14
