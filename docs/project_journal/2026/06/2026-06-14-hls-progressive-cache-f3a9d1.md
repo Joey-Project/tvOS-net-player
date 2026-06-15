@@ -160,9 +160,13 @@ superseded_by:
   - Startup HLS cache scans and direct completed-item lookups now reject session manifests whose persisted `id` does not match the containing cache directory, preventing mismatched restore metadata from surviving recovery cleanup or aliasing another completed cache entry.
   - Progressive HLS planning now registers the runtime HLS session before publishing a `Playable` task event, so watchers can immediately fetch the advertised playlist URI without a transient 404.
   - Cached file responses now sanitize persisted content types before writing HTTP headers, falling back to `application/octet-stream` for invalid metadata instead of panicking.
+  - HLS cache path validation now rejects symlinked root ancestors, matching the local library root policy before writes, removals, scans, or cached media reads trust cache paths.
+  - Cached HLS resources now require persisted resource metadata cache keys to match the current session manifest request cache key before a resource can count toward a completed offline item.
   - `cargo test --package tvos-net-player-cache-server --locked load_sessions_skips_manifest_with_mismatched_directory_id -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked get_completed_library_item_skips_manifest_with_mismatched_directory_id -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked cached_file_response_invalid_content_type_uses_octet_stream -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked rejects_hls_cache_root_symlink_ancestor -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked cached_resource_rejects_mismatched_request_cache_key -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -229,10 +233,11 @@ superseded_by:
   - Project journal validation passed.
   - `just ci` after final review fixes; log: `.codex-tmp/pr4-final-just-ci-after-final-review-fixes.log`
   - `cargo test --package tvos-net-player-cache-server --locked` after lengthless-download hardening: 141 lib tests and 6 integration tests passed.
-  - `cargo test --package tvos-net-player-cache-server --locked` after final review hardening: 144 lib tests and 6 integration tests passed.
+  - `cargo test --package tvos-net-player-cache-server --locked` after final review hardening: 146 lib tests and 6 integration tests passed.
   - `cargo fmt --all -- --check`
   - `git diff --check`
   - Project journal validation passed.
   - `just ci` after lengthless-download hardening; log: `.codex-tmp/pr4-final-just-ci-after-lengthless-download-fix.log`
   - `just ci` after mismatched-manifest restore hardening; log: `.codex-tmp/pr4-final-just-ci-after-mismatched-manifest-fix.log`
   - `just ci` after final review hardening; log: `.codex-tmp/pr4-final-just-ci-after-final-review-hardening.log`
+  - `just ci` after cache-key/root hardening; log: `.codex-tmp/pr4-final-just-ci-after-cache-key-root-hardening.log`

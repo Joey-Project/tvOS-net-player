@@ -184,6 +184,9 @@ impl HlsCacheStore {
         resource_id: &str,
     ) -> Option<CachedHlsResource> {
         let metadata = self.read_resource_metadata(session_id, resource_id)?;
+        if !self.resource_cache_key_matches(session_id, resource_id, &metadata) {
+            return None;
+        }
         let file_path = self.resource_path(session_id, resource_id).ok()?;
         self.reject_cache_path_symlink(&file_path).ok()?;
         let file_metadata = fs::symlink_metadata(&file_path).ok()?;
@@ -456,6 +459,22 @@ impl HlsCacheStore {
         let metadata = serde_json::from_slice::<PersistedHlsCachedResource>(&bytes).ok()?;
         (metadata.schema_version == HLS_CACHE_SCHEMA_VERSION && metadata.id == resource_id)
             .then_some(metadata)
+    }
+
+    fn resource_cache_key_matches(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+        metadata: &PersistedHlsCachedResource,
+    ) -> bool {
+        let Some(session) = self.load_session(session_id) else {
+            return false;
+        };
+        let Some(resource) = session.media_resource(resource_id) else {
+            return false;
+        };
+        metadata.cache_key
+            == PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone())
     }
 
     fn store_root(&self) -> PathBuf {
@@ -774,7 +793,7 @@ fn cache_path_contains_symlink(root_path: &Path, candidate_path: &Path) -> io::R
         return Ok(true);
     }
 
-    if path_is_symlink(&root_path)? {
+    if path_contains_symlink_component(&root_path)? {
         return Ok(true);
     }
 
@@ -792,6 +811,23 @@ fn cache_path_contains_symlink(root_path: &Path, candidate_path: &Path) -> io::R
         }
     }
 
+    Ok(false)
+}
+
+fn path_contains_symlink_component(path: &Path) -> io::Result<bool> {
+    let mut current_path = PathBuf::new();
+    for component in absolute_path(path).components() {
+        current_path.push(component.as_os_str());
+        if matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            continue;
+        }
+        if path_is_symlink(&current_path)? {
+            return Ok(true);
+        }
+    }
     Ok(false)
 }
 
@@ -1038,7 +1074,7 @@ impl From<PersistedBilibiliHttpHeader> for BilibiliHttpHeader {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct PersistedBilibiliMediaCacheKey {
     content_id: String,
     media_kind: PersistedBilibiliMediaRequestKind,
@@ -1071,7 +1107,7 @@ impl From<PersistedBilibiliMediaCacheKey> for BilibiliMediaCacheKey {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedBilibiliMediaRequestKind {
     Video,
@@ -1111,10 +1147,18 @@ mod tests {
 
     use super::*;
 
+    fn temp_store(temp: &TempDir) -> HlsCacheStore {
+        HlsCacheStore::new(
+            temp.path()
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(temp.path())),
+        )
+    }
+
     #[test]
     fn saves_and_loads_hls_session_manifest() {
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-1", "https://example.test/video.m4s");
 
         store
@@ -1128,7 +1172,7 @@ mod tests {
     #[test]
     fn load_sessions_skips_manifest_with_mismatched_directory_id() {
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-1", "https://example.test/video.m4s");
         let mismatched_dir = temp
             .path()
@@ -1149,7 +1193,7 @@ mod tests {
     #[test]
     fn get_completed_library_item_skips_manifest_with_mismatched_directory_id() {
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let completed_session = sample_session("session-2", "https://example.test/video.m4s");
         let completed_dir = store
             .session_dir(&completed_session.id)
@@ -1191,7 +1235,7 @@ mod tests {
     #[test]
     fn load_sessions_reports_unreadable_store_path() {
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let store_root = temp.path().join(".tvos-net-player").join("hls");
         std::fs::create_dir_all(store_root.parent().unwrap()).unwrap();
         std::fs::write(&store_root, b"not a directory").unwrap();
@@ -1203,10 +1247,35 @@ mod tests {
         assert_eq!(io::ErrorKind::NotADirectory, error.kind());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hls_cache_root_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let real_parent = temp.path().join("real-parent");
+        let real_root = real_parent.join("cache");
+        std::fs::create_dir_all(&real_root).expect("real cache root should be created");
+        let link_parent = temp.path().join("link-parent");
+        symlink(&real_parent, &link_parent).expect("root ancestor symlink should be made");
+        let store = HlsCacheStore::new(link_parent.join("cache"));
+        let session = sample_session("session-1", "https://example.test/video.m4s");
+
+        let save_error = store
+            .save_session(&session)
+            .expect_err("symlinked root ancestor should not be written");
+        let load_error = store
+            .load_sessions()
+            .expect_err("symlinked root ancestor should not be scanned");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, save_error.kind());
+        assert_eq!(io::ErrorKind::PermissionDenied, load_error.kind());
+    }
+
     #[test]
     fn rejects_dot_segments_as_hls_cache_ids() {
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
 
         assert!(validate_cache_id(".").is_err());
         assert!(validate_cache_id("..").is_err());
@@ -1222,7 +1291,7 @@ mod tests {
     async fn caches_session_resources_and_exposes_completed_library_item() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-1", &upstream_url);
         let client = reqwest::Client::new();
 
@@ -1245,10 +1314,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_resource_rejects_mismatched_request_cache_key() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-cache-key", &upstream_url);
+        let client = reqwest::Client::new();
+        let item_id = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("session resources should cache");
+        assert!(
+            store
+                .cached_resource("session-cache-key", "video.m4s")
+                .is_some()
+        );
+        session.variant.video.request.cache_key.source_hash = "different-source".to_owned();
+        store
+            .save_completed_session(&session)
+            .expect("tampered session manifest should save");
+
+        assert!(
+            store
+                .cached_resource("session-cache-key", "video.m4s")
+                .is_none()
+        );
+        assert!(store.get_completed_library_item(&item_id).is_none());
+    }
+
+    #[tokio::test]
     async fn rejects_short_hls_cache_response_with_declared_size() {
         let (upstream_url, _task) = start_short_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-short", &upstream_url);
         session.variant.video.request.size = Some(fake_mp4().len() as u64);
         let client = reqwest::Client::new();
@@ -1270,7 +1368,7 @@ mod tests {
     async fn rejects_lengthless_chunked_hls_cache_response() {
         let (upstream_url, _task) = start_overlong_chunked_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-lengthless", &upstream_url);
         let temp_path = store
             .resource_path("session-lengthless", "video.m4s")
@@ -1296,7 +1394,7 @@ mod tests {
     async fn rejects_overlong_chunked_hls_cache_response_with_expected_size() {
         let (upstream_url, _task) = start_overlong_chunked_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-overlong", &upstream_url);
         session.variant.video.request.size = Some(fake_mp4().len() as u64);
         let temp_path = store
@@ -1323,7 +1421,7 @@ mod tests {
     async fn rejects_unsolicited_partial_hls_cache_response() {
         let (upstream_url, _task) = start_partial_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-partial", &upstream_url);
         session.variant.video.request.size = Some(fake_mp4().len() as u64);
         let client = reqwest::Client::new();
@@ -1345,7 +1443,7 @@ mod tests {
     async fn removes_temp_file_when_cached_initialization_is_invalid() {
         let (upstream_url, _task) = start_invalid_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-invalid", &upstream_url);
         session.variant.video.request.size = Some(invalid_mp4().len() as u64);
         let temp_path = store
@@ -1373,7 +1471,7 @@ mod tests {
         let (primary_url, _primary_task) = start_invalid_mp4_upstream().await;
         let (backup_url, _backup_task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-backup", &primary_url);
         session.variant.video.request.backup_urls = vec![backup_url];
         let temp_path = store
@@ -1404,7 +1502,7 @@ mod tests {
         )
         .await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-sensitive-backup", &primary_url);
         session.variant.video.request.backup_urls = vec![backup_url];
         session.variant.video.request.headers.extend([
@@ -1435,7 +1533,7 @@ mod tests {
     async fn completed_session_manifest_scrubs_upstream_request_data() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let mut session = sample_session("session-scrubbed", &upstream_url);
         let backup_url = "https://cdn-backup.example.test/video.m4s".to_owned();
         session.variant.video.request.backup_urls = vec![backup_url.clone()];
@@ -1483,7 +1581,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-symlink", "https://example.test/video.m4s");
         store
             .save_session(&session)
@@ -1539,7 +1637,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let store_root = temp.path().join(".tvos-net-player").join("hls");
         let outside_dir = temp.path().join("outside-session-read");
         let session = sample_session("session-read-link", "https://example.test/video.m4s");
@@ -1563,7 +1661,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-manifest-link", "https://example.test/video.m4s");
         let session_dir = store
             .session_dir(&session.id)
@@ -1593,7 +1691,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let internal_dir = temp.path().join(".tvos-net-player");
         let outside_dir = temp.path().join("outside-hls-root");
         std::fs::create_dir_all(&internal_dir).expect("internal parent should be created");
@@ -1613,7 +1711,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-metadata-link", "https://example.test/video.m4s");
         store
             .save_session(&session)
@@ -1652,7 +1750,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let store_root = temp.path().join(".tvos-net-player").join("hls");
         let outside_dir = temp.path().join("outside-session-resource");
         let session = sample_session("session-resource-link", "https://example.test/video.m4s");
@@ -1676,7 +1774,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let store_root = temp.path().join(".tvos-net-player").join("hls");
         let outside_dir = temp.path().join("outside-session");
         std::fs::create_dir_all(&store_root).expect("store root should be created");
@@ -1711,7 +1809,7 @@ mod tests {
 
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-temp-symlink", &upstream_url);
         store
             .save_session(&session)
@@ -1753,7 +1851,7 @@ mod tests {
 
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session("session-resource-symlink", &upstream_url);
         store
             .save_session(&session)
@@ -1797,7 +1895,7 @@ mod tests {
     async fn cancellation_after_committed_resource_removes_partial_session() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
-        let store = HlsCacheStore::new(temp.path());
+        let store = temp_store(&temp);
         let session = sample_session_with_audio("session-cancel-after-video", &upstream_url);
         let client = reqwest::Client::new();
         let store_for_cancel = store.clone();
