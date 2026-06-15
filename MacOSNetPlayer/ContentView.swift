@@ -1,0 +1,291 @@
+import AVKit
+import SwiftUI
+import TVOSNetPlayerCacheClient
+import TVOSNetPlayerCore
+
+struct ContentView: View {
+    @ObservedObject var model: PlayerViewModel
+    @ObservedObject var cacheModel: CacheLibraryViewModel
+    @State private var selectedItemID: CacheLibraryItem.ID?
+
+    var body: some View {
+        NavigationSplitView {
+            cacheSidebar
+        } detail: {
+            detailPane
+        }
+        .frame(minWidth: 1100, minHeight: 720)
+        .onAppear(perform: selectFirstCacheItemIfNeeded)
+        .onChange(of: cacheModel.items) { _, _ in
+            selectFirstCacheItemIfNeeded()
+        }
+    }
+
+    private var selectedItem: CacheLibraryItem? {
+        if let selectedItemID,
+            let item = cacheModel.items.first(where: { $0.id == selectedItemID })
+        {
+            return item
+        }
+
+        return cacheModel.items.first
+    }
+
+    private var cacheSidebar: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                TextField("mac-mini.local:50051", text: $cacheModel.serverAddressText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await cacheModel.refresh()
+                        }
+                    }
+
+                Button {
+                    Task {
+                        await cacheModel.refresh()
+                    }
+                } label: {
+                    Label(cacheModel.isLoading ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(!cacheModel.canRefresh)
+            }
+
+            if let errorMessage = cacheModel.errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+            }
+
+            Divider()
+
+            if cacheModel.items.isEmpty {
+                ContentUnavailableView("No Cached Videos", systemImage: "externaldrive")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $selectedItemID) {
+                    ForEach(cacheModel.items) { item in
+                        CacheLibraryRow(item: item)
+                            .tag(item.id)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .navigationTitle(cacheModel.serverName)
+    }
+
+    private var detailPane: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("macOS Net Player")
+                    .font(.title2.weight(.semibold))
+
+                if cacheModel.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Spacer()
+
+                Text("\(model.statusMessage) \(cacheModel.statusMessage)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.trailing)
+            }
+
+            manualStreamControls
+            selectedCacheItemControls
+            playerSurface
+        }
+        .padding(24)
+    }
+
+    private var manualStreamControls: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("http://192.168.1.10:8080/video.mp4", text: $model.streamURLText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(loadManualStream)
+
+                if let validationMessage = model.validationMessage {
+                    Text(validationMessage)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
+
+                HStack(spacing: 10) {
+                    Button(action: loadManualStream) {
+                        Label("Play", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button(action: stopManualStream) {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .disabled(model.player == nil)
+
+                    Button(action: clearManualStream) {
+                        Label("Clear", systemImage: "xmark.circle")
+                    }
+                    .disabled(!model.canClear)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Stream URL", systemImage: "link")
+        }
+    }
+
+    private var selectedCacheItemControls: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 16) {
+                if let selectedItem {
+                    CacheLibraryMetadata(item: selectedItem)
+
+                    Spacer(minLength: 16)
+
+                    Button {
+                        Task {
+                            await playCachedItem(selectedItem)
+                        }
+                    } label: {
+                        Label("Play Cached", systemImage: "play.rectangle.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(cacheModel.isLoading || !selectedItem.hasPlayableVariant)
+                } else {
+                    Text("No cached video selected")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        } label: {
+            Label("Cached Video", systemImage: "externaldrive.fill")
+        }
+    }
+
+    private var playerSurface: some View {
+        Group {
+            if let player = model.player {
+                VideoPlayer(player: player)
+                    .id(model.loadedURL)
+            } else {
+                ContentUnavailableView("No Stream Loaded", systemImage: "play.rectangle")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.black.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func playCachedItem(_ item: CacheLibraryItem) async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let url = await cacheModel.playbackURL(for: item) else {
+            return
+        }
+
+        let didStartPlayback = model.loadTransient(
+            streamURLText: url.absoluteString,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func loadManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.load()
+    }
+
+    private func stopManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.stop()
+    }
+
+    private func clearManualStream() {
+        cacheModel.clearPlaybackStatus()
+        model.clear()
+    }
+
+    private func selectFirstCacheItemIfNeeded() {
+        guard !cacheModel.items.isEmpty else {
+            selectedItemID = nil
+            return
+        }
+
+        if let selectedItemID,
+            cacheModel.items.contains(where: { $0.id == selectedItemID })
+        {
+            return
+        }
+
+        selectedItemID = cacheModel.items.first?.id
+    }
+}
+
+private struct CacheLibraryRow: View {
+    let item: CacheLibraryItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: item.hasPlayableVariant ? "play.rectangle" : "xmark.octagon")
+                .foregroundStyle(item.hasPlayableVariant ? Color.secondary : Color.red)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.displayTitle)
+                    .font(.headline)
+                    .lineLimit(2)
+
+                if !item.subtitle.isEmpty {
+                    Text(item.subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 8) {
+                    if let primaryVariant = item.primaryVariant {
+                        Text(primaryVariant.displayLabel)
+                    }
+                    Text(item.source)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct CacheLibraryMetadata: View {
+    let item: CacheLibraryItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(item.displayTitle)
+                .font(.headline)
+                .lineLimit(2)
+
+            if !item.subtitle.isEmpty {
+                Text(item.subtitle)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            HStack(spacing: 12) {
+                Text(item.source)
+
+                if let primaryVariant = item.primaryVariant {
+                    Text(primaryVariant.displayLabel)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}

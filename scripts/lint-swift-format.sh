@@ -17,5 +17,7 @@ xcrun swift-format lint \
   "${ROOT_DIR}/Package.swift" \
   "${ROOT_DIR}/Sources" \
   "${ROOT_DIR}/Tests" \
+  "${ROOT_DIR}/MacOSNetPlayer" \
+  "${ROOT_DIR}/MacOSNetPlayerTests" \
   "${ROOT_DIR}/TVOSNetPlayer" \
   "${ROOT_DIR}/TVOSNetPlayerTests"

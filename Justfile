@@ -6,13 +6,16 @@ default:
 build:
     scripts/build.sh
 
+build-macos:
+    scripts/build-macos.sh
+
 build-cache-server:
     scripts/build-cache-server.sh
 
 build-for-testing:
     scripts/build-for-testing.sh
 
-ci: lint build build-cache-server build-for-testing test-tvos test test-cache-server
+ci: lint build build-macos build-cache-server build-for-testing test-tvos test test-macos test-cache-server
 
 deploy:
     scripts/deploy-lan.sh
@@ -34,6 +37,9 @@ test:
 
 test-cache-server:
     scripts/test-cache-server.sh
+
+test-macos:
+    scripts/test-macos.sh
 
 test-tvos:
     scripts/test-tvos-simulator.sh
