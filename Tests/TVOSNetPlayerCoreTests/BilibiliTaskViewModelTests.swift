@@ -539,6 +539,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         throw FakeBilibiliCacheControlClientError.notImplemented
     }
 
+    func listCacheRoots() async throws -> [CacheRoot] {
+        throw FakeBilibiliCacheControlClientError.notImplemented
+    }
+
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
@@ -548,6 +552,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     }
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakeBilibiliCacheControlClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
         throw FakeBilibiliCacheControlClientError.notImplemented
     }
 

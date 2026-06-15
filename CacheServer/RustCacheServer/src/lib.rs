@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::{Status, transport::Server};
 
 use crate::{
     bilibili_playback::BilibiliPlaybackPlanner,
@@ -302,6 +302,33 @@ impl AppState {
         }
         self.hls_cache
             .create_playback_source(item_id, variant_id, uri)
+    }
+
+    pub(crate) fn delete_completed_hls_library_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<bool>, Status> {
+        let Some(session_id) = HlsCacheStore::session_id_from_library_item_id(item_id) else {
+            return Ok(None);
+        };
+        if !self.supports_completed_hls_cache_playback() {
+            return Ok(Some(false));
+        }
+        if self.get_completed_hls_library_item(item_id).is_none() {
+            return Ok(Some(false));
+        }
+
+        self.hls_cache
+            .remove_session(&session_id)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "Failed to delete completed HLS cache item: {error}"
+                ))
+            })?;
+        self.hls_sessions.remove(&session_id);
+        self.tasks
+            .remove_completed_playback_task(&session_id, item_id)?;
+        Ok(Some(true))
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {

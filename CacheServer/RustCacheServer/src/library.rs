@@ -99,6 +99,12 @@ impl LocalMediaLibrary {
             .await
     }
 
+    pub async fn delete_item(&self, id: &str) -> io::Result<bool> {
+        let id = id.to_owned();
+        self.run_blocking(move |library, _| library.delete_item_blocking(&id))
+            .await
+    }
+
     pub async fn is_root_available(&self) -> bool {
         self.run_blocking(|library, _| library.is_root_available_blocking())
             .await
@@ -235,6 +241,18 @@ impl LocalMediaLibrary {
         }
 
         root
+    }
+
+    fn delete_item_blocking(&self, id: &str) -> io::Result<bool> {
+        let Some(media_file) = self.resolve_media_file(id, VARIANT_ID) else {
+            return Ok(false);
+        };
+
+        match remove_file_no_follow(&self.root_path(), &media_file.relative_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn is_root_available_blocking(&self) -> bool {
@@ -762,26 +780,9 @@ fn supports_secure_no_follow_open() -> bool {
 
 #[cfg(unix)]
 pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    use std::os::fd::AsRawFd;
 
-    let segments = Path::new(relative_path)
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => CString::new(value.as_bytes()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "path segment contains NUL")
-            }),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "relative path contains non-normal segment",
-            )),
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if segments.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "media file relative path is empty",
-        ));
-    }
+    let segments = relative_path_segments(relative_path)?;
 
     let mut directory = open_path(
         root_path,
@@ -808,6 +809,69 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
         io::ErrorKind::Unsupported,
         "secure no-follow media open is not implemented on this platform",
     ))
+}
+
+#[cfg(unix)]
+fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        directory = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )?;
+    }
+
+    // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
+    let result = unsafe {
+        libc::unlinkat(
+            directory.as_raw_fd(),
+            segments.last().expect("segments is not empty").as_ptr(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+    fs::remove_file(root_path.join(relative_path))
+}
+
+#[cfg(unix)]
+fn relative_path_segments(relative_path: &str) -> io::Result<Vec<CString>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let segments = Path::new(relative_path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => CString::new(value.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path segment contains NUL")
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relative path contains non-normal segment",
+            )),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "media file relative path is empty",
+        ));
+    }
+
+    Ok(segments)
 }
 
 #[cfg(unix)]
@@ -1004,6 +1068,61 @@ mod tests {
                 .item_id_for_media_path_blocking(&internal_path)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn delete_item_removes_local_media_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let movie_dir = root_path.join("Movies");
+        fs::create_dir_all(&movie_dir).unwrap();
+        let movie_path = movie_dir.join("Sample.mp4");
+        fs::write(&movie_path, b"sample").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let movie_path = root_path.join("Movies/Sample.mp4");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+        let item_id = library
+            .item_id_for_media_path_blocking(&movie_path)
+            .expect("movie path should resolve to an item id");
+
+        assert!(
+            library
+                .delete_item_blocking(&item_id)
+                .expect("delete should succeed")
+        );
+        assert!(!movie_path.exists());
+        assert!(
+            !library
+                .delete_item_blocking(&item_id)
+                .expect("second delete should be idempotent")
+        );
+    }
+
+    #[test]
+    fn delete_item_rejects_internal_hls_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
+        fs::write(&internal_path, b"hls").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+
+        assert!(
+            !library
+                .delete_item_blocking(&item_id)
+                .expect("internal HLS delete should be ignored")
+        );
+        assert!(internal_path.exists());
     }
 
     #[test]

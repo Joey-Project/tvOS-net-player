@@ -24,6 +24,8 @@ public final class CacheLibraryViewModel: ObservableObject {
     @Published public private(set) var isLoadingMore = false
     @Published public private(set) var activeSearchText = ""
     @Published public private(set) var items: [CacheLibraryItem] = []
+    @Published public private(set) var cacheRoots: [CacheRoot] = []
+    @Published public private(set) var deletingItemIDs: Set<String> = []
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
@@ -64,8 +66,25 @@ public final class CacheLibraryViewModel: ObservableObject {
         loadedEndpoint != nil && hasMoreItems && !isLoading && !isLoadingMore
     }
 
+    public var cacheRootSummary: String {
+        guard !cacheRoots.isEmpty else {
+            return "Cache roots unavailable."
+        }
+
+        return
+            cacheRoots
+            .map { "\($0.displayLabel): \($0.capacityLabel)" }
+            .joined(separator: "  ")
+    }
+
     public var hasPendingSearch: Bool {
         normalizedSearchText != activeSearchText
+    }
+
+    public func canDelete(_ item: CacheLibraryItem) -> Bool {
+        loadedEndpoint != nil
+            && items.contains(where: { $0.id == item.id })
+            && !deletingItemIDs.contains(item.id)
     }
 
     public func refresh() async {
@@ -74,6 +93,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
+        deletingItemIDs = []
         isLoadingMore = false
         let requestSequence = refreshSequence
         let requestedSearchText = normalizedSearchText
@@ -96,6 +116,9 @@ public final class CacheLibraryViewModel: ObservableObject {
             let serverInfo = try await Self.withOperationTimeout(operationTimeout) {
                 try await client.getServerInfo()
             }
+            let cacheRoots = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listCacheRoots()
+            }
             let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
                 try await client.listLibraryItemsPage(
                     pageToken: "",
@@ -110,6 +133,7 @@ public final class CacheLibraryViewModel: ObservableObject {
 
             loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
+            self.cacheRoots = cacheRoots
             items = libraryPage.items
             nextPageToken = libraryPage.nextPageToken
             requestedLibraryPageTokens = [""]
@@ -124,6 +148,8 @@ public final class CacheLibraryViewModel: ObservableObject {
 
             loadedEndpoint = nil
             items = []
+            cacheRoots = []
+            deletingItemIDs = []
             nextPageToken = ""
             requestedLibraryPageTokens = []
             activeSearchText = ""
@@ -210,6 +236,60 @@ public final class CacheLibraryViewModel: ObservableObject {
             statusMessage = "Could not load more cached videos."
         }
 
+    }
+
+    public func deleteItem(_ item: CacheLibraryItem) async -> Bool {
+        guard canDelete(item) else {
+            if loadedEndpoint == nil {
+                statusMessage = "Refresh cache server to manage cached videos."
+            }
+            return false
+        }
+
+        guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText), endpoint == loadedEndpoint else {
+            clearLoadedLibrary(
+                statusMessage: "Refresh cache server to manage cached videos.",
+                errorMessage: nil
+            )
+            return false
+        }
+
+        let requestSequence = refreshSequence
+        deletingItemIDs.insert(item.id)
+        errorMessage = nil
+        statusMessage = "Deleting \(item.displayTitle)..."
+
+        do {
+            let client = clientFactory(endpoint)
+            let deleted = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.deleteLibraryItem(id: item.id)
+            }
+
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return false
+            }
+
+            deletingItemIDs.remove(item.id)
+            guard deleted else {
+                errorMessage = "Cached item was already deleted."
+                statusMessage = "Could not delete \(item.displayTitle)."
+                return false
+            }
+
+            items.removeAll { $0.id == item.id }
+            clearPlaybackIfNeeded(forDeletedItemID: item.id)
+            statusMessage = "Deleted \(item.displayTitle) from \(serverName). \(loadedLibraryStatusMessage)"
+            return true
+        } catch {
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return false
+            }
+
+            deletingItemIDs.remove(item.id)
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not delete \(item.displayTitle)."
+            return false
+        }
     }
 
     public func playbackURL(for item: CacheLibraryItem) async -> URL? {
@@ -403,6 +483,8 @@ public final class CacheLibraryViewModel: ObservableObject {
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
         items = []
+        cacheRoots = []
+        deletingItemIDs = []
         nextPageToken = ""
         requestedLibraryPageTokens = []
         activeSearchText = ""
@@ -426,6 +508,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         loadMoreSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
+        deletingItemIDs = []
         isLoading = false
         isLoadingMore = false
         errorMessage = nil
@@ -462,6 +545,16 @@ public final class CacheLibraryViewModel: ObservableObject {
 
     private func isCurrentPlayback(_ requestSequence: Int) -> Bool {
         requestSequence == playbackSequence
+    }
+
+    private func clearPlaybackIfNeeded(forDeletedItemID itemID: String) {
+        guard pendingPlaybackItemID == itemID || activePlaybackItemID == itemID else {
+            return
+        }
+
+        playbackSequence += 1
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
     }
 
     private static func withOperationTimeout<Value: Sendable>(

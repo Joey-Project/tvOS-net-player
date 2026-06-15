@@ -655,6 +655,38 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    pub fn remove_completed_playback_task(
+        &self,
+        id: &str,
+        library_item_id: &str,
+    ) -> Result<bool, Status> {
+        let normalized_id = normalize_required_id(id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let Some(task) = inner.tasks_by_id.get(&normalized_id) else {
+            return Ok(false);
+        };
+        if task.kind() != TaskKind::BilibiliProgressivePlayback {
+            return Err(Status::failed_precondition(
+                "Task is not a Bilibili progressive playback task.",
+            ));
+        }
+        if task.state() != TaskState::Completed || task.library_item_id != library_item_id {
+            return Err(Status::failed_precondition(
+                "Only completed playback tasks matching the deleted cache item can be removed.",
+            ));
+        }
+
+        inner.tasks_by_id.remove(&normalized_id);
+        inner.download_options_by_id.remove(&normalized_id);
+        inner.playback_options_by_id.remove(&normalized_id);
+        inner.running_cancellations_by_id.remove(&normalized_id);
+        inner.planning_cancellations_by_id.remove(&normalized_id);
+        let snapshot = self.persistence_snapshot_locked(&mut inner);
+        drop(inner);
+        self.persist_snapshot(snapshot);
+        Ok(true)
+    }
+
     pub fn complete_task_cancelled(&self, id: &str, message: String) -> Result<Task, Status> {
         self.complete_task(id, TaskState::Cancelled, message, None, None)
     }
@@ -1805,6 +1837,70 @@ mod tests {
             .as_ref()
             .expect("restored completed playback should keep a source");
         assert_eq!("bilibili.hls.completed", restored_source.item_id);
+    }
+
+    #[test]
+    fn remove_completed_playback_task_deletes_matching_completed_record() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let created = registry
+            .create_bilibili_playback_task("BV1delete", Some(playback_options("1080p")))
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        let library_item_id = format!("bilibili.hls.{}", created.task.id);
+        registry
+            .complete_playback_cached(&created.task.id, library_item_id.clone())
+            .expect("playback cache should complete");
+
+        assert!(
+            registry
+                .remove_completed_playback_task(&created.task.id, &library_item_id)
+                .expect("completed playback task should be removable")
+        );
+        assert!(registry.get_task(&created.task.id).is_err());
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        assert!(restored.get_task(&created.task.id).is_err());
+    }
+
+    #[test]
+    fn remove_completed_playback_task_rejects_mismatched_or_active_records() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1active", Some(playback_options("1080p")))
+            .expect("playback task should be created");
+
+        let active_error = registry
+            .remove_completed_playback_task(&created.task.id, "bilibili.hls.active")
+            .expect_err("active task should not be removable");
+        assert_eq!(tonic::Code::FailedPrecondition, active_error.code());
+
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        let library_item_id = format!("bilibili.hls.{}", created.task.id);
+        registry
+            .complete_playback_cached(&created.task.id, library_item_id)
+            .expect("playback cache should complete");
+
+        let mismatch_error = registry
+            .remove_completed_playback_task(&created.task.id, "bilibili.hls.other")
+            .expect_err("mismatched item should not be removable");
+        assert_eq!(tonic::Code::FailedPrecondition, mismatch_error.code());
+        assert!(registry.get_task(&created.task.id).is_ok());
     }
 
     #[test]

@@ -91,6 +91,14 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .refreshButton)
             }
 
+            if !cacheModel.cacheRoots.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(cacheModel.cacheRoots) { root in
+                        CacheRootRow(root: root)
+                    }
+                }
+            }
+
             HStack(spacing: 12) {
                 TextField("Search cached videos", text: $cacheModel.searchText)
                     .textContentType(.none)
@@ -136,15 +144,30 @@ struct ContentView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(cacheModel.items) { item in
-                            Button {
-                                Task {
-                                    await playCachedItem(item)
+                            HStack(alignment: .center, spacing: 10) {
+                                Button {
+                                    Task {
+                                        await playCachedItem(item)
+                                    }
+                                } label: {
+                                    CacheLibraryRow(item: item)
                                 }
-                            } label: {
-                                CacheLibraryRow(item: item)
+                                .buttonStyle(.bordered)
+                                .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
+
+                                Button {
+                                    Task {
+                                        await cacheModel.deleteItem(item)
+                                    }
+                                } label: {
+                                    Label(
+                                        cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                        systemImage: "trash"
+                                    )
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!cacheModel.canDelete(item))
                             }
-                            .buttonStyle(.bordered)
-                            .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
                         }
 
                         cacheLoadMoreButton
@@ -366,26 +389,50 @@ private struct CacheLibraryRow: View {
     let item: CacheLibraryItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(item.displayTitle)
-                .font(.headline)
-                .lineLimit(2)
-            if !item.subtitle.isEmpty {
-                Text(item.subtitle)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            HStack(spacing: 10) {
-                if let primaryVariant = item.primaryVariant {
-                    Text(primaryVariant.displayLabel)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: item.availabilitySystemImage)
+                .foregroundStyle(item.hasPlayableVariant ? Color.secondary : Color.red)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(item.displayTitle)
+                    .font(.headline)
+                    .lineLimit(2)
+                if !item.subtitle.isEmpty {
+                    Text(item.subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(item.source)
+                HStack(spacing: 10) {
+                    if let primaryVariant = item.primaryVariant {
+                        Text(primaryVariant.displayLabel)
+                    }
+                    Text(item.availabilityLabel)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 8)
+    }
+}
+
+private struct CacheRootRow: View {
+    let root: CacheRoot
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: root.writable ? "externaldrive.fill" : "lock.fill")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(root.displayLabel)
+                    .font(.caption.weight(.semibold))
+                Text(root.capacityLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .foregroundStyle(.secondary)
     }
 }

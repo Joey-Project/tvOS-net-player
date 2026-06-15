@@ -121,6 +121,10 @@ private actor FakePagedCacheControlClient: CacheControlClient {
         )
     }
 
+    func listCacheRoots() async throws -> [CacheRoot] {
+        []
+    }
+
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
@@ -136,6 +140,10 @@ private actor FakePagedCacheControlClient: CacheControlClient {
     }
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
         throw FakePagedCacheControlClientError.notImplemented
     }
 

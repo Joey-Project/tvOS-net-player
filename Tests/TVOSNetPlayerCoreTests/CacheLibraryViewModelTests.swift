@@ -51,6 +51,97 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshLoadsCacheRoots() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            cacheRoots: [
+                .fixture(id: "default", label: "Local Cache", freeBytes: 64_000_000, totalBytes: 128_000_000)
+            ]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+
+        XCTAssertEqual(model.cacheRoots.map(\.id), ["default"])
+        XCTAssertEqual(model.cacheRoots.first?.displayLabel, "Local Cache")
+        XCTAssertTrue(model.cacheRootSummary.contains("Local Cache"))
+    }
+
+    @MainActor
+    func testDeleteItemRemovesLoadedItemAndCallsClient() async {
+        let firstItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let secondItem = CacheLibraryItem.fixture(id: "item-b", title: "Server B item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [firstItem, secondItem],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let deleted = await model.deleteItem(firstItem)
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(model.items.map(\.id), ["item-b"])
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(
+            model.statusMessage, "Deleted Server A item from Server A. Loaded 1 cached item(s) from Server A.")
+        let requestedDeleteItemIDs = await client.requestedDeleteItemIDs
+        XCTAssertEqual(requestedDeleteItemIDs, ["item-a"])
+    }
+
+    @MainActor
+    func testDeleteItemReportsAlreadyDeletedWithoutRemovingLocalRow() async {
+        let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(),
+            deleteResponsesByItemID: ["item-a": false]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let deleted = await model.deleteItem(item)
+
+        XCTAssertFalse(deleted)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+        XCTAssertEqual(model.errorMessage, "Cached item was already deleted.")
+        XCTAssertEqual(model.statusMessage, "Could not delete Server A item.")
+    }
+
+    @MainActor
+    func testDeleteItemClearsCachedPlaybackStatusForDeletedItem() async throws {
+        let (cacheModel, _) = try await makeConfirmedCachedPlayback()
+        let item = try XCTUnwrap(cacheModel.items.first)
+
+        XCTAssertEqual(cacheModel.statusMessage, "Playing Server A item from Server A.")
+
+        let deleted = await cacheModel.deleteItem(item)
+
+        XCTAssertTrue(deleted)
+        XCTAssertTrue(cacheModel.items.isEmpty)
+        XCTAssertEqual(
+            cacheModel.statusMessage, "Deleted Server A item from Server A. Loaded 0 cached item(s) from Server A.")
+    }
+
+    @MainActor
     func testPlaybackURLRequestsPrimaryVariant() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(),
@@ -1188,6 +1279,9 @@ private actor FakeCacheControlClient: CacheControlClient {
     let serverInfo: CacheServerSummary
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
+    let cacheRoots: [CacheRoot]
+    let deleteResponsesByItemID: [String: Bool]
+    let deleteError: FakeCacheError?
     let libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage]
     let libraryPagesByToken: [String: CacheLibraryItemsPage]
     let getServerInfoDelayNanoseconds: UInt64
@@ -1204,6 +1298,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     private(set) var requestedLibraryPageSizes: [Int] = []
     private(set) var requestedLibraryPageTokens: [String] = []
     private(set) var requestedLibrarySearchTexts: [String?] = []
+    private(set) var requestedDeleteItemIDs: [String] = []
     private(set) var requestedPlayback: (itemID: String, variantID: String)?
     private var getServerInfoWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var serverInfoReleaseContinuations: [CheckedContinuation<Void, Never>] = []
@@ -1223,6 +1318,9 @@ private actor FakeCacheControlClient: CacheControlClient {
         serverInfo: CacheServerSummary,
         items: [CacheLibraryItem],
         playbackSource: CachePlaybackSource,
+        cacheRoots: [CacheRoot] = [.fixture()],
+        deleteResponsesByItemID: [String: Bool] = [:],
+        deleteError: FakeCacheError? = nil,
         libraryPagesByRequest: [LibraryPageRequestKey: CacheLibraryItemsPage] = [:],
         libraryPagesByToken: [String: CacheLibraryItemsPage] = [:],
         getServerInfoDelayNanoseconds: UInt64 = 0,
@@ -1238,6 +1336,9 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.serverInfo = serverInfo
         self.items = items
         self.playbackSource = playbackSource
+        self.cacheRoots = cacheRoots
+        self.deleteResponsesByItemID = deleteResponsesByItemID
+        self.deleteError = deleteError
         self.libraryPagesByRequest = libraryPagesByRequest
         self.libraryPagesByToken = libraryPagesByToken
         self.getServerInfoDelayNanoseconds = getServerInfoDelayNanoseconds
@@ -1272,6 +1373,10 @@ private actor FakeCacheControlClient: CacheControlClient {
             throw getServerInfoError
         }
         return serverInfo
+    }
+
+    func listCacheRoots() async throws -> [CacheRoot] {
+        cacheRoots
     }
 
     func listLibraryItemsPage(
@@ -1312,6 +1417,15 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
 
         return playbackSourcesByItemID[itemID] ?? playbackSource
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
+        requestedDeleteItemIDs.append(id)
+        if let deleteError {
+            throw deleteError
+        }
+
+        return deleteResponsesByItemID[id] ?? true
     }
 
     func getTask(id: String) async throws -> CacheTask {
@@ -1494,6 +1608,26 @@ private enum FakeCacheError: Error {
 extension CacheServerSummary {
     fileprivate static func fixture(name: String = "Mac mini cache") -> Self {
         Self(id: "server-1", name: name, version: "0.1.0", mediaBaseURIs: [], capabilities: [])
+    }
+}
+
+extension CacheRoot {
+    fileprivate static func fixture(
+        id: String = "default",
+        label: String = "Local Cache",
+        writable: Bool = true,
+        freeBytes: Int64 = 128_000_000,
+        totalBytes: Int64 = 256_000_000
+    ) -> Self {
+        Self(
+            id: id,
+            label: label,
+            kind: "CACHE_ROOT_KIND_LOCAL_DIRECTORY",
+            path: "/tmp/cache",
+            writable: writable,
+            freeBytes: freeBytes,
+            totalBytes: totalBytes
+        )
     }
 }
 

@@ -94,6 +94,13 @@ Initial services:
 
 Playback sources intentionally return URLs instead of media bytes.
 
+Cache deletion contract:
+
+- `CacheService.DeleteLibraryItem` accepts the stable library item id visible in `LibraryService` responses and returns `deleted=false` when the item is already gone.
+- Local cache items delete the validated media file under `Cache:RootPath`; internal `.tvos-net-player/hls` files are not addressable as local library items.
+- Completed Bilibili HLS items with ids shaped as `bilibili.hls.<session_id>` delete the HLS cache session directory, remove the runtime HLS session, and remove the persisted completed progressive playback task that authorized the virtual library item.
+- Active or playable-but-not-completed progressive HLS sessions are still controlled through task cancellation, not library item deletion.
+
 ## Deployment Notes
 
 - gRPC Swift 2 is the tvOS client library for the control plane.
@@ -110,11 +117,11 @@ Playback sources intentionally return URLs instead of media bytes.
 4. Add the server-side task worker foundation, adapter boundary, and persisted task state. Done in the worker-foundation slice.
 5. Add the real BBDown crate adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library. Done in the BBDown Rust adapter slice.
 6. Add Bonjour discovery once the manual server URL path works.
-7. Add HLS/progressive caching for weaker network conditions. Done for runtime passthrough, durable manifest restore, and selected-resource offline finalization; transcoding, eviction policy, and richer cache management remain follow-up work.
+7. Add HLS/progressive caching for weaker network conditions. Done for runtime passthrough, durable manifest restore, selected-resource offline finalization, user-visible offline labels, and manual deletion of completed HLS cache items; transcoding and automatic eviction policy remain follow-up work.
 
 ## First Slice Notes
 
-The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Cache deletion, Bonjour discovery, tvOS task submission UI, richer BBDown option mapping, transcoding, and full cache eviction remain follow-up work.
+The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Manual cache item deletion, cache root display, tvOS task submission UI, and completed-HLS offline UX are implemented. Bonjour discovery, richer BBDown option mapping, transcoding, and automatic cache eviction remain follow-up work.
 
 Runtime shape:
 

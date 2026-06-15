@@ -55,6 +55,31 @@ final class CacheLibraryItemTests: XCTestCase {
         XCTAssertFalse(item.hasPlayableVariant)
     }
 
+    func testBilibiliHLSItemExposesOfflineAvailabilityLabels() {
+        let item = CacheLibraryItem.fixture(
+            source: "LIBRARY_SOURCE_BILIBILI",
+            variants: [
+                .fixture(id: "hls", playbackProtocol: "PLAYBACK_PROTOCOL_HLS")
+            ]
+        )
+
+        XCTAssertTrue(item.isOfflineHLSCache)
+        XCTAssertEqual(item.availabilityLabel, "Offline HLS")
+        XCTAssertEqual(item.availabilitySystemImage, "externaldrive.fill.badge.checkmark")
+    }
+
+    func testLocalCacheItemExposesLANAvailabilityLabel() {
+        let item = CacheLibraryItem.fixture(
+            source: "LIBRARY_SOURCE_LOCAL_CACHE",
+            variants: [
+                .fixture(id: "original", playbackProtocol: "PLAYBACK_PROTOCOL_HTTP_FILE")
+            ]
+        )
+
+        XCTAssertFalse(item.isOfflineHLSCache)
+        XCTAssertEqual(item.availabilityLabel, "LAN file")
+    }
+
     func testPlaybackSourceSupportsHTTPFileAndHLSProtocols() {
         let protocolNames = ["httpFile", "PLAYBACK_PROTOCOL_HTTP_FILE", "hls", "PLAYBACK_PROTOCOL_HLS"]
 
@@ -146,12 +171,15 @@ final class CacheLibraryItemTests: XCTestCase {
 }
 
 extension CacheLibraryItem {
-    fileprivate static func fixture(variants: [CacheMediaVariant]) -> Self {
+    fileprivate static func fixture(
+        source: String = "localCache",
+        variants: [CacheMediaVariant]
+    ) -> Self {
         Self(
             id: "item-1",
             title: "Cached video",
             subtitle: "",
-            source: "localCache",
+            source: source,
             sourceID: "item-1",
             posterURI: "",
             variants: variants

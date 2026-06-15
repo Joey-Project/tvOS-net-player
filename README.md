@@ -66,7 +66,7 @@ cargo run --package tvos-net-player-cache-server -- \
 
 `0.0.0.0`、`[::]`、`*` 和 `+` 都会尝试展开为 IPv4/IPv6 双栈 wildcard listener；如果系统不支持某个地址族，只要另一个地址族可用就会继续启动。如果只想暴露某个地址族或某个网卡，请改用具体 LAN IP。
 
-当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS、Bonjour discovery、完整 tvOS task UI 和其他服务端平台的安全媒体打开都是后续工作。Rust server 默认启动真实 Bilibili worker：worker 消费已提交的 task，调用 pin 到指定 commit 的 `bbdown-core`，把输出下载到 cache root 下的 `Bilibili/`，用 `ffmpeg` mux 成 `.mp4`，再把 mux 输出映射成 stable library item id。高频 progress 更新会通过内存状态和 watch 事件暴露，不逐次强制写盘；BBDown core 当前没有逐 chunk callback，所以真实下载中的 progress 是 coarse-grained 阶段状态。
+当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS、Bonjour discovery、自动缓存淘汰和其他服务端平台的安全媒体打开都是后续工作。Rust server 默认启动真实 Bilibili worker：worker 消费已提交的 task，调用 pin 到指定 commit 的 `bbdown-core`，把输出下载到 cache root 下的 `Bilibili/`，用 `ffmpeg` mux 成 `.mp4`，再把 mux 输出映射成 stable library item id。高频 progress 更新会通过内存状态和 watch 事件暴露，不逐次强制写盘；BBDown core 当前没有逐 chunk callback，所以真实下载中的 progress 是 coarse-grained 阶段状态。tvOS/macOS 客户端可以展示 cache root 容量，删除可见 local cache/离线 HLS 库项，并把 completed Bilibili HLS 项标记为 offline HLS。
 
 默认 task state 路径是 server 可执行文件旁的 `cache-server-state/tasks.json`。本机部署建议显式指定，便于备份和排查：
 

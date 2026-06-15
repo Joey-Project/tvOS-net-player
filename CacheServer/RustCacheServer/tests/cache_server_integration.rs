@@ -10,10 +10,10 @@ use tvos_net_player_cache_server::{
     AppState,
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
-        CancelTaskRequest, CheckHealthRequest, CreateBilibiliTaskRequest, GetLibraryItemRequest,
-        GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, LibrarySource,
-        ListCacheRootsRequest, ListLibraryItemsRequest, RescanLibraryRequest, ServerCapability,
-        TaskState, WatchTasksRequest, cache_service_client::CacheServiceClient,
+        CancelTaskRequest, CheckHealthRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
+        GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
+        LibrarySource, ListCacheRootsRequest, ListLibraryItemsRequest, RescanLibraryRequest,
+        ServerCapability, TaskState, WatchTasksRequest, cache_service_client::CacheServiceClient,
         library_service_client::LibraryServiceClient, server_service_client::ServerServiceClient,
         task_service_client::TaskServiceClient,
     },
@@ -242,6 +242,37 @@ async fn supports_cache_roots_rescan_and_bilibili_task_lifecycle() {
     assert!(roots.roots[0].writable);
 
     let mut library_client = LibraryServiceClient::new(channel.clone());
+    let library = library_client
+        .list_library_items(ListLibraryItemsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(1, library.items.len());
+    let deleted = cache_client
+        .delete_library_item(DeleteLibraryItemRequest {
+            id: library.items[0].id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(deleted.deleted);
+    assert!(
+        !server
+            ._temp_root
+            .path()
+            .join("Movies")
+            .join("Sample Clip.mp4")
+            .exists()
+    );
+    let repeated_delete = cache_client
+        .delete_library_item(DeleteLibraryItemRequest {
+            id: library.items[0].id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!repeated_delete.deleted);
+
     let rescan = library_client
         .rescan_library(RescanLibraryRequest {
             cache_root_ids: vec!["default".to_owned()],
@@ -249,7 +280,7 @@ async fn supports_cache_roots_rescan_and_bilibili_task_lifecycle() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(1, rescan.discovered_item_count);
+    assert_eq!(0, rescan.discovered_item_count);
     let missing_root = library_client
         .rescan_library(RescanLibraryRequest {
             cache_root_ids: vec!["missing".to_owned()],

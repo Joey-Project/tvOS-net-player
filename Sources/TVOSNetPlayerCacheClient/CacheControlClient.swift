@@ -14,12 +14,14 @@ public struct CacheLibraryItemsPage: Equatable, Sendable {
 
 public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
+    func listCacheRoots() async throws -> [CacheRoot]
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
         searchText: String?
     ) async throws -> CacheLibraryItemsPage
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource
+    func deleteLibraryItem(id: String) async throws -> Bool
     func getTask(id: String) async throws -> CacheTask
     func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error>
     func cancelTask(id: String) async throws -> CacheTask
