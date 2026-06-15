@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-15
 updated: 2026-06-15
 branch: wip/bilibili-task-ui
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/16
 supersedes: []
 superseded_by:
 ---
