@@ -56,7 +56,9 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     public var canRefresh: Bool {
-        !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isLoading
+        !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isLoading
+            && deletingItemIDs.isEmpty
     }
 
     public var hasMoreItems: Bool {
@@ -92,6 +94,10 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     public func refresh() async {
+        guard deletingItemIDs.isEmpty else {
+            return
+        }
+
         refreshSequence += 1
         loadMoreSequence += 1
         playbackSequence += 1
@@ -283,11 +289,15 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            deletingItemIDs.remove(item.id)
             return false
         }
 
-        deletingItemIDs.remove(item.id)
+        defer {
+            deletingItemIDs.remove(item.id)
+        }
 
+        await refreshCacheRoots(client: client, requestSequence: requestSequence, endpoint: endpoint)
         clearPlaybackIfNeeded(forDeletedItemID: item.id)
         if nextPageToken.isEmpty {
             items.removeAll { $0.id == item.id }
@@ -332,7 +342,31 @@ public final class CacheLibraryViewModel: ObservableObject {
         return true
     }
 
+    private func refreshCacheRoots(
+        client: CacheControlClient,
+        requestSequence: Int,
+        endpoint: CacheServerEndpoint
+    ) async {
+        do {
+            let cacheRoots = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listCacheRoots()
+            }
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+                return
+            }
+
+            self.cacheRoots = cacheRoots
+        } catch {
+            // Cache root capacity is advisory; a transient refresh failure should not make
+            // the already-completed delete look like it failed.
+        }
+    }
+
     public func playbackURL(for item: CacheLibraryItem) async -> URL? {
+        guard !deletingItemIDs.contains(item.id) else {
+            return nil
+        }
+
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
@@ -442,6 +476,10 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
     }
 
+    public func isActivePlaybackItem(_ item: CacheLibraryItem) -> Bool {
+        activePlaybackItemID == item.id
+    }
+
     public func clearPlaybackStatus() {
         guard pendingPlaybackItemID != nil || activePlaybackItemID != nil else {
             return
@@ -539,7 +577,8 @@ public final class CacheLibraryViewModel: ObservableObject {
     private func markSearchPendingIfNeeded(previousValue: String) {
         guard
             normalizedSearchText != Self.normalizedSearchText(previousValue),
-            loadedEndpoint != nil || isLoading
+            loadedEndpoint != nil || isLoading,
+            deletingItemIDs.isEmpty
         else {
             return
         }

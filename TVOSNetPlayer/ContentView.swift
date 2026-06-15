@@ -153,7 +153,11 @@ struct ContentView: View {
                                     CacheLibraryRow(item: item)
                                 }
                                 .buttonStyle(.bordered)
-                                .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
+                                .disabled(
+                                    cacheModel.isLoading
+                                        || cacheModel.deletingItemIDs.contains(item.id)
+                                        || !item.hasPlayableVariant
+                                )
 
                                 Button {
                                     Task {
@@ -353,8 +357,13 @@ struct ContentView: View {
     }
 
     private func deleteCachedItem(_ item: CacheLibraryItem) async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        let shouldStopActivePlayback = cacheModel.isActivePlaybackItem(item)
         let didRemove = await cacheModel.deleteItem(item)
         if didRemove {
+            if shouldStopActivePlayback, model.manualInteractionSequence == manualInteractionSequence {
+                model.stop()
+            }
             bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
         }
     }
