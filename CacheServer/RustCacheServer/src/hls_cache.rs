@@ -631,6 +631,7 @@ async fn download_resource(
             "HLS resource Content-Length {declared} did not match expected size {expected}"
         )));
     }
+    let maximum_length = resource.request.size.or(declared_length);
 
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -661,6 +662,13 @@ async fn download_resource(
             .ok_or_else(|| {
                 HlsCacheError::InvalidResource("HLS resource is too large".to_owned())
             })?;
+        if let Some(maximum_length) = maximum_length
+            && total_length > maximum_length
+        {
+            return Err(HlsCacheError::InvalidResource(format!(
+                "HLS resource body length exceeded expected size {maximum_length}"
+            )));
+        }
         file.write_all(&chunk).await?;
     }
     file.sync_all().await?;
@@ -1182,6 +1190,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_overlong_chunked_hls_cache_response_with_expected_size() {
+        let (upstream_url, _task) = start_overlong_chunked_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let mut session = sample_session("session-overlong", &upstream_url);
+        session.variant.video.request.size = Some(fake_mp4().len() as u64);
+        let temp_path = store
+            .resource_path("session-overlong", "video.m4s")
+            .expect("resource path should be valid")
+            .with_extension("tmp");
+        let client = reqwest::Client::new();
+
+        let error = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect_err("overlong response should be rejected");
+
+        assert!(error.to_string().contains("exceeded expected size"));
+        assert!(!temp_path.exists());
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-overlong")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_unsolicited_partial_hls_cache_response() {
         let (upstream_url, _task) = start_partial_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
@@ -1698,6 +1733,13 @@ mod tests {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_short_mp4))).await
     }
 
+    async fn start_overlong_chunked_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_overlong_chunked_mp4)),
+        )
+        .await
+    }
+
     async fn start_partial_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_partial_mp4))).await
     }
@@ -1749,6 +1791,26 @@ mod tests {
             .header(CONTENT_TYPE, "video/mp4")
             .header(CONTENT_LENGTH, (body.len() - 4).to_string())
             .body(Body::from(body[..body.len() - 4].to_vec()))
+            .unwrap()
+    }
+
+    async fn upstream_overlong_chunked_mp4(headers: HeaderMap) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        let body = fake_mp4();
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::convert::Infallible>(body),
+            Ok::<_, std::convert::Infallible>(b"extra".to_vec()),
+        ]);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "video/mp4")
+            .body(Body::from_stream(chunks))
             .unwrap()
     }
 

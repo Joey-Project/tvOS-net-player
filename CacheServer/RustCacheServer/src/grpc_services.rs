@@ -702,6 +702,7 @@ pub(crate) async fn run_hls_cache_finalization(
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
                     state.hls_sessions.remove(&task_id);
+                    let _ = state.hls_cache.remove_session(&task_id);
                     if let Err(status) = state.tasks.fail_playback_task_after_cache_restore(
                         &task_id,
                         format!("Failed to restore offline HLS cache after restart: {error}"),
@@ -1679,7 +1680,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            root_path
+            !root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)
