@@ -3,28 +3,28 @@ import Combine
 import Foundation
 
 @MainActor
-final class PlayerViewModel: ObservableObject {
-    static let lastStreamURLDefaultsKey = "LastStreamURLText"
+public final class PlayerViewModel: ObservableObject {
+    public static let lastStreamURLDefaultsKey = "LastStreamURLText"
 
-    @Published var streamURLText: String {
+    @Published public var streamURLText: String {
         didSet {
             syncStateAfterInputChange()
         }
     }
-    @Published private(set) var loadedURL: URL?
-    @Published private(set) var player: AVPlayer?
-    @Published private(set) var statusMessage: String
-    @Published private(set) var validationMessage: String?
-    private(set) var manualInteractionSequence = 0
+    @Published public private(set) var loadedURL: URL?
+    @Published public private(set) var player: AVPlayer?
+    @Published public private(set) var statusMessage: String
+    @Published public private(set) var validationMessage: String?
+    public private(set) var manualInteractionSequence = 0
 
     private let defaults: UserDefaults
     private let autoplay: Bool
 
-    var canClear: Bool {
+    public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
     }
 
-    init(defaultStreamURLText: String? = nil, defaults: UserDefaults = .standard, autoplay: Bool = true) {
+    public init(defaultStreamURLText: String? = nil, defaults: UserDefaults = .standard, autoplay: Bool = true) {
         self.defaults = defaults
         self.autoplay = autoplay
 
@@ -36,7 +36,7 @@ final class PlayerViewModel: ObservableObject {
             : "Ready to replay \(initialStreamURLText)."
     }
 
-    func load() {
+    public func load() {
         markManualInteraction()
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
@@ -47,13 +47,13 @@ final class PlayerViewModel: ObservableObject {
         load(url: url, persist: true)
     }
 
-    func load(streamURLText: String) {
+    public func load(streamURLText: String) {
         self.streamURLText = streamURLText
         load()
     }
 
     @discardableResult
-    func loadTransient(streamURLText: String) -> Bool {
+    public func loadTransient(streamURLText: String) -> Bool {
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
             statusMessage = "Cannot load this stream."
@@ -65,7 +65,7 @@ final class PlayerViewModel: ObservableObject {
     }
 
     @discardableResult
-    func loadTransient(streamURLText: String, ifManualInteractionSequenceMatches expectedSequence: Int) -> Bool {
+    public func loadTransient(streamURLText: String, ifManualInteractionSequenceMatches expectedSequence: Int) -> Bool {
         guard manualInteractionSequence == expectedSequence else {
             return false
         }
@@ -89,7 +89,7 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
-    func stop() {
+    public func stop() {
         markManualInteraction()
         player?.pause()
         player = nil
@@ -97,7 +97,7 @@ final class PlayerViewModel: ObservableObject {
         statusMessage = "Stopped."
     }
 
-    func clear() {
+    public func clear() {
         stop()
         streamURLText = ""
         validationMessage = nil
@@ -133,7 +133,7 @@ final class PlayerViewModel: ObservableObject {
         manualInteractionSequence += 1
     }
 
-    nonisolated static func normalizedHTTPURL(from text: String) -> URL? {
+    public nonisolated static func normalizedHTTPURL(from text: String) -> URL? {
         StreamURLNormalizer.normalizedHTTPURL(from: text)
     }
 }

@@ -1,5 +1,5 @@
 import XCTest
-@testable import TVOSNetPlayer
+@testable import TVOSNetPlayerCore
 
 final class PlayerViewModelTests: XCTestCase {
     private var defaultsSuiteName: String!

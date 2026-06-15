@@ -21,7 +21,8 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "TVOSNetPlayerCore"
+            name: "TVOSNetPlayerCore",
+            dependencies: ["TVOSNetPlayerCacheClient"]
         ),
         .target(
             name: "TVOSNetPlayerCacheClient",

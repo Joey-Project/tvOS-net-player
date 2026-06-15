@@ -1,4 +1,5 @@
 import SwiftUI
+import TVOSNetPlayerCore
 
 @main
 struct TVOSNetPlayerApp: App {

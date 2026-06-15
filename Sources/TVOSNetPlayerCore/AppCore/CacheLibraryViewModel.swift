@@ -3,20 +3,20 @@ import Foundation
 import TVOSNetPlayerCacheClient
 
 @MainActor
-final class CacheLibraryViewModel: ObservableObject {
-    static let serverAddressDefaultsKey = "CacheServerAddress"
+public final class CacheLibraryViewModel: ObservableObject {
+    public static let serverAddressDefaultsKey = "CacheServerAddress"
     private static let libraryPreviewPageSize = 200
 
-    @Published var serverAddressText: String {
+    @Published public var serverAddressText: String {
         didSet {
             clearLoadedLibraryIfNeeded(previousValue: oldValue)
         }
     }
-    @Published private(set) var serverName: String = "LAN cache"
-    @Published private(set) var statusMessage: String = "Cache server not connected."
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var isLoading = false
-    @Published private(set) var items: [CacheLibraryItem] = []
+    @Published public private(set) var serverName: String = "LAN cache"
+    @Published public private(set) var statusMessage: String = "Cache server not connected."
+    @Published public private(set) var errorMessage: String?
+    @Published public private(set) var isLoading = false
+    @Published public private(set) var items: [CacheLibraryItem] = []
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
@@ -27,7 +27,7 @@ final class CacheLibraryViewModel: ObservableObject {
     private var pendingPlaybackItemID: String?
     private var activePlaybackItemID: String?
 
-    init(
+    public init(
         defaultServerAddressText: String? = nil,
         defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
@@ -47,11 +47,11 @@ final class CacheLibraryViewModel: ObservableObject {
             defaultServerAddressText ?? defaults.string(forKey: Self.serverAddressDefaultsKey) ?? ""
     }
 
-    var canRefresh: Bool {
+    public var canRefresh: Bool {
         !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isLoading
     }
 
-    func refresh() async {
+    public func refresh() async {
         refreshSequence += 1
         playbackSequence += 1
         pendingPlaybackItemID = nil
@@ -104,7 +104,7 @@ final class CacheLibraryViewModel: ObservableObject {
         isLoading = false
     }
 
-    func playbackURL(for item: CacheLibraryItem) async -> URL? {
+    public func playbackURL(for item: CacheLibraryItem) async -> URL? {
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
@@ -198,7 +198,7 @@ final class CacheLibraryViewModel: ObservableObject {
         }
     }
 
-    func finishPreparedPlayback(for item: CacheLibraryItem, didStartPlayback: Bool) {
+    public func finishPreparedPlayback(for item: CacheLibraryItem, didStartPlayback: Bool) {
         guard items.contains(where: { $0.id == item.id }) else {
             return
         }
@@ -214,7 +214,7 @@ final class CacheLibraryViewModel: ObservableObject {
         }
     }
 
-    func clearPlaybackStatus() {
+    public func clearPlaybackStatus() {
         guard pendingPlaybackItemID != nil || activePlaybackItemID != nil else {
             return
         }

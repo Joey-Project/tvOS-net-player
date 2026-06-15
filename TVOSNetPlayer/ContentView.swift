@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import TVOSNetPlayerCore
 import TVOSNetPlayerCacheClient
 
 struct ContentView: View {
