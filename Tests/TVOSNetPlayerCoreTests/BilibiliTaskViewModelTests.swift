@@ -58,7 +58,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
     func testSubmittingNewTaskDisablesCancellingPreviousTask() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
-            .success(.fixture(id: "old-task", source: "BV1old", state: "TASK_STATE_PLAYABLE"))
+            .success(.playableFixture(id: "old-task", source: "BV1old"))
         ])
         let model = BilibiliTaskViewModel(
             sourceText: "BV1old",
@@ -67,6 +67,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
         XCTAssertEqual(model.currentTask?.id, "old-task")
+        XCTAssertTrue(model.canPlay)
 
         await client.setSuspendsCreateResponses(true)
         model.sourceText = "BV1new"
@@ -76,6 +77,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await client.waitForCreateRequestCount(2)
         XCTAssertTrue(model.isSubmitting)
         XCTAssertFalse(model.canCancel)
+        XCTAssertFalse(model.canPlay)
 
         await model.cancel(serverAddressText: "mac-mini.local:50051")
         let cancelledIDs = await client.cancelledIDsSnapshot()
@@ -87,6 +89,26 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         XCTAssertEqual(model.currentTask?.id, "new-task")
         XCTAssertFalse(model.isSubmitting)
+
+        model.clearTask()
+    }
+
+    func testCompletedPlayableTaskShowsCachedStatus() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1done", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.yield(.playableFixture(source: "BV1done", state: "TASK_STATE_COMPLETED"))
+        await waitUntil(model.currentTask?.state == "TASK_STATE_COMPLETED")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.statusMessage, "Ready video is cached for LAN playback.")
 
         model.clearTask()
     }
@@ -213,6 +235,64 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await cancelTask.value
 
         XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
+        XCTAssertFalse(model.isCancelling)
+        XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
+
+        model.clearTask()
+    }
+
+    func testCancelErrorDoesNotEnableRetryForActiveTask() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1active", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1active",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setSuspendsCancelResponses(true)
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+
+        await client.completeNextCancel(with: .failure(FakeBilibiliCacheControlClientError.cancelFailed))
+        await cancelTask.value
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_PREPARING")
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertFalse(model.canRetry)
+
+        model.clearTask()
+    }
+
+    func testLateCancelErrorDoesNotOverwriteTerminalWatchUpdate() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1race", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1race",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.setSuspendsCancelResponses(true)
+
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+        XCTAssertTrue(model.isCancelling)
+
+        await client.yield(.fixture(source: "BV1race", state: "TASK_STATE_CANCELLED"))
+        await waitUntil(model.currentTask?.state == "TASK_STATE_CANCELLED")
+        await client.completeNextCancel(with: .failure(FakeBilibiliCacheControlClientError.cancelFailed))
+        await cancelTask.value
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
+        XCTAssertNil(model.errorMessage)
         XCTAssertFalse(model.isCancelling)
         XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
 
@@ -489,6 +569,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 private enum FakeBilibiliCacheControlClientError: Error {
     case notImplemented
     case noCreateResponse
+    case cancelFailed
 }
 
 private extension CacheTask {
@@ -516,20 +597,25 @@ private extension CacheTask {
         )
     }
 
-    static func playableFixture(source: String = "BV1test") -> Self {
+    static func playableFixture(
+        id: String = "bilibili-playback-1",
+        source: String = "BV1test",
+        state: String = "TASK_STATE_PLAYABLE"
+    ) -> Self {
         .fixture(
+            id: id,
             source: source,
-            state: "TASK_STATE_PLAYABLE",
+            state: state,
             progress: 1,
             message: "Bilibili playback session is playable.",
             playbackSource: CachePlaybackSource(
-                itemID: "bilibili-playback-1",
+                itemID: id,
                 variantID: "h264",
                 playbackProtocol: "PLAYBACK_PROTOCOL_HLS",
-                uri: "http://mac-mini.local:8080/hls/bilibili-playback-1/master.m3u8"
+                uri: "http://mac-mini.local:8080/hls/\(id)/master.m3u8"
             ),
             playbackSession: CacheBilibiliPlaybackSession(
-                id: "bilibili-playback-1",
+                id: id,
                 title: "Ready video",
                 contentID: "BV1ready-cid1",
                 selectedVariantID: "h264",

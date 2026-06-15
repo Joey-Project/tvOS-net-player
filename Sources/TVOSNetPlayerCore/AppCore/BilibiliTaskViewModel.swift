@@ -64,15 +64,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return false
         }
 
-        if errorMessage != nil {
-            return true
+        guard let currentTask else {
+            return errorMessage != nil
         }
 
-        return currentTask?.isRetryableBilibiliTaskState == true
+        return currentTask.isRetryableBilibiliTaskState
     }
 
     public var canPlay: Bool {
-        playableURL != nil
+        !isSubmitting && !isCancelling && playableURL != nil
     }
 
     public var progress: Double? {
@@ -215,6 +215,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
+            if let currentTask = self.currentTask,
+                currentTask.id == targetTaskID,
+                currentTask.isTerminalBilibiliTaskState
+            {
+                statusMessage = Self.statusMessage(for: currentTask)
+                isCancelling = false
+                return
+            }
+
             errorMessage = error.localizedDescription
             statusMessage = "Could not cancel \(currentTask.bilibiliDisplayTitle)."
             isCancelling = false
@@ -321,12 +330,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private static func statusMessage(for task: CacheTask) -> String {
-        if task.isPlayableBilibiliTaskState, task.playableBilibiliURL != nil {
-            return "\(task.bilibiliDisplayTitle) is ready to play."
-        }
-
         if task.isCompletedBilibiliTaskState {
             return "\(task.bilibiliDisplayTitle) is cached for LAN playback."
+        }
+
+        if task.isPlayableBilibiliTaskState, task.playableBilibiliURL != nil {
+            return "\(task.bilibiliDisplayTitle) is ready to play."
         }
 
         if task.isFailedBilibiliTaskState {
