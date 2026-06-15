@@ -419,7 +419,12 @@ fn default_selection_for_input(input: &Input) -> Option<Selection> {
         | Input::CollectionList(_)
         | Input::SeriesList(_)
         | Input::SpaceCollectionList { .. }
-        | Input::SpaceSeriesList { .. } => Some(Selection::Latest),
+        | Input::SpaceSeriesList { .. }
+        | Input::RecommendationFeed
+        | Input::FollowingFeed
+        | Input::SpaceDynamic(_)
+        | Input::History
+        | Input::WatchLater => Some(Selection::Latest),
         Input::Aid(_)
         | Input::Bvid(_)
         | Input::Episode(_)
@@ -1410,6 +1415,26 @@ mod tests {
         assert_eq!(
             default_selection_for_input(&Input::CheeseEpisode(101)),
             Some(Selection::Current)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::RecommendationFeed),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::FollowingFeed),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::SpaceDynamic(123)),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::History),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::WatchLater),
+            Some(Selection::Latest)
         );
     }
 
