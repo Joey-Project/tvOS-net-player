@@ -191,6 +191,78 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleDeleteConfirmationDoesNotMutateNewEndpointPlaybackOrDeleteState() async {
+        let originalItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let replacementItem = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server B item",
+            variants: [.fixture(id: "original")]
+        )
+        let originalClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [originalItem],
+            playbackSource: .fixture(),
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let replacementClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server B"),
+            items: [replacementItem],
+            playbackSource: .fixture(
+                itemID: "item-a",
+                uri: "http://server-b.local:8080/media/item-a/original"
+            ),
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.host == "server-a.local" ? originalClient : replacementClient
+            }
+        )
+
+        await model.refresh()
+        var originalDeleteConfirmed = false
+        let originalDeleteTask = Task {
+            await model.deleteItem(originalItem) {
+                originalDeleteConfirmed = true
+            }
+        }
+        await originalClient.waitForDeleteRequest(itemID: "item-a")
+
+        model.serverAddressText = "server-b.local:50051"
+        await model.refresh()
+        let preparedURL = await model.playbackURL(for: replacementItem)
+        XCTAssertNotNil(preparedURL)
+        model.finishPreparedPlayback(for: replacementItem, didStartPlayback: true)
+        XCTAssertTrue(model.isActivePlaybackItem(replacementItem))
+
+        var replacementDeleteConfirmed = false
+        let replacementDeleteTask = Task {
+            await model.deleteItem(replacementItem) {
+                replacementDeleteConfirmed = true
+            }
+        }
+        await replacementClient.waitForDeleteRequest(itemID: "item-a")
+
+        await originalClient.releaseDeleteRequest(itemID: "item-a")
+        let originalDeleted = await originalDeleteTask.value
+
+        XCTAssertTrue(originalDeleted)
+        XCTAssertFalse(originalDeleteConfirmed)
+        XCTAssertTrue(model.isActivePlaybackItem(replacementItem))
+        XCTAssertTrue(model.deletingItemIDs.contains("item-a"))
+
+        await replacementClient.releaseDeleteRequest(itemID: "item-a")
+        let replacementDeleted = await replacementDeleteTask.value
+
+        XCTAssertTrue(replacementDeleted)
+        XCTAssertTrue(replacementDeleteConfirmed)
+        XCTAssertFalse(model.isActivePlaybackItem(replacementItem))
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+    }
+
+    @MainActor
     func testDeleteItemErrorDoesNotMutateNewEndpointAfterAddressChange() async {
         let originalItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let replacementItem = CacheLibraryItem.fixture(id: "item-a", title: "Server B item")

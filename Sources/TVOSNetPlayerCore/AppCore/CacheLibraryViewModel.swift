@@ -36,6 +36,8 @@ public final class CacheLibraryViewModel: ObservableObject {
     private var requestedLibraryPageTokens: Set<String> = []
     private var refreshSequence = 0
     private var loadMoreSequence = 0
+    private var deleteOperationSequence = 0
+    private var deletingItemOperationIDs: [String: Int] = [:]
     private var playbackSequence = 0
     private var pendingPlaybackItemID: String?
     private var activePlaybackItemID: String?
@@ -104,6 +106,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
         deletingItemIDs = []
+        deletingItemOperationIDs = [:]
         isLoadingMore = false
         let requestSequence = refreshSequence
         let requestedSearchText = normalizedSearchText
@@ -270,9 +273,12 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         let requestSequence = refreshSequence
+        deleteOperationSequence += 1
+        let deleteOperationID = deleteOperationSequence
+        deletingItemOperationIDs[item.id] = deleteOperationID
         deletingItemIDs.insert(item.id)
         defer {
-            deletingItemIDs.remove(item.id)
+            finishDeletingItem(id: item.id, operationID: deleteOperationID)
         }
         errorMessage = nil
         statusMessage = "Deleting \(item.displayTitle)..."
@@ -293,12 +299,12 @@ public final class CacheLibraryViewModel: ObservableObject {
             return false
         }
 
-        clearPlaybackIfNeeded(forDeletedItemID: item.id)
-        onDeleteConfirmed?()
-
         guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
             return true
         }
+
+        clearPlaybackIfNeeded(forDeletedItemID: item.id)
+        onDeleteConfirmed?()
 
         await refreshCacheRoots(client: client, requestSequence: requestSequence, endpoint: endpoint)
         guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
@@ -569,6 +575,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         items = []
         cacheRoots = []
         deletingItemIDs = []
+        deletingItemOperationIDs = [:]
         canDeleteLibraryItems = false
         nextPageToken = ""
         requestedLibraryPageTokens = []
@@ -595,6 +602,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
         deletingItemIDs = []
+        deletingItemOperationIDs = [:]
         isLoading = false
         isLoadingMore = false
         errorMessage = nil
@@ -641,6 +649,15 @@ public final class CacheLibraryViewModel: ObservableObject {
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
+    }
+
+    private func finishDeletingItem(id itemID: String, operationID: Int) {
+        guard deletingItemOperationIDs[itemID] == operationID else {
+            return
+        }
+
+        deletingItemOperationIDs[itemID] = nil
+        deletingItemIDs.remove(itemID)
     }
 
     private static func withOperationTimeout<Value: Sendable>(
