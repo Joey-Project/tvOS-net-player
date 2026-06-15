@@ -9,14 +9,12 @@
 /* Begin PBXBuildFile section */
 		D00000000000000000000001 /* TVOSNetPlayerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* TVOSNetPlayerApp.swift */; };
 		D00000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* ContentView.swift */; };
-		D00000000000000000000003 /* PlayerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* PlayerViewModel.swift */; };
 		D00000000000000000000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000005 /* Assets.xcassets */; };
-		D00000000000000000000005 /* PlayerViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000006 /* PlayerViewModelTests.swift */; };
-		D00000000000000000000006 /* StreamURLNormalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000008 /* StreamURLNormalizer.swift */; };
-		D00000000000000000000007 /* CacheLibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000009 /* CacheLibraryViewModel.swift */; };
-		D00000000000000000000008 /* CacheLibraryViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000A /* CacheLibraryViewModelTests.swift */; };
 		D00000000000000000000009 /* TVOSNetPlayerCacheClient in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000002 /* TVOSNetPlayerCacheClient */; };
 		D0000000000000000000000A /* TVOSNetPlayerCacheClient in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000002 /* TVOSNetPlayerCacheClient */; };
+		D0000000000000000000000B /* TVOSNetPlayerCore in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000003 /* TVOSNetPlayerCore */; };
+		D0000000000000000000000C /* TVOSNetPlayerCore in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000003 /* TVOSNetPlayerCore */; };
+		D0000000000000000000000D /* AppCoreIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000B /* AppCoreIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,14 +30,13 @@
 /* Begin PBXFileReference section */
 		B00000000000000000000001 /* TVOSNetPlayerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TVOSNetPlayerApp.swift; sourceTree = "<group>"; };
 		B00000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		B00000000000000000000003 /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewModel.swift; sourceTree = "<group>"; };
 		B00000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B00000000000000000000005 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		B00000000000000000000006 /* PlayerViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewModelTests.swift; sourceTree = "<group>"; };
 		B00000000000000000000007 /* Project.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Project.xcconfig; sourceTree = "<group>"; };
 		B00000000000000000000008 /* StreamURLNormalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamURLNormalizer.swift; sourceTree = "<group>"; };
-		B00000000000000000000009 /* CacheLibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLibraryViewModel.swift; sourceTree = "<group>"; };
-		B0000000000000000000000A /* CacheLibraryViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLibraryViewModelTests.swift; sourceTree = "<group>"; };
+		B0000000000000000000000B /* AppCoreIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppCoreIntegrationTests.swift; sourceTree = "<group>"; };
+		B0000000000000000000000C /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerViewModel.swift; sourceTree = "<group>"; };
+		B0000000000000000000000D /* CacheLibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLibraryViewModel.swift; sourceTree = "<group>"; };
 		C00000000000000000000001 /* TVOSNetPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TVOSNetPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000002 /* TVOSNetPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TVOSNetPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -49,6 +46,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D0000000000000000000000B /* TVOSNetPlayerCore in Frameworks */,
 				D00000000000000000000009 /* TVOSNetPlayerCacheClient in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -57,6 +55,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D0000000000000000000000C /* TVOSNetPlayerCore in Frameworks */,
 				D0000000000000000000000A /* TVOSNetPlayerCacheClient in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -80,8 +79,6 @@
 			children = (
 				B00000000000000000000001 /* TVOSNetPlayerApp.swift */,
 				B00000000000000000000002 /* ContentView.swift */,
-				B00000000000000000000003 /* PlayerViewModel.swift */,
-				B00000000000000000000009 /* CacheLibraryViewModel.swift */,
 				B00000000000000000000004 /* Info.plist */,
 				B00000000000000000000005 /* Assets.xcassets */,
 			);
@@ -92,15 +89,24 @@
 			isa = PBXGroup;
 			children = (
 				B00000000000000000000008 /* StreamURLNormalizer.swift */,
+				A00000000000000000000008 /* AppCore */,
 			);
 			path = Sources/TVOSNetPlayerCore;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000008 /* AppCore */ = {
+			isa = PBXGroup;
+			children = (
+				B0000000000000000000000C /* PlayerViewModel.swift */,
+				B0000000000000000000000D /* CacheLibraryViewModel.swift */,
+			);
+			path = AppCore;
 			sourceTree = "<group>";
 		};
 		A00000000000000000000004 /* TVOSNetPlayerTests */ = {
 			isa = PBXGroup;
 			children = (
-				B00000000000000000000006 /* PlayerViewModelTests.swift */,
-				B0000000000000000000000A /* CacheLibraryViewModelTests.swift */,
+				B0000000000000000000000B /* AppCoreIntegrationTests.swift */,
 			);
 			path = TVOSNetPlayerTests;
 			sourceTree = "<group>";
@@ -139,6 +145,7 @@
 			);
 			name = TVOSNetPlayer;
 			packageProductDependencies = (
+				I00000000000000000000003 /* TVOSNetPlayerCore */,
 				I00000000000000000000002 /* TVOSNetPlayerCacheClient */,
 			);
 			productName = TVOSNetPlayer;
@@ -160,6 +167,7 @@
 			);
 			name = TVOSNetPlayerTests;
 			packageProductDependencies = (
+				I00000000000000000000003 /* TVOSNetPlayerCore */,
 				I00000000000000000000002 /* TVOSNetPlayerCacheClient */,
 			);
 			productName = TVOSNetPlayerTests;
@@ -232,9 +240,6 @@
 			files = (
 				D00000000000000000000001 /* TVOSNetPlayerApp.swift in Sources */,
 				D00000000000000000000002 /* ContentView.swift in Sources */,
-				D00000000000000000000003 /* PlayerViewModel.swift in Sources */,
-				D00000000000000000000007 /* CacheLibraryViewModel.swift in Sources */,
-				D00000000000000000000006 /* StreamURLNormalizer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -242,8 +247,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D00000000000000000000005 /* PlayerViewModelTests.swift in Sources */,
-				D00000000000000000000008 /* CacheLibraryViewModelTests.swift in Sources */,
+				D0000000000000000000000D /* AppCoreIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -503,6 +507,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = J00000000000000000000001 /* XCLocalSwiftPackageReference "." */;
 			productName = TVOSNetPlayerCacheClient;
+		};
+		I00000000000000000000003 /* TVOSNetPlayerCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = J00000000000000000000001 /* XCLocalSwiftPackageReference "." */;
+			productName = TVOSNetPlayerCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

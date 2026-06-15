@@ -1,6 +1,6 @@
 import XCTest
 import TVOSNetPlayerCacheClient
-@testable import TVOSNetPlayer
+@testable import TVOSNetPlayerCore
 
 final class CacheLibraryViewModelTests: XCTestCase {
     private var defaultsSuiteName: String!
