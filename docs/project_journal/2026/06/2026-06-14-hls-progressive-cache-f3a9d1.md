@@ -153,6 +153,8 @@ superseded_by:
   - Local library direct item resolution now rejects internal `.tvos-net-player/hls` cache paths, not only recursive enumeration.
   - HLS cache writes, reads, and removals now reject symlinked store roots, session directories, temporary resource paths, and final resource targets before creating, renaming, or deleting cache files.
   - HLS cache read paths now reject symlinked session directories, `session.json` manifests, metadata JSON files, and resource parent paths before startup restore, library listing, or cached media lookup can trust on-disk HLS cache entries.
+  - Restart restore now preserves the originally request-derived HLS playback URI when `Cache:PublicMediaBaseUri` is unset, while still refreshing restored URIs when an explicit public media base is configured.
+  - Secure no-follow media opens now use the existing `openat` implementation on Unix platforms instead of macOS only, so completed offline HLS resources can be served on Linux/macOS without falling back to scrubbed upstream URLs.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -187,6 +189,22 @@ superseded_by:
   - `git diff --check`
   - Project journal validation passed.
   - `just ci` after symlink read hardening; log: `.codex-tmp/pr4-final-just-ci-after-symlink-read-fixes.log`
+  - `cargo test --package tvos-net-player-cache-server --locked preserves_restored_hls_uri -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked refreshes_restored_hls_uri -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked preserves_existing_restored_hls_uri -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked` after restored URI preservation: 139 lib tests and 6 integration tests passed.
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - Project journal validation passed.
+  - `just ci` after restored URI preservation; log: `.codex-tmp/pr4-final-just-ci-after-restored-uri-fix.log`
+  - `cargo test --package tvos-net-player-cache-server --locked restored_hls_uri -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked root_availability_rejects_symlink_ancestor -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_segment_serves_cached_resource_with_range -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked` after Unix no-follow open support: 139 lib tests and 6 integration tests passed.
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - Project journal validation passed.
+  - `just ci` after Unix no-follow open support; log: `.codex-tmp/pr4-final-just-ci-after-unix-nofollow-fix.log`
   - `cargo test --package tvos-net-player-cache-server --locked` after symlink write hardening: 132 lib tests and 6 integration tests passed.
   - `cargo fmt --all -- --check`
   - `git diff --check`

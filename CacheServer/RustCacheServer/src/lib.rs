@@ -308,7 +308,12 @@ fn refresh_restored_hls_playback_source(
         item_id,
         variant_id: session.variant.id.clone(),
         protocol: PlaybackProtocol::Hls.into(),
-        uri: playback_uri_factory.create_hls_master_playlist_for_runtime(&session.id),
+        uri: playback_uri_factory.create_hls_master_playlist_for_restored_task(
+            &session.id,
+            task.playback_source
+                .as_ref()
+                .map(|source| source.uri.as_str()),
+        ),
         expires_at: None,
     };
 

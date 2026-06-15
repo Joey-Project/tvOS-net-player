@@ -750,17 +750,17 @@ fn is_within_root(root_path: &Path, candidate_path: &Path) -> bool {
     candidate_path == root_path || candidate_path.starts_with(root_path)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn supports_secure_no_follow_open() -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn supports_secure_no_follow_open() -> bool {
     false
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
@@ -802,7 +802,7 @@ pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -810,7 +810,7 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_path(path: &Path, flags: i32) -> io::Result<File> {
     use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
 
@@ -826,7 +826,7 @@ fn open_path(path: &Path, flags: i32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_at(directory_fd: i32, path: &CString, flags: i32) -> io::Result<File> {
     use std::os::fd::FromRawFd;
 

@@ -1769,6 +1769,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_preserves_restored_hls_uri_without_public_media_base() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: None,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1offline", None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        let lan_uri = format!("http://10.0.0.5:8080/hls/{}/master.m3u8", creation.task.id);
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: lan_uri.clone(),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &metadata.hls_session)
+            .await
+            .expect("HLS resources should cache");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let completed = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should restore");
+
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(
+            lan_uri,
+            completed
+                .playback_source
+                .as_ref()
+                .expect("restored task should keep playback source")
+                .uri
+        );
+    }
+
+    #[tokio::test]
     async fn app_state_scrubs_completed_hls_manifest_during_restart_recovery() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
