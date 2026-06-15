@@ -359,11 +359,12 @@ struct ContentView: View {
     private func deleteCachedItem(_ item: CacheLibraryItem) async {
         let manualInteractionSequence = model.manualInteractionSequence
         let shouldStopActivePlayback = cacheModel.isActivePlaybackItem(item)
-        let didRemove = await cacheModel.deleteItem(item)
-        if didRemove {
+        let didRemove = await cacheModel.deleteItem(item) {
             if shouldStopActivePlayback, model.manualInteractionSequence == manualInteractionSequence {
                 model.stop()
             }
+        }
+        if didRemove {
             bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
         }
     }

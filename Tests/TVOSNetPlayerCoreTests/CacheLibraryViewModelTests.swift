@@ -101,6 +101,139 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDeleteItemConfirmsBeforeAdvisoryRefreshCompletes() async throws {
+        let item = CacheLibraryItem.fixture(
+            id: "item-a",
+            title: "Server A item",
+            variants: [.fixture(id: "original")]
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(
+                itemID: "item-a",
+                uri: "http://mac-mini.local:8080/media/item-a/original"
+            ),
+            suspendedCacheRootCallCounts: [2],
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let preparedURL = await model.playbackURL(for: item)
+        XCTAssertNotNil(preparedURL)
+        model.finishPreparedPlayback(for: item, didStartPlayback: true)
+        XCTAssertTrue(model.isActivePlaybackItem(item))
+
+        var didConfirmDelete = false
+        let deleteTask = Task {
+            await model.deleteItem(item) {
+                didConfirmDelete = true
+            }
+        }
+        await client.waitForDeleteRequest(itemID: "item-a")
+        await client.releaseDeleteRequest(itemID: "item-a")
+        await client.waitForCacheRootRequest(callCount: 2)
+
+        XCTAssertTrue(didConfirmDelete)
+        XCTAssertFalse(model.isActivePlaybackItem(item))
+        XCTAssertTrue(model.deletingItemIDs.contains("item-a"))
+
+        await client.releaseCacheRootRequest(callCount: 2)
+        let deleted = await deleteTask.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+    }
+
+    @MainActor
+    func testDeleteItemDoesNotMutateNewEndpointAfterAdvisoryRefresh() async {
+        let originalItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let replacementItem = CacheLibraryItem.fixture(id: "item-a", title: "Server B item")
+        let originalClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [originalItem],
+            playbackSource: .fixture(),
+            suspendedCacheRootCallCounts: [2]
+        )
+        let replacementClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server B"),
+            items: [replacementItem],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.host == "server-a.local" ? originalClient : replacementClient
+            }
+        )
+
+        await model.refresh()
+        let deleteTask = Task {
+            await model.deleteItem(originalItem)
+        }
+        await originalClient.waitForCacheRootRequest(callCount: 2)
+
+        model.serverAddressText = "server-b.local:50051"
+        await model.refresh()
+        await originalClient.releaseCacheRootRequest(callCount: 2)
+        let deleted = await deleteTask.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(model.serverName, "Server B")
+        XCTAssertEqual(model.items.map(\.displayTitle), ["Server B item"])
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) from Server B.")
+    }
+
+    @MainActor
+    func testDeleteItemErrorDoesNotMutateNewEndpointAfterAddressChange() async {
+        let originalItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let replacementItem = CacheLibraryItem.fixture(id: "item-a", title: "Server B item")
+        let originalClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [originalItem],
+            playbackSource: .fixture(),
+            deleteError: .serverUnavailable,
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let replacementClient = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server B"),
+            items: [replacementItem],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.host == "server-a.local" ? originalClient : replacementClient
+            }
+        )
+
+        await model.refresh()
+        let deleteTask = Task {
+            await model.deleteItem(originalItem)
+        }
+        await originalClient.waitForDeleteRequest(itemID: "item-a")
+
+        model.serverAddressText = "server-b.local:50051"
+        await model.refresh()
+        await originalClient.releaseDeleteRequest(itemID: "item-a")
+        let deleted = await deleteTask.value
+
+        XCTAssertFalse(deleted)
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+        XCTAssertEqual(model.serverName, "Server B")
+        XCTAssertEqual(model.items.map(\.displayTitle), ["Server B item"])
+        XCTAssertEqual(model.statusMessage, "Loaded 1 cached item(s) from Server B.")
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
     func testDeleteItemRequiresServerCapability() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(
@@ -1551,11 +1684,13 @@ private actor FakeCacheControlClient: CacheControlClient {
     let getServerInfoIgnoresCancellation: Bool
     let suspendServerInfoUntilReleased: Bool
     let suspendedServerInfoCallCounts: Set<Int>
+    let suspendedCacheRootCallCounts: Set<Int>
     let suspendedLibraryPageTokens: Set<String>
     let suspendedPlaybackItemIDs: Set<String>
     let suspendedDeleteItemIDs: Set<String>
 
     private(set) var getServerInfoCallCount = 0
+    private(set) var cacheRootCallCount = 0
     private(set) var requestedLibraryPageSizes: [Int] = []
     private(set) var requestedLibraryPageTokens: [String] = []
     private(set) var requestedLibrarySearchTexts: [String?] = []
@@ -1567,6 +1702,9 @@ private actor FakeCacheControlClient: CacheControlClient {
     private var serverInfoCallReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var serverInfoRequestsReleased = false
     private var releasedServerInfoCallCounts: Set<Int> = []
+    private var cacheRootWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var cacheRootReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var releasedCacheRootCallCounts: Set<Int> = []
     private var libraryPageWaiters: [(pageToken: String, continuation: CheckedContinuation<Void, Never>)] = []
     private var libraryPageReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var requestedLibraryPageTokenSet: Set<String> = []
@@ -1599,6 +1737,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         getServerInfoIgnoresCancellation: Bool = false,
         suspendServerInfoUntilReleased: Bool = false,
         suspendedServerInfoCallCounts: Set<Int> = [],
+        suspendedCacheRootCallCounts: Set<Int> = [],
         suspendedLibraryPageTokens: Set<String> = [],
         suspendedPlaybackItemIDs: Set<String> = [],
         suspendedDeleteItemIDs: Set<String> = []
@@ -1620,6 +1759,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
         self.suspendServerInfoUntilReleased = suspendServerInfoUntilReleased
         self.suspendedServerInfoCallCounts = suspendedServerInfoCallCounts
+        self.suspendedCacheRootCallCounts = suspendedCacheRootCallCounts
         self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
         self.suspendedPlaybackItemIDs = suspendedPlaybackItemIDs
         self.suspendedDeleteItemIDs = suspendedDeleteItemIDs
@@ -1649,6 +1789,13 @@ private actor FakeCacheControlClient: CacheControlClient {
     }
 
     func listCacheRoots() async throws -> [CacheRoot] {
+        cacheRootCallCount += 1
+        let callCount = cacheRootCallCount
+        notifyCacheRootWaiters()
+        if suspendedCacheRootCallCounts.contains(callCount) {
+            await waitForCacheRootRelease(callCount: callCount)
+        }
+
         if cacheRootResponseIndex < cacheRootResponses.count {
             let response = cacheRootResponses[cacheRootResponseIndex]
             cacheRootResponseIndex += 1
@@ -1749,6 +1896,22 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
     }
 
+    func waitForCacheRootRequest(callCount: Int) async {
+        guard cacheRootCallCount < callCount else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            cacheRootWaiters.append((callCount, continuation))
+        }
+    }
+
+    func releaseCacheRootRequest(callCount: Int) {
+        releasedCacheRootCallCounts.insert(callCount)
+        let continuations = cacheRootReleaseContinuations.removeValue(forKey: callCount) ?? []
+        continuations.forEach { $0.resume() }
+    }
+
     func releaseServerInfoRequests() {
         serverInfoRequestsReleased = true
         let continuations = serverInfoReleaseContinuations
@@ -1821,6 +1984,29 @@ private actor FakeCacheControlClient: CacheControlClient {
             return true
         }
         readyContinuations.forEach { $0.resume() }
+    }
+
+    private func notifyCacheRootWaiters() {
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        cacheRootWaiters.removeAll { waiter in
+            guard cacheRootCallCount >= waiter.minimumCallCount else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
+    }
+
+    private func waitForCacheRootRelease(callCount: Int) async {
+        guard !releasedCacheRootCallCounts.contains(callCount) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            cacheRootReleaseContinuations[callCount, default: []].append(continuation)
+        }
     }
 
     private func waitForServerInfoRelease() async {

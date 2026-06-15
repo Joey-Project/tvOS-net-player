@@ -250,7 +250,10 @@ public final class CacheLibraryViewModel: ObservableObject {
 
     }
 
-    public func deleteItem(_ item: CacheLibraryItem) async -> Bool {
+    public func deleteItem(
+        _ item: CacheLibraryItem,
+        onDeleteConfirmed: (() -> Void)? = nil
+    ) async -> Bool {
         guard canDelete(item) else {
             if loadedEndpoint == nil {
                 statusMessage = "Refresh cache server to manage cached videos."
@@ -268,6 +271,9 @@ public final class CacheLibraryViewModel: ObservableObject {
 
         let requestSequence = refreshSequence
         deletingItemIDs.insert(item.id)
+        defer {
+            deletingItemIDs.remove(item.id)
+        }
         errorMessage = nil
         statusMessage = "Deleting \(item.displayTitle)..."
 
@@ -282,23 +288,23 @@ public final class CacheLibraryViewModel: ObservableObject {
                 return false
             }
 
-            deletingItemIDs.remove(item.id)
             errorMessage = error.localizedDescription
             statusMessage = "Could not delete \(item.displayTitle)."
             return false
         }
 
-        guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
-            deletingItemIDs.remove(item.id)
-            return false
-        }
+        clearPlaybackIfNeeded(forDeletedItemID: item.id)
+        onDeleteConfirmed?()
 
-        defer {
-            deletingItemIDs.remove(item.id)
+        guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            return true
         }
 
         await refreshCacheRoots(client: client, requestSequence: requestSequence, endpoint: endpoint)
-        clearPlaybackIfNeeded(forDeletedItemID: item.id)
+        guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            return true
+        }
+
         if nextPageToken.isEmpty {
             items.removeAll { $0.id == item.id }
         } else {
