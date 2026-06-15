@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -47,8 +47,8 @@ impl HlsCacheStore {
 
     pub(crate) fn save_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
         let session_dir = self.session_dir(&session.id)?;
-        fs::create_dir_all(&session_dir)?;
-        write_json_atomically(
+        self.ensure_cache_directory(&session_dir)?;
+        self.write_json_atomically(
             &session_dir.join("session.json"),
             &PersistedHlsSession::from(session.clone()),
         )
@@ -60,6 +60,7 @@ impl HlsCacheStore {
 
     pub(crate) fn remove_session(&self, session_id: &str) -> io::Result<()> {
         let session_dir = self.session_dir(session_id)?;
+        self.reject_cache_path_symlink(&session_dir)?;
         match fs::remove_dir_all(session_dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -68,7 +69,9 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn load_sessions(&self) -> io::Result<Vec<HlsPlaybackSession>> {
-        let entries = match fs::read_dir(self.store_root()) {
+        let store_root = self.store_root();
+        self.reject_cache_path_symlink(&store_root)?;
+        let entries = match fs::read_dir(store_root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound && self.root_path.is_dir() => {
                 return Ok(Vec::new());
@@ -356,7 +359,7 @@ impl HlsCacheStore {
         }
 
         let session_dir = self.session_dir(session_id)?;
-        tokio::fs::create_dir_all(&session_dir).await?;
+        self.ensure_cache_directory(&session_dir)?;
         let resource_path = self.resource_path(session_id, &resource.id)?;
         let temp_path = resource_path.with_extension("tmp");
         let mut last_error = None;
@@ -364,6 +367,7 @@ impl HlsCacheStore {
             if should_cancel() {
                 return Err(HlsCacheError::Cancelled);
             }
+            self.prepare_temp_path(&temp_path)?;
             match download_resource(client, resource, &url, &temp_path, should_cancel).await {
                 Ok(total_length) => {
                     let initialization_length =
@@ -386,6 +390,10 @@ impl HlsCacheStore {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(HlsCacheError::Cancelled);
                     }
+                    if let Err(error) = self.reject_cache_path_symlink(&resource_path) {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(error.into());
+                    }
                     tokio::fs::rename(&temp_path, &resource_path).await?;
                     if should_cancel() {
                         return Err(HlsCacheError::Cancelled);
@@ -400,7 +408,7 @@ impl HlsCacheStore {
                             resource.request.cache_key.clone(),
                         ),
                     };
-                    write_json_atomically(
+                    self.write_json_atomically(
                         &self.resource_metadata_path(session_id, &resource.id)?,
                         &metadata,
                     )?;
@@ -457,6 +465,69 @@ impl HlsCacheStore {
         Ok(self
             .session_dir(session_id)?
             .join(format!("{resource_id}.json")))
+    }
+
+    fn ensure_cache_directory(&self, path: &Path) -> io::Result<()> {
+        self.reject_cache_path_symlink(path)?;
+        fs::create_dir_all(path)?;
+        self.reject_cache_path_symlink(path)?;
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "HLS cache path is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_temp_path(&self, path: &Path) -> io::Result<()> {
+        self.reject_cache_path_symlink(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS cache temp path must not be a symlink",
+            )),
+            Ok(metadata) if metadata.is_file() => fs::remove_file(path),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "HLS cache temp path already exists and is not a file",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_json_atomically<T: Serialize>(&self, path: &Path, value: &T) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            self.ensure_cache_directory(parent)?;
+        }
+        let temp_path = path.with_extension("tmp");
+        self.prepare_temp_path(&temp_path)?;
+        let bytes = serde_json::to_vec_pretty(value).map_err(invalid_data)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        if let Err(error) = self.reject_cache_path_symlink(path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        fs::rename(temp_path, path)
+    }
+
+    fn reject_cache_path_symlink(&self, path: &Path) -> io::Result<()> {
+        if cache_path_contains_symlink(self.root_path.as_ref(), path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS cache path must not contain symlinks",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -550,7 +621,11 @@ async fn download_resource(
         )));
     }
 
-    let mut file = tokio::fs::File::create(temp_path).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .await?;
     let mut stream = response.bytes_stream();
     let mut total_length = 0_u64;
     loop {
@@ -655,22 +730,58 @@ fn validate_cache_id(value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp_path = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(value).map_err(invalid_data)?;
-    let mut file = File::create(&temp_path)?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temp_path, path)
-}
-
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn cache_path_contains_symlink(root_path: &Path, candidate_path: &Path) -> io::Result<bool> {
+    let root_path = absolute_path(root_path);
+    let candidate_path = absolute_path(candidate_path);
+    if !is_within_root(&root_path, &candidate_path) {
+        return Ok(true);
+    }
+
+    if path_is_symlink(&root_path)? {
+        return Ok(true);
+    }
+
+    let Ok(relative_path) = candidate_path.strip_prefix(&root_path) else {
+        return Ok(true);
+    };
+    let mut current_path = root_path;
+    for component in relative_path.components() {
+        current_path.push(component.as_os_str());
+        match fs::symlink_metadata(&current_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn path_is_symlink(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn is_within_root(root_path: &Path, candidate_path: &Path) -> bool {
+    candidate_path == root_path || candidate_path.starts_with(root_path)
 }
 
 fn created_time_for_path(path: &Path) -> Option<SystemTime> {
@@ -1247,13 +1358,14 @@ mod tests {
                 session.variant.video.request.cache_key.clone(),
             ),
         };
-        write_json_atomically(
-            &store
-                .resource_metadata_path("session-symlink", "video.m4s")
-                .expect("metadata path should be valid"),
-            &metadata,
-        )
-        .expect("resource metadata should save");
+        store
+            .write_json_atomically(
+                &store
+                    .resource_metadata_path("session-symlink", "video.m4s")
+                    .expect("metadata path should be valid"),
+                &metadata,
+            )
+            .expect("resource metadata should save");
 
         assert!(
             store
@@ -1268,6 +1380,149 @@ mod tests {
         assert!(
             store
                 .get_completed_library_item("bilibili.hls.session-symlink")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_hls_cache_store_root_for_reads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let internal_dir = temp.path().join(".tvos-net-player");
+        let outside_dir = temp.path().join("outside-hls-root");
+        std::fs::create_dir_all(&internal_dir).expect("internal parent should be created");
+        std::fs::create_dir(&outside_dir).expect("outside target should be created");
+        symlink(&outside_dir, internal_dir.join("hls")).expect("store root symlink should be made");
+
+        let error = store
+            .load_sessions()
+            .expect_err("symlinked HLS store root should be rejected");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_hls_cache_session_directory_for_writes_and_removal() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let store_root = temp.path().join(".tvos-net-player").join("hls");
+        let outside_dir = temp.path().join("outside-session");
+        std::fs::create_dir_all(&store_root).expect("store root should be created");
+        std::fs::create_dir(&outside_dir).expect("outside target should be created");
+        std::fs::write(outside_dir.join("keep.txt"), b"outside")
+            .expect("outside sentinel should be written");
+        symlink(&outside_dir, store_root.join("session-link"))
+            .expect("session dir symlink should be made");
+        let session = sample_session("session-link", "https://example.test/video.m4s");
+
+        let save_error = store
+            .save_session(&session)
+            .expect_err("symlinked session dir should not be written");
+        let remove_error = store
+            .remove_session("session-link")
+            .expect_err("symlinked session dir should not be removed");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, save_error.kind());
+        assert_eq!(io::ErrorKind::PermissionDenied, remove_error.kind());
+        assert_eq!(
+            b"outside",
+            std::fs::read(outside_dir.join("keep.txt"))
+                .expect("outside sentinel should survive")
+                .as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlinked_hls_cache_temp_resource_path() {
+        use std::os::unix::fs::symlink;
+
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-temp-symlink", &upstream_url);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let target_path = temp.path().join("outside-temp-target");
+        std::fs::write(&target_path, b"outside").expect("target file should be written");
+        let temp_path = store
+            .resource_path("session-temp-symlink", "video.m4s")
+            .expect("resource path should be valid")
+            .with_extension("tmp");
+        symlink(&target_path, &temp_path).expect("temp path symlink should be made");
+        let client = reqwest::Client::new();
+
+        let error = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect_err("symlinked temp resource should be rejected");
+
+        assert!(
+            matches!(error, HlsCacheError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            b"outside",
+            std::fs::read(&target_path)
+                .expect("target file should survive")
+                .as_slice()
+        );
+        assert!(
+            store
+                .cached_resource("session-temp-symlink", "video.m4s")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlinked_hls_cache_resource_path_before_commit() {
+        use std::os::unix::fs::symlink;
+
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-resource-symlink", &upstream_url);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let target_path = temp.path().join("outside-resource-target");
+        std::fs::write(&target_path, b"outside").expect("target file should be written");
+        let resource_path = store
+            .resource_path("session-resource-symlink", "video.m4s")
+            .expect("resource path should be valid");
+        symlink(&target_path, &resource_path).expect("resource path symlink should be made");
+        let client = reqwest::Client::new();
+
+        let error = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect_err("symlinked resource target should be rejected before rename");
+
+        assert!(
+            matches!(error, HlsCacheError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            b"outside",
+            std::fs::read(&target_path)
+                .expect("target file should survive")
+                .as_slice()
+        );
+        assert!(
+            std::fs::symlink_metadata(&resource_path)
+                .expect("resource symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            store
+                .cached_resource("session-resource-symlink", "video.m4s")
                 .is_none()
         );
     }

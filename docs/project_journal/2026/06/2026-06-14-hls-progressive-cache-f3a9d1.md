@@ -151,6 +151,7 @@ superseded_by:
   - Restored HLS playback tasks now refresh persisted `PlaybackSource.uri` values from the current media base, avoiding stale host/base URLs after restart or config changes.
   - Cached HLS resources now reject symlinked resource files and open cached media through the same no-follow file-open helper used by local media playback.
   - Local library direct item resolution now rejects internal `.tvos-net-player/hls` cache paths, not only recursive enumeration.
+  - HLS cache writes, reads, and removals now reject symlinked store roots, session directories, temporary resource paths, and final resource targets before creating, renaming, or deleting cache files.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -178,3 +179,10 @@ superseded_by:
   - `just ci` after second independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-rerun-fixes.log`
   - `just ci` after third independent review fixes; log: `.codex-tmp/pr4-final-just-ci-after-independent-third-fixes-rerun.log`
   - `just ci` after GitHub Codex review-gate fixes; log: `.codex-tmp/pr4-final-just-ci-after-github-codex-gate-fixes.log`
+  - `cargo test --package tvos-net-player-cache-server --locked symlink -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked hls_cache -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked` after symlink write hardening: 132 lib tests and 6 integration tests passed.
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - Project journal validation passed.
+  - `just ci` after symlink write hardening; log: `.codex-tmp/pr4-final-just-ci-after-symlink-write-fixes.log`
