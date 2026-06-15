@@ -56,7 +56,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return false
         }
 
-        return !currentTask.isTerminalBilibiliTaskState && !isCancelling
+        return !currentTask.isTerminalBilibiliTaskState
+            && !currentTask.isCancellationPendingBilibiliTaskState
+            && !isCancelling
     }
 
     public var canRetry: Bool {
@@ -138,10 +140,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
-            currentTask = task
-            statusMessage = Self.statusMessage(for: task)
+            applyTaskUpdate(task)
             isSubmitting = false
-            startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
+            if !task.isTerminalBilibiliTaskState {
+                startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
+            }
         } catch {
             guard sequence == operationSequence else {
                 return
@@ -199,16 +202,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             if let currentTask = self.currentTask,
-                currentTask.isTerminalBilibiliTaskState,
-                !task.isTerminalBilibiliTaskState
+                currentTask.isTerminalBilibiliTaskState
             {
-                statusMessage = Self.statusMessage(for: currentTask)
+                applyTaskUpdate(currentTask)
                 isCancelling = false
                 return
             }
 
-            self.currentTask = task
-            statusMessage = Self.statusMessage(for: task)
+            applyTaskUpdate(task)
             isCancelling = false
         } catch {
             guard sequence == operationSequence else {
@@ -219,7 +220,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 currentTask.id == targetTaskID,
                 currentTask.isTerminalBilibiliTaskState
             {
-                statusMessage = Self.statusMessage(for: currentTask)
+                applyTaskUpdate(currentTask)
                 isCancelling = false
                 return
             }
@@ -295,6 +296,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
+        applyTaskUpdate(task)
+    }
+
+    private func applyTaskUpdate(_ task: CacheTask) {
         currentTask = task
         if activePlaybackTaskID == task.id, !task.isPlayableBilibiliTaskState {
             activePlaybackTaskID = nil
@@ -430,6 +435,10 @@ private extension CacheTask {
 
     var isCancelledBilibiliTaskState: Bool {
         normalizedBilibiliTaskState.contains("cancelled")
+    }
+
+    var isCancellationPendingBilibiliTaskState: Bool {
+        normalizedBilibiliTaskState.contains("cancelrequested")
     }
 
     var isRetryableBilibiliTaskState: Bool {

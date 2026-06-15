@@ -28,6 +28,25 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testTerminalSubmitResponseDoesNotStartWatching() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1fail", state: "TASK_STATE_FAILED", message: "Planning failed."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1fail",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_FAILED")
+        XCTAssertFalse(model.isWatching)
+        XCTAssertEqual(model.statusMessage, "Planning failed.")
+        XCTAssertEqual(model.errorMessage, "Planning failed.")
+        XCTAssertFalse(model.canCancel)
+        XCTAssertTrue(model.canRetry)
+    }
+
     func testDuplicateSubmitWhileSubmittingDoesNotInvalidateInFlightSubmission() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [],
@@ -263,6 +282,36 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testTerminalCancelResponseStopsWatchingAndIgnoresLostWatchError() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1ready", state: "TASK_STATE_PREPARING"))
+            ],
+            cancelResponsesByID: [
+                "bilibili-playback-1": .fixture(source: "BV1ready", state: "TASK_STATE_CANCELLED")
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1ready",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await model.cancel(serverAddressText: "mac-mini.local:50051")
+        await waitUntil(!model.isWatching)
+        await client.waitForWatchTermination()
+        await client.failWatching()
+        await Task.yield()
+
+        XCTAssertFalse(model.isWatching)
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCELLED")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Ready video was cancelled.")
+
+        model.clearTask()
+    }
+
     func testLateCancelResponseDoesNotOverwriteTerminalWatchUpdate() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(source: "BV1race", state: "TASK_STATE_PREPARING"))
@@ -408,6 +457,12 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(cancelledIDs, ["bilibili-playback-1"])
         XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCEL_REQUESTED")
         XCTAssertEqual(model.statusMessage, "Cancelling task.")
+        XCTAssertFalse(model.isCancelling)
+        XCTAssertFalse(model.canCancel)
+
+        await model.cancel(serverAddressText: "mac-mini.local:50051")
+        let repeatedCancelledIDs = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(repeatedCancelledIDs, ["bilibili-playback-1"])
 
         model.clearTask()
     }
@@ -625,6 +680,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         watchContinuations.forEach { $0.yield(task) }
     }
 
+    func failWatching() {
+        let continuations = watchContinuations
+        watchContinuations = []
+        continuations.forEach { $0.finish(throwing: FakeBilibiliCacheControlClientError.watchFailed) }
+    }
+
     private func resumeCreateRequestWaiters() {
         let ready = createRequestWaiters.filter { $0.count <= createdRequests.count }
         createRequestWaiters.removeAll { $0.count <= createdRequests.count }
@@ -658,6 +719,7 @@ private enum FakeBilibiliCacheControlClientError: Error {
     case notImplemented
     case noCreateResponse
     case cancelFailed
+    case watchFailed
 }
 
 private extension CacheTask {
