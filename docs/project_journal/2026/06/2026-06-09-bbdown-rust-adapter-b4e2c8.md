@@ -22,7 +22,7 @@ superseded_by:
 ## Current State
 
 - `Cache:BilibiliWorkerEnabled` defaults to `true` in normal server runtime; integration tests disable it to keep control-plane tests offline and deterministic.
-- `bbdown-core` is pinned to commit `55c764d660996f6547225957d680500b481c31bb`.
+- `bbdown-core` is pinned to `BBDown-rust` `v0.3.0` tag commit `4905a2f06b8038a979cf4d6078c7dd5f40f6a2d8`; Cargo resolves the `bbdown-core` crate source to `433591b6c14b97a4adfe189e6d8826fa699d8470`.
 - The adapter writes downloads under `Cache:RootPath/Bilibili` by default and stores BBDown archive state beside the task snapshot as `bbdown-archive.json`.
 - Startup validation rejects enabled or explicitly configured BBDown output paths outside `Cache:RootPath`, `..` parent components, and existing symlink components under that root before handing paths to BBDown.
 - Runtime setup canonicalizes existing root/output prefixes before constructing the media library and BBDown adapter, keeping their path boundary checks aligned.
@@ -30,12 +30,13 @@ superseded_by:
 - The adapter lets `bbdown-core` handle planning/download/archive state, then runs server-owned `ffmpeg` muxing into a hidden non-indexed temporary output before publishing a title-preserving `.mp4` for library indexing. This avoids ffmpeg container inference failures without exposing partial mux outputs to library scans.
 - The mux phase checks task cancellation before starting and while `ffmpeg` is running; cancellation kills and reaps the child process before returning a cancelled task result.
 - BV/av inputs default to current/first page, while ss/md inputs default to latest episode because the task result schema currently exposes one `library_item_id`.
+- `BBDown-rust` `v0.3.0` feed/history/watch-later inputs are parsed by the core, and the cache server maps those collection/feed-style inputs to the latest item by default until a richer task result schema exists.
 - Progress is coarse-grained until BBDown core exposes chunk-level download progress and native download cancellation hooks.
 
 ## Next Steps
 
 - Add tvOS UI for submitting Bilibili URLs/BV IDs and watching task progress.
-- Extend task options/result schema if we want explicit page/episode/all selection or multi-item task results.
+- Discuss task options/result schema separately if we want explicit page/episode/all selection, feed/history/watch-later workflows, or multi-item task results.
 - Add retention/cleanup policy for old persisted terminal tasks and downloaded output conflicts.
 - Keep live BBDown validation as an opt-in local smoke path rather than default CI, because it depends on public Bilibili availability, network, and local `ffmpeg`.
 

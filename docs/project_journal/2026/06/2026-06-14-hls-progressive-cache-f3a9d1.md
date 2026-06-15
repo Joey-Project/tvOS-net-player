@@ -15,12 +15,12 @@ superseded_by:
 ## Summary
 
 - Deliver progressive Bilibili playback through the LAN cache server while keeping gRPC as the control plane and AVPlayer-compatible HTTP/HLS as the media plane.
-- Use `BBDown-rust` `v0.2.0` playback planning APIs as the resolver layer. The cache server owns playback session lifecycle, HLS playlist/segment generation, caching, recovery, and optional LAN-side transcoding.
+- Use `BBDown-rust` playback planning APIs as the resolver layer. The cache server owns playback session lifecycle, HLS playlist/segment generation, caching, recovery, and optional LAN-side transcoding.
 - Land the work as four independently reviewable PRs. Each PR must pass the full local test gate, CI, `independent-codex-pr-review`, `offline-frozen-diff-review`, and required GitHub review/conversation-resolution gates before merge. After each merge, update `master` before branching for the next PR.
 
 ## Current State
 
-- `BBDown-rust` `v0.2.0` exposes playback planning with media URLs, backup URLs, request headers, codec/mime metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
+- `BBDown-rust` `v0.3.0` is now the pinned core dependency; playback planning still provides media URLs, backup URLs, request headers, codec/mime metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
 - The current LAN cache server adapter still uses the older complete-download path: BBDown core downloads selected media, then the server muxes a completed MP4 and publishes it as a library item.
 - The cache server now has a BBDown playback-planning adapter foundation that maps core playback plans into server-owned DTOs and selects AVPlayer-friendly variants for later progressive sessions.
 - The cache server now exposes progressive playback through `TaskService.CreateBilibiliPlaybackTask`: it creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it in `preparing` state immediately, while BBDown playback planning runs in the background.
@@ -29,6 +29,7 @@ superseded_by:
 - Startup now restores HLS session manifests into the runtime HLS registry. Persisted `playable`/`completed` progressive tasks remain usable when their manifest exists; only tasks missing a matching manifest are failed during startup reconcile.
 - The Swift cache client exposes `getTask(id:)` and `watchTasks(ids:)` so tvOS code can track background playback planning to a playable HLS source without repeating create calls.
 - Playback planning rejects Bilibili short links until `bbdown-core` exposes a resolved-input API that lets the server choose the correct default selection after short-link expansion.
+- Feed/history/watch-later style inputs added by `BBDown-rust` `v0.3.0` are accepted through the adapter with latest-item defaults; richer explicit selection and multi-item results remain deferred until the task options/result schema is designed.
 - Existing architecture already reserves HLS playlists and segments over HTTP as the media-plane direction, so progressive playback should extend the current boundary rather than introduce gRPC media streaming or direct tvOS BBDown integration.
 
 ## PR Plan
@@ -76,6 +77,7 @@ superseded_by:
 ## Evidence
 
 - `BBDown-rust` `v0.2.0` release: https://github.com/Joey-Project/BBDown-rust/releases/tag/v0.2.0
+- `BBDown-rust` `v0.3.0` release: https://github.com/Joey-Project/BBDown-rust/releases/tag/v0.3.0
 - Current BBDown adapter journal: `docs/project_journal/2026/06/2026-06-09-bbdown-rust-adapter-b4e2c8.md`
 - Cache server architecture: `docs/architecture/cache-server.md`
 - PR 1 local gate:
