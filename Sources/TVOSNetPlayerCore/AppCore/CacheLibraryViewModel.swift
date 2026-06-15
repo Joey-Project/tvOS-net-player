@@ -5,24 +5,34 @@ import TVOSNetPlayerCacheClient
 @MainActor
 public final class CacheLibraryViewModel: ObservableObject {
     public static let serverAddressDefaultsKey = "CacheServerAddress"
-    private static let libraryPreviewPageSize = 200
+    private static let libraryPageSize = 50
 
     @Published public var serverAddressText: String {
         didSet {
             clearLoadedLibraryIfNeeded(previousValue: oldValue)
         }
     }
+    @Published public var searchText: String = "" {
+        didSet {
+            markSearchPendingIfNeeded(previousValue: oldValue)
+        }
+    }
     @Published public private(set) var serverName: String = "LAN cache"
     @Published public private(set) var statusMessage: String = "Cache server not connected."
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var isLoading = false
+    @Published public private(set) var isLoadingMore = false
+    @Published public private(set) var activeSearchText = ""
     @Published public private(set) var items: [CacheLibraryItem] = []
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private var loadedEndpoint: CacheServerEndpoint?
+    private var nextPageToken = ""
+    private var requestedLibraryPageTokens: Set<String> = []
     private var refreshSequence = 0
+    private var loadMoreSequence = 0
     private var playbackSequence = 0
     private var pendingPlaybackItemID: String?
     private var activePlaybackItemID: String?
@@ -32,12 +42,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
-            GRPCCacheControlClient(
-                endpoint: $0,
-                maxLibraryPages: 1,
-                maxLibraryItems: 200,
-                allowPartialLibraryResults: true
-            )
+            GRPCCacheControlClient(endpoint: $0)
         }
     ) {
         self.defaults = defaults
@@ -51,12 +56,28 @@ public final class CacheLibraryViewModel: ObservableObject {
         !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isLoading
     }
 
+    public var hasMoreItems: Bool {
+        !nextPageToken.isEmpty && !hasPendingSearch
+    }
+
+    public var canLoadMore: Bool {
+        loadedEndpoint != nil && hasMoreItems && !isLoading && !isLoadingMore
+    }
+
+    public var hasPendingSearch: Bool {
+        normalizedSearchText != activeSearchText
+    }
+
     public func refresh() async {
         refreshSequence += 1
+        loadMoreSequence += 1
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
+        isLoadingMore = false
         let requestSequence = refreshSequence
+        let requestedSearchText = normalizedSearchText
+        let requestSearchText = Self.searchTextForRequest(requestedSearchText)
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             clearLoadedLibrary(
@@ -76,32 +97,119 @@ public final class CacheLibraryViewModel: ObservableObject {
                 try await client.getServerInfo()
             }
             let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.listLibraryItemsPage(pageSize: Self.libraryPreviewPageSize)
+                try await client.listLibraryItemsPage(
+                    pageToken: "",
+                    pageSize: Self.libraryPageSize,
+                    searchText: requestSearchText
+                )
             }
 
-            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
                 return
             }
 
             loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
             items = libraryPage.items
+            nextPageToken = libraryPage.nextPageToken
+            requestedLibraryPageTokens = [""]
+            activeSearchText = requestedSearchText
             serverAddressText = endpoint.displayAddress
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
             statusMessage = loadedLibraryStatusMessage
         } catch {
-            guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
                 return
             }
 
             loadedEndpoint = nil
             items = []
+            nextPageToken = ""
+            requestedLibraryPageTokens = []
+            activeSearchText = ""
             serverName = "LAN cache"
             errorMessage = error.localizedDescription
             statusMessage = "Could not load cache library."
         }
 
         isLoading = false
+    }
+
+    public func loadMore() async {
+        guard canLoadMore else {
+            if loadedEndpoint == nil {
+                statusMessage = "Refresh cache server to load videos."
+            }
+            return
+        }
+
+        guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText), endpoint == loadedEndpoint else {
+            clearLoadedLibrary(
+                statusMessage: "Refresh cache server to load videos.",
+                errorMessage: nil
+            )
+            return
+        }
+
+        let requestSequence = refreshSequence
+        loadMoreSequence += 1
+        let loadMoreRequestSequence = loadMoreSequence
+        let requestedSearchText = activeSearchText
+        let requestSearchText = Self.searchTextForRequest(requestedSearchText)
+        let requestedPageToken = nextPageToken
+        isLoading = true
+        isLoadingMore = true
+        errorMessage = nil
+        statusMessage = "Loading more cached videos..."
+        defer {
+            if isCurrentLoadMore(loadMoreRequestSequence) {
+                isLoadingMore = false
+                if isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) {
+                    isLoading = false
+                }
+            }
+        }
+
+        do {
+            let client = clientFactory(endpoint)
+            let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listLibraryItemsPage(
+                    pageToken: requestedPageToken,
+                    pageSize: Self.libraryPageSize,
+                    searchText: requestSearchText
+                )
+            }
+
+            guard
+                isCurrentLoadMore(loadMoreRequestSequence),
+                isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText)
+            else {
+                return
+            }
+
+            guard !isRepeatedLibraryPageToken(libraryPage.nextPageToken, requestedPageToken: requestedPageToken) else {
+                nextPageToken = ""
+                errorMessage = "Cache server returned a repeated library page token."
+                statusMessage = "Could not load more cached videos."
+                return
+            }
+
+            items.append(contentsOf: libraryPage.items)
+            requestedLibraryPageTokens.insert(requestedPageToken)
+            nextPageToken = libraryPage.nextPageToken
+            statusMessage = loadedLibraryStatusMessage
+        } catch {
+            guard
+                isCurrentLoadMore(loadMoreRequestSequence),
+                isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText)
+            else {
+                return
+            }
+
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not load more cached videos."
+        }
+
     }
 
     public func playbackURL(for item: CacheLibraryItem) async -> URL? {
@@ -222,13 +330,32 @@ public final class CacheLibraryViewModel: ObservableObject {
         playbackSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
-        isLoading = false
         errorMessage = nil
-        statusMessage = loadedLibraryStatusMessage
+        if isLoadingMore {
+            isLoading = true
+            statusMessage = "Loading more cached videos..."
+        } else {
+            isLoading = false
+            statusMessage = loadedLibraryStatusMessage
+        }
     }
 
     private var loadedLibraryStatusMessage: String {
-        "Loaded \(items.count) cached item(s) from \(serverName)."
+        let searchSuffix = activeSearchText.isEmpty ? "" : " matching \"\(activeSearchText)\""
+        let moreSuffix = nextPageToken.isEmpty ? "" : " More items available."
+        return "Loaded \(items.count) cached item(s)\(searchSuffix) from \(serverName).\(moreSuffix)"
+    }
+
+    private var normalizedSearchText: String {
+        Self.normalizedSearchText(searchText)
+    }
+
+    private static func searchTextForRequest(_ text: String) -> String? {
+        text.isEmpty ? nil : text
+    }
+
+    private static func normalizedSearchText(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func clearLoadedLibraryIfNeeded(previousValue: String) {
@@ -272,17 +399,65 @@ public final class CacheLibraryViewModel: ObservableObject {
 
     private func clearLoadedLibrary(statusMessage: String, errorMessage: String?) {
         loadedEndpoint = nil
+        loadMoreSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
         items = []
+        nextPageToken = ""
+        requestedLibraryPageTokens = []
+        activeSearchText = ""
+        isLoadingMore = false
         serverName = "LAN cache"
         isLoading = false
         self.statusMessage = statusMessage
         self.errorMessage = errorMessage
     }
 
+    private func markSearchPendingIfNeeded(previousValue: String) {
+        guard
+            normalizedSearchText != Self.normalizedSearchText(previousValue),
+            loadedEndpoint != nil || isLoading
+        else {
+            return
+        }
+
+        playbackSequence += 1
+        refreshSequence += 1
+        loadMoreSequence += 1
+        pendingPlaybackItemID = nil
+        activePlaybackItemID = nil
+        isLoading = false
+        isLoadingMore = false
+        errorMessage = nil
+        if loadedEndpoint == nil {
+            statusMessage = "Refresh cache server to load videos."
+        } else if hasPendingSearch {
+            statusMessage = "Search cache library to update results."
+        } else {
+            statusMessage = loadedLibraryStatusMessage
+        }
+    }
+
+    private func isCurrentRefresh(
+        _ requestSequence: Int,
+        endpoint: CacheServerEndpoint,
+        searchText: String
+    ) -> Bool {
+        isCurrentRefresh(requestSequence, endpoint: endpoint)
+            && normalizedSearchText == searchText
+    }
+
     private func isCurrentRefresh(_ requestSequence: Int, endpoint: CacheServerEndpoint) -> Bool {
-        requestSequence == refreshSequence && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
+        requestSequence == refreshSequence
+            && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
+    }
+
+    private func isCurrentLoadMore(_ requestSequence: Int) -> Bool {
+        requestSequence == loadMoreSequence
+    }
+
+    private func isRepeatedLibraryPageToken(_ pageToken: String, requestedPageToken: String) -> Bool {
+        !pageToken.isEmpty && (pageToken == requestedPageToken || requestedLibraryPageTokens.contains(pageToken))
     }
 
     private func isCurrentPlayback(_ requestSequence: Int) -> Bool {

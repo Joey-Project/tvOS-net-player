@@ -12,6 +12,9 @@ struct ContentView: View {
     private enum FocusedControl: Hashable {
         case cacheServerField
         case refreshButton
+        case cacheSearchField
+        case cacheSearchButton
+        case cacheLoadMoreButton
         case bilibiliField
         case bilibiliSubmitButton
         case urlField
@@ -88,6 +91,29 @@ struct ContentView: View {
                 .focused($focusedControl, equals: .refreshButton)
             }
 
+            HStack(spacing: 12) {
+                TextField("Search cached videos", text: $cacheModel.searchText)
+                    .textContentType(.none)
+                    .submitLabel(.search)
+                    .onSubmit {
+                        Task {
+                            await cacheModel.refresh()
+                        }
+                    }
+                    .focused($focusedControl, equals: .cacheSearchField)
+
+                Button {
+                    Task {
+                        await cacheModel.refresh()
+                    }
+                } label: {
+                    Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!cacheModel.canRefresh)
+                .focused($focusedControl, equals: .cacheSearchButton)
+            }
+
             Divider()
 
             bilibiliControls
@@ -95,13 +121,17 @@ struct ContentView: View {
             Divider()
 
             if cacheModel.items.isEmpty {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.white.opacity(0.08))
-                    Text("No cached videos")
-                        .foregroundStyle(.secondary)
+                VStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(.white.opacity(0.08))
+                        Text("No cached videos")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 220)
+
+                    cacheLoadMoreButton
                 }
-                .frame(maxWidth: .infinity, minHeight: 220)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
@@ -116,9 +146,31 @@ struct ContentView: View {
                             .buttonStyle(.bordered)
                             .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
                         }
+
+                        cacheLoadMoreButton
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var cacheLoadMoreButton: some View {
+        if cacheModel.hasMoreItems {
+            Button {
+                Task {
+                    await cacheModel.loadMore()
+                }
+            } label: {
+                Label(
+                    cacheModel.isLoadingMore ? "Loading More" : "Load More",
+                    systemImage: "chevron.down.circle"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!cacheModel.canLoadMore)
+            .focused($focusedControl, equals: .cacheLoadMoreButton)
         }
     }
 
