@@ -1,11 +1,11 @@
 ---
 id: 20260615-7d4a6b
 title: Shared AppCore And macOS Frontend
-status: active
+status: completed
 created: 2026-06-15
 updated: 2026-06-15
-branch: wip/shared-appcore-refactor
-pr:
+branch: wip/macos-frontend
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/14
 supersedes: []
 superseded_by:
 ---
@@ -24,7 +24,10 @@ superseded_by:
 - `TVOSNetPlayerCacheClient` already provides the reusable gRPC/cache model layer for tvOS and future macOS code.
 - tvOS app-owned files keep tvOS-specific SwiftUI views, focus behavior, and app entrypoint code.
 - tvOS app and XCTest targets link `TVOSNetPlayerCore` to verify the shared AppCore product is usable from the app bundle.
+- `MacOSNetPlayer` adds a desktop SwiftUI shell that reuses `PlayerViewModel`, `CacheLibraryViewModel`, and the cache client for server URL entry, library browsing, cached playback, and manual URL playback.
+- `MacOSNetPlayerTests` verifies the macOS app shell can render with the shared AppCore models.
 - `TVOSNetPlayer/ContentView.swift` and `TVOSNetPlayer/TVOSNetPlayerApp.swift` should remain tvOS-specific UI/app-shell code.
+- `MacOSNetPlayer/ContentView.swift` and `MacOSNetPlayer/MacOSNetPlayerApp.swift` should remain macOS-specific UI/app-shell code.
 
 ## PR Plan
 
@@ -45,15 +48,14 @@ superseded_by:
 
 ## Next Steps
 
-- Complete the PR 1 gate: GitHub PR, GitHub CI, triple review, and all conversations resolved.
-- Merge PR 1, update `master`, then branch PR 2 from the updated `master`.
-- Resume broader TODOs only after the shared AppCore and macOS parity work lands.
+- Resume the broader playback/cache TODO backlog from `docs/PROJECT_TODO.md`.
 
 ## Evidence
 
-- Current `master`: `a040e04 Add offline HLS cache finalization (#12)`.
+- Current `master`: `fca140e Extract shared AppCore view models (#13)`.
 - Current shared Swift targets: `Package.swift`.
 - Current tvOS app sources: `TVOSNetPlayer/`.
+- Current macOS app sources: `MacOSNetPlayer/`.
 - PR 1 local validation on 2026-06-15:
   - `just ci`
   - `just format`
@@ -61,3 +63,19 @@ superseded_by:
   - `git diff --check`
   - `plutil -lint TVOSNetPlayer.xcodeproj/project.pbxproj`
   - `project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+- PR 1 merged on 2026-06-15 as `fca140e`.
+- PR 2 local validation on 2026-06-15:
+  - `xcodebuild -list -project TVOSNetPlayer.xcodeproj`
+  - `scripts/build-macos.sh`
+  - `scripts/test-macos.sh`
+  - `just format`
+  - `just lint`
+  - `just ci`
+  - `scripts/pre-commit.sh`
+  - `git diff --check`
+  - `bash -n scripts/format.sh scripts/lint-swift-format.sh scripts/build-macos.sh scripts/test-macos.sh scripts/pre-commit.sh`
+  - `shellcheck scripts/format.sh scripts/lint-swift-format.sh scripts/build-macos.sh scripts/test-macos.sh scripts/pre-commit.sh`
+  - `plutil -lint TVOSNetPlayer.xcodeproj/project.pbxproj MacOSNetPlayer/Info.plist TVOSNetPlayer/Info.plist`
+  - `xmllint --noout TVOSNetPlayer.xcodeproj/xcshareddata/xcschemes/MacOSNetPlayer.xcscheme TVOSNetPlayer.xcodeproj/xcshareddata/xcschemes/TVOSNetPlayer.xcscheme`
+  - `project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+- PR 2: https://github.com/Joey-Project/tvOS-net-player/pull/14

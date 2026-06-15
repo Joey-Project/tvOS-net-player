@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tvos:
+  apple-platforms:
     name: tvOS build and tests
     runs-on: macos-26
     timeout-minutes: 30
@@ -45,6 +45,9 @@ jobs:
       - name: Build tvOS simulator app
         run: scripts/build.sh
 
+      - name: Build macOS app
+        run: scripts/build-macos.sh
+
       - name: Build LAN cache server
         run: scripts/build-cache-server.sh
 
@@ -56,6 +59,9 @@ jobs:
 
       - name: Run core unit tests
         run: scripts/test.sh
+
+      - name: Run macOS XCTest target
+        run: scripts/test-macos.sh
 
       - name: Run LAN cache server integration tests
         run: scripts/test-cache-server.sh

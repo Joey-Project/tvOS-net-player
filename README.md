@@ -3,11 +3,12 @@
 这是一个准备给家用 Apple TV 自签名使用的 tvOS 网络播放器仓库。当前版本提供手动播放和 LAN cache control-plane 第一片：
 
 - SwiftUI tvOS app target：输入 HTTP/HTTPS 地址后用 `AVPlayer` 播放。
+- SwiftUI macOS app target：复用同一套 AppCore/cache client，用于桌面调试和轻量使用。
 - 手动 URL v0 工作流：保存上次播放地址，支持停止、清空和输入校验。
 - LAN cache client v0：输入 Mac mini cache server 地址，刷新 gRPC library 首屏预览，选择可播放 variant，并把 HTTP/HLS playback source 交给 `AVPlayer`。
 - LAN cache server MVP：用 gRPC 提供控制面，用 HTTP Range endpoint 提供 `AVPlayer` 可播放媒体 URL，并包含可落盘恢复的 Bilibili task worker 和 BBDown Rust adapter。
 - Swift package tests：覆盖 core URL 规范化和 cache client model/pagination 行为，不依赖本机 tvOS simulator runtime。
-- GitHub Actions CI：pre-commit checks、tvOS simulator build、LAN cache server build、tvOS XCTest target、core tests、cache server integration tests。
+- GitHub Actions CI：pre-commit checks、tvOS simulator build、macOS app build、LAN cache server build、tvOS/macOS XCTest targets、core tests、cache server integration tests。
 - LAN 刷新脚本：从这台 Mac build/sign，然后通过 `devicectl` 安装到同一局域网内已配对的 Apple TV。
 - Codex review gate：保留模板仓库已有的 `codex/review-gate` workflow。
 
@@ -27,8 +28,10 @@ just ci
 just lint
 just format
 just build
+just build-macos
 just build-cache-server
 just build-for-testing
+just test-macos
 just test-tvos
 just test
 just test-cache-server
@@ -36,7 +39,7 @@ just test-cache-server
 
 `just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict`、`cargo fmt --check` 和 `cargo clippy -D warnings`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `cargo fmt` 格式化 Rust cache server 源码。
 
-`just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-for-testing` 会编译 Xcode XCTest bundle，但不会启动 simulator。`just test` 运行 Swift package core/cache client tests，不需要本机安装 tvOS simulator runtime。
+`just build` 默认使用 `generic/platform=tvOS Simulator`，不会要求本机配置签名。`just build-macos` 默认使用 `generic/platform=macOS` 编译 macOS app。`just build-for-testing` 会编译 tvOS Xcode XCTest bundle，但不会启动 simulator。`just test-macos` 运行 macOS app-shell XCTest target。`just test` 运行 Swift package core/cache client tests，不需要本机安装 tvOS simulator runtime。
 
 如果要跑 Xcode/tvOS simulator XCTest target：
 
@@ -151,14 +154,16 @@ xcrun devicectl device install app --device "$TVOS_DEVICE_ID" build/DerivedData/
 ```bash
 scripts/pre-commit.sh
 scripts/build.sh
+scripts/build-macos.sh
 scripts/build-cache-server.sh
 scripts/build-for-testing.sh
 scripts/test-tvos-simulator.sh
 scripts/test.sh
+scripts/test-macos.sh
 scripts/test-cache-server.sh
 ```
 
-其中 pre-commit 检查包括 Swift formatter/linter、Rust formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 Rust LAN cache server，`scripts/build-for-testing.sh` 编译 Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 app target 的 tvOS XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-cache-server.sh` 启动真实 Rust server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
+其中 pre-commit 检查包括 Swift formatter/linter、Rust formatter/linter 和 shell script lint，`scripts/build-cache-server.sh` 编译 Rust LAN cache server，`scripts/build-for-testing.sh` 编译 tvOS Xcode XCTest bundle，`scripts/test-tvos-simulator.sh` 执行 tvOS app target 的 XCTest，`scripts/test.sh` 跑不依赖 simulator runtime 的 core tests，`scripts/test-macos.sh` 执行 macOS app-shell XCTest，`scripts/test-cache-server.sh` 启动真实 Rust server 并覆盖 gRPC 控制面和 HTTP Range 媒体面。CI 不做设备签名，也不需要 Apple Developer secrets。物理 Apple TV 的安装只保留在本机脚本里执行。
 
 后续设置 required checks 时，建议至少 gate：
 
