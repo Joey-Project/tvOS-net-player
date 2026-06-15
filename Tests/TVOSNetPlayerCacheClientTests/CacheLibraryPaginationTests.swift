@@ -149,6 +149,10 @@ private actor FakePagedCacheControlClient: CacheControlClient {
         }
     }
 
+    func cancelTask(id: String) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
     func createBilibiliPlaybackTask(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions

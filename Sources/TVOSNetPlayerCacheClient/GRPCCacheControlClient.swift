@@ -135,6 +135,21 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func cancelTask(id: String) async throws -> CacheTask {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+            var request = TvosNetPlayer_V1_CancelTaskRequest()
+            request.id = id
+            let response = try await service.cancelTask(request, options: callOptions)
+            return CacheTask(response)
+        }
+    }
+
     public func watchTasks(ids: [String] = []) async -> AsyncThrowingStream<CacheTask, Error> {
         AsyncThrowingStream { continuation in
             let streamTask = Task {

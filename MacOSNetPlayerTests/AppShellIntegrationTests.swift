@@ -14,11 +14,13 @@ final class AppShellIntegrationTests: XCTestCase {
 
         let playerModel = PlayerViewModel(defaults: defaults, autoplay: false)
         let cacheModel = CacheLibraryViewModel(defaults: defaults)
-        let view = ContentView(model: playerModel, cacheModel: cacheModel)
+        let bilibiliModel = BilibiliTaskViewModel()
+        let view = ContentView(model: playerModel, cacheModel: cacheModel, bilibiliModel: bilibiliModel)
 
         _ = view.body
 
         XCTAssertEqual(playerModel.streamURLText, "")
         XCTAssertEqual(cacheModel.serverAddressText, "")
+        XCTAssertEqual(bilibiliModel.sourceText, "")
     }
 }

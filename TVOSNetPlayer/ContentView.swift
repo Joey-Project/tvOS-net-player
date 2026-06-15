@@ -6,11 +6,14 @@ import TVOSNetPlayerCacheClient
 struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
+    @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @FocusState private var focusedControl: FocusedControl?
 
     private enum FocusedControl: Hashable {
         case cacheServerField
         case refreshButton
+        case bilibiliField
+        case bilibiliSubmitButton
         case urlField
         case playButton
     }
@@ -23,7 +26,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("TVOS Net Player")
                         .font(.largeTitle.weight(.semibold))
-                    Text("\(model.statusMessage) \(cacheModel.statusMessage)")
+                    Text("\(model.statusMessage) \(cacheModel.statusMessage) \(bilibiliModel.statusMessage)")
                         .foregroundStyle(.secondary)
                 }
 
@@ -87,6 +90,10 @@ struct ContentView: View {
 
             Divider()
 
+            bilibiliControls
+
+            Divider()
+
             if cacheModel.items.isEmpty {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8)
@@ -111,6 +118,96 @@ struct ContentView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private var bilibiliControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Bilibili")
+                .font(.title3.weight(.semibold))
+
+            TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
+                .keyboardType(.URL)
+                .submitLabel(.go)
+                .onSubmit {
+                    Task {
+                        await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                    }
+                }
+                .focused($focusedControl, equals: .bilibiliField)
+
+            HStack(spacing: 10) {
+                TextField("Quality", text: $bilibiliModel.qualityPreference)
+                    .textContentType(.none)
+
+                TextField("Codec", text: $bilibiliModel.encodingPreference)
+                    .textContentType(.none)
+            }
+
+            if let errorMessage = bilibiliModel.errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+
+            if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting {
+                VStack(alignment: .leading, spacing: 8) {
+                    ProgressView(value: bilibiliModel.progress)
+                    Text(bilibiliModel.statusMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label(bilibiliModel.isSubmitting ? "Submitting" : "Submit", systemImage: "plus.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!bilibiliModel.canSubmit)
+                .focused($focusedControl, equals: .bilibiliSubmitButton)
+
+                Button {
+                    Task {
+                        await playBilibiliTask()
+                    }
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                }
+                .disabled(!bilibiliModel.canPlay)
+
+                Button {
+                    Task {
+                        await bilibiliModel.cancel(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
+                }
+                .disabled(!bilibiliModel.canCancel)
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        await bilibiliModel.retry(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .disabled(!bilibiliModel.canRetry)
+
+                Button {
+                    bilibiliModel.clearTask()
+                } label: {
+                    Label("Clear", systemImage: "trash")
+                }
+                .disabled(bilibiliModel.currentTask == nil && bilibiliModel.errorMessage == nil)
             }
         }
     }
@@ -176,21 +273,39 @@ struct ContentView: View {
             streamURLText: url.absoluteString,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
+        bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func playBilibiliTask() async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let url = bilibiliModel.playableURL else {
+            return
+        }
+
+        cacheModel.clearPlaybackStatus()
+        let didStartPlayback = model.loadTransient(
+            streamURLText: url.absoluteString,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
     }
 
     private func loadManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.load()
     }
 
     private func stopManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.stop()
     }
 
     private func clearManualStream() {
         cacheModel.clearPlaybackStatus()
+        bilibiliModel.clearPlaybackStatus()
         model.clear()
     }
 }

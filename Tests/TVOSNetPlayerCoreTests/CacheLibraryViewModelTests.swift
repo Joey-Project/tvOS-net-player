@@ -848,6 +848,10 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
     }
 
+    func cancelTask(id: String) async throws -> CacheTask {
+        throw FakeCacheError.serverUnavailable
+    }
+
     func createBilibiliPlaybackTask(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
