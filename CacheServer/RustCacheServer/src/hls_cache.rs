@@ -631,7 +631,11 @@ async fn download_resource(
             "HLS resource Content-Length {declared} did not match expected size {expected}"
         )));
     }
-    let maximum_length = resource.request.size.or(declared_length);
+    let Some(maximum_length) = resource.request.size.or(declared_length) else {
+        return Err(HlsCacheError::InvalidResource(
+            "HLS resource length was unknown".to_owned(),
+        ));
+    };
 
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -662,9 +666,7 @@ async fn download_resource(
             .ok_or_else(|| {
                 HlsCacheError::InvalidResource("HLS resource is too large".to_owned())
             })?;
-        if let Some(maximum_length) = maximum_length
-            && total_length > maximum_length
-        {
+        if total_length > maximum_length {
             return Err(HlsCacheError::InvalidResource(format!(
                 "HLS resource body length exceeded expected size {maximum_length}"
             )));
@@ -1185,6 +1187,32 @@ mod tests {
         assert!(
             store
                 .get_completed_library_item("bilibili.hls.session-short")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_lengthless_chunked_hls_cache_response() {
+        let (upstream_url, _task) = start_overlong_chunked_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let session = sample_session("session-lengthless", &upstream_url);
+        let temp_path = store
+            .resource_path("session-lengthless", "video.m4s")
+            .expect("resource path should be valid")
+            .with_extension("tmp");
+        let client = reqwest::Client::new();
+
+        let error = store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect_err("lengthless response should be rejected");
+
+        assert!(error.to_string().contains("length was unknown"));
+        assert!(!temp_path.exists());
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-lengthless")
                 .is_none()
         );
     }

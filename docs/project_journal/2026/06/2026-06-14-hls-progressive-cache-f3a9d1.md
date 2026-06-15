@@ -156,6 +156,7 @@ superseded_by:
   - Restart restore now preserves the originally request-derived HLS playback URI when `Cache:PublicMediaBaseUri` is unset, while still refreshing restored URIs when an explicit public media base is configured.
   - Secure no-follow media opens now use the existing `openat` implementation on Unix platforms instead of macOS only, so completed offline HLS resources can be served on Linux/macOS without falling back to scrubbed upstream URLs.
   - HLS cache downloads now stop before writing any chunk that would exceed the expected media size, including chunked responses without `Content-Length`, preventing overlong upstream bodies from filling disk before validation fails.
+  - Offline HLS cache downloads now reject resources with neither BBDown-provided size nor upstream `Content-Length`, so chunked responses must still have an independent expected-size bound.
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -213,6 +214,7 @@ superseded_by:
   - `just ci` after symlink write hardening; log: `.codex-tmp/pr4-final-just-ci-after-symlink-write-fixes.log`
   - `cargo test --package tvos-net-player-cache-server --locked symlink -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked hls_cache -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked rejects_lengthless_chunked_hls_cache_response -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_fails_restored_hls_task_when_cache_finalization_fails -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked rejects_overlong_chunked_hls_cache_response_with_expected_size -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked` after final review fixes: 140 lib tests and 6 integration tests passed.
@@ -220,3 +222,8 @@ superseded_by:
   - `git diff --check`
   - Project journal validation passed.
   - `just ci` after final review fixes; log: `.codex-tmp/pr4-final-just-ci-after-final-review-fixes.log`
+  - `cargo test --package tvos-net-player-cache-server --locked` after lengthless-download hardening: 141 lib tests and 6 integration tests passed.
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - Project journal validation passed.
+  - `just ci` after lengthless-download hardening; log: `.codex-tmp/pr4-final-just-ci-after-lengthless-download-fix.log`
