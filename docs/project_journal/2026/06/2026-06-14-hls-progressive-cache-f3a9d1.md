@@ -157,8 +157,12 @@ superseded_by:
   - Secure no-follow media opens now use the existing `openat` implementation on Unix platforms instead of macOS only, so completed offline HLS resources can be served on Linux/macOS without falling back to scrubbed upstream URLs.
   - HLS cache downloads now stop before writing any chunk that would exceed the expected media size, including chunked responses without `Content-Length`, preventing overlong upstream bodies from filling disk before validation fails.
   - Offline HLS cache downloads now reject resources with neither BBDown-provided size nor upstream `Content-Length`, so chunked responses must still have an independent expected-size bound.
-  - Startup HLS cache scans now reject session manifests whose persisted `id` does not match the containing cache directory, preventing mismatched restore metadata from surviving recovery cleanup.
+  - Startup HLS cache scans and direct completed-item lookups now reject session manifests whose persisted `id` does not match the containing cache directory, preventing mismatched restore metadata from surviving recovery cleanup or aliasing another completed cache entry.
+  - Progressive HLS planning now registers the runtime HLS session before publishing a `Playable` task event, so watchers can immediately fetch the advertised playlist URI without a transient 404.
+  - Cached file responses now sanitize persisted content types before writing HTTP headers, falling back to `application/octet-stream` for invalid metadata instead of panicking.
   - `cargo test --package tvos-net-player-cache-server --locked load_sessions_skips_manifest_with_mismatched_directory_id -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked get_completed_library_item_skips_manifest_with_mismatched_directory_id -- --nocapture`
+  - `cargo test --package tvos-net-player-cache-server --locked cached_file_response_invalid_content_type_uses_octet_stream -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_resumes_incomplete_hls_cache_finalization_after_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked app_state_completes_playable_hls_task_when_cache_finished_before_restart -- --nocapture`
   - `cargo test --package tvos-net-player-cache-server --locked removes_temp_file_when_cached_initialization_is_invalid -- --nocapture`
@@ -225,9 +229,10 @@ superseded_by:
   - Project journal validation passed.
   - `just ci` after final review fixes; log: `.codex-tmp/pr4-final-just-ci-after-final-review-fixes.log`
   - `cargo test --package tvos-net-player-cache-server --locked` after lengthless-download hardening: 141 lib tests and 6 integration tests passed.
-  - `cargo test --package tvos-net-player-cache-server --locked` after mismatched-manifest restore hardening: 142 lib tests and 6 integration tests passed.
+  - `cargo test --package tvos-net-player-cache-server --locked` after final review hardening: 144 lib tests and 6 integration tests passed.
   - `cargo fmt --all -- --check`
   - `git diff --check`
   - Project journal validation passed.
   - `just ci` after lengthless-download hardening; log: `.codex-tmp/pr4-final-just-ci-after-lengthless-download-fix.log`
   - `just ci` after mismatched-manifest restore hardening; log: `.codex-tmp/pr4-final-just-ci-after-mismatched-manifest-fix.log`
+  - `just ci` after final review hardening; log: `.codex-tmp/pr4-final-just-ci-after-final-review-hardening.log`

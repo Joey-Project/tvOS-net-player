@@ -523,7 +523,10 @@ async fn build_file_response(
 
     let mut response = Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, opened_file.content_type)
+        .header(
+            CONTENT_TYPE,
+            content_type_header_value(&opened_file.content_type),
+        )
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, length.to_string())
         .header(
@@ -959,6 +962,23 @@ mod tests {
         copy_hls_upstream_headers(&source, &mut target, "video/mp4\nx-invalid: nope");
 
         assert_eq!("application/octet-stream", target[CONTENT_TYPE]);
+    }
+
+    #[tokio::test]
+    async fn cached_file_response_invalid_content_type_uses_octet_stream() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("video.m4s");
+        std::fs::write(&path, b"media").expect("media file should be written");
+        let opened_file = OpenedMediaFile {
+            file: std::fs::File::open(&path).expect("media file should open"),
+            content_type: "video/mp4\nx-invalid: nope".to_owned(),
+            last_modified: std::time::SystemTime::UNIX_EPOCH,
+            size_bytes: 5,
+        };
+
+        let response = build_file_response(opened_file, None, true).await;
+
+        assert_eq!("application/octet-stream", response.headers()[CONTENT_TYPE]);
     }
 
     #[test]

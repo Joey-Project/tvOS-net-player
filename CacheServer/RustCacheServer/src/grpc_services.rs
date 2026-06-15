@@ -604,6 +604,7 @@ async fn run_bilibili_playback_planning(
         uri: playback_source_uri,
         expires_at: None,
     };
+    state.hls_sessions.insert(metadata.hls_session.clone());
     match state.tasks.complete_playback_playable(
         &task_id,
         metadata.title,
@@ -615,7 +616,6 @@ async fn run_bilibili_playback_planning(
                 state.hls_sessions.remove(&task_id);
                 let _ = state.hls_cache.remove_session(&task_id);
             } else {
-                state.hls_sessions.insert(metadata.hls_session.clone());
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
                         "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"

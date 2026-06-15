@@ -354,6 +354,9 @@ impl HlsCacheStore {
         if persisted.schema_version != HLS_CACHE_SCHEMA_VERSION {
             return None;
         }
+        if persisted.id != session_id {
+            return None;
+        }
 
         HlsPlaybackSession::try_from(persisted).ok()
     }
@@ -1141,6 +1144,48 @@ mod tests {
         let sessions = store.load_sessions().expect("cache scan should succeed");
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn get_completed_library_item_skips_manifest_with_mismatched_directory_id() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = HlsCacheStore::new(temp.path());
+        let completed_session = sample_session("session-2", "https://example.test/video.m4s");
+        let completed_dir = store
+            .session_dir(&completed_session.id)
+            .expect("session dir should be valid");
+        std::fs::create_dir_all(&completed_dir).expect("completed session dir should be created");
+        write_pretty_json(
+            &completed_dir.join("session.json"),
+            &PersistedHlsSession::from(completed_session.clone()),
+        );
+        std::fs::write(
+            store
+                .resource_path(&completed_session.id, "video.m4s")
+                .expect("resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("completed resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&completed_session.id, "video.m4s")
+                .expect("resource metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, "video.m4s"),
+        );
+        let mismatched_dir = store
+            .session_dir("orphan")
+            .expect("mismatched session dir should be valid");
+        std::fs::create_dir_all(&mismatched_dir).expect("mismatched session dir should be created");
+        write_pretty_json(
+            &mismatched_dir.join("session.json"),
+            &PersistedHlsSession::from(completed_session),
+        );
+
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.orphan")
+                .is_none()
+        );
     }
 
     #[test]
