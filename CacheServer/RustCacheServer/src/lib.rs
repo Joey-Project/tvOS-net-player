@@ -36,7 +36,7 @@ use crate::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
         TaskGrpcService,
     },
-    hls::HlsPlaybackRegistry,
+    hls::{HlsPlaybackRegistry, HlsPlaybackSession},
     hls_cache::{HlsCacheStore, sanitized_completed_session},
     library::LocalMediaLibrary,
     media::{
@@ -316,6 +316,43 @@ impl AppState {
 
     pub(crate) fn supports_completed_hls_cache_playback(&self) -> bool {
         self.completed_hls_cache_playback_supported
+    }
+
+    pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
+        if let Some(session) = self.hls_sessions.get(session_id) {
+            return Some(session);
+        }
+        self.ensure_hls_session_registered(session_id)
+            .then(|| self.hls_sessions.get(session_id))
+            .flatten()
+    }
+
+    fn ensure_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_sessions.get(session_id).is_some() {
+            return true;
+        }
+        let Ok(task) = self.tasks.get_task(session_id) else {
+            return false;
+        };
+        if task.kind() != TaskKind::BilibiliProgressivePlayback {
+            return false;
+        }
+
+        match task.state() {
+            TaskState::Playable => {
+                let Some(session) = self.hls_cache.playback_session(session_id) else {
+                    return false;
+                };
+                self.hls_sessions.insert(session);
+                true
+            }
+            TaskState::Completed => {
+                self.supports_completed_hls_cache_playback()
+                    && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+                    && self.ensure_completed_hls_session_registered(session_id)
+            }
+            _ => false,
+        }
     }
 
     fn ensure_completed_hls_session_registered(&self, session_id: &str) -> bool {

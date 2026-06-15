@@ -877,6 +877,7 @@ mod tests {
     use axum::{
         Router,
         body::{Body, Bytes},
+        extract::{Path as AxumPath, State},
         http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
         routing::get,
     };
@@ -1768,6 +1769,15 @@ mod tests {
         readable_permissions.set_mode(0o700);
         fs::set_permissions(&hls_root, readable_permissions)
             .expect("HLS cache root should become readable again");
+
+        let direct_master = crate::media::hls_master_playlist_get(
+            State(crate::media::MediaState::new(restored.clone())),
+            AxumPath(creation.task.id.clone()),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, direct_master.status());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_some());
+        restored.hls_sessions.remove(&creation.task.id);
 
         let library_service = LibraryGrpcService::new(restored.clone());
         let item = library_service

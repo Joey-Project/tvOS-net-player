@@ -119,7 +119,7 @@ fn hls_master_playlist_response(
     session_id: String,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_sessions.get(&session_id) else {
+    let Some(session) = state.state.hls_playback_session(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
@@ -144,7 +144,7 @@ async fn hls_segment_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_sessions.get(&session_id) else {
+    let Some(session) = state.state.hls_playback_session(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
