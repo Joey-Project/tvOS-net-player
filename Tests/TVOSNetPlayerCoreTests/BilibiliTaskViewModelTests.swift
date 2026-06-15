@@ -170,6 +170,39 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.statusMessage, "No Bilibili playback task submitted.")
     }
 
+    func testActivePlaybackLibraryItemMatchesCompletedTaskCache() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(
+                    source: "BV1done",
+                    state: "TASK_STATE_COMPLETED",
+                    libraryItemID: "cached-bilibili-playback-1",
+                    playbackSourceItemID: "cached-bilibili-playback-1"
+                )
+            )
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+
+        model.finishPreparedPlayback(didStartPlayback: true)
+
+        XCTAssertTrue(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "other-item"))
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: ""))
+
+        model.clearPlaybackStatus()
+
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+
+        model.clearTask()
+    }
+
     func testPlayableTaskRejectsMismatchedPlaybackSourceOwner() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(state: "TASK_STATE_PREPARING"))
