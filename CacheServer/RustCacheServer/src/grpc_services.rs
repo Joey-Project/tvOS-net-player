@@ -763,6 +763,15 @@ pub(crate) async fn run_hls_cache_finalization(
                     state
                         .hls_sessions
                         .insert(sanitized_completed_session(&session));
+                    if let Err(error) = state.enforce_hls_cache_quota(
+                        "after_hls_finalization",
+                        [task_id.clone()],
+                        0,
+                    ) {
+                        eprintln!(
+                            "Failed to run HLS cache eviction after finalization for task {task_id}: {error}"
+                        );
+                    }
                 }
                 Ok(_) | Err(_) => {
                     state.hls_sessions.remove(&task_id);
@@ -1785,6 +1794,71 @@ mod tests {
         );
         assert!(state.tasks.get_task(&protected.task_id).is_ok());
         assert!(state.tasks.get_task(&evictable.task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_finalization_enforces_quota_after_unknown_projected_size() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 2,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let older =
+            create_completed_hls_playback_task(&state, "BV1older-cache", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (current_task_id, current_session, current_library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1current-cache", &upstream_url);
+
+        assert_eq!(None, hls_session_declared_size_bytes(&current_session));
+
+        run_hls_cache_finalization(
+            state.clone(),
+            current_task_id.clone(),
+            current_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        )
+        .await;
+
+        let status = state
+            .hls_cache_status()
+            .expect("status should scan after finalization");
+        let summary = status
+            .last_eviction
+            .expect("post-finalization quota should run");
+        assert_eq!("after_hls_finalization", summary.reason);
+        assert_eq!(2 * session_size, summary.started_used_bytes);
+        assert_eq!(session_size, summary.finished_used_bytes);
+        assert_eq!(session_size, summary.target_used_bytes);
+        assert_eq!(vec![older.task_id.clone()], summary.evicted_session_ids);
+        assert!(summary.target_reached);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&older.library_item_id)
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&current_library_item_id)
+                .is_some()
+        );
+        assert!(state.tasks.get_task(&older.task_id).is_err());
+        assert!(state.tasks.get_task(&current_task_id).is_ok());
     }
 
     #[tokio::test]
@@ -3505,6 +3579,32 @@ mod tests {
         source: &str,
         upstream_url: &str,
     ) -> CompletedHlsTestTask {
+        let (task_id, hls_session, _) =
+            create_playable_hls_playback_task(state, source, upstream_url);
+        let library_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &hls_session)
+            .await
+            .expect("HLS resources should cache");
+        state
+            .tasks
+            .complete_playback_cached(&task_id, library_item_id.clone())
+            .expect("task should become completed");
+        state
+            .hls_sessions
+            .insert(sanitized_completed_session(&hls_session));
+
+        CompletedHlsTestTask {
+            task_id,
+            library_item_id,
+        }
+    }
+
+    fn create_playable_hls_playback_task(
+        state: &AppState,
+        source: &str,
+        upstream_url: &str,
+    ) -> (String, HlsPlaybackSession, String) {
         let creation = state
             .tasks
             .create_bilibili_playback_task(source, None)
@@ -3538,23 +3638,9 @@ mod tests {
                 metadata.playback_session,
             )
             .expect("task should become playable");
-        let library_item_id = state
-            .hls_cache
-            .cache_session_resources(&state.hls_upstream_client, &metadata.hls_session)
-            .await
-            .expect("HLS resources should cache");
-        state
-            .tasks
-            .complete_playback_cached(&creation.task.id, library_item_id.clone())
-            .expect("task should become completed");
-        state
-            .hls_sessions
-            .insert(sanitized_completed_session(&metadata.hls_session));
-
-        CompletedHlsTestTask {
-            task_id: creation.task.id,
-            library_item_id,
-        }
+        let task_id = creation.task.id;
+        let library_item_id = HlsCacheStore::completed_library_item_id(&task_id);
+        (task_id, metadata.hls_session, library_item_id)
     }
 
     struct EmptyPlaybackPlanner;
