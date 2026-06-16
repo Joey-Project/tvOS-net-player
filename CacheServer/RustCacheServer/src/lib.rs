@@ -14,7 +14,7 @@ pub mod task_registry;
 mod task_store;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -78,6 +78,28 @@ pub struct AppState {
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
+    hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+pub(crate) struct HlsCacheEvictionProtectionGuard {
+    session_id: String,
+    protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for HlsCacheEvictionProtectionGuard {
+    fn drop(&mut self) {
+        let mut protected_session_ids = self
+            .protected_session_ids
+            .lock()
+            .expect("HLS cache eviction protection lock poisoned");
+        let Some(count) = protected_session_ids.get_mut(&self.session_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            protected_session_ids.remove(&self.session_id);
+        }
+    }
 }
 
 impl AppState {
@@ -196,6 +218,7 @@ impl AppState {
             hls_cache_finalization_permits,
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
+            hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
@@ -388,6 +411,24 @@ impl AppState {
         })
     }
 
+    pub(crate) fn protect_hls_cache_session_from_eviction(
+        &self,
+        session_id: &str,
+    ) -> HlsCacheEvictionProtectionGuard {
+        let session_id = session_id.to_owned();
+        {
+            let mut protected_session_ids = self
+                .hls_cache_eviction_protected_session_ids
+                .lock()
+                .expect("HLS cache eviction protection lock poisoned");
+            *protected_session_ids.entry(session_id.clone()).or_insert(0) += 1;
+        }
+        HlsCacheEvictionProtectionGuard {
+            session_id,
+            protected_session_ids: Arc::clone(&self.hls_cache_eviction_protected_session_ids),
+        }
+    }
+
     pub(crate) fn enforce_hls_cache_quota(
         &self,
         reason: &str,
@@ -408,6 +449,13 @@ impl AppState {
 
         let mut protected_ids = self.tasks.protected_hls_cache_session_ids();
         protected_ids.extend(protected_session_ids);
+        protected_ids.extend(
+            self.hls_cache_eviction_protected_session_ids
+                .lock()
+                .expect("HLS cache eviction protection lock poisoned")
+                .keys()
+                .cloned(),
+        );
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
@@ -478,15 +526,18 @@ impl AppState {
         if task.kind() != TaskKind::BilibiliProgressivePlayback {
             return false;
         }
-        if task.state() != TaskState::Completed {
-            return false;
-        }
-        if task.library_item_id == entry.library_item_id {
-            return true;
-        }
+        match task.state() {
+            TaskState::Completed => {
+                if task.library_item_id == entry.library_item_id {
+                    return true;
+                }
 
-        self.fail_completed_hls_task_after_cache_restore(&entry.session_id);
-        true
+                self.fail_completed_hls_task_after_cache_restore(&entry.session_id);
+                true
+            }
+            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => true,
+            _ => false,
+        }
     }
 
     fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
