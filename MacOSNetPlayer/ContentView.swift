@@ -6,9 +6,11 @@ import TVOSNetPlayerCore
 struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
+    @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
+    @State private var didAttemptAutoDiscovery = false
 
     var body: some View {
         NavigationSplitView {
@@ -18,8 +20,19 @@ struct ContentView: View {
         }
         .frame(minWidth: 1100, minHeight: 720)
         .onAppear(perform: selectFirstCacheItemIfNeeded)
+        .onAppear {
+            discoveryModel.start()
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
+        }
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
+        }
+        .onChange(of: discoveryModel.discoveredServers) { _, _ in
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
         }
         .confirmationDialog(
             "Delete Cached Video?",
@@ -75,6 +88,8 @@ struct ContentView: View {
                 }
                 .disabled(!cacheModel.canRefresh)
             }
+
+            discoveryControls
 
             HStack(spacing: 8) {
                 TextField("Search cached videos", text: $cacheModel.searchText)
@@ -134,6 +149,30 @@ struct ContentView: View {
         }
         .padding(16)
         .navigationTitle(cacheModel.serverName)
+    }
+
+    private var discoveryControls: some View {
+        HStack(spacing: 8) {
+            Menu {
+                ForEach(discoveryModel.discoveredServers) { server in
+                    Button {
+                        Task {
+                            await selectDiscoveredServer(server)
+                        }
+                    } label: {
+                        Text(server.displayName)
+                    }
+                }
+            } label: {
+                Label("LAN Servers", systemImage: "network")
+            }
+            .disabled(discoveryModel.discoveredServers.isEmpty || cacheModel.isLoading)
+
+            Text(discoveryModel.statusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
     }
 
     @ViewBuilder
@@ -402,6 +441,25 @@ struct ContentView: View {
         Task {
             await deleteCachedItem(item)
         }
+    }
+
+    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async {
+        discoveryModel.select(server)
+        cacheModel.useDiscoveredServer(server)
+        await cacheModel.refresh()
+    }
+
+    private func autoConnectDiscoveredServerIfNeeded() async {
+        guard
+            !didAttemptAutoDiscovery,
+            !cacheModel.hasServerAddress,
+            let server = discoveryModel.preferredServer
+        else {
+            return
+        }
+
+        didAttemptAutoDiscovery = true
+        await selectDiscoveredServer(server)
     }
 
     private func playBilibiliTask() async {

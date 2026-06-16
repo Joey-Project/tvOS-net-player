@@ -63,6 +63,10 @@ public final class CacheLibraryViewModel: ObservableObject {
             && deletingItemIDs.isEmpty
     }
 
+    public var hasServerAddress: Bool {
+        !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     public var hasMoreItems: Bool {
         !nextPageToken.isEmpty && !hasPendingSearch
     }
@@ -174,6 +178,12 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    public func useDiscoveredServer(_ server: DiscoveredCacheServer) {
+        serverAddressText = server.endpoint.displayAddress
+        errorMessage = nil
+        statusMessage = "Discovered \(server.displayName). Refresh cache server to load videos."
     }
 
     public func loadMore() async {

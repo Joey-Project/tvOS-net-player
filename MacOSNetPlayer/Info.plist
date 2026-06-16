@@ -29,6 +29,10 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>MacOS Net Player connects to media servers on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_tvos-net-player._tcp</string>
+	</array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

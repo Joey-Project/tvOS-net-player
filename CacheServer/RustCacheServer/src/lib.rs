@@ -1,6 +1,7 @@
 mod bbdown_adapter;
 mod bilibili_playback;
 pub mod bilibili_worker;
+mod bonjour;
 pub mod config;
 pub mod generated;
 pub mod grpc_services;
@@ -512,6 +513,13 @@ pub async fn run_with_state(
     let grpc_state = state.clone();
     let media_state = state.clone();
 
+    let _bonjour_advertisement = match bonjour::BonjourAdvertisement::start(&state.options) {
+        Ok(advertisement) => advertisement,
+        Err(error) => {
+            eprintln!("warning: Bonjour advertisement is unavailable: {error}");
+            None
+        }
+    };
     let grpc_server = run_grpc_servers(grpc_addrs, grpc_state);
     let media_server = run_media_servers(media_addrs, media_state);
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();

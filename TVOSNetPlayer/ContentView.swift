@@ -6,8 +6,10 @@ import TVOSNetPlayerCacheClient
 struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
+    @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var pendingDeleteItem: CacheLibraryItem?
+    @State private var didAttemptAutoDiscovery = false
     @FocusState private var focusedControl: FocusedControl?
 
     private enum FocusedControl: Hashable {
@@ -49,10 +51,19 @@ struct ContentView: View {
             .padding(.vertical, 58)
         }
         .onAppear {
+            discoveryModel.start()
             focusedControl =
                 cacheModel.serverAddressText.isEmpty
                 ? .cacheServerField
                 : (model.streamURLText.isEmpty ? .refreshButton : .playButton)
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
+        }
+        .onChange(of: discoveryModel.discoveredServers) { _, _ in
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
         }
         .confirmationDialog(
             "Delete Cached Video?",
@@ -113,6 +124,8 @@ struct ContentView: View {
                 .disabled(!cacheModel.canRefresh)
                 .focused($focusedControl, equals: .refreshButton)
             }
+
+            discoveryControls
 
             if !cacheModel.cacheRoots.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -197,6 +210,40 @@ struct ContentView: View {
 
                         cacheLoadMoreButton
                     }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var discoveryControls: some View {
+        if discoveryModel.isSearching || discoveryModel.errorMessage != nil || !discoveryModel.discoveredServers.isEmpty
+        {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(discoveryModel.statusMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                ForEach(discoveryModel.discoveredServers.prefix(4)) { server in
+                    Button {
+                        Task {
+                            await selectDiscoveredServer(server)
+                        }
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(server.displayName)
+                                Text(server.detailText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "network")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(cacheModel.isLoading)
                 }
             }
         }
@@ -397,6 +444,25 @@ struct ContentView: View {
         Task {
             await deleteCachedItem(item)
         }
+    }
+
+    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async {
+        discoveryModel.select(server)
+        cacheModel.useDiscoveredServer(server)
+        await cacheModel.refresh()
+    }
+
+    private func autoConnectDiscoveredServerIfNeeded() async {
+        guard
+            !didAttemptAutoDiscovery,
+            !cacheModel.hasServerAddress,
+            let server = discoveryModel.preferredServer
+        else {
+            return
+        }
+
+        didAttemptAutoDiscovery = true
+        await selectDiscoveredServer(server)
     }
 
     private func playBilibiliTask() async {
