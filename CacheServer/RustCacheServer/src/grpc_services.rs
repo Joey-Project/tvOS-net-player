@@ -1805,6 +1805,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_quota_evicts_unprotected_session_when_protected_usage_exceeds_low_watermark()
+    {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 3,
+                hls_cache_high_watermark_percent: 50,
+                hls_cache_low_watermark_percent: 25,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let old =
+            create_completed_hls_playback_task(&state, "BV1old-unprotected", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let protected =
+            create_completed_hls_playback_task(&state, "BV1large-protected", &upstream_url).await;
+
+        let summary = state
+            .enforce_hls_cache_quota("test", [protected.task_id.clone()], 0)
+            .expect("eviction should scan cache")
+            .expect("quota should trigger eviction");
+
+        assert_eq!(vec![old.task_id.clone()], summary.evicted_session_ids);
+        assert_eq!(session_size, summary.finished_used_bytes);
+        assert!(!summary.target_reached);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&old.library_item_id)
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&protected.library_item_id)
+                .is_some()
+        );
+        assert!(state.tasks.get_task(&old.task_id).is_err());
+        assert!(state.tasks.get_task(&protected.task_id).is_ok());
+    }
+
+    #[tokio::test]
     async fn hls_cache_quota_skips_recent_completed_playback_source() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -1868,7 +1920,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_cache_quota_skips_pre_eviction_for_oversized_projected_session() {
+    async fn hls_cache_quota_rechecks_recent_playback_before_eviction() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 2,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let just_used =
+            create_completed_hls_playback_task(&state, "BV1late-lease", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let evictable =
+            create_completed_hls_playback_task(&state, "BV1late-evict", &upstream_url).await;
+        let should_cancel_calls = std::cell::Cell::new(0_usize);
+
+        let summary = state
+            .enforce_hls_cache_quota_until_cancelled("test", Vec::new(), 0, || {
+                let call = should_cancel_calls.get();
+                should_cancel_calls.set(call + 1);
+                if call == 2 {
+                    state.note_hls_cache_playback_use(&just_used.task_id);
+                }
+                false
+            })
+            .expect("eviction should scan cache")
+            .expect("quota should trigger eviction");
+
+        assert_eq!(vec![evictable.task_id.clone()], summary.evicted_session_ids);
+        assert!(summary.target_reached);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&just_used.library_item_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&evictable.library_item_id)
+                .is_none()
+        );
+        assert!(state.tasks.get_task(&just_used.task_id).is_ok());
+        assert!(state.tasks.get_task(&evictable.task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_quota_evicts_unprotected_sessions_for_oversized_projected_session() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -1896,25 +2006,29 @@ mod tests {
         let summary = state
             .enforce_hls_cache_quota("test", Vec::new(), session_size * 2)
             .expect("eviction should scan cache")
-            .expect("quota should trigger but skip unreachable target");
+            .expect("quota should trigger and evict eligible sessions");
 
-        assert!(summary.evicted_session_ids.is_empty());
+        assert_eq!(
+            vec![first.task_id.clone(), second.task_id.clone()],
+            summary.evicted_session_ids
+        );
+        assert_eq!(0, summary.finished_used_bytes);
         assert!(!summary.target_reached);
         assert_eq!(0, summary.target_used_bytes);
         assert!(
             state
                 .hls_cache
                 .get_completed_library_item(&first.library_item_id)
-                .is_some()
+                .is_none()
         );
         assert!(
             state
                 .hls_cache
                 .get_completed_library_item(&second.library_item_id)
-                .is_some()
+                .is_none()
         );
-        assert!(state.tasks.get_task(&first.task_id).is_ok());
-        assert!(state.tasks.get_task(&second.task_id).is_ok());
+        assert!(state.tasks.get_task(&first.task_id).is_err());
+        assert!(state.tasks.get_task(&second.task_id).is_err());
     }
 
     #[tokio::test]
@@ -2475,6 +2589,69 @@ mod tests {
             .tasks
             .get_task(&creation.task.id)
             .expect("playable task should remain persisted when cache scan fails");
+
+        assert_eq!(TaskState::Playable, restored_task.state());
+        assert!(restored_task.playback_source.is_some());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn app_state_preserves_hls_tasks_when_cache_root_is_missing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("external-cache-root");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()).join("external-cache-root"));
+        let task_state_path = temp.path().join("tasks.json");
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1missing-root", None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        creation.task.id
+                    ),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        fs::remove_dir_all(&root_path).expect("cache root should become unavailable");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should remain persisted when cache root is missing");
 
         assert_eq!(TaskState::Playable, restored_task.state());
         assert!(restored_task.playback_source.is_some());

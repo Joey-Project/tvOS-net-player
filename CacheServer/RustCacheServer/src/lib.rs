@@ -354,6 +354,10 @@ impl AppState {
         variant_id: &str,
         uri: String,
     ) -> Option<PlaybackSource> {
+        let _quota_lock = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
         if !self.supports_completed_hls_cache_playback() {
             return None;
         }
@@ -366,6 +370,19 @@ impl AppState {
             .create_playback_source(item_id, variant_id, uri)?;
         self.note_hls_cache_playback_use(&session_id);
         Some(source)
+    }
+
+    pub(crate) fn hls_playback_session_for_serving(
+        &self,
+        session_id: &str,
+    ) -> Option<HlsPlaybackSession> {
+        let _quota_lock = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
+        let session = self.hls_playback_session(session_id)?;
+        self.note_hls_cache_playback_use(session_id);
+        Some(session)
     }
 
     pub(crate) fn delete_completed_hls_library_item(
@@ -477,6 +494,26 @@ impl AppState {
         playback_leases.keys().cloned().collect()
     }
 
+    fn hls_cache_session_is_protected_from_eviction(
+        &self,
+        session_id: &str,
+        explicit_protected_session_ids: &HashSet<String>,
+    ) -> bool {
+        explicit_protected_session_ids.contains(session_id)
+            || self
+                .tasks
+                .protected_hls_cache_session_ids()
+                .contains(session_id)
+            || self
+                .recently_used_hls_cache_session_ids()
+                .contains(session_id)
+            || self
+                .hls_cache_eviction_protected_session_ids
+                .lock()
+                .expect("HLS cache eviction protection lock poisoned")
+                .contains_key(session_id)
+    }
+
     pub(crate) fn enforce_hls_cache_quota(
         &self,
         reason: &str,
@@ -520,44 +557,14 @@ impl AppState {
             return Ok(None);
         }
 
-        let mut protected_ids = self.tasks.protected_hls_cache_session_ids();
-        protected_ids.extend(protected_session_ids);
-        protected_ids.extend(self.recently_used_hls_cache_session_ids());
-        protected_ids.extend(
-            self.hls_cache_eviction_protected_session_ids
-                .lock()
-                .expect("HLS cache eviction protection lock poisoned")
-                .keys()
-                .cloned(),
-        );
+        let explicit_protected_session_ids =
+            protected_session_ids.into_iter().collect::<HashSet<_>>();
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
-        let protected_used_bytes = entries
-            .iter()
-            .filter(|entry| protected_ids.contains(&entry.session_id))
-            .map(|entry| entry.size_bytes)
-            .sum::<u64>();
         let mut finished_used_bytes = started_used_bytes;
         let mut evicted_bytes = 0_u64;
         let mut evicted_session_ids = Vec::new();
-
-        if protected_used_bytes.saturating_add(projected_added_bytes) > policy.low_watermark_bytes()
-        {
-            return Ok(Some(self.record_hls_cache_eviction_summary(
-                HlsCacheEvictionSummary {
-                    reason: reason.to_owned(),
-                    started_used_bytes,
-                    finished_used_bytes,
-                    target_used_bytes,
-                    projected_added_bytes,
-                    evicted_bytes,
-                    evicted_session_ids,
-                    target_reached: false,
-                    completed_at: SystemTime::now(),
-                },
-            )));
-        }
 
         let mut cancelled = false;
         for entry in entries {
@@ -568,7 +575,10 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            if protected_ids.contains(&entry.session_id) {
+            if self.hls_cache_session_is_protected_from_eviction(
+                &entry.session_id,
+                &explicit_protected_session_ids,
+            ) {
                 continue;
             }
             if !self.completed_hls_cache_entry_is_evictable(&entry) {
@@ -577,6 +587,12 @@ impl AppState {
             if should_cancel() {
                 cancelled = true;
                 break;
+            }
+            if self.hls_cache_session_is_protected_from_eviction(
+                &entry.session_id,
+                &explicit_protected_session_ids,
+            ) {
+                continue;
             }
             self.hls_cache.remove_session(&entry.session_id)?;
             self.hls_sessions.remove(&entry.session_id);
@@ -599,7 +615,8 @@ impl AppState {
                 projected_added_bytes,
                 evicted_bytes,
                 evicted_session_ids,
-                target_reached: finished_used_bytes <= target_used_bytes,
+                target_reached: finished_used_bytes.saturating_add(projected_added_bytes)
+                    <= policy.low_watermark_bytes(),
                 completed_at: SystemTime::now(),
             },
         )))

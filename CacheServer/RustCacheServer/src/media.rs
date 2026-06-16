@@ -119,10 +119,9 @@ fn hls_master_playlist_response(
     session_id: String,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_playback_session(&session_id) else {
+    let Some(session) = state.state.hls_playback_session_for_serving(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
-    state.state.note_hls_cache_playback_use(&session_id);
 
     let body = if head_only {
         Body::empty()
@@ -145,10 +144,9 @@ async fn hls_segment_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(session) = state.state.hls_playback_session(&session_id) else {
+    let Some(session) = state.state.hls_playback_session_for_serving(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
-    state.state.note_hls_cache_playback_use(&session_id);
 
     if segment_id.ends_with(".m3u8") {
         let Some(resource) = session.media_playlist_resource(&segment_id) else {

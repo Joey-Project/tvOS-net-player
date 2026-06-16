@@ -124,6 +124,18 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn load_sessions(&self) -> io::Result<Vec<HlsPlaybackSession>> {
+        self.reject_cache_path_symlink(self.root_path.as_ref())?;
+        match fs::metadata(self.root_path.as_ref()) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "HLS cache root path is not a directory",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+
         let store_root = self.store_root();
         self.reject_cache_path_symlink(&store_root)?;
         let entries = match fs::read_dir(store_root) {
@@ -1289,7 +1301,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_hls_cache_root_scans_as_empty_cache() {
+    fn missing_hls_store_directory_scans_as_empty_cache() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let store = HlsCacheStore::new(root);
+
+        let sessions = store
+            .load_sessions()
+            .expect("missing HLS store directory should scan as empty");
+        let entries = store
+            .completed_cache_entries()
+            .expect("missing HLS store directory should have no completed entries");
+        let usage = store
+            .usage_snapshot()
+            .expect("missing HLS store directory should report empty usage");
+
+        assert!(sessions.is_empty());
+        assert!(entries.is_empty());
+        assert_eq!(0, usage.used_bytes);
+        assert_eq!(0, usage.completed_session_count);
+    }
+
+    #[test]
+    fn missing_cache_root_reports_not_found() {
         let temp = TempDir::new().expect("temp dir should be created");
         let missing_root = temp
             .path()
@@ -1298,20 +1335,11 @@ mod tests {
             .join("fresh-cache-root");
         let store = HlsCacheStore::new(&missing_root);
 
-        let sessions = store
+        let error = store
             .load_sessions()
-            .expect("missing HLS cache root should scan as empty");
-        let entries = store
-            .completed_cache_entries()
-            .expect("missing HLS cache root should have no completed entries");
-        let usage = store
-            .usage_snapshot()
-            .expect("missing HLS cache root should report empty usage");
+            .expect_err("missing cache root should fail closed");
 
-        assert!(sessions.is_empty());
-        assert!(entries.is_empty());
-        assert_eq!(0, usage.used_bytes);
-        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(io::ErrorKind::NotFound, error.kind());
     }
 
     #[test]
