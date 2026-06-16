@@ -23,7 +23,7 @@ superseded_by:
 
 - Automatic eviction remains HLS-only and completed-session-only in this slice.
 - `Cache:HlsCacheMaxBytes=0` disables automatic eviction, while watermark values still validate.
-- Cleanup uses projected bytes before finalization when BBDown metadata includes complete resource sizes, then rechecks after finalization using actual cached size so unknown-size sessions are still enforced.
+- Cleanup uses projected bytes before finalization when BBDown metadata includes complete resource sizes, then rechecks after finalization using actual cached size so unknown-size sessions are still enforced. Startup restore shortcuts for already-complete HLS resources run the same post-finalization quota check.
 - Eviction skips protected/current progressive playback work, the session being finalized, recently issued/served completed playback sources, and incomplete sessions. Eligible completed sessions delete the HLS session directory and matching completed playback task record together.
 - If cancellation wins before or during pre-finalization quota enforcement, the server stops before deleting unrelated completed HLS items for that cancelled task.
 - If protected/projected bytes make the low-watermark target unreachable, the server records an eviction attempt but avoids wiping unrelated completed cache entries.
@@ -36,6 +36,7 @@ superseded_by:
 - `swift format lint --recursive Sources TVOSNetPlayer MacOSNetPlayer Tests TVOSNetPlayerTests MacOSNetPlayerTests`
 - `cargo test --package tvos-net-player-cache-server hls_cache`
 - `cargo test --package tvos-net-player-cache-server hls_cache_quota`
+- `cargo test --package tvos-net-player-cache-server app_state_restore_shortcut_enforces_quota_after_completed_hls_cache_restart`
 - `cargo test --package tvos-net-player-cache-server missing_hls_cache_root_scans_as_empty_cache`
 - `cargo test --package tvos-net-player-cache-server get_hls_cache_status`
 - `cargo test --package tvos-net-player-cache-server hls_eviction_policy`
@@ -43,5 +44,4 @@ superseded_by:
 
 ## Next Steps
 
-- Run the full local gate for this PR.
-- Open PR B, complete GitHub CI plus the three review lanes, resolve all conversations, merge, update `master`, then branch PR C for progressive weak-network scheduler/prewarm UX.
+- Branch PR C for progressive weak-network scheduler/prewarm UX.

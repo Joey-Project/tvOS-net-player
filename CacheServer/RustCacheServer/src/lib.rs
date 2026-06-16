@@ -256,10 +256,30 @@ impl AppState {
                     .insert(sanitized_completed_session(session));
                 match self.hls_cache.save_completed_session(session) {
                     Ok(()) => {
-                        let _ = self.tasks.complete_playback_cached(
+                        match self.tasks.complete_playback_cached(
                             &session.id,
                             HlsCacheStore::completed_library_item_id(&session.id),
-                        );
+                        ) {
+                            Ok(task) if task.state() == TaskState::Completed => {
+                                if let Err(error) = self.enforce_hls_cache_quota(
+                                    "after_hls_finalization",
+                                    [session.id.clone()],
+                                    0,
+                                ) {
+                                    eprintln!(
+                                        "Failed to run HLS cache eviction after startup finalization for task {}: {error}",
+                                        session.id
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(status) => {
+                                eprintln!(
+                                    "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
+                                    session.id
+                                );
+                            }
+                        }
                         continue;
                     }
                     Err(error) => {

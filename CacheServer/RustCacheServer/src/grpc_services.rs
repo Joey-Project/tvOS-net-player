@@ -2881,6 +2881,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_restore_shortcut_enforces_quota_after_completed_hls_cache_restart() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            hls_cache_max_bytes: session_size * 2,
+            hls_cache_high_watermark_percent: 90,
+            hls_cache_low_watermark_percent: 50,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let older =
+            create_completed_hls_playback_task(&state, "BV1older-cache", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (current_task_id, current_session, current_library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1current-cache", &upstream_url);
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &current_session)
+            .await
+            .expect("HLS resources should already be complete before restart");
+        let playable = state
+            .tasks
+            .get_task(&current_task_id)
+            .expect("current task should remain persisted");
+        assert_eq!(TaskState::Playable, playable.state());
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let completed =
+            wait_for_task_state(&restored.tasks, &current_task_id, TaskState::Completed).await;
+
+        assert_eq!(current_library_item_id, completed.library_item_id);
+        let status = restored
+            .hls_cache_status()
+            .expect("status should scan after startup finalization");
+        let summary = status
+            .last_eviction
+            .expect("startup finalization should run post-cache quota");
+        assert_eq!("after_hls_finalization", summary.reason);
+        assert_eq!(2 * session_size, summary.started_used_bytes);
+        assert_eq!(session_size, summary.finished_used_bytes);
+        assert_eq!(session_size, summary.target_used_bytes);
+        assert_eq!(vec![older.task_id.clone()], summary.evicted_session_ids);
+        assert!(summary.target_reached);
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&older.library_item_id)
+                .is_none()
+        );
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&current_library_item_id)
+                .is_some()
+        );
+        assert!(restored.tasks.get_task(&older.task_id).is_err());
+        assert!(restored.tasks.get_task(&current_task_id).is_ok());
+    }
+
+    #[tokio::test]
     async fn app_state_fails_restored_hls_task_when_cache_finalization_fails() {
         let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
