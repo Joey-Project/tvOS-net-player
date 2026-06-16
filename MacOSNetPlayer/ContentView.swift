@@ -446,7 +446,7 @@ struct ContentView: View {
     }
 
     @discardableResult
-    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async -> Bool {
+    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async -> CacheLibraryRefreshResult {
         discoveryModel.select(server)
         cacheModel.useDiscoveredServer(server)
         return await cacheModel.refresh()
@@ -464,13 +464,16 @@ struct ContentView: View {
         }
 
         isAutoDiscoveryConnecting = true
-        let didConnect = await selectDiscoveredServer(server)
+        let refreshResult = await selectDiscoveredServer(server)
         isAutoDiscoveryConnecting = false
-        if didConnect {
+        switch refreshResult {
+        case .succeeded:
             failedAutoDiscoveryServerIDs = []
-        } else {
+        case .failed:
             markAutoDiscoveryFailure(server)
             await autoConnectDiscoveredServerIfNeeded()
+        case .superseded:
+            break
         }
     }
 

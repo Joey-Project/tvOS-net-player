@@ -163,17 +163,56 @@ fn service_instance_name(server_name: &str, server_id: &str) -> String {
         return truncate_utf8(name, HOST_LABEL_MAX_BYTES).to_owned();
     }
 
-    service_host_label(server_id)
+    service_id_label(server_id)
 }
 
 fn service_host_name(server_id: &str) -> String {
-    format!("{}.local.", service_host_label(server_id))
+    format!(
+        "{}.local.",
+        service_host_label(server_id, system_host_name().as_deref())
+    )
 }
 
-fn service_host_label(server_id: &str) -> String {
-    let mut label = String::with_capacity(server_id.len());
+fn service_host_label(server_id: &str, host_name: Option<&str>) -> String {
+    let server_label = service_id_label(server_id);
+    let Some(host_label) = host_name.and_then(host_label_component) else {
+        return server_label;
+    };
+
+    let host_label = truncate_utf8(&host_label, 24).trim_matches('-').to_owned();
+    if host_label.is_empty() {
+        return server_label;
+    }
+
+    let max_server_bytes = HOST_LABEL_MAX_BYTES.saturating_sub(host_label.len() + 1);
+    let server_prefix = truncate_utf8(&server_label, max_server_bytes)
+        .trim_matches('-')
+        .to_owned();
+    if server_prefix.is_empty() {
+        return host_label;
+    }
+
+    format!("{server_prefix}-{host_label}")
+}
+
+fn service_id_label(server_id: &str) -> String {
+    dns_label_component(server_id).unwrap_or_else(|| "tvos-net-player-cache".to_owned())
+}
+
+fn host_label_component(host_name: &str) -> Option<String> {
+    let first_label = host_name
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .next()
+        .unwrap_or_default();
+    dns_label_component(first_label)
+}
+
+fn dns_label_component(value: &str) -> Option<String> {
+    let mut label = String::with_capacity(value.len());
     let mut previous_was_dash = false;
-    for byte in server_id.bytes() {
+    for byte in value.bytes() {
         let lower = byte.to_ascii_lowercase();
         let valid = lower.is_ascii_lowercase() || lower.is_ascii_digit();
         if valid {
@@ -186,17 +225,40 @@ fn service_host_label(server_id: &str) -> String {
     }
 
     let label = label.trim_matches('-');
-    let label = if label.is_empty() {
-        "tvos-net-player-cache"
-    } else {
-        label
-    };
-    truncate_utf8(label, HOST_LABEL_MAX_BYTES)
-        .trim_matches('-')
-        .to_owned()
+    if label.is_empty() {
+        return None;
+    }
+
+    Some(
+        truncate_utf8(label, HOST_LABEL_MAX_BYTES)
+            .trim_matches('-')
+            .to_owned(),
+    )
+}
+
+fn system_host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8(buffer[..length].to_vec())
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if max_bytes == 0 {
+        return "";
+    }
     if value.len() <= max_bytes {
         return value;
     }
@@ -234,7 +296,8 @@ mod tests {
                 .get_fullname()
                 .starts_with("Living Room Cache._tvos-net-player._tcp.local.")
         );
-        assert_eq!("living-room-cache.local.", service.get_hostname());
+        assert!(service.get_hostname().starts_with("living-room-cache"));
+        assert!(service.get_hostname().ends_with(".local."));
         assert_eq!(51051, service.get_port());
         assert!(service.is_addr_auto());
         assert!(service.get_addresses().is_empty());
@@ -272,11 +335,20 @@ mod tests {
 
     #[test]
     fn service_host_label_is_ascii_dns_safe() {
+        assert_eq!("living-room-cache", service_id_label("Living Room Cache!"));
+        assert_eq!("tvos-net-player-cache", service_id_label("..."));
+    }
+
+    #[test]
+    fn service_host_label_includes_machine_identity() {
         assert_eq!(
-            "living-room-cache",
-            service_host_label("Living Room Cache!")
+            "default-mac-mini",
+            service_host_label("default", Some("Mac mini.local."))
         );
-        assert_eq!("tvos-net-player-cache", service_host_label("..."));
+        assert_eq!(
+            "living-room-cache-mac-mini",
+            service_host_label("Living Room Cache", Some("mac-mini"))
+        );
     }
 
     #[test]

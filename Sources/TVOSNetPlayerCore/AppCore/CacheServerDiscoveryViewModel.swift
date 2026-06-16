@@ -286,17 +286,19 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
 
     private func handleBrowseResults(_ results: Set<NWBrowser.Result>) {
         var nextKeys: Set<BonjourServiceKey> = []
+        var keysToResolve: [BonjourServiceKey] = []
         for result in results {
             guard let key = BonjourServiceKey(endpoint: result.endpoint) else {
                 continue
             }
             nextKeys.insert(key)
             if resolvedServers[key] == nil && resolvingServices[key] == nil {
-                resolve(key)
+                keysToResolve.append(key)
             }
         }
 
         let removedKeys = activeServiceKeys.subtracting(nextKeys)
+        activeServiceKeys = nextKeys
         for key in removedKeys {
             if let service = resolvingServices.removeValue(forKey: key) {
                 let handle = NetServiceHandle(service: service)
@@ -308,7 +310,9 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
             resolveRetryCounts[key] = nil
         }
 
-        activeServiceKeys = nextKeys
+        for key in keysToResolve where activeServiceKeys.contains(key) {
+            resolve(key)
+        }
         emitSnapshot()
     }
 
@@ -333,6 +337,12 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
                 return
             }
             self.resolvingServices[key] = nil
+            guard self.activeServiceKeys.contains(key) else {
+                self.resolvedServers[key] = nil
+                self.resolveRetryCounts[key] = nil
+                self.emitSnapshot()
+                return
+            }
             guard let host = Self.normalizedHostName(hostName), port > 0 else {
                 self.scheduleResolveRetry(for: key)
                 self.emitSnapshot()

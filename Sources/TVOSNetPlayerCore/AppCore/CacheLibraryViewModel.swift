@@ -2,6 +2,12 @@ import Combine
 import Foundation
 import TVOSNetPlayerCacheClient
 
+public enum CacheLibraryRefreshResult: Equatable, Sendable {
+    case succeeded
+    case failed
+    case superseded
+}
+
 @MainActor
 public final class CacheLibraryViewModel: ObservableObject {
     public static let serverAddressDefaultsKey = "CacheServerAddress"
@@ -100,9 +106,9 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     @discardableResult
-    public func refresh() async -> Bool {
+    public func refresh() async -> CacheLibraryRefreshResult {
         guard deletingItemIDs.isEmpty else {
-            return false
+            return .failed
         }
 
         refreshSequence += 1
@@ -122,7 +128,7 @@ public final class CacheLibraryViewModel: ObservableObject {
                 statusMessage: "Cache server address is invalid.",
                 errorMessage: "Use a host and optional port, such as mac-mini.local:50051."
             )
-            return false
+            return .failed
         }
 
         isLoading = true
@@ -146,7 +152,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             }
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
-                return false
+                return .superseded
             }
 
             loadedEndpoint = endpoint
@@ -161,10 +167,10 @@ public final class CacheLibraryViewModel: ObservableObject {
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
             statusMessage = loadedLibraryStatusMessage
             isLoading = false
-            return true
+            return .succeeded
         } catch {
             guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
-                return false
+                return .superseded
             }
 
             loadedEndpoint = nil
@@ -181,7 +187,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         isLoading = false
-        return false
+        return .failed
     }
 
     public func useDiscoveredServer(_ server: DiscoveredCacheServer) {
