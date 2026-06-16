@@ -41,8 +41,9 @@ final class CacheLibraryViewModelTests: XCTestCase {
             clientFactory: { _ in client }
         )
 
-        await model.refresh()
+        let refreshResult = await model.refresh()
 
+        XCTAssertEqual(refreshResult, .succeeded)
         XCTAssertEqual(model.serverAddressText, "mac-mini.local:50051")
         XCTAssertEqual(model.serverName, "Mac mini cache")
         XCTAssertEqual(model.items.map(\.id), ["item-1"])
@@ -1128,7 +1129,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertNotNil(model.errorMessage)
 
         await client.releaseServerInfoRequests()
-        await initialRefresh.value
+        _ = await initialRefresh.value
 
         XCTAssertFalse(model.isLoading)
         XCTAssertTrue(model.items.isEmpty)
@@ -1539,8 +1540,9 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertEqual(model.statusMessage, "Refresh cache server to load videos.")
 
         await client.releaseServerInfoRequests()
-        await initialRefresh.value
+        let refreshResult = await initialRefresh.value
 
+        XCTAssertEqual(refreshResult, .superseded)
         XCTAssertFalse(model.isLoading)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.statusMessage, "Refresh cache server to load videos.")
@@ -1577,7 +1579,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertFalse(model.hasPendingSearch)
 
         await client.releaseServerInfoRequest(callCount: 2)
-        await reload.value
+        _ = await reload.value
 
         let requestedSearchTexts = await client.requestedLibrarySearchTexts
         XCTAssertEqual(requestedSearchTexts, ["clip", "clip"])
@@ -1601,8 +1603,9 @@ final class CacheLibraryViewModelTests: XCTestCase {
             clientFactory: { _ in client }
         )
 
-        await model.refresh()
+        let refreshResult = await model.refresh()
 
+        XCTAssertEqual(refreshResult, .failed)
         XCTAssertFalse(model.isLoading)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.serverName, "LAN cache")
@@ -1627,9 +1630,10 @@ final class CacheLibraryViewModelTests: XCTestCase {
         )
 
         let start = Date()
-        await model.refresh()
+        let refreshResult = await model.refresh()
         let elapsed = Date().timeIntervalSince(start)
 
+        XCTAssertEqual(refreshResult, .failed)
         XCTAssertLessThan(elapsed, 0.5)
         XCTAssertFalse(model.isLoading)
         XCTAssertEqual(model.statusMessage, "Could not load cache library.")
@@ -1692,8 +1696,9 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertEqual(model.items.map(\.id), ["item-a"])
 
         model.serverAddressText = "server-b.local:50051"
-        await model.refresh()
+        let refreshResult = await model.refresh()
 
+        XCTAssertEqual(refreshResult, .failed)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.serverName, "LAN cache")
         XCTAssertEqual(model.statusMessage, "Could not load cache library.")
@@ -1729,7 +1734,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         model.serverAddressText = "server-b.local:50051"
         await model.refresh()
         await slowClient.releaseServerInfoRequests()
-        await staleRefresh.value
+        _ = await staleRefresh.value
 
         XCTAssertEqual(model.serverAddressText, "server-b.local:50051")
         XCTAssertEqual(model.serverName, "Server B")

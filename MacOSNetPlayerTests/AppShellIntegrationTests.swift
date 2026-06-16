@@ -15,7 +15,13 @@ final class AppShellIntegrationTests: XCTestCase {
         let playerModel = PlayerViewModel(defaults: defaults, autoplay: false)
         let cacheModel = CacheLibraryViewModel(defaults: defaults)
         let bilibiliModel = BilibiliTaskViewModel()
-        let view = ContentView(model: playerModel, cacheModel: cacheModel, bilibiliModel: bilibiliModel)
+        let discoveryModel = CacheServerDiscoveryViewModel()
+        let view = ContentView(
+            model: playerModel,
+            cacheModel: cacheModel,
+            discoveryModel: discoveryModel,
+            bilibiliModel: bilibiliModel
+        )
 
         _ = view.body
 

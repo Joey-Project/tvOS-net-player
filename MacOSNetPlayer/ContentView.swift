@@ -6,9 +6,13 @@ import TVOSNetPlayerCore
 struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
+    @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
+    @State private var isAutoDiscoveryConnecting = false
+    @State private var failedAutoDiscoveryServerIDs: Set<String> = []
+    private let autoDiscoveryRetryDelay: Duration = .seconds(30)
 
     var body: some View {
         NavigationSplitView {
@@ -18,8 +22,19 @@ struct ContentView: View {
         }
         .frame(minWidth: 1100, minHeight: 720)
         .onAppear(perform: selectFirstCacheItemIfNeeded)
+        .onAppear {
+            discoveryModel.start()
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
+        }
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
+        }
+        .onChange(of: discoveryModel.discoveredServers) { _, _ in
+            Task {
+                await autoConnectDiscoveredServerIfNeeded()
+            }
         }
         .confirmationDialog(
             "Delete Cached Video?",
@@ -75,6 +90,8 @@ struct ContentView: View {
                 }
                 .disabled(!cacheModel.canRefresh)
             }
+
+            discoveryControls
 
             HStack(spacing: 8) {
                 TextField("Search cached videos", text: $cacheModel.searchText)
@@ -134,6 +151,30 @@ struct ContentView: View {
         }
         .padding(16)
         .navigationTitle(cacheModel.serverName)
+    }
+
+    private var discoveryControls: some View {
+        HStack(spacing: 8) {
+            Menu {
+                ForEach(discoveryModel.discoveredServers) { server in
+                    Button {
+                        Task {
+                            await selectDiscoveredServer(server)
+                        }
+                    } label: {
+                        Text(server.displayName)
+                    }
+                }
+            } label: {
+                Label("LAN Servers", systemImage: "network")
+            }
+            .disabled(discoveryModel.discoveredServers.isEmpty || cacheModel.isLoading)
+
+            Text(discoveryModel.statusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
     }
 
     @ViewBuilder
@@ -401,6 +442,52 @@ struct ContentView: View {
         pendingDeleteItem = nil
         Task {
             await deleteCachedItem(item)
+        }
+    }
+
+    @discardableResult
+    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async -> CacheLibraryRefreshResult {
+        discoveryModel.select(server)
+        cacheModel.useDiscoveredServer(server)
+        return await cacheModel.refresh()
+    }
+
+    private func autoConnectDiscoveredServerIfNeeded() async {
+        guard
+            !isAutoDiscoveryConnecting,
+            !cacheModel.hasServerAddress,
+            let server = discoveryModel.discoveredServers.first(where: {
+                !failedAutoDiscoveryServerIDs.contains($0.id)
+            })
+        else {
+            return
+        }
+
+        isAutoDiscoveryConnecting = true
+        let refreshResult = await selectDiscoveredServer(server)
+        isAutoDiscoveryConnecting = false
+        switch refreshResult {
+        case .succeeded:
+            failedAutoDiscoveryServerIDs = []
+        case .failed:
+            markAutoDiscoveryFailure(server)
+            await autoConnectDiscoveredServerIfNeeded()
+        case .superseded:
+            break
+        }
+    }
+
+    private func markAutoDiscoveryFailure(_ server: DiscoveredCacheServer) {
+        let inserted = failedAutoDiscoveryServerIDs.insert(server.id).inserted
+        cacheModel.clearFailedDiscoveredServer(server)
+        guard inserted else {
+            return
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: autoDiscoveryRetryDelay)
+            failedAutoDiscoveryServerIDs.remove(server.id)
+            await autoConnectDiscoveredServerIfNeeded()
         }
     }
 

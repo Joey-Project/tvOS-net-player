@@ -14,6 +14,7 @@ The tvOS app asks the LAN cache server for library state, task state, and playba
 ### tvOS App
 
 - Discover or configure the LAN cache server.
+- Browse Bonjour `_tvos-net-player._tcp` advertisements and fall back to manual host entry.
 - Browse library items and task progress through gRPC.
 - Submit Bilibili URLs or IDs as cache tasks.
 - Request a playback source for a library item.
@@ -24,6 +25,7 @@ The tvOS app should not parse Bilibili APIs, store Bilibili credentials, run BBD
 ### LAN Cache Server
 
 - Run on the Mac mini or another LAN host.
+- Publish a Bonjour `_tvos-net-player._tcp` advertisement for the gRPC control-plane listener when discovery is enabled.
 - Expose gRPC services for library, task, cache, and playback control.
 - Expose HTTP endpoints for media playback.
 - Manage cache roots on local disk or mounted shares.
@@ -107,8 +109,10 @@ Cache deletion contract:
 - gRPC Swift 2 is the tvOS client library for the control plane.
 - The app deployment target is tvOS 18.0 because generated gRPC Swift 2 client code is available on tvOS 18.0 or newer.
 - The tvOS client uses the Network.framework-backed `GRPCNIOTransportHTTP2TransportServices` transport with plaintext h2c to the trusted LAN cache server.
+- The tvOS and macOS apps declare `NSBonjourServices` for `_tvos-net-player._tcp`; discovery fills the same manual `host:port` control-plane address model that the gRPC client already uses.
 - `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` at the 2.7.0 source level with a manifest-only Xcode linkage patch for `GRPCNIOTransportCore` direct dependencies. Remove the vendor and return to the upstream package URL once upstream declares the same direct dependencies and Xcode package product linking succeeds without the local patch.
 - The server runtime is Rust. `tonic` hosts the gRPC h2c control plane, and `axum` hosts the HTTP media listener. BBDown remains behind an adapter boundary and is not part of the server runtime contract.
+- When `Cache:BonjourEnabled=true`, the gRPC listener includes a non-loopback address, and playback media is also LAN-reachable through either a non-loopback media listener or a non-localhost `Cache:PublicMediaBaseUri`, the Rust server publishes `_tvos-net-player._tcp.local.` through mDNS with TXT metadata for `server_id`, `server_name`, and server `version`. Bonjour publication is best-effort: if mDNS registration fails, gRPC and media listeners still start and the apps can use manual host entry. The default `localhost` listeners are not advertised because LAN clients cannot reach them.
 
 ## First Implementation Slice
 
@@ -117,19 +121,19 @@ Cache deletion contract:
 3. Add Bilibili task intake, lookup, watching, and pre-adapter cancellation. Done in the task-intake slice.
 4. Add the server-side task worker foundation, adapter boundary, and persisted task state. Done in the worker-foundation slice.
 5. Add the real BBDown crate adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library. Done in the BBDown Rust adapter slice.
-6. Add Bonjour discovery once the manual server URL path works.
+6. Add Bonjour discovery once the manual server URL path works. Done in the Bonjour discovery slice.
 7. Add HLS/progressive caching for weaker network conditions. Done for runtime passthrough, durable manifest restore, selected-resource offline finalization, user-visible offline labels, and manual deletion of completed HLS cache items; transcoding and automatic eviction policy remain follow-up work.
 
 ## First Slice Notes
 
-The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Manual cache item deletion, cache root display, tvOS task submission UI, and completed-HLS offline UX are implemented. Bonjour discovery, richer BBDown option mapping, transcoding, and automatic cache eviction remain follow-up work.
+The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Manual cache item deletion, cache root display, tvOS task submission UI, completed-HLS offline UX, and Bonjour discovery are implemented. Richer BBDown option mapping, transcoding, and automatic cache eviction remain follow-up work.
 
 Runtime shape:
 
 - The canonical proto lives under `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto` so the Swift package plugin and Rust server build share one schema source.
 - gRPC services are hosted by `tonic` and generated from `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`.
 - The server uses separate cleartext listeners by default: `http://localhost:50051` for gRPC/h2c and `http://localhost:8080` for HTTP media.
-- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) try to open both IPv4 and IPv6 listeners, and continue when one address family is unavailable but the other is bound; use a concrete LAN IP to restrict address family or interface. The first slice does not implement authentication.
+- LAN exposure is explicit: bind `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0` or a specific LAN address only on a trusted network. Wildcard hosts (`0.0.0.0`, `[::]`, `*`, and `+`) try to open both IPv4 and IPv6 listeners, and continue when one address family is unavailable but the other is bound; use a concrete LAN IP to restrict address family or interface. Bonjour advertises all host LAN addresses for wildcard gRPC listeners, but a concrete LAN IP listener advertises only that IP. Bonjour stays disabled unless playback media is also reachable through the LAN media listener or a configured public media base URI. The first slice does not implement authentication.
 - Destructive library deletion is opt-in with `Cache:AllowLibraryItemDelete=true` and otherwise returns `permission_denied`.
 - `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` must use `http://` in this slice. TLS should be added explicitly later rather than accepting an `https://` URL that the server does not actually serve.
 - `LibraryService.GetPlaybackSource` returns an HTTP URL under `/media/{itemId}/{variantId}`.
@@ -149,6 +153,7 @@ Configuration:
 - `Cache:GrpcListenUrl`: gRPC listen URL. Defaults to `http://localhost:50051`.
 - `Cache:MediaListenUrl`: HTTP media listen URL. Defaults to `http://localhost:8080`.
 - `Cache:PublicMediaBaseUri`: optional public base URL for playback URLs when the server sits behind a proxy.
+- `Cache:BonjourEnabled`: enables Bonjour/mDNS publication when both the control-plane gRPC endpoint and media playback endpoint are LAN-reachable. Defaults to `true`, but the default `localhost` listeners are intentionally not advertised; bind both `Cache:GrpcListenUrl` and `Cache:MediaListenUrl` to `0.0.0.0`, `[::]`, or trusted LAN IPs, or configure a non-localhost `Cache:PublicMediaBaseUri` for playback. Wildcard listeners publish automatically detected LAN addresses; concrete LAN IP listeners publish only that configured IP.
 - `Cache:TaskStatePath`: JSON task snapshot path. Defaults to `cache-server-state/tasks.json` next to the server executable.
 - `Cache:TaskRetentionMaxTerminalTasks`: maximum ordinary terminal task records to retain in the persisted task snapshot. Defaults to `200`; set `0` to disable this limit.
 - `Cache:TaskRetentionTerminalAgeDays`: maximum age in days for ordinary terminal task records in the persisted task snapshot. Defaults to `30`; set `0` to disable this limit.

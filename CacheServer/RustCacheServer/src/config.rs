@@ -19,6 +19,7 @@ pub struct CacheServerOptions {
     pub grpc_listen_url: String,
     pub media_listen_url: String,
     pub public_media_base_uri: Option<String>,
+    pub bonjour_enabled: bool,
     pub task_state_path: PathBuf,
     pub task_retention_max_terminal_tasks: usize,
     pub task_retention_terminal_age_days: u64,
@@ -42,6 +43,7 @@ impl Default for CacheServerOptions {
             grpc_listen_url: "http://localhost:50051".to_owned(),
             media_listen_url: "http://localhost:8080".to_owned(),
             public_media_base_uri: None,
+            bonjour_enabled: true,
             task_state_path: state_path.join("tasks.json"),
             task_retention_max_terminal_tasks: 200,
             task_retention_terminal_age_days: 30,
@@ -196,6 +198,7 @@ impl CacheServerOptions {
             "Cache:GrpcListenUrl" => self.grpc_listen_url = value,
             "Cache:MediaListenUrl" => self.media_listen_url = value,
             "Cache:PublicMediaBaseUri" => self.public_media_base_uri = Some(value),
+            "Cache:BonjourEnabled" => self.bonjour_enabled = parse_bool(&value)?,
             "Cache:TaskStatePath" => self.task_state_path = PathBuf::from(value),
             "Cache:TaskRetentionMaxTerminalTasks" => {
                 self.task_retention_max_terminal_tasks = value.parse().map_err(|_| {
@@ -400,7 +403,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -439,6 +442,7 @@ mod tests {
 
         assert_eq!("Test Cache", options.server_name);
         assert!(options.allow_library_item_delete);
+        assert!(options.bonjour_enabled);
         assert_eq!(PathBuf::from("/tmp/cache"), options.root_path);
         assert_eq!(
             PathBuf::from("/tmp/cache-state/tasks.json"),
@@ -448,6 +452,17 @@ mod tests {
             "127.0.0.1:51000".parse::<SocketAddr>().unwrap(),
             options.grpc_listen_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn parses_bonjour_disabled_arg() {
+        let options = CacheServerOptions::from_args([
+            "--Cache:BonjourEnabled".to_owned(),
+            "false".to_owned(),
+        ])
+        .expect("options should parse");
+
+        assert!(!options.bonjour_enabled);
     }
 
     #[test]

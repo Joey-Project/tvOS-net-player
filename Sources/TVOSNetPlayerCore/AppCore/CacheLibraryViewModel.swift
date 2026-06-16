@@ -2,6 +2,12 @@ import Combine
 import Foundation
 import TVOSNetPlayerCacheClient
 
+public enum CacheLibraryRefreshResult: Equatable, Sendable {
+    case succeeded
+    case failed
+    case superseded
+}
+
 @MainActor
 public final class CacheLibraryViewModel: ObservableObject {
     public static let serverAddressDefaultsKey = "CacheServerAddress"
@@ -63,6 +69,10 @@ public final class CacheLibraryViewModel: ObservableObject {
             && deletingItemIDs.isEmpty
     }
 
+    public var hasServerAddress: Bool {
+        !serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     public var hasMoreItems: Bool {
         !nextPageToken.isEmpty && !hasPendingSearch
     }
@@ -95,9 +105,10 @@ public final class CacheLibraryViewModel: ObservableObject {
             && !isLoadingMore
     }
 
-    public func refresh() async {
+    @discardableResult
+    public func refresh() async -> CacheLibraryRefreshResult {
         guard deletingItemIDs.isEmpty else {
-            return
+            return .failed
         }
 
         refreshSequence += 1
@@ -117,7 +128,7 @@ public final class CacheLibraryViewModel: ObservableObject {
                 statusMessage: "Cache server address is invalid.",
                 errorMessage: "Use a host and optional port, such as mac-mini.local:50051."
             )
-            return
+            return .failed
         }
 
         isLoading = true
@@ -141,7 +152,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             }
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
-                return
+                return .superseded
             }
 
             loadedEndpoint = endpoint
@@ -155,9 +166,11 @@ public final class CacheLibraryViewModel: ObservableObject {
             serverAddressText = endpoint.displayAddress
             defaults.set(endpoint.displayAddress, forKey: Self.serverAddressDefaultsKey)
             statusMessage = loadedLibraryStatusMessage
+            isLoading = false
+            return .succeeded
         } catch {
             guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
-                return
+                return .superseded
             }
 
             loadedEndpoint = nil
@@ -174,6 +187,26 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         isLoading = false
+        return .failed
+    }
+
+    public func useDiscoveredServer(_ server: DiscoveredCacheServer) {
+        serverAddressText = server.endpoint.displayAddress
+        errorMessage = nil
+        statusMessage = "Discovered \(server.displayName). Refresh cache server to load videos."
+    }
+
+    public func clearFailedDiscoveredServer(_ server: DiscoveredCacheServer) {
+        guard
+            loadedEndpoint == nil,
+            serverAddressText == server.endpoint.displayAddress
+        else {
+            return
+        }
+
+        serverAddressText = ""
+        errorMessage = nil
+        statusMessage = "Cache server not connected."
     }
 
     public func loadMore() async {
