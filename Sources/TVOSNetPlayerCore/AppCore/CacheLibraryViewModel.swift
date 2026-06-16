@@ -314,12 +314,13 @@ public final class CacheLibraryViewModel: ObservableObject {
         if nextPageToken.isEmpty {
             items.removeAll { $0.id == item.id }
         } else {
+            let requestSearchText = Self.searchTextForRequest(activeSearchText)
             do {
                 let libraryPage = try await Self.withOperationTimeout(operationTimeout) {
                     try await client.listLibraryItemsPage(
                         pageToken: "",
                         pageSize: Self.libraryPageSize,
-                        searchText: Self.searchTextForRequest(self.activeSearchText)
+                        searchText: requestSearchText
                     )
                 }
 
@@ -355,7 +356,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     private func refreshCacheRoots(
-        client: CacheControlClient,
+        client: any CacheControlClient,
         requestSequence: Int,
         endpoint: CacheServerEndpoint
     ) async {

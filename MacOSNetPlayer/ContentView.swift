@@ -8,6 +8,7 @@ struct ContentView: View {
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
+    @State private var pendingDeleteItem: CacheLibraryItem?
 
     var body: some View {
         NavigationSplitView {
@@ -19,6 +20,28 @@ struct ContentView: View {
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
+        }
+        .confirmationDialog(
+            "Delete Cached Video?",
+            isPresented: Binding(
+                get: { pendingDeleteItem != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteItem = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteItem
+        ) { item in
+            Button("Delete", role: .destructive) {
+                confirmDeleteCachedItem(item)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItem = nil
+            }
+        } message: { item in
+            Text("Delete \(item.displayTitle) from the LAN cache server.")
         }
     }
 
@@ -310,9 +333,7 @@ struct ContentView: View {
                     )
 
                     Button {
-                        Task {
-                            await deleteCachedItem(selectedItem)
-                        }
+                        pendingDeleteItem = selectedItem
                     } label: {
                         Label(
                             cacheModel.deletingItemIDs.contains(selectedItem.id) ? "Deleting" : "Delete",
@@ -373,6 +394,13 @@ struct ContentView: View {
         }
         if didRemove {
             bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
+        }
+    }
+
+    private func confirmDeleteCachedItem(_ item: CacheLibraryItem) {
+        pendingDeleteItem = nil
+        Task {
+            await deleteCachedItem(item)
         }
     }
 

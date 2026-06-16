@@ -7,6 +7,7 @@ struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
+    @State private var pendingDeleteItem: CacheLibraryItem?
     @FocusState private var focusedControl: FocusedControl?
 
     private enum FocusedControl: Hashable {
@@ -52,6 +53,28 @@ struct ContentView: View {
                 cacheModel.serverAddressText.isEmpty
                 ? .cacheServerField
                 : (model.streamURLText.isEmpty ? .refreshButton : .playButton)
+        }
+        .confirmationDialog(
+            "Delete Cached Video?",
+            isPresented: Binding(
+                get: { pendingDeleteItem != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteItem = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteItem
+        ) { item in
+            Button("Delete", role: .destructive) {
+                confirmDeleteCachedItem(item)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItem = nil
+            }
+        } message: { item in
+            Text("Delete \(item.displayTitle) from the LAN cache server.")
         }
     }
 
@@ -160,9 +183,7 @@ struct ContentView: View {
                                 )
 
                                 Button {
-                                    Task {
-                                        await deleteCachedItem(item)
-                                    }
+                                    pendingDeleteItem = item
                                 } label: {
                                     Label(
                                         cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
@@ -368,6 +389,13 @@ struct ContentView: View {
         }
         if didRemove {
             bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
+        }
+    }
+
+    private func confirmDeleteCachedItem(_ item: CacheLibraryItem) {
+        pendingDeleteItem = nil
+        Task {
+            await deleteCachedItem(item)
         }
     }
 
