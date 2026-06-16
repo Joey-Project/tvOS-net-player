@@ -128,7 +128,7 @@ impl HlsCacheStore {
         self.reject_cache_path_symlink(&store_root)?;
         let entries = match fs::read_dir(store_root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && self.root_path.is_dir() => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Vec::new());
             }
             Err(error) => return Err(error),
@@ -1286,6 +1286,32 @@ mod tests {
         let sessions = store.load_sessions().expect("session manifest should load");
 
         assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn missing_hls_cache_root_scans_as_empty_cache() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let missing_root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()))
+            .join("fresh-cache-root");
+        let store = HlsCacheStore::new(&missing_root);
+
+        let sessions = store
+            .load_sessions()
+            .expect("missing HLS cache root should scan as empty");
+        let entries = store
+            .completed_cache_entries()
+            .expect("missing HLS cache root should have no completed entries");
+        let usage = store
+            .usage_snapshot()
+            .expect("missing HLS cache root should report empty usage");
+
+        assert!(sessions.is_empty());
+        assert!(entries.is_empty());
+        assert_eq!(0, usage.used_bytes);
+        assert_eq!(0, usage.completed_session_count);
     }
 
     #[test]

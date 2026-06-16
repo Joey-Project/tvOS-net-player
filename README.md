@@ -97,6 +97,7 @@ BBDown adapter 相关配置：
 - `Cache:HlsCacheMaxBytes`: completed HLS cache 的自动淘汰预算。默认 50 GiB；设为 `0` 可关闭自动淘汰。
 - `Cache:HlsCacheHighWatermarkPercent`: current/projected completed-HLS usage 触发清理的高水位。默认 `90`。
 - `Cache:HlsCacheLowWatermarkPercent`: 触发清理后的目标低水位。默认 `80`，必须低于 high watermark。
+  自动淘汰只会处理 completed HLS sessions，并会跳过 active/finalizing/recently-served sessions；如果 task-state snapshot 不可读，server 会保留可能可恢复的 HLS cache，而不是把它当 orphan 删除。
 - `Cache:BBDownOutputDir`: BBDown 输出目录，默认是 `Cache:RootPath/Bilibili`；当 worker 启用或显式配置该路径时，它必须位于 `Cache:RootPath` 内，不能包含 `..` parent components，且 root 内已经存在的输出路径组件不能是 symlink。
 - `Cache:BBDownArchivePath`: BBDown 下载 archive JSON。默认和 `Cache:TaskStatePath` 同目录，文件名为 `bbdown-archive.json`。
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。

@@ -63,6 +63,7 @@ const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,7 +79,9 @@ pub struct AppState {
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
+    hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
     hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
+    hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
 }
 
 pub(crate) struct HlsCacheEvictionProtectionGuard {
@@ -218,7 +221,9 @@ impl AppState {
             hls_cache_finalization_permits,
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
+            hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
             hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
@@ -336,8 +341,11 @@ impl AppState {
         if !self.completed_hls_task_is_authorized(&session_id) {
             return None;
         }
-        self.hls_cache
-            .create_playback_source(item_id, variant_id, uri)
+        let source = self
+            .hls_cache
+            .create_playback_source(item_id, variant_id, uri)?;
+        self.note_hls_cache_playback_use(&session_id);
+        Some(source)
     }
 
     pub(crate) fn delete_completed_hls_library_item(
@@ -429,17 +437,62 @@ impl AppState {
         }
     }
 
+    pub(crate) fn note_hls_cache_playback_use(&self, session_id: &str) {
+        let expires_at = SystemTime::now()
+            .checked_add(HLS_CACHE_PLAYBACK_LEASE_DURATION)
+            .unwrap_or_else(SystemTime::now);
+        self.hls_cache_playback_leases
+            .lock()
+            .expect("HLS cache playback lease lock poisoned")
+            .insert(session_id.to_owned(), expires_at);
+    }
+
+    fn recently_used_hls_cache_session_ids(&self) -> HashSet<String> {
+        let now = SystemTime::now();
+        let mut playback_leases = self
+            .hls_cache_playback_leases
+            .lock()
+            .expect("HLS cache playback lease lock poisoned");
+        playback_leases.retain(|_, expires_at| *expires_at > now);
+        playback_leases.keys().cloned().collect()
+    }
+
     pub(crate) fn enforce_hls_cache_quota(
         &self,
         reason: &str,
         protected_session_ids: impl IntoIterator<Item = String>,
         projected_added_bytes: u64,
     ) -> io::Result<Option<HlsCacheEvictionSummary>> {
+        self.enforce_hls_cache_quota_until_cancelled(
+            reason,
+            protected_session_ids,
+            projected_added_bytes,
+            || false,
+        )
+    }
+
+    pub(crate) fn enforce_hls_cache_quota_until_cancelled(
+        &self,
+        reason: &str,
+        protected_session_ids: impl IntoIterator<Item = String>,
+        projected_added_bytes: u64,
+        should_cancel: impl Fn() -> bool,
+    ) -> io::Result<Option<HlsCacheEvictionSummary>> {
         let policy = self.hls_cache_policy();
         if !policy.eviction_enabled() {
             return Ok(None);
         }
+        if should_cancel() {
+            return Ok(None);
+        }
 
+        let _quota_lock = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
+        if should_cancel() {
+            return Ok(None);
+        }
         let entries = self.hls_cache.completed_cache_entries()?;
         let started_used_bytes = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
         let projected_used_bytes = started_used_bytes.saturating_add(projected_added_bytes);
@@ -449,6 +502,7 @@ impl AppState {
 
         let mut protected_ids = self.tasks.protected_hls_cache_session_ids();
         protected_ids.extend(protected_session_ids);
+        protected_ids.extend(self.recently_used_hls_cache_session_ids());
         protected_ids.extend(
             self.hls_cache_eviction_protected_session_ids
                 .lock()
@@ -459,12 +513,39 @@ impl AppState {
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
+        let protected_used_bytes = entries
+            .iter()
+            .filter(|entry| protected_ids.contains(&entry.session_id))
+            .map(|entry| entry.size_bytes)
+            .sum::<u64>();
         let mut finished_used_bytes = started_used_bytes;
         let mut evicted_bytes = 0_u64;
         let mut evicted_session_ids = Vec::new();
 
+        if protected_used_bytes.saturating_add(projected_added_bytes) > policy.low_watermark_bytes()
+        {
+            return Ok(Some(self.record_hls_cache_eviction_summary(
+                HlsCacheEvictionSummary {
+                    reason: reason.to_owned(),
+                    started_used_bytes,
+                    finished_used_bytes,
+                    target_used_bytes,
+                    projected_added_bytes,
+                    evicted_bytes,
+                    evicted_session_ids,
+                    target_reached: false,
+                    completed_at: SystemTime::now(),
+                },
+            )));
+        }
+
+        let mut cancelled = false;
         for entry in entries {
             if finished_used_bytes <= target_used_bytes {
+                break;
+            }
+            if should_cancel() {
+                cancelled = true;
                 break;
             }
             if protected_ids.contains(&entry.session_id) {
@@ -472,6 +553,10 @@ impl AppState {
             }
             if !self.completed_hls_cache_entry_is_evictable(&entry) {
                 continue;
+            }
+            if should_cancel() {
+                cancelled = true;
+                break;
             }
             self.hls_cache.remove_session(&entry.session_id)?;
             self.hls_sessions.remove(&entry.session_id);
@@ -481,47 +566,39 @@ impl AppState {
             evicted_session_ids.push(entry.session_id);
         }
 
-        let summary = HlsCacheEvictionSummary {
-            reason: reason.to_owned(),
-            started_used_bytes,
-            finished_used_bytes,
-            target_used_bytes,
-            projected_added_bytes,
-            evicted_bytes,
-            evicted_session_ids,
-            target_reached: finished_used_bytes <= target_used_bytes,
-            completed_at: SystemTime::now(),
-        };
+        if cancelled && evicted_session_ids.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(self.record_hls_cache_eviction_summary(
+            HlsCacheEvictionSummary {
+                reason: reason.to_owned(),
+                started_used_bytes,
+                finished_used_bytes,
+                target_used_bytes,
+                projected_added_bytes,
+                evicted_bytes,
+                evicted_session_ids,
+                target_reached: finished_used_bytes <= target_used_bytes,
+                completed_at: SystemTime::now(),
+            },
+        )))
+    }
+
+    fn record_hls_cache_eviction_summary(
+        &self,
+        summary: HlsCacheEvictionSummary,
+    ) -> HlsCacheEvictionSummary {
         *self
             .last_hls_cache_eviction
             .lock()
             .expect("HLS cache eviction summary lock poisoned") = Some(summary.clone());
-
-        Ok(Some(summary))
-    }
-
-    pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {
-        if !self.hls_cache_policy().eviction_enabled() {
-            return None;
-        }
-
-        let state = self.clone();
-        Some(tokio::spawn(async move {
-            let start = tokio::time::Instant::now() + HLS_CACHE_EVICTION_CHECK_INTERVAL;
-            let mut interval = tokio::time::interval_at(start, HLS_CACHE_EVICTION_CHECK_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(error) = state.enforce_hls_cache_quota("periodic", Vec::new(), 0) {
-                    eprintln!("Failed to run periodic HLS cache eviction: {error}");
-                }
-            }
-        }))
+        summary
     }
 
     fn completed_hls_cache_entry_is_evictable(&self, entry: &HlsCacheCompletedEntry) -> bool {
         let Ok(task) = self.tasks.get_task(&entry.session_id) else {
-            return true;
+            return self.tasks.persistence_available();
         };
         if task.kind() != TaskKind::BilibiliProgressivePlayback {
             return false;
@@ -559,6 +636,25 @@ impl AppState {
                 entry.session_id
             );
         }
+    }
+
+    pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {
+        if !self.hls_cache_policy().eviction_enabled() {
+            return None;
+        }
+
+        let state = self.clone();
+        Some(tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + HLS_CACHE_EVICTION_CHECK_INTERVAL;
+            let mut interval = tokio::time::interval_at(start, HLS_CACHE_EVICTION_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = state.enforce_hls_cache_quota("periodic", Vec::new(), 0) {
+                    eprintln!("Failed to run periodic HLS cache eviction: {error}");
+                }
+            }
+        }))
     }
 
     pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {

@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-16
 updated: 2026-06-16
 branch: wip/hls-cache-quota-watermarks
-pr:
+pr: 21
 supersedes: []
 superseded_by:
 ---
@@ -23,8 +23,11 @@ superseded_by:
 
 - Automatic eviction remains HLS-only and completed-session-only in this slice.
 - `Cache:HlsCacheMaxBytes=0` disables automatic eviction, while watermark values still validate.
-- Cleanup uses projected bytes before finalization when BBDown metadata includes complete resource sizes; otherwise periodic cleanup still catches completed-HLS usage after the fact.
-- Eviction skips protected/current progressive playback work and incomplete sessions. Eligible completed sessions delete the HLS session directory and matching completed playback task record together.
+- Cleanup uses projected bytes before finalization when BBDown metadata includes complete resource sizes, then rechecks after finalization using actual cached size so unknown-size sessions are still enforced.
+- Eviction skips protected/current progressive playback work, the session being finalized, recently issued/served completed playback sources, and incomplete sessions. Eligible completed sessions delete the HLS session directory and matching completed playback task record together.
+- If cancellation wins before or during pre-finalization quota enforcement, the server stops before deleting unrelated completed HLS items for that cancelled task.
+- If protected/projected bytes make the low-watermark target unreachable, the server records an eviction attempt but avoids wiping unrelated completed cache entries.
+- If task-state persistence is unavailable after a malformed snapshot, missing tasks are not treated as orphan authorization for deletion. Missing HLS cache roots scan as empty cache.
 - The Swift cache client exposes status as a read-only model without adding UI yet. Weak-network and cache-management UX belongs to the next PR.
 
 ## Validation
@@ -33,6 +36,7 @@ superseded_by:
 - `swift format lint --recursive Sources TVOSNetPlayer MacOSNetPlayer Tests TVOSNetPlayerTests MacOSNetPlayerTests`
 - `cargo test --package tvos-net-player-cache-server hls_cache`
 - `cargo test --package tvos-net-player-cache-server hls_cache_quota`
+- `cargo test --package tvos-net-player-cache-server missing_hls_cache_root_scans_as_empty_cache`
 - `cargo test --package tvos-net-player-cache-server get_hls_cache_status`
 - `cargo test --package tvos-net-player-cache-server hls_eviction_policy`
 - `swift test --filter CacheLibraryPaginationTests`
