@@ -244,7 +244,7 @@ impl LocalMediaLibrary {
     }
 
     fn delete_item_blocking(&self, id: &str) -> io::Result<bool> {
-        let Some(media_file) = self.resolve_media_file(id, VARIANT_ID) else {
+        let Some(media_file) = self.resolve_deletable_media_file(id)? else {
             return Ok(false);
         };
 
@@ -336,6 +336,76 @@ impl LocalMediaLibrary {
 
         let relative_path = decode_item_id(item_id)?;
         self.try_create_media_file(&self.root_path(), &self.root_path().join(relative_path))
+    }
+
+    fn resolve_deletable_media_file(&self, item_id: &str) -> io::Result<Option<MediaFile>> {
+        let root_path = self.root_path();
+        ensure_deletable_root(&root_path)?;
+
+        let Some(decoded_relative_path) = decode_item_id(item_id) else {
+            return Ok(None);
+        };
+        let full_candidate_path = absolute_path(&root_path.join(decoded_relative_path));
+        if !is_within_root(&root_path, &full_candidate_path) {
+            return Ok(None);
+        }
+
+        let metadata = match fs::symlink_metadata(&full_candidate_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+
+        if path_contains_link(&root_path, &full_candidate_path) {
+            return Ok(None);
+        }
+
+        if !self
+            .allowed_extensions()
+            .contains(&extension_with_dot(&full_candidate_path))
+        {
+            return Ok(None);
+        }
+
+        let Some(relative_path) = relative_path(&root_path, &full_candidate_path) else {
+            return Ok(None);
+        };
+        if is_internal_hls_cache_path(&relative_path) {
+            return Ok(None);
+        }
+        let media_content_type = content_type(&full_candidate_path).to_owned();
+        if !self.supports_http_range_playback() {
+            return Ok(Some(MediaFile {
+                path: full_candidate_path,
+                relative_path,
+                content_type: media_content_type,
+                created_at: UNIX_EPOCH,
+                last_modified: UNIX_EPOCH,
+                size_bytes: 0,
+            }));
+        }
+
+        let file = match open_read_no_follow(&root_path, &relative_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Ok(None);
+        }
+
+        Ok(Some(MediaFile {
+            path: full_candidate_path,
+            relative_path,
+            content_type: media_content_type,
+            created_at: metadata.created().unwrap_or(UNIX_EPOCH),
+            last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            size_bytes: metadata.len(),
+        }))
     }
 
     fn try_create_library_item(&self, root_path: &Path, path: &Path) -> Option<LibraryItem> {
@@ -705,6 +775,27 @@ fn content_type(path: &Path) -> &'static str {
         ".mov" => "video/quicktime",
         _ => "video/mp4",
     }
+}
+
+fn ensure_deletable_root(root_path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(root_path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("cache root is not a directory: {}", root_path.display()),
+        ));
+    }
+    if path_has_link_component(root_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cache root contains a symbolic link component: {}",
+                root_path.display()
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn timestamp_from_system_time(value: SystemTime) -> Timestamp {
@@ -1099,6 +1190,32 @@ mod tests {
                 .delete_item_blocking(&item_id)
                 .expect("second delete should be idempotent")
         );
+    }
+
+    #[test]
+    fn delete_item_errors_when_cache_root_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let movie_dir = root_path.join("Movies");
+        fs::create_dir_all(&movie_dir).unwrap();
+        let movie_path = movie_dir.join("Sample.mp4");
+        fs::write(&movie_path, b"sample").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let movie_path = root_path.join("Movies/Sample.mp4");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            ..CacheServerOptions::default()
+        }));
+        let item_id = library
+            .item_id_for_media_path_blocking(&movie_path)
+            .expect("movie path should resolve to an item id");
+        fs::remove_dir_all(&root_path).expect("cache root should be removable");
+
+        let error = library
+            .delete_item_blocking(&item_id)
+            .expect_err("missing cache root should be reported");
+
+        assert_eq!(io::ErrorKind::NotFound, error.kind());
     }
 
     #[test]

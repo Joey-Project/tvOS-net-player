@@ -28,6 +28,7 @@ const PLAYBACK_PLANNED_MESSAGE: &str = "Bilibili playback plan is ready.";
 const PLAYBACK_PLAYABLE_MESSAGE: &str = "Bilibili playback session is playable.";
 const PLAYBACK_COMPLETED_MESSAGE: &str =
     "Bilibili playback session is cached for offline playback.";
+const PLAYBACK_CACHE_DELETED_MESSAGE: &str = "Bilibili playback cache was deleted.";
 const REQUEUED_AFTER_RESTART_MESSAGE: &str = "Requeued after cache server restart.";
 const PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE: &str =
     "Playback planning was interrupted during cache server restart.";
@@ -676,12 +677,24 @@ impl BilibiliTaskRegistry {
             ));
         }
 
-        inner.tasks_by_id.remove(&normalized_id);
+        let mut removed_task = inner
+            .tasks_by_id
+            .remove(&normalized_id)
+            .expect("task must exist after precondition checks");
+        let finished_at = current_timestamp();
+        removed_task.state = TaskState::Failed.into();
+        removed_task.message = PLAYBACK_CACHE_DELETED_MESSAGE.to_owned();
+        removed_task.library_item_id.clear();
+        removed_task.playback_source = None;
+        removed_task.playback_session = None;
+        removed_task.updated_at = Some(copy_timestamp(&finished_at));
+        removed_task.finished_at = Some(finished_at);
         inner.download_options_by_id.remove(&normalized_id);
         inner.playback_options_by_id.remove(&normalized_id);
         inner.running_cancellations_by_id.remove(&normalized_id);
         inner.planning_cancellations_by_id.remove(&normalized_id);
         let snapshot = self.persistence_snapshot_locked(&mut inner);
+        Self::publish_locked(&mut inner, removed_task);
         drop(inner);
         self.persist_snapshot(snapshot);
         Ok(true)
@@ -1869,6 +1882,49 @@ mod tests {
 
         let restored = BilibiliTaskRegistry::with_persistence_path(&path);
         assert!(restored.get_task(&created.task.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_completed_playback_task_notifies_watchers_before_record_removal() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1delete", Some(playback_options("1080p")))
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        let library_item_id = format!("bilibili.hls.{}", created.task.id);
+        registry
+            .complete_playback_cached(&created.task.id, library_item_id.clone())
+            .expect("playback cache should complete");
+        let mut subscription = registry
+            .subscribe(std::slice::from_ref(&created.task.id))
+            .expect("subscription should be created");
+
+        assert_eq!(1, subscription.snapshots().len());
+        assert!(
+            registry
+                .remove_completed_playback_task(&created.task.id, &library_item_id)
+                .expect("completed playback task should be removable")
+        );
+
+        let event = subscription
+            .recv()
+            .await
+            .expect("watcher should receive task removal tombstone");
+
+        assert_eq!(created.task.id, event.id);
+        assert_eq!(TaskState::Failed, event.state());
+        assert_eq!(PLAYBACK_CACHE_DELETED_MESSAGE, event.message);
+        assert!(event.library_item_id.is_empty());
+        assert!(event.playback_source.is_none());
+        assert!(event.playback_session.is_none());
+        assert!(registry.get_task(&created.task.id).is_err());
     }
 
     #[test]

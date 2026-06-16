@@ -522,6 +522,44 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDeleteDisablesOtherDeletesUntilDeleteCompletes() async {
+        let firstItem = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let secondItem = CacheLibraryItem.fixture(id: "item-b", title: "Server B item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [firstItem, secondItem],
+            playbackSource: .fixture(),
+            suspendedDeleteItemIDs: ["item-a"]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        await model.refresh()
+        let deleteTask = Task {
+            await model.deleteItem(firstItem)
+        }
+        await client.waitForDeleteRequest(itemID: "item-a")
+
+        XCTAssertTrue(model.deletingItemIDs.contains("item-a"))
+        XCTAssertFalse(model.canDelete(secondItem))
+        let secondDeleted = await model.deleteItem(secondItem)
+
+        XCTAssertFalse(secondDeleted)
+        let requestedItemIDsBeforeRelease = await client.requestedDeleteItemIDs
+        XCTAssertEqual(requestedItemIDsBeforeRelease, ["item-a"])
+
+        await client.releaseDeleteRequest(itemID: "item-a")
+        let firstDeleted = await deleteTask.value
+
+        XCTAssertTrue(firstDeleted)
+        XCTAssertTrue(model.deletingItemIDs.isEmpty)
+        XCTAssertTrue(model.canDelete(secondItem))
+    }
+
+    @MainActor
     func testDeleteDisablesRefreshUntilDeleteCompletes() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(

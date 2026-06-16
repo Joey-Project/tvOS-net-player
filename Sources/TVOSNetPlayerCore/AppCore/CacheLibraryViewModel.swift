@@ -90,7 +90,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         loadedEndpoint != nil
             && canDeleteLibraryItems
             && items.contains(where: { $0.id == item.id })
-            && !deletingItemIDs.contains(item.id)
+            && deletingItemIDs.isEmpty
             && !isLoading
             && !isLoadingMore
     }
@@ -273,6 +273,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         let requestSequence = refreshSequence
+        loadMoreSequence += 1
         deleteOperationSequence += 1
         let deleteOperationID = deleteOperationSequence
         deletingItemOperationIDs[item.id] = deleteOperationID

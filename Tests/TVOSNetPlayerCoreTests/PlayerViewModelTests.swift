@@ -88,10 +88,12 @@ final class PlayerViewModelTests: XCTestCase {
     func testTransientLoadDoesNotPersistOrReplaceManualURLText() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         model.streamURLText = "example.com/manual.m3u8"
+        let sequenceBeforeTransientLoad = model.manualInteractionSequence
 
         let didLoad = model.loadTransient(streamURLText: "mac-mini.local:8080/media/item-a/original")
 
         XCTAssertTrue(didLoad)
+        XCTAssertGreaterThan(model.manualInteractionSequence, sequenceBeforeTransientLoad)
         XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/media/item-a/original")
         XCTAssertEqual(model.streamURLText, "example.com/manual.m3u8")
         XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
@@ -109,6 +111,7 @@ final class PlayerViewModelTests: XCTestCase {
         )
 
         XCTAssertTrue(didLoad)
+        XCTAssertGreaterThan(model.manualInteractionSequence, sequence)
         XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/media/item-a/original")
         XCTAssertNil(model.validationMessage)
     }
