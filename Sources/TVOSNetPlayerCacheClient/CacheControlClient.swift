@@ -15,6 +15,7 @@ public struct CacheLibraryItemsPage: Equatable, Sendable {
 public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
     func listCacheRoots() async throws -> [CacheRoot]
+    func getHLSCacheStatus() async throws -> HLSCacheStatus
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
@@ -31,7 +32,15 @@ public protocol CacheControlClient: Sendable {
     ) async throws -> CacheTask
 }
 
+public enum CacheControlClientUnsupportedFeature: Error, Equatable {
+    case hlsCacheStatus
+}
+
 public extension CacheControlClient {
+    func getHLSCacheStatus() async throws -> HLSCacheStatus {
+        throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+    }
+
     func listLibraryItemsPage(
         pageSize: Int = 50,
         searchText: String? = nil

@@ -4,7 +4,7 @@ title: Discovery Cache And Bilibili Roadmap
 status: active
 created: 2026-06-16
 updated: 2026-06-16
-branch: wip/bonjour-discovery
+branch: wip/hls-cache-quota-watermarks
 pr:
 supersedes: []
 superseded_by:
@@ -47,13 +47,15 @@ superseded_by:
 
 ### PR B: HLS Cache Quota And Watermark Eviction
 
+- Status: implemented by this slice.
 - Add configurable HLS cache quota and watermark settings:
   - `Cache:HlsCacheMaxBytes` default: 50 GiB.
   - `Cache:HlsCacheHighWatermarkPercent` default: 90.
   - `Cache:HlsCacheLowWatermarkPercent` default: 80.
-- Run eviction before new cache/full-fill/prewarm work when projected usage exceeds the high watermark.
+- Run eviction before HLS cache finalization when projected usage exceeds the high watermark.
 - Add a periodic background check that cleans completed HLS cache down to the low watermark.
-- Surface cache quota, watermark, usage, and last eviction summary to Swift clients.
+- Surface cache quota, watermark, completed-HLS usage, and last eviction summary to Swift clients.
+- Keep eviction scoped to completed HLS sessions. It skips protected/current playback work and incomplete sessions.
 
 ### PR C: Progressive Weak-Network Scheduler And Prewarm
 
@@ -119,4 +121,4 @@ superseded_by:
 
 ## Next Steps
 
-- After PR A merges, update `master`, branch PR B, and implement HLS cache quota plus watermark eviction.
+- After PR B merges, update `master`, branch PR C, and implement progressive weak-network scheduler/prewarm UX.

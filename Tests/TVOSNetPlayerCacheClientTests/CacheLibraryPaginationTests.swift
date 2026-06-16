@@ -23,6 +23,19 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(page.hasMoreItems)
     }
 
+    func testDefaultHLSCacheStatusImplementationReportsUnsupportedFeature() async {
+        let client: any CacheControlClient = FakePagedCacheControlClient()
+
+        do {
+            _ = try await client.getHLSCacheStatus()
+            XCTFail("Expected unsupported feature error.")
+        } catch CacheControlClientUnsupportedFeature.hlsCacheStatus {
+            return
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testCollectsItemsAcrossAllPages() async throws {
         var requestedPageTokens: [String] = []
         let pages = [

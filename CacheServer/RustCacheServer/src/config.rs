@@ -10,6 +10,7 @@ use url::Url;
 use crate::task_registry::TaskRetentionPolicy;
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const DEFAULT_HLS_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheServerOptions {
@@ -25,6 +26,9 @@ pub struct CacheServerOptions {
     pub task_retention_terminal_age_days: u64,
     pub allowed_extensions: Vec<String>,
     pub allow_library_item_delete: bool,
+    pub hls_cache_max_bytes: u64,
+    pub hls_cache_high_watermark_percent: u8,
+    pub hls_cache_low_watermark_percent: u8,
     pub bilibili_worker_enabled: bool,
     pub bilibili_worker_max_concurrent_tasks: usize,
     pub bbdown_output_dir: Option<PathBuf>,
@@ -49,6 +53,9 @@ impl Default for CacheServerOptions {
             task_retention_terminal_age_days: 30,
             allowed_extensions: vec![".mp4".to_owned(), ".m4v".to_owned(), ".mov".to_owned()],
             allow_library_item_delete: false,
+            hls_cache_max_bytes: DEFAULT_HLS_CACHE_MAX_BYTES,
+            hls_cache_high_watermark_percent: 90,
+            hls_cache_low_watermark_percent: 80,
             bilibili_worker_enabled: true,
             bilibili_worker_max_concurrent_tasks: 1,
             bbdown_output_dir: None,
@@ -90,6 +97,17 @@ impl CacheServerOptions {
         if self.bilibili_worker_max_concurrent_tasks == 0 {
             return Err(ConfigError::new(
                 "Bilibili worker max concurrent tasks must be greater than zero.",
+            ));
+        }
+        if self.hls_cache_high_watermark_percent == 0 || self.hls_cache_high_watermark_percent > 100
+        {
+            return Err(ConfigError::new(
+                "HLS cache high watermark percent must be between 1 and 100.",
+            ));
+        }
+        if self.hls_cache_low_watermark_percent >= self.hls_cache_high_watermark_percent {
+            return Err(ConfigError::new(
+                "HLS cache low watermark percent must be lower than the high watermark percent.",
             ));
         }
         if self.bilibili_worker_enabled || self.bbdown_output_dir.is_some() {
@@ -223,6 +241,27 @@ impl CacheServerOptions {
                     .collect();
             }
             "Cache:AllowLibraryItemDelete" => self.allow_library_item_delete = parse_bool(&value)?,
+            "Cache:HlsCacheMaxBytes" => {
+                self.hls_cache_max_bytes = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:HlsCacheMaxBytes: {value}"
+                    ))
+                })?;
+            }
+            "Cache:HlsCacheHighWatermarkPercent" => {
+                self.hls_cache_high_watermark_percent = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:HlsCacheHighWatermarkPercent: {value}"
+                    ))
+                })?;
+            }
+            "Cache:HlsCacheLowWatermarkPercent" => {
+                self.hls_cache_low_watermark_percent = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:HlsCacheLowWatermarkPercent: {value}"
+                    ))
+                })?;
+            }
             "Cache:BilibiliWorkerEnabled" => self.bilibili_worker_enabled = parse_bool(&value)?,
             "Cache:BilibiliWorkerMaxConcurrentTasks" => {
                 self.bilibili_worker_max_concurrent_tasks = value.parse().map_err(|_| {
@@ -470,6 +509,12 @@ mod tests {
         let options = CacheServerOptions::from_args([
             "--Cache:RootPath".to_owned(),
             "/tmp/cache".to_owned(),
+            "--Cache:HlsCacheMaxBytes".to_owned(),
+            "123456".to_owned(),
+            "--Cache:HlsCacheHighWatermarkPercent".to_owned(),
+            "85".to_owned(),
+            "--Cache:HlsCacheLowWatermarkPercent".to_owned(),
+            "70".to_owned(),
             "--Cache:BilibiliWorkerEnabled".to_owned(),
             "off".to_owned(),
             "--Cache:BilibiliWorkerMaxConcurrentTasks".to_owned(),
@@ -488,6 +533,9 @@ mod tests {
         .expect("options should parse");
 
         assert!(!options.bilibili_worker_enabled);
+        assert_eq!(123456, options.hls_cache_max_bytes);
+        assert_eq!(85, options.hls_cache_high_watermark_percent);
+        assert_eq!(70, options.hls_cache_low_watermark_percent);
         assert_eq!(2, options.bilibili_worker_max_concurrent_tasks);
         assert_eq!(25, options.task_retention_max_terminal_tasks);
         assert_eq!(7, options.task_retention_terminal_age_days);
@@ -526,6 +574,25 @@ mod tests {
     }
 
     #[test]
+    fn default_hls_cache_quota_uses_watermarks() {
+        let options = CacheServerOptions::default();
+
+        assert_eq!(50 * 1024 * 1024 * 1024, options.hls_cache_max_bytes);
+        assert_eq!(90, options.hls_cache_high_watermark_percent);
+        assert_eq!(80, options.hls_cache_low_watermark_percent);
+    }
+
+    #[test]
+    fn zero_hls_cache_quota_disables_eviction_but_keeps_watermark_validation() {
+        let options = CacheServerOptions {
+            hls_cache_max_bytes: 0,
+            ..CacheServerOptions::default()
+        };
+
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
     fn derives_bbdown_paths_from_root_and_task_state_paths() {
         let options = CacheServerOptions {
             root_path: PathBuf::from("/tmp/cache-root"),
@@ -561,6 +628,28 @@ mod tests {
         };
 
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_hls_cache_watermarks() {
+        let zero_high = CacheServerOptions {
+            hls_cache_high_watermark_percent: 0,
+            ..CacheServerOptions::default()
+        };
+        let equal_watermarks = CacheServerOptions {
+            hls_cache_high_watermark_percent: 80,
+            hls_cache_low_watermark_percent: 80,
+            ..CacheServerOptions::default()
+        };
+        let inverted_watermarks = CacheServerOptions {
+            hls_cache_high_watermark_percent: 70,
+            hls_cache_low_watermark_percent: 80,
+            ..CacheServerOptions::default()
+        };
+
+        assert!(zero_high.validate().is_err());
+        assert!(equal_watermarks.validate().is_err());
+        assert!(inverted_watermarks.validate().is_err());
     }
 
     #[test]
