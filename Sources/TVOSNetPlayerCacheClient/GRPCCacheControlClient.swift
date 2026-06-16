@@ -39,6 +39,22 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func listCacheRoots() async throws -> [CacheRoot] {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+            let response = try await service.listCacheRoots(
+                TvosNetPlayer_V1_ListCacheRootsRequest(),
+                options: callOptions
+            )
+            return response.roots.map(CacheRoot.init)
+        }
+    }
+
     public func listLibraryItemsPage(
         pageToken: String = "",
         pageSize: Int = 50,
@@ -98,6 +114,21 @@ public final class GRPCCacheControlClient: CacheControlClient {
             request.variantID = variantID
             let response = try await service.getPlaybackSource(request, options: callOptions)
             return CachePlaybackSource(response)
+        }
+    }
+
+    public func deleteLibraryItem(id: String) async throws -> Bool {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+            var request = TvosNetPlayer_V1_DeleteLibraryItemRequest()
+            request.id = id
+            let response = try await service.deleteLibraryItem(request, options: callOptions)
+            return response.deleted
         }
     }
 
@@ -273,6 +304,20 @@ extension CacheServerSummary {
             version: proto.version,
             mediaBaseURIs: proto.mediaBaseUris,
             capabilities: proto.capabilities.map { String(describing: $0) }
+        )
+    }
+}
+
+extension CacheRoot {
+    fileprivate init(_ proto: TvosNetPlayer_V1_CacheRoot) {
+        self.init(
+            id: proto.id,
+            label: proto.label,
+            kind: String(describing: proto.kind),
+            path: proto.path,
+            writable: proto.writable,
+            freeBytes: proto.freeBytes,
+            totalBytes: proto.totalBytes
         )
     }
 }

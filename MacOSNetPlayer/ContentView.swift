@@ -8,6 +8,7 @@ struct ContentView: View {
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
+    @State private var pendingDeleteItem: CacheLibraryItem?
 
     var body: some View {
         NavigationSplitView {
@@ -19,6 +20,28 @@ struct ContentView: View {
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
+        }
+        .confirmationDialog(
+            "Delete Cached Video?",
+            isPresented: Binding(
+                get: { pendingDeleteItem != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteItem = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteItem
+        ) { item in
+            Button("Delete", role: .destructive) {
+                confirmDeleteCachedItem(item)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItem = nil
+            }
+        } message: { item in
+            Text("Delete \(item.displayTitle) from the LAN cache server.")
         }
     }
 
@@ -77,6 +100,14 @@ struct ContentView: View {
                     .font(.callout)
                     .foregroundStyle(.red)
                     .lineLimit(3)
+            }
+
+            if !cacheModel.cacheRoots.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(cacheModel.cacheRoots) { root in
+                        CacheRootRow(root: root)
+                    }
+                }
             }
 
             Divider()
@@ -295,7 +326,21 @@ struct ContentView: View {
                         Label("Play Cached", systemImage: "play.rectangle.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(cacheModel.isLoading || !selectedItem.hasPlayableVariant)
+                    .disabled(
+                        cacheModel.isLoading
+                            || cacheModel.deletingItemIDs.contains(selectedItem.id)
+                            || !selectedItem.hasPlayableVariant
+                    )
+
+                    Button {
+                        pendingDeleteItem = selectedItem
+                    } label: {
+                        Label(
+                            cacheModel.deletingItemIDs.contains(selectedItem.id) ? "Deleting" : "Delete",
+                            systemImage: "trash"
+                        )
+                    }
+                    .disabled(!cacheModel.canDelete(selectedItem))
                 } else {
                     Text("No cached video selected")
                         .foregroundStyle(.secondary)
@@ -335,6 +380,28 @@ struct ContentView: View {
         )
         bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+    }
+
+    private func deleteCachedItem(_ item: CacheLibraryItem) async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        let shouldStopActivePlayback =
+            cacheModel.isActivePlaybackItem(item)
+            || bilibiliModel.isActivePlaybackLibraryItem(id: item.id)
+        let didRemove = await cacheModel.deleteItem(item) {
+            if shouldStopActivePlayback, model.manualInteractionSequence == manualInteractionSequence {
+                model.stop()
+            }
+        }
+        if didRemove {
+            bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
+        }
+    }
+
+    private func confirmDeleteCachedItem(_ item: CacheLibraryItem) {
+        pendingDeleteItem = nil
+        Task {
+            await deleteCachedItem(item)
+        }
     }
 
     private func playBilibiliTask() async {
@@ -390,7 +457,7 @@ private struct CacheLibraryRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: item.hasPlayableVariant ? "play.rectangle" : "xmark.octagon")
+            Image(systemName: item.availabilitySystemImage)
                 .foregroundStyle(item.hasPlayableVariant ? Color.secondary : Color.red)
 
             VStack(alignment: .leading, spacing: 5) {
@@ -409,7 +476,7 @@ private struct CacheLibraryRow: View {
                     if let primaryVariant = item.primaryVariant {
                         Text(primaryVariant.displayLabel)
                     }
-                    Text(item.source)
+                    Text(item.availabilityLabel)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -435,7 +502,7 @@ private struct CacheLibraryMetadata: View {
             }
 
             HStack(spacing: 12) {
-                Text(item.source)
+                Label(item.availabilityLabel, systemImage: item.availabilitySystemImage)
 
                 if let primaryVariant = item.primaryVariant {
                     Text(primaryVariant.displayLabel)
@@ -444,5 +511,25 @@ private struct CacheLibraryMetadata: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct CacheRootRow: View {
+    let root: CacheRoot
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(root.displayLabel)
+                    .font(.caption.weight(.semibold))
+                Text(root.capacityLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        } icon: {
+            Image(systemName: root.writable ? "externaldrive.fill" : "lock.fill")
+        }
+        .foregroundStyle(.secondary)
     }
 }

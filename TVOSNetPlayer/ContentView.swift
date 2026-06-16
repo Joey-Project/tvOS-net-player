@@ -7,6 +7,7 @@ struct ContentView: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
+    @State private var pendingDeleteItem: CacheLibraryItem?
     @FocusState private var focusedControl: FocusedControl?
 
     private enum FocusedControl: Hashable {
@@ -53,6 +54,28 @@ struct ContentView: View {
                 ? .cacheServerField
                 : (model.streamURLText.isEmpty ? .refreshButton : .playButton)
         }
+        .confirmationDialog(
+            "Delete Cached Video?",
+            isPresented: Binding(
+                get: { pendingDeleteItem != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeleteItem = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteItem
+        ) { item in
+            Button("Delete", role: .destructive) {
+                confirmDeleteCachedItem(item)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItem = nil
+            }
+        } message: { item in
+            Text("Delete \(item.displayTitle) from the LAN cache server.")
+        }
     }
 
     private var cacheControls: some View {
@@ -89,6 +112,14 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!cacheModel.canRefresh)
                 .focused($focusedControl, equals: .refreshButton)
+            }
+
+            if !cacheModel.cacheRoots.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(cacheModel.cacheRoots) { root in
+                        CacheRootRow(root: root)
+                    }
+                }
             }
 
             HStack(spacing: 12) {
@@ -136,15 +167,32 @@ struct ContentView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(cacheModel.items) { item in
-                            Button {
-                                Task {
-                                    await playCachedItem(item)
+                            HStack(alignment: .center, spacing: 10) {
+                                Button {
+                                    Task {
+                                        await playCachedItem(item)
+                                    }
+                                } label: {
+                                    CacheLibraryRow(item: item)
                                 }
-                            } label: {
-                                CacheLibraryRow(item: item)
+                                .buttonStyle(.bordered)
+                                .disabled(
+                                    cacheModel.isLoading
+                                        || cacheModel.deletingItemIDs.contains(item.id)
+                                        || !item.hasPlayableVariant
+                                )
+
+                                Button {
+                                    pendingDeleteItem = item
+                                } label: {
+                                    Label(
+                                        cacheModel.deletingItemIDs.contains(item.id) ? "Deleting" : "Delete",
+                                        systemImage: "trash"
+                                    )
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!cacheModel.canDelete(item))
                             }
-                            .buttonStyle(.bordered)
-                            .disabled(cacheModel.isLoading || !item.hasPlayableVariant)
                         }
 
                         cacheLoadMoreButton
@@ -329,6 +377,28 @@ struct ContentView: View {
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
     }
 
+    private func deleteCachedItem(_ item: CacheLibraryItem) async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        let shouldStopActivePlayback =
+            cacheModel.isActivePlaybackItem(item)
+            || bilibiliModel.isActivePlaybackLibraryItem(id: item.id)
+        let didRemove = await cacheModel.deleteItem(item) {
+            if shouldStopActivePlayback, model.manualInteractionSequence == manualInteractionSequence {
+                model.stop()
+            }
+        }
+        if didRemove {
+            bilibiliModel.clearTaskIfCachedLibraryItemDeleted(id: item.id)
+        }
+    }
+
+    private func confirmDeleteCachedItem(_ item: CacheLibraryItem) {
+        pendingDeleteItem = nil
+        Task {
+            await deleteCachedItem(item)
+        }
+    }
+
     private func playBilibiliTask() async {
         let manualInteractionSequence = model.manualInteractionSequence
         guard let url = bilibiliModel.playableURL else {
@@ -366,26 +436,50 @@ private struct CacheLibraryRow: View {
     let item: CacheLibraryItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(item.displayTitle)
-                .font(.headline)
-                .lineLimit(2)
-            if !item.subtitle.isEmpty {
-                Text(item.subtitle)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            HStack(spacing: 10) {
-                if let primaryVariant = item.primaryVariant {
-                    Text(primaryVariant.displayLabel)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: item.availabilitySystemImage)
+                .foregroundStyle(item.hasPlayableVariant ? Color.secondary : Color.red)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(item.displayTitle)
+                    .font(.headline)
+                    .lineLimit(2)
+                if !item.subtitle.isEmpty {
+                    Text(item.subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(item.source)
+                HStack(spacing: 10) {
+                    if let primaryVariant = item.primaryVariant {
+                        Text(primaryVariant.displayLabel)
+                    }
+                    Text(item.availabilityLabel)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 8)
+    }
+}
+
+private struct CacheRootRow: View {
+    let root: CacheRoot
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: root.writable ? "externaldrive.fill" : "lock.fill")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(root.displayLabel)
+                    .font(.caption.weight(.semibold))
+                Text(root.capacityLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .foregroundStyle(.secondary)
     }
 }

@@ -80,6 +80,10 @@ impl ServerService for ServerGrpcService {
                 info.media_base_uris.push(base_uri.to_owned());
             }
         }
+        if self.state.options.allow_library_item_delete {
+            info.capabilities
+                .push(ServerCapability::LibraryItemDelete.into());
+        }
 
         Ok(Response::new(info))
     }
@@ -428,11 +432,28 @@ impl CacheService for CacheGrpcService {
 
     async fn delete_library_item(
         &self,
-        _request: Request<DeleteLibraryItemRequest>,
+        request: Request<DeleteLibraryItemRequest>,
     ) -> Result<Response<DeleteLibraryItemResponse>, Status> {
-        Err(Status::unimplemented(
-            "Cache deletion is not implemented in this slice.",
-        ))
+        let request = request.into_inner();
+        let id = request.id.trim();
+        if id.is_empty() {
+            return Err(Status::invalid_argument("Library item id is required."));
+        }
+        if !self.state.options.allow_library_item_delete {
+            return Err(Status::permission_denied(
+                "Library item deletion is not enabled on this cache server.",
+            ));
+        }
+
+        if let Some(deleted) = self.state.delete_completed_hls_library_item(id)? {
+            return Ok(Response::new(DeleteLibraryItemResponse { deleted }));
+        }
+
+        let deleted =
+            self.state.library.delete_item(id).await.map_err(|error| {
+                Status::internal(format!("Failed to delete library item: {error}"))
+            })?;
+        Ok(Response::new(DeleteLibraryItemResponse { deleted }))
     }
 }
 
@@ -869,9 +890,9 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliPlaybackOptions, CreateBilibiliPlaybackTaskRequest, GetLibraryItemRequest,
-            GetPlaybackSourceRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
-            TaskKind, TaskState,
+            BilibiliPlaybackOptions, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
+            GetLibraryItemRequest, GetPlaybackSourceRequest, LibraryFilter, LibrarySource,
+            ListLibraryItemsRequest, TaskKind, TaskState,
         },
     };
     use axum::{
@@ -884,6 +905,32 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    #[tokio::test]
+    async fn delete_library_item_requires_explicit_enablement() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        fs::write(root_path.join("sample.mp4"), b"sample").expect("media file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = CacheGrpcService::new(state);
+
+        let error = service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: "local.default.c2FtcGxlLm1wNA".to_owned(),
+            }))
+            .await
+            .expect_err("delete should require explicit enablement");
+
+        assert_eq!(tonic::Code::PermissionDenied, error.code());
+        assert!(root_path.join("sample.mp4").exists());
+    }
 
     #[tokio::test]
     async fn create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background() {
@@ -1428,6 +1475,109 @@ mod tests {
                 .is_none()
         );
         assert!(hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_library_item_removes_completed_hls_cache_and_task_record() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            allow_library_item_delete: true,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
+        let state = AppState::new_with_playback_planner(options.clone(), Arc::new(planner));
+        let task_service = TaskGrpcService::new(state.clone());
+        let cache_service = CacheGrpcService::new(state.clone());
+        let library_service = LibraryGrpcService::new(state.clone());
+
+        let created = task_service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1deletehls".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        planner_started
+            .await
+            .expect("background playback planner should start");
+        plan_sender
+            .send(Ok(sample_playback_plan_with_video_url(&upstream_url)))
+            .expect("test should send playback plan");
+
+        let completed = wait_for_task_state(&state.tasks, &created.id, TaskState::Completed).await;
+        let expected_item_id = format!("bilibili.hls.{}", completed.id);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+
+        let deleted = cache_service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: expected_item_id.clone(),
+            }))
+            .await
+            .expect("completed HLS cache item should delete")
+            .into_inner();
+        assert!(deleted.deleted);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_none()
+        );
+        assert!(state.hls_sessions.get(&completed.id).is_none());
+        assert!(state.tasks.get_task(&completed.id).is_err());
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&completed.id)
+                .exists()
+        );
+
+        let library = library_service
+            .list_library_items(Request::new(ListLibraryItemsRequest {
+                page_token: String::new(),
+                page_size: 50,
+                filter: Some(LibraryFilter {
+                    sources: vec![LibrarySource::Bilibili.into()],
+                    search_text: String::new(),
+                }),
+            }))
+            .await
+            .expect("library list should succeed")
+            .into_inner();
+        assert!(library.items.is_empty());
+
+        let repeated_delete = cache_service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: expected_item_id.clone(),
+            }))
+            .await
+            .expect("second delete should be idempotent")
+            .into_inner();
+        assert!(!repeated_delete.deleted);
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        assert!(restored.tasks.get_task(&completed.id).is_err());
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_none()
+        );
     }
 
     #[tokio::test]

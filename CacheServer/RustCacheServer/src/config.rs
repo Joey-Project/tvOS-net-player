@@ -23,6 +23,7 @@ pub struct CacheServerOptions {
     pub task_retention_max_terminal_tasks: usize,
     pub task_retention_terminal_age_days: u64,
     pub allowed_extensions: Vec<String>,
+    pub allow_library_item_delete: bool,
     pub bilibili_worker_enabled: bool,
     pub bilibili_worker_max_concurrent_tasks: usize,
     pub bbdown_output_dir: Option<PathBuf>,
@@ -45,6 +46,7 @@ impl Default for CacheServerOptions {
             task_retention_max_terminal_tasks: 200,
             task_retention_terminal_age_days: 30,
             allowed_extensions: vec![".mp4".to_owned(), ".m4v".to_owned(), ".mov".to_owned()],
+            allow_library_item_delete: false,
             bilibili_worker_enabled: true,
             bilibili_worker_max_concurrent_tasks: 1,
             bbdown_output_dir: None,
@@ -217,6 +219,7 @@ impl CacheServerOptions {
                     .map(ToOwned::to_owned)
                     .collect();
             }
+            "Cache:AllowLibraryItemDelete" => self.allow_library_item_delete = parse_bool(&value)?,
             "Cache:BilibiliWorkerEnabled" => self.bilibili_worker_enabled = parse_bool(&value)?,
             "Cache:BilibiliWorkerMaxConcurrentTasks" => {
                 self.bilibili_worker_max_concurrent_tasks = value.parse().map_err(|_| {
@@ -429,10 +432,13 @@ mod tests {
             "/tmp/cache-state/tasks.json".to_owned(),
             "--Cache:ServerName".to_owned(),
             "Test Cache".to_owned(),
+            "--Cache:AllowLibraryItemDelete".to_owned(),
+            "true".to_owned(),
         ])
         .expect("options should parse");
 
         assert_eq!("Test Cache", options.server_name);
+        assert!(options.allow_library_item_delete);
         assert_eq!(PathBuf::from("/tmp/cache"), options.root_path);
         assert_eq!(
             PathBuf::from("/tmp/cache-state/tasks.json"),

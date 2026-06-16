@@ -86,6 +86,60 @@ public struct CacheServerSummary: Equatable, Sendable {
         self.mediaBaseURIs = mediaBaseURIs
         self.capabilities = capabilities
     }
+
+    public var supportsLibraryItemDelete: Bool {
+        capabilities.contains(CacheServerCapability.libraryItemDelete)
+    }
+}
+
+public enum CacheServerCapability {
+    public static let libraryItemDelete = "libraryItemDelete"
+}
+
+public struct CacheRoot: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let label: String
+    public let kind: String
+    public let path: String
+    public let writable: Bool
+    public let freeBytes: Int64
+    public let totalBytes: Int64
+
+    public init(
+        id: String,
+        label: String,
+        kind: String,
+        path: String,
+        writable: Bool,
+        freeBytes: Int64,
+        totalBytes: Int64
+    ) {
+        self.id = id
+        self.label = label
+        self.kind = kind
+        self.path = path
+        self.writable = writable
+        self.freeBytes = freeBytes
+        self.totalBytes = totalBytes
+    }
+
+    public var displayLabel: String {
+        label.isEmpty ? id : label
+    }
+
+    public var accessLabel: String {
+        writable ? "Writable" : "Read only"
+    }
+
+    public var capacityLabel: String {
+        guard totalBytes > 0 else {
+            return accessLabel
+        }
+
+        let free = ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        return "\(free) free of \(total)"
+    }
 }
 
 public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
@@ -136,6 +190,45 @@ public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
 
     public var hasPlayableVariant: Bool {
         primaryVariantID != nil
+    }
+
+    public var isOfflineHLSCache: Bool {
+        source.normalizedCacheProtocolName.removingLibrarySourcePrefix == "bilibili"
+            && primaryVariant?.isHLS == true
+    }
+
+    public var availabilityLabel: String {
+        if isOfflineHLSCache {
+            return "Offline HLS"
+        }
+
+        switch source.normalizedCacheProtocolName.removingLibrarySourcePrefix {
+        case "localcache":
+            return "LAN file"
+        case "mountedsmb":
+            return "Mounted SMB"
+        case "bilibili":
+            return "Bilibili"
+        default:
+            return source
+        }
+    }
+
+    public var availabilitySystemImage: String {
+        if isOfflineHLSCache {
+            return "externaldrive.fill.badge.checkmark"
+        }
+
+        switch source.normalizedCacheProtocolName.removingLibrarySourcePrefix {
+        case "localcache":
+            return "internaldrive"
+        case "mountedsmb":
+            return "network"
+        case "bilibili":
+            return "play.tv"
+        default:
+            return hasPlayableVariant ? "play.rectangle" : "xmark.octagon"
+        }
     }
 }
 
@@ -189,6 +282,10 @@ public struct CacheMediaVariant: Identifiable, Equatable, Sendable {
 
     public var isPlayableByTVOSClient: Bool {
         CachePlaybackProtocolSupport.isPlayable(playbackProtocol)
+    }
+
+    public var isHLS: Bool {
+        playbackProtocol.normalizedCacheProtocolName.removingPlaybackProtocolPrefix == "hls"
     }
 }
 
@@ -363,6 +460,15 @@ extension String {
 
     fileprivate var removingPlaybackProtocolPrefix: String {
         let prefix = "playbackprotocol"
+        guard hasPrefix(prefix) else {
+            return self
+        }
+
+        return String(dropFirst(prefix.count))
+    }
+
+    fileprivate var removingLibrarySourcePrefix: String {
+        let prefix = "librarysource"
         guard hasPrefix(prefix) else {
             return self
         }

@@ -60,6 +60,7 @@ public final class PlayerViewModel: ObservableObject {
             return false
         }
 
+        markManualInteraction()
         load(url: url, persist: false)
         return true
     }

@@ -139,6 +139,70 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testDeletedCachedLibraryItemClearsMatchingCompletedTask() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1done", state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.yield(
+            .playableFixture(
+                source: "BV1done",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: "cached-bilibili-playback-1",
+                playbackSourceItemID: "cached-bilibili-playback-1"
+            )
+        )
+        await waitUntil(model.currentTask?.state == "TASK_STATE_COMPLETED")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertFalse(model.clearTaskIfCachedLibraryItemDeleted(id: "other-item"))
+        XCTAssertNotNil(model.currentTask)
+
+        XCTAssertTrue(model.clearTaskIfCachedLibraryItemDeleted(id: "cached-bilibili-playback-1"))
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.canPlay)
+        XCTAssertEqual(model.statusMessage, "No Bilibili playback task submitted.")
+    }
+
+    func testActivePlaybackLibraryItemMatchesCompletedTaskCache() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(
+                    source: "BV1done",
+                    state: "TASK_STATE_COMPLETED",
+                    libraryItemID: "cached-bilibili-playback-1",
+                    playbackSourceItemID: "cached-bilibili-playback-1"
+                )
+            )
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+
+        model.finishPreparedPlayback(didStartPlayback: true)
+
+        XCTAssertTrue(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "other-item"))
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: ""))
+
+        model.clearPlaybackStatus()
+
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+
+        model.clearTask()
+    }
+
     func testPlayableTaskRejectsMismatchedPlaybackSourceOwner() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(state: "TASK_STATE_PREPARING"))
@@ -539,6 +603,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         throw FakeBilibiliCacheControlClientError.notImplemented
     }
 
+    func listCacheRoots() async throws -> [CacheRoot] {
+        throw FakeBilibiliCacheControlClientError.notImplemented
+    }
+
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
@@ -548,6 +616,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     }
 
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakeBilibiliCacheControlClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
         throw FakeBilibiliCacheControlClientError.notImplemented
     }
 

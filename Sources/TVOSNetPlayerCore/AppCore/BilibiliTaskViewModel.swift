@@ -255,6 +255,17 @@ public final class BilibiliTaskViewModel: ObservableObject {
         statusMessage = currentTask.map(Self.statusMessage(for:)) ?? "No Bilibili playback task submitted."
     }
 
+    public func isActivePlaybackLibraryItem(id libraryItemID: String) -> Bool {
+        guard let currentTask,
+            !libraryItemID.isEmpty,
+            activePlaybackTaskID == currentTask.id
+        else {
+            return false
+        }
+
+        return currentTask.libraryItemID == libraryItemID
+    }
+
     public func clearTask() {
         operationSequence += 1
         activeEndpoint = nil
@@ -265,6 +276,19 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isCancelling = false
         stopWatching()
         statusMessage = "No Bilibili playback task submitted."
+    }
+
+    @discardableResult
+    public func clearTaskIfCachedLibraryItemDeleted(id libraryItemID: String) -> Bool {
+        guard let currentTask,
+            !libraryItemID.isEmpty,
+            currentTask.libraryItemID == libraryItemID
+        else {
+            return false
+        }
+
+        clearTask()
+        return true
     }
 
     private func startWatching(taskID: String, endpoint: CacheServerEndpoint, sequence: Int) {
