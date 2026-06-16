@@ -494,24 +494,31 @@ impl AppState {
         playback_leases.keys().cloned().collect()
     }
 
-    fn hls_cache_session_is_protected_from_eviction(
+    fn hls_cache_stable_protected_session_ids(
+        &self,
+        protected_session_ids: impl IntoIterator<Item = String>,
+    ) -> HashSet<String> {
+        let mut stable_protected_session_ids =
+            protected_session_ids.into_iter().collect::<HashSet<_>>();
+        stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
+        stable_protected_session_ids.extend(self.recently_used_hls_cache_session_ids());
+        stable_protected_session_ids
+    }
+
+    fn hls_cache_session_has_finalization_protection(&self, session_id: &str) -> bool {
+        self.hls_cache_eviction_protected_session_ids
+            .lock()
+            .expect("HLS cache eviction protection lock poisoned")
+            .contains_key(session_id)
+    }
+
+    fn hls_cache_session_is_currently_protected_from_eviction(
         &self,
         session_id: &str,
-        explicit_protected_session_ids: &HashSet<String>,
+        stable_protected_session_ids: &HashSet<String>,
     ) -> bool {
-        explicit_protected_session_ids.contains(session_id)
-            || self
-                .tasks
-                .protected_hls_cache_session_ids()
-                .contains(session_id)
-            || self
-                .recently_used_hls_cache_session_ids()
-                .contains(session_id)
-            || self
-                .hls_cache_eviction_protected_session_ids
-                .lock()
-                .expect("HLS cache eviction protection lock poisoned")
-                .contains_key(session_id)
+        stable_protected_session_ids.contains(session_id)
+            || self.hls_cache_session_has_finalization_protection(session_id)
     }
 
     pub(crate) fn enforce_hls_cache_quota(
@@ -557,8 +564,8 @@ impl AppState {
             return Ok(None);
         }
 
-        let explicit_protected_session_ids =
-            protected_session_ids.into_iter().collect::<HashSet<_>>();
+        let stable_protected_session_ids =
+            self.hls_cache_stable_protected_session_ids(protected_session_ids);
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
@@ -575,9 +582,9 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            if self.hls_cache_session_is_protected_from_eviction(
+            if self.hls_cache_session_is_currently_protected_from_eviction(
                 &entry.session_id,
-                &explicit_protected_session_ids,
+                &stable_protected_session_ids,
             ) {
                 continue;
             }
@@ -588,9 +595,9 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            if self.hls_cache_session_is_protected_from_eviction(
+            if self.hls_cache_session_is_currently_protected_from_eviction(
                 &entry.session_id,
-                &explicit_protected_session_ids,
+                &stable_protected_session_ids,
             ) {
                 continue;
             }

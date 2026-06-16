@@ -1920,7 +1920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_cache_quota_rechecks_recent_playback_before_eviction() {
+    async fn hls_cache_quota_rechecks_finalization_protection_before_eviction() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -1946,13 +1946,15 @@ mod tests {
         let evictable =
             create_completed_hls_playback_task(&state, "BV1late-evict", &upstream_url).await;
         let should_cancel_calls = std::cell::Cell::new(0_usize);
+        let late_guard = std::cell::RefCell::new(None);
 
         let summary = state
             .enforce_hls_cache_quota_until_cancelled("test", Vec::new(), 0, || {
                 let call = should_cancel_calls.get();
                 should_cancel_calls.set(call + 1);
-                if call == 2 {
-                    state.note_hls_cache_playback_use(&just_used.task_id);
+                if call == 3 {
+                    *late_guard.borrow_mut() =
+                        Some(state.protect_hls_cache_session_from_eviction(&just_used.task_id));
                 }
                 false
             })
