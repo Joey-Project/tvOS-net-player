@@ -510,8 +510,12 @@ pub async fn run_with_state(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let grpc_addrs = state.options.grpc_listen_addrs()?;
     let media_addrs = state.options.media_listen_addrs()?;
+    let grpc_listeners = bind_listener_group(grpc_addrs).await?;
+    let media_listeners = bind_listener_group(media_addrs).await?;
     let grpc_state = state.clone();
     let media_state = state.clone();
+    let mut grpc_servers = spawn_servers(grpc_listeners, grpc_state, run_grpc_listener);
+    let mut media_servers = spawn_servers(media_listeners, media_state, run_media_listener);
 
     let _bonjour_advertisement = match bonjour::BonjourAdvertisement::start(&state.options) {
         Ok(advertisement) => advertisement,
@@ -520,13 +524,11 @@ pub async fn run_with_state(
             None
         }
     };
-    let grpc_server = run_grpc_servers(grpc_addrs, grpc_state);
-    let media_server = run_media_servers(media_addrs, media_state);
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
 
     tokio::select! {
-        result = grpc_server => result,
-        result = media_server => result,
+        result = wait_for_server_result(&mut grpc_servers) => result,
+        result = wait_for_server_result(&mut media_servers) => result,
         _ = shutdown_signal() => Ok(()),
     }
 }
@@ -616,12 +618,33 @@ where
         + Send
         + 'static,
 {
+    let mut servers = spawn_servers(listeners, state, run_one);
+    wait_for_server_result(&mut servers).await
+}
+
+type ServerTaskResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+fn spawn_servers<F, Fut>(
+    listeners: Vec<TcpListener>,
+    state: AppState,
+    run_one: F,
+) -> JoinSet<ServerTaskResult>
+where
+    F: Fn(TcpListener, AppState) -> Fut + Copy + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ServerTaskResult> + Send + 'static,
+{
     let mut servers = JoinSet::new();
     for listener in listeners {
         let state = state.clone();
         servers.spawn(async move { run_one(listener, state).await });
     }
 
+    servers
+}
+
+async fn wait_for_server_result(
+    servers: &mut JoinSet<ServerTaskResult>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match servers
         .join_next()
         .await

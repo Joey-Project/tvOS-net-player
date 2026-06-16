@@ -167,6 +167,7 @@ public final class BonjourCacheServerDiscoveryClient: NSObject, CacheServerDisco
 private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDelegate, @unchecked Sendable {
     private static let initialResolveRetryDelay: TimeInterval = 2
     private static let maxResolveRetryDelay: TimeInterval = 30
+    private static let browserRestartDelay: TimeInterval = 5
 
     private let serviceType: String
     private let serviceDomain: String
@@ -178,6 +179,7 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
     private var resolvedServers: [BonjourServiceKey: DiscoveredCacheServer] = [:]
     private var resolveRetryCounts: [BonjourServiceKey: Int] = [:]
     private var isSearching = false
+    private var isRestartingBrowser = false
     private var errorMessage: String?
 
     init(serviceType: String, serviceDomain: String) {
@@ -234,6 +236,7 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
         resolvedServers = [:]
         resolveRetryCounts = [:]
         isSearching = false
+        isRestartingBrowser = false
         continuation = nil
     }
 
@@ -241,10 +244,15 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
         switch state {
         case .ready:
             isSearching = true
+            isRestartingBrowser = false
             errorMessage = nil
         case .failed(let error):
             isSearching = false
             errorMessage = error.localizedDescription
+            let failedBrowser = browser
+            browser = nil
+            failedBrowser?.cancel()
+            scheduleBrowserRestart()
         case .cancelled:
             isSearching = false
         default:
@@ -252,6 +260,28 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
         }
 
         emitSnapshot()
+    }
+
+    private func scheduleBrowserRestart() {
+        guard continuation != nil, !isRestartingBrowser else {
+            return
+        }
+
+        isRestartingBrowser = true
+        queue.asyncAfter(deadline: .now() + Self.browserRestartDelay) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.isRestartingBrowser = false
+            guard self.continuation != nil, self.browser == nil else {
+                return
+            }
+
+            self.errorMessage = nil
+            self.startBrowser()
+            self.emitSnapshot()
+        }
     }
 
     private func handleBrowseResults(_ results: Set<NWBrowser.Result>) {

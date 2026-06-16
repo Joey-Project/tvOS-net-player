@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var isAutoDiscoveryConnecting = false
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
     @FocusState private var focusedControl: FocusedControl?
+    private let autoDiscoveryRetryDelay: Duration = .seconds(30)
 
     private enum FocusedControl: Hashable {
         case cacheServerField
@@ -471,8 +472,21 @@ struct ContentView: View {
         if didConnect {
             failedAutoDiscoveryServerIDs = []
         } else {
-            failedAutoDiscoveryServerIDs.insert(server.id)
-            cacheModel.clearFailedDiscoveredServer(server)
+            markAutoDiscoveryFailure(server)
+            await autoConnectDiscoveredServerIfNeeded()
+        }
+    }
+
+    private func markAutoDiscoveryFailure(_ server: DiscoveredCacheServer) {
+        let inserted = failedAutoDiscoveryServerIDs.insert(server.id).inserted
+        cacheModel.clearFailedDiscoveredServer(server)
+        guard inserted else {
+            return
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: autoDiscoveryRetryDelay)
+            failedAutoDiscoveryServerIDs.remove(server.id)
             await autoConnectDiscoveredServerIfNeeded()
         }
     }

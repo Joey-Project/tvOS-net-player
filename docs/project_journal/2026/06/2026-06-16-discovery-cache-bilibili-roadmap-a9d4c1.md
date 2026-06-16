@@ -101,17 +101,21 @@ superseded_by:
   - Added retry/backoff after transient Bonjour `NetService` resolve failures while the browser still reports the service.
   - Changed auto-discovery so failed refreshes clear the staged server and try other discovered candidates instead of consuming the first attempt forever.
   - Tightened server-side Bonjour publication so a LAN-reachable gRPC listener is only advertised when playback media is also reachable through a LAN media listener or public media base URI.
+- Post-review hardening fixes:
+  - Bound gRPC and media listeners and spawned their server tasks before starting Bonjour advertisement, so port/listener failures do not publish an unusable service.
+  - Changed auto-discovery failures from permanent service skips to a 30-second retry backoff while still trying other discovered servers immediately.
+  - Recreated the `NWBrowser` after transient browser failures with a bounded restart delay.
 - Full local gate:
-  - `just ci` after local and GitHub Codex review fixes.
+  - `just ci` after local, GitHub Codex, independent, and offline review fixes.
 - Formatting and metadata validation:
   - `scripts/format.sh`
   - `plutil -lint TVOSNetPlayer/Info.plist`
   - `plutil -lint MacOSNetPlayer/Info.plist`
   - `python3 /Users/joey/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
 - Targeted Rust validation:
-  - `cargo test --package tvos-net-player-cache-server bonjour` after the concrete listener-address fix and media-plane advertisement gate.
+  - `cargo test --package tvos-net-player-cache-server bonjour` after the concrete listener-address fix, media-plane advertisement gate, and listener-before-advertise hardening.
 - Targeted Swift validation:
-  - `swift test --filter CacheServerDiscoveryViewModelTests` after the discovered-server persistence, discovery error-visibility, and failed-auto-connect recovery fixes.
+  - `swift test --filter CacheServerDiscoveryViewModelTests` after the discovered-server persistence, discovery error-visibility, failed-auto-connect recovery, browser restart, and retry-backoff fixes.
 
 ## Next Steps
 
