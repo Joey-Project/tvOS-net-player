@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use url::Url;
@@ -20,7 +20,7 @@ impl BonjourAdvertisement {
         if !options.bonjour_enabled {
             return Ok(None);
         }
-        if !has_discoverable_grpc_listener(options)? {
+        if !has_discoverable_grpc_listener(options)? || !has_discoverable_media_endpoint(options)? {
             return Ok(None);
         }
 
@@ -95,6 +95,34 @@ fn has_discoverable_grpc_listener(options: &CacheServerOptions) -> Result<bool, 
         .grpc_listen_addrs()?
         .into_iter()
         .any(|addr| !addr.ip().is_loopback()))
+}
+
+fn has_discoverable_media_endpoint(options: &CacheServerOptions) -> Result<bool, ConfigError> {
+    if let Some(public_base_uri) = options.public_media_base_uri.as_deref() {
+        return public_media_base_is_discoverable(public_base_uri);
+    }
+
+    Ok(options
+        .media_listen_addrs()?
+        .into_iter()
+        .any(|addr| !addr.ip().is_loopback()))
+}
+
+fn public_media_base_is_discoverable(value: &str) -> Result<bool, ConfigError> {
+    let url = Url::parse(value)
+        .map_err(|error| ConfigError::new(format!("invalid public media base URI: {error}")))?;
+    let Some(host) = url.host_str() else {
+        return Ok(false);
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(false);
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(!ip.is_loopback() && !ip.is_unspecified());
+    }
+
+    Ok(true)
 }
 
 enum AdvertisedAddresses {
@@ -282,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn advertisement_start_skips_when_media_listener_is_loopback() {
+        let options = CacheServerOptions {
+            grpc_listen_url: "http://0.0.0.0:50051".to_owned(),
+            ..CacheServerOptions::default()
+        };
+
+        let advertisement = BonjourAdvertisement::start(&options).expect("start should skip");
+
+        assert!(advertisement.is_none());
+    }
+
+    #[test]
     fn wildcard_and_lan_grpc_listeners_are_discoverable() {
         for host in ["0.0.0.0", "[::]", "192.168.1.10"] {
             let options = CacheServerOptions {
@@ -291,5 +331,32 @@ mod tests {
 
             assert!(has_discoverable_grpc_listener(&options).unwrap());
         }
+    }
+
+    #[test]
+    fn media_endpoint_requires_lan_listener_or_public_base_uri() {
+        let options = CacheServerOptions {
+            media_listen_url: "http://localhost:8080".to_owned(),
+            ..CacheServerOptions::default()
+        };
+        assert!(!has_discoverable_media_endpoint(&options).unwrap());
+
+        let options = CacheServerOptions {
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            ..CacheServerOptions::default()
+        };
+        assert!(has_discoverable_media_endpoint(&options).unwrap());
+
+        let options = CacheServerOptions {
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            ..CacheServerOptions::default()
+        };
+        assert!(has_discoverable_media_endpoint(&options).unwrap());
+
+        let options = CacheServerOptions {
+            public_media_base_uri: Some("http://localhost:8080".to_owned()),
+            ..CacheServerOptions::default()
+        };
+        assert!(!has_discoverable_media_endpoint(&options).unwrap());
     }
 }

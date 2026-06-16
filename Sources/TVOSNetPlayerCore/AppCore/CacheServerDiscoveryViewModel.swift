@@ -165,6 +165,9 @@ public final class BonjourCacheServerDiscoveryClient: NSObject, CacheServerDisco
 }
 
 private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDelegate, @unchecked Sendable {
+    private static let initialResolveRetryDelay: TimeInterval = 2
+    private static let maxResolveRetryDelay: TimeInterval = 30
+
     private let serviceType: String
     private let serviceDomain: String
     private let queue = DispatchQueue(label: "TVOSNetPlayer.CacheServerDiscovery")
@@ -173,6 +176,7 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
     private var activeServiceKeys: Set<BonjourServiceKey> = []
     private var resolvingServices: [BonjourServiceKey: NetService] = [:]
     private var resolvedServers: [BonjourServiceKey: DiscoveredCacheServer] = [:]
+    private var resolveRetryCounts: [BonjourServiceKey: Int] = [:]
     private var isSearching = false
     private var errorMessage: String?
 
@@ -228,6 +232,7 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
         resolvingServices = [:]
         activeServiceKeys = []
         resolvedServers = [:]
+        resolveRetryCounts = [:]
         isSearching = false
         continuation = nil
     }
@@ -270,6 +275,7 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
                 }
             }
             resolvedServers[key] = nil
+            resolveRetryCounts[key] = nil
         }
 
         activeServiceKeys = nextKeys
@@ -298,10 +304,12 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
             }
             self.resolvingServices[key] = nil
             guard let host = Self.normalizedHostName(hostName), port > 0 else {
+                self.scheduleResolveRetry(for: key)
                 self.emitSnapshot()
                 return
             }
 
+            self.resolveRetryCounts[key] = nil
             let txt = Self.txtRecordValues(from: txtRecordData)
             let serverName = txt["server_name"]?.nonEmptyString ?? serviceName
             let server = DiscoveredCacheServer(
@@ -321,8 +329,38 @@ private final class BonjourCacheServerDiscoverySession: NSObject, NetServiceDele
         queue.async {
             if let key {
                 self.resolvingServices[key] = nil
+                self.scheduleResolveRetry(for: key)
             }
             self.emitSnapshot()
+        }
+    }
+
+    private func scheduleResolveRetry(for key: BonjourServiceKey) {
+        guard
+            activeServiceKeys.contains(key),
+            resolvedServers[key] == nil,
+            resolvingServices[key] == nil
+        else {
+            return
+        }
+
+        let retryCount = (resolveRetryCounts[key] ?? 0) + 1
+        resolveRetryCounts[key] = retryCount
+        let delay = min(
+            Self.initialResolveRetryDelay * Double(1 << min(retryCount - 1, 4)),
+            Self.maxResolveRetryDelay
+        )
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard
+                let self,
+                self.activeServiceKeys.contains(key),
+                self.resolvedServers[key] == nil,
+                self.resolvingServices[key] == nil
+            else {
+                return
+            }
+
+            self.resolve(key)
         }
     }
 

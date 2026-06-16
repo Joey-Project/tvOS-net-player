@@ -10,7 +10,8 @@ struct ContentView: View {
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
-    @State private var didAttemptAutoDiscovery = false
+    @State private var isAutoDiscoveryConnecting = false
+    @State private var failedAutoDiscoveryServerIDs: Set<String> = []
 
     var body: some View {
         NavigationSplitView {
@@ -443,23 +444,34 @@ struct ContentView: View {
         }
     }
 
-    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async {
+    @discardableResult
+    private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async -> Bool {
         discoveryModel.select(server)
         cacheModel.useDiscoveredServer(server)
-        await cacheModel.refresh()
+        return await cacheModel.refresh()
     }
 
     private func autoConnectDiscoveredServerIfNeeded() async {
         guard
-            !didAttemptAutoDiscovery,
+            !isAutoDiscoveryConnecting,
             !cacheModel.hasServerAddress,
-            let server = discoveryModel.preferredServer
+            let server = discoveryModel.discoveredServers.first(where: {
+                !failedAutoDiscoveryServerIDs.contains($0.id)
+            })
         else {
             return
         }
 
-        didAttemptAutoDiscovery = true
-        await selectDiscoveredServer(server)
+        isAutoDiscoveryConnecting = true
+        let didConnect = await selectDiscoveredServer(server)
+        isAutoDiscoveryConnecting = false
+        if didConnect {
+            failedAutoDiscoveryServerIDs = []
+        } else {
+            failedAutoDiscoveryServerIDs.insert(server.id)
+            cacheModel.clearFailedDiscoveredServer(server)
+            await autoConnectDiscoveredServerIfNeeded()
+        }
     }
 
     private func playBilibiliTask() async {

@@ -97,17 +97,21 @@ superseded_by:
   - Found and fixed concrete LAN IP advertisement so Bonjour publishes only the configured listener IP, while wildcard listeners keep automatic address publication.
   - Found and fixed tvOS discovery failure visibility so `Discovery failed` status remains visible when browsing stops with no servers.
   - Final `codex-readonly` isolated review after all fixes: LGTM.
+- GitHub `codex/review-gate` fixes:
+  - Added retry/backoff after transient Bonjour `NetService` resolve failures while the browser still reports the service.
+  - Changed auto-discovery so failed refreshes clear the staged server and try other discovered candidates instead of consuming the first attempt forever.
+  - Tightened server-side Bonjour publication so a LAN-reachable gRPC listener is only advertised when playback media is also reachable through a LAN media listener or public media base URI.
 - Full local gate:
-  - `just ci` after all review fixes.
+  - `just ci` after local and GitHub Codex review fixes.
 - Formatting and metadata validation:
   - `scripts/format.sh`
   - `plutil -lint TVOSNetPlayer/Info.plist`
   - `plutil -lint MacOSNetPlayer/Info.plist`
   - `python3 /Users/joey/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
 - Targeted Rust validation:
-  - `cargo test --package tvos-net-player-cache-server bonjour` after the concrete listener-address fix.
+  - `cargo test --package tvos-net-player-cache-server bonjour` after the concrete listener-address fix and media-plane advertisement gate.
 - Targeted Swift validation:
-  - `swift test --filter CacheServerDiscoveryViewModelTests` after the discovered-server persistence and discovery error-visibility fixes.
+  - `swift test --filter CacheServerDiscoveryViewModelTests` after the discovered-server persistence, discovery error-visibility, and failed-auto-connect recovery fixes.
 
 ## Next Steps
 

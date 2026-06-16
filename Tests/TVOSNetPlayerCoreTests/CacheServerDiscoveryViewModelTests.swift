@@ -83,6 +83,23 @@ final class CacheServerDiscoveryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCacheLibraryCanClearFailedDiscoveredServerAddress() {
+        let server = DiscoveredCacheServer(
+            id: "living-room",
+            name: "Living Room Cache",
+            endpoint: CacheServerEndpoint(host: "living-room.local", port: 50_051)
+        )
+        let model = CacheLibraryViewModel(defaults: defaults)
+
+        model.useDiscoveredServer(server)
+        model.clearFailedDiscoveredServer(server)
+
+        XCTAssertEqual(model.serverAddressText, "")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Cache server not connected.")
+    }
+
+    @MainActor
     private func waitUntil(predicate: @escaping @MainActor () -> Bool) async {
         for _ in 0..<100 where !predicate() {
             await Task.yield()
