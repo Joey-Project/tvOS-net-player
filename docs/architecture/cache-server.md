@@ -80,7 +80,8 @@ Playback planning foundation:
 - Progressive playback states extend the shared task model with `PLANNED`, `PREPARING`, `PLAYABLE`, and `COMPLETED`. `PREPARING` records in-flight background planning; `PLANNED` remains supported for older metadata-only snapshots; `PLAYABLE` means a HLS session manifest is persisted, a runtime HLS session is registered, and `PlaybackSource.uri` points at `/hls/{session_id}/master.m3u8`; `COMPLETED` means the selected HLS media resources have been cached under the cache root and can be restored for offline LAN playback.
 - The HLS HTTP routes are `/hls/{session_id}/master.m3u8` and `/hls/{session_id}/segments/{segment_id}`. The master playlist points at per-track media playlists under `segments/*.m3u8`; media playlists expose the selected DASH video/audio requests as single VOD-style fMP4 byte-range segments with `EXT-X-MAP`. Media playlist generation uses cached MP4 initialization metadata when available and otherwise probes only a bounded MP4 initialization window. Segment requests serve cached media resources first and fall back to proxying BBDown media URLs with the required request headers and client `Range` header. Ranged upstream responses must be `206 Partial Content` with a `Content-Range` matching the requested byte range; invalid ranged responses and retryable CDN statuses fail over to backup URLs, while bounded upstream connect/read timeouts prevent stalled CDN attempts from holding playlist/segment handlers indefinitely.
 - HLS cache manifests live under `Cache:RootPath/.tvos-net-player/hls/{session_id}`. `session.json` persists the server-owned HLS session and BBDown media request metadata; per-resource metadata records cached file size, initialization range length, content type, and BBDown cache keys as basic integrity and future eviction hooks. Startup loads these manifests into the runtime HLS registry, preserves restorable `PLAYABLE`/`COMPLETED` tasks, and fails only progressive tasks whose persisted playback state has no matching HLS manifest.
-- Once all selected HLS media resources are cached, the background finalizer marks the progressive task `COMPLETED` and exposes a virtual `LIBRARY_SOURCE_BILIBILI` item with id `bilibili.hls.<session_id>`. `LibraryService.GetPlaybackSource` returns a fresh HLS URL for that item using the current media base URI. The first offline slice does not transcode or remux progressive media; LAN-side transcoding, cache eviction policy, and user-facing cache management remain later extensions.
+- Once all selected HLS media resources are cached, the background finalizer marks the progressive task `COMPLETED` and exposes a virtual `LIBRARY_SOURCE_BILIBILI` item with id `bilibili.hls.<session_id>`. `LibraryService.GetPlaybackSource` returns a fresh HLS URL for that item using the current media base URI. The first offline slice does not transcode or remux progressive media; LAN-side transcoding and richer weak-network scheduling remain later extensions.
+- Completed HLS cache has a server-side quota policy. `Cache:HlsCacheMaxBytes` defaults to 50 GiB, `Cache:HlsCacheHighWatermarkPercent` defaults to 90, and `Cache:HlsCacheLowWatermarkPercent` defaults to 80. Setting the max bytes to `0` disables automatic eviction. Before HLS finalization starts, the server checks projected completed-HLS usage; when it would cross the high watermark, it evicts oldest eligible completed HLS sessions down toward the low watermark. A periodic background monitor runs the same cleanup without projected bytes. Eviction skips active/protected progressive playback work, incomplete sessions, and the session currently being finalized; it removes the completed HLS cache directory and matching completed playback task record together. `CacheService.GetHlsCacheStatus` reports quota settings, completed-HLS usage, and the last eviction attempt summary to clients.
 
 ## Protocol Shape
 
@@ -92,7 +93,7 @@ Initial services:
 - `LibraryService`: list items, get item details, rescan cache roots, and request playback sources.
 - `TaskService`: create Bilibili cache tasks, read task state, watch task events, and request cancellation.
 - `TaskService.CreateBilibiliPlaybackTask`: create a progressive Bilibili playback task, return it in `PREPARING`, and publish a playable HLS source later through task reads or watches.
-- `CacheService`: list cache roots and delete cached items.
+- `CacheService`: list cache roots, read HLS cache quota status, and delete cached items.
 
 Playback sources intentionally return URLs instead of media bytes.
 
@@ -103,6 +104,7 @@ Cache deletion contract:
 - Local cache items delete the validated media file under `Cache:RootPath`; internal `.tvos-net-player/hls` files are not addressable as local library items.
 - Completed Bilibili HLS items with ids shaped as `bilibili.hls.<session_id>` delete the HLS cache session directory, remove the runtime HLS session, and remove the persisted completed progressive playback task that authorized the virtual library item.
 - Active or playable-but-not-completed progressive HLS sessions are still controlled through task cancellation, not library item deletion.
+- Automatic HLS cache eviction uses the same completed-item cleanup boundary as manual deletion, but only for completed HLS cache entries selected by the quota policy.
 
 ## Deployment Notes
 
@@ -122,11 +124,11 @@ Cache deletion contract:
 4. Add the server-side task worker foundation, adapter boundary, and persisted task state. Done in the worker-foundation slice.
 5. Add the real BBDown crate adapter worker that consumes queued Bilibili tasks and materializes finished downloads into the library. Done in the BBDown Rust adapter slice.
 6. Add Bonjour discovery once the manual server URL path works. Done in the Bonjour discovery slice.
-7. Add HLS/progressive caching for weaker network conditions. Done for runtime passthrough, durable manifest restore, selected-resource offline finalization, user-visible offline labels, and manual deletion of completed HLS cache items; transcoding and automatic eviction policy remain follow-up work.
+7. Add HLS/progressive caching for weaker network conditions. Done for runtime passthrough, durable manifest restore, selected-resource offline finalization, user-visible offline labels, manual deletion of completed HLS cache items, and automatic completed-HLS quota eviction; transcoding and richer weak-network scheduling remain follow-up work.
 
 ## First Slice Notes
 
-The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Manual cache item deletion, cache root display, tvOS task submission UI, completed-HLS offline UX, and Bonjour discovery are implemented. Richer BBDown option mapping, transcoding, and automatic cache eviction remain follow-up work.
+The first server slice intentionally implemented only local cache browsing and HTTP playback for complete files (`.mp4`, `.m4v`, and `.mov`). Bilibili task intake/cancellation now feeds a real BBDown Rust crate adapter, and progressive playback can expose runtime passthrough HLS sessions after BBDown planning, restore persisted HLS manifests after restart, and finalize selected media resources into offline Bilibili HLS library items. Manual cache item deletion, cache root display, tvOS task submission UI, completed-HLS offline UX, Bonjour discovery, and automatic completed-HLS quota eviction are implemented. Richer BBDown option mapping, transcoding, and weak-network fill/prewarm scheduling remain follow-up work.
 
 Runtime shape:
 
@@ -158,6 +160,9 @@ Configuration:
 - `Cache:TaskRetentionMaxTerminalTasks`: maximum ordinary terminal task records to retain in the persisted task snapshot. Defaults to `200`; set `0` to disable this limit.
 - `Cache:TaskRetentionTerminalAgeDays`: maximum age in days for ordinary terminal task records in the persisted task snapshot. Defaults to `30`; set `0` to disable this limit.
 - `Cache:AllowLibraryItemDelete`: enables destructive cache library deletion RPCs and the matching `SERVER_CAPABILITY_LIBRARY_ITEM_DELETE` capability. Defaults to `false` while the control plane is cleartext and unauthenticated.
+- `Cache:HlsCacheMaxBytes`: maximum completed HLS cache budget before automatic eviction. Defaults to 50 GiB; set `0` to disable automatic HLS eviction.
+- `Cache:HlsCacheHighWatermarkPercent`: high watermark that triggers completed-HLS cleanup when current or projected usage crosses it. Defaults to `90`.
+- `Cache:HlsCacheLowWatermarkPercent`: target watermark for cleanup after the high watermark triggers. Defaults to `80` and must be lower than the high watermark.
 - `Cache:BilibiliWorkerEnabled`: starts the real BBDown worker when true. Defaults to `true`.
 - `Cache:BilibiliWorkerMaxConcurrentTasks`: maximum task worker concurrency. Defaults to `1`; the real BBDown adapter currently caps effective concurrency at `1` to avoid concurrent writes to the same archive.
 - `Cache:BBDownOutputDir`: BBDown download output directory. It defaults to `Cache:RootPath/Bilibili`; when the worker is enabled or this path is explicitly configured, it must be inside `Cache:RootPath`, with no `..` parent components and no existing symlink components under the root.

@@ -13,7 +13,13 @@ pub mod playback;
 pub mod task_registry;
 mod task_store;
 
-use std::{collections::HashSet, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 
 use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
@@ -38,7 +44,10 @@ use crate::{
         TaskGrpcService,
     },
     hls::{HlsPlaybackRegistry, HlsPlaybackSession},
-    hls_cache::{HlsCacheStore, sanitized_completed_session},
+    hls_cache::{
+        HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
+        HlsCacheStatusSnapshot, HlsCacheStore, sanitized_completed_session,
+    },
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
@@ -53,6 +62,7 @@ const HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS: usize = 1;
 const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,6 +77,7 @@ pub struct AppState {
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) completed_hls_cache_playback_supported: bool,
+    pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
 }
 
 impl AppState {
@@ -184,6 +195,7 @@ impl AppState {
             playback_planning_permits,
             hls_cache_finalization_permits,
             completed_hls_cache_playback_supported,
+            last_hls_cache_eviction: Arc::new(Mutex::new(None)),
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
@@ -356,6 +368,148 @@ impl AppState {
         self.completed_hls_cache_playback_supported
     }
 
+    pub(crate) fn hls_cache_policy(&self) -> HlsCacheEvictionPolicy {
+        HlsCacheEvictionPolicy {
+            max_bytes: self.options.hls_cache_max_bytes,
+            high_watermark_percent: self.options.hls_cache_high_watermark_percent,
+            low_watermark_percent: self.options.hls_cache_low_watermark_percent,
+        }
+    }
+
+    pub(crate) fn hls_cache_status(&self) -> io::Result<HlsCacheStatusSnapshot> {
+        Ok(HlsCacheStatusSnapshot {
+            policy: self.hls_cache_policy(),
+            usage: self.hls_cache.usage_snapshot()?,
+            last_eviction: self
+                .last_hls_cache_eviction
+                .lock()
+                .expect("HLS cache eviction summary lock poisoned")
+                .clone(),
+        })
+    }
+
+    pub(crate) fn enforce_hls_cache_quota(
+        &self,
+        reason: &str,
+        protected_session_ids: impl IntoIterator<Item = String>,
+        projected_added_bytes: u64,
+    ) -> io::Result<Option<HlsCacheEvictionSummary>> {
+        let policy = self.hls_cache_policy();
+        if !policy.eviction_enabled() {
+            return Ok(None);
+        }
+
+        let entries = self.hls_cache.completed_cache_entries()?;
+        let started_used_bytes = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
+        let projected_used_bytes = started_used_bytes.saturating_add(projected_added_bytes);
+        if projected_used_bytes <= policy.high_watermark_bytes() {
+            return Ok(None);
+        }
+
+        let mut protected_ids = self.tasks.protected_hls_cache_session_ids();
+        protected_ids.extend(protected_session_ids);
+        let target_used_bytes = policy
+            .low_watermark_bytes()
+            .saturating_sub(projected_added_bytes);
+        let mut finished_used_bytes = started_used_bytes;
+        let mut evicted_bytes = 0_u64;
+        let mut evicted_session_ids = Vec::new();
+
+        for entry in entries {
+            if finished_used_bytes <= target_used_bytes {
+                break;
+            }
+            if protected_ids.contains(&entry.session_id) {
+                continue;
+            }
+            if !self.completed_hls_cache_entry_is_evictable(&entry) {
+                continue;
+            }
+            self.hls_cache.remove_session(&entry.session_id)?;
+            self.hls_sessions.remove(&entry.session_id);
+            self.remove_evicted_completed_hls_task(&entry);
+            finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
+            evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
+            evicted_session_ids.push(entry.session_id);
+        }
+
+        let summary = HlsCacheEvictionSummary {
+            reason: reason.to_owned(),
+            started_used_bytes,
+            finished_used_bytes,
+            target_used_bytes,
+            projected_added_bytes,
+            evicted_bytes,
+            evicted_session_ids,
+            target_reached: finished_used_bytes <= target_used_bytes,
+            completed_at: SystemTime::now(),
+        };
+        *self
+            .last_hls_cache_eviction
+            .lock()
+            .expect("HLS cache eviction summary lock poisoned") = Some(summary.clone());
+
+        Ok(Some(summary))
+    }
+
+    pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {
+        if !self.hls_cache_policy().eviction_enabled() {
+            return None;
+        }
+
+        let state = self.clone();
+        Some(tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + HLS_CACHE_EVICTION_CHECK_INTERVAL;
+            let mut interval = tokio::time::interval_at(start, HLS_CACHE_EVICTION_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = state.enforce_hls_cache_quota("periodic", Vec::new(), 0) {
+                    eprintln!("Failed to run periodic HLS cache eviction: {error}");
+                }
+            }
+        }))
+    }
+
+    fn completed_hls_cache_entry_is_evictable(&self, entry: &HlsCacheCompletedEntry) -> bool {
+        let Ok(task) = self.tasks.get_task(&entry.session_id) else {
+            return true;
+        };
+        if task.kind() != TaskKind::BilibiliProgressivePlayback {
+            return false;
+        }
+        if task.state() != TaskState::Completed {
+            return false;
+        }
+        if task.library_item_id == entry.library_item_id {
+            return true;
+        }
+
+        self.fail_completed_hls_task_after_cache_restore(&entry.session_id);
+        true
+    }
+
+    fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
+        let Ok(task) = self.tasks.get_task(&entry.session_id) else {
+            return;
+        };
+        if task.kind() != TaskKind::BilibiliProgressivePlayback
+            || task.state() != TaskState::Completed
+            || task.library_item_id != entry.library_item_id
+        {
+            return;
+        }
+        if let Err(status) = self
+            .tasks
+            .remove_completed_playback_task(&entry.session_id, &entry.library_item_id)
+        {
+            eprintln!(
+                "Failed to remove evicted HLS playback task {} after cache eviction: {status}",
+                entry.session_id
+            );
+        }
+    }
+
     pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
         if let Some(session) = self.hls_sessions.get(session_id) {
             return Some(session);
@@ -525,6 +679,7 @@ pub async fn run_with_state(
         }
     };
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
+    let _hls_cache_quota_monitor = state.spawn_hls_cache_quota_monitor();
 
     tokio::select! {
         result = wait_for_server_result(&mut grpc_servers) => result,

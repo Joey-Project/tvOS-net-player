@@ -724,6 +724,25 @@ impl BilibiliTaskRegistry {
         })
     }
 
+    pub fn protected_hls_cache_session_ids(&self) -> HashSet<String> {
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .tasks_by_id
+            .values()
+            .filter(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && !matches!(
+                        task.state(),
+                        TaskState::Completed
+                            | TaskState::Succeeded
+                            | TaskState::Failed
+                            | TaskState::Cancelled
+                    )
+            })
+            .map(|task| task.id.clone())
+            .collect()
+    }
+
     pub fn subscribe(&self, ids: &[String]) -> Result<TaskSubscription, Status> {
         let mut watched_ids = HashSet::new();
         for id in ids {

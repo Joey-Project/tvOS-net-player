@@ -11,9 +11,10 @@ use tvos_net_player_cache_server::{
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
         CancelTaskRequest, CheckHealthRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
-        GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
-        LibrarySource, ListCacheRootsRequest, ListLibraryItemsRequest, RescanLibraryRequest,
-        ServerCapability, TaskState, WatchTasksRequest, cache_service_client::CacheServiceClient,
+        GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
+        GetServerInfoRequest, GetTaskRequest, LibrarySource, ListCacheRootsRequest,
+        ListLibraryItemsRequest, RescanLibraryRequest, ServerCapability, TaskState,
+        WatchTasksRequest, cache_service_client::CacheServiceClient,
         library_service_client::LibraryServiceClient, server_service_client::ServerServiceClient,
         task_service_client::TaskServiceClient,
     },
@@ -244,6 +245,17 @@ async fn supports_cache_roots_rescan_and_bilibili_task_lifecycle() {
     assert_eq!(1, roots.roots.len());
     assert_eq!("default", roots.roots[0].id);
     assert!(roots.roots[0].writable);
+    let hls_status = cache_client
+        .get_hls_cache_status(GetHlsCacheStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(hls_status.eviction_enabled);
+    assert_eq!(50 * 1024 * 1024 * 1024, hls_status.max_bytes);
+    assert_eq!(90, hls_status.high_watermark_percent);
+    assert_eq!(80, hls_status.low_watermark_percent);
+    assert_eq!(0, hls_status.used_bytes);
+    assert_eq!(0, hls_status.completed_session_count);
 
     let mut library_client = LibraryServiceClient::new(channel.clone());
     let library = library_client

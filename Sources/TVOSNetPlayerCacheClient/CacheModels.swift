@@ -142,6 +142,74 @@ public struct CacheRoot: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct HLSCacheStatus: Equatable, Sendable {
+    public let evictionEnabled: Bool
+    public let maxBytes: Int64
+    public let highWatermarkPercent: Int
+    public let lowWatermarkPercent: Int
+    public let highWatermarkBytes: Int64
+    public let lowWatermarkBytes: Int64
+    public let usedBytes: Int64
+    public let completedSessionCount: Int
+    public let lastEviction: HLSCacheEvictionSummary?
+
+    public init(
+        evictionEnabled: Bool,
+        maxBytes: Int64,
+        highWatermarkPercent: Int,
+        lowWatermarkPercent: Int,
+        highWatermarkBytes: Int64,
+        lowWatermarkBytes: Int64,
+        usedBytes: Int64,
+        completedSessionCount: Int,
+        lastEviction: HLSCacheEvictionSummary?
+    ) {
+        self.evictionEnabled = evictionEnabled
+        self.maxBytes = maxBytes
+        self.highWatermarkPercent = highWatermarkPercent
+        self.lowWatermarkPercent = lowWatermarkPercent
+        self.highWatermarkBytes = highWatermarkBytes
+        self.lowWatermarkBytes = lowWatermarkBytes
+        self.usedBytes = usedBytes
+        self.completedSessionCount = completedSessionCount
+        self.lastEviction = lastEviction
+    }
+}
+
+public struct HLSCacheEvictionSummary: Equatable, Sendable {
+    public let reason: String
+    public let startedUsedBytes: Int64
+    public let finishedUsedBytes: Int64
+    public let targetUsedBytes: Int64
+    public let projectedAddedBytes: Int64
+    public let evictedBytes: Int64
+    public let evictedSessionIDs: [String]
+    public let targetReached: Bool
+    public let completedAt: Date?
+
+    public init(
+        reason: String,
+        startedUsedBytes: Int64,
+        finishedUsedBytes: Int64,
+        targetUsedBytes: Int64,
+        projectedAddedBytes: Int64,
+        evictedBytes: Int64,
+        evictedSessionIDs: [String],
+        targetReached: Bool,
+        completedAt: Date?
+    ) {
+        self.reason = reason
+        self.startedUsedBytes = startedUsedBytes
+        self.finishedUsedBytes = finishedUsedBytes
+        self.targetUsedBytes = targetUsedBytes
+        self.projectedAddedBytes = projectedAddedBytes
+        self.evictedBytes = evictedBytes
+        self.evictedSessionIDs = evictedSessionIDs
+        self.targetReached = targetReached
+        self.completedAt = completedAt
+    }
+}
+
 public struct CacheLibraryItem: Identifiable, Equatable, Sendable {
     public let id: String
     public let title: String

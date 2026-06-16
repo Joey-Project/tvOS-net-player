@@ -1,0 +1,43 @@
+---
+id: 20260616-c2d8e4
+title: HLS Cache Quota Watermarks
+status: completed
+created: 2026-06-16
+updated: 2026-06-16
+branch: wip/hls-cache-quota-watermarks
+pr:
+supersedes: []
+superseded_by:
+---
+
+# HLS Cache Quota Watermarks
+
+## Summary
+
+- Implemented PR B from the discovery/cache/weak-network roadmap.
+- Added completed-HLS cache quota settings with defaults of 50 GiB max, 90% high watermark, and 80% low watermark.
+- Added automatic oldest-first cleanup for eligible completed HLS sessions before HLS finalization and through a periodic server monitor.
+- Added `CacheService.GetHlsCacheStatus` so Swift clients can read quota settings, completed-HLS usage, and the last eviction attempt summary.
+
+## Decisions
+
+- Automatic eviction remains HLS-only and completed-session-only in this slice.
+- `Cache:HlsCacheMaxBytes=0` disables automatic eviction, while watermark values still validate.
+- Cleanup uses projected bytes before finalization when BBDown metadata includes complete resource sizes; otherwise periodic cleanup still catches completed-HLS usage after the fact.
+- Eviction skips protected/current progressive playback work and incomplete sessions. Eligible completed sessions delete the HLS session directory and matching completed playback task record together.
+- The Swift cache client exposes status as a read-only model without adding UI yet. Weak-network and cache-management UX belongs to the next PR.
+
+## Validation
+
+- `cargo fmt --all`
+- `swift format lint --recursive Sources TVOSNetPlayer MacOSNetPlayer Tests TVOSNetPlayerTests MacOSNetPlayerTests`
+- `cargo test --package tvos-net-player-cache-server hls_cache`
+- `cargo test --package tvos-net-player-cache-server hls_cache_quota`
+- `cargo test --package tvos-net-player-cache-server get_hls_cache_status`
+- `cargo test --package tvos-net-player-cache-server hls_eviction_policy`
+- `swift test --filter CacheLibraryPaginationTests`
+
+## Next Steps
+
+- Run the full local gate for this PR.
+- Open PR B, complete GitHub CI plus the three review lanes, resolve all conversations, merge, update `master`, then branch PR C for progressive weak-network scheduler/prewarm UX.

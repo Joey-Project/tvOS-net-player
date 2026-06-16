@@ -38,6 +38,61 @@ pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheEvictionPolicy {
+    pub(crate) max_bytes: u64,
+    pub(crate) high_watermark_percent: u8,
+    pub(crate) low_watermark_percent: u8,
+}
+
+impl HlsCacheEvictionPolicy {
+    pub(crate) fn eviction_enabled(self) -> bool {
+        self.max_bytes > 0
+    }
+
+    pub(crate) fn high_watermark_bytes(self) -> u64 {
+        percentage_bytes(self.max_bytes, self.high_watermark_percent)
+    }
+
+    pub(crate) fn low_watermark_bytes(self) -> u64 {
+        percentage_bytes(self.max_bytes, self.low_watermark_percent)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheUsageSnapshot {
+    pub(crate) used_bytes: u64,
+    pub(crate) completed_session_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheStatusSnapshot {
+    pub(crate) policy: HlsCacheEvictionPolicy,
+    pub(crate) usage: HlsCacheUsageSnapshot,
+    pub(crate) last_eviction: Option<HlsCacheEvictionSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheCompletedEntry {
+    pub(crate) session_id: String,
+    pub(crate) library_item_id: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) updated_at: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheEvictionSummary {
+    pub(crate) reason: String,
+    pub(crate) started_used_bytes: u64,
+    pub(crate) finished_used_bytes: u64,
+    pub(crate) target_used_bytes: u64,
+    pub(crate) projected_added_bytes: u64,
+    pub(crate) evicted_bytes: u64,
+    pub(crate) evicted_session_ids: Vec<String>,
+    pub(crate) target_reached: bool,
+    pub(crate) completed_at: SystemTime,
+}
+
 impl HlsCacheStore {
     pub(crate) fn new(root_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -142,6 +197,28 @@ impl HlsCacheStore {
                 .then_with(|| left.id.cmp(&right.id))
         });
         items
+    }
+
+    pub(crate) fn usage_snapshot(&self) -> io::Result<HlsCacheUsageSnapshot> {
+        let entries = self.completed_cache_entries()?;
+        Ok(HlsCacheUsageSnapshot {
+            used_bytes: entries.iter().map(|entry| entry.size_bytes).sum(),
+            completed_session_count: entries.len(),
+        })
+    }
+
+    pub(crate) fn completed_cache_entries(&self) -> io::Result<Vec<HlsCacheCompletedEntry>> {
+        let mut entries = self
+            .load_sessions()?
+            .iter()
+            .filter_map(|session| self.completed_cache_entry(session))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        Ok(entries)
     }
 
     pub(crate) fn get_completed_library_item(&self, item_id: &str) -> Option<LibraryItem> {
@@ -276,17 +353,8 @@ impl HlsCacheStore {
     }
 
     fn completed_library_item(&self, session: &HlsPlaybackSession) -> Option<LibraryItem> {
-        if !self.session_is_complete(session) {
-            return None;
-        }
-
+        let entry = self.completed_cache_entry(session)?;
         let cached_video = self.cached_resource(&session.id, &session.variant.video.id)?;
-        let size_bytes = self.cached_resource_total_size(session).unwrap_or_default();
-        let updated_at = self
-            .resource_modification_times(session)
-            .into_iter()
-            .max()
-            .unwrap_or(UNIX_EPOCH);
 
         Some(LibraryItem {
             id: Self::completed_library_item_id(&session.id),
@@ -320,12 +388,34 @@ impl HlsCacheStore {
                     .try_into()
                     .unwrap_or(i32::MAX),
                 bitrate: session.variant.bandwidth.try_into().unwrap_or(i64::MAX),
-                size_bytes: size_bytes.try_into().unwrap_or(i64::MAX),
+                size_bytes: entry.size_bytes.try_into().unwrap_or(i64::MAX),
             }],
             created_at: Some(timestamp_from_system_time(
                 created_time_for_path(&cached_video.path).unwrap_or(UNIX_EPOCH),
             )),
-            updated_at: Some(timestamp_from_system_time(updated_at)),
+            updated_at: Some(timestamp_from_system_time(entry.updated_at)),
+        })
+    }
+
+    fn completed_cache_entry(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> Option<HlsCacheCompletedEntry> {
+        if !self.session_is_complete(session) {
+            return None;
+        }
+        let size_bytes = self.cached_resource_total_size(session)?;
+        let updated_at = self
+            .resource_modification_times(session)
+            .into_iter()
+            .max()
+            .unwrap_or(UNIX_EPOCH);
+
+        Some(HlsCacheCompletedEntry {
+            session_id: session.id.clone(),
+            library_item_id: Self::completed_library_item_id(&session.id),
+            size_bytes,
+            updated_at,
         })
     }
 
@@ -754,6 +844,19 @@ fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
     urls
 }
 
+pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> Option<u64> {
+    let mut total = 0_u64;
+    for resource in session
+        .variant
+        .audio
+        .iter()
+        .chain(std::iter::once(&session.variant.video))
+    {
+        total = total.checked_add(resource.request.size?)?;
+    }
+    Some(total)
+}
+
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
     sanitize_completed_resource(&mut session.variant.video);
@@ -868,12 +971,17 @@ fn created_time_for_path(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
-fn timestamp_from_system_time(time: SystemTime) -> Timestamp {
+pub(crate) fn timestamp_from_system_time(time: SystemTime) -> Timestamp {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     Timestamp {
         seconds: duration.as_secs().try_into().unwrap_or(i64::MAX),
         nanos: duration.subsec_nanos().try_into().unwrap_or(i32::MAX),
     }
+}
+
+fn percentage_bytes(bytes: u64, percent: u8) -> u64 {
+    let value = u128::from(bytes) * u128::from(percent) / 100;
+    value.try_into().unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1322,6 +1430,65 @@ mod tests {
         assert_eq!(PlaybackProtocol::Hls as i32, item.variants[0].protocol);
         assert_eq!(fake_mp4().len() as u64, cached.total_length);
         assert_eq!(28, cached.initialization_length);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_counts_completed_hls_cache_entries() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let client = reqwest::Client::new();
+
+        store
+            .cache_session_resources(&client, &sample_session("session-a", &upstream_url))
+            .await
+            .expect("first session should cache");
+        store
+            .cache_session_resources(&client, &sample_session("session-b", &upstream_url))
+            .await
+            .expect("second session should cache");
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should scan completed cache");
+        let entries = store
+            .completed_cache_entries()
+            .expect("completed cache entries should scan");
+
+        assert_eq!(2, usage.completed_session_count);
+        assert_eq!(2 * fake_mp4().len() as u64, usage.used_bytes);
+        assert_eq!(vec!["session-a", "session-b"], session_ids(&entries));
+    }
+
+    #[test]
+    fn hls_eviction_policy_derives_watermark_bytes() {
+        let policy = HlsCacheEvictionPolicy {
+            max_bytes: 1_000,
+            high_watermark_percent: 90,
+            low_watermark_percent: 80,
+        };
+
+        assert!(policy.eviction_enabled());
+        assert_eq!(900, policy.high_watermark_bytes());
+        assert_eq!(800, policy.low_watermark_bytes());
+    }
+
+    #[test]
+    fn declared_session_size_requires_all_resource_sizes() {
+        let mut session =
+            sample_session_with_audio("session-sized", "https://example.test/video.m4s");
+        session.variant.video.request.size = Some(10);
+        session
+            .variant
+            .audio
+            .as_mut()
+            .expect("sample should include audio")
+            .request
+            .size = Some(3);
+
+        assert_eq!(Some(13), hls_session_declared_size_bytes(&session));
+        session.variant.video.request.size = None;
+        assert_eq!(None, hls_session_declared_size_bytes(&session));
     }
 
     #[tokio::test]
@@ -2197,5 +2364,12 @@ mod tests {
         let mut bytes = serde_json::to_vec_pretty(value).expect("test JSON should serialize");
         bytes.push(b'\n');
         std::fs::write(path, bytes).expect("test JSON should be written");
+    }
+
+    fn session_ids(entries: &[HlsCacheCompletedEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| entry.session_id.as_str())
+            .collect()
     }
 }

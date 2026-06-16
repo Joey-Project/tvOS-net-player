@@ -1,6 +1,7 @@
 import Foundation
 import GRPCCore
 import GRPCNIOTransportHTTP2TransportServices
+import SwiftProtobuf
 
 public final class GRPCCacheControlClient: CacheControlClient {
     private let endpoint: CacheServerEndpoint
@@ -52,6 +53,22 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 options: callOptions
             )
             return response.roots.map(CacheRoot.init)
+        }
+    }
+
+    public func getHLSCacheStatus() async throws -> HLSCacheStatus {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: .plaintext
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+            let response = try await service.getHlsCacheStatus(
+                TvosNetPlayer_V1_GetHlsCacheStatusRequest(),
+                options: callOptions
+            )
+            return HLSCacheStatus(response)
         }
     }
 
@@ -322,6 +339,38 @@ extension CacheRoot {
     }
 }
 
+extension HLSCacheStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsCacheStatus) {
+        self.init(
+            evictionEnabled: proto.evictionEnabled,
+            maxBytes: proto.maxBytes,
+            highWatermarkPercent: Int(proto.highWatermarkPercent),
+            lowWatermarkPercent: Int(proto.lowWatermarkPercent),
+            highWatermarkBytes: proto.highWatermarkBytes,
+            lowWatermarkBytes: proto.lowWatermarkBytes,
+            usedBytes: proto.usedBytes,
+            completedSessionCount: Int(proto.completedSessionCount),
+            lastEviction: proto.hasLastEviction ? HLSCacheEvictionSummary(proto.lastEviction) : nil
+        )
+    }
+}
+
+extension HLSCacheEvictionSummary {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsCacheEvictionSummary) {
+        self.init(
+            reason: proto.reason,
+            startedUsedBytes: proto.startedUsedBytes,
+            finishedUsedBytes: proto.finishedUsedBytes,
+            targetUsedBytes: proto.targetUsedBytes,
+            projectedAddedBytes: proto.projectedAddedBytes,
+            evictedBytes: proto.evictedBytes,
+            evictedSessionIDs: proto.evictedSessionIds,
+            targetReached: proto.targetReached,
+            completedAt: proto.hasCompletedAt ? Date(proto.completedAt) : nil
+        )
+    }
+}
+
 extension CacheLibraryItem {
     fileprivate init(_ proto: TvosNetPlayer_V1_LibraryItem) {
         self.init(
@@ -428,5 +477,14 @@ extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
         qualityPreference = options.qualityPreference
         encodingPreference = options.encodingPreference
         preferTvApi = options.preferTVAPI
+    }
+}
+
+extension Date {
+    fileprivate init(_ proto: Google_Protobuf_Timestamp) {
+        self.init(
+            timeIntervalSince1970: TimeInterval(proto.seconds)
+                + TimeInterval(proto.nanos) / 1_000_000_000
+        )
     }
 }

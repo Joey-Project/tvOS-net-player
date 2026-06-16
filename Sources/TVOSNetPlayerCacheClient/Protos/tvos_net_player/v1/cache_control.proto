@@ -32,6 +32,7 @@ service TaskService {
 
 service CacheService {
   rpc ListCacheRoots(ListCacheRootsRequest) returns (ListCacheRootsResponse);
+  rpc GetHlsCacheStatus(GetHlsCacheStatusRequest) returns (HlsCacheStatus);
   rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
 }
 
@@ -253,6 +254,32 @@ message ListCacheRootsRequest {}
 
 message ListCacheRootsResponse {
   repeated CacheRoot roots = 1;
+}
+
+message GetHlsCacheStatusRequest {}
+
+message HlsCacheStatus {
+  bool eviction_enabled = 1;
+  int64 max_bytes = 2;
+  int32 high_watermark_percent = 3;
+  int32 low_watermark_percent = 4;
+  int64 high_watermark_bytes = 5;
+  int64 low_watermark_bytes = 6;
+  int64 used_bytes = 7;
+  int32 completed_session_count = 8;
+  HlsCacheEvictionSummary last_eviction = 9;
+}
+
+message HlsCacheEvictionSummary {
+  string reason = 1;
+  int64 started_used_bytes = 2;
+  int64 finished_used_bytes = 3;
+  int64 target_used_bytes = 4;
+  int64 projected_added_bytes = 5;
+  int64 evicted_bytes = 6;
+  repeated string evicted_session_ids = 7;
+  bool target_reached = 8;
+  google.protobuf.Timestamp completed_at = 9;
 }
 
 message CacheRoot {

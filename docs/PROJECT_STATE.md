@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、可落盘恢复的 server-side task worker、真实 BBDown Rust crate adapter、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、真实 BBDown Rust crate adapter、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
