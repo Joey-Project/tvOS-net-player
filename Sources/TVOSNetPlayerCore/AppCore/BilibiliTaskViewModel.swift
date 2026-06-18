@@ -198,6 +198,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let options = currentPlaybackOptions
 
+        guard Self.shouldResolveBeforeSubmittingBilibiliInput(source) else {
+            await createPlaybackTask(source: source, selectionID: nil, endpoint: endpoint, options: options)
+            return
+        }
+
         if isWaitingForCandidateSelection,
             resolvedInputMatches(source: source, endpoint: endpoint, options: options)
         {
@@ -799,6 +804,91 @@ private extension BilibiliTaskViewModel {
 
     static func normalizedBilibiliSource(_ source: String) -> String {
         source.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func shouldResolveBeforeSubmittingBilibiliInput(_ source: String) -> Bool {
+        !isCollectionOrFeedBilibiliInput(source)
+    }
+
+    static func isCollectionOrFeedBilibiliInput(_ source: String) -> Bool {
+        let trimmed = normalizedBilibiliSource(source)
+        let lowercased = trimmed.lowercased()
+        let collectionFeedKeywords: Set<String> = [
+            "following",
+            "history",
+            "later",
+            "recommend",
+            "recommendation",
+            "recommendations",
+            "toview",
+            "watch-later",
+            "watch_later",
+            "watchlater",
+        ]
+        if collectionFeedKeywords.contains(lowercased) {
+            return true
+        }
+
+        for prefix in ["collection", "fav", "mid", "series"] {
+            guard lowercased.hasPrefix(prefix) else {
+                continue
+            }
+
+            let suffix = lowercased.dropFirst(prefix.count)
+            if isNonEmptyASCIIDigits(suffix) {
+                return true
+            }
+        }
+
+        guard let components = URLComponents(string: trimmed),
+            let host = components.host?.lowercased()
+        else {
+            return false
+        }
+
+        let pathSegments = components.path
+            .split(separator: "/")
+            .map { $0.lowercased() }
+        if host == "space.bilibili.com",
+            pathSegments.first.map(isNonEmptyASCIIDigits) == true
+        {
+            return true
+        }
+
+        if host == "t.bilibili.com" {
+            return pathSegments.isEmpty
+        }
+
+        guard host == "www.bilibili.com" || host == "bilibili.com" else {
+            return false
+        }
+
+        let queryItemNames = Set((components.queryItems ?? []).map { $0.name.lowercased() })
+        if queryItemNames.contains("ep_id") || queryItemNames.contains("season_id") {
+            return false
+        }
+
+        if pathSegments.isEmpty {
+            return true
+        }
+        if pathSegments == ["account", "dynamic"] || pathSegments == ["account", "history"] {
+            return true
+        }
+        if pathSegments.first == "watchlater" || pathSegments == ["list", "watchlater"] {
+            return true
+        }
+        if pathSegments.contains("medialist") || pathSegments.first == "list" {
+            return true
+        }
+
+        return false
+    }
+
+    static func isNonEmptyASCIIDigits<S: StringProtocol>(_ value: S) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value >= 48 && scalar.value <= 57
+            }
     }
 }
 

@@ -64,6 +64,68 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitSkipsResolveForCollectionAndFeedInputs() async {
+        let sources = [
+            "history",
+            "watch-later",
+            "following",
+            "recommendations",
+            "mid123",
+            "fav456",
+            "collection789",
+            "series101",
+            "https://space.bilibili.com/123",
+            "https://space.bilibili.com/123/favlist?fid=456",
+            "https://www.bilibili.com/account/history",
+            "https://www.bilibili.com/list/ml1103407912",
+            "https://www.bilibili.com/medialist/detail/ml1103407912",
+            "https://t.bilibili.com/",
+        ]
+
+        for source in sources {
+            let client = FakeBilibiliCacheControlClient(createResponses: [
+                .success(.fixture(source: source, state: "TASK_STATE_PREPARING"))
+            ])
+            let model = BilibiliTaskViewModel(
+                sourceText: source,
+                clientFactory: { _ in client }
+            )
+
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+
+            let resolvedRequests = await client.resolvedRequestsSnapshot()
+            XCTAssertTrue(resolvedRequests.isEmpty, source)
+            let requests = await client.createdRequestsSnapshot()
+            XCTAssertEqual(requests.count, 1, source)
+            XCTAssertEqual(requests.first?.urlOrID, source)
+            XCTAssertNil(requests.first?.selectionID, source)
+
+            model.clearTask()
+        }
+    }
+
+    func testSubmitStillResolvesBilibiliRootEpisodeQuery() async {
+        let source = "https://www.bilibili.com/?ep_id=123"
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: source, state: "TASK_STATE_PREPARING"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: source,
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.count, 1)
+        XCTAssertEqual(resolvedRequests.first?.urlOrID, source)
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:1")
+
+        model.clearTask()
+    }
+
     func testSubmitStopsForMultiCandidateSelectionThenCreatesSelectedPlaybackTask() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [

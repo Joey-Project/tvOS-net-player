@@ -200,6 +200,8 @@ superseded_by:
   - The next `offline-frozen-diff-review` found direct selected-create calls against old gRPC servers could silently ignore the new `selection_id` field and play the default candidate.
   - Fixed playback `selection_id` parsing to validate IDs against the source input kind, reject unstable bare item IDs, and cap resolver-index IDs to the advertised candidate window.
   - Fixed `GRPCCacheControlClient` selected-create calls to require the `bilibiliResolve` capability before sending non-empty `selectionID` values.
+  - The next `offline-frozen-diff-review` found collection/feed submissions were again synchronously resolving before task creation, so BBDown's collection info fetch mode could crawl broad lists inside the 10s UI timeout.
+  - Fixed collection/feed submissions in the shared app core to skip pre-submit resolve and let the server-side background task planner handle them, while keeping ordinary video, episode, and season inputs on the resolve/select path.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
@@ -211,6 +213,8 @@ superseded_by:
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_waits_for_playback_planning_permit --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server playback_plan_rejects_stale_collection_selection_identity --lib`
   - `just ci`
+  - `swift test --filter BilibiliTaskViewModelTests` after skipping pre-submit resolve for collection/feed inputs.
+  - `just ci` after skipping pre-submit resolve for collection/feed inputs.
 
 ## Next Steps
 
