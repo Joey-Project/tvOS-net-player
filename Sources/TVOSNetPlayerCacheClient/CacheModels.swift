@@ -414,6 +414,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
     public let source: String
     public let title: String
     public let progress: Double
+    public let downloadedBytes: Int64
+    public let totalBytes: Int64
     public let message: String
     public let libraryItemID: String
     public let playbackSource: CachePlaybackSource?
@@ -426,6 +428,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         source: String,
         title: String,
         progress: Double,
+        downloadedBytes: Int64 = 0,
+        totalBytes: Int64 = 0,
         message: String,
         libraryItemID: String,
         playbackSource: CachePlaybackSource?,
@@ -437,6 +441,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         self.source = source
         self.title = title
         self.progress = progress
+        self.downloadedBytes = downloadedBytes
+        self.totalBytes = totalBytes
         self.message = message
         self.libraryItemID = libraryItemID
         self.playbackSource = playbackSource

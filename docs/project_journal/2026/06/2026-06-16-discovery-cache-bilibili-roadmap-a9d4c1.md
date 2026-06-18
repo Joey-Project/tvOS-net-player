@@ -4,7 +4,7 @@ title: Discovery Cache And Bilibili Roadmap
 status: active
 created: 2026-06-16
 updated: 2026-06-16
-branch: wip/hls-cache-quota-watermarks
+branch: wip/weak-network-progressive-scheduler
 pr:
 supersedes: []
 superseded_by:
@@ -59,9 +59,12 @@ superseded_by:
 
 ### PR C: Progressive Weak-Network Scheduler And Prewarm
 
+- Status: implemented by this slice for selected playable sessions; multi-result candidate prewarm remains tied to PR D's resolve/select schema.
 - Preserve the current fast playable-source path for active playback.
-- Add cancellable background fill work that demotes old playback sessions when a new user-visible action arrives.
-- Add low-priority first-frame prewarm for multi-result candidates using init plus bounded head bytes.
+- Add server-internal foreground/demoted fill scheduling so new playback can preempt older cache fills and older fills resume in FILO order.
+- Split user cancellation from scheduler preemption: cancellation deletes partial sessions, while preemption keeps the playable manifest and committed resources.
+- Add first-frame prewarm sidecars for selected HLS sessions using the MP4 init range plus a bounded head byte window.
+- Use prewarm metadata and prefix files in the media path before falling back to upstream proxying.
 - Add user-visible weak/offline states for pending fill, partially prepared cache, offline-ready cache, and quota-blocked/cache-failed outcomes.
 
 ### PR D: Bilibili Resolve/Select Multi-Result Control Plane
@@ -91,6 +94,14 @@ superseded_by:
 
 ## Evidence
 
+- PR C full local gate:
+  - `just ci` passed after implementing weak-network progressive scheduling, prewarm sidecars, Swift cache status mapping, and tvOS/macOS status UX.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server -- --nocapture`
+  - `scripts/test.sh`
+  - `scripts/format.sh`
+  - `scripts/lint.sh`
+  - `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/bb9b591d6375c3c11482cb4fa99394132419c816/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+  - `git diff --check`
 - Internal review:
   - Found and fixed discovery session lifetime retention in `BonjourCacheServerDiscoveryClient.snapshots()`.
   - Found and fixed default localhost-only server advertisement by skipping Bonjour when all gRPC listeners are loopback.
@@ -121,4 +132,4 @@ superseded_by:
 
 ## Next Steps
 
-- After PR B merges, update `master`, branch PR C, and implement progressive weak-network scheduler/prewarm UX.
+- After PR C merges, update `master`, branch PR D, and design the Bilibili resolve/select schema before wiring multi-result candidate prewarm.

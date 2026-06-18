@@ -18,6 +18,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     AppState,
     hls::{HlsMediaResource, mp4_initialization_length, should_forward_media_request_header},
+    hls_cache::OpenedPrewarmedHlsResource,
     library::OpenedMediaFile,
 };
 
@@ -161,6 +162,15 @@ async fn hls_segment_response(
                 length: cached.initialization_length,
                 total_length: cached.total_length,
             }
+        } else if let Some(prewarmed) = state
+            .state
+            .hls_cache
+            .prewarmed_resource(&session_id, &resource.id)
+        {
+            Mp4Initialization {
+                length: prewarmed.initialization_length,
+                total_length: prewarmed.total_length,
+            }
         } else {
             let Ok(initialization) = load_hls_mp4_initialization(&state, &resource).await else {
                 return text_response(
@@ -217,6 +227,30 @@ async fn hls_segment_response(
             }
         };
         return build_file_response(opened_file, range, head_only).await;
+    }
+
+    if let Some(opened_file) = state
+        .state
+        .hls_cache
+        .open_prewarmed_resource(&session_id, &resource.id)
+        && let Some(range_header) = headers.get(RANGE)
+    {
+        let range = match parse_range(Some(range_header), opened_file.total_length) {
+            Ok(Some(range)) if range.end < opened_file.prefix_length => range,
+            Ok(_) => {
+                return proxy_hls_media_resource(&state, resource, &headers, head_only).await;
+            }
+            Err(_) => {
+                let mut response = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+                response.headers_mut().insert(
+                    CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{}", opened_file.total_length))
+                        .expect("content range header should be valid"),
+                );
+                return response;
+            }
+        };
+        return build_prewarmed_file_response(opened_file, range, head_only).await;
     }
 
     proxy_hls_media_resource(&state, resource, &headers, head_only).await
@@ -546,6 +580,49 @@ async fn build_file_response(
     response
 }
 
+async fn build_prewarmed_file_response(
+    opened_file: OpenedPrewarmedHlsResource,
+    range: ByteRange,
+    head_only: bool,
+) -> Response<Body> {
+    let body = if head_only {
+        Body::empty()
+    } else {
+        let mut file = tokio::fs::File::from_std(opened_file.file);
+        if file.seek(SeekFrom::Start(range.start)).await.is_err() {
+            return empty_response(StatusCode::NOT_FOUND);
+        }
+
+        Body::from_stream(ReaderStream::new(file.take(range.length())))
+    };
+
+    let mut response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(
+            CONTENT_TYPE,
+            content_type_header_value(&opened_file.content_type),
+        )
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_LENGTH, range.length().to_string())
+        .header(
+            CONTENT_RANGE,
+            format!(
+                "bytes {}-{}/{}",
+                range.start, range.end, opened_file.total_length
+            ),
+        )
+        .header(
+            LAST_MODIFIED,
+            httpdate::fmt_http_date(opened_file.last_modified),
+        )
+        .body(body)
+        .expect("prewarmed media response should build");
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 fn empty_response(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -745,6 +822,128 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let playlist = String::from_utf8(body.to_vec()).unwrap();
         assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"28@0\""));
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_uses_prewarmed_initialization_without_upstream_probe() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"28@0\""));
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_keeps_single_media_range_for_prewarmed_prefix() {
+        let (upstream_url, _upstream_task) = start_hls_large_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        let mp4 = large_fake_mp4();
+        let initialization_length = mp4_initialization_length(&mp4).unwrap();
+        let media_length = u64::try_from(mp4.len()).unwrap() - initialization_length;
+        assert!(playlist.contains(&format!(
+            "#EXT-X-BYTERANGE:{media_length}@{initialization_length}"
+        )));
+        assert!(!playlist.contains(&format!("@{HLS_INITIALIZATION_SCAN_BYTES}")));
+    }
+
+    #[tokio::test]
+    async fn hls_segment_serves_prewarmed_prefix_range() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            format!("bytes 1-3/{}", fake_mp4().len()),
+            response.headers()[CONTENT_RANGE]
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&fake_mp4()[1..=3], &body[..]);
     }
 
     #[tokio::test]
@@ -1026,6 +1225,26 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_large_mp4_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(upstream_large_mp4_get).head(upstream_large_mp4_head),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_range_ignored_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1122,6 +1341,14 @@ mod tests {
         upstream_mp4_response(headers, true)
     }
 
+    async fn upstream_large_mp4_get(headers: HeaderMap) -> Response<Body> {
+        upstream_large_mp4_response(headers, false)
+    }
+
+    async fn upstream_large_mp4_head(headers: HeaderMap) -> Response<Body> {
+        upstream_large_mp4_response(headers, true)
+    }
+
     async fn upstream_forbidden() -> Response<Body> {
         empty_response(StatusCode::FORBIDDEN)
     }
@@ -1201,11 +1428,22 @@ mod tests {
     }
 
     fn upstream_mp4_response(headers: HeaderMap, head_only: bool) -> Response<Body> {
+        upstream_mp4_bytes_response(headers, head_only, fake_mp4())
+    }
+
+    fn upstream_large_mp4_response(headers: HeaderMap, head_only: bool) -> Response<Body> {
+        upstream_mp4_bytes_response(headers, head_only, large_fake_mp4())
+    }
+
+    fn upstream_mp4_bytes_response(
+        headers: HeaderMap,
+        head_only: bool,
+        data: Vec<u8>,
+    ) -> Response<Body> {
         if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
             return empty_response(StatusCode::FORBIDDEN);
         }
 
-        let data = fake_mp4();
         if let Some(range) = headers.get(RANGE).and_then(|value| value.to_str().ok())
             && let Some((start, end)) = parse_test_range(range, data.len())
         {
@@ -1247,6 +1485,18 @@ mod tests {
         bytes.extend(mp4_box(*b"moov", b"metadata"));
         bytes.extend(mp4_box(*b"moof", b"frag"));
         bytes.extend(mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn large_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(
+            *b"mdat",
+            &vec![0x55; usize::try_from(HLS_INITIALIZATION_SCAN_BYTES).unwrap() + 64],
+        ));
         bytes
     }
 

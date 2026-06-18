@@ -21,6 +21,22 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    private func waitForHLSCacheStatus(
+        on model: CacheLibraryViewModel,
+        usedBytes: Int64,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0..<50 {
+            if model.hlsCacheStatus?.usedBytes == usedBytes {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timed out waiting for HLS cache status.", file: file, line: line)
+    }
+
+    @MainActor
     func testRefreshLoadsServerInfoAndLibraryItems() async {
         let client = FakeCacheControlClient(
             serverInfo: CacheServerSummary(
@@ -72,6 +88,79 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertEqual(model.cacheRoots.map(\.id), ["default"])
         XCTAssertEqual(model.cacheRoots.first?.displayLabel, "Local Cache")
         XCTAssertTrue(model.cacheRootSummary.contains("Local Cache"))
+    }
+
+    @MainActor
+    func testRefreshLoadsHLSCacheStatusBestEffort() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: 50 * 1_024 * 1_024 * 1_024,
+                usedBytes: 45 * 1_024 * 1_024 * 1_024
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let refreshResult = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 45 * 1_024 * 1_024 * 1_024)
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.hlsCacheStatus?.usedBytes, 45 * 1_024 * 1_024 * 1_024)
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Auto cleanup starts at 90%") == true)
+    }
+
+    @MainActor
+    func testRefreshDoesNotWaitForSlowHLSCacheStatus() async {
+        let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [item],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(usedBytes: 42),
+            suspendHLSCacheStatusUntilReleased: true
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let refreshResult = await model.refresh()
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertNil(model.hlsCacheStatus)
+
+        await client.waitForHLSCacheStatusRequest()
+        await client.releaseHLSCacheStatusRequest()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+    }
+
+    @MainActor
+    func testRefreshIgnoresUnsupportedHLSCacheStatus() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let refreshResult = await model.refresh()
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertNil(model.hlsCacheStatus)
+        XCTAssertNil(model.hlsCacheSummary)
     }
 
     @MainActor
@@ -1786,6 +1875,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
     let cacheRoots: [CacheRoot]
+    let hlsCacheStatus: HLSCacheStatus?
     let cacheRootResponses: [[CacheRoot]]
     let deleteResponsesByItemID: [String: Bool]
     let deleteError: FakeCacheError?
@@ -1798,6 +1888,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let getServerInfoError: FakeCacheError?
     let getServerInfoIgnoresCancellation: Bool
     let suspendServerInfoUntilReleased: Bool
+    let suspendHLSCacheStatusUntilReleased: Bool
     let suspendedServerInfoCallCounts: Set<Int>
     let suspendedCacheRootCallCounts: Set<Int>
     let suspendedLibraryPageTokens: Set<String>
@@ -1805,6 +1896,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let suspendedDeleteItemIDs: Set<String>
 
     private(set) var getServerInfoCallCount = 0
+    private(set) var hlsCacheStatusCallCount = 0
     private(set) var cacheRootCallCount = 0
     private(set) var requestedLibraryPageSizes: [Int] = []
     private(set) var requestedLibraryPageTokens: [String] = []
@@ -1817,6 +1909,9 @@ private actor FakeCacheControlClient: CacheControlClient {
     private var serverInfoCallReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var serverInfoRequestsReleased = false
     private var releasedServerInfoCallCounts: Set<Int> = []
+    private var hlsCacheStatusWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hlsCacheStatusReleaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var hlsCacheStatusRequestsReleased = false
     private var cacheRootWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var cacheRootReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var releasedCacheRootCallCounts: Set<Int> = []
@@ -1839,6 +1934,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         items: [CacheLibraryItem],
         playbackSource: CachePlaybackSource,
         cacheRoots: [CacheRoot] = [.fixture()],
+        hlsCacheStatus: HLSCacheStatus? = nil,
         cacheRootResponses: [[CacheRoot]] = [],
         deleteResponsesByItemID: [String: Bool] = [:],
         deleteError: FakeCacheError? = nil,
@@ -1851,6 +1947,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         getServerInfoError: FakeCacheError? = nil,
         getServerInfoIgnoresCancellation: Bool = false,
         suspendServerInfoUntilReleased: Bool = false,
+        suspendHLSCacheStatusUntilReleased: Bool = false,
         suspendedServerInfoCallCounts: Set<Int> = [],
         suspendedCacheRootCallCounts: Set<Int> = [],
         suspendedLibraryPageTokens: Set<String> = [],
@@ -1861,6 +1958,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.items = items
         self.playbackSource = playbackSource
         self.cacheRoots = cacheRoots
+        self.hlsCacheStatus = hlsCacheStatus
         self.cacheRootResponses = cacheRootResponses
         self.deleteResponsesByItemID = deleteResponsesByItemID
         self.deleteError = deleteError
@@ -1873,6 +1971,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.getServerInfoError = getServerInfoError
         self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
         self.suspendServerInfoUntilReleased = suspendServerInfoUntilReleased
+        self.suspendHLSCacheStatusUntilReleased = suspendHLSCacheStatusUntilReleased
         self.suspendedServerInfoCallCounts = suspendedServerInfoCallCounts
         self.suspendedCacheRootCallCounts = suspendedCacheRootCallCounts
         self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
@@ -1918,6 +2017,19 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
 
         return cacheRoots
+    }
+
+    func getHLSCacheStatus() async throws -> HLSCacheStatus {
+        hlsCacheStatusCallCount += 1
+        notifyHLSCacheStatusWaiters()
+        if suspendHLSCacheStatusUntilReleased {
+            await waitForHLSCacheStatusRelease()
+        }
+        guard let hlsCacheStatus else {
+            throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+        }
+
+        return hlsCacheStatus
     }
 
     func listLibraryItemsPage(
@@ -2040,6 +2152,23 @@ private actor FakeCacheControlClient: CacheControlClient {
         continuations.forEach { $0.resume() }
     }
 
+    func waitForHLSCacheStatusRequest() async {
+        guard hlsCacheStatusCallCount == 0 else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            hlsCacheStatusWaiters.append(continuation)
+        }
+    }
+
+    func releaseHLSCacheStatusRequest() {
+        hlsCacheStatusRequestsReleased = true
+        let continuations = hlsCacheStatusReleaseContinuations
+        hlsCacheStatusReleaseContinuations = []
+        continuations.forEach { $0.resume() }
+    }
+
     func waitForLibraryPageRequest(pageToken: String) async {
         guard !requestedLibraryPageTokenSet.contains(pageToken) else {
             return
@@ -2114,6 +2243,12 @@ private actor FakeCacheControlClient: CacheControlClient {
         readyContinuations.forEach { $0.resume() }
     }
 
+    private func notifyHLSCacheStatusWaiters() {
+        let continuations = hlsCacheStatusWaiters
+        hlsCacheStatusWaiters = []
+        continuations.forEach { $0.resume() }
+    }
+
     private func waitForCacheRootRelease(callCount: Int) async {
         guard !releasedCacheRootCallCounts.contains(callCount) else {
             return
@@ -2141,6 +2276,16 @@ private actor FakeCacheControlClient: CacheControlClient {
 
         await withCheckedContinuation { continuation in
             serverInfoCallReleaseContinuations[callCount, default: []].append(continuation)
+        }
+    }
+
+    private func waitForHLSCacheStatusRelease() async {
+        guard !hlsCacheStatusRequestsReleased else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            hlsCacheStatusReleaseContinuations.append(continuation)
         }
     }
 
@@ -2260,6 +2405,30 @@ extension CacheRoot {
             writable: writable,
             freeBytes: freeBytes,
             totalBytes: totalBytes
+        )
+    }
+}
+
+extension HLSCacheStatus {
+    fileprivate static func fixture(
+        evictionEnabled: Bool = true,
+        maxBytes: Int64 = 50 * 1_024 * 1_024 * 1_024,
+        highWatermarkPercent: Int = 90,
+        lowWatermarkPercent: Int = 80,
+        usedBytes: Int64 = 0,
+        completedSessionCount: Int = 0,
+        lastEviction: HLSCacheEvictionSummary? = nil
+    ) -> Self {
+        Self(
+            evictionEnabled: evictionEnabled,
+            maxBytes: maxBytes,
+            highWatermarkPercent: highWatermarkPercent,
+            lowWatermarkPercent: lowWatermarkPercent,
+            highWatermarkBytes: maxBytes * Int64(highWatermarkPercent) / 100,
+            lowWatermarkBytes: maxBytes * Int64(lowWatermarkPercent) / 100,
+            usedBytes: usedBytes,
+            completedSessionCount: completedSessionCount,
+            lastEviction: lastEviction
         )
     }
 }

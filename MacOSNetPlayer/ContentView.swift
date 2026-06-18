@@ -127,6 +127,13 @@ struct ContentView: View {
                 }
             }
 
+            if let hlsCacheSummary = cacheModel.hlsCacheSummary {
+                Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+
             Divider()
 
             if cacheModel.items.isEmpty {
@@ -296,6 +303,11 @@ struct ContentView: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
+                        if let badge = bilibiliModel.progressiveCacheStatusBadge {
+                            Label(badge.label, systemImage: badge.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 

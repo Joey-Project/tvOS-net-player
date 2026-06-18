@@ -47,6 +47,82 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(model.canRetry)
     }
 
+    func testPreparingTaskShowsPendingOfflineFillBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(state: "TASK_STATE_PREPARING", message: "Preparing playback."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1pending",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Pending offline fill")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "clock")
+
+        model.clearTask()
+    }
+
+    func testPlayablePartialTaskKeepsPlaybackEnabledAndShowsFillProgressBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(downloadedBytes: 256, totalBytes: 1_024))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1partial",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Filling offline cache 25%")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "arrow.down.circle")
+
+        model.clearTask()
+    }
+
+    func testCompletedTaskShowsOfflineReadyBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    message: "Bilibili playback session is cached for offline playback.",
+                    libraryItemID: "bilibili.hls.bilibili-playback-1"
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.fill.badge.checkmark")
+    }
+
+    func testQuotaFailureShowsQuotaBlockedBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    source: "BV1quota",
+                    state: "TASK_STATE_FAILED",
+                    message: "Cache quota blocked offline fill."
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1quota",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Quota blocked")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "exclamationmark.triangle")
+    }
+
     func testDuplicateSubmitWhileSubmittingDoesNotInvalidateInFlightSubmission() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [],
@@ -801,6 +877,8 @@ private extension CacheTask {
         title: String = "Ready video",
         state: String,
         progress: Double = 0.25,
+        downloadedBytes: Int64 = 0,
+        totalBytes: Int64 = 0,
         message: String = "Preparing playback.",
         libraryItemID: String = "",
         playbackSource: CachePlaybackSource? = nil,
@@ -813,6 +891,8 @@ private extension CacheTask {
             source: source,
             title: title,
             progress: progress,
+            downloadedBytes: downloadedBytes,
+            totalBytes: totalBytes,
             message: message,
             libraryItemID: libraryItemID,
             playbackSource: playbackSource,
@@ -825,14 +905,18 @@ private extension CacheTask {
         source: String = "BV1test",
         state: String = "TASK_STATE_PLAYABLE",
         libraryItemID: String = "",
-        playbackSourceItemID: String? = nil
+        playbackSourceItemID: String? = nil,
+        downloadedBytes: Int64 = 0,
+        totalBytes: Int64 = 0
     ) -> Self {
         let resolvedPlaybackSourceItemID = playbackSourceItemID ?? id
         return .fixture(
             id: id,
             source: source,
             state: state,
-            progress: 1,
+            progress: totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 1,
+            downloadedBytes: downloadedBytes,
+            totalBytes: totalBytes,
             message: "Bilibili playback session is playable.",
             libraryItemID: libraryItemID,
             playbackSource: CachePlaybackSource(
