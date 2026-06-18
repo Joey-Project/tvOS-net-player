@@ -581,7 +581,6 @@ impl HlsCacheStore {
                         return Err(error.into());
                     }
                     tokio::fs::rename(&temp_path, &prewarm_path).await?;
-                    check_fill_control(control)?;
                     let metadata = PersistedHlsPrewarmedResource {
                         schema_version: HLS_CACHE_SCHEMA_VERSION,
                         id: resource.id.clone(),
@@ -838,7 +837,6 @@ impl HlsCacheStore {
                         return Err(error.into());
                     }
                     tokio::fs::rename(&temp_path, &resource_path).await?;
-                    check_fill_control(control)?;
                     let metadata = PersistedHlsCachedResource {
                         schema_version: HLS_CACHE_SCHEMA_VERSION,
                         id: resource.id.clone(),
@@ -2878,6 +2876,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preemption_after_prewarm_rename_commits_metadata_before_stopping() {
+        let (upstream_url, _task) = start_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-prewarm-commit-preempt", &upstream_url);
+        let client = reqwest::Client::new();
+        let prewarm_path = store
+            .resource_prewarm_path(&session.id, "video.m4s")
+            .expect("prewarm resource path should be valid");
+
+        let error = store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                if prewarm_path.exists() {
+                    HlsCacheFillControl::Preempt
+                } else {
+                    HlsCacheFillControl::Continue
+                }
+            })
+            .await
+            .expect_err("preempted prewarm should stop after metadata commit");
+
+        assert!(matches!(error, HlsCacheError::Preempted));
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarmed resource should be registered");
+        let usage = store.usage_snapshot().expect("prewarmed usage should scan");
+        assert_eq!(prewarmed.prefix_length, usage.used_bytes);
+    }
+
+    #[tokio::test]
     async fn preemption_after_committed_resource_preserves_partial_session() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
@@ -2927,6 +2955,42 @@ mod tests {
                 .with_extension("tmp")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn preemption_after_resource_rename_commits_metadata_before_stopping() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session_with_audio("session-resource-commit-preempt", &upstream_url);
+        let client = reqwest::Client::new();
+        let resource_path = store
+            .resource_path(&session.id, "video.m4s")
+            .expect("resource path should be valid");
+
+        let error = store
+            .cache_session_resources_with_control(
+                &client,
+                &session,
+                || {
+                    if resource_path.exists() {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("preempted fill should stop after metadata commit");
+
+        assert!(matches!(error, HlsCacheError::Preempted));
+        assert!(store.cached_resource(&session.id, "video.m4s").is_some());
+        assert!(store.cached_resource(&session.id, "audio.m4s").is_none());
+        let usage = store
+            .usage_snapshot()
+            .expect("partial cache usage should scan");
+        assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
     }
 
     async fn start_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
