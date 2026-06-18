@@ -242,5 +242,6 @@ superseded_by:
 
 ## Next Steps
 
-- Finish the PR D triple review, GitHub CI, resolved-conversation check, merge, and `master` sync.
+- This roadmap sequence is complete on `master` through PR D / PR #23.
 - Defer candidate prewarm beyond selected-item first-frame prewarm until we have real usage data for multi-result browsing.
+- Physical Apple TV deployment validation remains tracked in `docs/PROJECT_TODO.md`.
