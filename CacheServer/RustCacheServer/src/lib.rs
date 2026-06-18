@@ -602,7 +602,8 @@ impl AppState {
             return Ok(None);
         }
         let entries = self.hls_cache.completed_cache_entries()?;
-        let started_used_bytes = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
+        let usage = self.hls_cache.usage_snapshot()?;
+        let started_used_bytes = usage.used_bytes;
         let projected_used_bytes = started_used_bytes.saturating_add(projected_added_bytes);
         if projected_used_bytes <= policy.high_watermark_bytes() {
             return Ok(None);

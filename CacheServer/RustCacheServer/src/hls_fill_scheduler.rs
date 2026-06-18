@@ -92,7 +92,7 @@ impl HlsFillScheduler {
             let notified = self.notify.notified();
             {
                 let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
-                if let Some(job) = inner.foreground.pop_front().or_else(|| inner.demoted.pop()) {
+                if let Some(job) = inner.foreground.pop_back().or_else(|| inner.demoted.pop()) {
                     inner.current = Some(HlsFillCurrentJob {
                         task_id: job.task_id.clone(),
                         token: job.token.clone(),
@@ -224,6 +224,36 @@ mod tests {
         scheduler.finish_current(&old_job);
         let new_job = scheduler.next_job().await;
         assert_eq!("new-task", new_job.task_id);
+    }
+
+    #[tokio::test]
+    async fn foreground_queue_prefers_newest_playback_fill() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_foreground(
+            "active-task".to_owned(),
+            sample_session("active-task"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_job = scheduler.next_job().await;
+
+        assert!(!scheduler.enqueue_foreground(
+            "older-queued-task".to_owned(),
+            sample_session("older-queued-task"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!scheduler.enqueue_foreground(
+            "newest-queued-task".to_owned(),
+            sample_session("newest-queued-task"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+
+        assert!(active_job.token.is_preempted());
+        scheduler.finish_current(&active_job);
+        let newest_job = scheduler.next_job().await;
+        assert_eq!("newest-queued-task", newest_job.task_id);
+        scheduler.finish_current(&newest_job);
+        let older_job = scheduler.next_job().await;
+        assert_eq!("older-queued-task", older_job.task_id);
     }
 
     #[tokio::test]

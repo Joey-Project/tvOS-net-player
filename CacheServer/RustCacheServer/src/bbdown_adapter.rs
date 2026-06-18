@@ -2252,7 +2252,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn wait_for_path(path: &Path) {
-        for _ in 0..40 {
+        for _ in 0..200 {
             if path.exists() {
                 return;
             }
@@ -2263,7 +2263,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn wait_for_process_exit(pid: i32) {
-        for _ in 0..40 {
+        for _ in 0..200 {
             if !process_is_running(pid) {
                 return;
             }

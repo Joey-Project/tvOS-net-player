@@ -227,8 +227,9 @@ impl HlsCacheStore {
 
     pub(crate) fn usage_snapshot(&self) -> io::Result<HlsCacheUsageSnapshot> {
         let entries = self.completed_cache_entries()?;
+        let used_bytes = self.managed_usage_size_bytes()?;
         Ok(HlsCacheUsageSnapshot {
-            used_bytes: entries.iter().map(|entry| entry.size_bytes).sum(),
+            used_bytes,
             completed_session_count: entries.len(),
         })
     }
@@ -529,6 +530,7 @@ impl HlsCacheStore {
             });
         }
         self.save_completed_session(session)?;
+        self.remove_prewarmed_session_resources(session)?;
 
         Ok(Self::completed_library_item_id(&session.id))
     }
@@ -698,6 +700,46 @@ impl HlsCacheStore {
         Some(total)
     }
 
+    fn managed_usage_size_bytes(&self) -> io::Result<u64> {
+        let mut total = 0_u64;
+        for session in self.load_sessions()? {
+            total = total.saturating_add(self.session_managed_resource_size(&session));
+        }
+        Ok(total)
+    }
+
+    fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> u64 {
+        session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+            .map(|resource| self.resource_managed_size(&session.id, &resource.id))
+            .sum()
+    }
+
+    fn resource_managed_size(&self, session_id: &str, resource_id: &str) -> u64 {
+        if let Some(cached) = self.cached_resource(session_id, resource_id) {
+            cached.total_length
+        } else if let Some(prewarmed) = self.prewarmed_resource(session_id, resource_id) {
+            prewarmed.prefix_length
+        } else {
+            0
+        }
+    }
+
+    fn remove_prewarmed_session_resources(&self, session: &HlsPlaybackSession) -> io::Result<()> {
+        for resource in session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+        {
+            self.remove_prewarmed_resource(&session.id, &resource.id)?;
+        }
+        Ok(())
+    }
+
     fn resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
         session
             .variant
@@ -792,6 +834,7 @@ impl HlsCacheStore {
                         &metadata,
                     )?;
                     check_fill_control(control)?;
+                    self.remove_prewarmed_resource(session_id, &resource.id)?;
                     return Ok(total_length);
                 }
                 Err(error) => {
@@ -903,6 +946,32 @@ impl HlsCacheStore {
         Ok(self
             .session_dir(session_id)?
             .join(format!("{resource_id}.prewarm.json")))
+    }
+
+    fn remove_prewarmed_resource(&self, session_id: &str, resource_id: &str) -> io::Result<()> {
+        self.remove_managed_cache_file_if_exists(
+            &self.resource_prewarm_path(session_id, resource_id)?,
+        )?;
+        self.remove_managed_cache_file_if_exists(
+            &self.resource_prewarm_metadata_path(session_id, resource_id)?,
+        )
+    }
+
+    fn remove_managed_cache_file_if_exists(&self, path: &Path) -> io::Result<()> {
+        self.reject_cache_path_symlink(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS cache managed file path must not be a symlink",
+            )),
+            Ok(metadata) if metadata.is_file() => fs::remove_file(path),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "HLS cache managed file path already exists and is not a file",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn ensure_cache_directory(&self, path: &Path) -> io::Result<()> {
@@ -1208,8 +1277,17 @@ async fn download_resource_prefix(
         .await?;
     let mut bytes = Vec::with_capacity(prefix_length.try_into().unwrap_or(usize::MAX));
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
         check_fill_control(control)?;
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk?;
         let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
             HlsCacheError::InvalidResource("HLS prewarm prefix is too large".to_owned())
@@ -1219,6 +1297,7 @@ async fn download_resource_prefix(
                 "HLS prewarm body exceeded Content-Range length".to_owned(),
             ));
         }
+        check_fill_control(control)?;
         file.write_all(&chunk).await?;
         bytes.extend_from_slice(&chunk);
     }
@@ -1953,6 +2032,43 @@ mod tests {
         assert_eq!(vec!["session-a", "session-b"], session_ids(&entries));
     }
 
+    #[tokio::test]
+    async fn usage_snapshot_counts_partial_hls_cache_resources() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session_with_audio("session-partial-usage", &upstream_url);
+        let client = reqwest::Client::new();
+        let store_for_preempt = store.clone();
+        let session_id = session.id.clone();
+
+        let error = store
+            .cache_session_resources_with_control(
+                &client,
+                &session,
+                move || {
+                    if store_for_preempt
+                        .cached_resource(&session_id, "video.m4s")
+                        .is_some()
+                    {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("preempted session should leave partial cache resources");
+        assert!(matches!(error, HlsCacheError::Preempted));
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should count partial cache resources");
+        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
+    }
+
     #[test]
     fn hls_eviction_policy_derives_watermark_bytes() {
         let policy = HlsCacheEvictionPolicy {
@@ -2626,6 +2742,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_cache_removes_prewarmed_sidecars() {
+        let (prewarm_url, _prewarm_task) = start_prewarm_mp4_upstream().await;
+        let (full_url, _full_task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-prewarm-cleanup", &prewarm_url);
+        session.variant.video.request.backup_urls = vec![full_url];
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_some());
+
+        store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("session should finish full cache fill");
+
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+        assert!(
+            !store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid")
+                .exists()
+        );
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should count only completed resource bytes");
+        assert_eq!(1, usage.completed_session_count);
+        assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
+    }
+
+    #[tokio::test]
+    async fn prewarm_prefix_download_observes_preemption_while_body_is_stalled() {
+        let (upstream_url, _task) = start_stalled_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-stalled-prewarm", &upstream_url);
+        let client = reqwest::Client::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_calls = Arc::clone(&calls);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            store
+                .prewarm_session_first_frame_with_control(&client, &session, move || {
+                    if control_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 4 {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        })
+        .await
+        .expect("prewarm should observe preemption without waiting for read timeout");
+
+        assert!(matches!(result, Err(HlsCacheError::Preempted)));
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+    }
+
+    #[tokio::test]
     async fn preemption_after_committed_resource_preserves_partial_session() {
         let (upstream_url, _task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
@@ -2681,6 +2868,17 @@ mod tests {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_mp4))).await
     }
 
+    async fn start_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_prewarm_mp4))).await
+    }
+
+    async fn start_stalled_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_stalled_prewarm_mp4)),
+        )
+        .await
+    }
+
     async fn start_short_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_short_mp4))).await
     }
@@ -2726,6 +2924,53 @@ mod tests {
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "video/mp4")
             .body(Body::from(fake_mp4()))
+            .unwrap()
+    }
+
+    async fn upstream_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        let body = fake_mp4();
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_LENGTH, body.len().to_string())
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn upstream_stalled_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        let body = fake_mp4();
+        let body_len = body.len();
+        let chunks = futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, std::convert::Infallible>(body)
+        });
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_LENGTH, body_len.to_string())
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", body_len - 1, body_len),
+            )
+            .body(Body::from_stream(chunks))
             .unwrap()
     }
 
