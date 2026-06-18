@@ -347,8 +347,12 @@ impl HlsCacheStore {
             return None;
         }
         let file_path = self.resource_prewarm_path(session_id, resource_id).ok()?;
-        let file_metadata = fs::metadata(&file_path).ok()?;
-        if !file_metadata.is_file() || file_metadata.len() != metadata.prefix_length {
+        self.reject_cache_path_symlink(&file_path).ok()?;
+        let file_metadata = fs::symlink_metadata(&file_path).ok()?;
+        if file_metadata.file_type().is_symlink()
+            || !file_metadata.is_file()
+            || file_metadata.len() != metadata.prefix_length
+        {
             return None;
         }
         if metadata.initialization_length == 0
@@ -1125,6 +1129,24 @@ impl std::fmt::Display for HlsCacheError {
 
 impl std::error::Error for HlsCacheError {}
 
+async fn send_request_with_control(
+    request: reqwest::RequestBuilder,
+    control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
+) -> Result<reqwest::Response, HlsCacheError> {
+    let send = request.send();
+    tokio::pin!(send);
+    loop {
+        check_fill_control(control)?;
+        let response = tokio::select! {
+            response = &mut send => response,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
+                continue;
+            }
+        };
+        return response.map_err(HlsCacheError::from);
+    }
+}
+
 async fn download_resource(
     client: &reqwest::Client,
     resource: &HlsMediaResource,
@@ -1150,7 +1172,7 @@ async fn download_resource(
             "offline HLS cache does not support range-only media requests".to_owned(),
         ));
     }
-    let response = request.send().await?;
+    let response = send_request_with_control(request, control).await?;
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
@@ -1255,7 +1277,7 @@ async fn download_resource_prefix(
         request = request.header(header.name.as_str(), header.value.as_str());
     }
 
-    let response = request.send().await?;
+    let response = send_request_with_control(request, control).await?;
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if status != StatusCode::PARTIAL_CONTENT {
@@ -2511,6 +2533,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_symlinked_prewarmed_resource() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-prewarm-symlink", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let target_path = temp.path().join("outside-prewarm.mp4");
+        std::fs::write(&target_path, fake_mp4()).expect("target file should be written");
+        symlink(
+            &target_path,
+            store
+                .resource_prewarm_path("session-prewarm-symlink", "video.m4s")
+                .expect("prewarm resource path should be valid"),
+        )
+        .expect("prewarm resource symlink should be created");
+        let metadata = PersistedHlsPrewarmedResource {
+            schema_version: HLS_CACHE_SCHEMA_VERSION,
+            id: "video.m4s".to_owned(),
+            content_type: session.variant.video.content_type().to_owned(),
+            prefix_length: fake_mp4().len() as u64,
+            total_length: fake_mp4().len() as u64,
+            initialization_length: 28,
+            cache_key: PersistedBilibiliMediaCacheKey::from(
+                session.variant.video.request.cache_key.clone(),
+            ),
+        };
+        store
+            .write_json_atomically(
+                &store
+                    .resource_prewarm_metadata_path("session-prewarm-symlink", "video.m4s")
+                    .expect("prewarm metadata path should be valid"),
+                &metadata,
+            )
+            .expect("prewarm metadata should save");
+
+        assert!(
+            store
+                .prewarmed_resource("session-prewarm-symlink", "video.m4s")
+                .is_none()
+        );
+        assert!(
+            store
+                .open_prewarmed_resource("session-prewarm-symlink", "video.m4s")
+                .is_none()
+        );
+        let usage = store
+            .usage_snapshot()
+            .expect("cache usage should ignore symlinked prewarm resource");
+        assert_eq!(0, usage.used_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn load_sessions_skips_symlinked_hls_cache_session_directory_for_reads() {
         use std::os::unix::fs::symlink;
 
@@ -2876,6 +2954,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prewarm_prefix_download_observes_preemption_while_headers_are_stalled() {
+        let (upstream_url, _task) = start_headers_stalled_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-stalled-prewarm-headers", &upstream_url);
+        let client = reqwest::Client::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_calls = Arc::clone(&calls);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            store
+                .prewarm_session_first_frame_with_control(&client, &session, move || {
+                    if control_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 4 {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        })
+        .await
+        .expect("prewarm should observe preemption before upstream headers arrive");
+
+        assert!(matches!(result, Err(HlsCacheError::Preempted)));
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+    }
+
+    #[tokio::test]
+    async fn full_resource_download_observes_preemption_while_headers_are_stalled() {
+        let (upstream_url, _task) = start_headers_stalled_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-stalled-resource-headers", &upstream_url);
+        let client = reqwest::Client::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_calls = Arc::clone(&calls);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            store
+                .cache_session_resources_with_control(
+                    &client,
+                    &session,
+                    move || {
+                        if control_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 4 {
+                            HlsCacheFillControl::Preempt
+                        } else {
+                            HlsCacheFillControl::Continue
+                        }
+                    },
+                    |_| {},
+                )
+                .await
+        })
+        .await
+        .expect("resource fill should observe preemption before upstream headers arrive");
+
+        assert!(matches!(result, Err(HlsCacheError::Preempted)));
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
+    }
+
+    #[tokio::test]
     async fn preemption_after_prewarm_rename_commits_metadata_before_stopping() {
         let (upstream_url, _task) = start_prewarm_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
@@ -3001,6 +3140,20 @@ mod tests {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_prewarm_mp4))).await
     }
 
+    async fn start_headers_stalled_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_headers_stalled_mp4)),
+        )
+        .await
+    }
+
+    async fn start_headers_stalled_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_headers_stalled_prewarm_mp4)),
+        )
+        .await
+    }
+
     async fn start_stalled_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(
             Router::new().route("/video.m4s", get(upstream_stalled_prewarm_mp4)),
@@ -3075,6 +3228,16 @@ mod tests {
             )
             .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn upstream_headers_stalled_mp4(headers: HeaderMap) -> Response<Body> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        upstream_mp4(headers).await
+    }
+
+    async fn upstream_headers_stalled_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        upstream_prewarm_mp4(headers).await
     }
 
     async fn upstream_stalled_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
