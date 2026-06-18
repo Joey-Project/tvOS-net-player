@@ -359,15 +359,16 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input)?;
+        let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
-            self.client.resolve(input.clone(), Some(selection)),
+            self.client.resolve(input.clone(), selection),
             &is_cancel_requested,
             "Cancelled while BBDown input resolution was running.",
         )
         .await?
         {
             Ok(resolved) => resolved,
-            Err(error) if should_retry_bounded_resolve(&error) => {
+            Err(error) if can_retry_bounded_resolve && should_retry_bounded_resolve(&error) => {
                 self.retry_resolve_with_largest_bounded_prefix(
                     input.clone(),
                     error,
@@ -544,17 +545,18 @@ fn bounded_resolve_selection(limit: u32) -> Result<Selection, BilibiliDownloadEr
         .map_err(failed)
 }
 
+#[cfg(test)]
 fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
     bounded_resolve_selection(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
 }
 
-fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownloadError> {
+fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, BilibiliDownloadError> {
     match input {
-        Input::Aid(_) | Input::Bvid(_) => resolve_selection(),
+        Input::Aid(_) | Input::Bvid(_) => Ok(None),
         Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
-            Ok(Selection::Current)
+            Ok(Some(Selection::Current))
         }
-        Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_) => Ok(Selection::Page(1)),
+        Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_) => Ok(Some(Selection::Page(1))),
         Input::SpaceVideos(_)
         | Input::FavoriteList { .. }
         | Input::CollectionList(_)
@@ -565,8 +567,8 @@ fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownl
         | Input::FollowingFeed
         | Input::SpaceDynamic(_)
         | Input::History
-        | Input::WatchLater => Ok(Selection::Latest),
-        _ => resolve_selection(),
+        | Input::WatchLater => Ok(Some(Selection::Latest)),
+        Input::ShortLink(_) => Ok(None),
     }
 }
 
@@ -2062,44 +2064,40 @@ mod tests {
     fn resolve_selection_preserves_current_episode_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Episode(123)).unwrap(),
-            Selection::Current
+            Some(Selection::Current)
         );
         assert_eq!(
             resolve_selection_for_input(&Input::CheeseEpisode(456)).unwrap(),
-            Selection::Current
+            Some(Selection::Current)
         );
         assert_eq!(
             resolve_selection_for_input(&Input::IntlEpisode(789)).unwrap(),
-            Selection::Current
+            Some(Selection::Current)
         );
     }
 
     #[test]
-    fn resolve_selection_bounds_common_video_inputs() {
-        let bounded_selection = resolve_selection().unwrap();
+    fn resolve_selection_uses_full_video_metadata_for_common_video_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())).unwrap(),
-            bounded_selection
+            None
         );
-        assert_eq!(
-            resolve_selection_for_input(&Input::Aid(123)).unwrap(),
-            bounded_selection
-        );
+        assert_eq!(resolve_selection_for_input(&Input::Aid(123)).unwrap(), None);
     }
 
     #[test]
     fn resolve_selection_uses_single_overview_requests_for_list_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Season(123)).unwrap(),
-            Selection::Page(1)
+            Some(Selection::Page(1))
         );
         assert_eq!(
             resolve_selection_for_input(&Input::Media(456)).unwrap(),
-            Selection::Page(1)
+            Some(Selection::Page(1))
         );
         assert_eq!(
             resolve_selection_for_input(&Input::CheeseSeason(789)).unwrap(),
-            Selection::Page(1)
+            Some(Selection::Page(1))
         );
 
         let list_inputs = [
@@ -2114,7 +2112,7 @@ mod tests {
         for input in list_inputs {
             assert_eq!(
                 resolve_selection_for_input(&input).unwrap(),
-                Selection::Latest
+                Some(Selection::Latest)
             );
         }
     }

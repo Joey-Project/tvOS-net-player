@@ -211,6 +211,8 @@ superseded_by:
   - Fixed video page selection IDs to carry candidate `cid` plus BVID/aid identity and validate the final planned page against that identity before playback.
   - GitHub `codex/review-gate` found BVID/aid resolve used `Selection::All`, so very large multi-page videos could be fully resolved before local candidate truncation.
   - Fixed BVID/aid resolve to use the existing bounded `1..100` selection window while keeping concrete episode inputs on `Selection::Current`.
+  - The next `offline-frozen-diff-review` found bounded BVID/aid resolve could turn common short videos into several upstream BBDown resolve attempts before returning candidates.
+  - Fixed ordinary BVID/aid resolve to pass no explicit selection, let BBDown core return video metadata in one request, and keep the adapter's local `take(100)` candidate cap plus cid-bound page selection IDs.
   - Full `just ci` surfaced a timing-sensitive fake ffmpeg cancellation test wait; hardened the test to report early mux-task completion and tolerate slow child-process startup under loaded CI.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
@@ -232,6 +234,8 @@ superseded_by:
   - `just ci` after applying the stale guard to unsupported-resolve fallback.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound video page selection.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after bounding BVID/aid resolve selection.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after switching ordinary BVID/aid resolve back to one no-selection metadata request with local candidate truncation.
+  - `just ci` after switching ordinary BVID/aid resolve back to one no-selection metadata request with local candidate truncation.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter::tests::mux_download_report_cancels_running_ffmpeg -- --nocapture` after hardening the fake ffmpeg cancellation wait.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml` after hardening the fake ffmpeg cancellation wait.
   - `just ci` after cid-bound video page selections, bounded BVID/aid resolve selection, and fake ffmpeg cancellation wait hardening.
