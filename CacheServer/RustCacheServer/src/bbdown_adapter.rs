@@ -550,7 +550,7 @@ fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
 
 fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownloadError> {
     match input {
-        Input::Aid(_) | Input::Bvid(_) => Ok(Selection::Current),
+        Input::Aid(_) | Input::Bvid(_) => Ok(Selection::All),
         Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
             Ok(Selection::Current)
         }
@@ -653,6 +653,13 @@ impl PlaybackExpectedIdentity {
         self.aid
             .is_some_and(|expected_aid| entry.aid == expected_aid)
     }
+
+    fn input_override(&self) -> Option<Input> {
+        self.bvid
+            .as_ref()
+            .map(|bvid| Input::Bvid(bvid.clone()))
+            .or_else(|| self.aid.map(Input::Aid))
+    }
 }
 
 fn playback_selection_from_id(
@@ -683,14 +690,7 @@ fn playback_selection_from_id(
         });
     }
 
-    selection_id
-        .parse::<Selection>()
-        .map(|selection| PlaybackInputSelection {
-            input_override: None,
-            selection: Some(selection),
-            expected_identity: None,
-        })
-        .map_err(|error| BilibiliDownloadError::Failed(format!("Invalid selection_id: {error}")))
+    Err(invalid_selection_id(selection_id))
 }
 
 fn playback_collection_item_selection_from_id(
@@ -704,15 +704,24 @@ fn playback_collection_item_selection_from_id(
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_u32(index_text, selection_id)?;
     let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    let input_override = expected_identity
+        .as_ref()
+        .and_then(PlaybackExpectedIdentity::input_override);
+    let selection = if input_override.is_some() {
+        None
+    } else {
+        Some(
+            IndexSelection::single(index)
+                .map(Selection::Indices)
+                .map_err(failed)?,
+        )
+    };
 
-    IndexSelection::single(index)
-        .map(Selection::Indices)
-        .map(|selection| PlaybackInputSelection {
-            input_override: None,
-            selection: Some(selection),
-            expected_identity,
-        })
-        .map_err(failed)
+    Ok(PlaybackInputSelection {
+        input_override,
+        selection,
+        expected_identity,
+    })
 }
 
 fn playback_expected_identity_from_parts<'a>(
@@ -851,12 +860,8 @@ impl BilibiliInputResolution {
             }
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
-                let items = if resolve_should_use_full_collection_list(input) {
-                    &collection.collection.items
-                } else {
-                    &collection.selected_items
-                };
-                let candidates = items
+                let candidates = collection
+                    .selected_items
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|item| BilibiliResolvedCandidate {
@@ -906,23 +911,6 @@ fn resolve_should_use_full_episode_list(input: &Input) -> bool {
     matches!(
         input,
         Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_)
-    )
-}
-
-fn resolve_should_use_full_collection_list(input: &Input) -> bool {
-    matches!(
-        input,
-        Input::SpaceVideos(_)
-            | Input::FavoriteList { .. }
-            | Input::CollectionList(_)
-            | Input::SeriesList(_)
-            | Input::SpaceCollectionList { .. }
-            | Input::SpaceSeriesList { .. }
-            | Input::RecommendationFeed
-            | Input::FollowingFeed
-            | Input::SpaceDynamic(_)
-            | Input::History
-            | Input::WatchLater
     )
 }
 
@@ -1985,11 +1973,11 @@ mod tests {
     fn resolve_selection_uses_single_overview_requests_for_common_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())).unwrap(),
-            Selection::Current
+            Selection::All
         );
         assert_eq!(
             resolve_selection_for_input(&Input::Aid(123)).unwrap(),
-            Selection::Current
+            Selection::All
         );
         assert_eq!(
             resolve_selection_for_input(&Input::Season(123)).unwrap(),
@@ -2039,11 +2027,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_bvid_selection_id_as_index_selection() {
+    fn parses_collection_item_bvid_selection_id_as_stable_input_override() {
         let input_selection =
             playback_selection_from_id(Some("item:7:bvid:BV1xx411c7mD:aid:170001")).unwrap();
 
-        assert_eq!(input_selection.input_override, None);
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -2051,22 +2043,14 @@ mod tests {
                 aid: Some(170_001),
             })
         );
-        let Selection::Indices(indices) = input_selection
-            .selection
-            .expect("selection id should resolve to a selection")
-        else {
-            panic!("collection item selection should use index selection");
-        };
-        assert!(indices.contains(7));
-        assert!(!indices.contains(6));
-        assert!(!indices.contains(8));
     }
 
     #[test]
-    fn parses_collection_item_aid_selection_id_as_index_selection() {
+    fn parses_collection_item_aid_selection_id_as_stable_input_override() {
         let input_selection = playback_selection_from_id(Some("item:7:aid:170001")).unwrap();
 
-        assert_eq!(input_selection.input_override, None);
+        assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -2074,15 +2058,20 @@ mod tests {
                 aid: Some(170_001),
             })
         );
-        let Selection::Indices(indices) = input_selection
-            .selection
-            .expect("selection id should resolve to a selection")
-        else {
-            panic!("collection item selection should use index selection");
-        };
-        assert!(indices.contains(7));
-        assert!(!indices.contains(6));
-        assert!(!indices.contains(8));
+    }
+
+    #[test]
+    fn rejects_arbitrary_playback_selection_ids() {
+        for selection_id in ["all", "current", "latest", "1-100", "page:1-2"] {
+            assert!(
+                matches!(
+                    playback_selection_from_id(Some(selection_id)),
+                    Err(BilibiliDownloadError::Failed(message))
+                        if message.contains("Invalid selection_id")
+                ),
+                "expected {selection_id:?} to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2143,7 +2132,54 @@ mod tests {
     }
 
     #[test]
-    fn collection_resolution_candidates_round_trip_as_item_selections() {
+    fn video_resolution_candidates_include_multiple_pages_from_all_selection() {
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "BV1multi".to_owned(),
+            &Input::Bvid("BV1multi".to_owned()),
+            ResolvedContent::Video(bbdown_core::VideoMetadata {
+                aid: 170_001,
+                bvid: Some("BV1multi".to_owned()),
+                title: "Multi page video".to_owned(),
+                description: String::new(),
+                cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
+                pub_time: None,
+                owner: None,
+                tags: Vec::new(),
+                pages: vec![
+                    bbdown_core::PageMetadata {
+                        index: 1,
+                        aid: 170_001,
+                        cid: 270_001,
+                        epid: None,
+                        title: "Part 1".to_owned(),
+                        duration_seconds: Some(60),
+                    },
+                    bbdown_core::PageMetadata {
+                        index: 2,
+                        aid: 170_001,
+                        cid: 270_002,
+                        epid: None,
+                        title: "Part 2".to_owned(),
+                        duration_seconds: Some(90),
+                    },
+                ],
+            }),
+        );
+
+        assert_eq!(resolution.source_kind, "video");
+        assert_eq!(
+            resolution
+                .candidates
+                .iter()
+                .map(|candidate| candidate.selection_id.as_str())
+                .collect::<Vec<_>>(),
+            ["page:1", "page:2"]
+        );
+        assert_eq!(resolution.default_selection_id, "");
+    }
+
+    #[test]
+    fn collection_resolution_candidates_round_trip_as_stable_item_selection() {
         let owner = bbdown_core::Owner {
             mid: 123,
             name: "Owner".to_owned(),
@@ -2194,7 +2230,7 @@ mod tests {
         );
 
         assert_eq!(resolution.source_kind, "favorite");
-        assert_eq!(resolution.candidates.len(), 2);
+        assert_eq!(resolution.candidates.len(), 1);
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
@@ -2204,7 +2240,11 @@ mod tests {
         assert_eq!(candidate.index, 3);
 
         let input_selection = playback_selection_from_id(Some(&candidate.selection_id)).unwrap();
-        assert_eq!(input_selection.input_override, None);
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -2212,15 +2252,6 @@ mod tests {
                 aid: Some(170_001),
             })
         );
-        let Selection::Indices(indices) = input_selection
-            .selection
-            .expect("selection id should resolve to a selection")
-        else {
-            panic!("collection candidate selection should use original source index");
-        };
-        assert!(indices.contains(3));
-        assert!(!indices.contains(2));
-        assert!(!indices.contains(4));
     }
 
     #[test]

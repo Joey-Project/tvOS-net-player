@@ -94,6 +94,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])
         XCTAssertEqual(model.selectedCandidateID, "page:1")
         XCTAssertNil(model.currentTask)
+        XCTAssertTrue(model.canClear)
         var requests = await client.createdRequestsSnapshot()
         XCTAssertTrue(requests.isEmpty)
 
@@ -106,6 +107,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.currentTask?.source, "BV1multi")
 
         model.clearTask()
+        XCTAssertFalse(model.canClear)
     }
 
     func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {

@@ -387,7 +387,7 @@ struct ContentView: View {
                     } label: {
                         Label("Clear", systemImage: "trash")
                     }
-                    .disabled(bilibiliModel.currentTask == nil && bilibiliModel.errorMessage == nil)
+                    .disabled(!bilibiliModel.canClear)
                 }
             }
             .padding(.top, 4)

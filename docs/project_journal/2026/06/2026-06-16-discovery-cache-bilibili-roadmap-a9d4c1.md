@@ -190,13 +190,19 @@ superseded_by:
   - `offline-frozen-diff-review` found common Bilibili resolve inputs could require multiple upstream resolve calls before returning candidates, risking the UI timeout budget.
   - Fixed the Swift view model by binding resolved candidates to normalized source text, cache server endpoint, and playback options, and forcing a fresh resolve when any of those change before selected submission.
   - Restored the legacy `CacheControlClient.createBilibiliPlaybackTask(urlOrID:options:)` requirement and added a default selected-create overload that forwards nil selections while rejecting non-empty selections for conformers that do not support Bilibili resolve.
-  - Fixed the Rust adapter to use single overview resolve requests for common inputs and extract full episode/list candidates from returned metadata, keeping the old bounded-prefix fallback only for short-result recovery paths.
+  - Fixed the Rust adapter to use single overview resolve requests for common inputs and extract full episode candidates from returned metadata, keeping the old bounded-prefix fallback only for short-result recovery paths.
+  - The next `independent-codex-pr-review` and GitHub `codex/review-gate` pass found that ordinary BV/av resolve used `Selection::Current`, hiding multi-page candidates, collection/list resolve exposed full fetched lists before local truncation, arbitrary `selection_id` strings could request unbounded playback planning, stable collection identities only failed stale plans instead of planning by BVID/aid, and the picker state could not be cleared from the platform UIs.
+  - Fixed BV/av resolve by using `Selection::All` and adding an adapter test that multi-page videos produce page candidates.
+  - Fixed collection/list resolve to return only BBDown's selected item until `bbdown-core` exposes a bounded candidate-page API, avoiding adapter-level full-list candidate exposure.
+  - Restricted playback `selection_id` parsing to resolver-generated single-item `page:`, `episode:`, and `item:` forms; `item:` IDs carrying BVID/aid now override planning to the stable video input before falling back to original index selection.
+  - Added shared Bilibili `canClear` state and wired tvOS/macOS controls to clear resolved candidate pickers.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
   - `swift test --filter BilibiliTaskViewModelTests`
   - `swift test --filter CacheLibraryPaginationTests`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_waits_for_playback_planning_permit --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server playback_plan_rejects_stale_collection_selection_identity --lib`
   - `just ci`

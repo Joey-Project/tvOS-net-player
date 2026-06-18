@@ -102,6 +102,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         !isSubmitting && !isResolving && !isCancelling && playableURL != nil
     }
 
+    public var canClear: Bool {
+        currentTask != nil || errorMessage != nil || resolvedInput != nil
+    }
+
     public var resolvedCandidates: [BilibiliResolvedCandidate] {
         guard resolvedInputMatchesSource else {
             return []
