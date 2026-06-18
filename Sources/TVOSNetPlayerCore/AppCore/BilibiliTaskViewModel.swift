@@ -2,6 +2,11 @@ import Combine
 import Foundation
 import TVOSNetPlayerCacheClient
 
+public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
+    public let label: String
+    public let systemImage: String
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
@@ -83,6 +88,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         return currentTask.progress > 0 ? min(max(currentTask.progress, 0), 1) : nil
+    }
+
+    public var progressiveCacheStatusBadge: ProgressiveCacheStatusBadge? {
+        currentTask.flatMap(Self.progressiveCacheStatusBadge(for:))
     }
 
     public var playableURL: URL? {
@@ -394,6 +403,52 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return "\(task.bilibiliDisplayTitle) failed."
     }
 
+    private static func progressiveCacheStatusBadge(for task: CacheTask) -> ProgressiveCacheStatusBadge? {
+        guard task.isProgressivePlayback else {
+            return nil
+        }
+
+        if task.isCompletedBilibiliTaskState,
+            !task.libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return ProgressiveCacheStatusBadge(
+                label: "Offline ready", systemImage: "externaldrive.fill.badge.checkmark")
+        }
+
+        if task.isFailedBilibiliTaskState {
+            return ProgressiveCacheStatusBadge(
+                label: task.message.isQuotaOrStorageFailureMessage ? "Quota blocked" : "Cache failed",
+                systemImage: "exclamationmark.triangle"
+            )
+        }
+
+        if task.isPlayableBilibiliTaskState {
+            let normalizedMessage = task.message.lowercased()
+            if normalizedMessage.contains("failed") {
+                return ProgressiveCacheStatusBadge(label: "Cache failed; playable online", systemImage: "wifi")
+            }
+            if normalizedMessage.contains("paused") || normalizedMessage.contains("queued") {
+                return ProgressiveCacheStatusBadge(label: "Offline fill queued", systemImage: "clock")
+            }
+            if normalizedMessage.contains("prewarm") {
+                return ProgressiveCacheStatusBadge(label: "Prewarming cache", systemImage: "bolt.horizontal")
+            }
+            if let percent = task.offlineCachePercentLabel {
+                return ProgressiveCacheStatusBadge(
+                    label: "Filling offline cache \(percent)", systemImage: "arrow.down.circle")
+            }
+
+            return ProgressiveCacheStatusBadge(label: "Playable online; caching", systemImage: "wifi")
+        }
+
+        let state = task.normalizedBilibiliTaskState
+        if state.contains("preparing") || state.contains("planned") {
+            return ProgressiveCacheStatusBadge(label: "Pending offline fill", systemImage: "clock")
+        }
+
+        return nil
+    }
+
     private static func withOperationTimeout<Value: Sendable>(
         _ timeout: Duration,
         operation: @Sendable @escaping () async throws -> Value
@@ -479,6 +534,30 @@ private extension CacheTask {
 
     var normalizedBilibiliTaskState: String {
         state.lowercased().filter(\.isLetter)
+    }
+
+    var offlineCachePercentLabel: String? {
+        if totalBytes > 0, downloadedBytes > 0 {
+            let ratio = min(max(Double(downloadedBytes) / Double(totalBytes), 0), 0.99)
+            return "\(Int((ratio * 100).rounded()))%"
+        }
+
+        guard progress > 0, progress < 1 else {
+            return nil
+        }
+
+        return "\(Int((min(max(progress, 0), 0.99) * 100).rounded()))%"
+    }
+}
+
+private extension String {
+    var isQuotaOrStorageFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("quota")
+            || normalized.contains("watermark")
+            || normalized.contains("storage")
+            || normalized.contains("disk")
+            || normalized.contains("no space")
     }
 }
 

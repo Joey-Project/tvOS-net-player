@@ -31,6 +31,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     @Published public private(set) var activeSearchText = ""
     @Published public private(set) var items: [CacheLibraryItem] = []
     @Published public private(set) var cacheRoots: [CacheRoot] = []
+    @Published public private(set) var hlsCacheStatus: HLSCacheStatus?
     @Published public private(set) var deletingItemIDs: Set<String> = []
     @Published public private(set) var canDeleteLibraryItems = false
 
@@ -92,6 +93,27 @@ public final class CacheLibraryViewModel: ObservableObject {
             .joined(separator: "  ")
     }
 
+    public var hlsCacheSummary: String? {
+        guard let hlsCacheStatus else {
+            return nil
+        }
+
+        let used = ByteCountFormatter.string(fromByteCount: hlsCacheStatus.usedBytes, countStyle: .file)
+        guard hlsCacheStatus.evictionEnabled else {
+            return "HLS cache uses \(used)."
+        }
+
+        let max = ByteCountFormatter.string(fromByteCount: hlsCacheStatus.maxBytes, countStyle: .file)
+        let high = hlsCacheStatus.highWatermarkPercent
+        let low = hlsCacheStatus.lowWatermarkPercent
+        var summary = "HLS cache uses \(used) of \(max). Auto cleanup starts at \(high)% and trims toward \(low)%."
+        if let eviction = hlsCacheStatus.lastEviction {
+            let evicted = ByteCountFormatter.string(fromByteCount: eviction.evictedBytes, countStyle: .file)
+            summary += " Last cleanup freed \(evicted)."
+        }
+        return summary
+    }
+
     public var hasPendingSearch: Bool {
         normalizedSearchText != activeSearchText
     }
@@ -150,6 +172,7 @@ public final class CacheLibraryViewModel: ObservableObject {
                     searchText: requestSearchText
                 )
             }
+            let hlsCacheStatus = await fetchHLSCacheStatus(client: client)
 
             guard isCurrentRefresh(requestSequence, endpoint: endpoint, searchText: requestedSearchText) else {
                 return .superseded
@@ -159,6 +182,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
             canDeleteLibraryItems = serverInfo.supportsLibraryItemDelete
             self.cacheRoots = cacheRoots
+            self.hlsCacheStatus = hlsCacheStatus
             items = libraryPage.items
             nextPageToken = libraryPage.nextPageToken
             requestedLibraryPageTokens = [""]
@@ -176,6 +200,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             loadedEndpoint = nil
             items = []
             cacheRoots = []
+            hlsCacheStatus = nil
             deletingItemIDs = []
             canDeleteLibraryItems = false
             nextPageToken = ""
@@ -341,6 +366,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         onDeleteConfirmed?()
 
         await refreshCacheRoots(client: client, requestSequence: requestSequence, endpoint: endpoint)
+        await refreshHLSCacheStatus(client: client, requestSequence: requestSequence, endpoint: endpoint)
         guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
             return true
         }
@@ -406,6 +432,29 @@ public final class CacheLibraryViewModel: ObservableObject {
         } catch {
             // Cache root capacity is advisory; a transient refresh failure should not make
             // the already-completed delete look like it failed.
+        }
+    }
+
+    private func refreshHLSCacheStatus(
+        client: any CacheControlClient,
+        requestSequence: Int,
+        endpoint: CacheServerEndpoint
+    ) async {
+        let status = await fetchHLSCacheStatus(client: client)
+        guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+            return
+        }
+
+        hlsCacheStatus = status
+    }
+
+    private func fetchHLSCacheStatus(client: any CacheControlClient) async -> HLSCacheStatus? {
+        do {
+            return try await Self.withOperationTimeout(operationTimeout) {
+                try await client.getHLSCacheStatus()
+            }
+        } catch {
+            return nil
         }
     }
 
@@ -609,6 +658,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         activePlaybackItemID = nil
         items = []
         cacheRoots = []
+        hlsCacheStatus = nil
         deletingItemIDs = []
         deletingItemOperationIDs = [:]
         canDeleteLibraryItems = false

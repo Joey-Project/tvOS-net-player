@@ -431,6 +431,8 @@ extension CacheTask {
             source: proto.source,
             title: proto.title,
             progress: proto.progress,
+            downloadedBytes: proto.downloadedBytes,
+            totalBytes: proto.totalBytes,
             message: proto.message,
             libraryItemID: proto.libraryItemID,
             playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,

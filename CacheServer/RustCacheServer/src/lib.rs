@@ -7,6 +7,7 @@ pub mod generated;
 pub mod grpc_services;
 mod hls;
 mod hls_cache;
+mod hls_fill_scheduler;
 pub mod library;
 pub mod media;
 pub mod playback;
@@ -48,6 +49,7 @@ use crate::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheStatusSnapshot, HlsCacheStore, sanitized_completed_session,
     },
+    hls_fill_scheduler::HlsFillScheduler,
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
@@ -77,6 +79,7 @@ pub struct AppState {
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
@@ -207,6 +210,7 @@ impl AppState {
         ));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
+        let hls_fill_scheduler = HlsFillScheduler::default();
 
         let state = Self {
             options,
@@ -219,6 +223,7 @@ impl AppState {
             playback_planner,
             playback_planning_permits,
             hls_cache_finalization_permits,
+            hls_fill_scheduler,
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
@@ -240,9 +245,9 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
 
         for session in restored_sessions {
             let Ok(task) = self.tasks.get_task(&session.id) else {
@@ -291,11 +296,50 @@ impl AppState {
                 }
             }
 
-            handle.spawn(crate::grpc_services::run_hls_cache_finalization(
-                self.clone(),
+            self.enqueue_hls_cache_fill_demoted(
                 session.id.clone(),
                 session.clone(),
                 HlsCacheFinalizationFailureMode::FailRestoredTask,
+            );
+        }
+    }
+
+    pub(crate) fn enqueue_hls_cache_fill_foreground(
+        &self,
+        task_id: String,
+        session: HlsPlaybackSession,
+        failure_mode: HlsCacheFinalizationFailureMode,
+    ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            eprintln!("HLS cache fill worker could not start outside a Tokio runtime.");
+            return;
+        };
+        let should_start_worker =
+            self.hls_fill_scheduler
+                .enqueue_foreground(task_id, session, failure_mode);
+        if should_start_worker {
+            handle.spawn(crate::grpc_services::run_hls_cache_fill_worker(
+                self.clone(),
+            ));
+        }
+    }
+
+    pub(crate) fn enqueue_hls_cache_fill_demoted(
+        &self,
+        task_id: String,
+        session: HlsPlaybackSession,
+        failure_mode: HlsCacheFinalizationFailureMode,
+    ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            eprintln!("HLS cache fill worker could not start outside a Tokio runtime.");
+            return;
+        };
+        let should_start_worker =
+            self.hls_fill_scheduler
+                .enqueue_demoted(task_id, session, failure_mode);
+        if should_start_worker {
+            handle.spawn(crate::grpc_services::run_hls_cache_fill_worker(
+                self.clone(),
             ));
         }
     }

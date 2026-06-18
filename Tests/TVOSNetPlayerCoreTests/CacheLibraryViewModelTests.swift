@@ -75,6 +75,51 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshLoadsHLSCacheStatusBestEffort() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: 50 * 1_024 * 1_024 * 1_024,
+                usedBytes: 45 * 1_024 * 1_024 * 1_024
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let refreshResult = await model.refresh()
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.hlsCacheStatus?.usedBytes, 45 * 1_024 * 1_024 * 1_024)
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Auto cleanup starts at 90%") == true)
+    }
+
+    @MainActor
+    func testRefreshIgnoresUnsupportedHLSCacheStatus() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [.fixture(id: "item-a", title: "Server A item")],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let refreshResult = await model.refresh()
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.items.map(\.id), ["item-a"])
+        XCTAssertNil(model.hlsCacheStatus)
+        XCTAssertNil(model.hlsCacheSummary)
+    }
+
+    @MainActor
     func testDeleteItemRefreshesCacheRoots() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(
@@ -1786,6 +1831,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let items: [CacheLibraryItem]
     let playbackSource: CachePlaybackSource
     let cacheRoots: [CacheRoot]
+    let hlsCacheStatus: HLSCacheStatus?
     let cacheRootResponses: [[CacheRoot]]
     let deleteResponsesByItemID: [String: Bool]
     let deleteError: FakeCacheError?
@@ -1839,6 +1885,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         items: [CacheLibraryItem],
         playbackSource: CachePlaybackSource,
         cacheRoots: [CacheRoot] = [.fixture()],
+        hlsCacheStatus: HLSCacheStatus? = nil,
         cacheRootResponses: [[CacheRoot]] = [],
         deleteResponsesByItemID: [String: Bool] = [:],
         deleteError: FakeCacheError? = nil,
@@ -1861,6 +1908,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.items = items
         self.playbackSource = playbackSource
         self.cacheRoots = cacheRoots
+        self.hlsCacheStatus = hlsCacheStatus
         self.cacheRootResponses = cacheRootResponses
         self.deleteResponsesByItemID = deleteResponsesByItemID
         self.deleteError = deleteError
@@ -1918,6 +1966,14 @@ private actor FakeCacheControlClient: CacheControlClient {
         }
 
         return cacheRoots
+    }
+
+    func getHLSCacheStatus() async throws -> HLSCacheStatus {
+        guard let hlsCacheStatus else {
+            throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+        }
+
+        return hlsCacheStatus
     }
 
     func listLibraryItemsPage(
@@ -2260,6 +2316,30 @@ extension CacheRoot {
             writable: writable,
             freeBytes: freeBytes,
             totalBytes: totalBytes
+        )
+    }
+}
+
+extension HLSCacheStatus {
+    fileprivate static func fixture(
+        evictionEnabled: Bool = true,
+        maxBytes: Int64 = 50 * 1_024 * 1_024 * 1_024,
+        highWatermarkPercent: Int = 90,
+        lowWatermarkPercent: Int = 80,
+        usedBytes: Int64 = 0,
+        completedSessionCount: Int = 0,
+        lastEviction: HLSCacheEvictionSummary? = nil
+    ) -> Self {
+        Self(
+            evictionEnabled: evictionEnabled,
+            maxBytes: maxBytes,
+            highWatermarkPercent: highWatermarkPercent,
+            lowWatermarkPercent: lowWatermarkPercent,
+            highWatermarkBytes: maxBytes * Int64(highWatermarkPercent) / 100,
+            lowWatermarkBytes: maxBytes * Int64(lowWatermarkPercent) / 100,
+            usedBytes: usedBytes,
+            completedSessionCount: completedSessionCount,
+            lastEviction: lastEviction
         )
     }
 }

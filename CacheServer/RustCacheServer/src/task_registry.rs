@@ -362,6 +362,41 @@ impl BilibiliTaskRegistry {
         true
     }
 
+    pub fn update_playback_cache_progress(&self, id: &str, progress: BilibiliTaskProgress) -> bool {
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let Some(task) = ({
+            let Some(task) = inner.tasks_by_id.get_mut(id) else {
+                return false;
+            };
+            if task.kind() != TaskKind::BilibiliProgressivePlayback
+                || task.state() != TaskState::Playable
+            {
+                return false;
+            }
+
+            if let Some(value) = progress.progress
+                && value.is_finite()
+            {
+                task.progress = value.clamp(0.0, 1.0);
+            }
+            if let Some(value) = progress.downloaded_bytes {
+                task.downloaded_bytes = value.max(0);
+            }
+            if let Some(value) = progress.total_bytes {
+                task.total_bytes = value.max(0);
+            }
+            if let Some(message) = progress.message {
+                task.message = message;
+            }
+            task.updated_at = Some(current_timestamp());
+            Some(task.clone())
+        }) else {
+            return false;
+        };
+        Self::publish_locked(&mut inner, task);
+        true
+    }
+
     pub fn complete_task_succeeded(
         &self,
         id: &str,

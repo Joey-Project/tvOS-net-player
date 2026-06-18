@@ -29,15 +29,17 @@ use crate::{
     },
     hls::HlsPlaybackSession,
     hls_cache::{
-        HlsCacheEvictionSummary, HlsCacheStore, hls_session_declared_size_bytes,
-        sanitized_completed_session, timestamp_from_system_time,
+        HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
+        hls_session_declared_size_bytes, sanitized_completed_session, timestamp_from_system_time,
     },
+    hls_fill_scheduler::HlsFillPreemptionToken,
     library::ROOT_ID,
-    task_registry::{BilibiliTaskRegistry, current_timestamp},
+    task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
 };
 
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
+const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -692,12 +694,11 @@ async fn run_bilibili_playback_planning(
                         "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"
                     );
                 }
-                tokio::spawn(run_hls_cache_finalization(
-                    state.clone(),
+                state.enqueue_hls_cache_fill_foreground(
                     task_id.clone(),
                     metadata.hls_session,
                     HlsCacheFinalizationFailureMode::KeepPlayable,
-                ));
+                );
             }
             cleanup.disarm();
         }
@@ -708,20 +709,84 @@ async fn run_bilibili_playback_planning(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_hls_cache_finalization(
     state: AppState,
     task_id: String,
     session: HlsPlaybackSession,
     failure_mode: HlsCacheFinalizationFailureMode,
 ) {
+    let _ = run_hls_cache_finalization_inner(
+        state,
+        task_id,
+        session,
+        failure_mode,
+        HlsFillPreemptionToken::default(),
+    )
+    .await;
+}
+
+pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
+    loop {
+        let job = state.hls_fill_scheduler.next_job().await;
+        let outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            job.task_id.clone(),
+            job.session.clone(),
+            job.failure_mode,
+            job.token.clone(),
+        )
+        .await;
+        state.hls_fill_scheduler.finish_current(&job);
+        if outcome == HlsCacheFinalizationOutcome::Preempted
+            && state.tasks.is_playback_task_playable(&job.task_id)
+        {
+            let message = match job.priority {
+                crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
+                    "Playable online; offline cache fill paused behind newer playback."
+                }
+                crate::hls_fill_scheduler::HlsFillPriority::Demoted => {
+                    "Playable online; offline cache fill remains queued behind newer playback."
+                }
+            };
+            let _ = state.tasks.update_playback_cache_progress(
+                &job.task_id,
+                BilibiliTaskProgress {
+                    progress: None,
+                    downloaded_bytes: None,
+                    total_bytes: None,
+                    message: Some(message.to_owned()),
+                },
+            );
+            state.hls_fill_scheduler.requeue_preempted(job);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HlsCacheFinalizationOutcome {
+    Finished,
+    Preempted,
+}
+
+async fn run_hls_cache_finalization_inner(
+    state: AppState,
+    task_id: String,
+    session: HlsPlaybackSession,
+    failure_mode: HlsCacheFinalizationFailureMode,
+    preemption: HlsFillPreemptionToken,
+) -> HlsCacheFinalizationOutcome {
     if !state.supports_completed_hls_cache_playback() {
-        return;
+        return HlsCacheFinalizationOutcome::Finished;
     }
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
         if !state.tasks.is_playback_task_playable(&task_id) {
-            return;
+            return HlsCacheFinalizationOutcome::Finished;
+        }
+        if preemption.is_preempted() {
+            return HlsCacheFinalizationOutcome::Preempted;
         }
         tokio::select! {
             permit = &mut permit_request => {
@@ -731,7 +796,7 @@ pub(crate) async fn run_hls_cache_finalization(
                         eprintln!(
                             "HLS cache finalization limiter is unavailable for task {task_id}."
                         );
-                        return;
+                        return HlsCacheFinalizationOutcome::Finished;
                     }
                 }
             }
@@ -739,27 +804,83 @@ pub(crate) async fn run_hls_cache_finalization(
         }
     };
     let _eviction_protection = state.protect_hls_cache_session_from_eviction(&task_id);
-    let should_cancel = || !state.tasks.is_playback_task_playable(&task_id);
-    if should_cancel() {
-        return;
+    let control = || {
+        if !state.tasks.is_playback_task_playable(&task_id) {
+            HlsCacheFillControl::Cancel
+        } else if preemption.is_preempted() {
+            HlsCacheFillControl::Preempt
+        } else {
+            HlsCacheFillControl::Continue
+        }
+    };
+    if control() == HlsCacheFillControl::Preempt {
+        return HlsCacheFinalizationOutcome::Preempted;
+    }
+    if control() == HlsCacheFillControl::Cancel {
+        return HlsCacheFinalizationOutcome::Finished;
+    }
+    let _ = state.tasks.update_playback_cache_progress(
+        &task_id,
+        BilibiliTaskProgress {
+            progress: Some(0.0),
+            downloaded_bytes: Some(0),
+            total_bytes: hls_session_declared_size_bytes(&session)
+                .map(|value| value.try_into().unwrap_or(i64::MAX)),
+            message: Some("Playable online; prewarming offline cache.".to_owned()),
+        },
+    );
+    match state
+        .hls_cache
+        .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, &control)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::hls_cache::HlsCacheError::Preempted) => {
+            return HlsCacheFinalizationOutcome::Preempted;
+        }
+        Err(crate::hls_cache::HlsCacheError::Cancelled) => {
+            state.hls_sessions.remove(&task_id);
+            let _ = state.hls_cache.remove_session(&task_id);
+            return HlsCacheFinalizationOutcome::Finished;
+        }
+        Err(error) => {
+            eprintln!(
+                "Failed to prewarm HLS playback cache for task {task_id}; continuing full cache fill: {error}"
+            );
+        }
+    }
+    if control() == HlsCacheFillControl::Preempt {
+        return HlsCacheFinalizationOutcome::Preempted;
+    }
+    if control() == HlsCacheFillControl::Cancel {
+        return HlsCacheFinalizationOutcome::Finished;
     }
     let projected_added_bytes = hls_session_declared_size_bytes(&session).unwrap_or_default();
     if let Err(error) = state.enforce_hls_cache_quota_until_cancelled(
         "before_hls_finalization",
         [task_id.clone()],
         projected_added_bytes,
-        should_cancel,
+        || control() != HlsCacheFillControl::Continue,
     ) {
         eprintln!(
             "Failed to run HLS cache eviction before finalization for task {task_id}: {error}"
         );
     }
-    if should_cancel() {
-        return;
+    if control() == HlsCacheFillControl::Preempt {
+        return HlsCacheFinalizationOutcome::Preempted;
     }
+    if control() == HlsCacheFillControl::Cancel {
+        return HlsCacheFinalizationOutcome::Finished;
+    }
+    let progress = hls_cache_progress_reporter(&state, &task_id);
     match state
         .hls_cache
-        .cache_session_resources_until(&state.hls_upstream_client, &session, should_cancel)
+        .cache_session_resources_with_control(
+            &state.hls_upstream_client,
+            &session,
+            control,
+            progress,
+        )
         .await
     {
         Ok(library_item_id) => {
@@ -791,14 +912,28 @@ pub(crate) async fn run_hls_cache_finalization(
             state.hls_sessions.remove(&task_id);
             let _ = state.hls_cache.remove_session(&task_id);
         }
+        Err(crate::hls_cache::HlsCacheError::Preempted) => {
+            return HlsCacheFinalizationOutcome::Preempted;
+        }
         Err(error) => {
             if !state.tasks.is_playback_task_playable(&task_id) {
-                return;
+                return HlsCacheFinalizationOutcome::Finished;
             }
             match failure_mode {
                 HlsCacheFinalizationFailureMode::KeepPlayable => {
                     eprintln!(
                         "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {error}"
+                    );
+                    let _ = state.tasks.update_playback_cache_progress(
+                        &task_id,
+                        BilibiliTaskProgress {
+                            progress: None,
+                            downloaded_bytes: None,
+                            total_bytes: None,
+                            message: Some(format!(
+                                "Playable online; offline cache fill failed: {error}"
+                            )),
+                        },
                     );
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
@@ -815,6 +950,60 @@ pub(crate) async fn run_hls_cache_finalization(
                 }
             }
         }
+    }
+    HlsCacheFinalizationOutcome::Finished
+}
+
+fn hls_cache_progress_reporter(
+    state: &AppState,
+    task_id: &str,
+) -> impl Fn(HlsCacheFillProgress) + Send + Sync + 'static {
+    let tasks = Arc::clone(&state.tasks);
+    let task_id = task_id.to_owned();
+    let last_published_bytes = Arc::new(std::sync::Mutex::new(None::<u64>));
+    move |progress| {
+        let should_publish = {
+            let mut last_published_bytes = last_published_bytes
+                .lock()
+                .expect("HLS cache progress lock poisoned");
+            let downloaded_bytes = progress.downloaded_bytes;
+            let total_bytes = progress.total_bytes.unwrap_or_default();
+            let should_publish = last_published_bytes.is_none()
+                || Some(downloaded_bytes) == progress.total_bytes
+                || last_published_bytes.as_ref().is_some_and(|last| {
+                    downloaded_bytes.saturating_sub(*last) >= HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES
+                });
+            if should_publish {
+                *last_published_bytes = Some(downloaded_bytes);
+            }
+            should_publish || downloaded_bytes == 0 || downloaded_bytes == total_bytes
+        };
+        if !should_publish {
+            return;
+        }
+
+        let progress_value = progress.total_bytes.and_then(|total_bytes| {
+            (total_bytes > 0)
+                .then(|| (progress.downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 0.99))
+        });
+        let message = match progress_value {
+            Some(value) if value > 0.0 => format!(
+                "Playable online; filling offline cache ({:.0}%).",
+                value * 100.0
+            ),
+            _ => "Playable online; filling offline cache in background.".to_owned(),
+        };
+        let _ = tasks.update_playback_cache_progress(
+            &task_id,
+            BilibiliTaskProgress {
+                progress: progress_value,
+                downloaded_bytes: Some(progress.downloaded_bytes.try_into().unwrap_or(i64::MAX)),
+                total_bytes: progress
+                    .total_bytes
+                    .map(|value| value.try_into().unwrap_or(i64::MAX)),
+                message: Some(message),
+            },
+        );
     }
 }
 

@@ -32,6 +32,7 @@ const HLS_CACHE_DIR: &str = ".tvos-net-player/hls";
 const HLS_LIBRARY_ITEM_PREFIX: &str = "bilibili.hls.";
 const HLS_CACHE_VARIANT_LABEL: &str = "Offline HLS";
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
+const HLS_PREWARM_HEAD_BYTES: u64 = HLS_INITIALIZATION_SCAN_BYTES;
 
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
@@ -91,6 +92,19 @@ pub(crate) struct HlsCacheEvictionSummary {
     pub(crate) evicted_session_ids: Vec<String>,
     pub(crate) target_reached: bool,
     pub(crate) completed_at: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsCacheFillControl {
+    Continue,
+    Cancel,
+    Preempt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheFillProgress {
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) total_bytes: Option<u64>,
 }
 
 impl HlsCacheStore {
@@ -282,7 +296,7 @@ impl HlsCacheStore {
         resource_id: &str,
     ) -> Option<CachedHlsResource> {
         let metadata = self.read_resource_metadata(session_id, resource_id)?;
-        if !self.resource_cache_key_matches(session_id, resource_id, &metadata) {
+        if !self.resource_cache_key_matches(session_id, resource_id, &metadata.cache_key) {
             return None;
         }
         let file_path = self.resource_path(session_id, resource_id).ok()?;
@@ -322,6 +336,57 @@ impl HlsCacheStore {
         })
     }
 
+    pub(crate) fn prewarmed_resource(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> Option<PrewarmedHlsResource> {
+        let metadata = self.read_prewarmed_resource_metadata(session_id, resource_id)?;
+        if !self.resource_cache_key_matches(session_id, resource_id, &metadata.cache_key) {
+            return None;
+        }
+        let file_path = self.resource_prewarm_path(session_id, resource_id).ok()?;
+        let file_metadata = fs::metadata(&file_path).ok()?;
+        if !file_metadata.is_file() || file_metadata.len() != metadata.prefix_length {
+            return None;
+        }
+        if metadata.initialization_length == 0
+            || metadata.initialization_length >= metadata.total_length
+            || metadata.prefix_length > metadata.total_length
+            || metadata.initialization_length > metadata.prefix_length
+        {
+            return None;
+        }
+
+        Some(PrewarmedHlsResource {
+            path: file_path,
+            content_type: metadata.content_type,
+            initialization_length: metadata.initialization_length,
+            prefix_length: metadata.prefix_length,
+            total_length: metadata.total_length,
+            last_modified: file_metadata.modified().unwrap_or(UNIX_EPOCH),
+        })
+    }
+
+    pub(crate) fn open_prewarmed_resource(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> Option<OpenedPrewarmedHlsResource> {
+        let prewarmed = self.prewarmed_resource(session_id, resource_id)?;
+        let relative_path = self
+            .resource_prewarm_relative_path(session_id, resource_id)
+            .ok()?;
+        let file = open_read_no_follow(self.root_path.as_ref(), &relative_path).ok()?;
+        Some(OpenedPrewarmedHlsResource {
+            file,
+            content_type: prewarmed.content_type,
+            last_modified: prewarmed.last_modified,
+            prefix_length: prewarmed.prefix_length,
+            total_length: prewarmed.total_length,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn cache_session_resources(
         &self,
@@ -332,6 +397,7 @@ impl HlsCacheStore {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn cache_session_resources_until<F>(
         &self,
         client: &reqwest::Client,
@@ -341,27 +407,207 @@ impl HlsCacheStore {
     where
         F: Fn() -> bool + Send + Sync,
     {
-        if should_cancel() {
-            let _ = self.remove_session(&session.id);
-            return Err(HlsCacheError::Cancelled);
-        }
-        let result = async {
-            self.save_session(session)?;
-            self.cache_resource(client, &session.id, &session.variant.video, &should_cancel)
-                .await?;
-            if let Some(audio) = &session.variant.audio {
-                self.cache_resource(client, &session.id, audio, &should_cancel)
-                    .await?;
-            }
-            self.save_completed_session(session)?;
+        self.cache_session_resources_with_control(
+            client,
+            session,
+            || {
+                if should_cancel() {
+                    HlsCacheFillControl::Cancel
+                } else {
+                    HlsCacheFillControl::Continue
+                }
+            },
+            |_| {},
+        )
+        .await
+    }
 
-            Ok(Self::completed_library_item_id(&session.id))
+    pub(crate) async fn cache_session_resources_with_control<F, P>(
+        &self,
+        client: &reqwest::Client,
+        session: &HlsPlaybackSession,
+        control: F,
+        progress: P,
+    ) -> Result<String, HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(HlsCacheFillProgress) + Send + Sync,
+    {
+        if let Err(error) = check_fill_control(&control) {
+            if matches!(&error, HlsCacheError::Cancelled) {
+                let _ = self.remove_session(&session.id);
+            }
+            return Err(error);
         }
-        .await;
+        let result = self
+            .cache_session_resources_inner(client, session, &control, &progress)
+            .await;
         if matches!(&result, Err(HlsCacheError::Cancelled)) {
             let _ = self.remove_session(&session.id);
         }
         result
+    }
+
+    pub(crate) async fn prewarm_session_first_frame_with_control<F>(
+        &self,
+        client: &reqwest::Client,
+        session: &HlsPlaybackSession,
+        control: F,
+    ) -> Result<(), HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        check_fill_control(&control)?;
+        self.save_session(session)?;
+        self.prewarm_resource(client, &session.id, &session.variant.video, &control)
+            .await?;
+        if let Some(audio) = &session.variant.audio {
+            self.prewarm_resource(client, &session.id, audio, &control)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cache_session_resources_inner<F, P>(
+        &self,
+        client: &reqwest::Client,
+        session: &HlsPlaybackSession,
+        control: &F,
+        progress: &P,
+    ) -> Result<String, HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(HlsCacheFillProgress) + Send + Sync,
+    {
+        self.save_session(session)?;
+        let total_bytes = hls_session_declared_size_bytes(session);
+        let mut downloaded_bytes = 0_u64;
+        progress(HlsCacheFillProgress {
+            downloaded_bytes,
+            total_bytes,
+        });
+        downloaded_bytes = downloaded_bytes.saturating_add(
+            self.cache_resource(
+                client,
+                &session.id,
+                &session.variant.video,
+                control,
+                |resource_downloaded_bytes| {
+                    progress(HlsCacheFillProgress {
+                        downloaded_bytes: downloaded_bytes
+                            .saturating_add(resource_downloaded_bytes),
+                        total_bytes,
+                    });
+                },
+            )
+            .await?,
+        );
+        progress(HlsCacheFillProgress {
+            downloaded_bytes,
+            total_bytes,
+        });
+        if let Some(audio) = &session.variant.audio {
+            downloaded_bytes = downloaded_bytes.saturating_add(
+                self.cache_resource(
+                    client,
+                    &session.id,
+                    audio,
+                    control,
+                    |resource_downloaded_bytes| {
+                        progress(HlsCacheFillProgress {
+                            downloaded_bytes: downloaded_bytes
+                                .saturating_add(resource_downloaded_bytes),
+                            total_bytes,
+                        });
+                    },
+                )
+                .await?,
+            );
+            progress(HlsCacheFillProgress {
+                downloaded_bytes,
+                total_bytes,
+            });
+        }
+        self.save_completed_session(session)?;
+
+        Ok(Self::completed_library_item_id(&session.id))
+    }
+
+    async fn prewarm_resource<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        control: &F,
+    ) -> Result<(), HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        check_fill_control(control)?;
+        if self.cached_resource(session_id, &resource.id).is_some()
+            || self.prewarmed_resource(session_id, &resource.id).is_some()
+        {
+            return Ok(());
+        }
+
+        let session_dir = self.session_dir(session_id)?;
+        self.ensure_cache_directory(&session_dir)?;
+        let prewarm_path = self.resource_prewarm_path(session_id, &resource.id)?;
+        let temp_path = prewarm_path.with_extension("tmp");
+        let mut last_error = None;
+        for url in resource_urls(resource) {
+            check_fill_control(control)?;
+            self.prepare_temp_path(&temp_path)?;
+            match download_resource_prefix(client, resource, &url, &temp_path, control).await {
+                Ok(prefix) => {
+                    if prefix.initialization_length == 0
+                        || prefix.initialization_length >= prefix.total_length
+                        || prefix.initialization_length > prefix.prefix_length
+                    {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        last_error = Some(HlsCacheError::InvalidResource(
+                            "prewarmed HLS MP4 initialization range was invalid".to_owned(),
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = check_fill_control(control) {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(error);
+                    }
+                    if let Err(error) = self.reject_cache_path_symlink(&prewarm_path) {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(error.into());
+                    }
+                    tokio::fs::rename(&temp_path, &prewarm_path).await?;
+                    check_fill_control(control)?;
+                    let metadata = PersistedHlsPrewarmedResource {
+                        schema_version: HLS_CACHE_SCHEMA_VERSION,
+                        id: resource.id.clone(),
+                        content_type: resource.content_type().to_owned(),
+                        prefix_length: prefix.prefix_length,
+                        total_length: prefix.total_length,
+                        initialization_length: prefix.initialization_length,
+                        cache_key: PersistedBilibiliMediaCacheKey::from(
+                            resource.request.cache_key.clone(),
+                        ),
+                    };
+                    self.write_json_atomically(
+                        &self.resource_prewarm_metadata_path(session_id, &resource.id)?,
+                        &metadata,
+                    )?;
+                    check_fill_control(control)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            HlsCacheError::InvalidResource("HLS media request did not contain a URL".to_owned())
+        }))
     }
 
     fn completed_library_item(&self, session: &HlsPlaybackSession) -> Option<LibraryItem> {
@@ -477,18 +723,22 @@ impl HlsCacheStore {
         HlsPlaybackSession::try_from(persisted).ok()
     }
 
-    async fn cache_resource(
+    async fn cache_resource<F, P>(
         &self,
         client: &reqwest::Client,
         session_id: &str,
         resource: &HlsMediaResource,
-        should_cancel: &(impl Fn() -> bool + Send + Sync),
-    ) -> Result<(), HlsCacheError> {
-        if should_cancel() {
-            return Err(HlsCacheError::Cancelled);
-        }
-        if self.cached_resource(session_id, &resource.id).is_some() {
-            return Ok(());
+        control: &F,
+        progress: P,
+    ) -> Result<u64, HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(u64) + Send + Sync,
+    {
+        check_fill_control(control)?;
+        if let Some(cached) = self.cached_resource(session_id, &resource.id) {
+            progress(cached.total_length);
+            return Ok(cached.total_length);
         }
 
         let session_dir = self.session_dir(session_id)?;
@@ -497,11 +747,9 @@ impl HlsCacheStore {
         let temp_path = resource_path.with_extension("tmp");
         let mut last_error = None;
         for url in resource_urls(resource) {
-            if should_cancel() {
-                return Err(HlsCacheError::Cancelled);
-            }
+            check_fill_control(control)?;
             self.prepare_temp_path(&temp_path)?;
-            match download_resource(client, resource, &url, &temp_path, should_cancel).await {
+            match download_resource(client, resource, &url, &temp_path, control, &progress).await {
                 Ok(total_length) => {
                     let initialization_length =
                         match cached_mp4_initialization_length(&temp_path).await {
@@ -519,18 +767,16 @@ impl HlsCacheStore {
                         ));
                         continue;
                     }
-                    if should_cancel() {
+                    if let Err(error) = check_fill_control(control) {
                         let _ = tokio::fs::remove_file(&temp_path).await;
-                        return Err(HlsCacheError::Cancelled);
+                        return Err(error);
                     }
                     if let Err(error) = self.reject_cache_path_symlink(&resource_path) {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(error.into());
                     }
                     tokio::fs::rename(&temp_path, &resource_path).await?;
-                    if should_cancel() {
-                        return Err(HlsCacheError::Cancelled);
-                    }
+                    check_fill_control(control)?;
                     let metadata = PersistedHlsCachedResource {
                         schema_version: HLS_CACHE_SCHEMA_VERSION,
                         id: resource.id.clone(),
@@ -545,10 +791,8 @@ impl HlsCacheStore {
                         &self.resource_metadata_path(session_id, &resource.id)?,
                         &metadata,
                     )?;
-                    if should_cancel() {
-                        return Err(HlsCacheError::Cancelled);
-                    }
-                    return Ok(());
+                    check_fill_control(control)?;
+                    return Ok(total_length);
                 }
                 Err(error) => {
                     let _ = tokio::fs::remove_file(&temp_path).await;
@@ -574,11 +818,26 @@ impl HlsCacheStore {
             .then_some(metadata)
     }
 
+    fn read_prewarmed_resource_metadata(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> Option<PersistedHlsPrewarmedResource> {
+        let bytes = self.read_cache_file(
+            &self
+                .resource_prewarm_metadata_path(session_id, resource_id)
+                .ok()?,
+        )?;
+        let metadata = serde_json::from_slice::<PersistedHlsPrewarmedResource>(&bytes).ok()?;
+        (metadata.schema_version == HLS_CACHE_SCHEMA_VERSION && metadata.id == resource_id)
+            .then_some(metadata)
+    }
+
     fn resource_cache_key_matches(
         &self,
         session_id: &str,
         resource_id: &str,
-        metadata: &PersistedHlsCachedResource,
+        cache_key: &PersistedBilibiliMediaCacheKey,
     ) -> bool {
         let Some(session) = self.load_session(session_id) else {
             return false;
@@ -586,8 +845,7 @@ impl HlsCacheStore {
         let Some(resource) = session.media_resource(resource_id) else {
             return false;
         };
-        metadata.cache_key
-            == PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone())
+        *cache_key == PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone())
     }
 
     fn store_root(&self) -> PathBuf {
@@ -604,10 +862,29 @@ impl HlsCacheStore {
         Ok(self.session_dir(session_id)?.join(resource_id))
     }
 
+    fn resource_prewarm_path(&self, session_id: &str, resource_id: &str) -> io::Result<PathBuf> {
+        validate_cache_id(resource_id)?;
+        Ok(self
+            .session_dir(session_id)?
+            .join(format!("{resource_id}.prewarm")))
+    }
+
     fn resource_relative_path(&self, session_id: &str, resource_id: &str) -> io::Result<String> {
         validate_cache_id(session_id)?;
         validate_cache_id(resource_id)?;
         Ok(format!("{HLS_CACHE_DIR}/{session_id}/{resource_id}"))
+    }
+
+    fn resource_prewarm_relative_path(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> io::Result<String> {
+        validate_cache_id(session_id)?;
+        validate_cache_id(resource_id)?;
+        Ok(format!(
+            "{HLS_CACHE_DIR}/{session_id}/{resource_id}.prewarm"
+        ))
     }
 
     fn resource_metadata_path(&self, session_id: &str, resource_id: &str) -> io::Result<PathBuf> {
@@ -615,6 +892,17 @@ impl HlsCacheStore {
         Ok(self
             .session_dir(session_id)?
             .join(format!("{resource_id}.json")))
+    }
+
+    fn resource_prewarm_metadata_path(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> io::Result<PathBuf> {
+        validate_cache_id(resource_id)?;
+        Ok(self
+            .session_dir(session_id)?
+            .join(format!("{resource_id}.prewarm.json")))
     }
 
     fn ensure_cache_directory(&self, path: &Path) -> io::Result<()> {
@@ -695,6 +983,24 @@ pub(crate) struct CachedHlsResource {
     pub(crate) last_modified: SystemTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrewarmedHlsResource {
+    pub(crate) path: PathBuf,
+    pub(crate) content_type: String,
+    pub(crate) initialization_length: u64,
+    pub(crate) prefix_length: u64,
+    pub(crate) total_length: u64,
+    pub(crate) last_modified: SystemTime,
+}
+
+pub(crate) struct OpenedPrewarmedHlsResource {
+    pub(crate) file: std::fs::File,
+    pub(crate) content_type: String,
+    pub(crate) last_modified: SystemTime,
+    pub(crate) prefix_length: u64,
+    pub(crate) total_length: u64,
+}
+
 #[derive(Debug)]
 pub(crate) enum HlsCacheError {
     Io(io::Error),
@@ -702,6 +1008,7 @@ pub(crate) enum HlsCacheError {
     UpstreamStatus(StatusCode),
     InvalidResource(String),
     Cancelled,
+    Preempted,
 }
 
 impl From<io::Error> for HlsCacheError {
@@ -724,6 +1031,7 @@ impl std::fmt::Display for HlsCacheError {
             Self::UpstreamStatus(status) => write!(formatter, "upstream returned {status}"),
             Self::InvalidResource(message) => formatter.write_str(message),
             Self::Cancelled => formatter.write_str("HLS cache finalization was cancelled"),
+            Self::Preempted => formatter.write_str("HLS cache finalization was preempted"),
         }
     }
 }
@@ -735,11 +1043,10 @@ async fn download_resource(
     resource: &HlsMediaResource,
     url: &str,
     temp_path: &Path,
-    should_cancel: &(impl Fn() -> bool + Send + Sync),
+    control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
+    progress: &(impl Fn(u64) + Send + Sync),
 ) -> Result<u64, HlsCacheError> {
-    if should_cancel() {
-        return Err(HlsCacheError::Cancelled);
-    }
+    check_fill_control(control)?;
     let mut request = client.get(url);
     let mut requested_range = false;
     for header in &resource.request.headers {
@@ -789,9 +1096,7 @@ async fn download_resource(
     let mut stream = response.bytes_stream();
     let mut total_length = 0_u64;
     loop {
-        if should_cancel() {
-            return Err(HlsCacheError::Cancelled);
-        }
+        check_fill_control(control)?;
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
             () = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -802,9 +1107,7 @@ async fn download_resource(
             break;
         };
         let chunk = chunk?;
-        if should_cancel() {
-            return Err(HlsCacheError::Cancelled);
-        }
+        check_fill_control(control)?;
         total_length = total_length
             .checked_add(chunk.len().try_into().unwrap_or(u64::MAX))
             .ok_or_else(|| {
@@ -816,6 +1119,7 @@ async fn download_resource(
             )));
         }
         file.write_all(&chunk).await?;
+        progress(total_length);
     }
     file.sync_all().await?;
     if let Some(declared) = declared_length
@@ -836,6 +1140,120 @@ async fn download_resource(
     Ok(total_length)
 }
 
+struct DownloadedResourcePrefix {
+    prefix_length: u64,
+    total_length: u64,
+    initialization_length: u64,
+}
+
+async fn download_resource_prefix(
+    client: &reqwest::Client,
+    resource: &HlsMediaResource,
+    url: &str,
+    temp_path: &Path,
+    control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
+) -> Result<DownloadedResourcePrefix, HlsCacheError> {
+    check_fill_control(control)?;
+    let mut request = client.get(url).header(
+        reqwest::header::RANGE,
+        format!("bytes=0-{}", HLS_PREWARM_HEAD_BYTES - 1),
+    );
+    for header in &resource.request.headers {
+        if header.name.eq_ignore_ascii_case("range") {
+            continue;
+        }
+        if !should_forward_media_request_header(&header.name, &resource.request.url, url) {
+            continue;
+        }
+        request = request.header(header.name.as_str(), header.value.as_str());
+    }
+
+    let response = request.send().await?;
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(HlsCacheError::InvalidResource(format!(
+            "HLS prewarm expected partial content, got {status}"
+        )));
+    }
+    let headers = response.headers().clone();
+    let (start, end, total_length) = parse_content_range_header(&headers).ok_or_else(|| {
+        HlsCacheError::InvalidResource(
+            "HLS prewarm response did not include Content-Range".to_owned(),
+        )
+    })?;
+    if start != 0 || end < start || end >= total_length {
+        return Err(HlsCacheError::InvalidResource(
+            "HLS prewarm Content-Range was invalid".to_owned(),
+        ));
+    }
+    let prefix_length = end.saturating_add(1);
+    if prefix_length > HLS_PREWARM_HEAD_BYTES {
+        return Err(HlsCacheError::InvalidResource(
+            "HLS prewarm response exceeded bounded prefix length".to_owned(),
+        ));
+    }
+    if let Some(declared_length) = response.content_length()
+        && declared_length != prefix_length
+    {
+        return Err(HlsCacheError::InvalidResource(format!(
+            "HLS prewarm Content-Length {declared_length} did not match prefix length {prefix_length}"
+        )));
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .await?;
+    let mut bytes = Vec::with_capacity(prefix_length.try_into().unwrap_or(usize::MAX));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        check_fill_control(control)?;
+        let chunk = chunk?;
+        let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+            HlsCacheError::InvalidResource("HLS prewarm prefix is too large".to_owned())
+        })?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > prefix_length {
+            return Err(HlsCacheError::InvalidResource(
+                "HLS prewarm body exceeded Content-Range length".to_owned(),
+            ));
+        }
+        file.write_all(&chunk).await?;
+        bytes.extend_from_slice(&chunk);
+    }
+    file.sync_all().await?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != prefix_length {
+        return Err(HlsCacheError::InvalidResource(format!(
+            "HLS prewarm body length {} did not match Content-Range length {prefix_length}",
+            bytes.len()
+        )));
+    }
+    let initialization_length = mp4_initialization_length(&bytes).ok_or_else(|| {
+        HlsCacheError::InvalidResource("prewarmed HLS MP4 init box not found".to_owned())
+    })?;
+
+    Ok(DownloadedResourcePrefix {
+        prefix_length,
+        total_length,
+        initialization_length,
+    })
+}
+
+fn parse_content_range_header(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, u64)> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let spec = value.strip_prefix("bytes ")?;
+    let (range, total) = spec.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    let total = total.parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    (total > 0 && start <= end && end < total).then_some((start, end, total))
+}
+
 async fn cached_mp4_initialization_length(path: &Path) -> Result<u64, HlsCacheError> {
     let file = tokio::fs::File::open(path).await?;
     let mut bytes = Vec::new();
@@ -845,6 +1263,16 @@ async fn cached_mp4_initialization_length(path: &Path) -> Result<u64, HlsCacheEr
     mp4_initialization_length(&bytes).ok_or_else(|| {
         HlsCacheError::InvalidResource("cached HLS MP4 init box not found".to_owned())
     })
+}
+
+fn check_fill_control(
+    control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
+) -> Result<(), HlsCacheError> {
+    match control() {
+        HlsCacheFillControl::Continue => Ok(()),
+        HlsCacheFillControl::Cancel => Err(HlsCacheError::Cancelled),
+        HlsCacheFillControl::Preempt => Err(HlsCacheError::Preempted),
+    }
 }
 
 fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
@@ -1106,6 +1534,17 @@ struct PersistedHlsCachedResource {
     schema_version: u32,
     id: String,
     content_type: String,
+    total_length: u64,
+    initialization_length: u64,
+    cache_key: PersistedBilibiliMediaCacheKey,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsPrewarmedResource {
+    schema_version: u32,
+    id: String,
+    content_type: String,
+    prefix_length: u64,
     total_length: u64,
     initialization_length: u64,
     cache_key: PersistedBilibiliMediaCacheKey,
@@ -2182,6 +2621,58 @@ mod tests {
             !store
                 .session_dir(&session.id)
                 .expect("session dir should be valid")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn preemption_after_committed_resource_preserves_partial_session() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session_with_audio("session-preempt-after-video", &upstream_url);
+        let client = reqwest::Client::new();
+        let store_for_preempt = store.clone();
+        let session_id = session.id.clone();
+
+        let error = store
+            .cache_session_resources_with_control(
+                &client,
+                &session,
+                move || {
+                    if store_for_preempt
+                        .cached_resource(&session_id, "video.m4s")
+                        .is_some()
+                    {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("preemption after video commit should stop finalization");
+
+        assert!(matches!(error, HlsCacheError::Preempted));
+        assert!(store.cached_resource(&session.id, "video.m4s").is_some());
+        assert!(store.cached_resource(&session.id, "audio.m4s").is_none());
+        assert!(
+            store
+                .get_completed_library_item(&format!("bilibili.hls.{}", session.id))
+                .is_none()
+        );
+        assert!(
+            store
+                .session_dir(&session.id)
+                .expect("session dir should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(&session.id, "audio.m4s")
+                .expect("audio resource path should be valid")
+                .with_extension("tmp")
                 .exists()
         );
     }
