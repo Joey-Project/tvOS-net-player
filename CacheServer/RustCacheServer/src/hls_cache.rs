@@ -932,8 +932,8 @@ impl HlsCacheStore {
                         &self.resource_metadata_path(session_id, &resource.id)?,
                         &metadata,
                     )?;
-                    check_fill_control(control)?;
                     self.remove_prewarmed_resource(session_id, &resource.id)?;
+                    check_fill_control(control)?;
                     return Ok(total_length);
                 }
                 Err(error) => {
@@ -3333,15 +3333,32 @@ mod tests {
 
     #[tokio::test]
     async fn preemption_after_resource_rename_commits_metadata_before_stopping() {
-        let (upstream_url, _task) = start_mp4_upstream().await;
+        let (prewarm_url, _prewarm_task) = start_prewarm_mp4_upstream().await;
+        let (full_url, _full_task) = start_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
-        let session = sample_session_with_audio("session-resource-commit-preempt", &upstream_url);
+        let mut session = sample_session("session-resource-commit-preempt", &prewarm_url);
         let client = reqwest::Client::new();
+        let prewarm_path = store
+            .resource_prewarm_path(&session.id, "video.m4s")
+            .expect("prewarm resource path should be valid");
+        let prewarm_metadata_path = store
+            .resource_prewarm_metadata_path(&session.id, "video.m4s")
+            .expect("prewarm metadata path should be valid");
         let resource_path = store
             .resource_path(&session.id, "video.m4s")
             .expect("resource path should be valid");
 
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        assert!(prewarm_path.exists());
+        assert!(prewarm_metadata_path.exists());
+
+        session.variant.video.request.url = full_url;
         let error = store
             .cache_session_resources_with_control(
                 &client,
@@ -3360,7 +3377,9 @@ mod tests {
 
         assert!(matches!(error, HlsCacheError::Preempted));
         assert!(store.cached_resource(&session.id, "video.m4s").is_some());
-        assert!(store.cached_resource(&session.id, "audio.m4s").is_none());
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+        assert!(!prewarm_path.exists());
+        assert!(!prewarm_metadata_path.exists());
         let usage = store
             .usage_snapshot()
             .expect("partial cache usage should scan");
