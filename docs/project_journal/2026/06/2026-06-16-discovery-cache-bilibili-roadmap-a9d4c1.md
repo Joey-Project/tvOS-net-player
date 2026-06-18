@@ -205,6 +205,8 @@ superseded_by:
   - The next `independent-codex-pr-review` and `offline-frozen-diff-review` both found collection/feed item selection still dropped candidate `cid`, so multi-page history/watch-later/favorite entries could resolve to a specific part but plan playback for the default page.
   - Fixed collection/feed item selection IDs to carry `cid`, keep planning on the original collection/feed source with the selected list index, and validate the final planned BVID/aid/cid against the resolved candidate.
   - Fixed in-flight Swift resolve results so changing the input text or playback options before resolve completes drops the stale result instead of creating a task from outdated candidate state.
+  - The next `offline-frozen-diff-review` found the old-server unsupported-resolve fallback still bypassed that stale input/options guard.
+  - Fixed the unsupported-resolve fallback path to reuse the same current-submission guard and drop stale fallback submissions before creating legacy playback tasks.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
@@ -221,6 +223,8 @@ superseded_by:
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound collection item selection.
   - `swift test --filter BilibiliTaskViewModelTests` after dropping stale in-flight resolve results.
   - `just ci` after adding cid-bound collection item selection and dropping stale in-flight resolve results.
+  - `swift test --filter BilibiliTaskViewModelTests` after applying the stale guard to unsupported-resolve fallback.
+  - `just ci` after applying the stale guard to unsupported-resolve fallback.
 
 ## Next Steps
 

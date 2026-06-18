@@ -247,17 +247,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
-            guard Self.normalizedBilibiliSource(sourceText) == source,
-                currentPlaybackOptions == options
-            else {
-                currentTask = nil
-                resolvedInput = nil
-                resolvedInputContext = nil
-                selectedCandidateID = nil
-                errorMessage = nil
-                statusMessage = "Bilibili input changed before resolve completed."
-                isResolving = false
-                isSubmitting = false
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
                 return
             }
 
@@ -300,6 +291,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             if Self.isBilibiliResolveUnsupported(error) {
+                guard currentSubmissionMatches(source: source, options: options) else {
+                    discardStaleResolveSubmission()
+                    return
+                }
+
                 await createPlaybackTask(
                     source: source,
                     selectionID: nil,
@@ -814,6 +810,22 @@ private extension BilibiliTaskViewModel {
         return resolvedInputContext.source == source
             && resolvedInputContext.options == options
             && Self.normalizedBilibiliSource(resolvedInput.source) == source
+    }
+
+    func currentSubmissionMatches(source: String, options: BilibiliPlaybackTaskOptions) -> Bool {
+        Self.normalizedBilibiliSource(sourceText) == source
+            && currentPlaybackOptions == options
+    }
+
+    func discardStaleResolveSubmission() {
+        currentTask = nil
+        resolvedInput = nil
+        resolvedInputContext = nil
+        selectedCandidateID = nil
+        errorMessage = nil
+        statusMessage = "Bilibili input changed before resolve completed."
+        isResolving = false
+        isSubmitting = false
     }
 
     static func normalizedBilibiliSource(_ source: String) -> String {

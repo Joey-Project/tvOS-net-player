@@ -332,6 +332,71 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testSubmitIgnoresUnsupportedResolveFallbackWhenInputChangesBeforeCompletion() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1old", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1old",
+            clientFactory: { _ in client }
+        )
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(1)
+        XCTAssertTrue(model.isResolving)
+
+        model.sourceText = "BV1new"
+        await client.completeNextResolve(with: .failure(CacheControlClientUnsupportedFeature.bilibiliResolve))
+        await submitTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolvedInput)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Bilibili input changed before resolve completed.")
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testSubmitIgnoresUnsupportedResolveFallbackWhenOptionsChangeBeforeCompletion() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1old", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1old",
+            qualityPreference: "720p",
+            clientFactory: { _ in client }
+        )
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(1)
+        XCTAssertTrue(model.isResolving)
+
+        model.qualityPreference = "1080p"
+        await client.completeNextResolve(with: .failure(CacheControlClientUnsupportedFeature.bilibiliResolve))
+        await submitTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolvedInput)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Bilibili input changed before resolve completed.")
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testTerminalSubmitResponseDoesNotStartWatching() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(source: "BV1fail", state: "TASK_STATE_FAILED", message: "Planning failed."))
