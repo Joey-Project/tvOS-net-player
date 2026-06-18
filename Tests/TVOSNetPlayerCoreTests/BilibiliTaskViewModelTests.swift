@@ -267,6 +267,71 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitIgnoresResolveResultWhenInputChangesBeforeCompletion() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1old", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1old",
+            clientFactory: { _ in client }
+        )
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(1)
+        XCTAssertTrue(model.isResolving)
+
+        model.sourceText = "BV1new"
+        await client.completeNextResolve(with: .success(.fixture(source: "BV1old")))
+        await submitTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolvedInput)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Bilibili input changed before resolve completed.")
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testSubmitIgnoresResolveResultWhenOptionsChangeBeforeCompletion() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1old", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1old",
+            qualityPreference: "720p",
+            clientFactory: { _ in client }
+        )
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(1)
+        XCTAssertTrue(model.isResolving)
+
+        model.qualityPreference = "1080p"
+        await client.completeNextResolve(with: .success(.fixture(source: "BV1old")))
+        await submitTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolvedInput)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Bilibili input changed before resolve completed.")
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testTerminalSubmitResponseDoesNotStartWatching() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(source: "BV1fail", state: "TASK_STATE_FAILED", message: "Planning failed."))
@@ -892,13 +957,16 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var resolveResponses: [Result<BilibiliResolveResult, Error>]
     private var createResponses: [Result<CacheTask, Error>]
     private let cancelResponsesByID: [String: CacheTask]
+    private var suspendsResolveResponses: Bool
     private var suspendsCreateResponses: Bool
     private var suspendsCancelResponses = false
     private var resolvedRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
     private var createdRequests: [(urlOrID: String, selectionID: String?, options: BilibiliPlaybackTaskOptions)] = []
     private var cancelledIDs: [String] = []
+    private var pendingResolveContinuations: [CheckedContinuation<BilibiliResolveResult, Error>] = []
     private var pendingCreateContinuations: [CheckedContinuation<CacheTask, Error>] = []
     private var pendingCancelContinuations: [CheckedContinuation<CacheTask, Error>] = []
+    private var resolveRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var createRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var cancelRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var watchContinuations: [AsyncThrowingStream<CacheTask, Error>.Continuation] = []
@@ -910,11 +978,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         resolveResponses: [Result<BilibiliResolveResult, Error>] = [],
         createResponses: [Result<CacheTask, Error>],
         cancelResponsesByID: [String: CacheTask] = [:],
+        suspendsResolveResponses: Bool = false,
         suspendsCreateResponses: Bool = false
     ) {
         self.resolveResponses = resolveResponses
         self.createResponses = createResponses
         self.cancelResponsesByID = cancelResponsesByID
+        self.suspendsResolveResponses = suspendsResolveResponses
         self.suspendsCreateResponses = suspendsCreateResponses
     }
 
@@ -976,6 +1046,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult {
         resolvedRequests.append((urlOrID, options))
+        resumeResolveRequestWaiters()
+        if suspendsResolveResponses {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingResolveContinuations.append(continuation)
+            }
+        }
+
         if resolveResponses.isEmpty {
             return .fixture(source: urlOrID)
         }
@@ -1028,6 +1105,14 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         self.suspendsCancelResponses = suspendsCancelResponses
     }
 
+    func completeNextResolve(with result: Result<BilibiliResolveResult, Error>) {
+        guard !pendingResolveContinuations.isEmpty else {
+            return
+        }
+
+        pendingResolveContinuations.removeFirst().resume(with: result)
+    }
+
     func completeNextCreate(with result: Result<CacheTask, Error>) {
         guard !pendingCreateContinuations.isEmpty else {
             return
@@ -1054,6 +1139,16 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func cancelledIDsSnapshot() -> [String] {
         cancelledIDs
+    }
+
+    func waitForResolveRequestCount(_ count: Int) async {
+        guard resolvedRequests.count < count else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            resolveRequestWaiters.append((count, continuation))
+        }
     }
 
     func waitForCreateRequestCount(_ count: Int) async {
@@ -1104,6 +1199,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         let continuations = watchContinuations
         watchContinuations = []
         continuations.forEach { $0.finish(throwing: FakeBilibiliCacheControlClientError.watchFailed) }
+    }
+
+    private func resumeResolveRequestWaiters() {
+        let ready = resolveRequestWaiters.filter { $0.count <= resolvedRequests.count }
+        resolveRequestWaiters.removeAll { $0.count <= resolvedRequests.count }
+        ready.forEach { $0.continuation.resume() }
     }
 
     private func resumeCreateRequestWaiters() {

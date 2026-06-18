@@ -640,25 +640,35 @@ struct PlaybackInputSelection {
 struct PlaybackExpectedIdentity {
     bvid: Option<String>,
     aid: Option<u64>,
+    cid: Option<u64>,
 }
 
 impl PlaybackExpectedIdentity {
+    fn is_valid_collection_item_identity(&self) -> bool {
+        self.cid.is_some() && (self.bvid.is_some() || self.aid.is_some())
+    }
+
     fn matches(&self, entry: &BilibiliPlaybackEntry) -> bool {
         if let Some(expected_bvid) = self.bvid.as_deref()
             && let Some(actual_bvid) = entry.bvid.as_deref()
+            && !actual_bvid.eq_ignore_ascii_case(expected_bvid)
         {
-            return actual_bvid.eq_ignore_ascii_case(expected_bvid);
+            return false;
         }
 
-        self.aid
-            .is_some_and(|expected_aid| entry.aid == expected_aid)
-    }
+        if let Some(expected_aid) = self.aid
+            && entry.aid != expected_aid
+        {
+            return false;
+        }
 
-    fn input_override(&self) -> Option<Input> {
-        self.bvid
-            .as_ref()
-            .map(|bvid| Input::Bvid(bvid.clone()))
-            .or_else(|| self.aid.map(Input::Aid))
+        if let Some(expected_cid) = self.cid
+            && entry.cid != expected_cid
+        {
+            return false;
+        }
+
+        self.cid.is_some() || self.aid.is_some() || (self.bvid.is_some() && entry.bvid.is_some())
     }
 }
 
@@ -747,24 +757,20 @@ fn playback_collection_item_selection_from_id(
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_index(index_text, selection_id)?;
     let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
-    if expected_identity.is_none() {
+    if !expected_identity
+        .as_ref()
+        .is_some_and(PlaybackExpectedIdentity::is_valid_collection_item_identity)
+    {
         return Err(invalid_selection_id(selection_id));
     }
-    let input_override = expected_identity
-        .as_ref()
-        .and_then(PlaybackExpectedIdentity::input_override);
-    let selection = if input_override.is_some() {
-        None
-    } else {
-        Some(
-            IndexSelection::single(index)
-                .map(Selection::Indices)
-                .map_err(failed)?,
-        )
-    };
+    let selection = Some(
+        IndexSelection::single(index)
+            .map(Selection::Indices)
+            .map_err(failed)?,
+    );
 
     Ok(PlaybackInputSelection {
-        input_override,
+        input_override: None,
         selection,
         expected_identity,
     })
@@ -776,6 +782,7 @@ fn playback_expected_identity_from_parts<'a>(
 ) -> Result<Option<PlaybackExpectedIdentity>, BilibiliDownloadError> {
     let mut bvid = None;
     let mut aid = None;
+    let mut cid = None;
     while let Some(kind) = parts.next() {
         let Some(value) = parts.next() else {
             return Err(invalid_selection_id(selection_id));
@@ -787,14 +794,17 @@ fn playback_expected_identity_from_parts<'a>(
             "aid" if aid.is_none() => {
                 aid = Some(parse_selection_u64(value, selection_id)?);
             }
+            "cid" if cid.is_none() => {
+                cid = Some(parse_selection_u64(value, selection_id)?);
+            }
             _ => return Err(invalid_selection_id(selection_id)),
         }
     }
 
-    if bvid.is_none() && aid.is_none() {
+    if bvid.is_none() && aid.is_none() && cid.is_none() {
         return Ok(None);
     }
-    Ok(Some(PlaybackExpectedIdentity { bvid, aid }))
+    Ok(Some(PlaybackExpectedIdentity { bvid, aid, cid }))
 }
 
 fn parse_selection_index(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
@@ -978,8 +988,13 @@ fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> Stri
         .map(str::trim)
         .filter(|bvid| !bvid.is_empty())
         .map_or_else(
-            || format!("item:{}:aid:{}", item.index, item.aid),
-            |bvid| format!("item:{}:bvid:{}:aid:{}", item.index, bvid, item.aid),
+            || format!("item:{}:cid:{}:aid:{}", item.index, item.cid, item.aid),
+            |bvid| {
+                format!(
+                    "item:{}:cid:{}:bvid:{}:aid:{}",
+                    item.index, item.cid, bvid, item.aid
+                )
+            },
         )
 }
 
@@ -2085,39 +2100,45 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_bvid_selection_id_as_stable_input_override() {
+    fn parses_collection_item_bvid_selection_id_as_stable_index_selection() {
         let input_selection = playback_selection_from_id(
             &Input::History,
-            Some("item:7:bvid:BV1xx411c7mD:aid:170001"),
+            Some("item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
         )
         .unwrap();
 
+        assert_eq!(input_selection.input_override, None);
         assert_eq!(
-            input_selection.input_override,
-            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+            input_selection.selection,
+            Some(Selection::Indices(IndexSelection::single(7).unwrap()))
         );
-        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
                 bvid: Some("BV1xx411c7mD".to_owned()),
                 aid: Some(170_001),
+                cid: Some(270_001),
             })
         );
     }
 
     #[test]
-    fn parses_collection_item_aid_selection_id_as_stable_input_override() {
+    fn parses_collection_item_aid_selection_id_as_stable_index_selection() {
         let input_selection =
-            playback_selection_from_id(&Input::History, Some("item:7:aid:170001")).unwrap();
+            playback_selection_from_id(&Input::History, Some("item:7:cid:270001:aid:170001"))
+                .unwrap();
 
-        assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
-        assert_eq!(input_selection.selection, None);
+        assert_eq!(input_selection.input_override, None);
+        assert_eq!(
+            input_selection.selection,
+            Some(Selection::Indices(IndexSelection::single(7).unwrap()))
+        );
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
                 bvid: None,
                 aid: Some(170_001),
+                cid: Some(270_001),
             })
         );
     }
@@ -2161,8 +2182,10 @@ mod tests {
     fn rejects_unstable_or_unbounded_selection_indices() {
         for (input, selection_id) in [
             (Input::History, "item:1"),
+            (Input::History, "item:1:cid:270001"),
             (Input::History, "item:0:aid:170001"),
             (Input::History, "item:101:aid:170001"),
+            (Input::History, "item:1:aid:170001"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:0"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:101"),
         ] {
@@ -2337,23 +2360,24 @@ mod tests {
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
-            "item:3:bvid:BV1xx411c7mD:aid:170001"
+            "item:3:cid:270001:bvid:BV1xx411c7mD:aid:170001"
         );
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
 
         let input_selection =
             playback_selection_from_id(&Input::History, Some(&candidate.selection_id)).unwrap();
+        assert_eq!(input_selection.input_override, None);
         assert_eq!(
-            input_selection.input_override,
-            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+            input_selection.selection,
+            Some(Selection::Indices(IndexSelection::single(3).unwrap()))
         );
-        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
                 bvid: Some("BV1xx411c7mD".to_owned()),
                 aid: Some(170_001),
+                cid: Some(270_001),
             })
         );
     }
@@ -2377,6 +2401,7 @@ mod tests {
             .validate_expected_identity(&PlaybackExpectedIdentity {
                 bvid: Some("BV1test".to_owned()),
                 aid: Some(1),
+                cid: Some(2),
             })
             .expect("matching identity should be accepted");
     }
@@ -2387,7 +2412,25 @@ mod tests {
 
         let result = mapped.validate_expected_identity(&PlaybackExpectedIdentity {
             bvid: Some("BV1other".to_owned()),
-            aid: Some(170_001),
+            aid: Some(1),
+            cid: Some(2),
+        });
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("no longer matches the resolved candidate")
+        ));
+    }
+
+    #[test]
+    fn playback_plan_rejects_stale_collection_selection_cid() {
+        let mapped = BilibiliPlaybackPlan::from_core(sample_playback_plan(), None).unwrap();
+
+        let result = mapped.validate_expected_identity(&PlaybackExpectedIdentity {
+            bvid: Some("BV1test".to_owned()),
+            aid: Some(1),
+            cid: Some(270_001),
         });
 
         assert!(matches!(

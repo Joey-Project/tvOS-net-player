@@ -202,6 +202,9 @@ superseded_by:
   - Fixed `GRPCCacheControlClient` selected-create calls to require the `bilibiliResolve` capability before sending non-empty `selectionID` values.
   - The next `offline-frozen-diff-review` found collection/feed submissions were again synchronously resolving before task creation, so BBDown's collection info fetch mode could crawl broad lists inside the 10s UI timeout.
   - Fixed collection/feed submissions in the shared app core to skip pre-submit resolve and let the server-side background task planner handle them, while keeping ordinary video, episode, and season inputs on the resolve/select path.
+  - The next `independent-codex-pr-review` and `offline-frozen-diff-review` both found collection/feed item selection still dropped candidate `cid`, so multi-page history/watch-later/favorite entries could resolve to a specific part but plan playback for the default page.
+  - Fixed collection/feed item selection IDs to carry `cid`, keep planning on the original collection/feed source with the selected list index, and validate the final planned BVID/aid/cid against the resolved candidate.
+  - Fixed in-flight Swift resolve results so changing the input text or playback options before resolve completes drops the stale result instead of creating a task from outdated candidate state.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
@@ -215,6 +218,9 @@ superseded_by:
   - `just ci`
   - `swift test --filter BilibiliTaskViewModelTests` after skipping pre-submit resolve for collection/feed inputs.
   - `just ci` after skipping pre-submit resolve for collection/feed inputs.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound collection item selection.
+  - `swift test --filter BilibiliTaskViewModelTests` after dropping stale in-flight resolve results.
+  - `just ci` after adding cid-bound collection item selection and dropping stale in-flight resolve results.
 
 ## Next Steps
 

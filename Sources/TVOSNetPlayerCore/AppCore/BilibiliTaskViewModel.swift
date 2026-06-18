@@ -247,6 +247,20 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
+            guard Self.normalizedBilibiliSource(sourceText) == source,
+                currentPlaybackOptions == options
+            else {
+                currentTask = nil
+                resolvedInput = nil
+                resolvedInputContext = nil
+                selectedCandidateID = nil
+                errorMessage = nil
+                statusMessage = "Bilibili input changed before resolve completed."
+                isResolving = false
+                isSubmitting = false
+                return
+            }
+
             resolvedInput = resolved
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
