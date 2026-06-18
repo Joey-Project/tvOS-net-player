@@ -207,6 +207,11 @@ superseded_by:
   - Fixed in-flight Swift resolve results so changing the input text or playback options before resolve completes drops the stale result instead of creating a task from outdated candidate state.
   - The next `offline-frozen-diff-review` found the old-server unsupported-resolve fallback still bypassed that stale input/options guard.
   - Fixed the unsupported-resolve fallback path to reuse the same current-submission guard and drop stale fallback submissions before creating legacy playback tasks.
+  - The next `offline-frozen-diff-review` found video `page:` selections carried only the page number, so a multi-page video could silently play a different CID if page ordering changed between resolve and create.
+  - Fixed video page selection IDs to carry candidate `cid` plus BVID/aid identity and validate the final planned page against that identity before playback.
+  - GitHub `codex/review-gate` found BVID/aid resolve used `Selection::All`, so very large multi-page videos could be fully resolved before local candidate truncation.
+  - Fixed BVID/aid resolve to use the existing bounded `1..100` selection window while keeping concrete episode inputs on `Selection::Current`.
+  - Full `just ci` surfaced a timing-sensitive fake ffmpeg cancellation test wait; hardened the test to report early mux-task completion and tolerate slow child-process startup under loaded CI.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
@@ -225,6 +230,11 @@ superseded_by:
   - `just ci` after adding cid-bound collection item selection and dropping stale in-flight resolve results.
   - `swift test --filter BilibiliTaskViewModelTests` after applying the stale guard to unsupported-resolve fallback.
   - `just ci` after applying the stale guard to unsupported-resolve fallback.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound video page selection.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after bounding BVID/aid resolve selection.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter::tests::mux_download_report_cancels_running_ffmpeg -- --nocapture` after hardening the fake ffmpeg cancellation wait.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml` after hardening the fake ffmpeg cancellation wait.
+  - `just ci` after cid-bound video page selections, bounded BVID/aid resolve selection, and fake ffmpeg cancellation wait hardening.
 
 ## Next Steps
 

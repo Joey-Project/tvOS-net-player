@@ -550,7 +550,7 @@ fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
 
 fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownloadError> {
     match input {
-        Input::Aid(_) | Input::Bvid(_) => Ok(Selection::All),
+        Input::Aid(_) | Input::Bvid(_) => resolve_selection(),
         Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
             Ok(Selection::Current)
         }
@@ -644,8 +644,12 @@ struct PlaybackExpectedIdentity {
 }
 
 impl PlaybackExpectedIdentity {
-    fn is_valid_collection_item_identity(&self) -> bool {
+    fn is_valid_page_identity(&self) -> bool {
         self.cid.is_some() && (self.bvid.is_some() || self.aid.is_some())
+    }
+
+    fn is_valid_collection_item_identity(&self) -> bool {
+        self.is_valid_page_identity()
     }
 
     fn matches(&self, entry: &BilibiliPlaybackEntry) -> bool {
@@ -687,11 +691,7 @@ fn playback_selection_from_id(
         if !playback_input_accepts_page_selection(input) {
             return Err(invalid_selection_id(selection_id));
         }
-        return parse_selection_index(page, selection_id).map(|page| PlaybackInputSelection {
-            input_override: None,
-            selection: Some(Selection::Page(page)),
-            expected_identity: None,
-        });
+        return playback_page_selection_from_id(page, selection_id);
     }
     if let Some(item) = selection_id.strip_prefix("item:") {
         if !playback_input_accepts_collection_item_selection(input) {
@@ -744,6 +744,31 @@ fn playback_input_accepts_collection_item_selection(input: &Input) -> bool {
             | Input::History
             | Input::WatchLater
     )
+}
+
+fn playback_page_selection_from_id(
+    page: &str,
+    selection_id: &str,
+) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
+    let mut parts = page.split(':');
+    let index_text = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_selection_id(selection_id))?;
+    let index = parse_selection_index(index_text, selection_id)?;
+    let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    if !expected_identity
+        .as_ref()
+        .is_some_and(PlaybackExpectedIdentity::is_valid_page_identity)
+    {
+        return Err(invalid_selection_id(selection_id));
+    }
+
+    Ok(PlaybackInputSelection {
+        input_override: None,
+        selection: Some(Selection::Page(index)),
+        expected_identity,
+    })
 }
 
 fn playback_collection_item_selection_from_id(
@@ -880,7 +905,7 @@ impl BilibiliInputResolution {
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|page| BilibiliResolvedCandidate {
-                        selection_id: page_selection_id(page.index),
+                        selection_id: page_selection_id(page, video.bvid.as_deref()),
                         title: non_empty_or(&page.title, &video.title),
                         subtitle: format!("Page {}", page.index),
                         source_kind: "video_page".to_owned(),
@@ -978,8 +1003,19 @@ fn resolve_should_use_full_episode_list(input: &Input) -> bool {
     )
 }
 
-fn page_selection_id(index: u32) -> String {
-    format!("page:{index}")
+fn page_selection_id(page: &bbdown_core::PageMetadata, video_bvid: Option<&str>) -> String {
+    video_bvid
+        .map(str::trim)
+        .filter(|bvid| !bvid.is_empty())
+        .map_or_else(
+            || format!("page:{}:cid:{}:aid:{}", page.index, page.cid, page.aid),
+            |bvid| {
+                format!(
+                    "page:{}:cid:{}:bvid:{}:aid:{}",
+                    page.index, page.cid, bvid, page.aid
+                )
+            },
+        )
 }
 
 fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> String {
@@ -2039,15 +2075,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_uses_single_overview_requests_for_common_inputs() {
+    fn resolve_selection_bounds_common_video_inputs() {
+        let bounded_selection = resolve_selection().unwrap();
         assert_eq!(
             resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())).unwrap(),
-            Selection::All
+            bounded_selection
         );
         assert_eq!(
             resolve_selection_for_input(&Input::Aid(123)).unwrap(),
-            Selection::All
+            bounded_selection
         );
+    }
+
+    #[test]
+    fn resolve_selection_uses_single_overview_requests_for_list_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Season(123)).unwrap(),
             Selection::Page(1)
@@ -2080,13 +2121,40 @@ mod tests {
 
     #[test]
     fn parses_video_page_selection_id() {
+        let input_selection = playback_selection_from_id(
+            &Input::Bvid("BV1xx411c7mD".to_owned()),
+            Some("page:7:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
+        )
+        .unwrap();
+
+        assert_eq!(input_selection.input_override, None);
+        assert_eq!(input_selection.selection, Some(Selection::Page(7)));
+        assert_eq!(
+            input_selection.expected_identity,
+            Some(PlaybackExpectedIdentity {
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_001),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_video_page_aid_selection_id() {
         let input_selection =
-            playback_selection_from_id(&Input::Bvid("BV1xx411c7mD".to_owned()), Some("page:7"))
+            playback_selection_from_id(&Input::Aid(170_001), Some("page:7:cid:270001:aid:170001"))
                 .unwrap();
 
         assert_eq!(input_selection.input_override, None);
-        assert_eq!(input_selection.expected_identity, None);
         assert_eq!(input_selection.selection, Some(Selection::Page(7)));
+        assert_eq!(
+            input_selection.expected_identity,
+            Some(PlaybackExpectedIdentity {
+                bvid: None,
+                aid: Some(170_001),
+                cid: Some(270_001),
+            })
+        );
     }
 
     #[test]
@@ -2186,6 +2254,8 @@ mod tests {
             (Input::History, "item:0:aid:170001"),
             (Input::History, "item:101:aid:170001"),
             (Input::History, "item:1:aid:170001"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "page:1"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "page:1:cid:270001"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:0"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:101"),
         ] {
@@ -2299,9 +2369,27 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.selection_id.as_str())
                 .collect::<Vec<_>>(),
-            ["page:1", "page:2"]
+            [
+                "page:1:cid:270001:bvid:BV1multi:aid:170001",
+                "page:2:cid:270002:bvid:BV1multi:aid:170001"
+            ]
         );
         assert_eq!(resolution.default_selection_id, "");
+
+        let input_selection = playback_selection_from_id(
+            &Input::Bvid("BV1multi".to_owned()),
+            Some(&resolution.candidates[1].selection_id),
+        )
+        .unwrap();
+        assert_eq!(input_selection.selection, Some(Selection::Page(2)));
+        assert_eq!(
+            input_selection.expected_identity,
+            Some(PlaybackExpectedIdentity {
+                bvid: Some("BV1multi".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_002),
+            })
+        );
     }
 
     #[test]
@@ -2414,6 +2502,23 @@ mod tests {
             bvid: Some("BV1other".to_owned()),
             aid: Some(1),
             cid: Some(2),
+        });
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("no longer matches the resolved candidate")
+        ));
+    }
+
+    #[test]
+    fn playback_plan_rejects_stale_page_selection_cid() {
+        let mapped = BilibiliPlaybackPlan::from_core(sample_playback_plan(), None).unwrap();
+
+        let result = mapped.validate_expected_identity(&PlaybackExpectedIdentity {
+            bvid: Some("BV1test".to_owned()),
+            aid: Some(1),
+            cid: Some(3),
         });
 
         assert!(matches!(
@@ -2923,12 +3028,24 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_probe = Arc::clone(&cancelled);
         let ffmpeg_for_task = ffmpeg.clone();
-        let mux_task = tokio::spawn(async move {
+        let mut mux_task = tokio::spawn(async move {
             let is_cancel_requested = || cancel_probe.load(Ordering::SeqCst);
             mux_download_report(report, &ffmpeg_for_task, &is_cancel_requested).await
         });
 
-        wait_for_path(&temp.path().join("ffmpeg-started")).await;
+        let ffmpeg_started_path = temp.path().join("ffmpeg-started");
+        tokio::select! {
+            () = wait_for_path(&ffmpeg_started_path) => {}
+            result = &mut mux_task => {
+                match result {
+                    Ok(Ok(_)) => panic!("mux task completed before fake ffmpeg started"),
+                    Ok(Err(error)) => {
+                        panic!("mux task failed before fake ffmpeg started: {error:?}")
+                    }
+                    Err(error) => panic!("mux task panicked before fake ffmpeg started: {error}"),
+                }
+            }
+        }
         let pid = std::fs::read_to_string(temp.path().join("ffmpeg.pid"))
             .unwrap()
             .trim()
@@ -3243,7 +3360,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn wait_for_path(path: &Path) {
-        for _ in 0..200 {
+        for _ in 0..600 {
             if path.exists() {
                 return;
             }
