@@ -153,15 +153,18 @@ superseded_by:
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bounded_resolve_fallback_only_retries_short_selection_errors --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib`
-  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after the stable collection-item selection identity fix.
-  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib` after the stable collection-item selection identity fix.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after preserving collection-item source context.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib` after preserving collection-item source context.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server mux_download_report_cancels_running_ffmpeg --lib` after moving the fake ffmpeg start marker before partial-output creation.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib` after moving the fake ffmpeg start marker before partial-output creation.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after removing unbounded `Selection::All` resolve fallback.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after replacing fixed retry windows with largest bounded-prefix probing.
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib` after replacing fixed retry windows with largest bounded-prefix probing.
   - `just ci` after the concrete-episode selection fix.
   - `just ci` after the collection item selection fix.
   - `just ci` after the bounded short-result resolve fallback fix.
-  - `just ci` after the stable collection-item selection identity fix.
+  - `just ci` after the collection-item source-context fix.
+  - `just ci` after moving the fake ffmpeg start marker before partial-output creation.
   - `just ci` after removing unbounded `Selection::All` resolve fallback and replacing it with smaller bounded retry windows.
   - `just ci` after replacing fixed retry windows with largest bounded-prefix probing.
 - PR D pre-commit internal review:
@@ -171,7 +174,7 @@ superseded_by:
   - Found and fixed concrete episode, cheese episode, and international episode inputs so resolve planning preserves `Selection::Current` instead of forcing a first-page candidate window.
   - Found and fixed collection, favorite, history, and watch-later candidates so their opaque selection IDs round-trip to single-item `Selection::Indices` instead of video-page `Selection::Page`.
   - Found and fixed bounded resolve for short videos, seasons, and lists by retrying with smaller bounded index windows when BBDown core reports a missing selected page, episode, or collection item; returned candidates remain capped to 100.
-  - Found and fixed unstable collection/feed selection IDs by embedding the candidate BVID or aid in the opaque ID and using that stable identity as the playback planning source instead of replaying the mutable list index.
+  - Found and fixed collection/feed selection IDs so playback planning keeps the original collection/feed source and applies the selected list index instead of rewriting the input to a single BVID or aid.
   - Found and fixed unbounded short-result fallback by replacing `Selection::All` retry with smaller bounded index windows.
   - Found and fixed fixed-window bounded retries truncating common 2-4 candidate inputs by probing for the largest valid bounded `1..N` prefix instead of accepting the first smaller successful window.
   - Final `codex-readonly` isolated review after largest bounded-prefix probing: LGTM.

@@ -660,26 +660,22 @@ fn playback_collection_item_selection_from_id(
     let index = parse_selection_u32(index_text, selection_id)?;
 
     match (parts.next(), parts.next(), parts.next()) {
-        (None, None, None) => IndexSelection::single(index)
-            .map(Selection::Indices)
-            .map(|selection| PlaybackInputSelection {
-                input_override: None,
-                selection: Some(selection),
-            })
-            .map_err(failed),
-        (Some("bvid"), Some(bvid), None) if !bvid.trim().is_empty() => Ok(PlaybackInputSelection {
-            input_override: Some(Input::Bvid(bvid.trim().to_owned())),
-            selection: Some(Selection::Current),
-        }),
+        (None, None, None) => Ok(()),
+        (Some("bvid"), Some(bvid), None) if !bvid.trim().is_empty() => Ok(()),
         (Some("aid"), Some(aid), None) => {
-            let aid = parse_selection_u64(aid, selection_id)?;
-            Ok(PlaybackInputSelection {
-                input_override: Some(Input::Aid(aid)),
-                selection: Some(Selection::Current),
-            })
+            let _ = parse_selection_u64(aid, selection_id)?;
+            Ok(())
         }
         _ => Err(invalid_selection_id(selection_id)),
-    }
+    }?;
+
+    IndexSelection::single(index)
+        .map(Selection::Indices)
+        .map(|selection| PlaybackInputSelection {
+            input_override: None,
+            selection: Some(selection),
+        })
+        .map_err(failed)
 }
 
 fn parse_selection_u32(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
@@ -822,15 +818,7 @@ fn page_selection_id(index: u32) -> String {
 }
 
 fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> String {
-    match item
-        .bvid
-        .as_deref()
-        .map(str::trim)
-        .filter(|bvid| !bvid.is_empty())
-    {
-        Some(bvid) => format!("item:{}:bvid:{bvid}", item.index),
-        None => format!("item:{}:aid:{}", item.index, item.aid),
-    }
+    format!("item:{}", item.index)
 }
 
 fn episode_selection_id(epid: u64) -> String {
@@ -1913,22 +1901,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_bvid_selection_id_as_source_override() {
+    fn parses_collection_item_bvid_selection_id_as_index_selection() {
         let input_selection = playback_selection_from_id(Some("item:7:bvid:BV1xx411c7mD")).unwrap();
 
-        assert_eq!(
-            input_selection.input_override,
-            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
-        );
-        assert_eq!(input_selection.selection, Some(Selection::Current));
+        assert_eq!(input_selection.input_override, None);
+        let Selection::Indices(indices) = input_selection
+            .selection
+            .expect("selection id should resolve to a selection")
+        else {
+            panic!("collection item selection should use index selection");
+        };
+        assert!(indices.contains(7));
+        assert!(!indices.contains(6));
+        assert!(!indices.contains(8));
     }
 
     #[test]
-    fn parses_collection_item_aid_selection_id_as_source_override() {
+    fn parses_collection_item_aid_selection_id_as_index_selection() {
         let input_selection = playback_selection_from_id(Some("item:7:aid:170001")).unwrap();
 
-        assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
-        assert_eq!(input_selection.selection, Some(Selection::Current));
+        assert_eq!(input_selection.input_override, None);
+        let Selection::Indices(indices) = input_selection
+            .selection
+            .expect("selection id should resolve to a selection")
+        else {
+            panic!("collection item selection should use index selection");
+        };
+        assert!(indices.contains(7));
+        assert!(!indices.contains(6));
+        assert!(!indices.contains(8));
     }
 
     #[test]
@@ -2025,16 +2026,21 @@ mod tests {
         assert_eq!(resolution.source_kind, "favorite");
         assert_eq!(resolution.candidates.len(), 1);
         let candidate = &resolution.candidates[0];
-        assert_eq!(candidate.selection_id, "item:3:bvid:BV1xx411c7mD");
+        assert_eq!(candidate.selection_id, "item:3");
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
 
         let input_selection = playback_selection_from_id(Some(&candidate.selection_id)).unwrap();
-        assert_eq!(
-            input_selection.input_override,
-            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
-        );
-        assert_eq!(input_selection.selection, Some(Selection::Current));
+        assert_eq!(input_selection.input_override, None);
+        let Selection::Indices(indices) = input_selection
+            .selection
+            .expect("selection id should resolve to a selection")
+        else {
+            panic!("collection candidate selection should use original source index");
+        };
+        assert!(indices.contains(3));
+        assert!(!indices.contains(2));
+        assert!(!indices.contains(4));
     }
 
     #[test]
@@ -2914,12 +2920,12 @@ printf muxed > "$last"
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 printf '%s\n' "$$" > "$script_dir/ffmpeg.pid"
+: > "$script_dir/ffmpeg-started"
 last=
 for arg in "$@"; do
   last=$arg
 done
 printf partial > "$last"
-: > "$script_dir/ffmpeg-started"
 while :; do
   sleep 1
 done
