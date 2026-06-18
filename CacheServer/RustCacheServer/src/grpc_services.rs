@@ -855,7 +855,10 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
-    let projected_added_bytes = hls_session_declared_size_bytes(&session).unwrap_or_default();
+    let projected_added_bytes = state
+        .hls_cache
+        .session_projected_remaining_size_bytes(&session)
+        .unwrap_or_default();
     if let Err(error) = state.enforce_hls_cache_quota_until_cancelled(
         "before_hls_finalization",
         [task_id.clone()],
@@ -2488,6 +2491,100 @@ mod tests {
                 .is_some()
         );
         assert!(state.tasks.get_task(&older.task_id).is_err());
+        assert!(state.tasks.get_task(&current_task_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_finalization_quota_projects_only_uncached_session_bytes() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 4,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let older =
+            create_completed_hls_playback_task(&state, "BV1projection-older", &upstream_url).await;
+        let (current_task_id, mut current_session, current_library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1projection-current", &upstream_url);
+        current_session.variant.video.request.size = Some(session_size);
+        let mut audio = current_session.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = BilibiliMediaRequestKind::Audio;
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.size = Some(session_size);
+        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
+        current_session.variant.audio = Some(audio);
+        state.hls_sessions.insert(current_session.clone());
+
+        let cache_for_preempt = state.hls_cache.clone();
+        let task_id_for_preempt = current_task_id.clone();
+        let error = state
+            .hls_cache
+            .cache_session_resources_with_control(
+                &state.hls_upstream_client,
+                &current_session,
+                move || {
+                    if cache_for_preempt
+                        .cached_resource(&task_id_for_preempt, "video.m4s")
+                        .is_some()
+                    {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("preempted fill should leave a partial current session");
+        assert!(matches!(error, crate::hls_cache::HlsCacheError::Preempted));
+
+        let partial_status = state
+            .hls_cache_status()
+            .expect("partial status should scan cache");
+        assert_eq!(2 * session_size, partial_status.usage.used_bytes);
+        assert!(partial_status.last_eviction.is_none());
+
+        run_hls_cache_finalization(
+            state.clone(),
+            current_task_id.clone(),
+            current_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        )
+        .await;
+
+        let status = state
+            .hls_cache_status()
+            .expect("status should scan after finalization");
+        assert_eq!(3 * session_size, status.usage.used_bytes);
+        assert!(status.last_eviction.is_none());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&older.library_item_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&current_library_item_id)
+                .is_some()
+        );
+        assert!(state.tasks.get_task(&older.task_id).is_ok());
         assert!(state.tasks.get_task(&current_task_id).is_ok());
     }
 

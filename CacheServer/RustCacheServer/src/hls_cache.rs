@@ -700,6 +700,26 @@ impl HlsCacheStore {
         Some(total)
     }
 
+    pub(crate) fn session_projected_remaining_size_bytes(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> Option<u64> {
+        let mut total = 0_u64;
+        for resource in session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+        {
+            let declared_size = resource.request.size?;
+            let managed_size = self
+                .resource_managed_size(&session.id, &resource.id)
+                .min(declared_size);
+            total = total.checked_add(declared_size.saturating_sub(managed_size))?;
+        }
+        Some(total)
+    }
+
     fn managed_usage_size_bytes(&self) -> io::Result<u64> {
         let mut total = 0_u64;
         for session in self.load_sessions()? {
@@ -2067,6 +2087,51 @@ mod tests {
             .expect("usage snapshot should count partial cache resources");
         assert_eq!(0, usage.completed_session_count);
         assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
+    }
+
+    #[tokio::test]
+    async fn projected_remaining_size_excludes_managed_partial_resources() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session_with_audio("session-partial-projection", &upstream_url);
+        let resource_size = fake_mp4().len() as u64;
+        session.variant.video.request.size = Some(resource_size);
+        session
+            .variant
+            .audio
+            .as_mut()
+            .expect("sample session should include audio")
+            .request
+            .size = Some(resource_size);
+        let client = reqwest::Client::new();
+        let store_for_preempt = store.clone();
+        let session_id = session.id.clone();
+
+        let error = store
+            .cache_session_resources_with_control(
+                &client,
+                &session,
+                move || {
+                    if store_for_preempt
+                        .cached_resource(&session_id, "video.m4s")
+                        .is_some()
+                    {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("preempted session should leave partial cache resources");
+        assert!(matches!(error, HlsCacheError::Preempted));
+
+        assert_eq!(
+            Some(resource_size),
+            store.session_projected_remaining_size_bytes(&session)
+        );
     }
 
     #[test]
