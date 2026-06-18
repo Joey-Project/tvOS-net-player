@@ -26,19 +26,36 @@ public protocol CacheControlClient: Sendable {
     func getTask(id: String) async throws -> CacheTask
     func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error>
     func cancelTask(id: String) async throws -> CacheTask
+    func resolveBilibiliInput(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> BilibiliResolveResult
     func createBilibiliPlaybackTask(
         urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selectionID: String?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask
 }
 
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case hlsCacheStatus
+    case bilibiliResolve
 }
 
 public extension CacheControlClient {
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+    }
+
+    func resolveBilibiliInput(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> BilibiliResolveResult {
+        throw CacheControlClientUnsupportedFeature.bilibiliResolve
     }
 
     func listLibraryItemsPage(
@@ -54,6 +71,21 @@ public extension CacheControlClient {
         try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
             options: BilibiliPlaybackTaskOptions()
+        )
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selectionID: String?,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard normalizedSelectionID.isEmpty else {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolve
+        }
+        return try await createBilibiliPlaybackTask(
+            urlOrID: urlOrID,
+            options: options
         )
     }
 

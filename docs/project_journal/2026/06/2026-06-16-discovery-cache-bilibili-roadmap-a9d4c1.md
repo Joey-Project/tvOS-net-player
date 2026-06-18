@@ -1,10 +1,10 @@
 ---
 id: 20260616-a9d4c1
 title: Discovery Cache And Bilibili Roadmap
-status: active
+status: completed
 created: 2026-06-16
-updated: 2026-06-16
-branch: wip/weak-network-progressive-scheduler
+updated: 2026-06-18
+branch: wip/bilibili-resolve-select-schema
 pr:
 supersedes: []
 superseded_by:
@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 
 - Physical Apple TV validation remains deferred until signing and device pairing are available.
-- Deliver the next product slice as sequential PRs, each branched from updated `master` after the previous PR is merged.
+- Delivered the product slice as sequential PRs, each branched from updated `master` after the previous PR was merged.
 - Keep gRPC as the control plane and HTTP/HLS/Range URLs as the media plane.
 - Prioritize online playback responsiveness while making completed and partially prepared HLS cache more useful on weak networks.
 
@@ -69,6 +69,7 @@ superseded_by:
 
 ### PR D: Bilibili Resolve/Select Multi-Result Control Plane
 
+- Status: implemented by this slice.
 - Add a resolve RPC that maps a Bilibili input into selectable candidates.
 - Keep playback/cache task creation single-selection and accept an opaque `selection_id`.
 - Return enough candidate metadata for tvOS/macOS selection UI: title, index/subtitle, source kind/content id, and optional duration/cover when the core provides it.
@@ -129,7 +130,117 @@ superseded_by:
   - `cargo test --package tvos-net-player-cache-server bonjour` after the concrete listener-address fix, media-plane advertisement gate, and listener-before-advertise hardening.
 - Targeted Swift validation:
   - `swift test --filter CacheServerDiscoveryViewModelTests` after the discovered-server persistence, discovery error-visibility, failed-auto-connect recovery, browser restart, and retry-backoff fixes.
+- PR D targeted local validation:
+  - `just ci` after the PR D implementation and local review fixes.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server get_server_info_advertises_bilibili_resolve_capability --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_selection_limits_candidates_to_first_page_window --lib`
+  - `scripts/test.sh`
+  - `scripts/test-cache-server.sh`
+  - `scripts/format.sh`
+  - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `python3 /Users/joey/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+  - `git diff --check`
+- PR D final local validation:
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_selection_preserves_current_episode_inputs --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_selection_uses_bounded_indices_for_broad_inputs --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server parses_collection_item_selection_id_as_single_index --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server collection_resolution_candidates_round_trip_as_item_selections --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bounded_resolve_fallback_only_retries_short_selection_errors --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after preserving collection-item source context.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib` after preserving collection-item source context.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server mux_download_report_cancels_running_ffmpeg --lib` after moving the fake ffmpeg start marker before partial-output creation.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib` after moving the fake ffmpeg start marker before partial-output creation.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after removing unbounded `Selection::All` resolve fallback.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib` after replacing fixed retry windows with largest bounded-prefix probing.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib` after replacing fixed retry windows with largest bounded-prefix probing.
+  - `just ci` after the concrete-episode selection fix.
+  - `just ci` after the collection item selection fix.
+  - `just ci` after the bounded short-result resolve fallback fix.
+  - `just ci` after the collection-item source-context fix.
+  - `just ci` after moving the fake ffmpeg start marker before partial-output creation.
+  - `just ci` after removing unbounded `Selection::All` resolve fallback and replacing it with smaller bounded retry windows.
+  - `just ci` after replacing fixed retry windows with largest bounded-prefix probing.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib` after adding stale collection selection identity validation and sharing the playback-planning semaphore with resolve RPCs.
+  - `just ci` after adding stale collection selection identity validation and sharing the playback-planning semaphore with resolve RPCs.
+- PR D pre-commit internal review:
+  - Found and fixed old-server compatibility by advertising a `bilibiliResolve` capability and falling back to direct task creation when the resolve RPC returns `UNIMPLEMENTED`.
+  - Initially separated resolve from playback task creation; final review later re-shared the playback-planning semaphore for BBDown resolve work that can fetch broad collections.
+  - Found and fixed unbounded resolve fan-out by asking BBDown core for a bounded first candidate window and capping returned candidates to 100.
+  - Found and fixed concrete episode, cheese episode, and international episode inputs so resolve planning preserves `Selection::Current` instead of forcing a first-page candidate window.
+  - Found and fixed collection, favorite, history, and watch-later candidates so their opaque selection IDs round-trip to single-item `Selection::Indices` instead of video-page `Selection::Page`.
+  - Found and fixed bounded resolve for short videos, seasons, and lists by retrying with smaller bounded index windows when BBDown core reports a missing selected page, episode, or collection item; returned candidates remain capped to 100.
+  - Found and fixed collection/feed selection IDs so playback planning keeps the original collection/feed source and applies the selected list index instead of rewriting the input to a single BVID or aid.
+  - Found and fixed unbounded short-result fallback by replacing `Selection::All` retry with smaller bounded index windows.
+  - Found and fixed fixed-window bounded retries truncating common 2-4 candidate inputs by probing for the largest valid bounded `1..N` prefix instead of accepting the first smaller successful window.
+  - Earlier `codex-readonly` isolated review after largest bounded-prefix probing: LGTM.
+- PR D triple-review fixes:
+  - `independent-codex-pr-review` found dynamic collection/feed candidate selection could silently play a different item when the list changed between resolve and create.
+  - `offline-frozen-diff-review` found the same index-only collection/feed selection risk and found resolve RPCs bypassed the playback-planning concurrency limiter.
+  - Fixed collection/feed selection IDs by preserving the original source context, adding expected BVID/aid identity to opaque `item` IDs, and failing stale selections when the planned entry no longer matches the resolved candidate.
+  - Fixed resolve RPC resource protection by acquiring `playback_planning_permits` while the resolver runs.
+- PR D final review follow-up:
+  - `independent-codex-pr-review` found selected candidate submissions were only bound to the source text, so changing the cache server endpoint or playback options after resolve could send a server-specific selection ID to the wrong create request.
+  - `independent-codex-pr-review` also found the new selected-create method replaced the old public `CacheControlClient.createBilibiliPlaybackTask(urlOrID:options:)` requirement, breaking existing external conformers.
+  - `offline-frozen-diff-review` found common Bilibili resolve inputs could require multiple upstream resolve calls before returning candidates, risking the UI timeout budget.
+  - Fixed the Swift view model by binding resolved candidates to normalized source text, cache server endpoint, and playback options, and forcing a fresh resolve when any of those change before selected submission.
+  - Restored the legacy `CacheControlClient.createBilibiliPlaybackTask(urlOrID:options:)` requirement and added a default selected-create overload that forwards nil selections while rejecting non-empty selections for conformers that do not support Bilibili resolve.
+  - Fixed the Rust adapter to use single overview resolve requests for common inputs and extract full episode candidates from returned metadata, keeping the old bounded-prefix fallback only for short-result recovery paths.
+  - The next `independent-codex-pr-review` and GitHub `codex/review-gate` pass found that ordinary BV/av resolve used `Selection::Current`, hiding multi-page candidates, collection/list resolve exposed full fetched lists before local truncation, arbitrary `selection_id` strings could request unbounded playback planning, stable collection identities only failed stale plans instead of planning by BVID/aid, and the picker state could not be cleared from the platform UIs.
+  - Fixed BV/av resolve by using `Selection::All` and adding an adapter test that multi-page videos produce page candidates.
+  - Fixed collection/list resolve to return only BBDown's selected item until `bbdown-core` exposes a bounded candidate-page API, avoiding adapter-level full-list candidate exposure.
+  - Restricted playback `selection_id` parsing to resolver-generated single-item `page:`, `episode:`, and `item:` forms; `item:` IDs carrying BVID/aid now override planning to the stable video input before falling back to original index selection.
+  - Added shared Bilibili `canClear` state and wired tvOS/macOS controls to clear resolved candidate pickers.
+  - The next `independent-codex-pr-review` found `page:` and bare `item:` IDs could still be paired with collection/feed sources and trigger high-index BBDown fetch windows.
+  - The next `offline-frozen-diff-review` found direct selected-create calls against old gRPC servers could silently ignore the new `selection_id` field and play the default candidate.
+  - Fixed playback `selection_id` parsing to validate IDs against the source input kind, reject unstable bare item IDs, and cap resolver-index IDs to the advertised candidate window.
+  - Fixed `GRPCCacheControlClient` selected-create calls to require the `bilibiliResolve` capability before sending non-empty `selectionID` values.
+  - The next `offline-frozen-diff-review` found collection/feed submissions were again synchronously resolving before task creation, so BBDown's collection info fetch mode could crawl broad lists inside the 10s UI timeout.
+  - Fixed collection/feed submissions in the shared app core to skip pre-submit resolve and let the server-side background task planner handle them, while keeping ordinary video, episode, and season inputs on the resolve/select path.
+  - The next `independent-codex-pr-review` and `offline-frozen-diff-review` both found collection/feed item selection still dropped candidate `cid`, so multi-page history/watch-later/favorite entries could resolve to a specific part but plan playback for the default page.
+  - Fixed collection/feed item selection IDs to carry `cid`, keep planning on the original collection/feed source with the selected list index, and validate the final planned BVID/aid/cid against the resolved candidate.
+  - Fixed in-flight Swift resolve results so changing the input text or playback options before resolve completes drops the stale result instead of creating a task from outdated candidate state.
+  - The next `offline-frozen-diff-review` found the old-server unsupported-resolve fallback still bypassed that stale input/options guard.
+  - Fixed the unsupported-resolve fallback path to reuse the same current-submission guard and drop stale fallback submissions before creating legacy playback tasks.
+  - The next `offline-frozen-diff-review` found video `page:` selections carried only the page number, so a multi-page video could silently play a different CID if page ordering changed between resolve and create.
+  - Fixed video page selection IDs to carry candidate `cid` plus BVID/aid identity and validate the final planned page against that identity before playback.
+  - GitHub `codex/review-gate` found BVID/aid resolve used `Selection::All`, so very large multi-page videos could be fully resolved before local candidate truncation.
+  - Fixed BVID/aid resolve to use the existing bounded `1..100` selection window while keeping concrete episode inputs on `Selection::Current`.
+  - The next `offline-frozen-diff-review` found bounded BVID/aid resolve could turn common short videos into several upstream BBDown resolve attempts before returning candidates.
+  - Fixed ordinary BVID/aid resolve to pass no explicit selection, let BBDown core return video metadata in one request, and keep the adapter's local `take(100)` candidate cap plus cid-bound page selection IDs.
+  - Full `just ci` surfaced a timing-sensitive fake ffmpeg cancellation test wait; hardened the test to report early mux-task completion and tolerate slow child-process startup under loaded CI.
+- PR D final review follow-up validation:
+  - `scripts/format.sh`
+  - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
+  - `swift test --filter TVOSNetPlayerCacheClientTests`
+  - `swift test --filter BilibiliTaskViewModelTests`
+  - `swift test --filter CacheLibraryPaginationTests`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_waits_for_playback_planning_permit --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server playback_plan_rejects_stale_collection_selection_identity --lib`
+  - `just ci`
+  - `swift test --filter BilibiliTaskViewModelTests` after skipping pre-submit resolve for collection/feed inputs.
+  - `just ci` after skipping pre-submit resolve for collection/feed inputs.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound collection item selection.
+  - `swift test --filter BilibiliTaskViewModelTests` after dropping stale in-flight resolve results.
+  - `just ci` after adding cid-bound collection item selection and dropping stale in-flight resolve results.
+  - `swift test --filter BilibiliTaskViewModelTests` after applying the stale guard to unsupported-resolve fallback.
+  - `just ci` after applying the stale guard to unsupported-resolve fallback.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after adding cid-bound video page selection.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after bounding BVID/aid resolve selection.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter` after switching ordinary BVID/aid resolve back to one no-selection metadata request with local candidate truncation.
+  - `just ci` after switching ordinary BVID/aid resolve back to one no-selection metadata request with local candidate truncation.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml bbdown_adapter::tests::mux_download_report_cancels_running_ffmpeg -- --nocapture` after hardening the fake ffmpeg cancellation wait.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml` after hardening the fake ffmpeg cancellation wait.
+  - `just ci` after cid-bound video page selections, bounded BVID/aid resolve selection, and fake ffmpeg cancellation wait hardening.
 
 ## Next Steps
 
-- After PR C merges, update `master`, branch PR D, and design the Bilibili resolve/select schema before wiring multi-result candidate prewarm.
+- Finish the PR D triple review, GitHub CI, resolved-conversation check, merge, and `master` sync.
+- Defer candidate prewarm beyond selected-item first-frame prewarm until we have real usage data for multi-result browsing.

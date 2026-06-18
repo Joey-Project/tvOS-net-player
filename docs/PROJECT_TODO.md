@@ -8,4 +8,4 @@
 - [completed] PR A：加入 Bonjour discovery、自动连接、server picker 和 manual fallback。
 - [completed] PR B：加入 HLS cache 50 GiB 默认 quota、90% high watermark、80% low watermark 和自动淘汰。
 - [completed] PR C：加入弱网 progressive fill scheduler、旧播放 demotion/FILO、first-frame prewarm 和更完整状态 UX。
-- [pending] PR D：加入 Bilibili resolve/select multi-result control-plane schema 和 tvOS/macOS selection UI。
+- [completed] PR D：加入 Bilibili resolve/select multi-result control-plane schema 和 tvOS/macOS selection UI。

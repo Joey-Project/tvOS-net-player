@@ -90,9 +90,14 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsLibraryItemDelete: Bool {
         capabilities.contains(CacheServerCapability.libraryItemDelete)
     }
+
+    public var supportsBilibiliResolve: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliResolve)
+    }
 }
 
 public enum CacheServerCapability {
+    public static let bilibiliResolve = "bilibiliResolve"
     public static let libraryItemDelete = "libraryItemDelete"
 }
 
@@ -404,6 +409,65 @@ public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
         self.preferTVAPI = preferTVAPI
+    }
+}
+
+public struct BilibiliResolveResult: Equatable, Sendable {
+    public let source: String
+    public let title: String
+    public let sourceKind: String
+    public let candidates: [BilibiliResolvedCandidate]
+    public let defaultSelectionID: String
+
+    public init(
+        source: String,
+        title: String,
+        sourceKind: String,
+        candidates: [BilibiliResolvedCandidate],
+        defaultSelectionID: String
+    ) {
+        self.source = source
+        self.title = title
+        self.sourceKind = sourceKind
+        self.candidates = candidates
+        self.defaultSelectionID = defaultSelectionID
+    }
+
+    public var requiresSelection: Bool {
+        candidates.count > 1
+    }
+}
+
+public struct BilibiliResolvedCandidate: Identifiable, Equatable, Sendable {
+    public var id: String { selectionID }
+
+    public let selectionID: String
+    public let title: String
+    public let subtitle: String
+    public let sourceKind: String
+    public let contentID: String
+    public let index: Int
+    public let durationSeconds: Int64
+    public let coverURI: String
+
+    public init(
+        selectionID: String,
+        title: String,
+        subtitle: String,
+        sourceKind: String,
+        contentID: String,
+        index: Int,
+        durationSeconds: Int64,
+        coverURI: String
+    ) {
+        self.selectionID = selectionID
+        self.title = title
+        self.subtitle = subtitle
+        self.sourceKind = sourceKind
+        self.contentID = contentID
+        self.index = index
+        self.durationSeconds = durationSeconds
+        self.coverURI = coverURI
     }
 }
 

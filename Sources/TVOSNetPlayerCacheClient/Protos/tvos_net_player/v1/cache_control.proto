@@ -23,6 +23,7 @@ service LibraryService {
 }
 
 service TaskService {
+  rpc ResolveBilibiliInput(ResolveBilibiliInputRequest) returns (BilibiliResolveResult);
   rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
   rpc CreateBilibiliPlaybackTask(CreateBilibiliPlaybackTaskRequest) returns (Task);
   rpc GetTask(GetTaskRequest) returns (Task);
@@ -53,6 +54,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_HLS = 3;
   SERVER_CAPABILITY_BONJOUR_DISCOVERY = 4;
   SERVER_CAPABILITY_LIBRARY_ITEM_DELETE = 5;
+  SERVER_CAPABILITY_BILIBILI_RESOLVE = 6;
 }
 
 message CheckHealthRequest {}
@@ -165,12 +167,37 @@ message BilibiliDownloadOptions {
 message CreateBilibiliPlaybackTaskRequest {
   string url_or_id = 1;
   BilibiliPlaybackOptions options = 2;
+  string selection_id = 3;
 }
 
 message BilibiliPlaybackOptions {
   string quality_preference = 1;
   string encoding_preference = 2;
   bool prefer_tv_api = 3;
+}
+
+message ResolveBilibiliInputRequest {
+  string url_or_id = 1;
+  BilibiliPlaybackOptions options = 2;
+}
+
+message BilibiliResolveResult {
+  string source = 1;
+  string title = 2;
+  string source_kind = 3;
+  repeated BilibiliResolvedCandidate candidates = 4;
+  string default_selection_id = 5;
+}
+
+message BilibiliResolvedCandidate {
+  string selection_id = 1;
+  string title = 2;
+  string subtitle = 3;
+  string source_kind = 4;
+  string content_id = 5;
+  uint32 index = 6;
+  int64 duration_seconds = 7;
+  string cover_uri = 8;
 }
 
 message GetTaskRequest {

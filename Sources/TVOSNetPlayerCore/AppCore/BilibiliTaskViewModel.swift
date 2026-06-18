@@ -7,6 +7,12 @@ public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
     public let systemImage: String
 }
 
+private struct BilibiliResolvedInputContext: Equatable {
+    let source: String
+    let endpoint: CacheServerEndpoint
+    let options: BilibiliPlaybackTaskOptions
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
@@ -16,12 +22,16 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public private(set) var statusMessage: String = "No Bilibili playback task submitted."
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var isSubmitting = false
+    @Published public private(set) var isResolving = false
     @Published public private(set) var isWatching = false
     @Published public private(set) var isCancelling = false
+    @Published public private(set) var resolvedInput: BilibiliResolveResult?
+    @Published public var selectedCandidateID: String?
 
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private var activeEndpoint: CacheServerEndpoint?
+    private var resolvedInputContext: BilibiliResolvedInputContext?
     private var taskWatcher: Task<Void, Never>?
     private var operationSequence = 0
     private var activePlaybackTaskID: String?
@@ -47,9 +57,19 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var canSubmit: Bool {
-        !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !isSubmitting
-            && !isCancelling
+        guard !isSubmitting, !isResolving, !isCancelling else {
+            return false
+        }
+
+        guard !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        if isWaitingForCandidateSelection {
+            return selectedCandidate != nil
+        }
+
+        return true
     }
 
     public var canCancel: Bool {
@@ -67,7 +87,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var canRetry: Bool {
-        guard !isSubmitting && !isCancelling else {
+        guard !isSubmitting && !isResolving && !isCancelling else {
             return false
         }
 
@@ -79,7 +99,58 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var canPlay: Bool {
-        !isSubmitting && !isCancelling && playableURL != nil
+        !isSubmitting && !isResolving && !isCancelling && playableURL != nil
+    }
+
+    public var canClear: Bool {
+        currentTask != nil || errorMessage != nil || resolvedInput != nil
+    }
+
+    public var resolvedCandidates: [BilibiliResolvedCandidate] {
+        guard resolvedInputMatchesSource else {
+            return []
+        }
+
+        return resolvedInput?.candidates ?? []
+    }
+
+    public var isWaitingForCandidateSelection: Bool {
+        resolvedInputMatchesSource && resolvedInput?.requiresSelection == true && currentTask == nil
+    }
+
+    public var selectedCandidate: BilibiliResolvedCandidate? {
+        let candidates = resolvedCandidates
+        guard !candidates.isEmpty else {
+            return nil
+        }
+
+        if let selectedCandidateID,
+            let candidate = candidates.first(where: { $0.selectionID == selectedCandidateID })
+        {
+            return candidate
+        }
+
+        let defaultSelectionID = resolvedInput?.defaultSelectionID ?? ""
+        if !defaultSelectionID.isEmpty,
+            let candidate = candidates.first(where: { $0.selectionID == defaultSelectionID })
+        {
+            return candidate
+        }
+
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    public var submitButtonTitle: String {
+        if isResolving {
+            return "Resolving"
+        }
+        if isSubmitting {
+            return "Submitting"
+        }
+        if isWaitingForCandidateSelection {
+            return "Submit Selected"
+        }
+        return "Submit"
     }
 
     public var progress: Double? {
@@ -125,43 +196,124 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
+        let options = currentPlaybackOptions
+
+        guard Self.shouldResolveBeforeSubmittingBilibiliInput(source) else {
+            await createPlaybackTask(source: source, selectionID: nil, endpoint: endpoint, options: options)
+            return
+        }
+
+        if isWaitingForCandidateSelection,
+            resolvedInputMatches(source: source, endpoint: endpoint, options: options)
+        {
+            guard let selectedCandidate else {
+                errorMessage = "Select a Bilibili item before submitting playback."
+                statusMessage = "Bilibili item selection is required."
+                return
+            }
+
+            await createPlaybackTask(
+                source: source,
+                selectionID: selectedCandidate.selectionID,
+                endpoint: endpoint,
+                options: options
+            )
+            return
+        }
+
         operationSequence += 1
         activePlaybackTaskID = nil
         let sequence = operationSequence
 
         stopWatching()
         activeEndpoint = endpoint
+        currentTask = nil
+        resolvedInput = nil
+        resolvedInputContext = nil
+        selectedCandidateID = nil
         isSubmitting = true
+        isResolving = true
         errorMessage = nil
-        statusMessage = "Submitting Bilibili playback task..."
+        statusMessage = "Resolving Bilibili input..."
+
+        let client = clientFactory(endpoint)
 
         do {
-            let client = clientFactory(endpoint)
-            let options = BilibiliPlaybackTaskOptions(
-                qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
-                encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-            let task = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.createBilibiliPlaybackTask(urlOrID: source, options: options)
+            let resolved = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.resolveBilibiliInput(urlOrID: source, options: options)
             }
 
             guard sequence == operationSequence else {
                 return
             }
 
-            applyTaskUpdate(task)
-            isSubmitting = false
-            if !task.isTerminalBilibiliTaskState {
-                startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
+                return
             }
+
+            resolvedInput = resolved
+            resolvedInputContext = BilibiliResolvedInputContext(
+                source: source,
+                endpoint: endpoint,
+                options: options
+            )
+            selectedCandidateID =
+                resolved.defaultSelectionID.isEmpty
+                ? resolved.candidates.first?.selectionID
+                : resolved.defaultSelectionID
+            isResolving = false
+
+            guard let candidate = selectedCandidate else {
+                isSubmitting = false
+                errorMessage = "Bilibili input did not resolve to a playable item."
+                statusMessage = "No selectable Bilibili item was found."
+                return
+            }
+
+            guard !resolved.requiresSelection else {
+                isSubmitting = false
+                statusMessage = "Select a Bilibili item to play."
+                return
+            }
+
+            await createPlaybackTask(
+                source: source,
+                selectionID: candidate.selectionID,
+                endpoint: endpoint,
+                sequence: sequence,
+                client: client,
+                options: options
+            )
         } catch {
             guard sequence == operationSequence else {
                 return
             }
 
+            if Self.isBilibiliResolveUnsupported(error) {
+                guard currentSubmissionMatches(source: source, options: options) else {
+                    discardStaleResolveSubmission()
+                    return
+                }
+
+                await createPlaybackTask(
+                    source: source,
+                    selectionID: nil,
+                    endpoint: endpoint,
+                    sequence: sequence,
+                    client: client,
+                    options: options
+                )
+                return
+            }
+
             currentTask = nil
+            resolvedInput = nil
+            resolvedInputContext = nil
+            selectedCandidateID = nil
             errorMessage = error.localizedDescription
-            statusMessage = "Could not submit Bilibili playback task."
+            statusMessage = "Could not resolve Bilibili input."
+            isResolving = false
             isSubmitting = false
         }
     }
@@ -282,7 +434,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask = nil
         errorMessage = nil
         isSubmitting = false
+        isResolving = false
         isCancelling = false
+        resolvedInput = nil
+        resolvedInputContext = nil
+        selectedCandidateID = nil
         stopWatching()
         statusMessage = "No Bilibili playback task submitted."
     }
@@ -316,6 +472,78 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 self?.finishWatching(sequence: sequence, error: error)
             }
         }
+    }
+
+    private func createPlaybackTask(
+        source: String,
+        selectionID: String?,
+        endpoint: CacheServerEndpoint,
+        options: BilibiliPlaybackTaskOptions
+    ) async {
+        operationSequence += 1
+        activePlaybackTaskID = nil
+        let sequence = operationSequence
+        let client = clientFactory(endpoint)
+        await createPlaybackTask(
+            source: source,
+            selectionID: selectionID,
+            endpoint: endpoint,
+            sequence: sequence,
+            client: client,
+            options: options
+        )
+    }
+
+    private func createPlaybackTask(
+        source: String,
+        selectionID: String?,
+        endpoint: CacheServerEndpoint,
+        sequence: Int,
+        client: any CacheControlClient,
+        options: BilibiliPlaybackTaskOptions
+    ) async {
+        stopWatching()
+        activeEndpoint = endpoint
+        isSubmitting = true
+        isResolving = false
+        errorMessage = nil
+        statusMessage = "Submitting Bilibili playback task..."
+
+        do {
+            let task = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.createBilibiliPlaybackTask(
+                    urlOrID: source,
+                    selectionID: selectionID,
+                    options: options
+                )
+            }
+
+            guard sequence == operationSequence else {
+                return
+            }
+
+            applyTaskUpdate(task)
+            isSubmitting = false
+            if !task.isTerminalBilibiliTaskState {
+                startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
+            }
+        } catch {
+            guard sequence == operationSequence else {
+                return
+            }
+
+            currentTask = nil
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not submit Bilibili playback task."
+            isSubmitting = false
+        }
+    }
+
+    private static func isBilibiliResolveUnsupported(_ error: Error) -> Bool {
+        if let unsupported = error as? CacheControlClientUnsupportedFeature {
+            return unsupported == .bilibiliResolve
+        }
+        return false
     }
 
     private func stopWatching() {
@@ -547,6 +775,146 @@ private extension CacheTask {
         }
 
         return "\(Int((min(max(progress, 0), 0.99) * 100).rounded()))%"
+    }
+}
+
+private extension BilibiliTaskViewModel {
+    var currentPlaybackOptions: BilibiliPlaybackTaskOptions {
+        BilibiliPlaybackTaskOptions(
+            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    var resolvedInputMatchesSource: Bool {
+        resolvedInputMatches(
+            source: Self.normalizedBilibiliSource(sourceText),
+            endpoint: nil,
+            options: currentPlaybackOptions
+        )
+    }
+
+    func resolvedInputMatches(
+        source: String,
+        endpoint: CacheServerEndpoint?,
+        options: BilibiliPlaybackTaskOptions
+    ) -> Bool {
+        guard let resolvedInput, let resolvedInputContext else {
+            return false
+        }
+
+        if let endpoint, resolvedInputContext.endpoint != endpoint {
+            return false
+        }
+
+        return resolvedInputContext.source == source
+            && resolvedInputContext.options == options
+            && Self.normalizedBilibiliSource(resolvedInput.source) == source
+    }
+
+    func currentSubmissionMatches(source: String, options: BilibiliPlaybackTaskOptions) -> Bool {
+        Self.normalizedBilibiliSource(sourceText) == source
+            && currentPlaybackOptions == options
+    }
+
+    func discardStaleResolveSubmission() {
+        currentTask = nil
+        resolvedInput = nil
+        resolvedInputContext = nil
+        selectedCandidateID = nil
+        errorMessage = nil
+        statusMessage = "Bilibili input changed before resolve completed."
+        isResolving = false
+        isSubmitting = false
+    }
+
+    static func normalizedBilibiliSource(_ source: String) -> String {
+        source.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func shouldResolveBeforeSubmittingBilibiliInput(_ source: String) -> Bool {
+        !isCollectionOrFeedBilibiliInput(source)
+    }
+
+    static func isCollectionOrFeedBilibiliInput(_ source: String) -> Bool {
+        let trimmed = normalizedBilibiliSource(source)
+        let lowercased = trimmed.lowercased()
+        let collectionFeedKeywords: Set<String> = [
+            "following",
+            "history",
+            "later",
+            "recommend",
+            "recommendation",
+            "recommendations",
+            "toview",
+            "watch-later",
+            "watch_later",
+            "watchlater",
+        ]
+        if collectionFeedKeywords.contains(lowercased) {
+            return true
+        }
+
+        for prefix in ["collection", "fav", "mid", "series"] {
+            guard lowercased.hasPrefix(prefix) else {
+                continue
+            }
+
+            let suffix = lowercased.dropFirst(prefix.count)
+            if isNonEmptyASCIIDigits(suffix) {
+                return true
+            }
+        }
+
+        guard let components = URLComponents(string: trimmed),
+            let host = components.host?.lowercased()
+        else {
+            return false
+        }
+
+        let pathSegments = components.path
+            .split(separator: "/")
+            .map { $0.lowercased() }
+        if host == "space.bilibili.com",
+            pathSegments.first.map(isNonEmptyASCIIDigits) == true
+        {
+            return true
+        }
+
+        if host == "t.bilibili.com" {
+            return pathSegments.isEmpty
+        }
+
+        guard host == "www.bilibili.com" || host == "bilibili.com" else {
+            return false
+        }
+
+        let queryItemNames = Set((components.queryItems ?? []).map { $0.name.lowercased() })
+        if queryItemNames.contains("ep_id") || queryItemNames.contains("season_id") {
+            return false
+        }
+
+        if pathSegments.isEmpty {
+            return true
+        }
+        if pathSegments == ["account", "dynamic"] || pathSegments == ["account", "history"] {
+            return true
+        }
+        if pathSegments.first == "watchlater" || pathSegments == ["list", "watchlater"] {
+            return true
+        }
+        if pathSegments.contains("medialist") || pathSegments.first == "list" {
+            return true
+        }
+
+        return false
+    }
+
+    static func isNonEmptyASCIIDigits<S: StringProtocol>(_ value: S) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                scalar.value >= 48 && scalar.value <= 57
+            }
     }
 }
 

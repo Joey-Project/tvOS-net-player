@@ -2,6 +2,55 @@ import XCTest
 @testable import TVOSNetPlayerCacheClient
 
 final class CacheLibraryPaginationTests: XCTestCase {
+    func testGeneratedBilibiliResolveCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliResolve),
+            CacheServerCapability.bilibiliResolve
+        )
+    }
+
+    func testCacheServerSummaryExposesBilibiliResolveSupport() {
+        let supported = CacheServerSummary(
+            id: "server-1",
+            name: "Test cache",
+            version: "0.1.0",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.bilibiliResolve]
+        )
+        let unsupported = CacheServerSummary(
+            id: "server-2",
+            name: "Old cache",
+            version: "0.1.0",
+            mediaBaseURIs: [],
+            capabilities: []
+        )
+
+        XCTAssertTrue(supported.supportsBilibiliResolve)
+        XCTAssertFalse(unsupported.supportsBilibiliResolve)
+    }
+
+    func testLegacyBilibiliPlaybackConformerUsesDefaultSelectionFallback() async throws {
+        let client: any CacheControlClient = LegacyBilibiliPlaybackCacheControlClient()
+
+        let task = try await client.createBilibiliPlaybackTask(
+            urlOrID: "BV1legacy",
+            selectionID: nil,
+            options: BilibiliPlaybackTaskOptions()
+        )
+        XCTAssertEqual(task.source, "BV1legacy")
+
+        do {
+            _ = try await client.createBilibiliPlaybackTask(
+                urlOrID: "BV1legacy",
+                selectionID: "page:2",
+                options: BilibiliPlaybackTaskOptions()
+            )
+            XCTFail("selected playback should require a client implementation")
+        } catch {
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolve)
+        }
+    }
+
     func testGeneratedDeleteCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.libraryItemDelete),
@@ -187,10 +236,76 @@ private actor FakePagedCacheControlClient: CacheControlClient {
     ) async throws -> CacheTask {
         throw FakePagedCacheControlClientError.notImplemented
     }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selectionID: String?,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
 }
 
 private enum FakePagedCacheControlClientError: Error {
     case notImplemented
+}
+
+private struct LegacyBilibiliPlaybackCacheControlClient: CacheControlClient {
+    func getServerInfo() async throws -> CacheServerSummary {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func listCacheRoots() async throws -> [CacheRoot] {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func listLibraryItemsPage(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) async throws -> CacheLibraryItemsPage {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func getTask(id: String) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: FakePagedCacheControlClientError.notImplemented)
+        }
+    }
+
+    func cancelTask(id: String) async throws -> CacheTask {
+        throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        CacheTask(
+            id: "legacy-playback-1",
+            kind: "TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK",
+            state: "TASK_STATE_PREPARING",
+            source: urlOrID,
+            title: "Legacy playback",
+            progress: 0,
+            message: "",
+            libraryItemID: "",
+            playbackSource: nil,
+            playbackSession: nil
+        )
+    }
 }
 
 extension CacheLibraryItem {
