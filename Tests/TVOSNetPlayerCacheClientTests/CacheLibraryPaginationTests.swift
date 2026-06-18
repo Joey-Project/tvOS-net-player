@@ -2,6 +2,13 @@ import XCTest
 @testable import TVOSNetPlayerCacheClient
 
 final class CacheLibraryPaginationTests: XCTestCase {
+    func testGeneratedBilibiliResolveCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliResolve),
+            CacheServerCapability.bilibiliResolve
+        )
+    }
+
     func testGeneratedDeleteCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.libraryItemDelete),
@@ -183,6 +190,7 @@ private actor FakePagedCacheControlClient: CacheControlClient {
 
     func createBilibiliPlaybackTask(
         urlOrID: String,
+        selectionID: String?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
         throw FakePagedCacheControlClientError.notImplemented

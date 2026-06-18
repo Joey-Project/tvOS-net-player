@@ -307,7 +307,40 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
 
-            if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting {
+            if bilibiliModel.isWaitingForCandidateSelection {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                            Button {
+                                bilibiliModel.selectedCandidateID = candidate.selectionID
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(
+                                        systemName: bilibiliModel.selectedCandidateID == candidate.selectionID
+                                            ? "checkmark.circle.fill"
+                                            : "circle"
+                                    )
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(candidate.title)
+                                            .lineLimit(1)
+                                        if !candidate.subtitle.isEmpty {
+                                            Text(candidate.subtitle)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+                .frame(maxHeight: 260)
+            }
+
+            if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
                 VStack(alignment: .leading, spacing: 8) {
                     ProgressView(value: bilibiliModel.progress)
                     Text(bilibiliModel.statusMessage)
@@ -328,7 +361,7 @@ struct ContentView: View {
                         await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
                     }
                 } label: {
-                    Label(bilibiliModel.isSubmitting ? "Submitting" : "Submit", systemImage: "plus.circle.fill")
+                    Label(bilibiliModel.submitButtonTitle, systemImage: "plus.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!bilibiliModel.canSubmit)

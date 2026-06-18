@@ -10,14 +10,16 @@ use std::{
 
 use bbdown_core::{
     BiliClient, ClientConfig, DownloadArchive, DownloadFileKind, DownloadOptions, DownloadReport,
-    DuplicateDecision, EntryDownloadReport, HttpHeaderSpec, Input, MediaRequestKind,
-    MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
-    PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
-    PlaybackVariantKind, Selection, StreamSelection,
+    DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
+    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
+    PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
+    PlaybackPlan, PlaybackVariant, PlaybackVariantKind, ResolvedContent, Selection,
+    StreamSelection, VideoCollectionKind,
 };
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
 
 use crate::{
+    bilibili_playback::{BilibiliInputResolution, BilibiliResolvedCandidate},
     bilibili_worker::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadRequest,
@@ -27,6 +29,9 @@ use crate::{
     library::LocalMediaLibrary,
     task_registry::BilibiliTaskProgress,
 };
+
+const BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT as u32;
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
@@ -345,15 +350,85 @@ impl BbdownBilibiliAdapter {
     }
 
     #[allow(dead_code)]
+    pub(crate) async fn resolve_playback_input(
+        &self,
+        source: &str,
+        options: Option<&BilibiliDownloadOptions>,
+        is_cancel_requested: impl Fn() -> bool,
+    ) -> Result<BilibiliInputResolution, BilibiliDownloadError> {
+        let _preferences = playback_variant_preferences_from_options(options)?;
+        let input = playback_input_for_planning(source)?;
+        let selection = resolve_selection_for_input(&input)?;
+        let resolved = match run_bbdown_core_until_cancelled(
+            self.client.resolve(input.clone(), Some(selection)),
+            &is_cancel_requested,
+            "Cancelled while BBDown input resolution was running.",
+        )
+        .await?
+        {
+            Ok(resolved) => resolved,
+            Err(error) if should_retry_bounded_resolve(&error) => {
+                self.retry_resolve_with_largest_bounded_prefix(input, error, &is_cancel_requested)
+                    .await?
+            }
+            Err(error) => return Err(failed(error)),
+        };
+        Ok(BilibiliInputResolution::from_resolved_content(
+            source.trim().to_owned(),
+            resolved,
+        ))
+    }
+
+    async fn retry_resolve_with_largest_bounded_prefix(
+        &self,
+        input: Input,
+        initial_error: BbdownError,
+        is_cancel_requested: &impl Fn() -> bool,
+    ) -> Result<ResolvedContent, BilibiliDownloadError> {
+        let mut last_error = initial_error;
+        let mut search =
+            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+        let mut best_resolved = None;
+
+        while let Some(limit) = search.next_limit() {
+            let selection = bounded_resolve_selection(limit)?;
+            match run_bbdown_core_until_cancelled(
+                self.client.resolve(input.clone(), Some(selection)),
+                is_cancel_requested,
+                "Cancelled while BBDown input resolution was running.",
+            )
+            .await?
+            {
+                Ok(resolved) => {
+                    search.record_success(limit);
+                    best_resolved = Some(resolved);
+                }
+                Err(error) if should_retry_bounded_resolve(&error) => {
+                    search.record_missing(limit);
+                    last_error = error;
+                }
+                Err(error) => return Err(failed(error)),
+            }
+        }
+
+        best_resolved.ok_or_else(|| failed(last_error))
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn plan_playback(
         &self,
         source: &str,
+        selection_id: Option<&str>,
         options: Option<&BilibiliDownloadOptions>,
         is_cancel_requested: impl Fn() -> bool,
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
         let preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
-        let selection = default_selection_for_input(&input);
+        let input_selection = playback_selection_from_id(selection_id)?;
+        let input = input_selection.input_override.unwrap_or(input);
+        let selection = input_selection
+            .selection
+            .or_else(|| default_selection_for_input(&input));
         let plan = run_bbdown_until_cancelled(
             self.client.plan_playback_input(input, selection),
             is_cancel_requested,
@@ -397,6 +472,26 @@ where
     }
 }
 
+async fn run_bbdown_core_until_cancelled<T>(
+    future: impl Future<Output = Result<T, BbdownError>>,
+    is_cancel_requested: &impl Fn() -> bool,
+    cancellation_message: &'static str,
+) -> Result<Result<T, BbdownError>, BilibiliDownloadError> {
+    tokio::pin!(future);
+    loop {
+        if is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                cancellation_message.to_owned(),
+            ));
+        }
+
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            () = sleep(Duration::from_millis(100)) => {}
+        }
+    }
+}
+
 fn failed(error: impl Display) -> BilibiliDownloadError {
     BilibiliDownloadError::Failed(format!("BBDown adapter failed: {error}"))
 }
@@ -434,6 +529,74 @@ fn default_selection_for_input(input: &Input) -> Option<Selection> {
     }
 }
 
+fn bounded_resolve_selection(limit: u32) -> Result<Selection, BilibiliDownloadError> {
+    IndexSelection::range(1, limit)
+        .map(Selection::Indices)
+        .map_err(failed)
+}
+
+fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
+    bounded_resolve_selection(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
+}
+
+fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownloadError> {
+    match input {
+        Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
+            Ok(Selection::Current)
+        }
+        _ => resolve_selection(),
+    }
+}
+
+fn should_retry_bounded_resolve(error: &BbdownError) -> bool {
+    matches!(
+        error,
+        BbdownError::MissingField(
+            "selected page" | "selected episode" | "selected collection item"
+        )
+    )
+}
+
+#[derive(Debug)]
+struct BoundedPrefixSearch {
+    next_low: u32,
+    next_high: u32,
+    best_success: Option<u32>,
+}
+
+impl BoundedPrefixSearch {
+    fn after_failed_limit(failed_limit: u32) -> Self {
+        Self {
+            next_low: 1,
+            next_high: failed_limit
+                .saturating_sub(1)
+                .min(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32),
+            best_success: None,
+        }
+    }
+
+    fn next_limit(&self) -> Option<u32> {
+        if self.next_low > self.next_high {
+            return None;
+        }
+        Some(self.next_low + (self.next_high - self.next_low).div_ceil(2))
+    }
+
+    fn record_success(&mut self, limit: u32) {
+        self.best_success = Some(limit);
+        self.next_low = limit.saturating_add(1);
+    }
+
+    fn record_missing(&mut self, limit: u32) {
+        self.next_high = limit.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    fn best_success(&self) -> Option<u32> {
+        self.best_success
+    }
+}
+
 fn playback_input_for_planning(source: &str) -> Result<Input, BilibiliDownloadError> {
     let input = Input::parse(source).map_err(failed)?;
     if matches!(input, Input::ShortLink(_)) {
@@ -442,6 +605,95 @@ fn playback_input_for_planning(source: &str) -> Result<Input, BilibiliDownloadEr
         ));
     }
     Ok(input)
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PlaybackInputSelection {
+    input_override: Option<Input>,
+    selection: Option<Selection>,
+}
+
+fn playback_selection_from_id(
+    selection_id: Option<&str>,
+) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
+    let Some(selection_id) = selection_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(PlaybackInputSelection::default());
+    };
+
+    if let Some(page) = selection_id.strip_prefix("page:") {
+        return parse_selection_u32(page, selection_id).map(|page| PlaybackInputSelection {
+            input_override: None,
+            selection: Some(Selection::Page(page)),
+        });
+    }
+    if let Some(item) = selection_id.strip_prefix("item:") {
+        return playback_collection_item_selection_from_id(item, selection_id);
+    }
+    if let Some(episode) = selection_id.strip_prefix("episode:") {
+        return parse_selection_u64(episode, selection_id).map(|episode| PlaybackInputSelection {
+            input_override: None,
+            selection: Some(Selection::Episode(episode)),
+        });
+    }
+
+    selection_id
+        .parse::<Selection>()
+        .map(|selection| PlaybackInputSelection {
+            input_override: None,
+            selection: Some(selection),
+        })
+        .map_err(|error| BilibiliDownloadError::Failed(format!("Invalid selection_id: {error}")))
+}
+
+fn playback_collection_item_selection_from_id(
+    item: &str,
+    selection_id: &str,
+) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
+    let mut parts = item.split(':');
+    let index_text = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_selection_id(selection_id))?;
+    let index = parse_selection_u32(index_text, selection_id)?;
+
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => IndexSelection::single(index)
+            .map(Selection::Indices)
+            .map(|selection| PlaybackInputSelection {
+                input_override: None,
+                selection: Some(selection),
+            })
+            .map_err(failed),
+        (Some("bvid"), Some(bvid), None) if !bvid.trim().is_empty() => Ok(PlaybackInputSelection {
+            input_override: Some(Input::Bvid(bvid.trim().to_owned())),
+            selection: Some(Selection::Current),
+        }),
+        (Some("aid"), Some(aid), None) => {
+            let aid = parse_selection_u64(aid, selection_id)?;
+            Ok(PlaybackInputSelection {
+                input_override: Some(Input::Aid(aid)),
+                selection: Some(Selection::Current),
+            })
+        }
+        _ => Err(invalid_selection_id(selection_id)),
+    }
+}
+
+fn parse_selection_u32(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
+    text.parse::<u32>()
+        .map_err(|_| invalid_selection_id(selection_id))
+}
+
+fn parse_selection_u64(text: &str, selection_id: &str) -> Result<u64, BilibiliDownloadError> {
+    text.parse::<u64>()
+        .map_err(|_| invalid_selection_id(selection_id))
+}
+
+fn invalid_selection_id(selection_id: &str) -> BilibiliDownloadError {
+    BilibiliDownloadError::Failed(format!("Invalid selection_id: {selection_id}"))
 }
 
 #[allow(dead_code)]
@@ -466,6 +718,161 @@ impl BilibiliPlaybackPlan {
                 .map(|entry| BilibiliPlaybackEntry::from_core(entry, preferences))
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+impl BilibiliInputResolution {
+    fn from_resolved_content(source: String, resolved: ResolvedContent) -> Self {
+        match resolved {
+            ResolvedContent::Video(video) => {
+                let candidates = video
+                    .pages
+                    .iter()
+                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .map(|page| BilibiliResolvedCandidate {
+                        selection_id: page_selection_id(page.index),
+                        title: non_empty_or(&page.title, &video.title),
+                        subtitle: format!("Page {}", page.index),
+                        source_kind: "video_page".to_owned(),
+                        content_id: page.cid.to_string(),
+                        index: page.index,
+                        duration_seconds: page.duration_seconds,
+                        cover_uri: video.cover_url.clone().unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                Self::with_candidates(source, video.title, "video", candidates)
+            }
+            ResolvedContent::Season(season) => {
+                let candidates = season
+                    .selected_episodes
+                    .iter()
+                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .map(|episode| {
+                        let subtitle = episode
+                            .long_title
+                            .as_ref()
+                            .filter(|value| !value.trim().is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("Episode {}", episode.index));
+                        BilibiliResolvedCandidate {
+                            selection_id: episode_selection_id(episode.epid),
+                            title: non_empty_or(&episode.title, &season.season.title),
+                            subtitle,
+                            source_kind: "season_episode".to_owned(),
+                            content_id: episode.epid.to_string(),
+                            index: episode.index,
+                            duration_seconds: None,
+                            cover_uri: season.season.cover_url.clone().unwrap_or_default(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Self::with_candidates(source, season.season.title, "season", candidates)
+            }
+            ResolvedContent::Collection(collection) => {
+                let source_kind = collection_kind_name(&collection.collection.kind);
+                let candidates = collection
+                    .selected_items
+                    .iter()
+                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .map(|item| BilibiliResolvedCandidate {
+                        selection_id: collection_item_selection_id(item),
+                        title: item.title.clone(),
+                        subtitle: collection_item_subtitle(source_kind, item.index, &item.owner),
+                        source_kind: source_kind.to_owned(),
+                        content_id: item
+                            .bvid
+                            .clone()
+                            .unwrap_or_else(|| format!("av{}", item.aid)),
+                        index: item.index,
+                        duration_seconds: item.duration_seconds,
+                        cover_uri: item.cover_url.clone().unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                Self::with_candidates(source, collection.collection.title, source_kind, candidates)
+            }
+        }
+    }
+
+    fn with_candidates(
+        source: String,
+        title: String,
+        source_kind: impl Into<String>,
+        candidates: Vec<BilibiliResolvedCandidate>,
+    ) -> Self {
+        let default_selection_id = if candidates.len() == 1 {
+            candidates
+                .first()
+                .map(|candidate| candidate.selection_id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Self {
+            source,
+            title,
+            source_kind: source_kind.into(),
+            candidates,
+            default_selection_id,
+        }
+    }
+}
+
+fn page_selection_id(index: u32) -> String {
+    format!("page:{index}")
+}
+
+fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> String {
+    match item
+        .bvid
+        .as_deref()
+        .map(str::trim)
+        .filter(|bvid| !bvid.is_empty())
+    {
+        Some(bvid) => format!("item:{}:bvid:{bvid}", item.index),
+        None => format!("item:{}:aid:{}", item.index, item.aid),
+    }
+}
+
+fn episode_selection_id(epid: u64) -> String {
+    format!("episode:{epid}")
+}
+
+fn non_empty_or(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn collection_kind_name(kind: &VideoCollectionKind) -> &'static str {
+    match kind {
+        VideoCollectionKind::Space => "space",
+        VideoCollectionKind::Favorite => "favorite",
+        VideoCollectionKind::Collection => "collection",
+        VideoCollectionKind::Series => "series",
+        VideoCollectionKind::Recommendation => "recommendation",
+        VideoCollectionKind::Following => "following",
+        VideoCollectionKind::SpaceDynamic => "space_dynamic",
+        VideoCollectionKind::History => "history",
+        VideoCollectionKind::WatchLater => "watch_later",
+    }
+}
+
+fn collection_item_subtitle(
+    source_kind: &str,
+    index: u32,
+    owner: &Option<bbdown_core::Owner>,
+) -> String {
+    let prefix = format!("{} #{}", source_kind.replace('_', " "), index);
+    match owner
+        .as_ref()
+        .map(|owner| owner.name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        Some(owner_name) => format!("{prefix} · {owner_name}"),
+        None => prefix,
     }
 }
 
@@ -1436,6 +1843,198 @@ mod tests {
             default_selection_for_input(&Input::WatchLater),
             Some(Selection::Latest)
         );
+    }
+
+    #[test]
+    fn resolve_selection_limits_candidates_to_first_page_window() {
+        let selection = resolve_selection().expect("resolve selection should be valid");
+
+        let Selection::Indices(indices) = selection else {
+            panic!("resolve selection should use bounded indices");
+        };
+        assert!(indices.contains(1));
+        assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
+        assert!(!indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1));
+    }
+
+    #[test]
+    fn resolve_selection_preserves_current_episode_inputs() {
+        assert_eq!(
+            resolve_selection_for_input(&Input::Episode(123)).unwrap(),
+            Selection::Current
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::CheeseEpisode(456)).unwrap(),
+            Selection::Current
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::IntlEpisode(789)).unwrap(),
+            Selection::Current
+        );
+    }
+
+    #[test]
+    fn resolve_selection_uses_bounded_indices_for_broad_inputs() {
+        let inputs = [
+            Input::Bvid("BV1qt4y1X7TW".to_owned()),
+            Input::Season(123),
+            Input::FavoriteList {
+                media_id: Some(456),
+                owner_mid: None,
+            },
+            Input::History,
+        ];
+
+        for input in inputs {
+            let selection = resolve_selection_for_input(&input).unwrap();
+            let Selection::Indices(indices) = selection else {
+                panic!("resolve selection should use bounded indices for {input:?}");
+            };
+            assert!(indices.contains(1));
+            assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
+            assert!(!indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1));
+        }
+    }
+
+    #[test]
+    fn parses_collection_item_selection_id_as_single_index() {
+        let input_selection = playback_selection_from_id(Some("item:7")).unwrap();
+        assert_eq!(input_selection.input_override, None);
+        let selection = input_selection
+            .selection
+            .expect("selection id should resolve to a selection");
+
+        let Selection::Indices(indices) = selection else {
+            panic!("collection item selection should use index selection");
+        };
+        assert!(indices.contains(7));
+        assert!(!indices.contains(6));
+        assert!(!indices.contains(8));
+    }
+
+    #[test]
+    fn parses_collection_item_bvid_selection_id_as_source_override() {
+        let input_selection = playback_selection_from_id(Some("item:7:bvid:BV1xx411c7mD")).unwrap();
+
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, Some(Selection::Current));
+    }
+
+    #[test]
+    fn parses_collection_item_aid_selection_id_as_source_override() {
+        let input_selection = playback_selection_from_id(Some("item:7:aid:170001")).unwrap();
+
+        assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
+        assert_eq!(input_selection.selection, Some(Selection::Current));
+    }
+
+    #[test]
+    fn bounded_resolve_fallback_only_retries_short_selection_errors() {
+        assert!(should_retry_bounded_resolve(&BbdownError::MissingField(
+            "selected page"
+        )));
+        assert!(should_retry_bounded_resolve(&BbdownError::MissingField(
+            "selected episode"
+        )));
+        assert!(should_retry_bounded_resolve(&BbdownError::MissingField(
+            "selected collection item"
+        )));
+        assert!(!should_retry_bounded_resolve(&BbdownError::MissingField(
+            "playurl streams"
+        )));
+        assert!(!should_retry_bounded_resolve(&BbdownError::InvalidInput(
+            "bad input".to_owned()
+        )));
+    }
+
+    #[test]
+    fn bounded_resolve_probe_finds_largest_valid_prefix() {
+        for available_count in [1, 2, 4, 9, 24, 49, 99] {
+            let mut search =
+                BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+            let mut attempts = Vec::new();
+
+            while let Some(limit) = search.next_limit() {
+                attempts.push(limit);
+                if limit <= available_count {
+                    search.record_success(limit);
+                } else {
+                    search.record_missing(limit);
+                }
+            }
+
+            assert_eq!(search.best_success(), Some(available_count));
+            assert!(attempts.iter().all(|limit| *limit > 0));
+            assert!(
+                attempts
+                    .iter()
+                    .all(|limit| *limit < BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_resolve_probe_returns_no_success_when_no_prefix_exists() {
+        let mut search =
+            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+
+        while let Some(limit) = search.next_limit() {
+            search.record_missing(limit);
+        }
+
+        assert_eq!(search.best_success(), None);
+    }
+
+    #[test]
+    fn collection_resolution_candidates_round_trip_as_item_selections() {
+        let owner = bbdown_core::Owner {
+            mid: 123,
+            name: "Owner".to_owned(),
+        };
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "favorite:456".to_owned(),
+            ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
+                collection: bbdown_core::VideoCollectionMetadata {
+                    id: Some(456),
+                    kind: VideoCollectionKind::Favorite,
+                    title: "Favorite Videos".to_owned(),
+                    description: String::new(),
+                    cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
+                    pub_time: None,
+                    owner: Some(owner.clone()),
+                    items: Vec::new(),
+                },
+                selected_items: vec![bbdown_core::VideoCollectionItem {
+                    index: 3,
+                    aid: 170_001,
+                    bvid: Some("BV1xx411c7mD".to_owned()),
+                    cid: 270_001,
+                    title: "Selected Item".to_owned(),
+                    cover_url: None,
+                    description: String::new(),
+                    pub_time: None,
+                    owner: Some(owner),
+                    duration_seconds: Some(120),
+                }],
+            }),
+        );
+
+        assert_eq!(resolution.source_kind, "favorite");
+        assert_eq!(resolution.candidates.len(), 1);
+        let candidate = &resolution.candidates[0];
+        assert_eq!(candidate.selection_id, "item:3:bvid:BV1xx411c7mD");
+        assert_eq!(candidate.title, "Selected Item");
+        assert_eq!(candidate.index, 3);
+
+        let input_selection = playback_selection_from_id(Some(&candidate.selection_id)).unwrap();
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, Some(Selection::Current));
     }
 
     #[test]

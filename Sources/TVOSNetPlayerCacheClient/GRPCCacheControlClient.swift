@@ -149,8 +149,32 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func resolveBilibiliInput(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
+    ) async throws -> BilibiliResolveResult {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: .plaintext
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_ResolveBilibiliInputRequest()
+                request.urlOrID = urlOrID
+                request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+                let response = try await service.resolveBilibiliInput(request, options: callOptions)
+                return BilibiliResolveResult(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolve
+        }
+    }
+
     public func createBilibiliPlaybackTask(
         urlOrID: String,
+        selectionID: String? = nil,
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
     ) async throws -> CacheTask {
         try await withGRPCClient(
@@ -163,6 +187,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
             var request = TvosNetPlayer_V1_CreateBilibiliPlaybackTaskRequest()
             request.urlOrID = urlOrID
             request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+            request.selectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let response = try await service.createBilibiliPlaybackTask(request, options: callOptions)
             return CacheTask(response)
         }
@@ -418,6 +443,33 @@ extension CachePlaybackSource {
             variantID: proto.variantID,
             playbackProtocol: String(describing: proto.`protocol`),
             uri: proto.uri
+        )
+    }
+}
+
+extension BilibiliResolveResult {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliResolveResult) {
+        self.init(
+            source: proto.source,
+            title: proto.title,
+            sourceKind: proto.sourceKind,
+            candidates: proto.candidates.map(BilibiliResolvedCandidate.init),
+            defaultSelectionID: proto.defaultSelectionID
+        )
+    }
+}
+
+extension BilibiliResolvedCandidate {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliResolvedCandidate) {
+        self.init(
+            selectionID: proto.selectionID,
+            title: proto.title,
+            subtitle: proto.subtitle,
+            sourceKind: proto.sourceKind,
+            contentID: proto.contentID,
+            index: Int(proto.index),
+            durationSeconds: proto.durationSeconds,
+            coverURI: proto.coverUri
         )
     }
 }

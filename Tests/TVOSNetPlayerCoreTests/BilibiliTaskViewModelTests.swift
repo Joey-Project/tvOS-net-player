@@ -20,10 +20,90 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let requests = await client.createdRequestsSnapshot()
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.urlOrID, "BV1test")
+        XCTAssertEqual(requests.first?.selectionID, "page:1")
         XCTAssertEqual(requests.first?.options.qualityPreference, "1080p")
         XCTAssertEqual(requests.first?.options.encodingPreference, "h264")
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.count, 1)
+        XCTAssertEqual(resolvedRequests.first?.urlOrID, "BV1test")
         XCTAssertEqual(model.currentTask?.id, "bilibili-playback-1")
         XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+    }
+
+    func testSubmitFallsBackToCreateWhenResolveIsUnsupported() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .failure(CacheControlClientUnsupportedFeature.bilibiliResolve)
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1legacy", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1legacy",
+            qualityPreference: "720p",
+            encodingPreference: "h265",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.count, 1)
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.urlOrID, "BV1legacy")
+        XCTAssertNil(requests.first?.selectionID)
+        XCTAssertEqual(requests.first?.options.qualityPreference, "720p")
+        XCTAssertEqual(requests.first?.options.encodingPreference, "h265")
+        XCTAssertEqual(model.currentTask?.source, "BV1legacy")
+        XCTAssertFalse(model.isResolving)
+
+        model.clearTask()
+    }
+
+    func testSubmitStopsForMultiCandidateSelectionThenCreatesSelectedPlaybackTask() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi page video",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", subtitle: "Page 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", subtitle: "Page 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+        XCTAssertEqual(model.statusMessage, "Select a Bilibili item to play.")
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])
+        XCTAssertEqual(model.selectedCandidateID, "page:1")
+        XCTAssertNil(model.currentTask)
+        var requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+
+        model.selectedCandidateID = "page:2"
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:2")
+        XCTAssertEqual(model.currentTask?.source, "BV1multi")
 
         model.clearTask()
     }
@@ -650,11 +730,13 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 }
 
 private actor FakeBilibiliCacheControlClient: CacheControlClient {
+    private var resolveResponses: [Result<BilibiliResolveResult, Error>]
     private var createResponses: [Result<CacheTask, Error>]
     private let cancelResponsesByID: [String: CacheTask]
     private var suspendsCreateResponses: Bool
     private var suspendsCancelResponses = false
-    private var createdRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
+    private var resolvedRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
+    private var createdRequests: [(urlOrID: String, selectionID: String?, options: BilibiliPlaybackTaskOptions)] = []
     private var cancelledIDs: [String] = []
     private var pendingCreateContinuations: [CheckedContinuation<CacheTask, Error>] = []
     private var pendingCancelContinuations: [CheckedContinuation<CacheTask, Error>] = []
@@ -666,10 +748,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var watchTerminationWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
+        resolveResponses: [Result<BilibiliResolveResult, Error>] = [],
         createResponses: [Result<CacheTask, Error>],
         cancelResponsesByID: [String: CacheTask] = [:],
         suspendsCreateResponses: Bool = false
     ) {
+        self.resolveResponses = resolveResponses
         self.createResponses = createResponses
         self.cancelResponsesByID = cancelResponsesByID
         self.suspendsCreateResponses = suspendsCreateResponses
@@ -728,11 +812,29 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         return cancelResponsesByID[id] ?? .fixture(state: "TASK_STATE_CANCEL_REQUESTED")
     }
 
-    func createBilibiliPlaybackTask(
+    func resolveBilibiliInput(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
+    ) async throws -> BilibiliResolveResult {
+        resolvedRequests.append((urlOrID, options))
+        if resolveResponses.isEmpty {
+            return .fixture(source: urlOrID)
+        }
+
+        switch resolveResponses.removeFirst() {
+        case let .success(result):
+            return result
+        case let .failure(error):
+            throw error
+        }
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selectionID: String?,
+        options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
-        createdRequests.append((urlOrID, options))
+        createdRequests.append((urlOrID, selectionID, options))
         resumeCreateRequestWaiters()
         if suspendsCreateResponses {
             return try await withCheckedThrowingContinuation { continuation in
@@ -776,7 +878,11 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         pendingCancelContinuations.removeFirst().resume(with: result)
     }
 
-    func createdRequestsSnapshot() -> [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] {
+    func resolvedRequestsSnapshot() -> [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] {
+        resolvedRequests
+    }
+
+    func createdRequestsSnapshot() -> [(urlOrID: String, selectionID: String?, options: BilibiliPlaybackTaskOptions)] {
         createdRequests
     }
 
@@ -868,6 +974,45 @@ private enum FakeBilibiliCacheControlClientError: Error {
     case noCreateResponse
     case cancelFailed
     case watchFailed
+}
+
+private extension BilibiliResolveResult {
+    static func fixture(
+        source: String = "BV1test",
+        title: String = "Ready video",
+        candidates: [BilibiliResolvedCandidate] = [
+            .fixture()
+        ],
+        defaultSelectionID: String = "page:1"
+    ) -> Self {
+        Self(
+            source: source.trimmingCharacters(in: .whitespacesAndNewlines),
+            title: title,
+            sourceKind: "video",
+            candidates: candidates,
+            defaultSelectionID: defaultSelectionID
+        )
+    }
+}
+
+private extension BilibiliResolvedCandidate {
+    static func fixture(
+        selectionID: String = "page:1",
+        title: String = "Ready video",
+        subtitle: String = "Page 1",
+        index: Int = 1
+    ) -> Self {
+        Self(
+            selectionID: selectionID,
+            title: title,
+            subtitle: subtitle,
+            sourceKind: "video_page",
+            contentID: "100\(index)",
+            index: index,
+            durationSeconds: 60,
+            coverURI: "https://example.test/cover.jpg"
+        )
+    }
 }
 
 private extension CacheTask {
