@@ -153,7 +153,6 @@ async fn hls_segment_response(
         let Some(resource) = session.media_playlist_resource(&segment_id) else {
             return empty_response(StatusCode::NOT_FOUND);
         };
-        let mut prewarmed_prefix_length = None;
         let initialization = if let Some(cached) = state
             .state
             .hls_cache
@@ -168,7 +167,6 @@ async fn hls_segment_response(
             .hls_cache
             .prewarmed_resource(&session_id, &resource.id)
         {
-            prewarmed_prefix_length = Some(prewarmed.prefix_length);
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
@@ -187,7 +185,6 @@ async fn hls_segment_response(
             &segment_id,
             initialization.length,
             initialization.total_length,
-            prewarmed_prefix_length,
         ) else {
             return text_response(
                 StatusCode::BAD_GATEWAY,
@@ -865,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_media_playlist_splits_prewarmed_media_range_to_prefix() {
+    async fn hls_media_playlist_keeps_single_media_range_for_prewarmed_prefix() {
         let (upstream_url, _upstream_task) = start_hls_large_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
         let root_path = temp.path().canonicalize().unwrap();
@@ -900,15 +897,11 @@ mod tests {
         let playlist = String::from_utf8(body.to_vec()).unwrap();
         let mp4 = large_fake_mp4();
         let initialization_length = mp4_initialization_length(&mp4).unwrap();
-        let first_media_length = HLS_INITIALIZATION_SCAN_BYTES - initialization_length;
-        let remaining_media_length =
-            u64::try_from(mp4.len()).unwrap() - HLS_INITIALIZATION_SCAN_BYTES;
+        let media_length = u64::try_from(mp4.len()).unwrap() - initialization_length;
         assert!(playlist.contains(&format!(
-            "#EXT-X-BYTERANGE:{first_media_length}@{initialization_length}"
+            "#EXT-X-BYTERANGE:{media_length}@{initialization_length}"
         )));
-        assert!(playlist.contains(&format!(
-            "#EXT-X-BYTERANGE:{remaining_media_length}@{HLS_INITIALIZATION_SCAN_BYTES}"
-        )));
+        assert!(!playlist.contains(&format!("@{HLS_INITIALIZATION_SCAN_BYTES}")));
     }
 
     #[tokio::test]

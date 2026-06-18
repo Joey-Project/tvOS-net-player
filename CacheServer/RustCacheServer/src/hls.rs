@@ -135,7 +135,6 @@ impl HlsPlaybackSession {
         playlist_id: &str,
         initialization_length: u64,
         total_length: u64,
-        prewarmed_prefix_length: Option<u64>,
     ) -> Option<String> {
         let resource = match playlist_id {
             VIDEO_PLAYLIST_ID => &self.variant.video,
@@ -151,25 +150,11 @@ impl HlsPlaybackSession {
             .duration_seconds
             .unwrap_or(self.variant.duration_seconds)
             .max(DEFAULT_DURATION_SECONDS);
-        let segments = media_playlist_segments(
-            initialization_length,
-            total_length,
-            prewarmed_prefix_length,
-            duration,
-        );
 
-        let mut playlist = format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{duration}\n#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{initialization_length}@0\"\n",
-            resource.id
-        );
-        for segment in segments {
-            playlist.push_str(&format!(
-                "#EXTINF:{:.3},\n#EXT-X-BYTERANGE:{}@{}\n{}\n",
-                segment.duration_seconds, segment.length, segment.offset, resource.id
-            ));
-        }
-        playlist.push_str("#EXT-X-ENDLIST\n");
-        Some(playlist)
+        Some(format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{duration}\n#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{initialization_length}@0\"\n#EXTINF:{duration}.000,\n#EXT-X-BYTERANGE:{media_length}@{initialization_length}\n{}\n#EXT-X-ENDLIST\n",
+            resource.id, resource.id
+        ))
     }
 
     pub(crate) fn media_resource(&self, segment_id: &str) -> Option<HlsMediaResource> {
@@ -183,51 +168,6 @@ impl HlsPlaybackSession {
             .filter(|audio| segment_id == audio.id)
             .cloned()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HlsMediaPlaylistSegment {
-    offset: u64,
-    length: u64,
-    duration_seconds: f64,
-}
-
-fn media_playlist_segments(
-    initialization_length: u64,
-    total_length: u64,
-    prewarmed_prefix_length: Option<u64>,
-    duration_seconds: u32,
-) -> Vec<HlsMediaPlaylistSegment> {
-    let media_length = total_length.saturating_sub(initialization_length);
-    let duration = f64::from(duration_seconds);
-    let Some(prefix_length) = prewarmed_prefix_length
-        .filter(|prefix_length| *prefix_length > initialization_length)
-        .filter(|prefix_length| *prefix_length < total_length)
-    else {
-        return vec![HlsMediaPlaylistSegment {
-            offset: initialization_length,
-            length: media_length,
-            duration_seconds: duration,
-        }];
-    };
-
-    let first_length = prefix_length - initialization_length;
-    let second_length = total_length - prefix_length;
-    let first_duration =
-        (duration * (first_length as f64 / media_length as f64)).clamp(0.001, duration);
-    let second_duration = (duration - first_duration).max(0.001);
-    vec![
-        HlsMediaPlaylistSegment {
-            offset: initialization_length,
-            length: first_length,
-            duration_seconds: first_duration,
-        },
-        HlsMediaPlaylistSegment {
-            offset: prefix_length,
-            length: second_length,
-            duration_seconds: second_duration,
-        },
-    ]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,34 +341,15 @@ mod tests {
         assert!(master.contains("URI=\"segments/audio.m3u8\""));
         assert!(master.ends_with("segments/video.m3u8\n"));
 
-        let video = session
-            .media_playlist("video.m3u8", 128, 10_000, None)
-            .unwrap();
+        let video = session.media_playlist("video.m3u8", 128, 10_000).unwrap();
         assert!(video.contains("#EXT-X-TARGETDURATION:60"));
         assert!(video.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"128@0\""));
         assert!(video.contains("#EXT-X-BYTERANGE:9872@128"));
         assert!(video.contains("video.m4s"));
 
-        let audio = session
-            .media_playlist("audio.m3u8", 64, 10_000, None)
-            .unwrap();
+        let audio = session.media_playlist("audio.m3u8", 64, 10_000).unwrap();
         assert!(audio.contains("#EXT-X-MAP:URI=\"audio.m4s\",BYTERANGE=\"64@0\""));
         assert!(audio.contains("audio.m4s"));
-    }
-
-    #[test]
-    fn media_playlist_splits_first_media_range_at_prewarmed_prefix() {
-        let session =
-            HlsPlaybackSession::from_selected_variant("session-1", "Episode", &dash_variant())
-                .unwrap();
-
-        let playlist = session
-            .media_playlist("video.m3u8", 128, 10_000, Some(1_024))
-            .unwrap();
-
-        assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"128@0\""));
-        assert!(playlist.contains("#EXT-X-BYTERANGE:896@128"));
-        assert!(playlist.contains("#EXT-X-BYTERANGE:8976@1024"));
     }
 
     #[test]
