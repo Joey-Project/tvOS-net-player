@@ -188,7 +188,15 @@ public final class GRPCCacheControlClient: CacheControlClient {
         selectionID: String? = nil,
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
     ) async throws -> CacheTask {
-        try await withGRPCClient(
+        let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !normalizedSelectionID.isEmpty {
+            let serverInfo = try await getServerInfo()
+            guard serverInfo.supportsBilibiliResolve else {
+                throw CacheControlClientUnsupportedFeature.bilibiliResolve
+            }
+        }
+
+        return try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
                 transportSecurity: .plaintext
@@ -198,7 +206,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
             var request = TvosNetPlayer_V1_CreateBilibiliPlaybackTaskRequest()
             request.urlOrID = urlOrID
             request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
-            request.selectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            request.selectionID = normalizedSelectionID
             let response = try await service.createBilibiliPlaybackTask(request, options: callOptions)
             return CacheTask(response)
         }

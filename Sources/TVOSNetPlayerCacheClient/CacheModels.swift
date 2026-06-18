@@ -90,6 +90,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsLibraryItemDelete: Bool {
         capabilities.contains(CacheServerCapability.libraryItemDelete)
     }
+
+    public var supportsBilibiliResolve: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliResolve)
+    }
 }
 
 public enum CacheServerCapability {

@@ -9,6 +9,26 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testCacheServerSummaryExposesBilibiliResolveSupport() {
+        let supported = CacheServerSummary(
+            id: "server-1",
+            name: "Test cache",
+            version: "0.1.0",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.bilibiliResolve]
+        )
+        let unsupported = CacheServerSummary(
+            id: "server-2",
+            name: "Old cache",
+            version: "0.1.0",
+            mediaBaseURIs: [],
+            capabilities: []
+        )
+
+        XCTAssertTrue(supported.supportsBilibiliResolve)
+        XCTAssertFalse(unsupported.supportsBilibiliResolve)
+    }
+
     func testLegacyBilibiliPlaybackConformerUsesDefaultSelectionFallback() async throws {
         let client: any CacheControlClient = LegacyBilibiliPlaybackCacheControlClient()
 

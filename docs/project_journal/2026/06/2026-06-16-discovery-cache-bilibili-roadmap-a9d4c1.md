@@ -196,10 +196,15 @@ superseded_by:
   - Fixed collection/list resolve to return only BBDown's selected item until `bbdown-core` exposes a bounded candidate-page API, avoiding adapter-level full-list candidate exposure.
   - Restricted playback `selection_id` parsing to resolver-generated single-item `page:`, `episode:`, and `item:` forms; `item:` IDs carrying BVID/aid now override planning to the stable video input before falling back to original index selection.
   - Added shared Bilibili `canClear` state and wired tvOS/macOS controls to clear resolved candidate pickers.
+  - The next `independent-codex-pr-review` found `page:` and bare `item:` IDs could still be paired with collection/feed sources and trigger high-index BBDown fetch windows.
+  - The next `offline-frozen-diff-review` found direct selected-create calls against old gRPC servers could silently ignore the new `selection_id` field and play the default candidate.
+  - Fixed playback `selection_id` parsing to validate IDs against the source input kind, reject unstable bare item IDs, and cap resolver-index IDs to the advertised candidate window.
+  - Fixed `GRPCCacheControlClient` selected-create calls to require the `bilibiliResolve` capability before sending non-empty `selectionID` values.
 - PR D final review follow-up validation:
   - `scripts/format.sh`
   - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
+  - `swift test --filter TVOSNetPlayerCacheClientTests`
   - `swift test --filter BilibiliTaskViewModelTests`
   - `swift test --filter CacheLibraryPaginationTests`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`

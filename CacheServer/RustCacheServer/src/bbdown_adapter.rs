@@ -429,7 +429,7 @@ impl BbdownBilibiliAdapter {
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
         let preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
-        let input_selection = playback_selection_from_id(selection_id)?;
+        let input_selection = playback_selection_from_id(&input, selection_id)?;
         let input = input_selection.input_override.unwrap_or(input);
         let selection = input_selection
             .selection
@@ -663,6 +663,7 @@ impl PlaybackExpectedIdentity {
 }
 
 fn playback_selection_from_id(
+    input: &Input,
     selection_id: Option<&str>,
 ) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
     let Some(selection_id) = selection_id
@@ -673,16 +674,25 @@ fn playback_selection_from_id(
     };
 
     if let Some(page) = selection_id.strip_prefix("page:") {
-        return parse_selection_u32(page, selection_id).map(|page| PlaybackInputSelection {
+        if !playback_input_accepts_page_selection(input) {
+            return Err(invalid_selection_id(selection_id));
+        }
+        return parse_selection_index(page, selection_id).map(|page| PlaybackInputSelection {
             input_override: None,
             selection: Some(Selection::Page(page)),
             expected_identity: None,
         });
     }
     if let Some(item) = selection_id.strip_prefix("item:") {
+        if !playback_input_accepts_collection_item_selection(input) {
+            return Err(invalid_selection_id(selection_id));
+        }
         return playback_collection_item_selection_from_id(item, selection_id);
     }
     if let Some(episode) = selection_id.strip_prefix("episode:") {
+        if !playback_input_accepts_episode_selection(input) {
+            return Err(invalid_selection_id(selection_id));
+        }
         return parse_selection_u64(episode, selection_id).map(|episode| PlaybackInputSelection {
             input_override: None,
             selection: Some(Selection::Episode(episode)),
@@ -691,6 +701,39 @@ fn playback_selection_from_id(
     }
 
     Err(invalid_selection_id(selection_id))
+}
+
+fn playback_input_accepts_page_selection(input: &Input) -> bool {
+    matches!(input, Input::Aid(_) | Input::Bvid(_))
+}
+
+fn playback_input_accepts_episode_selection(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::Episode(_)
+            | Input::Season(_)
+            | Input::Media(_)
+            | Input::CheeseEpisode(_)
+            | Input::CheeseSeason(_)
+            | Input::IntlEpisode(_)
+    )
+}
+
+fn playback_input_accepts_collection_item_selection(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::SpaceVideos(_)
+            | Input::FavoriteList { .. }
+            | Input::CollectionList(_)
+            | Input::SeriesList(_)
+            | Input::SpaceCollectionList { .. }
+            | Input::SpaceSeriesList { .. }
+            | Input::RecommendationFeed
+            | Input::FollowingFeed
+            | Input::SpaceDynamic(_)
+            | Input::History
+            | Input::WatchLater
+    )
 }
 
 fn playback_collection_item_selection_from_id(
@@ -702,8 +745,11 @@ fn playback_collection_item_selection_from_id(
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_selection_id(selection_id))?;
-    let index = parse_selection_u32(index_text, selection_id)?;
+    let index = parse_selection_index(index_text, selection_id)?;
     let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    if expected_identity.is_none() {
+        return Err(invalid_selection_id(selection_id));
+    }
     let input_override = expected_identity
         .as_ref()
         .and_then(PlaybackExpectedIdentity::input_override);
@@ -749,6 +795,14 @@ fn playback_expected_identity_from_parts<'a>(
         return Ok(None);
     }
     Ok(Some(PlaybackExpectedIdentity { bvid, aid }))
+}
+
+fn parse_selection_index(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
+    let index = parse_selection_u32(text, selection_id)?;
+    if index == 0 || index > BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 {
+        return Err(invalid_selection_id(selection_id));
+    }
+    Ok(index)
 }
 
 fn parse_selection_u32(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
@@ -2010,26 +2064,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_selection_id_as_single_index() {
-        let input_selection = playback_selection_from_id(Some("item:7")).unwrap();
+    fn parses_video_page_selection_id() {
+        let input_selection =
+            playback_selection_from_id(&Input::Bvid("BV1xx411c7mD".to_owned()), Some("page:7"))
+                .unwrap();
+
         assert_eq!(input_selection.input_override, None);
         assert_eq!(input_selection.expected_identity, None);
-        let selection = input_selection
-            .selection
-            .expect("selection id should resolve to a selection");
+        assert_eq!(input_selection.selection, Some(Selection::Page(7)));
+    }
 
-        let Selection::Indices(indices) = selection else {
-            panic!("collection item selection should use index selection");
-        };
-        assert!(indices.contains(7));
-        assert!(!indices.contains(6));
-        assert!(!indices.contains(8));
+    #[test]
+    fn parses_episode_selection_id() {
+        let input_selection =
+            playback_selection_from_id(&Input::Season(1), Some("episode:170001")).unwrap();
+
+        assert_eq!(input_selection.input_override, None);
+        assert_eq!(input_selection.expected_identity, None);
+        assert_eq!(input_selection.selection, Some(Selection::Episode(170_001)));
     }
 
     #[test]
     fn parses_collection_item_bvid_selection_id_as_stable_input_override() {
-        let input_selection =
-            playback_selection_from_id(Some("item:7:bvid:BV1xx411c7mD:aid:170001")).unwrap();
+        let input_selection = playback_selection_from_id(
+            &Input::History,
+            Some("item:7:bvid:BV1xx411c7mD:aid:170001"),
+        )
+        .unwrap();
 
         assert_eq!(
             input_selection.input_override,
@@ -2047,7 +2108,8 @@ mod tests {
 
     #[test]
     fn parses_collection_item_aid_selection_id_as_stable_input_override() {
-        let input_selection = playback_selection_from_id(Some("item:7:aid:170001")).unwrap();
+        let input_selection =
+            playback_selection_from_id(&Input::History, Some("item:7:aid:170001")).unwrap();
 
         assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
         assert_eq!(input_selection.selection, None);
@@ -2065,11 +2127,52 @@ mod tests {
         for selection_id in ["all", "current", "latest", "1-100", "page:1-2"] {
             assert!(
                 matches!(
-                    playback_selection_from_id(Some(selection_id)),
+                    playback_selection_from_id(&Input::Bvid("BV1xx411c7mD".to_owned()), Some(selection_id)),
                     Err(BilibiliDownloadError::Failed(message))
                         if message.contains("Invalid selection_id")
                 ),
                 "expected {selection_id:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_selection_ids_for_mismatched_source_kinds() {
+        for (input, selection_id) in [
+            (Input::History, "page:1"),
+            (Input::History, "episode:170001"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "item:1:aid:170001"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "episode:170001"),
+            (Input::Season(1), "page:1"),
+            (Input::Season(1), "item:1:aid:170001"),
+        ] {
+            assert!(
+                matches!(
+                    playback_selection_from_id(&input, Some(selection_id)),
+                    Err(BilibiliDownloadError::Failed(message))
+                        if message.contains("Invalid selection_id")
+                ),
+                "expected {selection_id:?} to be rejected for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unstable_or_unbounded_selection_indices() {
+        for (input, selection_id) in [
+            (Input::History, "item:1"),
+            (Input::History, "item:0:aid:170001"),
+            (Input::History, "item:101:aid:170001"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "page:0"),
+            (Input::Bvid("BV1xx411c7mD".to_owned()), "page:101"),
+        ] {
+            assert!(
+                matches!(
+                    playback_selection_from_id(&input, Some(selection_id)),
+                    Err(BilibiliDownloadError::Failed(message))
+                        if message.contains("Invalid selection_id")
+                ),
+                "expected {selection_id:?} to be rejected for {input:?}"
             );
         }
     }
@@ -2239,7 +2342,8 @@ mod tests {
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
 
-        let input_selection = playback_selection_from_id(Some(&candidate.selection_id)).unwrap();
+        let input_selection =
+            playback_selection_from_id(&Input::History, Some(&candidate.selection_id)).unwrap();
         assert_eq!(
             input_selection.input_override,
             Some(Input::Bvid("BV1xx411c7mD".to_owned()))
