@@ -368,13 +368,18 @@ impl BbdownBilibiliAdapter {
         {
             Ok(resolved) => resolved,
             Err(error) if should_retry_bounded_resolve(&error) => {
-                self.retry_resolve_with_largest_bounded_prefix(input, error, &is_cancel_requested)
-                    .await?
+                self.retry_resolve_with_largest_bounded_prefix(
+                    input.clone(),
+                    error,
+                    &is_cancel_requested,
+                )
+                .await?
             }
             Err(error) => return Err(failed(error)),
         };
         Ok(BilibiliInputResolution::from_resolved_content(
             source.trim().to_owned(),
+            &input,
             resolved,
         ))
     }
@@ -545,9 +550,22 @@ fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
 
 fn resolve_selection_for_input(input: &Input) -> Result<Selection, BilibiliDownloadError> {
     match input {
+        Input::Aid(_) | Input::Bvid(_) => Ok(Selection::Current),
         Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
             Ok(Selection::Current)
         }
+        Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_) => Ok(Selection::Page(1)),
+        Input::SpaceVideos(_)
+        | Input::FavoriteList { .. }
+        | Input::CollectionList(_)
+        | Input::SeriesList(_)
+        | Input::SpaceCollectionList { .. }
+        | Input::SpaceSeriesList { .. }
+        | Input::RecommendationFeed
+        | Input::FollowingFeed
+        | Input::SpaceDynamic(_)
+        | Input::History
+        | Input::WatchLater => Ok(Selection::Latest),
         _ => resolve_selection(),
     }
 }
@@ -781,7 +799,7 @@ impl BilibiliPlaybackPlan {
 }
 
 impl BilibiliInputResolution {
-    fn from_resolved_content(source: String, resolved: ResolvedContent) -> Self {
+    fn from_resolved_content(source: String, input: &Input, resolved: ResolvedContent) -> Self {
         match resolved {
             ResolvedContent::Video(video) => {
                 let candidates = video
@@ -802,8 +820,12 @@ impl BilibiliInputResolution {
                 Self::with_candidates(source, video.title, "video", candidates)
             }
             ResolvedContent::Season(season) => {
-                let candidates = season
-                    .selected_episodes
+                let episodes = if resolve_should_use_full_episode_list(input) {
+                    &season.season.episodes
+                } else {
+                    &season.selected_episodes
+                };
+                let candidates = episodes
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|episode| {
@@ -829,8 +851,12 @@ impl BilibiliInputResolution {
             }
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
-                let candidates = collection
-                    .selected_items
+                let items = if resolve_should_use_full_collection_list(input) {
+                    &collection.collection.items
+                } else {
+                    &collection.selected_items
+                };
+                let candidates = items
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|item| BilibiliResolvedCandidate {
@@ -874,6 +900,30 @@ impl BilibiliInputResolution {
             default_selection_id,
         }
     }
+}
+
+fn resolve_should_use_full_episode_list(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_)
+    )
+}
+
+fn resolve_should_use_full_collection_list(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::SpaceVideos(_)
+            | Input::FavoriteList { .. }
+            | Input::CollectionList(_)
+            | Input::SeriesList(_)
+            | Input::SpaceCollectionList { .. }
+            | Input::SpaceSeriesList { .. }
+            | Input::RecommendationFeed
+            | Input::FollowingFeed
+            | Input::SpaceDynamic(_)
+            | Input::History
+            | Input::WatchLater
+    )
 }
 
 fn page_selection_id(index: u32) -> String {
@@ -1904,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_limits_candidates_to_first_page_window() {
+    fn bounded_resolve_selection_limits_candidates_to_first_page_window() {
         let selection = resolve_selection().expect("resolve selection should be valid");
 
         let Selection::Indices(indices) = selection else {
@@ -1932,25 +1982,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_uses_bounded_indices_for_broad_inputs() {
-        let inputs = [
-            Input::Bvid("BV1qt4y1X7TW".to_owned()),
-            Input::Season(123),
+    fn resolve_selection_uses_single_overview_requests_for_common_inputs() {
+        assert_eq!(
+            resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())).unwrap(),
+            Selection::Current
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::Aid(123)).unwrap(),
+            Selection::Current
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::Season(123)).unwrap(),
+            Selection::Page(1)
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::Media(456)).unwrap(),
+            Selection::Page(1)
+        );
+        assert_eq!(
+            resolve_selection_for_input(&Input::CheeseSeason(789)).unwrap(),
+            Selection::Page(1)
+        );
+
+        let list_inputs = [
             Input::FavoriteList {
                 media_id: Some(456),
                 owner_mid: None,
             },
+            Input::RecommendationFeed,
             Input::History,
         ];
 
-        for input in inputs {
-            let selection = resolve_selection_for_input(&input).unwrap();
-            let Selection::Indices(indices) = selection else {
-                panic!("resolve selection should use bounded indices for {input:?}");
-            };
-            assert!(indices.contains(1));
-            assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
-            assert!(!indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1));
+        for input in list_inputs {
+            assert_eq!(
+                resolve_selection_for_input(&input).unwrap(),
+                Selection::Latest
+            );
         }
     }
 
@@ -2081,8 +2148,36 @@ mod tests {
             mid: 123,
             name: "Owner".to_owned(),
         };
+        let selected_item = bbdown_core::VideoCollectionItem {
+            index: 3,
+            aid: 170_001,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: 270_001,
+            title: "Selected Item".to_owned(),
+            cover_url: None,
+            description: String::new(),
+            pub_time: None,
+            owner: Some(owner.clone()),
+            duration_seconds: Some(120),
+        };
+        let unselected_item = bbdown_core::VideoCollectionItem {
+            index: 4,
+            aid: 170_002,
+            bvid: Some("BV1yy411c7mD".to_owned()),
+            cid: 270_002,
+            title: "Unselected Item".to_owned(),
+            cover_url: None,
+            description: String::new(),
+            pub_time: None,
+            owner: Some(owner.clone()),
+            duration_seconds: Some(90),
+        };
         let resolution = BilibiliInputResolution::from_resolved_content(
             "favorite:456".to_owned(),
+            &Input::FavoriteList {
+                media_id: Some(456),
+                owner_mid: None,
+            },
             ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
                 collection: bbdown_core::VideoCollectionMetadata {
                     id: Some(456),
@@ -2092,25 +2187,14 @@ mod tests {
                     cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
                     pub_time: None,
                     owner: Some(owner.clone()),
-                    items: Vec::new(),
+                    items: vec![selected_item.clone(), unselected_item],
                 },
-                selected_items: vec![bbdown_core::VideoCollectionItem {
-                    index: 3,
-                    aid: 170_001,
-                    bvid: Some("BV1xx411c7mD".to_owned()),
-                    cid: 270_001,
-                    title: "Selected Item".to_owned(),
-                    cover_url: None,
-                    description: String::new(),
-                    pub_time: None,
-                    owner: Some(owner),
-                    duration_seconds: Some(120),
-                }],
+                selected_items: vec![selected_item],
             }),
         );
 
         assert_eq!(resolution.source_kind, "favorite");
-        assert_eq!(resolution.candidates.len(), 1);
+        assert_eq!(resolution.candidates.len(), 2);
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,

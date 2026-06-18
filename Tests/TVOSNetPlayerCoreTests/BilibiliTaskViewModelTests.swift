@@ -108,6 +108,101 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Server A result",
+                        candidates: [
+                            .fixture(selectionID: "page:a1", title: "A1", index: 1),
+                            .fixture(selectionID: "page:a2", title: "A2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Server B result",
+                        candidates: [
+                            .fixture(selectionID: "page:b1", title: "B1", index: 1)
+                        ],
+                        defaultSelectionID: "page:b1"
+                    )),
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "server-a.local:50051")
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+        model.selectedCandidateID = "page:a2"
+
+        await model.submit(serverAddressText: "server-b.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:b1")
+
+        model.clearTask()
+    }
+
+    func testSubmitReResolvesWhenOptionsChangeAfterCandidateSelection() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Default quality result",
+                        candidates: [
+                            .fixture(selectionID: "page:default1", title: "Default 1", index: 1),
+                            .fixture(selectionID: "page:default2", title: "Default 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "1080p result",
+                        candidates: [
+                            .fixture(selectionID: "page:1080p1", title: "1080p 1", index: 1)
+                        ],
+                        defaultSelectionID: "page:1080p1"
+                    )),
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+        model.selectedCandidateID = "page:default2"
+        model.qualityPreference = "1080p"
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.options.qualityPreference), ["", "1080p"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:1080p1")
+
+        model.clearTask()
+    }
+
     func testTerminalSubmitResponseDoesNotStartWatching() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(source: "BV1fail", state: "TASK_STATE_FAILED", message: "Planning failed."))
@@ -827,6 +922,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         case let .failure(error):
             throw error
         }
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        try await createBilibiliPlaybackTask(urlOrID: urlOrID, selectionID: nil, options: options)
     }
 
     func createBilibiliPlaybackTask(

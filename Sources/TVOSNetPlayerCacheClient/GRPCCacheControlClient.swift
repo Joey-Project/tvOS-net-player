@@ -174,6 +174,17 @@ public final class GRPCCacheControlClient: CacheControlClient {
 
     public func createBilibiliPlaybackTask(
         urlOrID: String,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
+    ) async throws -> CacheTask {
+        try await createBilibiliPlaybackTask(
+            urlOrID: urlOrID,
+            selectionID: nil,
+            options: options
+        )
+    }
+
+    public func createBilibiliPlaybackTask(
+        urlOrID: String,
         selectionID: String? = nil,
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
     ) async throws -> CacheTask {

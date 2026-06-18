@@ -184,6 +184,22 @@ superseded_by:
   - `offline-frozen-diff-review` found the same index-only collection/feed selection risk and found resolve RPCs bypassed the playback-planning concurrency limiter.
   - Fixed collection/feed selection IDs by preserving the original source context, adding expected BVID/aid identity to opaque `item` IDs, and failing stale selections when the planned entry no longer matches the resolved candidate.
   - Fixed resolve RPC resource protection by acquiring `playback_planning_permits` while the resolver runs.
+- PR D final review follow-up:
+  - `independent-codex-pr-review` found selected candidate submissions were only bound to the source text, so changing the cache server endpoint or playback options after resolve could send a server-specific selection ID to the wrong create request.
+  - `independent-codex-pr-review` also found the new selected-create method replaced the old public `CacheControlClient.createBilibiliPlaybackTask(urlOrID:options:)` requirement, breaking existing external conformers.
+  - `offline-frozen-diff-review` found common Bilibili resolve inputs could require multiple upstream resolve calls before returning candidates, risking the UI timeout budget.
+  - Fixed the Swift view model by binding resolved candidates to normalized source text, cache server endpoint, and playback options, and forcing a fresh resolve when any of those change before selected submission.
+  - Restored the legacy `CacheControlClient.createBilibiliPlaybackTask(urlOrID:options:)` requirement and added a default selected-create overload that forwards nil selections while rejecting non-empty selections for conformers that do not support Bilibili resolve.
+  - Fixed the Rust adapter to use single overview resolve requests for common inputs and extract full episode/list candidates from returned metadata, keeping the old bounded-prefix fallback only for short-result recovery paths.
+- PR D final review follow-up validation:
+  - `scripts/format.sh`
+  - `cargo fmt --all --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server bbdown_adapter::tests --lib`
+  - `swift test --filter BilibiliTaskViewModelTests`
+  - `swift test --filter CacheLibraryPaginationTests`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_waits_for_playback_planning_permit --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server playback_plan_rejects_stale_collection_selection_identity --lib`
+  - `just ci`
 
 ## Next Steps
 

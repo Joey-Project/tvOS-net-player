@@ -32,6 +32,10 @@ public protocol CacheControlClient: Sendable {
     ) async throws -> BilibiliResolveResult
     func createBilibiliPlaybackTask(
         urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
         selectionID: String?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask
@@ -66,18 +70,21 @@ public extension CacheControlClient {
     ) async throws -> CacheTask {
         try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
-            selectionID: nil,
             options: BilibiliPlaybackTaskOptions()
         )
     }
 
     func createBilibiliPlaybackTask(
         urlOrID: String,
+        selectionID: String?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
-        try await createBilibiliPlaybackTask(
+        let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard normalizedSelectionID.isEmpty else {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolve
+        }
+        return try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
-            selectionID: nil,
             options: options
         )
     }

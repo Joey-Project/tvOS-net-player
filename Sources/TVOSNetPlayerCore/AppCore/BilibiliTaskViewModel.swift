@@ -7,6 +7,12 @@ public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
     public let systemImage: String
 }
 
+private struct BilibiliResolvedInputContext: Equatable {
+    let source: String
+    let endpoint: CacheServerEndpoint
+    let options: BilibiliPlaybackTaskOptions
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
@@ -25,6 +31,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private var activeEndpoint: CacheServerEndpoint?
+    private var resolvedInputContext: BilibiliResolvedInputContext?
     private var taskWatcher: Task<Void, Never>?
     private var operationSequence = 0
     private var activePlaybackTaskID: String?
@@ -185,7 +192,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
-        if isWaitingForCandidateSelection {
+        let options = currentPlaybackOptions
+
+        if isWaitingForCandidateSelection,
+            resolvedInputMatches(source: source, endpoint: endpoint, options: options)
+        {
             guard let selectedCandidate else {
                 errorMessage = "Select a Bilibili item before submitting playback."
                 statusMessage = "Bilibili item selection is required."
@@ -195,7 +206,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
             await createPlaybackTask(
                 source: source,
                 selectionID: selectedCandidate.selectionID,
-                endpoint: endpoint
+                endpoint: endpoint,
+                options: options
             )
             return
         }
@@ -208,6 +220,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         activeEndpoint = endpoint
         currentTask = nil
         resolvedInput = nil
+        resolvedInputContext = nil
         selectedCandidateID = nil
         isSubmitting = true
         isResolving = true
@@ -215,10 +228,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
         statusMessage = "Resolving Bilibili input..."
 
         let client = clientFactory(endpoint)
-        let options = BilibiliPlaybackTaskOptions(
-            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
-            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
 
         do {
             let resolved = try await Self.withOperationTimeout(operationTimeout) {
@@ -230,6 +239,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             resolvedInput = resolved
+            resolvedInputContext = BilibiliResolvedInputContext(
+                source: source,
+                endpoint: endpoint,
+                options: options
+            )
             selectedCandidateID =
                 resolved.defaultSelectionID.isEmpty
                 ? resolved.candidates.first?.selectionID
@@ -276,6 +290,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             currentTask = nil
             resolvedInput = nil
+            resolvedInputContext = nil
             selectedCandidateID = nil
             errorMessage = error.localizedDescription
             statusMessage = "Could not resolve Bilibili input."
@@ -403,6 +418,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isResolving = false
         isCancelling = false
         resolvedInput = nil
+        resolvedInputContext = nil
         selectedCandidateID = nil
         stopWatching()
         statusMessage = "No Bilibili playback task submitted."
@@ -442,16 +458,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private func createPlaybackTask(
         source: String,
         selectionID: String?,
-        endpoint: CacheServerEndpoint
+        endpoint: CacheServerEndpoint,
+        options: BilibiliPlaybackTaskOptions
     ) async {
         operationSequence += 1
         activePlaybackTaskID = nil
         let sequence = operationSequence
         let client = clientFactory(endpoint)
-        let options = BilibiliPlaybackTaskOptions(
-            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
-            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
         await createPlaybackTask(
             source: source,
             selectionID: selectionID,
@@ -747,13 +760,41 @@ private extension CacheTask {
 }
 
 private extension BilibiliTaskViewModel {
+    var currentPlaybackOptions: BilibiliPlaybackTaskOptions {
+        BilibiliPlaybackTaskOptions(
+            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
     var resolvedInputMatchesSource: Bool {
-        guard let resolvedInput else {
+        resolvedInputMatches(
+            source: Self.normalizedBilibiliSource(sourceText),
+            endpoint: nil,
+            options: currentPlaybackOptions
+        )
+    }
+
+    func resolvedInputMatches(
+        source: String,
+        endpoint: CacheServerEndpoint?,
+        options: BilibiliPlaybackTaskOptions
+    ) -> Bool {
+        guard let resolvedInput, let resolvedInputContext else {
             return false
         }
 
-        return resolvedInput.source.trimmingCharacters(in: .whitespacesAndNewlines)
-            == sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let endpoint, resolvedInputContext.endpoint != endpoint {
+            return false
+        }
+
+        return resolvedInputContext.source == source
+            && resolvedInputContext.options == options
+            && Self.normalizedBilibiliSource(resolvedInput.source) == source
+    }
+
+    static func normalizedBilibiliSource(_ source: String) -> String {
+        source.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
