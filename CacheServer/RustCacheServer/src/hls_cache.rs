@@ -94,6 +94,13 @@ pub(crate) struct HlsCacheEvictionSummary {
     pub(crate) completed_at: SystemTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCachePartialEntry {
+    pub(crate) session_id: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) updated_at: SystemTime,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFillControl {
     Continue,
@@ -239,6 +246,20 @@ impl HlsCacheStore {
             .load_sessions()?
             .iter()
             .filter_map(|session| self.completed_cache_entry(session))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        Ok(entries)
+    }
+
+    pub(crate) fn partial_cache_entries(&self) -> io::Result<Vec<HlsCachePartialEntry>> {
+        let mut entries = self
+            .load_sessions()?
+            .iter()
+            .filter_map(|session| self.partial_cache_entry(session))
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             left.updated_at
@@ -682,6 +703,27 @@ impl HlsCacheStore {
         })
     }
 
+    fn partial_cache_entry(&self, session: &HlsPlaybackSession) -> Option<HlsCachePartialEntry> {
+        if self.session_is_complete(session) {
+            return None;
+        }
+        let size_bytes = self.session_managed_resource_size(session);
+        if size_bytes == 0 {
+            return None;
+        }
+        let updated_at = self
+            .managed_resource_modification_times(session)
+            .into_iter()
+            .max()
+            .unwrap_or(UNIX_EPOCH);
+
+        Some(HlsCachePartialEntry {
+            session_id: session.id.clone(),
+            size_bytes,
+            updated_at,
+        })
+    }
+
     fn session_is_complete(&self, session: &HlsPlaybackSession) -> bool {
         self.cached_resource(&session.id, &session.variant.video.id)
             .is_some()
@@ -771,6 +813,23 @@ impl HlsCacheStore {
             .chain(std::iter::once(&session.variant.video))
             .filter_map(|resource| self.cached_resource(&session.id, &resource.id))
             .map(|resource| resource.last_modified)
+            .collect()
+    }
+
+    fn managed_resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
+        session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+            .filter_map(|resource| {
+                self.cached_resource(&session.id, &resource.id)
+                    .map(|resource| resource.last_modified)
+                    .or_else(|| {
+                        self.prewarmed_resource(&session.id, &resource.id)
+                            .map(|resource| resource.last_modified)
+                    })
+            })
             .collect()
     }
 
@@ -1267,14 +1326,21 @@ async fn download_resource_prefix(
         reqwest::header::RANGE,
         format!("bytes=0-{}", HLS_PREWARM_HEAD_BYTES - 1),
     );
+    let mut requested_range = false;
     for header in &resource.request.headers {
         if header.name.eq_ignore_ascii_case("range") {
+            requested_range = true;
             continue;
         }
         if !should_forward_media_request_header(&header.name, &resource.request.url, url) {
             continue;
         }
         request = request.header(header.name.as_str(), header.value.as_str());
+    }
+    if requested_range {
+        return Err(HlsCacheError::InvalidResource(
+            "offline HLS cache prewarm does not support range-only media requests".to_owned(),
+        ));
     }
 
     let response = send_request_with_control(request, control).await?;
@@ -2337,6 +2403,38 @@ mod tests {
                 .get_completed_library_item("bilibili.hls.session-partial")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_range_only_hls_cache_prewarm_request() {
+        let (upstream_url, _task) = start_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-prewarm-range", &upstream_url);
+        session
+            .variant
+            .video
+            .request
+            .headers
+            .push(BilibiliHttpHeader {
+                name: "range".to_owned(),
+                value: "bytes=128-255".to_owned(),
+            });
+        let client = reqwest::Client::new();
+
+        let error = store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect_err("range-only prewarm should be rejected");
+
+        assert!(error.to_string().contains("range-only"));
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+        let usage = store
+            .usage_snapshot()
+            .expect("usage should not count rejected prewarm");
+        assert_eq!(0, usage.used_bytes);
     }
 
     #[tokio::test]

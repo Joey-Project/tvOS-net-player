@@ -538,17 +538,6 @@ impl AppState {
         playback_leases.keys().cloned().collect()
     }
 
-    fn hls_cache_stable_protected_session_ids(
-        &self,
-        protected_session_ids: impl IntoIterator<Item = String>,
-    ) -> HashSet<String> {
-        let mut stable_protected_session_ids =
-            protected_session_ids.into_iter().collect::<HashSet<_>>();
-        stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
-        stable_protected_session_ids.extend(self.recently_used_hls_cache_session_ids());
-        stable_protected_session_ids
-    }
-
     fn hls_cache_session_has_finalization_protection(&self, session_id: &str) -> bool {
         self.hls_cache_eviction_protected_session_ids
             .lock()
@@ -602,6 +591,7 @@ impl AppState {
             return Ok(None);
         }
         let entries = self.hls_cache.completed_cache_entries()?;
+        let partial_entries = self.hls_cache.partial_cache_entries()?;
         let usage = self.hls_cache.usage_snapshot()?;
         let started_used_bytes = usage.used_bytes;
         let projected_used_bytes = started_used_bytes.saturating_add(projected_added_bytes);
@@ -609,8 +599,14 @@ impl AppState {
             return Ok(None);
         }
 
-        let stable_protected_session_ids =
-            self.hls_cache_stable_protected_session_ids(protected_session_ids);
+        let explicitly_protected_session_ids =
+            protected_session_ids.into_iter().collect::<HashSet<_>>();
+        let recent_playback_session_ids = self.recently_used_hls_cache_session_ids();
+        let mut stable_protected_session_ids = explicitly_protected_session_ids.clone();
+        stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
+        stable_protected_session_ids.extend(recent_playback_session_ids.iter().cloned());
+        let mut partial_protected_session_ids = explicitly_protected_session_ids;
+        partial_protected_session_ids.extend(recent_playback_session_ids);
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
@@ -649,6 +645,25 @@ impl AppState {
             self.hls_cache.remove_session(&entry.session_id)?;
             self.hls_sessions.remove(&entry.session_id);
             self.remove_evicted_completed_hls_task(&entry);
+            finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
+            evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
+            evicted_session_ids.push(entry.session_id);
+        }
+        for entry in partial_entries {
+            if finished_used_bytes <= target_used_bytes {
+                break;
+            }
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+            if self.hls_cache_session_is_currently_protected_from_eviction(
+                &entry.session_id,
+                &partial_protected_session_ids,
+            ) {
+                continue;
+            }
+            self.hls_cache.remove_session(&entry.session_id)?;
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
             evicted_session_ids.push(entry.session_id);

@@ -2378,6 +2378,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_quota_evicts_unprotected_partial_session() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 2,
+                hls_cache_high_watermark_percent: 50,
+                hls_cache_low_watermark_percent: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let protected =
+            create_partial_hls_playback_task(&state, "BV1protected-partial", &upstream_url).await;
+        let evictable =
+            create_partial_hls_playback_task(&state, "BV1evictable-partial", &upstream_url).await;
+
+        let summary = state
+            .enforce_hls_cache_quota("test", [protected.task_id.clone()], 0)
+            .expect("partial eviction should scan cache")
+            .expect("partial usage should trigger eviction");
+
+        assert_eq!(2 * session_size, summary.started_used_bytes);
+        assert_eq!(session_size, summary.finished_used_bytes);
+        assert_eq!(0, summary.target_used_bytes);
+        assert_eq!(session_size, summary.evicted_bytes);
+        assert_eq!(vec![evictable.task_id.clone()], summary.evicted_session_ids);
+        assert!(!summary.target_reached);
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&protected.task_id, "video.m4s")
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&evictable.task_id, "video.m4s")
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&protected.task_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&evictable.task_id)
+                .is_none()
+        );
+        assert!(state.hls_sessions.get(&evictable.task_id).is_some());
+        assert!(state.tasks.get_task(&protected.task_id).is_ok());
+        assert!(state.tasks.get_task(&evictable.task_id).is_ok());
+    }
+
+    #[tokio::test]
     async fn hls_cache_quota_evicts_stale_failed_progressive_cache() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -4434,6 +4500,10 @@ mod tests {
         library_item_id: String,
     }
 
+    struct PartialHlsTestTask {
+        task_id: String,
+    }
+
     async fn create_completed_hls_playback_task(
         state: &AppState,
         source: &str,
@@ -4458,6 +4528,48 @@ mod tests {
             task_id,
             library_item_id,
         }
+    }
+
+    async fn create_partial_hls_playback_task(
+        state: &AppState,
+        source: &str,
+        upstream_url: &str,
+    ) -> PartialHlsTestTask {
+        let (task_id, mut hls_session, _) =
+            create_playable_hls_playback_task(state, source, upstream_url);
+        let mut audio = hls_session.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = BilibiliMediaRequestKind::Audio;
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
+        hls_session.variant.audio = Some(audio);
+        state.hls_sessions.insert(hls_session.clone());
+        let cache_for_preempt = state.hls_cache.clone();
+        let task_id_for_preempt = task_id.clone();
+
+        let error = state
+            .hls_cache
+            .cache_session_resources_with_control(
+                &state.hls_upstream_client,
+                &hls_session,
+                move || {
+                    if cache_for_preempt
+                        .cached_resource(&task_id_for_preempt, "video.m4s")
+                        .is_some()
+                    {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("partial HLS cache should stop after video resource");
+        assert!(matches!(error, crate::hls_cache::HlsCacheError::Preempted));
+
+        PartialHlsTestTask { task_id }
     }
 
     fn create_playable_hls_playback_task(
