@@ -2436,8 +2436,13 @@ mod tests {
             state
                 .hls_cache
                 .playback_session(&evictable.task_id)
-                .is_none()
+                .is_some()
         );
+        let usage = state
+            .hls_cache
+            .usage_snapshot()
+            .expect("usage snapshot should scan cache after partial eviction");
+        assert_eq!(session_size, usage.used_bytes);
         assert!(state.hls_sessions.get(&evictable.task_id).is_some());
         assert!(state.tasks.get_task(&protected.task_id).is_ok());
         assert!(state.tasks.get_task(&evictable.task_id).is_ok());

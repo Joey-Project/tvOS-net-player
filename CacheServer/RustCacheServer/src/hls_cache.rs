@@ -144,6 +144,22 @@ impl HlsCacheStore {
         }
     }
 
+    pub(crate) fn remove_session_managed_resources(&self, session_id: &str) -> io::Result<()> {
+        let Some(session) = self.load_session(session_id) else {
+            return Ok(());
+        };
+        for resource in session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+        {
+            self.remove_cached_resource(session_id, &resource.id)?;
+            self.remove_prewarmed_resource(session_id, &resource.id)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn load_sessions(&self) -> io::Result<Vec<HlsPlaybackSession>> {
         self.reject_cache_path_symlink(self.root_path.as_ref())?;
         match fs::metadata(self.root_path.as_ref()) {
@@ -757,10 +773,12 @@ impl HlsCacheStore {
             .chain(std::iter::once(&session.variant.video))
         {
             let declared_size = resource.request.size?;
-            let managed_size = self
-                .resource_managed_size(&session.id, &resource.id)
+            let cached_size = self
+                .cached_resource(&session.id, &resource.id)
+                .map(|cached| cached.total_length)
+                .unwrap_or_default()
                 .min(declared_size);
-            total = total.checked_add(declared_size.saturating_sub(managed_size))?;
+            total = total.checked_add(declared_size.saturating_sub(cached_size))?;
         }
         Some(total)
     }
@@ -1027,6 +1045,13 @@ impl HlsCacheStore {
         Ok(self
             .session_dir(session_id)?
             .join(format!("{resource_id}.prewarm.json")))
+    }
+
+    fn remove_cached_resource(&self, session_id: &str, resource_id: &str) -> io::Result<()> {
+        self.remove_managed_cache_file_if_exists(&self.resource_path(session_id, resource_id)?)?;
+        self.remove_managed_cache_file_if_exists(
+            &self.resource_metadata_path(session_id, resource_id)?,
+        )
     }
 
     fn remove_prewarmed_resource(&self, session_id: &str, resource_id: &str) -> io::Result<()> {
@@ -2220,6 +2245,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn projected_remaining_size_does_not_subtract_prewarmed_prefix() {
+        let (upstream_url, _task) = start_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-prewarm-projection", &upstream_url);
+        let resource_size = fake_mp4().len() as u64;
+        session.variant.video.request.size = Some(resource_size);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_some());
+        assert_eq!(
+            Some(resource_size),
+            store.session_projected_remaining_size_bytes(&session)
+        );
+    }
+
     #[test]
     fn hls_eviction_policy_derives_watermark_bytes() {
         let policy = HlsCacheEvictionPolicy {
@@ -3021,6 +3070,94 @@ mod tests {
             .expect("usage snapshot should count only completed resource bytes");
         assert_eq!(1, usage.completed_session_count);
         assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
+    }
+
+    #[test]
+    fn remove_session_managed_resources_preserves_manifest_and_removes_sidecars() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-resource-cleanup", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&session.id, "video.m4s")
+                .expect("resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&session.id, "video.m4s")
+                .expect("resource metadata path should be valid"),
+            &cached_metadata_for_session(&session, "video.m4s"),
+        );
+        let prewarm_prefix_length = 32_u64;
+        std::fs::write(
+            store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid"),
+            &fake_mp4()[..prewarm_prefix_length as usize],
+        )
+        .expect("prewarm resource should be written");
+        write_pretty_json(
+            &store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid"),
+            &PersistedHlsPrewarmedResource {
+                schema_version: HLS_CACHE_SCHEMA_VERSION,
+                id: "video.m4s".to_owned(),
+                content_type: session.variant.video.content_type().to_owned(),
+                prefix_length: prewarm_prefix_length,
+                total_length: fake_mp4().len() as u64,
+                initialization_length: 28,
+                cache_key: PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            },
+        );
+
+        assert!(store.playback_session("session-resource-cleanup").is_some());
+        assert!(store.cached_resource(&session.id, "video.m4s").is_some());
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_some());
+
+        store
+            .remove_session_managed_resources("session-resource-cleanup")
+            .expect("managed resources should be removed");
+
+        assert!(store.playback_session("session-resource-cleanup").is_some());
+        assert!(store.cached_resource(&session.id, "video.m4s").is_none());
+        assert!(store.prewarmed_resource(&session.id, "video.m4s").is_none());
+        assert!(
+            !store
+                .resource_path(&session.id, "video.m4s")
+                .expect("resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&session.id, "video.m4s")
+                .expect("resource metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid")
+                .exists()
+        );
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should scan preserved manifest");
+        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
     }
 
     #[tokio::test]

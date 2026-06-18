@@ -153,6 +153,7 @@ async fn hls_segment_response(
         let Some(resource) = session.media_playlist_resource(&segment_id) else {
             return empty_response(StatusCode::NOT_FOUND);
         };
+        let mut prewarmed_prefix_length = None;
         let initialization = if let Some(cached) = state
             .state
             .hls_cache
@@ -167,6 +168,7 @@ async fn hls_segment_response(
             .hls_cache
             .prewarmed_resource(&session_id, &resource.id)
         {
+            prewarmed_prefix_length = Some(prewarmed.prefix_length);
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
@@ -185,6 +187,7 @@ async fn hls_segment_response(
             &segment_id,
             initialization.length,
             initialization.total_length,
+            prewarmed_prefix_length,
         ) else {
             return text_response(
                 StatusCode::BAD_GATEWAY,
@@ -862,6 +865,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_media_playlist_splits_prewarmed_media_range_to_prefix() {
+        let (upstream_url, _upstream_task) = start_hls_large_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        state.hls_sessions.insert(hls_session(
+            "session-1",
+            "http://127.0.0.1:9/unreachable.m4s",
+        ));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        let mp4 = large_fake_mp4();
+        let initialization_length = mp4_initialization_length(&mp4).unwrap();
+        let first_media_length = HLS_INITIALIZATION_SCAN_BYTES - initialization_length;
+        let remaining_media_length =
+            u64::try_from(mp4.len()).unwrap() - HLS_INITIALIZATION_SCAN_BYTES;
+        assert!(playlist.contains(&format!(
+            "#EXT-X-BYTERANGE:{first_media_length}@{initialization_length}"
+        )));
+        assert!(playlist.contains(&format!(
+            "#EXT-X-BYTERANGE:{remaining_media_length}@{HLS_INITIALIZATION_SCAN_BYTES}"
+        )));
+    }
+
+    #[tokio::test]
     async fn hls_segment_serves_prewarmed_prefix_range() {
         let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
@@ -1182,6 +1232,26 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_large_mp4_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(upstream_large_mp4_get).head(upstream_large_mp4_head),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_range_ignored_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1278,6 +1348,14 @@ mod tests {
         upstream_mp4_response(headers, true)
     }
 
+    async fn upstream_large_mp4_get(headers: HeaderMap) -> Response<Body> {
+        upstream_large_mp4_response(headers, false)
+    }
+
+    async fn upstream_large_mp4_head(headers: HeaderMap) -> Response<Body> {
+        upstream_large_mp4_response(headers, true)
+    }
+
     async fn upstream_forbidden() -> Response<Body> {
         empty_response(StatusCode::FORBIDDEN)
     }
@@ -1357,11 +1435,22 @@ mod tests {
     }
 
     fn upstream_mp4_response(headers: HeaderMap, head_only: bool) -> Response<Body> {
+        upstream_mp4_bytes_response(headers, head_only, fake_mp4())
+    }
+
+    fn upstream_large_mp4_response(headers: HeaderMap, head_only: bool) -> Response<Body> {
+        upstream_mp4_bytes_response(headers, head_only, large_fake_mp4())
+    }
+
+    fn upstream_mp4_bytes_response(
+        headers: HeaderMap,
+        head_only: bool,
+        data: Vec<u8>,
+    ) -> Response<Body> {
         if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
             return empty_response(StatusCode::FORBIDDEN);
         }
 
-        let data = fake_mp4();
         if let Some(range) = headers.get(RANGE).and_then(|value| value.to_str().ok())
             && let Some((start, end)) = parse_test_range(range, data.len())
         {
@@ -1403,6 +1492,18 @@ mod tests {
         bytes.extend(mp4_box(*b"moov", b"metadata"));
         bytes.extend(mp4_box(*b"moof", b"frag"));
         bytes.extend(mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn large_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(
+            *b"mdat",
+            &vec![0x55; usize::try_from(HLS_INITIALIZATION_SCAN_BYTES).unwrap() + 64],
+        ));
         bytes
     }
 

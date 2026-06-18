@@ -663,7 +663,8 @@ impl AppState {
             ) {
                 continue;
             }
-            self.hls_cache.remove_session(&entry.session_id)?;
+            self.hls_cache
+                .remove_session_managed_resources(&entry.session_id)?;
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
             evicted_session_ids.push(entry.session_id);
