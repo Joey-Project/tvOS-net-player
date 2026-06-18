@@ -135,7 +135,6 @@ superseded_by:
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_returns_selectable_candidates --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_passes_selection_id_to_planner --lib`
-  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_bilibili_input_does_not_consume_playback_planning_permit --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server get_server_info_advertises_bilibili_resolve_capability --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server resolve_selection_limits_candidates_to_first_page_window --lib`
   - `scripts/test.sh`
@@ -167,9 +166,11 @@ superseded_by:
   - `just ci` after moving the fake ffmpeg start marker before partial-output creation.
   - `just ci` after removing unbounded `Selection::All` resolve fallback and replacing it with smaller bounded retry windows.
   - `just ci` after replacing fixed retry windows with largest bounded-prefix probing.
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib` after adding stale collection selection identity validation and sharing the playback-planning semaphore with resolve RPCs.
+  - `just ci` after adding stale collection selection identity validation and sharing the playback-planning semaphore with resolve RPCs.
 - PR D pre-commit internal review:
   - Found and fixed old-server compatibility by advertising a `bilibiliResolve` capability and falling back to direct task creation when the resolve RPC returns `UNIMPLEMENTED`.
-  - Found and fixed resolve-side planning pressure by removing playback-planning permit usage from `ResolveBilibiliInput`.
+  - Initially separated resolve from playback task creation; final review later re-shared the playback-planning semaphore for BBDown resolve work that can fetch broad collections.
   - Found and fixed unbounded resolve fan-out by asking BBDown core for a bounded first candidate window and capping returned candidates to 100.
   - Found and fixed concrete episode, cheese episode, and international episode inputs so resolve planning preserves `Selection::Current` instead of forcing a first-page candidate window.
   - Found and fixed collection, favorite, history, and watch-later candidates so their opaque selection IDs round-trip to single-item `Selection::Indices` instead of video-page `Selection::Page`.
@@ -177,7 +178,12 @@ superseded_by:
   - Found and fixed collection/feed selection IDs so playback planning keeps the original collection/feed source and applies the selected list index instead of rewriting the input to a single BVID or aid.
   - Found and fixed unbounded short-result fallback by replacing `Selection::All` retry with smaller bounded index windows.
   - Found and fixed fixed-window bounded retries truncating common 2-4 candidate inputs by probing for the largest valid bounded `1..N` prefix instead of accepting the first smaller successful window.
-  - Final `codex-readonly` isolated review after largest bounded-prefix probing: LGTM.
+  - Earlier `codex-readonly` isolated review after largest bounded-prefix probing: LGTM.
+- PR D triple-review fixes:
+  - `independent-codex-pr-review` found dynamic collection/feed candidate selection could silently play a different item when the list changed between resolve and create.
+  - `offline-frozen-diff-review` found the same index-only collection/feed selection risk and found resolve RPCs bypassed the playback-planning concurrency limiter.
+  - Fixed collection/feed selection IDs by preserving the original source context, adding expected BVID/aid identity to opaque `item` IDs, and failing stale selections when the planned entry no longer matches the resolved candidate.
+  - Fixed resolve RPC resource protection by acquiring `playback_planning_permits` while the resolver runs.
 
 ## Next Steps
 

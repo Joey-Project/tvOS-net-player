@@ -317,6 +317,12 @@ impl TaskService for TaskGrpcService {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
         }
 
+        let _permit = Arc::clone(&self.state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                Status::unavailable("Playback planning concurrency limiter is unavailable.")
+            })?;
         let resolution = self
             .state
             .playback_planner
@@ -1391,14 +1397,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_bilibili_input_does_not_consume_playback_planning_permit() {
+    async fn resolve_bilibili_input_waits_for_playback_planning_permit() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let planner = StaticResolvePlanner {
-            requests: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::clone(&requests),
             resolution: BilibiliInputResolution {
                 source: "BV1multi".to_owned(),
                 title: "Multi page video".to_owned(),
@@ -1430,19 +1437,31 @@ mod tests {
             .expect("playback planning permit should be acquired");
         let service = TaskGrpcService::new(state);
 
-        let resolved = tokio::time::timeout(
-            Duration::from_millis(100),
-            service.resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
-                url_or_id: "BV1multi".to_owned(),
-                options: None,
-            })),
-        )
-        .await
-        .expect("resolve should not wait for the playback planning permit")
-        .expect("resolve should succeed")
-        .into_inner();
+        let pending_resolve = tokio::spawn(async move {
+            service
+                .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+                    url_or_id: "BV1multi".to_owned(),
+                    options: None,
+                }))
+                .await
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(!pending_resolve.is_finished());
+        assert!(
+            requests
+                .lock()
+                .expect("request log should not be poisoned")
+                .is_empty()
+        );
 
         drop(held_permit);
+        let resolved = tokio::time::timeout(Duration::from_secs(1), pending_resolve)
+            .await
+            .expect("resolve should finish after the playback planning permit is released")
+            .expect("resolve task should not panic")
+            .expect("resolve should succeed")
+            .into_inner();
+
         assert_eq!("page:1", resolved.default_selection_id);
     }
 
