@@ -65,6 +65,7 @@ Current Rust crate adapter behavior:
 - Download archive state goes to `Cache:BBDownArchivePath`, defaulting to `bbdown-archive.json` beside `Cache:TaskStatePath`.
 - The adapter requires `ffmpeg`; BBDown core downloads the selected media streams, and the server runs its own `ffmpeg` mux step to publish a title-preserving `.mp4` output that the current local media library can index.
 - The adapter defaults BV/av inputs to current/first page and ss/md inputs to latest episode because the current task result schema has only one `library_item_id`.
+- The adapter can load BBDown credentials from `Cache:BBDownCredentialPath` and pass restricted-area `playurl` / Bilibili API proxy lists through to `bbdown-core`. Runtime configuration stores only file paths and proxy base URLs; Bilibili cookies/access keys stay in the local credential JSON file.
 - `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. Download tasks still reject non-empty `encoding_preference`; `prefer_tv_api` selects BBDown core's TV playurl mode for both download planning and progressive playback planning.
 - BBDown core currently does not expose a chunk-level progress callback or cancellation hook for this adapter path. The worker reports coarse phases and marks late cancellation as cancelled after the core call returns; files may already exist on disk and can be discovered by library rescan.
 
@@ -169,3 +170,7 @@ Configuration:
 - Existing root/output prefixes are canonicalized at runtime before the media library and BBDown adapter are built.
 - `Cache:BBDownArchivePath`: BBDown archive JSON path. Defaults to `bbdown-archive.json` beside `Cache:TaskStatePath`.
 - `Cache:BBDownFfmpegPath`: `ffmpeg` executable path. Defaults to `ffmpeg` from `PATH`.
+- `Cache:BBDownCredentialPath`: optional BBDown credential JSON path. Supported fields are `cookie`, `access_key`, and `tv_access_key`.
+- `Cache:BBDownRestrictedArea`: optional restricted-area hint: `cn`, `th`, `hk`, or `tw`.
+- `Cache:BBDownRestrictedAreaProxy`: optional comma-separated restricted-area playurl proxy specs. Each spec is `[area=]URL`; the URL must use `http` or `https`.
+- `Cache:BBDownRestrictedApiProxy`: optional comma-separated restricted-area Bilibili API proxy specs. Each spec is `[area=]URL`; the URL must use `http` or `https`.

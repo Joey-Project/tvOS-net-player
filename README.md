@@ -56,7 +56,16 @@ BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case；显式指定这些 case 时会真正访问它们，用于验证后续 BBDown restricted-area runtime 配置。
+默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
+
+```bash
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
+BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY='hk=https://proxy.example/playurl' \
+BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://proxy.example/api' \
+BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode \
+just test-bilibili-live
+```
 
 ## LAN Cache Server
 
@@ -112,6 +121,10 @@ BBDown adapter 相关配置：
 - `Cache:BBDownOutputDir`: BBDown 输出目录，默认是 `Cache:RootPath/Bilibili`；当 worker 启用或显式配置该路径时，它必须位于 `Cache:RootPath` 内，不能包含 `..` parent components，且 root 内已经存在的输出路径组件不能是 symlink。
 - `Cache:BBDownArchivePath`: BBDown 下载 archive JSON。默认和 `Cache:TaskStatePath` 同目录，文件名为 `bbdown-archive.json`。
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。
+- `Cache:BBDownCredentialPath`: BBDown credential JSON 文件路径，字段兼容 `bbdown-core` 的 `cookie`、`access_key` 和 `tv_access_key`。不要把这个文件提交到仓库。
+- `Cache:BBDownRestrictedArea`: restricted-area 优先区域，可选 `cn`、`th`、`hk` 或 `tw`。
+- `Cache:BBDownRestrictedAreaProxy`: restricted-area playurl proxy 列表，格式为逗号分隔的 `[area=]URL`，例如 `hk=https://proxy.example/playurl,https://fallback.example/playurl`。
+- `Cache:BBDownRestrictedApiProxy`: restricted-area Bilibili API proxy 列表，格式同上。
 
 启动时 server 会把 `Cache:RootPath` 和启用中的 BBDown output 的已存在路径前缀 canonicalize，再交给 media library 和 BBDown adapter 使用，避免 symlink ancestor 造成下载路径和索引边界不一致。
 

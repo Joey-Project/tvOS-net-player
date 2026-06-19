@@ -21,13 +21,13 @@ superseded_by:
 ## Current State
 
 - Default live smoke validates the two non-region-restricted video cases through the Rust LAN cache server, progressive playback task, and generated HLS master playlist.
-- The Bangumi media and episode cases are recorded and explicitly runnable, but currently fail without BBDown restricted-area runtime configuration.
+- The Bangumi media and episode cases are recorded and explicitly runnable. The Rust LAN cache server now accepts BBDown credential file and restricted-area proxy runtime config, but this workstation has not been configured with real restricted-area credentials/proxy values yet.
 - `prefer_tv_api` now reaches BBDown core's TV playurl mode instead of being rejected by the adapter.
 
 ## Next Steps
 
-- Add server-side BBDown restricted-area configuration and credential/proxy handling.
-- Re-run `BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode just test-bilibili-live`.
+- Configure local BBDown restricted-area proxy/credentials outside the repository.
+- Re-run `BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode just test-bilibili-live` with the restricted-area env overrides documented in `.agents/skills/bilibili-live-e2e/SKILL.md`.
 - After the restricted-area route is available, decide whether default live smoke should include all four cases.
 
 ## Evidence
@@ -45,3 +45,14 @@ superseded_by:
 - `scripts/test-bilibili-live.sh`: default run passed `ordinary-video-playlist` and `multi-part-video`, skipped the two restricted-area cases.
 - Explicit `bangumi-media-series` run failed with Bilibili area restriction after playback planning.
 - Explicit `bangumi-episode` run failed with Bilibili area restriction after playback planning.
+- Added `Cache:BBDownCredentialPath`, `Cache:BBDownRestrictedArea`, `Cache:BBDownRestrictedAreaProxy`, and `Cache:BBDownRestrictedApiProxy`.
+- `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server config --locked`: passed.
+- `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server bbdown_adapter --locked`: passed.
+- `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`: passed.
+- `uv run --isolated --with pyyaml python3 .../skill-creator/scripts/quick_validate.py .agents/skills/bilibili-live-e2e`: passed after narrow escalation for uv cache access.
+- `python3 .../project-journal/scripts/project_journal.py validate --repo .../tvOS-net-player`: passed.
+- `just lint`: passed.
+- `just test-cache-server`: passed.
+- `just test-bilibili-live`: passed the default live smoke entrypoint after the restricted-area config wiring; restricted-area env vars were unset, so the two Bangumi cases were not run in this pass.
+- `git diff --check`: passed.
+- Internal Codex review (`isolated_review`, `codex-review` lane): no findings.

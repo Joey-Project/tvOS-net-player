@@ -1,10 +1,11 @@
 use std::{
-    env, fs, io,
+    env, fmt, fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
 
+use serde::Deserialize;
 use url::Url;
 
 use crate::task_registry::TaskRetentionPolicy;
@@ -34,6 +35,34 @@ pub struct CacheServerOptions {
     pub bbdown_output_dir: Option<PathBuf>,
     pub bbdown_archive_path: Option<PathBuf>,
     pub bbdown_ffmpeg_path: PathBuf,
+    pub bbdown_credential_path: Option<PathBuf>,
+    pub bbdown_restricted_area: Option<BbdownRestrictedArea>,
+    pub bbdown_restricted_area_proxies: Vec<BbdownRestrictedProxy>,
+    pub bbdown_restricted_api_proxies: Vec<BbdownRestrictedProxy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BbdownRestrictedArea {
+    Cn,
+    Th,
+    Hk,
+    Tw,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BbdownRestrictedProxy {
+    pub area: Option<BbdownRestrictedArea>,
+    pub base_url: String,
+}
+
+impl fmt::Debug for BbdownRestrictedProxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BbdownRestrictedProxy")
+            .field("area", &self.area)
+            .field("base_url", &redact_config_url_for_error(&self.base_url))
+            .finish()
+    }
 }
 
 impl Default for CacheServerOptions {
@@ -61,6 +90,10 @@ impl Default for CacheServerOptions {
             bbdown_output_dir: None,
             bbdown_archive_path: None,
             bbdown_ffmpeg_path: PathBuf::from("ffmpeg"),
+            bbdown_credential_path: None,
+            bbdown_restricted_area: None,
+            bbdown_restricted_area_proxies: Vec::new(),
+            bbdown_restricted_api_proxies: Vec::new(),
         }
     }
 }
@@ -133,6 +166,9 @@ impl CacheServerOptions {
                 ));
             }
         }
+        if let Some(path) = self.bbdown_credential_path.as_deref() {
+            validate_bbdown_credential_path(path)?;
+        }
 
         Ok(())
     }
@@ -141,6 +177,9 @@ impl CacheServerOptions {
         self.root_path = self.normalized_root_path();
         if self.bbdown_output_dir.is_some() {
             self.bbdown_output_dir = Some(self.bbdown_output_dir());
+        }
+        if let Some(path) = self.bbdown_credential_path.take() {
+            self.bbdown_credential_path = Some(normalized_absolute_path(&path));
         }
         self
     }
@@ -273,6 +312,18 @@ impl CacheServerOptions {
             "Cache:BBDownOutputDir" => self.bbdown_output_dir = Some(PathBuf::from(value)),
             "Cache:BBDownArchivePath" => self.bbdown_archive_path = Some(PathBuf::from(value)),
             "Cache:BBDownFfmpegPath" => self.bbdown_ffmpeg_path = PathBuf::from(value),
+            "Cache:BBDownCredentialPath" => {
+                self.bbdown_credential_path = Some(PathBuf::from(value));
+            }
+            "Cache:BBDownRestrictedArea" => {
+                self.bbdown_restricted_area = Some(parse_bbdown_restricted_area(&value)?);
+            }
+            "Cache:BBDownRestrictedAreaProxy" => {
+                self.bbdown_restricted_area_proxies = parse_bbdown_restricted_proxy_list(&value)?;
+            }
+            "Cache:BBDownRestrictedApiProxy" => {
+                self.bbdown_restricted_api_proxies = parse_bbdown_restricted_proxy_list(&value)?;
+            }
             key if key.starts_with("Logging:") => {}
             _ => return Err(ConfigError::new(format!("unknown argument: --{key}"))),
         }
@@ -337,6 +388,131 @@ fn parse_bool(value: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" | "n" | "off" => Ok(false),
         _ => Err(ConfigError::new(format!("invalid boolean value: {value}"))),
     }
+}
+
+fn parse_bbdown_restricted_area(value: &str) -> Result<BbdownRestrictedArea, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cn" => Ok(BbdownRestrictedArea::Cn),
+        "th" => Ok(BbdownRestrictedArea::Th),
+        "hk" => Ok(BbdownRestrictedArea::Hk),
+        "tw" => Ok(BbdownRestrictedArea::Tw),
+        other => Err(ConfigError::new(format!(
+            "unsupported BBDown restricted area `{other}`; expected cn, th, hk, or tw"
+        ))),
+    }
+}
+
+fn parse_bbdown_restricted_proxy_list(
+    value: &str,
+) -> Result<Vec<BbdownRestrictedProxy>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty())
+        .map(parse_bbdown_restricted_proxy)
+        .collect()
+}
+
+fn parse_bbdown_restricted_proxy(spec: &str) -> Result<BbdownRestrictedProxy, ConfigError> {
+    let (area, base_url) = if let Some((area, base_url)) = parse_area_prefixed_proxy(spec)? {
+        (Some(parse_bbdown_restricted_area(area)?), base_url.trim())
+    } else {
+        (None, spec)
+    };
+    if base_url.is_empty() {
+        return Err(ConfigError::new(
+            "BBDown restricted-area proxy URL cannot be empty",
+        ));
+    }
+    let parsed = Url::parse(base_url).map_err(|error| {
+        ConfigError::new(format!(
+            "failed to parse BBDown restricted-area proxy URL `{}`: {error}",
+            redact_config_url_for_error(base_url)
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ConfigError::new(format!(
+            "BBDown restricted-area proxy URL `{}` must use http or https",
+            redact_config_url_for_error(base_url)
+        )));
+    }
+
+    Ok(BbdownRestrictedProxy {
+        area,
+        base_url: base_url.to_owned(),
+    })
+}
+
+fn parse_area_prefixed_proxy(spec: &str) -> Result<Option<(&str, &str)>, ConfigError> {
+    if starts_with_url_scheme(spec) {
+        return Ok(None);
+    }
+    let Some((area, base_url)) = spec.split_once('=') else {
+        return Ok(None);
+    };
+    match area.trim().to_ascii_lowercase().as_str() {
+        "cn" | "th" | "hk" | "tw" => Ok(Some((area, base_url))),
+        other => Err(ConfigError::new(format!(
+            "unsupported BBDown restricted area `{other}`; expected cn, th, hk, or tw"
+        ))),
+    }
+}
+
+fn starts_with_url_scheme(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let scheme = &value[..scheme_end];
+    scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn redact_config_url_for_error(raw: &str) -> String {
+    Url::parse(raw).map_or_else(
+        |_| "<redacted restricted-area proxy URL>".to_owned(),
+        |mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_path("");
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        },
+    )
+}
+
+#[derive(Deserialize)]
+struct BbdownCredentialFile {
+    cookie: Option<String>,
+    access_key: Option<String>,
+    #[serde(default)]
+    tv_access_key: Option<String>,
+}
+
+fn validate_bbdown_credential_path(path: &Path) -> Result<(), ConfigError> {
+    let raw = fs::read_to_string(path).map_err(|error| {
+        ConfigError::new(format!(
+            "failed to read BBDown credential file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let credentials: BbdownCredentialFile = serde_json::from_str(&raw).map_err(|error| {
+        ConfigError::new(format!(
+            "failed to parse BBDown credential file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let _ = (
+        credentials.cookie,
+        credentials.access_key,
+        credentials.tv_access_key,
+    );
+    Ok(())
 }
 
 fn normalized_absolute_path(path: &Path) -> PathBuf {
@@ -529,6 +705,12 @@ mod tests {
             "/tmp/state/bbdown.json".to_owned(),
             "--Cache:BBDownFfmpegPath".to_owned(),
             "/opt/homebrew/bin/ffmpeg".to_owned(),
+            "--Cache:BBDownRestrictedArea".to_owned(),
+            "hk".to_owned(),
+            "--Cache:BBDownRestrictedAreaProxy".to_owned(),
+            "hk=https://play.example/proxy,https://generic.example/proxy".to_owned(),
+            "--Cache:BBDownRestrictedApiProxy".to_owned(),
+            "tw=https://api.example/proxy".to_owned(),
         ])
         .expect("options should parse");
 
@@ -555,6 +737,93 @@ mod tests {
             PathBuf::from("/opt/homebrew/bin/ffmpeg"),
             options.bbdown_ffmpeg_path
         );
+        assert_eq!(
+            Some(BbdownRestrictedArea::Hk),
+            options.bbdown_restricted_area
+        );
+        assert_eq!(
+            vec![
+                BbdownRestrictedProxy {
+                    area: Some(BbdownRestrictedArea::Hk),
+                    base_url: "https://play.example/proxy".to_owned(),
+                },
+                BbdownRestrictedProxy {
+                    area: None,
+                    base_url: "https://generic.example/proxy".to_owned(),
+                },
+            ],
+            options.bbdown_restricted_area_proxies
+        );
+        assert_eq!(
+            vec![BbdownRestrictedProxy {
+                area: Some(BbdownRestrictedArea::Tw),
+                base_url: "https://api.example/proxy".to_owned(),
+            }],
+            options.bbdown_restricted_api_proxies
+        );
+    }
+
+    #[test]
+    fn parses_bbdown_credential_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{"cookie":"SESSDATA=secret","access_key":"access-token","tv_access_key":"tv-token"}"#,
+        )
+        .unwrap();
+
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+        ])
+        .expect("options should parse");
+
+        assert_eq!(Some(credentials_path), options.bbdown_credential_path);
+    }
+
+    #[test]
+    fn rejects_invalid_bbdown_credential_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(&credentials_path, "not json").unwrap();
+
+        let result = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+        ]);
+
+        assert!(matches!(result, Err(ConfigError { .. })));
+    }
+
+    #[test]
+    fn rejects_invalid_bbdown_restricted_area() {
+        let result = CacheServerOptions::from_args([
+            "--Cache:BBDownRestrictedArea".to_owned(),
+            "us".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("expected cn, th, hk, or tw")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_bbdown_restricted_proxy_without_leaking_secret_url_parts() {
+        let result = CacheServerOptions::from_args([
+            "--Cache:BBDownRestrictedAreaProxy".to_owned(),
+            "hk=ftp://user:password@example.invalid/private/path?token=secret".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message })
+                if message.contains("ftp://example.invalid/")
+                    && !message.contains("password")
+                    && !message.contains("private")
+                    && !message.contains("secret")
+        ));
     }
 
     #[test]

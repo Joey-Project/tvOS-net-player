@@ -300,17 +300,8 @@ impl LiveTestServer {
         let media_port = free_port();
         let grpc_url = format!("http://127.0.0.1:{grpc_port}");
         let media_url = format!("http://127.0.0.1:{media_port}");
-        let state = AppState::new(CacheServerOptions {
-            server_name: "Bilibili Live E2E".to_owned(),
-            task_state_path: root_path.join(".state").join("tasks.json"),
-            root_path,
-            grpc_listen_url: grpc_url.clone(),
-            media_listen_url: media_url,
-            bonjour_enabled: false,
-            bilibili_worker_enabled: false,
-            hls_cache_max_bytes: 0,
-            ..CacheServerOptions::default()
-        });
+        let options = live_server_options(root_path.clone(), grpc_url.clone(), media_url);
+        let state = AppState::new(options);
 
         let grpc_task = tokio::spawn(run_grpc_server(
             state.options.grpc_listen_addr().unwrap(),
@@ -337,6 +328,71 @@ impl LiveTestServer {
             .await
             .unwrap()
     }
+}
+
+fn live_server_options(
+    root_path: PathBuf,
+    grpc_url: String,
+    media_url: String,
+) -> CacheServerOptions {
+    let mut args = vec![
+        "--Cache:ServerName".to_owned(),
+        "Bilibili Live E2E".to_owned(),
+        "--Cache:TaskStatePath".to_owned(),
+        root_path
+            .join(".state")
+            .join("tasks.json")
+            .display()
+            .to_string(),
+        "--Cache:RootPath".to_owned(),
+        root_path.display().to_string(),
+        "--Cache:GrpcListenUrl".to_owned(),
+        grpc_url,
+        "--Cache:MediaListenUrl".to_owned(),
+        media_url,
+        "--Cache:BonjourEnabled".to_owned(),
+        "false".to_owned(),
+        "--Cache:BilibiliWorkerEnabled".to_owned(),
+        "false".to_owned(),
+        "--Cache:HlsCacheMaxBytes".to_owned(),
+        "0".to_owned(),
+    ];
+    push_arg_from_env(
+        &mut args,
+        "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH",
+        "Cache:BBDownCredentialPath",
+    );
+    push_arg_from_env(
+        &mut args,
+        "BILIBILI_LIVE_E2E_RESTRICTED_AREA",
+        "Cache:BBDownRestrictedArea",
+    );
+    push_arg_from_env(
+        &mut args,
+        "BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY",
+        "Cache:BBDownRestrictedAreaProxy",
+    );
+    push_arg_from_env(
+        &mut args,
+        "BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY",
+        "Cache:BBDownRestrictedApiProxy",
+    );
+
+    CacheServerOptions::from_args(args)
+        .expect("live e2e cache server options should parse")
+        .normalized_for_runtime()
+}
+
+fn push_arg_from_env(args: &mut Vec<String>, env_key: &str, config_key: &str) {
+    let Some(value) = env::var(env_key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    args.push(format!("--{config_key}"));
+    args.push(value);
 }
 
 fn free_port() -> u16 {

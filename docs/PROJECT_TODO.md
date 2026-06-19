@@ -2,7 +2,7 @@
 
 - [completed] 在共享 AppCore、tvOS app 和 macOS app 增加 Bilibili URL/BV task 提交和进度 UI。
 - [pending] 在 Apple TV 实机上验证 `scripts/deploy-lan.sh` 的签名、安装和启动链路。
-- [pending] 为 Rust LAN cache server 增加 BBDown restricted-area runtime 配置/凭据入口，然后验证 `bangumi-media-series` 和 `bangumi-episode` 两个真实番剧 live e2e case。
+- [pending] 配置真实 BBDown restricted-area proxy/credentials 后，验证 `bangumi-media-series` 和 `bangumi-episode` 两个真实番剧 live e2e case。
 - [completed] 为 LAN cache library 增加完整分页/search UI，替代当前最多 200 条的首屏 preview。
 - [completed] 为持久化 task state 增加 retention/cleanup 策略，避免历史任务无限增长。
 - [completed] 增加 cache root 展示、可见缓存项删除和离线 HLS 状态 UX。

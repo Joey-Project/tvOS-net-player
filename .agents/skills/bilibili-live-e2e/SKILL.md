@@ -1,6 +1,6 @@
 ---
 name: bilibili-live-e2e
-description: Run this repository's opt-in real Bilibili live e2e smoke tests for the macOS/tvOS LAN cache playback path. Use when Joey asks to validate real Bilibili URLs, run live e2e, test bbdown-rust integration, verify macOS client playback readiness, or investigate live progressive HLS playback failures in tvOS-net-player.
+description: Run this repository's opt-in real Bilibili live e2e smoke tests for the macOS/tvOS LAN cache playback path, including restricted-area Bangumi cases. Use when Joey asks to validate real Bilibili URLs, run live e2e, test bbdown-rust integration, verify macOS client playback readiness, or investigate live progressive HLS playback failures in tvOS-net-player.
 ---
 
 # Bilibili Live E2E
@@ -31,7 +31,18 @@ BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-5. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors.
+5. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Pass local restricted-area runtime settings through these environment variables:
+
+```bash
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
+BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY='hk=https://proxy.example/playurl' \
+BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://proxy.example/api' \
+BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode \
+just test-bilibili-live
+```
+
+The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `access_key`, and `tv_access_key` fields. Do not commit real credentials or real proxy tokens.
 6. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, or upstream availability.
 
 ## Scope

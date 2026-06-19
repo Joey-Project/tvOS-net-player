@@ -32,4 +32,4 @@
 - 架构决策：gRPC 只做控制面；媒体面继续使用 `AVPlayer` 可直接播放的 HTTP/HLS/Range URL。
 - CI 不保存 Apple Developer secrets；设备刷新只在本机通过 `scripts/deploy-lan.sh` 执行。
 - 本地 hook 用 `just install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。
-- 真实 Bilibili smoke suite 由 `.agents/skills/bilibili-live-e2e/` 维护；默认跑非区域限制 case，番剧区域限制 case 需要后续 BBDown restricted-area runtime 配置。
+- 真实 Bilibili smoke suite 由 `.agents/skills/bilibili-live-e2e/` 维护；默认跑非区域限制 case。Rust LAN cache server 已支持 BBDown credential file 和 restricted-area proxy runtime 配置，番剧区域限制 case 仍需要本机真实 proxy/credential 后再验证。
