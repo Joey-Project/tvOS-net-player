@@ -117,6 +117,8 @@ impl BilibiliTaskRegistry {
             finished_at: None,
             playback_source: None,
             playback_session: None,
+            bilibili_selection: None,
+            result_items: Vec::new(),
         };
 
         inner
@@ -163,6 +165,8 @@ impl BilibiliTaskRegistry {
             finished_at: None,
             playback_source: None,
             playback_session: None,
+            bilibili_selection: None,
+            result_items: Vec::new(),
         };
 
         inner
@@ -2464,6 +2468,8 @@ mod tests {
                 finished_at,
                 playback_source: None,
                 playback_session: None,
+                bilibili_selection: None,
+                result_items: Vec::new(),
             },
             options: None,
             playback_options: None,

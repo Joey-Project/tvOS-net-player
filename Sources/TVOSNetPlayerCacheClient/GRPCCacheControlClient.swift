@@ -493,8 +493,38 @@ extension BilibiliResolvedCandidate {
     }
 }
 
+extension BilibiliTaskSelection {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliTaskSelection) {
+        self.init(
+            mode: String(describing: proto.mode),
+            selectionIDs: proto.selectionIds,
+            rangeStartIndex: Int(proto.rangeStartIndex),
+            rangeEndIndex: Int(proto.rangeEndIndex)
+        )
+    }
+}
+
+extension BilibiliTaskResultItem {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliTaskResultItem) {
+        self.init(
+            id: proto.id,
+            selectionID: proto.selectionID,
+            title: proto.title,
+            subtitle: proto.subtitle,
+            sourceKind: proto.sourceKind,
+            contentID: proto.contentID,
+            index: Int(proto.index),
+            state: String(describing: proto.state),
+            message: proto.message,
+            libraryItemID: proto.libraryItemID,
+            playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
+            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil
+        )
+    }
+}
+
 extension CacheTask {
-    fileprivate init(_ proto: TvosNetPlayer_V1_Task) {
+    init(_ proto: TvosNetPlayer_V1_Task) {
         self.init(
             id: proto.id,
             kind: String(describing: proto.kind),
@@ -507,7 +537,11 @@ extension CacheTask {
             message: proto.message,
             libraryItemID: proto.libraryItemID,
             playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
-            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil
+            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil,
+            bilibiliSelection: proto.hasBilibiliSelection
+                ? BilibiliTaskSelection(proto.bilibiliSelection)
+                : nil,
+            resultItems: proto.resultItems.map(BilibiliTaskResultItem.init)
         )
     }
 }

@@ -19,10 +19,10 @@ use crate::{
     generated::tvos_net_player::v1::{
         BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackVariant,
         BilibiliResolveResult, BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate,
-        CacheRoot, CancelTaskRequest, CheckHealthRequest, CreateBilibiliPlaybackTaskRequest,
-        CreateBilibiliTaskRequest, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
-        GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
-        GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
+        BilibiliTaskSelection, CacheRoot, CancelTaskRequest, CheckHealthRequest,
+        CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
+        DeleteLibraryItemResponse, GetHlsCacheStatusRequest, GetLibraryItemRequest,
+        GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
         HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus, LibraryItem,
         LibrarySource, ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
         ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource, RescanLibraryRequest,
@@ -44,6 +44,8 @@ use crate::{
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
 const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
+const BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED: i32 = 0;
+const BILIBILI_TASK_SELECTION_MODE_DEFAULT: i32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -355,6 +357,7 @@ impl TaskService for TaskGrpcService {
         let url_or_id = request.get_ref().url_or_id.clone();
         let options = request.get_ref().options.clone();
         let selection_id = normalized_optional_string(&request.get_ref().selection_id);
+        validate_deferred_bilibili_task_selection(request.get_ref().selection.as_ref())?;
         let creation = self
             .state
             .tasks
@@ -1186,6 +1189,34 @@ fn normalized_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+fn validate_deferred_bilibili_task_selection(
+    selection: Option<&BilibiliTaskSelection>,
+) -> Result<(), Status> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+
+    let has_payload = selection
+        .selection_ids
+        .iter()
+        .any(|selection_id| !selection_id.trim().is_empty())
+        || selection.range_start_index != 0
+        || selection.range_end_index != 0;
+    let is_default_mode = matches!(
+        selection.mode,
+        BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED | BILIBILI_TASK_SELECTION_MODE_DEFAULT
+    );
+
+    if is_default_mode && !has_payload {
+        return Ok(());
+    }
+
+    Err(Status::invalid_argument(concat!(
+        "Bilibili task selection is schema-only in this server version; ",
+        "use selection_id for single-item playback until multi-selection execution is implemented."
+    )))
+}
+
 impl From<BilibiliInputResolution> for BilibiliResolveResult {
     fn from(resolution: BilibiliInputResolution) -> Self {
         Self {
@@ -1241,10 +1272,10 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliPlaybackOptions, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
-            GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, LibraryFilter,
-            LibrarySource, ListLibraryItemsRequest, ResolveBilibiliInputRequest, TaskKind,
-            TaskState,
+            BilibiliPlaybackOptions, BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest,
+            DeleteLibraryItemRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
+            GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
+            ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
     };
     use axum::{
@@ -1492,6 +1523,12 @@ mod tests {
                 url_or_id: "BV1select".to_owned(),
                 options: None,
                 selection_id: "page:2".to_owned(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_DEFAULT,
+                    selection_ids: Vec::new(),
+                    range_start_index: 0,
+                    range_end_index: 0,
+                }),
             }))
             .await
             .expect("playback task should be created")
@@ -1504,6 +1541,48 @@ mod tests {
             vec![("BV1select".to_owned(), Some("page:2".to_owned()))],
             *requests
         );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_rejects_deferred_selection_schema() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(RecordingPlaybackPlanner {
+                requests: Arc::clone(&requests),
+            }),
+        );
+        let service = TaskGrpcService::new(state);
+
+        let error = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: 5,
+                    selection_ids: vec!["page:1".to_owned(), "page:2".to_owned()],
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect_err("deferred selection schema should be rejected");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert!(error.message().contains("schema-only"));
+        let requests = requests.lock().expect("request log should not be poisoned");
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
@@ -1538,6 +1617,7 @@ mod tests {
                         prefer_tv_api: false,
                     }),
                     selection_id: String::new(),
+                    selection: None,
                 },
             )),
         )
@@ -1621,6 +1701,7 @@ mod tests {
                 url_or_id: "BV1cancel-before-manifest".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -1673,6 +1754,7 @@ mod tests {
                 url_or_id: "BV1empty".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -1683,6 +1765,7 @@ mod tests {
                 url_or_id: "BV1empty".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("failed planning should allow retry")
@@ -1722,6 +1805,7 @@ mod tests {
                     url_or_id: "BV1pending".to_owned(),
                     options: None,
                     selection_id: String::new(),
+                    selection: None,
                 }))
                 .await
         })
@@ -1770,6 +1854,7 @@ mod tests {
                 url_or_id: "BV1pending-duplicate".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("first playback task should be created")
@@ -1779,6 +1864,7 @@ mod tests {
                 url_or_id: "BV1pending-duplicate".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("second playback task should be created")
@@ -1836,6 +1922,7 @@ mod tests {
                 url_or_id: "BV1first".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("first playback task should be created")
@@ -1848,6 +1935,7 @@ mod tests {
                 url_or_id: "BV1second".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("second playback task should be created")
@@ -1901,6 +1989,7 @@ mod tests {
                 url_or_id: "BV1offline".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -2088,6 +2177,7 @@ mod tests {
                 url_or_id: "BV1deletehls".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -3039,6 +3129,7 @@ mod tests {
                 url_or_id: "BV1offline".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -3133,6 +3224,7 @@ mod tests {
                 url_or_id: "BV1runtime".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -3188,6 +3280,7 @@ mod tests {
                 url_or_id: "BV1runtime".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -4444,6 +4537,7 @@ mod tests {
                 url_or_id: "BV1offline".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")
@@ -4715,6 +4809,7 @@ mod tests {
                 url_or_id: "BV1first".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("first playback task should be created")
@@ -4727,6 +4822,7 @@ mod tests {
                 url_or_id: "BV1second".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("second playback task should be created")
@@ -4749,6 +4845,7 @@ mod tests {
                 url_or_id: "BV1second".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("cancelled playback task should allow retry")
@@ -4798,6 +4895,7 @@ mod tests {
                 url_or_id: "BV1race".to_owned(),
                 options: None,
                 selection_id: String::new(),
+                selection: None,
             }))
             .await
             .expect("playback task should be created")

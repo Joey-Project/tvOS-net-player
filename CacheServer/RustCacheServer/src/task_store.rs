@@ -167,6 +167,8 @@ impl From<PersistedTaskFile> for PersistedTaskRecord {
                 finished_at: file.finished_at.map(Timestamp::from),
                 playback_source: file.playback_source.map(PlaybackSource::from),
                 playback_session: file.playback_session.map(BilibiliPlaybackSession::from),
+                bilibili_selection: None,
+                result_items: Vec::new(),
             },
             options: file.bilibili_options.map(BilibiliDownloadOptions::from),
             playback_options: file
@@ -398,4 +400,47 @@ fn temp_path_for(path: &Path) -> PathBuf {
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_legacy_snapshot_defaults_bilibili_schema_fields() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "bilibili-playback-legacy",
+      "kind": 3,
+      "state": 10,
+      "source": "BV1legacy",
+      "title": "Legacy video",
+      "progress": 1.0,
+      "downloaded_bytes": 0,
+      "total_bytes": 0,
+      "message": "Cached.",
+      "library_item_id": "bilibili.hls.legacy",
+      "created_at": null,
+      "updated_at": null,
+      "finished_at": null
+    }
+  ]
+}"#,
+        )
+        .expect("legacy snapshot should be written");
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("legacy snapshot should load");
+
+        assert_eq!(1, records.len());
+        assert!(records[0].task.bilibili_selection.is_none());
+        assert!(records[0].task.result_items.is_empty());
+    }
 }

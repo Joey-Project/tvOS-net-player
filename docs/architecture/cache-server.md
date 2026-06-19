@@ -64,7 +64,7 @@ Current Rust crate adapter behavior:
 - At runtime, existing root/output path prefixes are canonicalized before constructing the media library and BBDown adapter so common symlink ancestors such as `/tmp` do not make BBDown download to a path the library later rejects.
 - Download archive state goes to `Cache:BBDownArchivePath`, defaulting to `bbdown-archive.json` beside `Cache:TaskStatePath`.
 - The adapter requires `ffmpeg`; BBDown core downloads the selected media streams, and the server runs its own `ffmpeg` mux step to publish a title-preserving `.mp4` output that the current local media library can index.
-- The adapter defaults BV/av inputs to current/first page and ss/md inputs to latest episode because the current task result schema has only one `library_item_id`.
+- The adapter still defaults BV/av inputs to current/first page and ss/md inputs to latest episode for execution until the new Bilibili task selection/result schema is wired through the server planner. The schema foundation now keeps the legacy single `library_item_id` path while adding explicit selection intent and repeated result item fields for follow-up execution work.
 - The adapter can load BBDown credentials from `Cache:BBDownCredentialPath` and pass restricted-area `playurl` / Bilibili API proxy lists through to `bbdown-core`. Runtime configuration stores only file paths and proxy base URLs; Bilibili cookies/access keys stay in the local credential JSON file.
 - `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. Download tasks still reject non-empty `encoding_preference`; `prefer_tv_api` selects BBDown core's TV playurl mode for both download planning and progressive playback planning.
 - BBDown core currently does not expose a chunk-level progress callback or cancellation hook for this adapter path. The worker reports coarse phases and marks late cancellation as cancelled after the core call returns; files may already exist on disk and can be discovered by library rescan.
@@ -74,7 +74,7 @@ Playback planning foundation:
 - `bbdown-core` `v0.3.0` exposes playback planning as resolver output: entries, DASH/FLV variants, media URLs, backup URLs, request headers, mime/codec metadata, duration/size metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
 - The cache server maps those core playback structs into server-owned DTOs before any control-plane or media-pipeline exposure. This keeps BBDown API churn behind the adapter boundary.
 - Variant selection starts with BBDown's `PlaybackCodecPreference::avplayer_default()` ranking, supports explicit H.264/HEVC/AV1 preferences for future progressive requests, and falls back to H.264/AAC when an explicit non-H.264 preference is not available.
-- `v0.3.0` adds feed/history/watch-later style input parsing. The cache server maps those new collection/feed-style inputs to the latest item by default, matching the existing single-result task schema while explicit page/episode/all and multi-item task schema remain deferred product decisions.
+- `v0.3.0` adds feed/history/watch-later style input parsing. The cache server maps those new collection/feed-style inputs to the latest item by default until the follow-up server execution slice consumes the explicit page/episode/all and multi-item task schema.
 - Playback planning currently rejects Bilibili short links because `bbdown-core` resolves them internally after the caller must already choose a default selection. Supporting short links without incorrect season/collection behavior requires a core API that exposes the resolved `Input` before planning.
 - BBDown remains a resolver and metadata provider for progressive playback. The LAN cache server owns source fetch retry, HLS playlist/segment generation, durable cache layout, recovery, and optional LAN-side transcoding.
 - The cache server exposes progressive playback through `TaskService.CreateBilibiliPlaybackTask`. The RPC creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it immediately in `PREPARING`; BBDown playback planning runs in the background, registers a runtime HLS session, then publishes persisted `BilibiliPlaybackSession` metadata and a HLS `PlaybackSource` through `GetTask` and `WatchTasks`.
@@ -97,6 +97,14 @@ Initial services:
 - `CacheService`: list cache roots, read HLS cache quota status, and delete cached items.
 
 Playback sources intentionally return URLs instead of media bytes.
+
+Bilibili task schema foundation:
+
+- `CreateBilibiliPlaybackTaskRequest.selection_id` remains the legacy single-candidate path.
+- `CreateBilibiliPlaybackTaskRequest.selection` adds forward-compatible selection intent for default/current/single/multiple/range/all item requests.
+- `Task.library_item_id` remains the primary single-result compatibility field.
+- `Task.bilibili_selection` and `Task.result_items` add the shape needed for explicit selection and multi-result status, but this slice does not change planner execution semantics yet.
+- `BilibiliTaskResultItem` can carry per-result state, messages, library item IDs, playback sources, and playback session metadata.
 
 Cache deletion contract:
 
