@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、真实 BBDown Rust crate adapter、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、真实 BBDown Rust crate adapter、repo-local Bilibili live e2e skill、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -20,6 +20,7 @@
 - Cache library pagination/search workstream：`docs/project_journal/2026/06/2026-06-15-cache-library-pagination-search-d2f8a1.md`
 - Task retention cleanup workstream：`docs/project_journal/2026/06/2026-06-15-task-retention-cleanup-e7c2b5.md`
 - Discovery/cache/weak-network/Bilibili schema roadmap：`docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
+- Bilibili live e2e skill：`docs/project_journal/2026/06/2026-06-19-bilibili-live-e2e-skill-6e4b2a.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
@@ -31,3 +32,4 @@
 - 架构决策：gRPC 只做控制面；媒体面继续使用 `AVPlayer` 可直接播放的 HTTP/HLS/Range URL。
 - CI 不保存 Apple Developer secrets；设备刷新只在本机通过 `scripts/deploy-lan.sh` 执行。
 - 本地 hook 用 `just install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。
+- 真实 Bilibili smoke suite 由 `.agents/skills/bilibili-live-e2e/` 维护；默认跑非区域限制 case，番剧区域限制 case 需要后续 BBDown restricted-area runtime 配置。

@@ -65,7 +65,7 @@ Current Rust crate adapter behavior:
 - Download archive state goes to `Cache:BBDownArchivePath`, defaulting to `bbdown-archive.json` beside `Cache:TaskStatePath`.
 - The adapter requires `ffmpeg`; BBDown core downloads the selected media streams, and the server runs its own `ffmpeg` mux step to publish a title-preserving `.mp4` output that the current local media library can index.
 - The adapter defaults BV/av inputs to current/first page and ss/md inputs to latest episode because the current task result schema has only one `library_item_id`.
-- `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. `encoding_preference` and `prefer_tv_api` remain in the proto but are rejected until the adapter implements them.
+- `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. Download tasks still reject non-empty `encoding_preference`; `prefer_tv_api` selects BBDown core's TV playurl mode for both download planning and progressive playback planning.
 - BBDown core currently does not expose a chunk-level progress callback or cancellation hook for this adapter path. The worker reports coarse phases and marks late cancellation as cancelled after the core call returns; files may already exist on disk and can be discovered by library rescan.
 
 Playback planning foundation:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bilibili Live E2E"
+  short_description: "Run repo Bilibili live playback smoke tests"
+  default_prompt: "Use $bilibili-live-e2e to run the repo Bilibili live e2e smoke suite."

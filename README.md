@@ -35,6 +35,7 @@ just test-macos
 just test-tvos
 just test
 just test-cache-server
+just test-bilibili-live
 ```
 
 `just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict`、`cargo fmt --check` 和 `cargo clippy -D warnings`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `cargo fmt` 格式化 Rust cache server 源码。
@@ -46,6 +47,16 @@ just test-cache-server
 ```bash
 TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
+
+真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，固定覆盖普通视频、多 P 视频、番剧 media 页和番剧 episode 页四类输入。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
+
+```bash
+just test-bilibili-live
+BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
+BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
+```
+
+默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case；显式指定这些 case 时会真正访问它们，用于验证后续 BBDown restricted-area runtime 配置。
 
 ## LAN Cache Server
 

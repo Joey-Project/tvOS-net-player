@@ -38,6 +38,9 @@ test:
 test-cache-server:
     scripts/test-cache-server.sh
 
+test-bilibili-live:
+    scripts/test-bilibili-live.sh
+
 test-macos:
     scripts/test-macos.sh
 
