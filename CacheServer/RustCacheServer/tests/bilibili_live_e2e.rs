@@ -91,6 +91,7 @@ async fn run_live_case(
             url_or_id: case.url.clone(),
             options: Some(options),
             selection_id,
+            selection: None,
         }))
         .await
         .unwrap_or_else(|error| panic!("{}: create playback task failed: {error}", case.id))

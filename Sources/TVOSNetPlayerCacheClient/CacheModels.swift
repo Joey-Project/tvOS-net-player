@@ -471,6 +471,68 @@ public struct BilibiliResolvedCandidate: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct BilibiliTaskSelection: Equatable, Sendable {
+    public let mode: String
+    public let selectionIDs: [String]
+    public let rangeStartIndex: Int
+    public let rangeEndIndex: Int
+
+    public init(
+        mode: String,
+        selectionIDs: [String] = [],
+        rangeStartIndex: Int = 0,
+        rangeEndIndex: Int = 0
+    ) {
+        self.mode = mode
+        self.selectionIDs = selectionIDs
+        self.rangeStartIndex = rangeStartIndex
+        self.rangeEndIndex = rangeEndIndex
+    }
+}
+
+public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let selectionID: String
+    public let title: String
+    public let subtitle: String
+    public let sourceKind: String
+    public let contentID: String
+    public let index: Int
+    public let state: String
+    public let message: String
+    public let libraryItemID: String
+    public let playbackSource: CachePlaybackSource?
+    public let playbackSession: CacheBilibiliPlaybackSession?
+
+    public init(
+        id: String,
+        selectionID: String,
+        title: String,
+        subtitle: String,
+        sourceKind: String,
+        contentID: String,
+        index: Int,
+        state: String,
+        message: String,
+        libraryItemID: String,
+        playbackSource: CachePlaybackSource? = nil,
+        playbackSession: CacheBilibiliPlaybackSession? = nil
+    ) {
+        self.id = id
+        self.selectionID = selectionID
+        self.title = title
+        self.subtitle = subtitle
+        self.sourceKind = sourceKind
+        self.contentID = contentID
+        self.index = index
+        self.state = state
+        self.message = message
+        self.libraryItemID = libraryItemID
+        self.playbackSource = playbackSource
+        self.playbackSession = playbackSession
+    }
+}
+
 public struct CacheTask: Identifiable, Equatable, Sendable {
     public let id: String
     public let kind: String
@@ -484,6 +546,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
     public let libraryItemID: String
     public let playbackSource: CachePlaybackSource?
     public let playbackSession: CacheBilibiliPlaybackSession?
+    public let bilibiliSelection: BilibiliTaskSelection?
+    public let resultItems: [BilibiliTaskResultItem]
 
     public init(
         id: String,
@@ -497,7 +561,9 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         message: String,
         libraryItemID: String,
         playbackSource: CachePlaybackSource?,
-        playbackSession: CacheBilibiliPlaybackSession?
+        playbackSession: CacheBilibiliPlaybackSession?,
+        bilibiliSelection: BilibiliTaskSelection? = nil,
+        resultItems: [BilibiliTaskResultItem] = []
     ) {
         self.id = id
         self.kind = kind
@@ -511,6 +577,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         self.libraryItemID = libraryItemID
         self.playbackSource = playbackSource
         self.playbackSession = playbackSession
+        self.bilibiliSelection = bilibiliSelection
+        self.resultItems = resultItems
     }
 
     public var isProgressivePlayback: Bool {

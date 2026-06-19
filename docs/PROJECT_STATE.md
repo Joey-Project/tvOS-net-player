@@ -21,6 +21,7 @@
 - Task retention cleanup workstream：`docs/project_journal/2026/06/2026-06-15-task-retention-cleanup-e7c2b5.md`
 - Discovery/cache/weak-network/Bilibili schema roadmap：`docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Bilibili live e2e skill：`docs/project_journal/2026/06/2026-06-19-bilibili-live-e2e-skill-6e4b2a.md`
+- Bilibili task options/result schema roadmap：`docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers

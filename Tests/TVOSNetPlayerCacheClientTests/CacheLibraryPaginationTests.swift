@@ -9,6 +9,53 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testBilibiliTaskSchemaMapsSelectionAndResultItems() {
+        var proto = TvosNetPlayer_V1_Task()
+        proto.id = "task-1"
+        proto.kind = .bilibiliProgressivePlayback
+        proto.state = .completed
+        proto.source = "BV1schema"
+        proto.title = "Schema video"
+        proto.message = "Completed."
+        proto.libraryItemID = "bilibili.hls.task-1"
+        proto.bilibiliSelection.mode = .range
+        proto.bilibiliSelection.selectionIds = ["page:1", "page:2"]
+        proto.bilibiliSelection.rangeStartIndex = 1
+        proto.bilibiliSelection.rangeEndIndex = 2
+
+        var result = TvosNetPlayer_V1_BilibiliTaskResultItem()
+        result.id = "result-1"
+        result.selectionID = "page:1"
+        result.title = "Part 1"
+        result.subtitle = "Page 1"
+        result.sourceKind = "video_page"
+        result.contentID = "BV1schema:cid1"
+        result.index = 1
+        result.state = .completed
+        result.message = "Cached."
+        result.libraryItemID = "bilibili.hls.result-1"
+        result.playbackSource.itemID = "bilibili.hls.result-1"
+        result.playbackSource.variantID = "h264"
+        result.playbackSource.`protocol` = .hls
+        result.playbackSource.uri = "http://mac-mini.local:8080/hls/result-1/master.m3u8"
+        proto.resultItems = [result]
+
+        let task = CacheTask(proto)
+        let expectedSelectionMode = String(
+            describing: TvosNetPlayer_V1_BilibiliTaskSelectionMode.range
+        )
+        let expectedResultState = String(describing: TvosNetPlayer_V1_TaskState.completed)
+        let expectedPlaybackProtocol = String(describing: TvosNetPlayer_V1_PlaybackProtocol.hls)
+
+        XCTAssertEqual(task.bilibiliSelection?.mode, expectedSelectionMode)
+        XCTAssertEqual(task.bilibiliSelection?.selectionIDs, ["page:1", "page:2"])
+        XCTAssertEqual(task.bilibiliSelection?.rangeStartIndex, 1)
+        XCTAssertEqual(task.bilibiliSelection?.rangeEndIndex, 2)
+        XCTAssertEqual(task.resultItems.map(\.selectionID), ["page:1"])
+        XCTAssertEqual(task.resultItems.first?.state, expectedResultState)
+        XCTAssertEqual(task.resultItems.first?.playbackSource?.playbackProtocol, expectedPlaybackProtocol)
+    }
+
     func testCacheServerSummaryExposesBilibiliResolveSupport() {
         let supported = CacheServerSummary(
             id: "server-1",
