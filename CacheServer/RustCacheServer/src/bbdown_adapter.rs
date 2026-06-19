@@ -9,11 +9,12 @@ use std::{
 };
 
 use bbdown_core::{
-    BiliClient, ClientConfig, DownloadArchive, DownloadFileKind, DownloadOptions, DownloadReport,
-    DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
-    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
-    PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
-    PlaybackPlan, PlaybackVariant, PlaybackVariantKind, ResolvedContent, Selection,
+    BiliClient, ClientConfig, CredentialStore, Credentials, DownloadArchive, DownloadFileKind,
+    DownloadOptions, DownloadReport, DuplicateDecision, EntryDownloadReport, Error as BbdownError,
+    HttpHeaderSpec, IndexSelection, Input, MediaRequestKind, MediaRequestSpec, MuxOptions,
+    MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata,
+    PlaybackCodecPreference, PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode,
+    ResolvedContent, RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection,
     StreamSelection, VideoCollectionKind,
 };
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
@@ -24,7 +25,10 @@ use crate::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadRequest,
     },
-    config::CacheServerOptions,
+    config::{
+        BbdownRestrictedArea as CacheBbdownRestrictedArea,
+        BbdownRestrictedProxy as CacheBbdownRestrictedProxy, CacheServerOptions,
+    },
     generated::tvos_net_player::v1::BilibiliDownloadOptions,
     library::LocalMediaLibrary,
     task_registry::BilibiliTaskProgress,
@@ -35,6 +39,7 @@ const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIM
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
+    tv_client: BiliClient,
     library: Arc<LocalMediaLibrary>,
     output_dir: PathBuf,
     archive_path: PathBuf,
@@ -211,8 +216,13 @@ struct SelectedCorePlaybackVariant<'a> {
 
 impl BbdownBilibiliAdapter {
     pub fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
+        let client_config = bbdown_client_config(&options, PlayurlMode::Web)
+            .unwrap_or_else(|error| panic!("failed to configure BBDown client: {error:?}"));
+        let tv_client_config = bbdown_client_config(&options, PlayurlMode::Tv)
+            .unwrap_or_else(|error| panic!("failed to configure BBDown TV client: {error:?}"));
         Self {
-            client: BiliClient::new(ClientConfig::default()),
+            client: BiliClient::new(client_config),
+            tv_client: BiliClient::new(tv_client_config),
             library,
             output_dir: options.bbdown_output_dir(),
             archive_path: options.bbdown_archive_path(),
@@ -234,6 +244,7 @@ impl BbdownBilibiliAdapter {
 
         let input = Input::parse(&request.source).map_err(failed)?;
         let download_options = self.download_options(request.options.as_ref())?;
+        let client = self.client_for_options(request.options.as_ref());
 
         context.report_progress(progress(
             0.02,
@@ -241,7 +252,7 @@ impl BbdownBilibiliAdapter {
         ));
         let selection = default_selection_for_input(&input);
         let plan = run_bbdown_until_cancelled(
-            self.client.plan(input, selection),
+            client.plan(input, selection),
             || context.is_cancel_requested(),
             "Cancelled while BBDown planning was running.",
         )
@@ -266,7 +277,7 @@ impl BbdownBilibiliAdapter {
 
         let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
         let report = run_bbdown_until_cancelled(
-            self.client.download_plan_with_archive_decision(
+            client.download_plan_with_archive_decision(
                 &plan,
                 download_options,
                 &mut archive,
@@ -349,6 +360,14 @@ impl BbdownBilibiliAdapter {
             .with_mux(MuxOptions::Disabled))
     }
 
+    fn client_for_options(&self, options: Option<&BilibiliDownloadOptions>) -> BiliClient {
+        if options.is_some_and(|options| options.prefer_tv_api) {
+            self.tv_client.clone()
+        } else {
+            self.client.clone()
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn resolve_playback_input(
         &self,
@@ -359,9 +378,10 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input)?;
+        let client = self.client_for_options(options);
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
-            self.client.resolve(input.clone(), selection),
+            client.resolve(input.clone(), selection),
             &is_cancel_requested,
             "Cancelled while BBDown input resolution was running.",
         )
@@ -372,6 +392,7 @@ impl BbdownBilibiliAdapter {
                 self.retry_resolve_with_largest_bounded_prefix(
                     input.clone(),
                     error,
+                    &client,
                     &is_cancel_requested,
                 )
                 .await?
@@ -389,6 +410,7 @@ impl BbdownBilibiliAdapter {
         &self,
         input: Input,
         initial_error: BbdownError,
+        client: &BiliClient,
         is_cancel_requested: &impl Fn() -> bool,
     ) -> Result<ResolvedContent, BilibiliDownloadError> {
         let mut last_error = initial_error;
@@ -399,7 +421,7 @@ impl BbdownBilibiliAdapter {
         while let Some(limit) = search.next_limit() {
             let selection = bounded_resolve_selection(limit)?;
             match run_bbdown_core_until_cancelled(
-                self.client.resolve(input.clone(), Some(selection)),
+                client.resolve(input.clone(), Some(selection)),
                 is_cancel_requested,
                 "Cancelled while BBDown input resolution was running.",
             )
@@ -432,11 +454,12 @@ impl BbdownBilibiliAdapter {
         let input = playback_input_for_planning(source)?;
         let input_selection = playback_selection_from_id(&input, selection_id)?;
         let input = input_selection.input_override.unwrap_or(input);
+        let client = self.client_for_options(options);
         let selection = input_selection
             .selection
             .or_else(|| default_selection_for_input(&input));
         let plan = run_bbdown_until_cancelled(
-            self.client.plan_playback_input(input, selection),
+            client.plan_playback_input(input, selection),
             is_cancel_requested,
             "Cancelled while BBDown playback planning was running.",
         )
@@ -446,6 +469,60 @@ impl BbdownBilibiliAdapter {
             plan.validate_expected_identity(expected_identity)?;
         }
         Ok(plan)
+    }
+}
+
+fn bbdown_client_config(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+) -> Result<ClientConfig, BilibiliDownloadError> {
+    Ok(ClientConfig::default()
+        .with_credentials(bbdown_credentials(
+            options.bbdown_credential_path.as_deref(),
+        )?)
+        .with_restricted_area(bbdown_restricted_area_config(options))
+        .with_playurl_mode(playurl_mode))
+}
+
+fn bbdown_credentials(path: Option<&Path>) -> Result<Credentials, BilibiliDownloadError> {
+    let Some(path) = path else {
+        return Ok(Credentials::default());
+    };
+    CredentialStore::new(path.to_path_buf())
+        .load()
+        .map_err(failed)
+}
+
+fn bbdown_restricted_area_config(options: &CacheServerOptions) -> RestrictedAreaConfig {
+    RestrictedAreaConfig::new(
+        options.bbdown_restricted_area.map(core_restricted_area),
+        options
+            .bbdown_restricted_area_proxies
+            .iter()
+            .map(core_playurl_proxy)
+            .chain(
+                options
+                    .bbdown_restricted_api_proxies
+                    .iter()
+                    .map(core_api_proxy),
+            ),
+    )
+}
+
+fn core_playurl_proxy(proxy: &CacheBbdownRestrictedProxy) -> RestrictedAreaProxy {
+    RestrictedAreaProxy::playurl(proxy.base_url.clone(), proxy.area.map(core_restricted_area))
+}
+
+fn core_api_proxy(proxy: &CacheBbdownRestrictedProxy) -> RestrictedAreaProxy {
+    RestrictedAreaProxy::bilibili_api(proxy.base_url.clone(), proxy.area.map(core_restricted_area))
+}
+
+fn core_restricted_area(area: CacheBbdownRestrictedArea) -> RestrictedArea {
+    match area {
+        CacheBbdownRestrictedArea::Cn => RestrictedArea::Cn,
+        CacheBbdownRestrictedArea::Th => RestrictedArea::Th,
+        CacheBbdownRestrictedArea::Hk => RestrictedArea::Hk,
+        CacheBbdownRestrictedArea::Tw => RestrictedArea::Tw,
     }
 }
 
@@ -1280,13 +1357,6 @@ fn playback_explicit_encoding_preference(
 fn playback_codec_preferences_from_options(
     options: Option<&BilibiliDownloadOptions>,
 ) -> Result<Vec<PlaybackCodecPreferenceCandidate>, BilibiliDownloadError> {
-    if options.is_some_and(|options| options.prefer_tv_api) {
-        return Err(BilibiliDownloadError::Failed(
-            "BBDown playback planning does not support prefer_tv_api yet; set prefer_tv_api=false."
-                .to_owned(),
-        ));
-    }
-
     let encoding_preference = options
         .map(|options| normalized_preference_token(&options.encoding_preference))
         .unwrap_or_default();
@@ -1495,13 +1565,6 @@ fn validate_supported_download_options(
         return Err(BilibiliDownloadError::Failed(format!(
             "BBDown adapter does not support encoding_preference yet; received {encoding_preference:?}."
         )));
-    }
-
-    if options.prefer_tv_api {
-        return Err(BilibiliDownloadError::Failed(
-            "BBDown adapter does not support prefer_tv_api yet; set prefer_tv_api=false."
-                .to_owned(),
-        ));
     }
 
     Ok(())
@@ -1933,7 +1996,8 @@ fn success_message(report: &DownloadReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport};
+    use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
+    use std::fs as std_fs;
 
     #[test]
     fn maps_common_video_quality_preferences() {
@@ -1976,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_tv_api_preference() {
+    fn accepts_tv_api_preference() {
         let options = BilibiliDownloadOptions {
             quality_preference: String::new(),
             encoding_preference: String::new(),
@@ -1986,11 +2050,69 @@ mod tests {
         };
 
         let result = validate_supported_download_options(Some(&options));
-        assert!(matches!(
-            result,
-            Err(BilibiliDownloadError::Failed(message))
-                if message.contains("does not support prefer_tv_api")
-        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builds_bbdown_client_config_from_cache_server_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{"cookie":"SESSDATA=secret","access_key":"access-token","tv_access_key":"tv-token"}"#,
+        )
+        .unwrap();
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+            "--Cache:BBDownRestrictedArea".to_owned(),
+            "hk".to_owned(),
+            "--Cache:BBDownRestrictedAreaProxy".to_owned(),
+            "hk=https://play.example/proxy".to_owned(),
+            "--Cache:BBDownRestrictedApiProxy".to_owned(),
+            "https://api.example/proxy".to_owned(),
+        ])
+        .expect("options should parse");
+
+        let config =
+            bbdown_client_config(&options, PlayurlMode::Tv).expect("client config should build");
+
+        assert_eq!(PlayurlMode::Tv, config.playurl_mode);
+        assert_eq!(
+            Some("SESSDATA=secret"),
+            config.credentials.cookie.as_deref()
+        );
+        assert_eq!(
+            Some("access-token"),
+            config.credentials.access_key.as_deref()
+        );
+        assert_eq!(
+            Some("tv-token"),
+            config.credentials.tv_access_key.as_deref()
+        );
+        assert_eq!(Some(RestrictedArea::Hk), config.restricted_area.area_hint);
+        assert_eq!(2, config.restricted_area.proxies.len());
+        assert_eq!(
+            RestrictedAreaProxyKind::PlayUrl,
+            config.restricted_area.proxies[0].kind
+        );
+        assert_eq!(
+            Some(RestrictedArea::Hk),
+            config.restricted_area.proxies[0].area
+        );
+        assert_eq!(
+            "https://play.example/proxy",
+            config.restricted_area.proxies[0].base_url
+        );
+        assert_eq!(
+            RestrictedAreaProxyKind::BilibiliApi,
+            config.restricted_area.proxies[1].kind
+        );
+        assert_eq!(None, config.restricted_area.proxies[1].area);
+        assert_eq!(
+            "https://api.example/proxy",
+            config.restricted_area.proxies[1].base_url
+        );
     }
 
     #[test]
@@ -2760,12 +2882,9 @@ mod tests {
                 if message.contains("encoding_preference")
         ));
 
+        options = bilibili_options_with_quality("360p");
         options.prefer_tv_api = true;
-        assert!(matches!(
-            playback_variant_preferences_from_options(Some(&options)),
-            Err(BilibiliDownloadError::Failed(message))
-                if message.contains("prefer_tv_api")
-        ));
+        assert!(playback_variant_preferences_from_options(Some(&options)).is_ok());
     }
 
     #[tokio::test]

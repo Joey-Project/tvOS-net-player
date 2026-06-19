@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "description": "Canonical real Bilibili inputs for the tvOS-net-player LAN cache live e2e smoke suite.",
+  "cases": [
+    {
+      "id": "ordinary-video-playlist",
+      "description": "Ordinary Bilibili video with a playlist-like multi-item surface.",
+      "url": "https://www.bilibili.com/video/BV1QtjA6BEB8/",
+      "expected_source_kind": "video",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "multi-part-video",
+      "description": "Bilibili video with multiple parts.",
+      "url": "https://www.bilibili.com/video/BV1uW4y1s7zN/",
+      "expected_source_kind": "video",
+      "minimum_candidates": 2,
+      "selection": "first",
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "bangumi-media-series",
+      "description": "Bangumi media page for an anime series; requires the BBDown TV playurl path for region-restricted playback.",
+      "url": "https://www.bilibili.com/bangumi/media/md28338980",
+      "expected_source_kind": "season",
+      "minimum_candidates": 2,
+      "selection": "first",
+      "requires_restricted_area_path": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": true
+      }
+    },
+    {
+      "id": "bangumi-episode",
+      "description": "Specific Bangumi episode page; requires the BBDown TV playurl path for region-restricted playback.",
+      "url": "https://www.bilibili.com/bangumi/play/ep664928",
+      "expected_source_kind": "season",
+      "minimum_candidates": 1,
+      "selection": "default_or_first",
+      "requires_restricted_area_path": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": true
+      }
+    }
+  ]
+}

@@ -956,7 +956,8 @@ pub async fn run_grpc_server(
     run_grpc_listener(listener, state).await
 }
 
-async fn run_grpc_listener(
+#[doc(hidden)]
+pub async fn run_grpc_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -990,7 +991,8 @@ pub async fn run_media_server(
     run_media_listener(listener, state).await
 }
 
-async fn run_media_listener(
+#[doc(hidden)]
+pub async fn run_media_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
