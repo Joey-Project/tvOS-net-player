@@ -1,8 +1,9 @@
-use std::{collections::HashSet, env, fs, net::TcpListener, path::PathBuf, time::Duration};
+use std::{collections::HashSet, env, fs, path::PathBuf, time::Duration};
 
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tonic::Request;
 use tvos_net_player_cache_server::{
@@ -13,7 +14,7 @@ use tvos_net_player_cache_server::{
         GetTaskRequest, PlaybackProtocol, ResolveBilibiliInputRequest, Task, TaskState,
         task_service_client::TaskServiceClient,
     },
-    run_grpc_server, run_media_server,
+    run_grpc_listener, run_media_listener,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -296,21 +297,15 @@ impl LiveTestServer {
     async fn start() -> Self {
         let temp_root = tempfile::tempdir().unwrap();
         let root_path = temp_root.path().canonicalize().unwrap();
-        let grpc_port = free_port();
-        let media_port = free_port();
-        let grpc_url = format!("http://127.0.0.1:{grpc_port}");
-        let media_url = format!("http://127.0.0.1:{media_port}");
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_url = format!("http://{}", grpc_listener.local_addr().unwrap());
+        let media_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let media_url = format!("http://{}", media_listener.local_addr().unwrap());
         let options = live_server_options(root_path.clone(), grpc_url.clone(), media_url);
         let state = AppState::new(options);
 
-        let grpc_task = tokio::spawn(run_grpc_server(
-            state.options.grpc_listen_addr().unwrap(),
-            state.clone(),
-        ));
-        let media_task = tokio::spawn(run_media_server(
-            state.options.media_listen_addr().unwrap(),
-            state,
-        ));
+        let grpc_task = tokio::spawn(run_grpc_listener(grpc_listener, state.clone()));
+        let media_task = tokio::spawn(run_media_listener(media_listener, state));
 
         wait_for_grpc(&grpc_url).await;
         Self {
@@ -393,14 +388,6 @@ fn push_arg_from_env(args: &mut Vec<String>, env_key: &str, config_key: &str) {
     };
     args.push(format!("--{config_key}"));
     args.push(value);
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 async fn wait_for_grpc(grpc_url: &str) {

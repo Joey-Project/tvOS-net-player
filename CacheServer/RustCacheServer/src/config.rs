@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use bbdown_core::CredentialStore;
 use url::Url;
 
 use crate::task_registry::TaskRetentionPolicy;
@@ -486,33 +486,16 @@ fn redact_config_url_for_error(raw: &str) -> String {
     )
 }
 
-#[derive(Deserialize)]
-struct BbdownCredentialFile {
-    cookie: Option<String>,
-    access_key: Option<String>,
-    #[serde(default)]
-    tv_access_key: Option<String>,
-}
-
 fn validate_bbdown_credential_path(path: &Path) -> Result<(), ConfigError> {
-    let raw = fs::read_to_string(path).map_err(|error| {
-        ConfigError::new(format!(
-            "failed to read BBDown credential file {}: {error}",
-            path.display()
-        ))
-    })?;
-    let credentials: BbdownCredentialFile = serde_json::from_str(&raw).map_err(|error| {
-        ConfigError::new(format!(
-            "failed to parse BBDown credential file {}: {error}",
-            path.display()
-        ))
-    })?;
-    let _ = (
-        credentials.cookie,
-        credentials.access_key,
-        credentials.tv_access_key,
-    );
-    Ok(())
+    CredentialStore::new(path.to_path_buf())
+        .load()
+        .map(|_| ())
+        .map_err(|error| {
+            ConfigError::new(format!(
+                "failed to load BBDown credential file {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn normalized_absolute_path(path: &Path) -> PathBuf {
@@ -783,6 +766,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_bbdown_profile_store_credential_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=secret",
+                        "access_key": "access-token",
+                        "tv_access_key": "tv-token"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+        ])
+        .expect("profile store credentials should parse");
+
+        assert_eq!(Some(credentials_path), options.bbdown_credential_path);
+    }
+
+    #[test]
     fn rejects_invalid_bbdown_credential_file() {
         let temp = tempfile::tempdir().unwrap();
         let credentials_path = temp.path().join("credentials.json");
@@ -793,7 +805,10 @@ mod tests {
             credentials_path.display().to_string(),
         ]);
 
-        assert!(matches!(result, Err(ConfigError { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("failed to load BBDown credential file")
+        ));
     }
 
     #[test]
