@@ -846,6 +846,47 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(model.isCancelling)
     }
 
+    func testTaskResultPlaybackIsDisabledForCancellationPendingTaskUpdate() async {
+        let childResultID = "bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: childResultID
+            )
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(resultItems: resultItems))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-result",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+
+        let playableResult = model.playableTaskResults[0]
+        XCTAssertTrue(model.canPlay(result: playableResult))
+        XCTAssertNotNil(model.playableURL(for: playableResult))
+
+        await client.yield(
+            .playableFixture(
+                state: "TASK_STATE_CANCEL_REQUESTED",
+                resultItems: resultItems
+            ))
+        await waitUntil(!model.canPlay(result: playableResult))
+
+        XCTAssertFalse(model.isCancelling)
+        XCTAssertFalse(model.canPlay(result: playableResult))
+        XCTAssertNil(model.playableURL(for: playableResult))
+
+        model.clearTask()
+    }
+
     func testTaskResultPlaybackRevalidatesCurrentTaskMembership() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [

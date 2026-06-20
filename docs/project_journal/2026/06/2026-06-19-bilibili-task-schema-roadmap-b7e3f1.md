@@ -101,11 +101,14 @@ Validation evidence:
   - Row playback now revalidates current task result membership and playback URL before loading, so stale SwiftUI result actions cannot start removed or failed entries.
   - Multiple selection can now clear the last selected candidate instead of silently re-adding the single-selection default.
   - Multiple selection now keeps the single-selection anchor in sync with the latest remaining selected candidate before switching back to single mode.
+  - Per-result playback now also rejects cancellation-pending task updates from the server, not only local in-flight cancellation state.
+  - Live e2e now validates each playable result playback source item id against the result/library item id expected by AppCore.
   - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
 - Review-fix validation passed locally on 2026-06-20:
   - `swift test --filter BilibiliTaskViewModelTests`
   - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionCanClearLastCandidate`
   - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionSwitchesBackToCurrentSingleCandidate`
+  - `swift test --filter BilibiliTaskViewModelTests/testTaskResultPlaybackIsDisabledForCancellationPendingTaskUpdate`
   - `cargo fmt --manifest-path Cargo.toml --check`
   - `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`
   - `git diff --check`

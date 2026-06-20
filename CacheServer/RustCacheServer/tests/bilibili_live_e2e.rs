@@ -10,7 +10,7 @@ use tvos_net_player_cache_server::{
     AppState,
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
-        BilibiliPlaybackOptions, BilibiliTaskSelection, CancelTaskRequest,
+        BilibiliPlaybackOptions, BilibiliTaskResultItem, BilibiliTaskSelection, CancelTaskRequest,
         CreateBilibiliPlaybackTaskRequest, GetTaskRequest, PlaybackProtocol, PlaybackSource,
         ResolveBilibiliInputRequest, Task, TaskState, task_service_client::TaskServiceClient,
     },
@@ -123,7 +123,8 @@ async fn run_live_case(
         "{}: unexpected playable result count",
         case.id
     );
-    for (index, result_source) in result_sources.into_iter().enumerate() {
+    for (index, (result_item, result_source)) in result_sources.into_iter().enumerate() {
+        assert_result_playback_source_item_id(case, result_item, result_source);
         assert_hls_master(
             case,
             http,
@@ -193,15 +194,38 @@ fn task_has_expected_playable_sources(task: &Task, selection: &LiveSelectionRequ
         && task.playback_source.is_some()
 }
 
-fn playable_result_sources(task: &Task) -> Vec<&PlaybackSource> {
+fn playable_result_sources(task: &Task) -> Vec<(&BilibiliTaskResultItem, &PlaybackSource)> {
     task.result_items
         .iter()
         .filter(|item| {
             item.state == i32::from(TaskState::Playable)
                 || item.state == i32::from(TaskState::Completed)
         })
-        .filter_map(|item| item.playback_source.as_ref())
+        .filter_map(|item| item.playback_source.as_ref().map(|source| (item, source)))
         .collect()
+}
+
+fn assert_result_playback_source_item_id(
+    case: &LiveCase,
+    result_item: &BilibiliTaskResultItem,
+    source: &PlaybackSource,
+) {
+    let expected_item_id = if result_item.state == i32::from(TaskState::Completed) {
+        result_item.library_item_id.trim()
+    } else {
+        result_item.id.trim()
+    };
+    assert!(
+        !expected_item_id.is_empty(),
+        "{}: result item {} has no expected playback source item id",
+        case.id,
+        result_item.id
+    );
+    assert_eq!(
+        expected_item_id, source.item_id,
+        "{}: result item {} playback source item id mismatch",
+        case.id, result_item.id
+    );
 }
 
 async fn assert_hls_master(

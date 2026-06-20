@@ -284,7 +284,16 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return nil
         }
 
-        return currentTaskResult(matching: result)?.playbackURL
+        guard let currentTask,
+            !currentTask.isCancellationPendingBilibiliTaskState
+        else {
+            return nil
+        }
+
+        return currentTask
+            .bilibiliTaskResults
+            .first { $0.id == result.id }?
+            .playbackURL
     }
 
     public var canClear: Bool {
@@ -427,12 +436,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public var playableURL: URL? {
         currentTask?.playableBilibiliURL
-    }
-
-    private func currentTaskResult(
-        matching result: BilibiliTaskResultPresentation
-    ) -> BilibiliTaskResultPresentation? {
-        taskResults.first { $0.id == result.id }
     }
 
     public var displayTitle: String {
