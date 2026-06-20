@@ -644,7 +644,9 @@ fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, Bilib
         | Input::FollowingFeed
         | Input::SpaceDynamic(_)
         | Input::History
-        | Input::WatchLater => Ok(Some(Selection::Latest)),
+        | Input::WatchLater => {
+            bounded_resolve_selection(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32).map(Some)
+        }
         Input::ShortLink(_) => Ok(None),
     }
 }
@@ -1043,7 +1045,7 @@ impl BilibiliInputResolution {
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
                 let candidates_truncated =
-                    collection.selected_items.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
+                    collection.selected_items.len() >= BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = collection
                     .selected_items
                     .iter()
@@ -2232,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_uses_single_overview_requests_for_list_inputs() {
+    fn resolve_selection_uses_bounded_windows_for_list_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Season(123)).unwrap(),
             Some(Selection::Page(1))
@@ -2254,11 +2256,12 @@ mod tests {
             Input::RecommendationFeed,
             Input::History,
         ];
+        let bounded_selection = Some(resolve_selection().unwrap());
 
         for input in list_inputs {
             assert_eq!(
                 resolve_selection_for_input(&input).unwrap(),
-                Some(Selection::Latest)
+                bounded_selection
             );
         }
     }
@@ -2581,14 +2584,14 @@ mod tests {
                     cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
                     pub_time: None,
                     owner: Some(owner.clone()),
-                    items: vec![selected_item.clone(), unselected_item],
+                    items: vec![selected_item.clone(), unselected_item.clone()],
                 },
-                selected_items: vec![selected_item],
+                selected_items: vec![selected_item, unselected_item],
             }),
         );
 
         assert_eq!(resolution.source_kind, "favorite");
-        assert_eq!(resolution.candidates.len(), 1);
+        assert_eq!(resolution.candidates.len(), 2);
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
@@ -2612,6 +2615,40 @@ mod tests {
                 cid: Some(270_001),
             })
         );
+    }
+
+    #[test]
+    fn collection_resolution_marks_full_candidate_window_truncated() {
+        let owner = bbdown_core::Owner {
+            mid: 123,
+            name: "Owner".to_owned(),
+        };
+        let selected_items = (1..=BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
+            .map(|index| test_collection_item(index, &format!("Item {index}"), Some(owner.clone())))
+            .collect::<Vec<_>>();
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "history".to_owned(),
+            &Input::History,
+            ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
+                collection: bbdown_core::VideoCollectionMetadata {
+                    id: None,
+                    kind: VideoCollectionKind::History,
+                    title: "History".to_owned(),
+                    description: String::new(),
+                    cover_url: None,
+                    pub_time: None,
+                    owner: Some(owner),
+                    items: selected_items.clone(),
+                },
+                selected_items,
+            }),
+        );
+
+        assert_eq!(
+            BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            resolution.candidates.len()
+        );
+        assert!(resolution.candidates_truncated);
     }
 
     #[test]
@@ -3287,6 +3324,25 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+        }
+    }
+
+    fn test_collection_item(
+        index: u32,
+        title: &str,
+        owner: Option<bbdown_core::Owner>,
+    ) -> bbdown_core::VideoCollectionItem {
+        bbdown_core::VideoCollectionItem {
+            index,
+            aid: 170_000 + u64::from(index),
+            bvid: Some(format!("BV1test{index}")),
+            cid: 270_000 + u64::from(index),
+            title: title.to_owned(),
+            cover_url: None,
+            description: String::new(),
+            pub_time: None,
+            owner,
+            duration_seconds: Some(index),
         }
     }
 
