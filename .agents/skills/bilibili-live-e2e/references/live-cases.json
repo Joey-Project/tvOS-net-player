@@ -30,7 +30,7 @@
     },
     {
       "id": "bangumi-media-series",
-      "description": "Bangumi media page for an anime series; requires the BBDown TV playurl path for region-restricted playback.",
+      "description": "Bangumi media page for an anime series; requires a trusted web-mode restricted API proxy for region-restricted playback.",
       "url": "https://www.bilibili.com/bangumi/media/md28338980",
       "expected_source_kind": "season",
       "minimum_candidates": 2,
@@ -39,12 +39,12 @@
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",
-        "prefer_tv_api": true
+        "prefer_tv_api": false
       }
     },
     {
       "id": "bangumi-episode",
-      "description": "Specific Bangumi episode page; requires the BBDown TV playurl path for region-restricted playback.",
+      "description": "Specific Bangumi episode page; requires a trusted web-mode restricted API proxy for region-restricted playback.",
       "url": "https://www.bilibili.com/bangumi/play/ep664928",
       "expected_source_kind": "season",
       "minimum_candidates": 1,
@@ -53,7 +53,7 @@
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",
-        "prefer_tv_api": true
+        "prefer_tv_api": false
       }
     }
   ]

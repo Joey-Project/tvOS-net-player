@@ -1,0 +1,315 @@
+{
+  "version": 1,
+  "source": {
+    "name": "BiliRoaming public parser server wiki",
+    "url": "https://github.com/yujincheng08/BiliRoaming/wiki/%E5%85%AC%E5%85%B1%E8%A7%A3%E6%9E%90%E6%9C%8D%E5%8A%A1%E5%99%A8",
+    "retrieved_at": "2026-06-20T21:11:38Z"
+  },
+  "policy": {
+    "proxy_kind": "restricted_api_proxy",
+    "playurl_mode": "web",
+    "notes": [
+      "Public BiliRoaming reverse proxies are BALH-style web API proxies.",
+      "Do not pair these proxies with BBDown TV playurl mode; TV API requests do not use public reverse-proxy fallback.",
+      "Requests may include the configured access_key; use only trusted proxy hosts, or use public hosts only with disposable/test credentials."
+    ]
+  },
+  "entries": [
+    {
+      "host": "bili.lli.cx",
+      "areas": ["hk", "mo", "tw", "cn"],
+      "source_area_label": "港澳台、中国大陆",
+      "provider": "@M1saka10010",
+      "url": "https://bili.lli.cx",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": "2026-06-20T21:11:38Z",
+      "last_probe": {
+        "status": "available",
+        "playurl_modes": ["web", "app"],
+        "restricted_api_proxy": "hk=https://bili.lli.cx",
+        "notes": "Web and app playback planning succeeded for bangumi-media-series; TV mode returned Bilibili area restriction."
+      }
+    },
+    {
+      "host": "bili.nepnep.moe",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@Kimmy_XYC",
+      "url": "https://bili.nepnep.moe",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 200,
+        "notes": "Playback proxy fallback reached the host but returned internal parser errors."
+      }
+    },
+    {
+      "host": "bili.xcnya.cn",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@xcnya",
+      "url": "https://bili.xcnya.cn",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 567,
+        "http_playurl_status": 567
+      }
+    },
+    {
+      "host": "api.rnmmihoyo.cc",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@heinu123",
+      "url": "https://api.rnmmihoyo.cc",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed from this workstation."
+      }
+    },
+    {
+      "host": "api.mihoyo.buzz",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@heinu123",
+      "url": "https://api.mihoyo.buzz",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 404,
+        "notes": "Playback proxy fallback returned HTTP 404."
+      }
+    },
+    {
+      "host": "bstar.kirara-fantasia.moe",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@NC-Raws",
+      "url": "https://bstar.kirara-fantasia.moe",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 301,
+        "http_playurl_status": 502
+      }
+    },
+    {
+      "host": "atri.ink",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@atri828",
+      "url": "https://atri.ink",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 502,
+        "http_playurl_status": 502,
+        "notes": "Host and PGC playurl paths returned 502 Bad Gateway."
+      }
+    },
+    {
+      "host": "melusine.moe",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@kotori tan",
+      "url": "https://melusine.moe",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 404,
+        "notes": "Playback proxy fallback failed while sending requests."
+      }
+    },
+    {
+      "host": "bilibili.suysker.xyz",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@Suysker",
+      "url": "https://bilibili.suysker.xyz",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 200,
+        "notes": "Playback proxy fallback returned area restriction or HTTP client errors."
+      }
+    },
+    {
+      "host": "bili.nekorua.com",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@xcnya",
+      "url": "https://bili.nekorua.com",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed from this workstation."
+      }
+    },
+    {
+      "host": "bili.ayo.moe",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@CielNeko",
+      "url": "https://bili.ayo.moe",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed from this workstation."
+      }
+    },
+    {
+      "host": "bili.xifeng.cf",
+      "areas": ["hk", "mo", "tw", "sea"],
+      "source_area_label": "港澳台、东南亚",
+      "provider": "@xifeng0",
+      "url": "https://bili.xifeng.cf",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "Connection to port 443 timed out from this workstation."
+      }
+    },
+    {
+      "host": "hk.biliroaming.bili33.top",
+      "areas": ["hk", "mo"],
+      "source_area_label": "港澳",
+      "provider": "@GamerNoTitle",
+      "url": "https://hk.biliroaming.bili33.top",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 200,
+        "notes": "Playback proxy fallback returned web_on disabled."
+      }
+    },
+    {
+      "host": "api.etocs.tk",
+      "areas": ["hk", "mo"],
+      "source_area_label": "港澳",
+      "provider": "@weifenghexu",
+      "url": "https://api.etocs.tk",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 301
+      }
+    },
+    {
+      "host": "cc.hmountainln.cn",
+      "areas": ["hk", "mo", "tw", "cn"],
+      "source_area_label": "港澳台、中国大陆",
+      "provider": "@JSTks24",
+      "url": "https://cc.hmountainln.cn",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 403,
+        "http_playurl_status": 403
+      }
+    },
+    {
+      "host": "xn--6iq3kpqgx685at9rw0i59xsk7d.work",
+      "areas": ["hk", "mo", "tw", "cn"],
+      "source_area_label": "港澳台、中国大陆",
+      "provider": "@M1saka10010",
+      "url": "https://xn--6iq3kpqgx685at9rw0i59xsk7d.work",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed from this workstation."
+      }
+    },
+    {
+      "host": "bili.jixiejidiguan.eu.org",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@aedelnz",
+      "url": "https://bili.jixiejidiguan.eu.org",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 200,
+        "http_playurl_status": 200,
+        "notes": "Playback proxy fallback returned a response decoding error."
+      }
+    },
+    {
+      "host": "bili.hybgzs.com",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@hyb-oyqq",
+      "url": "https://bili.hybgzs.com",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 525,
+        "http_playurl_status": 525
+      }
+    },
+    {
+      "host": "姬坂乃爱.我爱你",
+      "ascii_host": "xn--yetw86k.xn--6iq3kpqgxt31fvs6c4pp.icu",
+      "areas": ["all"],
+      "source_area_label": "所有",
+      "provider": "@ColdThunder11",
+      "url": "https://姬坂乃爱.我爱你",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed for the punycode host from this workstation."
+      }
+    },
+    {
+      "host": "bili.api.acfun.win",
+      "areas": ["hk", "mo", "tw"],
+      "source_area_label": "港澳台",
+      "provider": "@cxw620",
+      "url": "https://bili.api.acfun.win",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "notes": "DNS resolution failed from this workstation."
+      }
+    },
+    {
+      "host": "bilibili.page",
+      "areas": ["sea"],
+      "source_area_label": "东南亚4K",
+      "provider": "@david082321",
+      "url": "https://bilibili.page",
+      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_available_at": null,
+      "last_probe": {
+        "status": "unavailable",
+        "http_root_status": 403,
+        "http_playurl_status": 403
+      }
+    }
+  ]
+}
