@@ -49,6 +49,7 @@ Implementation notes:
 - PR 4A merged as `a498e676c5652b02a25ac283482225acd91b4a2c`.
 - PR 4B keeps legacy `selection_id` playback behavior intact while mapping it to persisted single-selection intent.
 - PR 4B executes explicit single/multiple/range/all selection server-side by resolving Bilibili candidates, planning each selected result through BBDown Rust core, and publishing per-result HLS playback metadata through `Task.result_items`.
+- PR 4B advertises `SERVER_CAPABILITY_BILIBILI_TASK_SELECTION` separately from `SERVER_CAPABILITY_BILIBILI_RESOLVE` so newer clients do not send selection fields to schema-only/older resolver servers.
 - PR 4B keeps primary-result compatibility fields (`library_item_id`, `playback_source`, `playback_session`) pointed at the first successful result. The first selected result uses the parent task id; later successful results use `task-id-result-N` HLS ids and are recoverable as playable HLS sessions. Offline HLS cache finalization follows the actual primary HLS session id in this slice, while full non-primary batch cache-finalization policy remains deferred.
 
 ### PR 4C: Shared AppCore Integration

@@ -9,6 +9,13 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedBilibiliTaskSelectionCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliTaskSelection),
+            CacheServerCapability.bilibiliTaskSelection
+        )
+    }
+
     func testBilibiliTaskSchemaMapsSelectionAndResultItems() {
         var proto = TvosNetPlayer_V1_Task()
         proto.id = "task-1"
@@ -56,13 +63,16 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(task.resultItems.first?.playbackSource?.playbackProtocol, expectedPlaybackProtocol)
     }
 
-    func testCacheServerSummaryExposesBilibiliResolveSupport() {
+    func testCacheServerSummaryExposesBilibiliSupport() {
         let supported = CacheServerSummary(
             id: "server-1",
             name: "Test cache",
             version: "0.1.0",
             mediaBaseURIs: [],
-            capabilities: [CacheServerCapability.bilibiliResolve]
+            capabilities: [
+                CacheServerCapability.bilibiliResolve,
+                CacheServerCapability.bilibiliTaskSelection,
+            ]
         )
         let unsupported = CacheServerSummary(
             id: "server-2",
@@ -73,7 +83,9 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
 
         XCTAssertTrue(supported.supportsBilibiliResolve)
+        XCTAssertTrue(supported.supportsBilibiliTaskSelection)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
+        XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
     }
 
     func testLegacyBilibiliPlaybackConformerUsesDefaultSelectionFallback() async throws {
@@ -94,7 +106,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             )
             XCTFail("selected playback should require a client implementation")
         } catch {
-            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolve)
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliTaskSelection)
         }
     }
 

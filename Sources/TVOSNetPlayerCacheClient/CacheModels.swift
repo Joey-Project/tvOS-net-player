@@ -94,10 +94,15 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsBilibiliResolve: Bool {
         capabilities.contains(CacheServerCapability.bilibiliResolve)
     }
+
+    public var supportsBilibiliTaskSelection: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliTaskSelection)
+    }
 }
 
 public enum CacheServerCapability {
     public static let bilibiliResolve = "bilibiliResolve"
+    public static let bilibiliTaskSelection = "bilibiliTaskSelection"
     public static let libraryItemDelete = "libraryItemDelete"
 }
 

@@ -219,8 +219,8 @@ public final class GRPCCacheControlClient: CacheControlClient {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !normalizedSelectionID.isEmpty || selection != nil {
             let serverInfo = try await getServerInfo()
-            guard serverInfo.supportsBilibiliResolve else {
-                throw CacheControlClientUnsupportedFeature.bilibiliResolve
+            guard serverInfo.supportsBilibiliTaskSelection else {
+                throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
             }
         }
 

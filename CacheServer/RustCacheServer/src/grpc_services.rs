@@ -85,6 +85,7 @@ impl ServerService for ServerGrpcService {
             capabilities: vec![
                 ServerCapability::BilibiliTasks.into(),
                 ServerCapability::BilibiliResolve.into(),
+                ServerCapability::BilibiliTaskSelection.into(),
                 ServerCapability::Hls.into(),
             ],
         };
@@ -1933,6 +1934,10 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::BilibiliResolve as i32))
+        );
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliTaskSelection as i32))
         );
     }
 
@@ -4304,7 +4309,7 @@ mod tests {
                         source_kind: "video_page".to_owned(),
                         content_id: "cid-2".to_owned(),
                         index: 2,
-                        state: TaskState::Succeeded.into(),
+                        state: TaskState::Playable.into(),
                         message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
                         library_item_id: String::new(),
                         playback_source: Some(child_source),

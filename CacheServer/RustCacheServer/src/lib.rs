@@ -656,11 +656,11 @@ impl AppState {
         let explicitly_protected_session_ids =
             protected_session_ids.into_iter().collect::<HashSet<_>>();
         let recent_playback_session_ids = self.recently_used_hls_cache_session_ids();
-        let mut stable_protected_session_ids = explicitly_protected_session_ids.clone();
+        let mut completed_group_protected_session_ids = explicitly_protected_session_ids;
+        completed_group_protected_session_ids.extend(recent_playback_session_ids.iter().cloned());
+        let mut stable_protected_session_ids = completed_group_protected_session_ids.clone();
         stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
-        stable_protected_session_ids.extend(recent_playback_session_ids.iter().cloned());
-        let mut partial_protected_session_ids = explicitly_protected_session_ids;
-        partial_protected_session_ids.extend(recent_playback_session_ids);
+        let partial_protected_session_ids = completed_group_protected_session_ids.clone();
         let target_used_bytes = policy
             .low_watermark_bytes()
             .saturating_sub(projected_added_bytes);
@@ -689,10 +689,16 @@ impl AppState {
             {
                 continue;
             }
+            let protected_session_ids_for_completed_entry =
+                if self.completed_hls_cache_entry_matches_completed_task(&entry) {
+                    &completed_group_protected_session_ids
+                } else {
+                    &stable_protected_session_ids
+                };
             if session_ids.iter().any(|session_id| {
                 self.hls_cache_session_is_currently_protected_from_eviction(
                     session_id,
-                    &stable_protected_session_ids,
+                    protected_session_ids_for_completed_entry,
                 )
             }) {
                 continue;
@@ -707,7 +713,7 @@ impl AppState {
             if session_ids.iter().any(|session_id| {
                 self.hls_cache_session_is_currently_protected_from_eviction(
                     session_id,
-                    &stable_protected_session_ids,
+                    protected_session_ids_for_completed_entry,
                 )
             }) {
                 continue;
@@ -810,6 +816,22 @@ impl AppState {
             TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => true,
             _ => false,
         }
+    }
+
+    fn completed_hls_cache_entry_matches_completed_task(
+        &self,
+        entry: &HlsCacheCompletedEntry,
+    ) -> bool {
+        let Some(task) = self
+            .tasks
+            .completed_playback_task_for_hls_session(&entry.session_id)
+        else {
+            return false;
+        };
+
+        task.kind() == TaskKind::BilibiliProgressivePlayback
+            && task.state() == TaskState::Completed
+            && task.library_item_id == entry.library_item_id
     }
 
     fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {

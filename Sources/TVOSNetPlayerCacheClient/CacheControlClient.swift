@@ -49,6 +49,7 @@ public protocol CacheControlClient: Sendable {
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case hlsCacheStatus
     case bilibiliResolve
+    case bilibiliTaskSelection
 }
 
 public extension CacheControlClient {
@@ -86,7 +87,7 @@ public extension CacheControlClient {
     ) async throws -> CacheTask {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard normalizedSelectionID.isEmpty else {
-            throw CacheControlClientUnsupportedFeature.bilibiliResolve
+            throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
         }
         return try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
@@ -100,7 +101,7 @@ public extension CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
         guard selection == nil else {
-            throw CacheControlClientUnsupportedFeature.bilibiliResolve
+            throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
         }
         return try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
