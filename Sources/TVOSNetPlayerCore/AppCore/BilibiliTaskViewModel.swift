@@ -106,6 +106,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var taskWatcher: Task<Void, Never>?
     private var operationSequence = 0
     private var activePlaybackTaskID: String?
+    private var activePlaybackLibraryItemID: String?
 
     public init(
         sourceText: String = "",
@@ -486,9 +487,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
         errorMessage = nil
         if didStartPlayback {
             activePlaybackTaskID = currentTask.id
+            activePlaybackLibraryItemID = currentTask.playableBilibiliLibraryItemID
             statusMessage = "Playing \(currentTask.bilibiliDisplayTitle)."
         } else {
             activePlaybackTaskID = nil
+            activePlaybackLibraryItemID = nil
             statusMessage = Self.statusMessage(for: currentTask)
         }
     }
@@ -499,24 +502,26 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         activePlaybackTaskID = nil
+        activePlaybackLibraryItemID = nil
         statusMessage = currentTask.map(Self.statusMessage(for:)) ?? "No Bilibili playback task submitted."
     }
 
     public func isActivePlaybackLibraryItem(id libraryItemID: String) -> Bool {
         guard let currentTask,
-            !libraryItemID.isEmpty,
-            activePlaybackTaskID == currentTask.id
+            activePlaybackTaskID == currentTask.id,
+            let activePlaybackLibraryItemID
         else {
             return false
         }
 
-        return currentTask.hasBilibiliLibraryItem(id: libraryItemID)
+        return normalizedNonEmpty(libraryItemID) == activePlaybackLibraryItemID
     }
 
     public func clearTask() {
         operationSequence += 1
         activeEndpoint = nil
         activePlaybackTaskID = nil
+        activePlaybackLibraryItemID = nil
         currentTask = nil
         errorMessage = nil
         isSubmitting = false
@@ -702,6 +707,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask = task
         if activePlaybackTaskID == task.id, !task.isPlayableBilibiliTaskState {
             activePlaybackTaskID = nil
+            activePlaybackLibraryItemID = nil
+        } else if activePlaybackTaskID == task.id {
+            activePlaybackLibraryItemID = task.playableBilibiliLibraryItemID
         }
         if task.isFailedBilibiliTaskState {
             errorMessage = Self.failureMessage(for: task)
@@ -781,10 +789,27 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if let summary = task.bilibiliTaskResultSummary,
-            summary.totalCount > 1,
-            summary.hasPartialSuccess
+            summary.totalCount > 1
         {
-            return ProgressiveCacheStatusBadge(label: "Partial result success", systemImage: "checkmark.circle")
+            if summary.hasPartialSuccess {
+                return ProgressiveCacheStatusBadge(label: "Partial result success", systemImage: "checkmark.circle")
+            }
+
+            if summary.cachedCount == summary.totalCount {
+                return ProgressiveCacheStatusBadge(
+                    label: "Offline ready", systemImage: "externaldrive.fill.badge.checkmark")
+            }
+
+            if summary.cachedCount > 0 {
+                return ProgressiveCacheStatusBadge(
+                    label: "\(summary.cachedCount) of \(summary.totalCount) offline ready",
+                    systemImage: "externaldrive.badge.checkmark"
+                )
+            }
+
+            if summary.readyCount > 0 {
+                return ProgressiveCacheStatusBadge(label: "Playable online; caching", systemImage: "wifi")
+            }
         }
 
         if task.isCompletedBilibiliTaskState,
@@ -843,6 +868,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 }
 
+private func normalizedNonEmpty(_ value: String) -> String? {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return normalized.isEmpty ? nil : normalized
+}
+
 private extension CacheTask {
     var bilibiliDisplayTitle: String {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -865,6 +895,23 @@ private extension CacheTask {
 
         return topLevelPlayableBilibiliURL
             ?? bilibiliTaskResults.first(where: { $0.playbackURL != nil })?.playbackURL
+    }
+
+    var playableBilibiliLibraryItemID: String? {
+        guard isProgressivePlayback, isPlayableBilibiliTaskState else {
+            return nil
+        }
+
+        if topLevelPlayableBilibiliURL != nil {
+            guard isCompletedBilibiliTaskState else {
+                return nil
+            }
+
+            return normalizedNonEmpty(libraryItemID)
+                ?? playbackSource.flatMap { normalizedNonEmpty($0.itemID) }
+        }
+
+        return resultItems.first { $0.playableBilibiliURL != nil }?.playableBilibiliLibraryItemID
     }
 
     var topLevelPlayableBilibiliURL: URL? {
@@ -1014,6 +1061,15 @@ private extension BilibiliTaskResultItem {
         return playbackSource.flatMap {
             playableURL(for: $0, expectedItemID: expectedItemID)
         }
+    }
+
+    var playableBilibiliLibraryItemID: String? {
+        guard playableBilibiliURL != nil, isCompletedBilibiliResultState else {
+            return nil
+        }
+
+        return normalizedNonEmpty(libraryItemID)
+            ?? playbackSource.flatMap { normalizedNonEmpty($0.itemID) }
     }
 
     var expectedItemID: String? {

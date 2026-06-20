@@ -552,6 +552,47 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.fill.badge.checkmark")
     }
 
+    func testCompletedMultiResultTaskShowsPartialOfflineReadyBadge() async {
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: "bilibili.hls.bilibili-playback-1"
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: "bilibili-playback-1-result-2"
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    message: "Primary Bilibili playback result is cached.",
+                    libraryItemID: "bilibili.hls.bilibili-playback-1",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1partial-offline",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.totalCount, 2)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "1 of 2 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
+    }
+
     func testQuotaFailureShowsQuotaBlockedBadge() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(
@@ -765,6 +806,53 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearPlaybackStatus()
 
         XCTAssertFalse(model.isActivePlaybackLibraryItem(id: "cached-bilibili-playback-1"))
+
+        model.clearTask()
+    }
+
+    func testActivePlaybackLibraryItemDoesNotMatchSiblingResultCache() async {
+        let primaryLibraryItemID = "bilibili.hls.bilibili-playback-1"
+        let siblingLibraryItemID = "bilibili.hls.bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: primaryLibraryItemID
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: siblingLibraryItemID
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(
+                    source: "BV1done",
+                    state: "TASK_STATE_COMPLETED",
+                    libraryItemID: primaryLibraryItemID,
+                    playbackSourceItemID: primaryLibraryItemID,
+                    resultItems: resultItems
+                )
+            )
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1done",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        model.finishPreparedPlayback(didStartPlayback: true)
+
+        XCTAssertTrue(model.isActivePlaybackLibraryItem(id: primaryLibraryItemID))
+        XCTAssertFalse(model.isActivePlaybackLibraryItem(id: siblingLibraryItemID))
 
         model.clearTask()
     }
@@ -1610,7 +1698,8 @@ private extension CacheTask {
         libraryItemID: String = "",
         playbackSourceItemID: String? = nil,
         downloadedBytes: Int64 = 0,
-        totalBytes: Int64 = 0
+        totalBytes: Int64 = 0,
+        resultItems: [BilibiliTaskResultItem] = []
     ) -> Self {
         let resolvedPlaybackSourceItemID = playbackSourceItemID ?? id
         return .fixture(
@@ -1635,7 +1724,8 @@ private extension CacheTask {
                 selectedVariantID: "h264",
                 selectedVariant: nil,
                 variants: []
-            )
+            ),
+            resultItems: resultItems
         )
     }
 }
