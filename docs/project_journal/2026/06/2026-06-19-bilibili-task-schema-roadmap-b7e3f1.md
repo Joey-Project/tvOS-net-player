@@ -1,10 +1,10 @@
 ---
 id: 20260619-b7e3f1
 title: Bilibili Task Schema Roadmap
-status: active
+status: completed
 created: 2026-06-19
 updated: 2026-06-20
-branch: wip/bilibili-task-appcore-integration
+branch: wip/bilibili-task-ux-live-e2e
 pr:
 supersedes:
   - 20260615-c8f4d2
@@ -77,6 +77,47 @@ Validation evidence:
 - Surface multi-result task status, failures, and cached playback handoff consistently on tvOS and macOS.
 - Extend repo-local Bilibili live e2e smoke tests for the new schema path.
 - Keep restricted-area Bangumi cases opt-in until working proxy/credential validation is available locally.
+
+Implementation notes:
+
+- PR 4D adds shared candidate selection modes for single item, multiple items, range, and all items, then exposes those controls in both tvOS and macOS Bilibili task flows.
+- PR 4D prevents newer batch/range/all requests from silently falling back to legacy `selection_id` behavior against older servers. Legacy fallback remains limited to single-selection requests.
+- PR 4D surfaces per-result task rows on tvOS and macOS, including ready/cached/failed/cancelled state, per-result playback actions, and cached library-item handoff tracking.
+- PR 4D extends the live Bilibili smoke harness so default non-restricted cases send structured selection requests. The multi-part canonical case now exercises a range selection covering the first two items and validates each playable result HLS master playlist through the LAN cache server.
+
+Validation evidence:
+
+- `swift test --filter BilibiliTaskViewModelTests` passed locally on 2026-06-20 after PR 4D AppCore selection and result-tracking changes.
+- `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run` passed locally on 2026-06-20 after live harness changes.
+- `scripts/build.sh` passed locally on 2026-06-20 after tvOS UI changes.
+- `scripts/build-macos.sh` passed locally on 2026-06-20 after macOS UI changes.
+- `just test-cache-server` passed locally on 2026-06-20 with 285 Rust unit tests and 6 cache-server integration tests.
+- `just test-bilibili-live` passed locally on 2026-06-20 for `ordinary-video-playlist` and `multi-part-video`; restricted-area Bangumi cases were skipped by default as designed.
+- PR 4D review fixes landed on 2026-06-20 after the first independent and offline frozen review passes:
+  - Collection/feed-style inputs now enter the resolve-and-select flow instead of submitting directly through legacy create behavior.
+  - Range selection uses a two-click start/end interaction, and the all-items option is disabled when the resolved candidate list is truncated.
+  - Per-result Play actions now share the view-model playback guard so tvOS/macOS rows are disabled while cancellation is pending.
+  - tvOS/macOS selection mode controls now omit All for truncated resolve results, and row playback actions re-check the shared playback guard before loading.
+  - Row playback now revalidates current task result membership and playback URL before loading, so stale SwiftUI result actions cannot start removed or failed entries.
+  - Multiple selection can now clear the last selected candidate instead of silently re-adding the single-selection default.
+  - Multiple selection now keeps the single-selection anchor in sync with the latest remaining selected candidate before switching back to single mode.
+  - Per-result playback now also rejects cancellation-pending task updates from the server, not only local in-flight cancellation state.
+  - Active result playback tracking now clears when a server watch update moves the parent task into cancellation-pending state.
+  - Live e2e now validates the top-level task playback source item id against the task/library item id expected by AppCore.
+  - Live e2e now validates each playable result playback source item id against the result/library item id expected by AppCore.
+  - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
+- Review-fix validation passed locally on 2026-06-20:
+  - `swift test --filter BilibiliTaskViewModelTests`
+  - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionCanClearLastCandidate`
+  - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionSwitchesBackToCurrentSingleCandidate`
+  - `swift test --filter BilibiliTaskViewModelTests/testTaskResultPlaybackIsDisabledForCancellationPendingTaskUpdate`
+  - `swift test --filter BilibiliTaskViewModelTests/testActiveTaskResultPlaybackClearsForCancellationPendingTaskUpdate`
+  - `cargo fmt --manifest-path Cargo.toml --check`
+  - `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`
+  - `git diff --check`
+  - `just test-cache-server`
+  - `just test-bilibili-live`
+  - `just ci`
 
 ## Validation Contract
 

@@ -21,7 +21,7 @@
       "url": "https://www.bilibili.com/video/BV1uW4y1s7zN/",
       "expected_source_kind": "video",
       "minimum_candidates": 2,
-      "selection": "first",
+      "selection": "range_first_two",
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",

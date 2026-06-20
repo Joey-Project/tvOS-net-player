@@ -308,15 +308,45 @@ struct ContentView: View {
             }
 
             if bilibiliModel.isWaitingForCandidateSelection {
+                Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
+                    ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if bilibiliModel.candidateSelectionMode == .range {
+                    HStack(spacing: 10) {
+                        Picker("From", selection: $bilibiliModel.rangeStartCandidateID) {
+                            ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                                Text(candidate.title).tag(Optional(candidate.selectionID))
+                            }
+                        }
+
+                        Picker("To", selection: $bilibiliModel.rangeEndCandidateID) {
+                            ForEach(bilibiliModel.resolvedCandidates) { candidate in
+                                Text(candidate.title).tag(Optional(candidate.selectionID))
+                            }
+                        }
+                    }
+                }
+
+                if let selectionSummary = bilibiliModel.candidateSelectionSummary {
+                    Text(selectionSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(bilibiliModel.resolvedCandidates) { candidate in
                             Button {
-                                bilibiliModel.selectedCandidateID = candidate.selectionID
+                                bilibiliModel.chooseCandidate(candidate)
                             } label: {
                                 HStack(spacing: 10) {
                                     Image(
-                                        systemName: bilibiliModel.selectedCandidateID == candidate.selectionID
+                                        systemName: bilibiliModel.isCandidateSelected(candidate)
                                             ? "checkmark.circle.fill"
                                             : "circle"
                                     )
@@ -334,6 +364,7 @@ struct ContentView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .buttonStyle(.bordered)
+                            .disabled(bilibiliModel.candidateSelectionMode == .all)
                         }
                     }
                 }
@@ -352,6 +383,7 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    bilibiliTaskResults
                 }
             }
 
@@ -437,6 +469,32 @@ struct ContentView: View {
                 }
                 .disabled(!model.canClear)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var bilibiliTaskResults: some View {
+        if !bilibiliModel.taskResults.isEmpty {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(bilibiliModel.taskResults) { result in
+                        HStack(alignment: .center, spacing: 10) {
+                            BilibiliTaskResultRow(result: result)
+
+                            Button {
+                                Task {
+                                    await playBilibiliTaskResult(result)
+                                }
+                            } label: {
+                                Label("Play", systemImage: "play.fill")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!bilibiliModel.canPlay(result: result))
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 220)
         }
     }
 
@@ -553,6 +611,20 @@ struct ContentView: View {
         bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
     }
 
+    private func playBilibiliTaskResult(_ result: BilibiliTaskResultPresentation) async {
+        let manualInteractionSequence = model.manualInteractionSequence
+        guard let url = bilibiliModel.playableURL(for: result) else {
+            return
+        }
+
+        cacheModel.clearPlaybackStatus()
+        let didStartPlayback = model.loadTransient(
+            streamURLText: url.absoluteString,
+            ifManualInteractionSequenceMatches: manualInteractionSequence
+        )
+        bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
+    }
+
     private func loadManualStream() {
         cacheModel.clearPlaybackStatus()
         bilibiliModel.clearPlaybackStatus()
@@ -603,6 +675,36 @@ private struct CacheLibraryRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 8)
+    }
+}
+
+private struct BilibiliTaskResultRow: View {
+    let result: BilibiliTaskResultPresentation
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(result.title)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+
+                HStack(spacing: 8) {
+                    Text(result.statusLabel)
+                    if !result.subtitle.isEmpty {
+                        Text(result.subtitle)
+                    }
+                    if !result.message.isEmpty, result.isFailed || result.isCancelled {
+                        Text(result.message)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+        } icon: {
+            Image(systemName: result.statusSystemImage)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
