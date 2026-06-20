@@ -638,6 +638,14 @@ impl AppState {
         }
         let entries = self.hls_cache.completed_cache_entries()?;
         let partial_entries = self.hls_cache.partial_cache_entries()?;
+        let completed_entry_sizes_by_session_id = entries
+            .iter()
+            .map(|entry| (entry.session_id.clone(), entry.size_bytes))
+            .collect::<HashMap<_, _>>();
+        let partial_entry_sizes_by_session_id = partial_entries
+            .iter()
+            .map(|entry| (entry.session_id.clone(), entry.size_bytes))
+            .collect::<HashMap<_, _>>();
         let usage = self.hls_cache.usage_snapshot()?;
         let started_used_bytes = usage.used_bytes;
         let projected_used_bytes = started_used_bytes.saturating_add(projected_added_bytes);
@@ -659,11 +667,15 @@ impl AppState {
         let mut finished_used_bytes = started_used_bytes;
         let mut evicted_bytes = 0_u64;
         let mut evicted_session_ids = Vec::new();
+        let mut evicted_session_id_set = HashSet::new();
 
         let mut cancelled = false;
         for entry in entries {
             if finished_used_bytes <= target_used_bytes {
                 break;
+            }
+            if evicted_session_id_set.contains(&entry.session_id) {
+                continue;
             }
             if should_cancel() {
                 cancelled = true;
@@ -671,6 +683,12 @@ impl AppState {
             }
             let session_ids =
                 self.completed_hls_task_session_ids(&entry.session_id, &entry.library_item_id);
+            if session_ids
+                .iter()
+                .any(|session_id| evicted_session_id_set.contains(session_id))
+            {
+                continue;
+            }
             if session_ids.iter().any(|session_id| {
                 self.hls_cache_session_is_currently_protected_from_eviction(
                     session_id,
@@ -696,13 +714,29 @@ impl AppState {
             }
             self.remove_hls_sessions(&session_ids)?;
             self.remove_evicted_completed_hls_task(&entry);
-            finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
-            evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
-            evicted_session_ids.push(entry.session_id);
+            let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
+                total.saturating_add(
+                    completed_entry_sizes_by_session_id
+                        .get(session_id)
+                        .or_else(|| partial_entry_sizes_by_session_id.get(session_id))
+                        .copied()
+                        .unwrap_or_default(),
+                )
+            });
+            finished_used_bytes = finished_used_bytes.saturating_sub(removed_bytes);
+            evicted_bytes = evicted_bytes.saturating_add(removed_bytes);
+            for session_id in session_ids {
+                if evicted_session_id_set.insert(session_id.clone()) {
+                    evicted_session_ids.push(session_id);
+                }
+            }
         }
         for entry in partial_entries {
             if finished_used_bytes <= target_used_bytes {
                 break;
+            }
+            if evicted_session_id_set.contains(&entry.session_id) {
+                continue;
             }
             if should_cancel() {
                 cancelled = true;
@@ -718,7 +752,9 @@ impl AppState {
                 .remove_session_managed_resources(&entry.session_id)?;
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
-            evicted_session_ids.push(entry.session_id);
+            if evicted_session_id_set.insert(entry.session_id.clone()) {
+                evicted_session_ids.push(entry.session_id);
+            }
         }
 
         if cancelled && evicted_session_ids.is_empty() {
