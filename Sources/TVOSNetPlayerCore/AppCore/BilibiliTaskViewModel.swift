@@ -59,6 +59,20 @@ public struct BilibiliTaskResultSummary: Equatable, Sendable {
             return "\(totalCount) Bilibili results were cancelled."
         }
 
+        if failedCount + cancelledCount > 0 {
+            var message = "No Bilibili results are ready"
+            if failedCount > 0 {
+                message += "; \(failedCount) failed"
+            }
+            if cancelledCount > 0 {
+                message += "; \(cancelledCount) cancelled"
+            }
+            if pendingCount > 0 {
+                message += "; \(pendingCount) still preparing"
+            }
+            return "\(message)."
+        }
+
         return "Preparing \(totalCount) Bilibili results..."
     }
 }

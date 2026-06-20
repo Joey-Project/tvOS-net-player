@@ -593,6 +593,86 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
     }
 
+    func testMultiResultTaskShowsFailureStatusBeforeAnyResultIsReady() async {
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_FAILED",
+                message: "Planning failed."
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_RUNNING",
+                message: "Preparing."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_RUNNING",
+                    progress: 0.5,
+                    message: "Preparing Bilibili playback results.",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1partial-failure",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.readyCount, 0)
+        XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.pendingCount, 1)
+        XCTAssertEqual(model.statusMessage, "No Bilibili results are ready; 1 failed; 1 still preparing.")
+    }
+
+    func testMultiResultTaskShowsMixedTerminalFailureStatus() async {
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_FAILED",
+                message: "Planning failed."
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_CANCELLED",
+                message: "Cancelled."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_FAILED",
+                    progress: 1,
+                    message: "Bilibili playback results finished with errors.",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1mixed-terminal",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.readyCount, 0)
+        XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.cancelledCount, 1)
+        XCTAssertEqual(model.statusMessage, "No Bilibili results are ready; 1 failed; 1 cancelled.")
+    }
+
     func testQuotaFailureShowsQuotaBlockedBadge() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(
