@@ -721,6 +721,45 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testTaskResultPlaybackIsDisabledWhileCancellationIsPending() async {
+        let childResultID = "bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: childResultID
+            )
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(resultItems: resultItems))
+        ])
+        await client.setSuspendsCancelResponses(true)
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-result",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let playableResult = model.playableTaskResults[0]
+        XCTAssertTrue(model.canPlay(result: playableResult))
+
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+
+        XCTAssertTrue(model.isCancelling)
+        XCTAssertFalse(model.canPlay(result: playableResult))
+
+        await client.completeNextCancel(with: .success(.fixture(state: "TASK_STATE_CANCELLED")))
+        await cancelTask.value
+        XCTAssertFalse(model.isCancelling)
+    }
+
     func testFinishPreparedPlaybackForTaskResultTracksCachedLibraryItem() async throws {
         let childResultID = "bilibili-playback-1-result-2"
         let childLibraryItemID = "bilibili.hls.\(childResultID)"

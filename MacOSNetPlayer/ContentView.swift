@@ -489,7 +489,7 @@ struct ContentView: View {
                             } label: {
                                 Label("Play", systemImage: "play.fill")
                             }
-                            .disabled(result.playbackURL == nil)
+                            .disabled(!bilibiliModel.canPlay(result: result))
                         }
                     }
                 }

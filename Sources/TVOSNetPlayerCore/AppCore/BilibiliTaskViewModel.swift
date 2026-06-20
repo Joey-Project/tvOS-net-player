@@ -275,6 +275,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         !isSubmitting && !isResolving && !isCancelling && playableURL != nil
     }
 
+    public func canPlay(result: BilibiliTaskResultPresentation) -> Bool {
+        !isSubmitting && !isResolving && !isCancelling && result.playbackURL != nil
+    }
+
     public var canClear: Bool {
         currentTask != nil || errorMessage != nil || resolvedInput != nil
     }
