@@ -979,6 +979,7 @@ impl BilibiliInputResolution {
     fn from_resolved_content(source: String, input: &Input, resolved: ResolvedContent) -> Self {
         match resolved {
             ResolvedContent::Video(video) => {
+                let candidates_truncated = video.pages.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = video
                     .pages
                     .iter()
@@ -994,7 +995,13 @@ impl BilibiliInputResolution {
                         cover_uri: video.cover_url.clone().unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, video.title, "video", candidates)
+                Self::with_candidates(
+                    source,
+                    video.title,
+                    "video",
+                    candidates,
+                    candidates_truncated,
+                )
             }
             ResolvedContent::Season(season) => {
                 let episodes = if resolve_should_use_full_episode_list(input) {
@@ -1002,6 +1009,7 @@ impl BilibiliInputResolution {
                 } else {
                     &season.selected_episodes
                 };
+                let candidates_truncated = episodes.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = episodes
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
@@ -1024,10 +1032,18 @@ impl BilibiliInputResolution {
                         }
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, season.season.title, "season", candidates)
+                Self::with_candidates(
+                    source,
+                    season.season.title,
+                    "season",
+                    candidates,
+                    candidates_truncated,
+                )
             }
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
+                let candidates_truncated =
+                    collection.selected_items.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = collection
                     .selected_items
                     .iter()
@@ -1046,7 +1062,13 @@ impl BilibiliInputResolution {
                         cover_uri: item.cover_url.clone().unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, collection.collection.title, source_kind, candidates)
+                Self::with_candidates(
+                    source,
+                    collection.collection.title,
+                    source_kind,
+                    candidates,
+                    candidates_truncated,
+                )
             }
         }
     }
@@ -1056,6 +1078,7 @@ impl BilibiliInputResolution {
         title: String,
         source_kind: impl Into<String>,
         candidates: Vec<BilibiliResolvedCandidate>,
+        candidates_truncated: bool,
     ) -> Self {
         let default_selection_id = if candidates.len() == 1 {
             candidates
@@ -1071,6 +1094,7 @@ impl BilibiliInputResolution {
             source_kind: source_kind.into(),
             candidates,
             default_selection_id,
+            candidates_truncated,
         }
     }
 }

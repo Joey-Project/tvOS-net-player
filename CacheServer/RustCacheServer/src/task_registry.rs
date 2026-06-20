@@ -602,7 +602,7 @@ impl BilibiliTaskRegistry {
                 task.state = TaskState::Playable.into();
                 task.title = title;
                 task.message = message;
-                task.progress = result_items_progress(&result_items);
+                task.progress = 0.0;
                 task.playback_source = Some(playback_source);
                 task.playback_session = Some(playback_session);
                 task.result_items = result_items;
@@ -1043,17 +1043,12 @@ impl BilibiliTaskRegistry {
         inner
             .tasks_by_id
             .values()
-            .filter(|task| {
-                task.kind() == TaskKind::BilibiliProgressivePlayback
-                    && !matches!(
-                        task.state(),
-                        TaskState::Completed
-                            | TaskState::Succeeded
-                            | TaskState::Failed
-                            | TaskState::Cancelled
-                    )
+            .filter(|task| task.kind() == TaskKind::BilibiliProgressivePlayback)
+            .flat_map(|task| match task.state() {
+                TaskState::Completed => protected_completed_result_hls_session_ids(task),
+                TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => Vec::new(),
+                _ => playback_hls_session_ids(task),
             })
-            .flat_map(playback_hls_session_ids)
             .collect()
     }
 
@@ -1786,6 +1781,25 @@ fn playback_hls_session_ids(task: &Task) -> Vec<String> {
             .iter()
             .flat_map(result_item_hls_session_ids),
     );
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn protected_completed_result_hls_session_ids(task: &Task) -> Vec<String> {
+    let primary_session_id = primary_hls_session_id(task);
+    let mut ids = task
+        .result_items
+        .iter()
+        .filter(|item| {
+            matches!(
+                result_item_state(item).unwrap_or(TaskState::Unspecified),
+                TaskState::Playable | TaskState::Completed
+            )
+        })
+        .flat_map(result_item_hls_session_ids)
+        .filter(|session_id| primary_session_id.as_ref() != Some(session_id))
+        .collect::<Vec<_>>();
     ids.sort();
     ids.dedup();
     ids
@@ -2945,6 +2959,67 @@ mod tests {
         assert!(completed.result_items[1].library_item_id.is_empty());
         assert!(completed.result_items[1].playback_source.is_some());
         assert!(completed.result_items[1].playback_session.is_some());
+    }
+
+    #[test]
+    fn protects_secondary_result_sessions_after_primary_completed() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1completed-protected-secondary", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: created.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&created.task.id)),
+                playback_session: Some(playback_session(&created.task.id)),
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&child_session_id)),
+                playback_session: Some(playback_session(&child_session_id)),
+            },
+        ];
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+                result_items,
+            )
+            .expect("playback results should become playable");
+        registry
+            .complete_playback_hls_session_cached(
+                &created.task.id,
+                &created.task.id,
+                format!("bilibili.hls.{}", created.task.id),
+            )
+            .expect("primary session should become completed");
+
+        let protected = registry.protected_hls_cache_session_ids();
+
+        assert!(!protected.contains(&created.task.id));
+        assert!(protected.contains(&child_session_id));
     }
 
     #[test]
