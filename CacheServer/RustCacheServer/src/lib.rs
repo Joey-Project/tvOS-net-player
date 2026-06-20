@@ -789,7 +789,7 @@ impl AppState {
         }
         let Ok(task) = self.tasks.get_task(session_id) else {
             if self.completed_hls_task_is_authorized(session_id) {
-                return true;
+                return self.ensure_completed_hls_session_registered(session_id);
             }
             if !self.tasks.is_playback_result_session_playable(session_id) {
                 return false;

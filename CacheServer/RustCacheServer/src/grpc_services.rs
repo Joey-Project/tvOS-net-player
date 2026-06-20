@@ -5279,6 +5279,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_serves_restored_completed_child_primary_after_cache_scan_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state = AppState::new_with_playback_planner(
+            options.clone(),
+            Arc::new(StaticResolveAndScriptedPlaybackPlanner {
+                resolve_requests: Arc::new(Mutex::new(Vec::new())),
+                playback_requests: Arc::new(Mutex::new(Vec::new())),
+                resolution: sample_resolution_with_pages(),
+                results: Mutex::new(HashMap::from([
+                    (
+                        "page:1".to_owned(),
+                        Err(BilibiliDownloadError::Failed(
+                            "page 1 planning failed".to_owned(),
+                        )),
+                    ),
+                    (
+                        "page:2".to_owned(),
+                        Ok(sample_playback_plan_with_video_url(&upstream_url)),
+                    ),
+                ])),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let task_service = TaskGrpcService::new(state);
+        let created = task_service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1recover-child-completed".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect("range task should be created")
+            .into_inner();
+
+        let completed = wait_for_task_state(&tasks, &created.id, TaskState::Completed).await;
+        let child_session_id = format!("{}-result-2", created.id);
+        let expected_item_id = format!("bilibili.hls.{child_session_id}");
+        assert_eq!(expected_item_id, completed.library_item_id);
+
+        let hls_root = root_path.join(".tvos-net-player").join("hls");
+        let mut unreadable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should exist")
+            .permissions();
+        unreadable_permissions.set_mode(0o000);
+        fs::set_permissions(&hls_root, unreadable_permissions)
+            .expect("HLS cache root should become unreadable");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let preserved = restored
+            .tasks
+            .get_task(&created.id)
+            .expect("completed task should stay persisted while cache scan fails");
+        assert_eq!(TaskState::Completed, preserved.state());
+        assert!(restored.hls_sessions.get(&child_session_id).is_none());
+
+        let mut readable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should remain present")
+            .permissions();
+        readable_permissions.set_mode(0o700);
+        fs::set_permissions(&hls_root, readable_permissions)
+            .expect("HLS cache root should become readable again");
+
+        let direct_master = crate::media::hls_master_playlist_get(
+            State(crate::media::MediaState::new(restored.clone())),
+            AxumPath(child_session_id.clone()),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, direct_master.status());
+        assert!(restored.hls_sessions.get(&child_session_id).is_some());
+    }
+
+    #[tokio::test]
     async fn app_state_scrubs_completed_hls_manifest_during_restart_recovery() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
