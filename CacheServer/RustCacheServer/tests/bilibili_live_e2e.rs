@@ -108,6 +108,7 @@ async fn run_live_case(
         .playback_source
         .as_ref()
         .unwrap_or_else(|| panic!("{}: playable task has no playback source", case.id));
+    assert_task_playback_source_item_id(case, &playable, source);
     assert_hls_master(case, http, source, "task playback source", media_url).await;
 
     let result_sources = playable_result_sources(&playable);
@@ -203,6 +204,24 @@ fn playable_result_sources(task: &Task) -> Vec<(&BilibiliTaskResultItem, &Playba
         })
         .filter_map(|item| item.playback_source.as_ref().map(|source| (item, source)))
         .collect()
+}
+
+fn assert_task_playback_source_item_id(case: &LiveCase, task: &Task, source: &PlaybackSource) {
+    let expected_item_id = if task.state == i32::from(TaskState::Completed) {
+        task.library_item_id.trim()
+    } else {
+        task.id.trim()
+    };
+    assert!(
+        !expected_item_id.is_empty(),
+        "{}: task has no expected playback source item id",
+        case.id
+    );
+    assert_eq!(
+        expected_item_id, source.item_id,
+        "{}: task playback source item id mismatch",
+        case.id
+    );
 }
 
 fn assert_result_playback_source_item_id(

@@ -887,6 +887,48 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testActiveTaskResultPlaybackClearsForCancellationPendingTaskUpdate() async throws {
+        let childResultID = "bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: childResultID
+            )
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(resultItems: resultItems))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-result",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+
+        let playableResult = try XCTUnwrap(model.playableTaskResults.first)
+        model.finishPreparedPlayback(result: playableResult, didStartPlayback: true)
+        XCTAssertEqual(model.statusMessage, "Playing Part 2.")
+
+        await client.yield(
+            .playableFixture(
+                state: "TASK_STATE_CANCEL_REQUESTED",
+                message: "Cancelling task.",
+                resultItems: resultItems
+            ))
+        await waitUntil(model.statusMessage == "Cancelling task.")
+
+        XCTAssertEqual(model.statusMessage, "Cancelling task.")
+        XCTAssertFalse(model.canPlay(result: playableResult))
+        XCTAssertNil(model.playableURL(for: playableResult))
+
+        model.clearTask()
+    }
+
     func testTaskResultPlaybackRevalidatesCurrentTaskMembership() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [
@@ -2313,6 +2355,7 @@ private extension CacheTask {
         state: String = "TASK_STATE_PLAYABLE",
         libraryItemID: String = "",
         playbackSourceItemID: String? = nil,
+        message: String = "Bilibili playback session is playable.",
         downloadedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
         resultItems: [BilibiliTaskResultItem] = []
@@ -2325,7 +2368,7 @@ private extension CacheTask {
             progress: totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 1,
             downloadedBytes: downloadedBytes,
             totalBytes: totalBytes,
-            message: "Bilibili playback session is playable.",
+            message: message,
             libraryItemID: libraryItemID,
             playbackSource: CachePlaybackSource(
                 itemID: resolvedPlaybackSourceItemID,

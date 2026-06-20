@@ -102,6 +102,8 @@ Validation evidence:
   - Multiple selection can now clear the last selected candidate instead of silently re-adding the single-selection default.
   - Multiple selection now keeps the single-selection anchor in sync with the latest remaining selected candidate before switching back to single mode.
   - Per-result playback now also rejects cancellation-pending task updates from the server, not only local in-flight cancellation state.
+  - Active result playback tracking now clears when a server watch update moves the parent task into cancellation-pending state.
+  - Live e2e now validates the top-level task playback source item id against the task/library item id expected by AppCore.
   - Live e2e now validates each playable result playback source item id against the result/library item id expected by AppCore.
   - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
 - Review-fix validation passed locally on 2026-06-20:
@@ -109,6 +111,7 @@ Validation evidence:
   - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionCanClearLastCandidate`
   - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionSwitchesBackToCurrentSingleCandidate`
   - `swift test --filter BilibiliTaskViewModelTests/testTaskResultPlaybackIsDisabledForCancellationPendingTaskUpdate`
+  - `swift test --filter BilibiliTaskViewModelTests/testActiveTaskResultPlaybackClearsForCancellationPendingTaskUpdate`
   - `cargo fmt --manifest-path Cargo.toml --check`
   - `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`
   - `git diff --check`

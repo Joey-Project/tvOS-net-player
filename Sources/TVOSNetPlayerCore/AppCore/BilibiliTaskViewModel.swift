@@ -1176,6 +1176,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private func updateActivePlaybackTracking(for task: CacheTask) {
+        guard task.isPlayableBilibiliTaskState,
+            !task.isCancellationPendingBilibiliTaskState
+        else {
+            activePlaybackTaskID = nil
+            activePlaybackResultID = nil
+            activePlaybackLibraryItemID = nil
+            return
+        }
+
         if let activePlaybackResultID {
             guard let result = task.bilibiliTaskResults.first(where: { $0.id == activePlaybackResultID }),
                 result.playbackURL != nil
@@ -1187,12 +1196,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             activePlaybackLibraryItemID = normalizedNonEmpty(result.playbackLibraryItemID)
-            return
-        }
-
-        guard task.isPlayableBilibiliTaskState else {
-            activePlaybackTaskID = nil
-            activePlaybackLibraryItemID = nil
             return
         }
 
