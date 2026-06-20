@@ -26,7 +26,7 @@ use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
 use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
-    LibraryItem, PlaybackProtocol, PlaybackSource, TaskKind, TaskState,
+    LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
@@ -462,25 +462,31 @@ impl AppState {
         if self.get_completed_hls_library_item(item_id).is_none() {
             return Ok(Some(false));
         }
-        let session_ids = self.completed_hls_task_session_ids(&session_id, item_id);
+        let session_ids = self.completed_hls_task_session_ids(&session_id);
+        let task_removal_cache_item = self.completed_hls_task_removal_cache_item(&session_id);
 
         self.remove_hls_sessions(&session_ids).map_err(|error| {
             Status::internal(format!(
                 "Failed to delete completed HLS cache item: {error}"
             ))
         })?;
-        self.tasks
-            .remove_completed_playback_task(&session_id, item_id)?;
+        if let Some((removal_session_id, removal_library_item_id)) = task_removal_cache_item {
+            self.tasks
+                .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)?;
+        } else {
+            self.tasks
+                .remove_completed_playback_task(&session_id, item_id)?;
+        }
         Ok(Some(true))
     }
 
-    fn completed_hls_task_session_ids(&self, session_id: &str, item_id: &str) -> Vec<String> {
+    fn completed_hls_task_session_ids(&self, session_id: &str) -> Vec<String> {
         self.tasks
-            .completed_playback_task_for_hls_session(session_id)
+            .completed_playback_task_for_any_hls_session(session_id)
             .filter(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
                     && task.state() == TaskState::Completed
-                    && task.library_item_id == item_id
+                    && self.completed_hls_cache_entry_belongs_to_task(task, session_id)
             })
             .map(|task| self.tasks.playback_hls_session_ids(&task.id))
             .filter(|session_ids| !session_ids.is_empty())
@@ -681,8 +687,7 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            let session_ids =
-                self.completed_hls_task_session_ids(&entry.session_id, &entry.library_item_id);
+            let session_ids = self.completed_hls_task_session_ids(&entry.session_id);
             if session_ids
                 .iter()
                 .any(|session_id| evicted_session_id_set.contains(session_id))
@@ -690,7 +695,7 @@ impl AppState {
                 continue;
             }
             let protected_session_ids_for_completed_entry =
-                if self.completed_hls_cache_entry_matches_completed_task(&entry) {
+                if self.completed_hls_cache_entry_belongs_to_completed_task(&entry) {
                     &completed_group_protected_session_ids
                 } else {
                     &stable_protected_session_ids
@@ -795,6 +800,18 @@ impl AppState {
     }
 
     fn completed_hls_cache_entry_is_evictable(&self, entry: &HlsCacheCompletedEntry) -> bool {
+        if self.completed_hls_cache_entry_matches_completed_task(entry) {
+            return true;
+        }
+        if self.completed_hls_cache_entry_belongs_to_completed_task(entry)
+            && self
+                .tasks
+                .completed_playback_task_for_hls_session(&entry.session_id)
+                .is_none()
+        {
+            return true;
+        }
+
         let Some(task) = self
             .tasks
             .completed_playback_task_for_hls_session(&entry.session_id)
@@ -824,32 +841,74 @@ impl AppState {
     ) -> bool {
         let Some(task) = self
             .tasks
-            .completed_playback_task_for_hls_session(&entry.session_id)
+            .completed_playback_task_for_any_hls_session(&entry.session_id)
         else {
             return false;
         };
 
         task.kind() == TaskKind::BilibiliProgressivePlayback
             && task.state() == TaskState::Completed
-            && task.library_item_id == entry.library_item_id
+            && self.tasks.completed_playback_task_matches_hls_cache_item(
+                &task,
+                &entry.session_id,
+                &entry.library_item_id,
+            )
+    }
+
+    fn completed_hls_cache_entry_belongs_to_completed_task(
+        &self,
+        entry: &HlsCacheCompletedEntry,
+    ) -> bool {
+        let Some(task) = self
+            .tasks
+            .completed_playback_task_for_any_hls_session(&entry.session_id)
+        else {
+            return false;
+        };
+
+        task.kind() == TaskKind::BilibiliProgressivePlayback
+            && task.state() == TaskState::Completed
+            && self.completed_hls_cache_entry_belongs_to_task(&task, &entry.session_id)
+    }
+
+    fn completed_hls_cache_entry_belongs_to_task(&self, task: &Task, session_id: &str) -> bool {
+        self.tasks
+            .playback_hls_session_ids(&task.id)
+            .iter()
+            .any(|task_session_id| task_session_id == session_id)
+    }
+
+    fn completed_hls_task_removal_cache_item(&self, session_id: &str) -> Option<(String, String)> {
+        let task = self
+            .tasks
+            .completed_playback_task_for_any_hls_session(session_id)?;
+        if task.kind() != TaskKind::BilibiliProgressivePlayback
+            || task.state() != TaskState::Completed
+            || !self.completed_hls_cache_entry_belongs_to_task(&task, session_id)
+            || task.library_item_id.is_empty()
+        {
+            return None;
+        }
+        let removal_session_id =
+            HlsCacheStore::session_id_from_library_item_id(&task.library_item_id)
+                .or_else(|| {
+                    task.playback_session
+                        .as_ref()
+                        .map(|session| session.id.clone())
+                })
+                .unwrap_or_else(|| task.id.clone());
+        Some((removal_session_id, task.library_item_id))
     }
 
     fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
-        let Some(task) = self
-            .tasks
-            .completed_playback_task_for_hls_session(&entry.session_id)
+        let Some((removal_session_id, removal_library_item_id)) =
+            self.completed_hls_task_removal_cache_item(&entry.session_id)
         else {
             return;
         };
-        if task.kind() != TaskKind::BilibiliProgressivePlayback
-            || task.state() != TaskState::Completed
-            || task.library_item_id != entry.library_item_id
-        {
-            return;
-        }
         if let Err(status) = self
             .tasks
-            .remove_completed_playback_task(&entry.session_id, &entry.library_item_id)
+            .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)
         {
             eprintln!(
                 "Failed to remove evicted HLS playback task {} after cache eviction: {status}",

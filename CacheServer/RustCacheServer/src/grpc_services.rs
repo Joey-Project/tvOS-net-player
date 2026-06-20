@@ -4318,6 +4318,12 @@ mod tests {
                 ],
             )
             .expect("multi-result playback task should become playable");
+        let child_library_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &child_metadata.hls_session)
+            .await
+            .expect("child HLS resources should cache");
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let primary_library_item_id = state
             .hls_cache
             .cache_session_resources(&state.hls_upstream_client, &primary_metadata.hls_session)
@@ -4334,12 +4340,6 @@ mod tests {
         state
             .hls_sessions
             .insert(sanitized_completed_session(&primary_metadata.hls_session));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let child_library_item_id = state
-            .hls_cache
-            .cache_session_resources(&state.hls_upstream_client, &child_metadata.hls_session)
-            .await
-            .expect("child HLS resources should cache");
 
         let summary = state
             .enforce_hls_cache_quota("test", Vec::new(), 0)

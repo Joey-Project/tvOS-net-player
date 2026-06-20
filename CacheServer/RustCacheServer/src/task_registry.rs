@@ -745,6 +745,29 @@ impl BilibiliTaskRegistry {
             .and_then(|task_id| inner.tasks_by_id.get(&task_id).cloned())
     }
 
+    pub fn completed_playback_task_for_any_hls_session(&self, session_id: &str) -> Option<Task> {
+        let normalized_id = normalize(session_id);
+        if normalized_id.is_empty() {
+            return None;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        completed_playback_task_id_for_any_hls_session_locked(&inner, &normalized_id)
+            .and_then(|task_id| inner.tasks_by_id.get(&task_id).cloned())
+    }
+
+    pub fn completed_playback_task_matches_hls_cache_item(
+        &self,
+        task: &Task,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> bool {
+        let normalized_id = normalize(session_id);
+        if normalized_id.is_empty() || normalize(library_item_id).is_empty() {
+            return false;
+        }
+        completed_playback_task_matches_hls_cache_item(task, &normalized_id, library_item_id)
+    }
+
     pub fn refresh_playback_source(
         &self,
         id: &str,
@@ -918,7 +941,7 @@ impl BilibiliTaskRegistry {
         let normalized_session_id = normalize_required_id(session_id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let normalized_task_id = if let Some(normalized_task_id) =
-            completed_playback_task_id_for_hls_session_locked(&inner, &normalized_session_id)
+            completed_playback_task_id_for_any_hls_session_locked(&inner, &normalized_session_id)
         {
             normalized_task_id
         } else {
@@ -943,7 +966,13 @@ impl BilibiliTaskRegistry {
                 "Task is not a Bilibili progressive playback task.",
             ));
         }
-        if task.state() != TaskState::Completed || task.library_item_id != library_item_id {
+        if task.state() != TaskState::Completed
+            || !completed_playback_task_matches_hls_cache_item(
+                task,
+                &normalized_session_id,
+                library_item_id,
+            )
+        {
             return Err(Status::failed_precondition(
                 "Only completed playback tasks matching the deleted cache item can be removed.",
             ));
@@ -1912,6 +1941,40 @@ fn completed_playback_task_id_for_hls_session_locked(
             && task.state() == TaskState::Completed
             && task_uses_hls_session_as_primary(task, session_id))
         .then(|| task.id.clone())
+    })
+}
+
+fn completed_playback_task_id_for_any_hls_session_locked(
+    inner: &RegistryInner,
+    session_id: &str,
+) -> Option<String> {
+    inner.tasks_by_id.values().find_map(|task| {
+        (task.kind() == TaskKind::BilibiliProgressivePlayback
+            && task.state() == TaskState::Completed
+            && playback_hls_session_ids(task)
+                .iter()
+                .any(|task_session_id| task_session_id == session_id))
+        .then(|| task.id.clone())
+    })
+}
+
+fn completed_playback_task_matches_hls_cache_item(
+    task: &Task,
+    session_id: &str,
+    library_item_id: &str,
+) -> bool {
+    if task.kind() != TaskKind::BilibiliProgressivePlayback || task.state() != TaskState::Completed
+    {
+        return false;
+    }
+    if task.library_item_id == library_item_id && task_uses_hls_session_as_primary(task, session_id)
+    {
+        return true;
+    }
+    task.result_items.iter().any(|item| {
+        result_item_state(item) == Some(TaskState::Completed)
+            && item.library_item_id == library_item_id
+            && result_item_uses_hls_session(item, session_id)
     })
 }
 
