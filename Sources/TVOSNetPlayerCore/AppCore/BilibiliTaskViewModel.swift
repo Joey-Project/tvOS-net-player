@@ -757,10 +757,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
         case .multiple:
             if selectedCandidateIDs.contains(candidate.selectionID) {
                 selectedCandidateIDs.remove(candidate.selectionID)
+                if selectedCandidateID == candidate.selectionID {
+                    selectedCandidateID = orderedSelectedCandidateIDs.first
+                }
             } else {
                 selectedCandidateIDs.insert(candidate.selectionID)
-            }
-            if selectedCandidateID == nil {
                 selectedCandidateID = candidate.selectionID
             }
         case .range:

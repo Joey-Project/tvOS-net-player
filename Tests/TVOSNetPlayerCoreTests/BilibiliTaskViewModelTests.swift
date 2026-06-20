@@ -303,6 +303,50 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testMultipleSelectionSwitchesBackToCurrentSingleCandidate() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi page video",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.candidateSelectionMode = .multiple
+        model.chooseCandidate(model.resolvedCandidates[0])
+        model.chooseCandidate(model.resolvedCandidates[1])
+        XCTAssertEqual(model.selectedCandidateID, "page:2")
+
+        model.candidateSelectionMode = .single
+        XCTAssertEqual(model.selectedCandidateID, "page:2")
+        XCTAssertEqual(model.selectedCandidateIDs, Set(["page:2"]))
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:2")
+        XCTAssertEqual(requests.first?.selection?.mode, "single")
+        XCTAssertEqual(requests.first?.selection?.selectionIDs, ["page:2"])
+
+        model.clearTask()
+    }
+
     func testSubmitCreatesRangeAndAllSelectionTasks() async {
         let candidates: [BilibiliResolvedCandidate] = [
             .fixture(selectionID: "page:1", title: "Part 1", index: 1),
