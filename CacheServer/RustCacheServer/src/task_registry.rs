@@ -1162,8 +1162,13 @@ impl BilibiliTaskRegistry {
             .values()
             .filter(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
-                    && task.state() == TaskState::Failed
-                    && task.message == PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE
+                    && matches!(
+                        (task.state(), task.message.as_str()),
+                        (
+                            TaskState::Failed,
+                            PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE
+                        ) | (TaskState::Cancelled, CANCELLED_AFTER_RESTART_MESSAGE)
+                    )
             })
             .flat_map(|task| task.result_items.iter())
             .map(|item| item.id.trim().to_owned())
@@ -3778,6 +3783,10 @@ mod tests {
         assert_eq!(
             i32::from(TaskState::Cancelled),
             restored_task.result_items[0].state
+        );
+        assert_eq!(
+            HashSet::from([child_session_id]),
+            restored.interrupted_planning_result_session_ids()
         );
         assert!(restored_task.result_items[0].library_item_id.is_empty());
         assert!(restored_task.result_items[0].playback_source.is_none());
