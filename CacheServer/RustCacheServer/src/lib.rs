@@ -445,18 +445,41 @@ impl AppState {
         if self.get_completed_hls_library_item(item_id).is_none() {
             return Ok(Some(false));
         }
+        let session_ids = self.completed_hls_task_session_ids(&session_id, item_id);
 
-        self.hls_cache
-            .remove_session(&session_id)
-            .map_err(|error| {
-                Status::internal(format!(
-                    "Failed to delete completed HLS cache item: {error}"
-                ))
-            })?;
-        self.hls_sessions.remove(&session_id);
+        self.remove_hls_sessions(&session_ids).map_err(|error| {
+            Status::internal(format!(
+                "Failed to delete completed HLS cache item: {error}"
+            ))
+        })?;
         self.tasks
             .remove_completed_playback_task(&session_id, item_id)?;
         Ok(Some(true))
+    }
+
+    fn completed_hls_task_session_ids(&self, session_id: &str, item_id: &str) -> Vec<String> {
+        self.tasks
+            .completed_playback_task_for_hls_session(session_id)
+            .filter(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && task.state() == TaskState::Completed
+                    && task.library_item_id == item_id
+            })
+            .map(|task| self.tasks.playback_hls_session_ids(&task.id))
+            .filter(|session_ids| !session_ids.is_empty())
+            .unwrap_or_else(|| vec![session_id.to_owned()])
+    }
+
+    fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
+        let mut removed = HashSet::new();
+        for session_id in session_ids {
+            if !removed.insert(session_id) {
+                continue;
+            }
+            self.hls_cache.remove_session(session_id)?;
+            self.hls_sessions.remove(session_id);
+        }
+        Ok(())
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
@@ -648,8 +671,9 @@ impl AppState {
             ) {
                 continue;
             }
-            self.hls_cache.remove_session(&entry.session_id)?;
-            self.hls_sessions.remove(&entry.session_id);
+            let session_ids =
+                self.completed_hls_task_session_ids(&entry.session_id, &entry.library_item_id);
+            self.remove_hls_sessions(&session_ids)?;
             self.remove_evicted_completed_hls_task(&entry);
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);

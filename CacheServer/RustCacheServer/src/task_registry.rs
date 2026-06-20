@@ -1103,6 +1103,10 @@ impl BilibiliTaskRegistry {
         restorable_playable_session_ids: &HashSet<String>,
         restorable_completed_session_ids: &HashSet<String>,
     ) -> Vec<String> {
+        let restorable_result_session_ids = restorable_playable_session_ids
+            .union(restorable_completed_session_ids)
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let mut changed_tasks = Vec::new();
         let mut changed_task_ids = Vec::new();
@@ -1145,7 +1149,7 @@ impl BilibiliTaskRegistry {
                     if primary_restorable
                         && clear_unrestorable_result_playback_metadata(
                             &mut task.result_items,
-                            restorable_completed_session_ids,
+                            &restorable_result_session_ids,
                         )
                     {
                         let updated_at = current_timestamp();
@@ -2854,6 +2858,91 @@ mod tests {
             completed.result_items[1].state
         );
         assert_eq!(library_item_id, completed.result_items[1].library_item_id);
+        assert!(completed.result_items[1].playback_source.is_some());
+        assert!(completed.result_items[1].playback_session.is_some());
+    }
+
+    #[test]
+    fn keeps_restorable_secondary_result_when_primary_completed() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task(
+                "BV1completed-restored-secondary",
+                Some(playback_options("1080p")),
+                None,
+            )
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: created.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&created.task.id)),
+                playback_session: Some(playback_session(&created.task.id)),
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&child_session_id)),
+                playback_session: Some(playback_session(&child_session_id)),
+            },
+        ];
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+                result_items,
+            )
+            .expect("playback results should become playable");
+        let library_item_id = format!("bilibili.hls.{}", created.task.id);
+        registry
+            .complete_playback_hls_session_cached(
+                &created.task.id,
+                &created.task.id,
+                library_item_id.clone(),
+            )
+            .expect("primary session should become completed");
+
+        let changed_ids = registry.fail_unrestorable_playback_tasks(
+            &HashSet::from([child_session_id.clone()]),
+            &HashSet::from([created.task.id.clone()]),
+        );
+        let completed = registry
+            .get_task(&created.task.id)
+            .expect("completed task should remain readable");
+
+        assert!(changed_ids.is_empty());
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(library_item_id, completed.library_item_id);
+        assert_eq!(2, completed.result_items.len());
+        assert_eq!(
+            i32::from(TaskState::Completed),
+            completed.result_items[0].state
+        );
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            completed.result_items[1].state
+        );
+        assert!(completed.result_items[1].library_item_id.is_empty());
         assert!(completed.result_items[1].playback_source.is_some());
         assert!(completed.result_items[1].playback_session.is_some());
     }
