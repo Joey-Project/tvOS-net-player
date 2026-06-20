@@ -97,12 +97,14 @@ Validation evidence:
   - Collection/feed-style inputs now enter the resolve-and-select flow instead of submitting directly through legacy create behavior.
   - Range selection uses a two-click start/end interaction, and the all-items option is disabled when the resolved candidate list is truncated.
   - Per-result Play actions now share the view-model playback guard so tvOS/macOS rows are disabled while cancellation is pending.
-  - tvOS/macOS selection mode controls now omit All for truncated resolve results, and row playback actions re-check the shared playback guard before loading.
-  - Row playback now revalidates current task result membership and playback URL before loading, so stale SwiftUI result actions cannot start removed or failed entries.
-  - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
-- Review-fix validation passed locally on 2026-06-20:
-  - `swift test --filter BilibiliTaskViewModelTests`
-  - `cargo fmt --manifest-path Cargo.toml --check`
+	  - tvOS/macOS selection mode controls now omit All for truncated resolve results, and row playback actions re-check the shared playback guard before loading.
+	  - Row playback now revalidates current task result membership and playback URL before loading, so stale SwiftUI result actions cannot start removed or failed entries.
+	  - Multiple selection can now clear the last selected candidate instead of silently re-adding the single-selection default.
+	  - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
+	- Review-fix validation passed locally on 2026-06-20:
+	  - `swift test --filter BilibiliTaskViewModelTests`
+	  - `swift test --filter BilibiliTaskViewModelTests/testMultipleSelectionCanClearLastCandidate`
+	  - `cargo fmt --manifest-path Cargo.toml --check`
   - `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`
   - `git diff --check`
   - `just test-cache-server`

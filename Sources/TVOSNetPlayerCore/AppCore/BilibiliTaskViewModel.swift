@@ -937,11 +937,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
         case .multiple:
             isChoosingRangeEnd = false
-            if selectedCandidateIDs.isEmpty,
-                let selectedCandidateID
-            {
-                selectedCandidateIDs = [selectedCandidateID]
-            }
         case .range:
             if rangeStartCandidateID == nil {
                 rangeStartCandidateID = candidates.first?.selectionID

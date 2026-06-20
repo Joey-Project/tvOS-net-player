@@ -265,6 +265,44 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testMultipleSelectionCanClearLastCandidate() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi page video",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        model.candidateSelectionMode = .multiple
+        XCTAssertEqual(model.selectedCandidateIDs, Set(["page:1"]))
+        XCTAssertTrue(model.canSubmit)
+
+        model.chooseCandidate(model.resolvedCandidates[0])
+
+        XCTAssertEqual(model.selectedCandidateIDs, Set<String>())
+        XCTAssertFalse(model.isCandidateSelected(model.resolvedCandidates[0]))
+        XCTAssertEqual(model.selectedCandidateCount, 0)
+        XCTAssertEqual(model.candidateSelectionSummary, "0 Bilibili items selected.")
+        XCTAssertFalse(model.canSubmit)
+
+        model.clearTask()
+    }
+
     func testSubmitCreatesRangeAndAllSelectionTasks() async {
         let candidates: [BilibiliResolvedCandidate] = [
             .fixture(selectionID: "page:1", title: "Part 1", index: 1),
