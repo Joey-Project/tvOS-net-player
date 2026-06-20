@@ -473,7 +473,8 @@ extension BilibiliResolveResult {
             title: proto.title,
             sourceKind: proto.sourceKind,
             candidates: proto.candidates.map(BilibiliResolvedCandidate.init),
-            defaultSelectionID: proto.defaultSelectionID
+            defaultSelectionID: proto.defaultSelectionID,
+            candidatesTruncated: proto.candidatesTruncated
         )
     }
 }

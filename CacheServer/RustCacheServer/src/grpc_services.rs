@@ -1837,6 +1837,7 @@ impl From<BilibiliInputResolution> for BilibiliResolveResult {
                 .map(ProtoBilibiliResolvedCandidate::from)
                 .collect(),
             default_selection_id: resolution.default_selection_id,
+            candidates_truncated: resolution.candidates_truncated,
         }
     }
 }
@@ -1968,7 +1969,7 @@ mod tests {
                 title: "Multi page video".to_owned(),
                 source_kind: "video".to_owned(),
                 default_selection_id: String::new(),
-                candidates_truncated: false,
+                candidates_truncated: true,
                 candidates: vec![
                     BilibiliResolvedCandidate {
                         selection_id: "page:1".to_owned(),
@@ -2019,6 +2020,7 @@ mod tests {
         assert_eq!("Multi page video", resolved.title);
         assert_eq!("video", resolved.source_kind);
         assert_eq!("", resolved.default_selection_id);
+        assert!(resolved.candidates_truncated);
         assert_eq!(2, resolved.candidates.len());
         assert_eq!("page:2", resolved.candidates[1].selection_id);
         assert_eq!("Part 2", resolved.candidates[1].title);

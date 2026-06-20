@@ -188,6 +188,7 @@ message BilibiliResolveResult {
   string source_kind = 3;
   repeated BilibiliResolvedCandidate candidates = 4;
   string default_selection_id = 5;
+  bool candidates_truncated = 6;
 }
 
 message BilibiliResolvedCandidate {
