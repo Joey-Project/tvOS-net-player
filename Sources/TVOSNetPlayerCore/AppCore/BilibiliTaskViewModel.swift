@@ -77,6 +77,28 @@ public struct BilibiliTaskResultSummary: Equatable, Sendable {
     }
 }
 
+public enum BilibiliCandidateSelectionMode: String, CaseIterable, Identifiable, Sendable {
+    case single
+    case multiple
+    case range
+    case all
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .single:
+            return "Single"
+        case .multiple:
+            return "Multiple"
+        case .range:
+            return "Range"
+        case .all:
+            return "All"
+        }
+    }
+}
+
 public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable {
     public let id: String
     public let selectionID: String
@@ -85,17 +107,55 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
     public let state: String
     public let message: String
     public let libraryItemID: String
+    public let playbackLibraryItemID: String
     public let playbackURL: URL?
     public let isReady: Bool
     public let isCached: Bool
     public let isFailed: Bool
     public let isCancelled: Bool
+
+    public var statusLabel: String {
+        if isCached {
+            return "Cached"
+        }
+        if isReady {
+            return "Ready"
+        }
+        if isFailed {
+            return "Failed"
+        }
+        if isCancelled {
+            return "Cancelled"
+        }
+        return "Pending"
+    }
+
+    public var statusSystemImage: String {
+        if isCached {
+            return "externaldrive.fill.badge.checkmark"
+        }
+        if isReady {
+            return "play.circle"
+        }
+        if isFailed {
+            return "exclamationmark.triangle"
+        }
+        if isCancelled {
+            return "xmark.circle"
+        }
+        return "clock"
+    }
 }
 
 private struct BilibiliResolvedInputContext: Equatable {
     let source: String
     let endpoint: CacheServerEndpoint
     let options: BilibiliPlaybackTaskOptions
+}
+
+private struct BilibiliCandidateSelectionRequest {
+    let selection: BilibiliTaskSelection
+    let legacySelectionID: String?
 }
 
 @MainActor
@@ -111,7 +171,31 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public private(set) var isWatching = false
     @Published public private(set) var isCancelling = false
     @Published public private(set) var resolvedInput: BilibiliResolveResult?
-    @Published public var selectedCandidateID: String?
+    @Published public var candidateSelectionMode: BilibiliCandidateSelectionMode = .single {
+        didSet {
+            normalizeCandidateSelectionForMode()
+        }
+    }
+    @Published public var selectedCandidateID: String? {
+        didSet {
+            normalizeCandidateSelectionForMode()
+        }
+    }
+    @Published public var selectedCandidateIDs: Set<String> = [] {
+        didSet {
+            normalizeCandidateSelectionForMode()
+        }
+    }
+    @Published public var rangeStartCandidateID: String? {
+        didSet {
+            normalizeCandidateSelectionForMode()
+        }
+    }
+    @Published public var rangeEndCandidateID: String? {
+        didSet {
+            normalizeCandidateSelectionForMode()
+        }
+    }
 
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
@@ -121,6 +205,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var operationSequence = 0
     private var activePlaybackTaskID: String?
     private var activePlaybackLibraryItemID: String?
+    private var activePlaybackResultID: String?
+    private var isNormalizingCandidateSelection = false
 
     public init(
         sourceText: String = "",
@@ -152,7 +238,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if isWaitingForCandidateSelection {
-            return selectedCandidate != nil
+            return candidateSelectionRequest != nil
         }
 
         return true
@@ -226,6 +312,49 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return candidates.count == 1 ? candidates[0] : nil
     }
 
+    public var selectedCandidateCount: Int {
+        guard isWaitingForCandidateSelection else {
+            return 0
+        }
+
+        switch candidateSelectionMode {
+        case .single:
+            return selectedCandidate == nil ? 0 : 1
+        case .multiple:
+            return orderedSelectedCandidateIDs.count
+        case .range:
+            return selectedRangeCandidateIDs.count
+        case .all:
+            return resolvedCandidates.count
+        }
+    }
+
+    public var candidateSelectionSummary: String? {
+        guard isWaitingForCandidateSelection else {
+            return nil
+        }
+
+        switch candidateSelectionMode {
+        case .single:
+            guard let selectedCandidate else {
+                return "Select one Bilibili item."
+            }
+            return "Selected \(selectedCandidate.displayTitle)."
+        case .multiple:
+            let count = orderedSelectedCandidateIDs.count
+            return count == 1 ? "1 Bilibili item selected." : "\(count) Bilibili items selected."
+        case .range:
+            guard let start = rangeStartCandidate, let end = rangeEndCandidate else {
+                return "Select a start and end item."
+            }
+            let count = selectedRangeCandidateIDs.count
+            return "Range \(start.displayTitle) to \(end.displayTitle) selects \(count) item\(count == 1 ? "" : "s")."
+        case .all:
+            let count = resolvedCandidates.count
+            return "All \(count) Bilibili item\(count == 1 ? "" : "s") selected."
+        }
+    }
+
     public var submitButtonTitle: String {
         if isResolving {
             return "Resolving"
@@ -234,7 +363,16 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return "Submitting"
         }
         if isWaitingForCandidateSelection {
-            return "Submit Selected"
+            switch candidateSelectionMode {
+            case .single:
+                return "Submit Selected"
+            case .multiple:
+                return "Submit Multiple"
+            case .range:
+                return "Submit Range"
+            case .all:
+                return "Submit All"
+            }
         }
         return "Submit"
     }
@@ -304,16 +442,16 @@ public final class BilibiliTaskViewModel: ObservableObject {
         if isWaitingForCandidateSelection,
             resolvedInputMatches(source: source, endpoint: endpoint, options: options)
         {
-            guard let selectedCandidate else {
-                errorMessage = "Select a Bilibili item before submitting playback."
+            guard let selectionRequest = candidateSelectionRequest else {
+                errorMessage = "Select Bilibili items before submitting playback."
                 statusMessage = "Bilibili item selection is required."
                 return
             }
 
             await createPlaybackTask(
                 source: source,
-                selection: Self.singleSelection(for: selectedCandidate.selectionID),
-                legacySelectionID: selectedCandidate.selectionID,
+                selection: selectionRequest.selection,
+                legacySelectionID: selectionRequest.legacySelectionID,
                 endpoint: endpoint,
                 options: options
             )
@@ -322,6 +460,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         operationSequence += 1
         activePlaybackTaskID = nil
+        activePlaybackResultID = nil
         let sequence = operationSequence
 
         stopWatching()
@@ -329,7 +468,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask = nil
         resolvedInput = nil
         resolvedInputContext = nil
-        selectedCandidateID = nil
+        clearCandidateSelection()
         isSubmitting = true
         isResolving = true
         errorMessage = nil
@@ -357,10 +496,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 endpoint: endpoint,
                 options: options
             )
-            selectedCandidateID =
-                resolved.defaultSelectionID.isEmpty
-                ? resolved.candidates.first?.selectionID
-                : resolved.defaultSelectionID
+            applyResolvedCandidateDefaults(resolved)
             isResolving = false
 
             guard let candidate = selectedCandidate else {
@@ -411,7 +547,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             currentTask = nil
             resolvedInput = nil
             resolvedInputContext = nil
-            selectedCandidateID = nil
+            clearCandidateSelection()
             errorMessage = error.localizedDescription
             statusMessage = "Could not resolve Bilibili input."
             isResolving = false
@@ -447,6 +583,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let targetTaskID = currentTask.id
         if activePlaybackTaskID == targetTaskID {
             activePlaybackTaskID = nil
+            activePlaybackResultID = nil
+            activePlaybackLibraryItemID = nil
         }
         isCancelling = true
         errorMessage = nil
@@ -501,10 +639,33 @@ public final class BilibiliTaskViewModel: ObservableObject {
         errorMessage = nil
         if didStartPlayback {
             activePlaybackTaskID = currentTask.id
+            activePlaybackResultID = nil
             activePlaybackLibraryItemID = currentTask.playableBilibiliLibraryItemID
             statusMessage = "Playing \(currentTask.bilibiliDisplayTitle)."
         } else {
             activePlaybackTaskID = nil
+            activePlaybackResultID = nil
+            activePlaybackLibraryItemID = nil
+            statusMessage = Self.statusMessage(for: currentTask)
+        }
+    }
+
+    public func finishPreparedPlayback(result: BilibiliTaskResultPresentation, didStartPlayback: Bool) {
+        guard let currentTask,
+            currentTask.bilibiliTaskResults.contains(where: { $0.id == result.id })
+        else {
+            return
+        }
+
+        errorMessage = nil
+        if didStartPlayback {
+            activePlaybackTaskID = currentTask.id
+            activePlaybackResultID = result.id
+            activePlaybackLibraryItemID = normalizedNonEmpty(result.playbackLibraryItemID)
+            statusMessage = "Playing \(result.title)."
+        } else {
+            activePlaybackTaskID = nil
+            activePlaybackResultID = nil
             activePlaybackLibraryItemID = nil
             statusMessage = Self.statusMessage(for: currentTask)
         }
@@ -516,6 +677,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         activePlaybackTaskID = nil
+        activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
         statusMessage = currentTask.map(Self.statusMessage(for:)) ?? "No Bilibili playback task submitted."
     }
@@ -535,6 +697,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         operationSequence += 1
         activeEndpoint = nil
         activePlaybackTaskID = nil
+        activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
         currentTask = nil
         errorMessage = nil
@@ -543,7 +706,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isCancelling = false
         resolvedInput = nil
         resolvedInputContext = nil
-        selectedCandidateID = nil
+        clearCandidateSelection()
         stopWatching()
         statusMessage = "No Bilibili playback task submitted."
     }
@@ -559,6 +722,237 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         clearTask()
         return true
+    }
+
+    public func chooseCandidate(_ candidate: BilibiliResolvedCandidate) {
+        switch candidateSelectionMode {
+        case .single:
+            selectedCandidateID = candidate.selectionID
+            selectedCandidateIDs = [candidate.selectionID]
+        case .multiple:
+            if selectedCandidateIDs.contains(candidate.selectionID) {
+                selectedCandidateIDs.remove(candidate.selectionID)
+            } else {
+                selectedCandidateIDs.insert(candidate.selectionID)
+            }
+            if selectedCandidateID == nil {
+                selectedCandidateID = candidate.selectionID
+            }
+        case .range:
+            chooseRangeCandidate(candidate)
+        case .all:
+            selectedCandidateID = candidate.selectionID
+        }
+    }
+
+    public func isCandidateSelected(_ candidate: BilibiliResolvedCandidate) -> Bool {
+        switch candidateSelectionMode {
+        case .single:
+            return selectedCandidate?.selectionID == candidate.selectionID
+        case .multiple:
+            return selectedCandidateIDs.contains(candidate.selectionID)
+        case .range:
+            return selectedRangeCandidateIDs.contains(candidate.selectionID)
+        case .all:
+            return true
+        }
+    }
+
+    private var orderedSelectedCandidateIDs: [String] {
+        let selectedIDs = selectedCandidateIDs
+        return
+            resolvedCandidates
+            .map(\.selectionID)
+            .filter { selectedIDs.contains($0) }
+    }
+
+    private var rangeStartCandidate: BilibiliResolvedCandidate? {
+        candidate(withID: rangeStartCandidateID) ?? resolvedCandidates.first
+    }
+
+    private var rangeEndCandidate: BilibiliResolvedCandidate? {
+        candidate(withID: rangeEndCandidateID) ?? rangeStartCandidate
+    }
+
+    private var selectedRangeCandidateIDs: Set<String> {
+        guard let start = rangeStartCandidate,
+            let end = rangeEndCandidate
+        else {
+            return []
+        }
+
+        let bounds = sortedRangeBounds(start: start, end: end)
+        return Set(
+            resolvedCandidates
+                .filter { candidate in
+                    let index = candidateSelectionIndex(candidate)
+                    return index >= bounds.start && index <= bounds.end
+                }
+                .map(\.selectionID)
+        )
+    }
+
+    private var candidateSelectionRequest: BilibiliCandidateSelectionRequest? {
+        switch candidateSelectionMode {
+        case .single:
+            guard let candidate = selectedCandidate else {
+                return nil
+            }
+            return BilibiliCandidateSelectionRequest(
+                selection: Self.singleSelection(for: candidate.selectionID),
+                legacySelectionID: candidate.selectionID
+            )
+        case .multiple:
+            let selectionIDs = orderedSelectedCandidateIDs
+            guard !selectionIDs.isEmpty else {
+                return nil
+            }
+            return BilibiliCandidateSelectionRequest(
+                selection: Self.multipleSelection(for: selectionIDs),
+                legacySelectionID: nil
+            )
+        case .range:
+            guard let start = rangeStartCandidate,
+                let end = rangeEndCandidate
+            else {
+                return nil
+            }
+            let bounds = sortedRangeBounds(start: start, end: end)
+            return BilibiliCandidateSelectionRequest(
+                selection: Self.rangeSelection(startIndex: bounds.start, endIndex: bounds.end),
+                legacySelectionID: nil
+            )
+        case .all:
+            guard !resolvedCandidates.isEmpty else {
+                return nil
+            }
+            return BilibiliCandidateSelectionRequest(
+                selection: Self.allSelection(),
+                legacySelectionID: nil
+            )
+        }
+    }
+
+    private func candidate(withID id: String?) -> BilibiliResolvedCandidate? {
+        guard let id,
+            !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return nil
+        }
+
+        return resolvedCandidates.first { $0.selectionID == id }
+    }
+
+    private func applyResolvedCandidateDefaults(_ resolved: BilibiliResolveResult) {
+        candidateSelectionMode = .single
+        let defaultSelectionID =
+            resolved.defaultSelectionID.isEmpty
+            ? resolved.candidates.first?.selectionID
+            : resolved.defaultSelectionID
+        selectedCandidateID = defaultSelectionID
+        selectedCandidateIDs = defaultSelectionID.map { Set([$0]) } ?? []
+        rangeStartCandidateID = resolved.candidates.first?.selectionID
+        rangeEndCandidateID = resolved.candidates.last?.selectionID
+        normalizeCandidateSelectionForMode()
+    }
+
+    private func clearCandidateSelection() {
+        candidateSelectionMode = .single
+        selectedCandidateID = nil
+        selectedCandidateIDs = []
+        rangeStartCandidateID = nil
+        rangeEndCandidateID = nil
+    }
+
+    private func normalizeCandidateSelectionForMode() {
+        guard !isNormalizingCandidateSelection else {
+            return
+        }
+
+        isNormalizingCandidateSelection = true
+        defer {
+            isNormalizingCandidateSelection = false
+        }
+
+        let candidates = resolvedCandidates
+        let validIDs = Set(candidates.map(\.selectionID))
+
+        if let selectedCandidateID,
+            !validIDs.contains(selectedCandidateID)
+        {
+            self.selectedCandidateID = nil
+        }
+
+        selectedCandidateIDs = selectedCandidateIDs.filter { validIDs.contains($0) }
+        if let rangeStartCandidateID,
+            !validIDs.contains(rangeStartCandidateID)
+        {
+            self.rangeStartCandidateID = nil
+        }
+        if let rangeEndCandidateID,
+            !validIDs.contains(rangeEndCandidateID)
+        {
+            self.rangeEndCandidateID = nil
+        }
+
+        switch candidateSelectionMode {
+        case .single:
+            if selectedCandidateID == nil {
+                selectedCandidateID = resolvedInput?.defaultSelectionID.nilIfEmpty ?? candidates.first?.selectionID
+            }
+            if let selectedCandidateID {
+                selectedCandidateIDs = [selectedCandidateID]
+            }
+        case .multiple:
+            if selectedCandidateIDs.isEmpty,
+                let selectedCandidateID
+            {
+                selectedCandidateIDs = [selectedCandidateID]
+            }
+        case .range:
+            if rangeStartCandidateID == nil {
+                rangeStartCandidateID = candidates.first?.selectionID
+            }
+            if rangeEndCandidateID == nil {
+                rangeEndCandidateID = rangeStartCandidateID
+            }
+        case .all:
+            break
+        }
+    }
+
+    private func chooseRangeCandidate(_ candidate: BilibiliResolvedCandidate) {
+        if rangeStartCandidateID == nil || rangeEndCandidateID != nil {
+            rangeStartCandidateID = candidate.selectionID
+            rangeEndCandidateID = candidate.selectionID
+            return
+        }
+
+        rangeEndCandidateID = candidate.selectionID
+    }
+
+    private func sortedRangeBounds(
+        start: BilibiliResolvedCandidate,
+        end: BilibiliResolvedCandidate
+    ) -> (start: Int, end: Int) {
+        let startIndex = candidateSelectionIndex(start)
+        let endIndex = candidateSelectionIndex(end)
+        return (
+            start: min(startIndex, endIndex),
+            end: max(startIndex, endIndex)
+        )
+    }
+
+    private func candidateSelectionIndex(_ candidate: BilibiliResolvedCandidate) -> Int {
+        if candidate.index > 0 {
+            return candidate.index
+        }
+
+        guard let offset = resolvedCandidates.firstIndex(where: { $0.selectionID == candidate.selectionID }) else {
+            return 1
+        }
+
+        return offset + 1
     }
 
     private func startWatching(taskID: String, endpoint: CacheServerEndpoint, sequence: Int) {
@@ -603,6 +997,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     ) async {
         operationSequence += 1
         activePlaybackTaskID = nil
+        activePlaybackResultID = nil
         let sequence = operationSequence
         let client = clientFactory(endpoint)
         await createPlaybackTask(
@@ -688,9 +1083,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
         } catch let unsupported as CacheControlClientUnsupportedFeature
             where unsupported == .bilibiliTaskSelection
         {
+            let normalizedLegacySelectionID =
+                legacySelectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !normalizedLegacySelectionID.isEmpty else {
+                throw unsupported
+            }
+
             return try await client.createBilibiliPlaybackTask(
                 urlOrID: source,
-                selectionID: legacySelectionID,
+                selectionID: normalizedLegacySelectionID,
                 options: options
             )
         }
@@ -719,11 +1120,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func applyTaskUpdate(_ task: CacheTask) {
         currentTask = task
-        if activePlaybackTaskID == task.id, !task.isPlayableBilibiliTaskState {
-            activePlaybackTaskID = nil
-            activePlaybackLibraryItemID = nil
-        } else if activePlaybackTaskID == task.id {
-            activePlaybackLibraryItemID = task.playableBilibiliLibraryItemID
+        if activePlaybackTaskID == task.id {
+            updateActivePlaybackTracking(for: task)
         }
         if task.isFailedBilibiliTaskState {
             errorMessage = Self.failureMessage(for: task)
@@ -732,7 +1130,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if activePlaybackTaskID == task.id {
-            statusMessage = "Playing \(task.bilibiliDisplayTitle)."
+            statusMessage = activePlaybackStatusMessage(for: task)
         } else {
             statusMessage = Self.statusMessage(for: task)
         }
@@ -740,6 +1138,40 @@ public final class BilibiliTaskViewModel: ObservableObject {
             isCancelling = false
             stopWatching()
         }
+    }
+
+    private func updateActivePlaybackTracking(for task: CacheTask) {
+        if let activePlaybackResultID {
+            guard let result = task.bilibiliTaskResults.first(where: { $0.id == activePlaybackResultID }),
+                result.playbackURL != nil
+            else {
+                activePlaybackTaskID = nil
+                self.activePlaybackResultID = nil
+                activePlaybackLibraryItemID = nil
+                return
+            }
+
+            activePlaybackLibraryItemID = normalizedNonEmpty(result.playbackLibraryItemID)
+            return
+        }
+
+        guard task.isPlayableBilibiliTaskState else {
+            activePlaybackTaskID = nil
+            activePlaybackLibraryItemID = nil
+            return
+        }
+
+        activePlaybackLibraryItemID = task.playableBilibiliLibraryItemID
+    }
+
+    private func activePlaybackStatusMessage(for task: CacheTask) -> String {
+        if let activePlaybackResultID,
+            let result = task.bilibiliTaskResults.first(where: { $0.id == activePlaybackResultID })
+        {
+            return "Playing \(result.title)."
+        }
+
+        return "Playing \(task.bilibiliDisplayTitle)."
     }
 
     private func finishWatching(sequence: Int, error: Error?) {
@@ -876,6 +1308,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
         BilibiliTaskSelection(mode: "single", selectionIDs: [selectionID])
     }
 
+    private static func multipleSelection(for selectionIDs: [String]) -> BilibiliTaskSelection {
+        BilibiliTaskSelection(mode: "multiple", selectionIDs: selectionIDs)
+    }
+
+    private static func rangeSelection(startIndex: Int, endIndex: Int) -> BilibiliTaskSelection {
+        BilibiliTaskSelection(mode: "range", rangeStartIndex: startIndex, rangeEndIndex: endIndex)
+    }
+
+    private static func allSelection() -> BilibiliTaskSelection {
+        BilibiliTaskSelection(mode: "all")
+    }
+
     private static func withOperationTimeout<Value: Sendable>(
         _ timeout: Duration,
         operation: @Sendable @escaping () async throws -> Value
@@ -959,6 +1403,7 @@ private extension CacheTask {
                 state: item.state,
                 message: item.message,
                 libraryItemID: item.libraryItemID,
+                playbackLibraryItemID: item.playableBilibiliLibraryItemID ?? "",
                 playbackURL: item.playableBilibiliURL,
                 isReady: item.isReadyBilibiliResultState,
                 isCached: item.isCompletedBilibiliResultState,
@@ -1119,6 +1564,22 @@ private extension BilibiliTaskResultItem {
     }
 }
 
+private extension BilibiliResolvedCandidate {
+    var displayTitle: String {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty {
+            return title
+        }
+
+        let subtitle = subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !subtitle.isEmpty {
+            return subtitle
+        }
+
+        return selectionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? id : selectionID
+    }
+}
+
 private func playableURL(for source: CachePlaybackSource, expectedItemID: String) -> URL? {
     guard source.isPlayableByTVOSClient,
         source.itemID == expectedItemID
@@ -1172,7 +1633,7 @@ private extension BilibiliTaskViewModel {
         currentTask = nil
         resolvedInput = nil
         resolvedInputContext = nil
-        selectedCandidateID = nil
+        clearCandidateSelection()
         errorMessage = nil
         statusMessage = "Bilibili input changed before resolve completed."
         isResolving = false
@@ -1270,6 +1731,11 @@ private extension BilibiliTaskViewModel {
 }
 
 private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     var isQuotaOrStorageFailureMessage: Bool {
         let normalized = lowercased()
         return normalized.contains("quota")

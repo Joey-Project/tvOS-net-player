@@ -199,6 +199,129 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(model.canClear)
     }
 
+    func testSubmitCreatesMultipleSelectionTask() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi page video",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                            .fixture(selectionID: "page:3", title: "Part 3", index: 3),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        model.candidateSelectionMode = .multiple
+        model.chooseCandidate(model.resolvedCandidates[1])
+        XCTAssertEqual(model.selectedCandidateCount, 2)
+        XCTAssertEqual(model.candidateSelectionSummary, "2 Bilibili items selected.")
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertNil(requests.first?.selectionID)
+        XCTAssertEqual(requests.first?.selection?.mode, "multiple")
+        XCTAssertEqual(requests.first?.selection?.selectionIDs, ["page:1", "page:2"])
+
+        model.clearTask()
+    }
+
+    func testSubmitCreatesRangeAndAllSelectionTasks() async {
+        let candidates: [BilibiliResolvedCandidate] = [
+            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+            .fixture(selectionID: "page:3", title: "Part 3", index: 3),
+        ]
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(.fixture(source: "BV1range", candidates: candidates, defaultSelectionID: "")),
+                .success(.fixture(source: "BV1all", candidates: candidates, defaultSelectionID: "")),
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1range", state: "TASK_STATE_PREPARING")),
+                .success(.fixture(source: "BV1all", state: "TASK_STATE_PREPARING")),
+            ]
+        )
+
+        let rangeModel = BilibiliTaskViewModel(
+            sourceText: "BV1range",
+            clientFactory: { _ in client }
+        )
+        await rangeModel.submit(serverAddressText: "mac-mini.local:50051")
+        rangeModel.candidateSelectionMode = .range
+        rangeModel.rangeStartCandidateID = "page:2"
+        rangeModel.rangeEndCandidateID = "page:3"
+        XCTAssertEqual(rangeModel.selectedCandidateCount, 2)
+
+        await rangeModel.submit(serverAddressText: "mac-mini.local:50051")
+
+        let allModel = BilibiliTaskViewModel(
+            sourceText: "BV1all",
+            clientFactory: { _ in client }
+        )
+        await allModel.submit(serverAddressText: "mac-mini.local:50051")
+        allModel.candidateSelectionMode = .all
+        XCTAssertEqual(allModel.selectedCandidateCount, 3)
+
+        await allModel.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].selection?.mode, "range")
+        XCTAssertEqual(requests[0].selection?.rangeStartIndex, 2)
+        XCTAssertEqual(requests[0].selection?.rangeEndIndex, 3)
+        XCTAssertEqual(requests[1].selection?.mode, "all")
+        XCTAssertEqual(requests[1].selection?.selectionIDs, [])
+    }
+
+    func testBatchSelectionDoesNotFallbackToLegacySelectionWhenUnsupported() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1unsupported",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: [],
+            supportsTaskSelection: false
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1unsupported",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.candidateSelectionMode = .multiple
+        model.chooseCandidate(model.resolvedCandidates[1])
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertNil(model.currentTask)
+        XCTAssertEqual(model.statusMessage, "Could not submit Bilibili playback task.")
+    }
+
     func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
@@ -529,6 +652,52 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Partial result success")
 
         model.clearTask()
+    }
+
+    func testFinishPreparedPlaybackForTaskResultTracksCachedLibraryItem() async throws {
+        let childResultID = "bilibili-playback-1-result-2"
+        let childLibraryItemID = "bilibili.hls.\(childResultID)"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_FAILED",
+                message: "Planning failed."
+            ),
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: childLibraryItemID
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    libraryItemID: "",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-result",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let playableResult = try XCTUnwrap(model.playableTaskResults.first)
+        XCTAssertEqual(playableResult.playbackLibraryItemID, childLibraryItemID)
+        model.finishPreparedPlayback(result: playableResult, didStartPlayback: true)
+
+        XCTAssertEqual(model.statusMessage, "Playing Part 2.")
+        XCTAssertTrue(model.isActivePlaybackLibraryItem(id: childLibraryItemID))
+        XCTAssertTrue(model.clearTaskIfCachedLibraryItemDeleted(id: childLibraryItemID))
+        XCTAssertNil(model.currentTask)
     }
 
     func testCompletedTaskShowsOfflineReadyBadge() async {
