@@ -207,6 +207,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var activePlaybackLibraryItemID: String?
     private var activePlaybackResultID: String?
     private var isNormalizingCandidateSelection = false
+    private var isChoosingRangeEnd = false
 
     public init(
         sourceText: String = "",
@@ -325,7 +326,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         case .range:
             return selectedRangeCandidateIDs.count
         case .all:
-            return resolvedCandidates.count
+            return canSelectAllResolvedCandidates ? resolvedCandidates.count : 0
         }
     }
 
@@ -350,6 +351,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
             let count = selectedRangeCandidateIDs.count
             return "Range \(start.displayTitle) to \(end.displayTitle) selects \(count) item\(count == 1 ? "" : "s")."
         case .all:
+            guard canSelectAllResolvedCandidates else {
+                return "All selection is unavailable because the resolved item list is truncated."
+            }
             let count = resolvedCandidates.count
             return "All \(count) Bilibili item\(count == 1 ? "" : "s") selected."
         }
@@ -433,11 +437,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         let options = currentPlaybackOptions
-
-        guard Self.shouldResolveBeforeSubmittingBilibiliInput(source) else {
-            await createPlaybackTask(source: source, selectionID: nil, endpoint: endpoint, options: options)
-            return
-        }
 
         if isWaitingForCandidateSelection,
             resolvedInputMatches(source: source, endpoint: endpoint, options: options)
@@ -792,6 +791,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         )
     }
 
+    private var canSelectAllResolvedCandidates: Bool {
+        resolvedInput?.candidatesTruncated != true && !resolvedCandidates.isEmpty
+    }
+
     private var candidateSelectionRequest: BilibiliCandidateSelectionRequest? {
         switch candidateSelectionMode {
         case .single:
@@ -823,7 +826,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 legacySelectionID: nil
             )
         case .all:
-            guard !resolvedCandidates.isEmpty else {
+            guard canSelectAllResolvedCandidates else {
                 return nil
             }
             return BilibiliCandidateSelectionRequest(
@@ -845,6 +848,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func applyResolvedCandidateDefaults(_ resolved: BilibiliResolveResult) {
         candidateSelectionMode = .single
+        isChoosingRangeEnd = false
         let defaultSelectionID =
             resolved.defaultSelectionID.isEmpty
             ? resolved.candidates.first?.selectionID
@@ -858,6 +862,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func clearCandidateSelection() {
         candidateSelectionMode = .single
+        isChoosingRangeEnd = false
         selectedCandidateID = nil
         selectedCandidateIDs = []
         rangeStartCandidateID = nil
@@ -897,6 +902,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         switch candidateSelectionMode {
         case .single:
+            isChoosingRangeEnd = false
             if selectedCandidateID == nil {
                 selectedCandidateID = resolvedInput?.defaultSelectionID.nilIfEmpty ?? candidates.first?.selectionID
             }
@@ -904,6 +910,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 selectedCandidateIDs = [selectedCandidateID]
             }
         case .multiple:
+            isChoosingRangeEnd = false
             if selectedCandidateIDs.isEmpty,
                 let selectedCandidateID
             {
@@ -917,18 +924,21 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 rangeEndCandidateID = rangeStartCandidateID
             }
         case .all:
+            isChoosingRangeEnd = false
             break
         }
     }
 
     private func chooseRangeCandidate(_ candidate: BilibiliResolvedCandidate) {
-        if rangeStartCandidateID == nil || rangeEndCandidateID != nil {
+        if !isChoosingRangeEnd {
             rangeStartCandidateID = candidate.selectionID
             rangeEndCandidateID = candidate.selectionID
+            isChoosingRangeEnd = true
             return
         }
 
         rangeEndCandidateID = candidate.selectionID
+        isChoosingRangeEnd = false
     }
 
     private func sortedRangeBounds(
@@ -1642,91 +1652,6 @@ private extension BilibiliTaskViewModel {
 
     static func normalizedBilibiliSource(_ source: String) -> String {
         source.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func shouldResolveBeforeSubmittingBilibiliInput(_ source: String) -> Bool {
-        !isCollectionOrFeedBilibiliInput(source)
-    }
-
-    static func isCollectionOrFeedBilibiliInput(_ source: String) -> Bool {
-        let trimmed = normalizedBilibiliSource(source)
-        let lowercased = trimmed.lowercased()
-        let collectionFeedKeywords: Set<String> = [
-            "following",
-            "history",
-            "later",
-            "recommend",
-            "recommendation",
-            "recommendations",
-            "toview",
-            "watch-later",
-            "watch_later",
-            "watchlater",
-        ]
-        if collectionFeedKeywords.contains(lowercased) {
-            return true
-        }
-
-        for prefix in ["collection", "fav", "mid", "series"] {
-            guard lowercased.hasPrefix(prefix) else {
-                continue
-            }
-
-            let suffix = lowercased.dropFirst(prefix.count)
-            if isNonEmptyASCIIDigits(suffix) {
-                return true
-            }
-        }
-
-        guard let components = URLComponents(string: trimmed),
-            let host = components.host?.lowercased()
-        else {
-            return false
-        }
-
-        let pathSegments = components.path
-            .split(separator: "/")
-            .map { $0.lowercased() }
-        if host == "space.bilibili.com",
-            pathSegments.first.map(isNonEmptyASCIIDigits) == true
-        {
-            return true
-        }
-
-        if host == "t.bilibili.com" {
-            return pathSegments.isEmpty
-        }
-
-        guard host == "www.bilibili.com" || host == "bilibili.com" else {
-            return false
-        }
-
-        let queryItemNames = Set((components.queryItems ?? []).map { $0.name.lowercased() })
-        if queryItemNames.contains("ep_id") || queryItemNames.contains("season_id") {
-            return false
-        }
-
-        if pathSegments.isEmpty {
-            return true
-        }
-        if pathSegments == ["account", "dynamic"] || pathSegments == ["account", "history"] {
-            return true
-        }
-        if pathSegments.first == "watchlater" || pathSegments == ["list", "watchlater"] {
-            return true
-        }
-        if pathSegments.contains("medialist") || pathSegments.first == "list" {
-            return true
-        }
-
-        return false
-    }
-
-    static func isNonEmptyASCIIDigits<S: StringProtocol>(_ value: S) -> Bool {
-        !value.isEmpty
-            && value.unicodeScalars.allSatisfy { scalar in
-                scalar.value >= 48 && scalar.value <= 57
-            }
     }
 }
 

@@ -91,7 +91,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
-    func testSubmitSkipsResolveForCollectionAndFeedInputs() async {
+    func testSubmitResolvesCollectionAndFeedInputsBeforeSelection() async {
         let sources = [
             "history",
             "watch-later",
@@ -110,9 +110,23 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         ]
 
         for source in sources {
-            let client = FakeBilibiliCacheControlClient(createResponses: [
-                .success(.fixture(source: source, state: "TASK_STATE_PREPARING"))
-            ])
+            let client = FakeBilibiliCacheControlClient(
+                resolveResponses: [
+                    .success(
+                        .fixture(
+                            source: source,
+                            title: "Resolved collection",
+                            candidates: [
+                                .fixture(selectionID: "item:1", title: "Item 1", index: 1),
+                                .fixture(selectionID: "item:2", title: "Item 2", index: 2),
+                            ],
+                            defaultSelectionID: ""
+                        ))
+                ],
+                createResponses: [
+                    .success(.fixture(source: source, state: "TASK_STATE_PREPARING"))
+                ]
+            )
             let model = BilibiliTaskViewModel(
                 sourceText: source,
                 clientFactory: { _ in client }
@@ -121,11 +135,20 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             await model.submit(serverAddressText: "mac-mini.local:50051")
 
             let resolvedRequests = await client.resolvedRequestsSnapshot()
-            XCTAssertTrue(resolvedRequests.isEmpty, source)
-            let requests = await client.createdRequestsSnapshot()
+            XCTAssertEqual(resolvedRequests.count, 1, source)
+            XCTAssertEqual(resolvedRequests.first?.urlOrID, source)
+            var requests = await client.createdRequestsSnapshot()
+            XCTAssertTrue(requests.isEmpty, source)
+            XCTAssertTrue(model.isWaitingForCandidateSelection, source)
+
+            model.candidateSelectionMode = .all
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+
+            requests = await client.createdRequestsSnapshot()
             XCTAssertEqual(requests.count, 1, source)
             XCTAssertEqual(requests.first?.urlOrID, source)
             XCTAssertNil(requests.first?.selectionID, source)
+            XCTAssertEqual(requests.first?.selection?.mode, "all", source)
 
             model.clearTask()
         }
@@ -264,8 +287,13 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
         await rangeModel.submit(serverAddressText: "mac-mini.local:50051")
         rangeModel.candidateSelectionMode = .range
-        rangeModel.rangeStartCandidateID = "page:2"
-        rangeModel.rangeEndCandidateID = "page:3"
+        rangeModel.chooseCandidate(rangeModel.resolvedCandidates[1])
+        XCTAssertEqual(rangeModel.rangeStartCandidateID, "page:2")
+        XCTAssertEqual(rangeModel.rangeEndCandidateID, "page:2")
+        XCTAssertEqual(rangeModel.selectedCandidateCount, 1)
+        rangeModel.chooseCandidate(rangeModel.resolvedCandidates[2])
+        XCTAssertEqual(rangeModel.rangeStartCandidateID, "page:2")
+        XCTAssertEqual(rangeModel.rangeEndCandidateID, "page:3")
         XCTAssertEqual(rangeModel.selectedCandidateCount, 2)
 
         await rangeModel.submit(serverAddressText: "mac-mini.local:50051")
@@ -320,6 +348,45 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
         XCTAssertNil(model.currentTask)
         XCTAssertEqual(model.statusMessage, "Could not submit Bilibili playback task.")
+    }
+
+    func testAllSelectionIsUnavailableWhenResolvedCandidatesAreTruncated() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "fav123",
+                        candidates: [
+                            .fixture(selectionID: "fav:1", title: "Item 1", index: 1),
+                            .fixture(selectionID: "fav:2", title: "Item 2", index: 2),
+                        ],
+                        defaultSelectionID: "",
+                        candidatesTruncated: true
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "fav123", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "fav123",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.candidateSelectionMode = .all
+
+        XCTAssertFalse(model.canSubmit)
+        XCTAssertEqual(model.selectedCandidateCount, 0)
+        XCTAssertEqual(
+            model.candidateSelectionSummary,
+            "All selection is unavailable because the resolved item list is truncated."
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
     }
 
     func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {
@@ -1925,14 +1992,16 @@ private extension BilibiliResolveResult {
         candidates: [BilibiliResolvedCandidate] = [
             .fixture()
         ],
-        defaultSelectionID: String = "page:1"
+        defaultSelectionID: String = "page:1",
+        candidatesTruncated: Bool = false
     ) -> Self {
         Self(
             source: source.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title,
             sourceKind: "video",
             candidates: candidates,
-            defaultSelectionID: defaultSelectionID
+            defaultSelectionID: defaultSelectionID,
+            candidatesTruncated: candidatesTruncated
         )
     }
 }

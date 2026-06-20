@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, fs, path::PathBuf, time::Duration};
 
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -46,7 +46,7 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
 
         ran_cases += 1;
         println!("running {}", case.id);
-        run_live_case(case, server.channel().await, &http).await;
+        run_live_case(case, server.channel().await, &http, &server.media_url).await;
     }
 
     assert!(
@@ -59,6 +59,7 @@ async fn run_live_case(
     case: &LiveCase,
     channel: tonic::transport::Channel,
     http: &reqwest::Client,
+    media_url: &str,
 ) {
     let mut task_client = TaskServiceClient::new(channel);
     let options = case.playback_options.to_proto();
@@ -95,42 +96,40 @@ async fn run_live_case(
         .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
             url_or_id: case.url.clone(),
             options: Some(options),
-            selection_id: selection.legacy_selection_id,
-            selection: Some(selection.selection),
+            selection_id: selection.legacy_selection_id.clone(),
+            selection: Some(selection.selection.clone()),
         }))
         .await
         .unwrap_or_else(|error| panic!("{}: create playback task failed: {error}", case.id))
         .into_inner();
 
-    let playable = wait_for_playable_task(
-        &mut task_client,
-        case,
-        &created.id,
-        selection.expected_playable_results,
-    )
-    .await;
+    let playable = wait_for_playable_task(&mut task_client, case, &created.id, &selection).await;
     let source = playable
         .playback_source
         .as_ref()
         .unwrap_or_else(|| panic!("{}: playable task has no playback source", case.id));
-    assert_hls_master(case, http, source, "task playback source").await;
+    assert_hls_master(case, http, source, "task playback source", media_url).await;
 
     let result_sources = playable_result_sources(&playable);
-    if selection.expected_playable_results > 1 {
-        assert!(
-            result_sources.len() >= selection.expected_playable_results,
-            "{}: expected at least {} playable result items, got {}",
-            case.id,
-            selection.expected_playable_results,
-            result_sources.len()
-        );
-    }
+    assert_eq!(
+        selection.expected_result_items,
+        playable.result_items.len(),
+        "{}: unexpected result item count",
+        case.id
+    );
+    assert_eq!(
+        selection.expected_playable_results,
+        result_sources.len(),
+        "{}: unexpected playable result count",
+        case.id
+    );
     for (index, result_source) in result_sources.into_iter().enumerate() {
         assert_hls_master(
             case,
             http,
             result_source,
             &format!("result item {} playback source", index + 1),
+            media_url,
         )
         .await;
     }
@@ -144,7 +143,7 @@ async fn wait_for_playable_task(
     task_client: &mut TaskServiceClient<tonic::transport::Channel>,
     case: &LiveCase,
     task_id: &str,
-    expected_playable_results: usize,
+    selection: &LiveSelectionRequest,
 ) -> Task {
     let timeout = Duration::from_secs(case.timeout_seconds.unwrap_or(90));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -159,7 +158,7 @@ async fn wait_for_playable_task(
 
         match task.state() {
             TaskState::Playable | TaskState::Completed
-                if task_has_expected_playable_sources(&task, expected_playable_results) =>
+                if task_has_expected_playable_sources(&task, selection) =>
             {
                 return task;
             }
@@ -185,12 +184,13 @@ async fn wait_for_playable_task(
     }
 }
 
-fn task_has_expected_playable_sources(task: &Task, expected_playable_results: usize) -> bool {
-    if expected_playable_results <= 1 {
-        return task.playback_source.is_some() || !playable_result_sources(task).is_empty();
+fn task_has_expected_playable_sources(task: &Task, selection: &LiveSelectionRequest) -> bool {
+    if task.result_items.len() != selection.expected_result_items {
+        return false;
     }
 
-    playable_result_sources(task).len() >= expected_playable_results
+    playable_result_sources(task).len() == selection.expected_playable_results
+        && task.playback_source.is_some()
 }
 
 fn playable_result_sources(task: &Task) -> Vec<&PlaybackSource> {
@@ -209,6 +209,7 @@ async fn assert_hls_master(
     http: &reqwest::Client,
     source: &PlaybackSource,
     label: &str,
+    media_url: &str,
 ) {
     assert_eq!(
         PlaybackProtocol::Hls,
@@ -216,6 +217,8 @@ async fn assert_hls_master(
         "{}: {label} is not HLS",
         case.id
     );
+
+    let source_url = assert_lan_media_url(case, &source.uri, media_url, label);
 
     let response =
         http.get(&source.uri).send().await.unwrap_or_else(|error| {
@@ -236,6 +239,115 @@ async fn assert_hls_master(
         "{}: {label} HLS master is not an m3u8 playlist",
         case.id
     );
+    let media_playlist_urls =
+        assert_playlist_stays_on_lan(case, &source_url, &playlist, media_url, label);
+    for media_playlist_url in media_playlist_urls {
+        let nested_label = format!("{label} media playlist");
+        let response = http
+            .get(media_playlist_url.clone())
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: {nested_label} request failed for {media_playlist_url}: {error}",
+                    case.id
+                )
+            });
+        assert_eq!(
+            StatusCode::OK,
+            response.status(),
+            "{}: {nested_label} returned non-OK status for {media_playlist_url}",
+            case.id
+        );
+        let media_playlist = response.text().await.unwrap_or_else(|error| {
+            panic!(
+                "{}: {nested_label} response body failed for {media_playlist_url}: {error}",
+                case.id
+            )
+        });
+        assert!(
+            media_playlist.starts_with("#EXTM3U"),
+            "{}: {nested_label} is not an m3u8 playlist for {media_playlist_url}",
+            case.id
+        );
+        assert_playlist_stays_on_lan(
+            case,
+            &media_playlist_url,
+            &media_playlist,
+            media_url,
+            &nested_label,
+        );
+    }
+}
+
+fn assert_playlist_stays_on_lan(
+    case: &LiveCase,
+    base_url: &Url,
+    playlist: &str,
+    media_url: &str,
+    label: &str,
+) -> Vec<Url> {
+    let mut media_playlist_urls = Vec::new();
+    for uri in playlist_referenced_uris(playlist) {
+        let resolved = base_url.join(&uri).unwrap_or_else(|error| {
+            panic!(
+                "{}: {label} playlist URI is not resolvable against {base_url}: {uri}: {error}",
+                case.id
+            )
+        });
+        assert_lan_media_url(case, resolved.as_str(), media_url, label);
+        if resolved.path().ends_with(".m3u8") {
+            media_playlist_urls.push(resolved);
+        }
+    }
+    media_playlist_urls
+}
+
+fn playlist_referenced_uris(playlist: &str) -> Vec<String> {
+    let mut uris = Vec::new();
+    for line in playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !line.starts_with('#') {
+            uris.push(line.to_owned());
+            continue;
+        }
+
+        let mut remainder = line;
+        while let Some(attribute_start) = remainder.find("URI=\"") {
+            let value_start = attribute_start + 5;
+            let Some(value_end) = remainder[value_start..].find('"') else {
+                break;
+            };
+            uris.push(remainder[value_start..value_start + value_end].to_owned());
+            remainder = &remainder[value_start + value_end + 1..];
+        }
+    }
+    uris
+}
+
+fn assert_lan_media_url(case: &LiveCase, uri: &str, media_url: &str, label: &str) -> Url {
+    let parsed = Url::parse(uri)
+        .unwrap_or_else(|error| panic!("{}: {label} URI is not absolute: {error}", case.id));
+    let media = Url::parse(media_url)
+        .unwrap_or_else(|error| panic!("{}: live media URL is invalid: {error}", case.id));
+    assert_eq!(
+        (
+            media.scheme(),
+            media.host_str(),
+            media.port_or_known_default()
+        ),
+        (
+            parsed.scheme(),
+            parsed.host_str(),
+            parsed.port_or_known_default()
+        ),
+        "{}: {label} escaped the LAN media listener: {uri}",
+        case.id
+    );
+    parsed
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +416,7 @@ impl LiveCase {
 struct LiveSelectionRequest {
     legacy_selection_id: String,
     selection: BilibiliTaskSelection,
+    expected_result_items: usize,
     expected_playable_results: usize,
 }
 
@@ -317,6 +430,7 @@ impl LiveSelectionRequest {
                 range_start_index: 0,
                 range_end_index: 0,
             },
+            expected_result_items: 1,
             expected_playable_results: 1,
         }
     }
@@ -331,6 +445,7 @@ impl LiveSelectionRequest {
                 range_start_index: 0,
                 range_end_index: 0,
             },
+            expected_result_items: expected_playable_results,
             expected_playable_results,
         }
     }
@@ -344,6 +459,7 @@ impl LiveSelectionRequest {
                 range_start_index: start_index,
                 range_end_index: end_index,
             },
+            expected_result_items: expected_playable_results,
             expected_playable_results,
         }
     }
@@ -357,6 +473,7 @@ impl LiveSelectionRequest {
                 range_start_index: 0,
                 range_end_index: 0,
             },
+            expected_result_items: expected_playable_results,
             expected_playable_results,
         }
     }
@@ -461,6 +578,7 @@ fn case_filter_from_env() -> Option<HashSet<String>> {
 struct LiveTestServer {
     _temp_root: TempDir,
     grpc_url: String,
+    media_url: String,
     _grpc_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     _media_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
@@ -473,7 +591,7 @@ impl LiveTestServer {
         let grpc_url = format!("http://{}", grpc_listener.local_addr().unwrap());
         let media_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let media_url = format!("http://{}", media_listener.local_addr().unwrap());
-        let options = live_server_options(root_path.clone(), grpc_url.clone(), media_url);
+        let options = live_server_options(root_path.clone(), grpc_url.clone(), media_url.clone());
         let state = AppState::new(options);
 
         let grpc_task = tokio::spawn(run_grpc_listener(grpc_listener, state.clone()));
@@ -483,6 +601,7 @@ impl LiveTestServer {
         Self {
             _temp_root: temp_root,
             grpc_url,
+            media_url,
             _grpc_task: grpc_task,
             _media_task: media_task,
         }

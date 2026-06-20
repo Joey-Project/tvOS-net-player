@@ -93,6 +93,18 @@ Validation evidence:
 - `scripts/build-macos.sh` passed locally on 2026-06-20 after macOS UI changes.
 - `just test-cache-server` passed locally on 2026-06-20 with 285 Rust unit tests and 6 cache-server integration tests.
 - `just test-bilibili-live` passed locally on 2026-06-20 for `ordinary-video-playlist` and `multi-part-video`; restricted-area Bangumi cases were skipped by default as designed.
+- PR 4D review fixes landed on 2026-06-20 after the first independent and offline frozen review passes:
+  - Collection/feed-style inputs now enter the resolve-and-select flow instead of submitting directly through legacy create behavior.
+  - Range selection uses a two-click start/end interaction, and the all-items option is disabled when the resolved candidate list is truncated.
+  - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
+- Review-fix validation passed locally on 2026-06-20:
+  - `swift test --filter BilibiliTaskViewModelTests`
+  - `cargo fmt --manifest-path Cargo.toml --check`
+  - `cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked --no-run`
+  - `git diff --check`
+  - `just test-cache-server`
+  - `just test-bilibili-live`
+  - `just ci`
 
 ## Validation Contract
 
