@@ -776,7 +776,14 @@ impl AppState {
             return true;
         }
         let Ok(task) = self.tasks.get_task(session_id) else {
-            return false;
+            if !self.tasks.is_playback_result_session_playable(session_id) {
+                return false;
+            }
+            let Some(session) = self.hls_cache.playback_session(session_id) else {
+                return false;
+            };
+            self.hls_sessions.insert(session);
+            return true;
         };
         if task.kind() != TaskKind::BilibiliProgressivePlayback {
             return false;
@@ -877,7 +884,7 @@ fn restored_hls_session_is_authorized(
     completed_session_ids: &HashSet<String>,
 ) -> bool {
     let Ok(task) = tasks.get_task(session_id) else {
-        return false;
+        return tasks.is_playback_result_session_playable(session_id);
     };
     if task.kind() != TaskKind::BilibiliProgressivePlayback {
         return false;

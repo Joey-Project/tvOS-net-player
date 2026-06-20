@@ -44,6 +44,13 @@ superseded_by:
 - Support multi-result task outcomes while preserving the existing primary playback item path.
 - Add Rust unit/integration coverage for recovery, stale selections, invalid ranges, and multi-result status transitions.
 
+Implementation notes:
+
+- PR 4A merged as `a498e676c5652b02a25ac283482225acd91b4a2c`.
+- PR 4B keeps legacy `selection_id` playback behavior intact while mapping it to persisted single-selection intent.
+- PR 4B executes explicit single/multiple/range/all selection server-side by resolving Bilibili candidates, planning each selected result through BBDown Rust core, and publishing per-result HLS playback metadata through `Task.result_items`.
+- PR 4B keeps primary-result compatibility fields (`library_item_id`, `playback_source`, `playback_session`) pointed at the first successful result. Additional result sessions use `task-id-result-N` HLS ids and are recoverable as playable HLS sessions, while full batch cache-finalization policy remains deferred.
+
 ### PR 4C: Shared AppCore Integration
 
 - Update the shared Swift client and view models to consume the new task result schema.

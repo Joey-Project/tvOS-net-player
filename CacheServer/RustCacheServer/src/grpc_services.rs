@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashSet, pin::Pin, sync::Arc, time::Duration};
 
 use futures_core::Stream;
 use tokio::{sync::mpsc, time::sleep};
@@ -12,24 +12,24 @@ use crate::{
         BilibiliPlaybackVariantKind,
     },
     bilibili_playback::{
-        BilibiliInputResolution, BilibiliPlaybackPlanningRequest,
+        BilibiliInputResolution, BilibiliInputResolveRequest, BilibiliPlaybackPlanningRequest,
         BilibiliResolvedCandidate as AdapterBilibiliResolvedCandidate,
     },
     bilibili_worker::BilibiliDownloadError,
     generated::tvos_net_player::v1::{
         BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackVariant,
         BilibiliResolveResult, BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate,
-        BilibiliTaskSelection, CacheRoot, CancelTaskRequest, CheckHealthRequest,
-        CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
-        DeleteLibraryItemResponse, GetHlsCacheStatusRequest, GetLibraryItemRequest,
-        GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
-        HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus, LibraryItem,
-        LibrarySource, ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
-        ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource, RescanLibraryRequest,
-        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task,
-        TaskEvent, TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
-        library_service_server::LibraryService, server_service_server::ServerService,
-        task_service_server::TaskService,
+        BilibiliTaskResultItem, BilibiliTaskSelection, CacheRoot, CancelTaskRequest,
+        CheckHealthRequest, CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest,
+        DeleteLibraryItemRequest, DeleteLibraryItemResponse, GetHlsCacheStatusRequest,
+        GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
+        HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
+        HlsCacheStatus, LibraryItem, LibrarySource, ListCacheRootsRequest, ListCacheRootsResponse,
+        ListLibraryItemsRequest, ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource,
+        RescanLibraryRequest, RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability,
+        ServerInfo, Task, TaskEvent, TaskKind, TaskState, WatchTasksRequest,
+        cache_service_server::CacheService, library_service_server::LibraryService,
+        server_service_server::ServerService, task_service_server::TaskService,
     },
     hls::HlsPlaybackSession,
     hls_cache::{
@@ -46,6 +46,13 @@ const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
 const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
 const BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED: i32 = 0;
 const BILIBILI_TASK_SELECTION_MODE_DEFAULT: i32 = 1;
+const BILIBILI_TASK_SELECTION_MODE_CURRENT: i32 = 2;
+const BILIBILI_TASK_SELECTION_MODE_SINGLE: i32 = 3;
+const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
+const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
+const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
+const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback planning.";
+const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -356,12 +363,15 @@ impl TaskService for TaskGrpcService {
     ) -> Result<Response<Task>, Status> {
         let url_or_id = request.get_ref().url_or_id.clone();
         let options = request.get_ref().options.clone();
-        let selection_id = normalized_optional_string(&request.get_ref().selection_id);
-        validate_deferred_bilibili_task_selection(request.get_ref().selection.as_ref())?;
-        let creation = self
-            .state
-            .tasks
-            .create_bilibili_playback_task(&url_or_id, options.clone())?;
+        let selection_plan = playback_selection_plan(
+            normalized_optional_string(&request.get_ref().selection_id),
+            request.get_ref().selection.clone(),
+        )?;
+        let creation = self.state.tasks.create_bilibili_playback_task(
+            &url_or_id,
+            options.clone(),
+            selection_plan.task_selection.clone(),
+        )?;
         if !creation.created {
             return Ok(Response::new(creation.task));
         }
@@ -380,7 +390,7 @@ impl TaskService for TaskGrpcService {
             task_id,
             creation.task.source.clone(),
             options,
-            selection_id,
+            selection_plan,
             playback_source_uri,
             cancellation,
         ));
@@ -444,12 +454,15 @@ impl TaskService for TaskGrpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
+        let hls_session_ids = self.state.tasks.playback_hls_session_ids(&request.id);
         let task = self.state.tasks.cancel_task(&request.id)?;
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
-            self.state.hls_sessions.remove(&task.id);
-            let _ = self.state.hls_cache.remove_session(&task.id);
+            for session_id in hls_session_ids {
+                self.state.hls_sessions.remove(&session_id);
+                let _ = self.state.hls_cache.remove_session(&session_id);
+            }
         }
         Ok(Response::new(task))
     }
@@ -621,7 +634,7 @@ async fn run_bilibili_playback_planning(
     task_id: String,
     source: String,
     options: Option<BilibiliPlaybackOptions>,
-    selection_id: Option<String>,
+    selection_plan: BilibiliPlaybackSelectionPlan,
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) {
@@ -678,6 +691,46 @@ async fn run_bilibili_playback_planning(
         }
         return;
     }
+    let completed = match selection_plan.mode.clone() {
+        BilibiliPlaybackSelectionPlanMode::LegacySingle { selection_id } => {
+            run_single_bilibili_playback_planning(
+                state,
+                task_id,
+                source,
+                options,
+                selection_id,
+                playback_source_uri,
+                cancellation,
+            )
+            .await
+        }
+        _ => {
+            run_explicit_bilibili_playback_planning(
+                state,
+                task_id,
+                source,
+                options,
+                selection_plan,
+                playback_source_uri,
+                cancellation,
+            )
+            .await
+        }
+    };
+    if completed {
+        cleanup.disarm();
+    }
+}
+
+async fn run_single_bilibili_playback_planning(
+    state: AppState,
+    task_id: String,
+    source: String,
+    options: Option<BilibiliPlaybackOptions>,
+    selection_id: Option<String>,
+    playback_source_uri: String,
+    cancellation: crate::task_registry::BilibiliTaskCancellation,
+) -> bool {
     let planning_request = BilibiliPlaybackPlanningRequest {
         source,
         options,
@@ -687,27 +740,19 @@ async fn run_bilibili_playback_planning(
     let plan = match state.playback_planner.plan(planning_request).await {
         Ok(plan) => plan,
         Err(error) => {
-            if state
+            return state
                 .tasks
                 .complete_task_failed(&task_id, playback_error_message(error))
-                .is_ok()
-            {
-                cleanup.disarm();
-            }
-            return;
+                .is_ok();
         }
     };
     let metadata = match playback_task_metadata(&task_id, plan) {
         Ok(metadata) => metadata,
         Err(error) => {
-            if state
+            return state
                 .tasks
                 .complete_task_failed(&task_id, error.message().to_owned())
-                .is_ok()
-            {
-                cleanup.disarm();
-            }
-            return;
+                .is_ok();
         }
     };
 
@@ -726,7 +771,7 @@ async fn run_bilibili_playback_planning(
         metadata.playback_session,
     ) {
         Ok(task) => {
-            if task.state() != crate::generated::tvos_net_player::v1::TaskState::Playable {
+            if task.state() != TaskState::Playable {
                 state.hls_sessions.remove(&task_id);
                 let _ = state.hls_cache.remove_session(&task_id);
             } else {
@@ -741,13 +786,370 @@ async fn run_bilibili_playback_planning(
                     HlsCacheFinalizationFailureMode::KeepPlayable,
                 );
             }
-            cleanup.disarm();
+            true
         }
         Err(_) => {
             state.hls_sessions.remove(&task_id);
             let _ = state.hls_cache.remove_session(&task_id);
+            false
         }
     }
+}
+
+async fn run_explicit_bilibili_playback_planning(
+    state: AppState,
+    task_id: String,
+    source: String,
+    options: Option<BilibiliPlaybackOptions>,
+    selection_plan: BilibiliPlaybackSelectionPlan,
+    primary_playback_source_uri: String,
+    cancellation: crate::task_registry::BilibiliTaskCancellation,
+) -> bool {
+    let resolution = match state
+        .playback_planner
+        .resolve_input(BilibiliInputResolveRequest {
+            source: source.clone(),
+            options: options.clone(),
+            cancellation: cancellation.clone(),
+        })
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return state
+                .tasks
+                .complete_task_failed(&task_id, playback_error_message(error))
+                .is_ok();
+        }
+    };
+    let candidates = match selected_bilibili_candidates(&resolution, &selection_plan.mode) {
+        Ok(candidates) => candidates,
+        Err(message) => {
+            return state.tasks.complete_task_failed(&task_id, message).is_ok();
+        }
+    };
+    let total = candidates.len();
+    let mut result_items = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            bilibili_result_item(
+                result_session_id(&task_id, index),
+                candidate,
+                TaskState::Preparing,
+                BILIBILI_RESULT_PLANNING_MESSAGE.to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let _ = state.tasks.update_playback_results(
+        &task_id,
+        Some(resolution.title.clone()),
+        format!("Planning {total} Bilibili playback result(s)."),
+        0.0,
+        result_items.clone(),
+    );
+
+    let mut primary: Option<(
+        PlaybackSource,
+        BilibiliPlaybackSession,
+        HlsPlaybackSession,
+        String,
+    )> = None;
+    let mut successful_results = 0_usize;
+    let mut planned_session_ids = Vec::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        if cancellation.is_cancel_requested() {
+            mark_remaining_results_cancelled(&mut result_items[index..]);
+            let _ = state.tasks.update_playback_results(
+                &task_id,
+                Some(resolution.title.clone()),
+                "Cancelled while planning Bilibili playback results.".to_owned(),
+                result_items_progress(&result_items),
+                result_items.clone(),
+            );
+            return state
+                .tasks
+                .complete_task_cancelled(
+                    &task_id,
+                    "Cancelled while planning Bilibili playback results.".to_owned(),
+                )
+                .is_ok();
+        }
+
+        let session_id = result_items[index].id.clone();
+        let planning_request = BilibiliPlaybackPlanningRequest {
+            source: source.clone(),
+            options: options.clone(),
+            selection_id: Some(candidate.selection_id.clone()),
+            cancellation: cancellation.clone(),
+        };
+        let item_outcome = match state.playback_planner.plan(planning_request).await {
+            Ok(plan) => playback_task_metadata(&session_id, plan)
+                .map_err(|error| BilibiliDownloadError::Failed(error.message().to_owned())),
+            Err(error) => Err(error),
+        };
+
+        match item_outcome {
+            Ok(metadata) => {
+                let playback_source_uri = if index == 0 {
+                    primary_playback_source_uri.clone()
+                } else {
+                    related_hls_master_playlist_uri(
+                        &primary_playback_source_uri,
+                        &task_id,
+                        &session_id,
+                    )
+                };
+                let playback_source = PlaybackSource {
+                    item_id: session_id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: playback_source_uri,
+                    expires_at: None,
+                };
+                result_items[index].state = TaskState::Playable.into();
+                result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
+                result_items[index].playback_source = Some(playback_source.clone());
+                result_items[index].playback_session = Some(metadata.playback_session.clone());
+                state.hls_sessions.insert(metadata.hls_session.clone());
+                planned_session_ids.push(session_id.clone());
+                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
+                    eprintln!(
+                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {error}"
+                    );
+                }
+                if primary.is_none() {
+                    primary = Some((
+                        playback_source,
+                        metadata.playback_session,
+                        metadata.hls_session,
+                        metadata.title,
+                    ));
+                }
+                successful_results += 1;
+            }
+            Err(error) if cancellation.is_cancel_requested() => {
+                mark_remaining_results_cancelled(&mut result_items[index..]);
+                let _ = state.tasks.update_playback_results(
+                    &task_id,
+                    Some(resolution.title.clone()),
+                    playback_error_message(error),
+                    result_items_progress(&result_items),
+                    result_items.clone(),
+                );
+                return state
+                    .tasks
+                    .complete_task_cancelled(
+                        &task_id,
+                        "Cancelled while planning Bilibili playback results.".to_owned(),
+                    )
+                    .is_ok();
+            }
+            Err(error) => {
+                result_items[index].state = TaskState::Failed.into();
+                result_items[index].message = playback_error_message(error);
+            }
+        }
+
+        let message = format!(
+            "Planned {}/{} Bilibili playback result(s).",
+            index + 1,
+            total
+        );
+        let _ = state.tasks.update_playback_results(
+            &task_id,
+            Some(resolution.title.clone()),
+            message,
+            result_items_progress(&result_items),
+            result_items.clone(),
+        );
+    }
+
+    let Some((primary_source, primary_session, primary_hls_session, primary_title)) = primary
+    else {
+        return state
+            .tasks
+            .complete_task_failed(
+                &task_id,
+                "Failed to plan any selected Bilibili playback result.".to_owned(),
+            )
+            .is_ok();
+    };
+
+    let final_message = if successful_results == total {
+        format!("All {total} Bilibili playback result(s) are playable.")
+    } else {
+        format!("{successful_results}/{total} Bilibili playback result(s) are playable.")
+    };
+    if let Some(first_item) = result_items
+        .iter_mut()
+        .find(|item| item.id == primary_hls_session.id)
+    {
+        first_item.message = final_message.clone();
+    }
+
+    match state.tasks.complete_playback_results_playable(
+        &task_id,
+        primary_title,
+        final_message,
+        primary_source,
+        primary_session,
+        result_items,
+    ) {
+        Ok(task) => {
+            if task.state() != TaskState::Playable {
+                for session_id in planned_session_ids {
+                    state.hls_sessions.remove(&session_id);
+                    let _ = state.hls_cache.remove_session(&session_id);
+                }
+            } else {
+                state.enqueue_hls_cache_fill_foreground(
+                    task_id.clone(),
+                    primary_hls_session,
+                    HlsCacheFinalizationFailureMode::KeepPlayable,
+                );
+            }
+            true
+        }
+        Err(_) => {
+            for session_id in planned_session_ids {
+                state.hls_sessions.remove(&session_id);
+                let _ = state.hls_cache.remove_session(&session_id);
+            }
+            false
+        }
+    }
+}
+
+fn selected_bilibili_candidates(
+    resolution: &BilibiliInputResolution,
+    mode: &BilibiliPlaybackSelectionPlanMode,
+) -> Result<Vec<AdapterBilibiliResolvedCandidate>, String> {
+    match mode {
+        BilibiliPlaybackSelectionPlanMode::ExplicitIds { selection_ids } => selection_ids
+            .iter()
+            .map(|selection_id| {
+                resolution
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.selection_id == *selection_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "Selected Bilibili item {selection_id:?} was not found. Resolve the input again and retry."
+                        )
+                    })
+            })
+            .collect(),
+        BilibiliPlaybackSelectionPlanMode::ExplicitRange {
+            start_index,
+            end_index,
+        } => {
+            let candidates = resolution
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.index >= *start_index && candidate.index <= *end_index
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                Err(format!(
+                    "Bilibili task selection range {start_index}-{end_index} did not match any resolved items."
+                ))
+            } else {
+                Ok(candidates)
+            }
+        }
+        BilibiliPlaybackSelectionPlanMode::ExplicitAll => {
+            if resolution.candidates.is_empty() {
+                Err("Bilibili task selection did not resolve any items.".to_owned())
+            } else {
+                Ok(resolution.candidates.clone())
+            }
+        }
+        BilibiliPlaybackSelectionPlanMode::LegacySingle { .. } => {
+            Err("Legacy Bilibili playback selection does not require resolved candidates.".to_owned())
+        }
+    }
+}
+
+fn result_session_id(task_id: &str, index: usize) -> String {
+    if index == 0 {
+        task_id.to_owned()
+    } else {
+        format!("{task_id}-result-{}", index + 1)
+    }
+}
+
+fn bilibili_result_item(
+    id: String,
+    candidate: &AdapterBilibiliResolvedCandidate,
+    state: TaskState,
+    message: String,
+) -> BilibiliTaskResultItem {
+    BilibiliTaskResultItem {
+        id,
+        selection_id: candidate.selection_id.clone(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        source_kind: candidate.source_kind.clone(),
+        content_id: candidate.content_id.clone(),
+        index: candidate.index,
+        state: state.into(),
+        message,
+        library_item_id: String::new(),
+        playback_source: None,
+        playback_session: None,
+    }
+}
+
+fn mark_remaining_results_cancelled(items: &mut [BilibiliTaskResultItem]) {
+    for item in items {
+        item.state = TaskState::Cancelled.into();
+        item.message = "Cancelled before this Bilibili playback result was planned.".to_owned();
+        item.playback_source = None;
+        item.playback_session = None;
+    }
+}
+
+fn result_items_progress(items: &[BilibiliTaskResultItem]) -> f64 {
+    if items.is_empty() {
+        return 0.0;
+    }
+    let finished = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                TaskState::try_from(item.state).unwrap_or(TaskState::Unspecified),
+                TaskState::Playable
+                    | TaskState::Completed
+                    | TaskState::Failed
+                    | TaskState::Cancelled
+            )
+        })
+        .count();
+    (finished as f64 / items.len() as f64).clamp(0.0, 1.0)
+}
+
+fn related_hls_master_playlist_uri(
+    primary_uri: &str,
+    primary_session_id: &str,
+    session_id: &str,
+) -> String {
+    let primary_suffix = format!(
+        "/hls/{}/master.m3u8",
+        urlencoding::encode(primary_session_id)
+    );
+    if let Some(prefix) = primary_uri.strip_suffix(&primary_suffix) {
+        return format!(
+            "{prefix}/hls/{}/master.m3u8",
+            urlencoding::encode(session_id)
+        );
+    }
+
+    primary_uri.to_owned()
 }
 
 #[cfg(test)]
@@ -1189,32 +1591,189 @@ fn normalized_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-fn validate_deferred_bilibili_task_selection(
-    selection: Option<&BilibiliTaskSelection>,
-) -> Result<(), Status> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BilibiliPlaybackSelectionPlan {
+    task_selection: Option<BilibiliTaskSelection>,
+    mode: BilibiliPlaybackSelectionPlanMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BilibiliPlaybackSelectionPlanMode {
+    LegacySingle { selection_id: Option<String> },
+    ExplicitIds { selection_ids: Vec<String> },
+    ExplicitRange { start_index: u32, end_index: u32 },
+    ExplicitAll,
+}
+
+fn playback_selection_plan(
+    legacy_selection_id: Option<String>,
+    selection: Option<BilibiliTaskSelection>,
+) -> Result<BilibiliPlaybackSelectionPlan, Status> {
+    let selection = selection.map(normalized_bilibili_task_selection);
+
+    if let Some(selection_id) = legacy_selection_id {
+        if let Some(selection) = selection.as_ref()
+            && !selection_is_default_empty(selection)
+        {
+            return Err(Status::invalid_argument(
+                "Use either selection_id or selection, not both.",
+            ));
+        }
+        return Ok(BilibiliPlaybackSelectionPlan {
+            task_selection: Some(BilibiliTaskSelection {
+                mode: BILIBILI_TASK_SELECTION_MODE_SINGLE,
+                selection_ids: vec![selection_id.clone()],
+                range_start_index: 0,
+                range_end_index: 0,
+            }),
+            mode: BilibiliPlaybackSelectionPlanMode::LegacySingle {
+                selection_id: Some(selection_id),
+            },
+        });
+    }
+
     let Some(selection) = selection else {
-        return Ok(());
+        return Ok(BilibiliPlaybackSelectionPlan {
+            task_selection: None,
+            mode: BilibiliPlaybackSelectionPlanMode::LegacySingle { selection_id: None },
+        });
     };
 
     let has_payload = selection
         .selection_ids
         .iter()
-        .any(|selection_id| !selection_id.trim().is_empty())
+        .any(|selection_id| !selection_id.is_empty())
         || selection.range_start_index != 0
         || selection.range_end_index != 0;
-    let is_default_mode = matches!(
+
+    match selection.mode {
+        BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED | BILIBILI_TASK_SELECTION_MODE_DEFAULT => {
+            if has_payload {
+                return Err(Status::invalid_argument(
+                    "Default Bilibili task selection cannot include ids or a range.",
+                ));
+            }
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection),
+                mode: BilibiliPlaybackSelectionPlanMode::LegacySingle { selection_id: None },
+            })
+        }
+        BILIBILI_TASK_SELECTION_MODE_CURRENT => {
+            if has_payload {
+                return Err(Status::invalid_argument(
+                    "Current Bilibili task selection cannot include ids or a range.",
+                ));
+            }
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection),
+                mode: BilibiliPlaybackSelectionPlanMode::LegacySingle { selection_id: None },
+            })
+        }
+        BILIBILI_TASK_SELECTION_MODE_SINGLE => {
+            require_no_range(&selection)?;
+            if selection.selection_ids.len() != 1 {
+                return Err(Status::invalid_argument(
+                    "Single Bilibili task selection requires exactly one selection id.",
+                ));
+            }
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection.clone()),
+                mode: BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                    selection_ids: selection.selection_ids,
+                },
+            })
+        }
+        BILIBILI_TASK_SELECTION_MODE_MULTIPLE => {
+            require_no_range(&selection)?;
+            require_selection_ids(&selection)?;
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection.clone()),
+                mode: BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                    selection_ids: selection.selection_ids,
+                },
+            })
+        }
+        BILIBILI_TASK_SELECTION_MODE_RANGE => {
+            if !selection.selection_ids.is_empty() {
+                return Err(Status::invalid_argument(
+                    "Range Bilibili task selection cannot include explicit ids.",
+                ));
+            }
+            if selection.range_start_index == 0 || selection.range_end_index == 0 {
+                return Err(Status::invalid_argument(
+                    "Range Bilibili task selection requires 1-based start and end indexes.",
+                ));
+            }
+            if selection.range_start_index > selection.range_end_index {
+                return Err(Status::invalid_argument(
+                    "Range Bilibili task selection start index cannot exceed end index.",
+                ));
+            }
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection.clone()),
+                mode: BilibiliPlaybackSelectionPlanMode::ExplicitRange {
+                    start_index: selection.range_start_index,
+                    end_index: selection.range_end_index,
+                },
+            })
+        }
+        BILIBILI_TASK_SELECTION_MODE_ALL => {
+            if has_payload {
+                return Err(Status::invalid_argument(
+                    "All Bilibili task selection cannot include ids or a range.",
+                ));
+            }
+            Ok(BilibiliPlaybackSelectionPlan {
+                task_selection: Some(selection),
+                mode: BilibiliPlaybackSelectionPlanMode::ExplicitAll,
+            })
+        }
+        _ => Err(Status::invalid_argument(
+            "Unknown Bilibili task selection mode.",
+        )),
+    }
+}
+
+fn normalized_bilibili_task_selection(
+    mut selection: BilibiliTaskSelection,
+) -> BilibiliTaskSelection {
+    let mut seen_selection_ids = HashSet::new();
+    let selection_ids = selection
+        .selection_ids
+        .into_iter()
+        .map(|selection_id| selection_id.trim().to_owned())
+        .filter(|selection_id| !selection_id.is_empty())
+        .filter(|selection_id| seen_selection_ids.insert(selection_id.clone()))
+        .collect::<Vec<_>>();
+    selection.selection_ids = selection_ids;
+    selection
+}
+
+fn selection_is_default_empty(selection: &BilibiliTaskSelection) -> bool {
+    matches!(
         selection.mode,
         BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED | BILIBILI_TASK_SELECTION_MODE_DEFAULT
-    );
+    ) && selection.selection_ids.is_empty()
+        && selection.range_start_index == 0
+        && selection.range_end_index == 0
+}
 
-    if is_default_mode && !has_payload {
-        return Ok(());
+fn require_no_range(selection: &BilibiliTaskSelection) -> Result<(), Status> {
+    if selection.range_start_index != 0 || selection.range_end_index != 0 {
+        return Err(Status::invalid_argument(
+            "Explicit id Bilibili task selection cannot include a range.",
+        ));
     }
+    Ok(())
+}
 
-    Err(Status::invalid_argument(concat!(
-        "Bilibili task selection is schema-only in this server version; ",
-        "use selection_id for single-item playback until multi-selection execution is implemented."
-    )))
+fn require_selection_ids(selection: &BilibiliTaskSelection) -> Result<(), Status> {
+    if selection.selection_ids.is_empty() {
+        return Err(Status::invalid_argument(
+            "Bilibili task selection requires at least one selection id.",
+        ));
+    }
+    Ok(())
 }
 
 impl From<BilibiliInputResolution> for BilibiliResolveResult {
@@ -1544,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_bilibili_playback_task_rejects_deferred_selection_schema() {
+    async fn create_bilibili_playback_task_rejects_invalid_selection_range() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -1570,19 +2129,164 @@ mod tests {
                 options: None,
                 selection_id: String::new(),
                 selection: Some(BilibiliTaskSelection {
-                    mode: 5,
-                    selection_ids: vec!["page:1".to_owned(), "page:2".to_owned()],
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 3,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect_err("invalid range should be rejected");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert!(error.message().contains("start index"));
+        let requests = requests.lock().expect("request log should not be poisoned");
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_executes_range_selection_results() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
                     range_start_index: 1,
                     range_end_index: 2,
                 }),
             }))
             .await
-            .expect_err("deferred selection schema should be rejected");
+            .expect("range task should be created")
+            .into_inner();
 
-        assert_eq!(tonic::Code::InvalidArgument, error.code());
-        assert!(error.message().contains("schema-only"));
-        let requests = requests.lock().expect("request log should not be poisoned");
-        assert!(requests.is_empty());
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+
+        assert_eq!(TaskState::Playable, playable.state());
+        assert_eq!(
+            Some(BILIBILI_TASK_SELECTION_MODE_RANGE),
+            playable
+                .bilibili_selection
+                .as_ref()
+                .map(|selection| selection.mode)
+        );
+        assert_eq!(2, playable.result_items.len());
+        assert_eq!(created.id, playable.result_items[0].id);
+        assert_eq!(
+            format!("{}-result-2", created.id),
+            playable.result_items[1].id
+        );
+        assert_eq!(
+            vec!["page:1".to_owned(), "page:2".to_owned()],
+            playable
+                .result_items
+                .iter()
+                .map(|item| item.selection_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(playable.result_items.iter().all(|item| {
+            item.state == i32::from(TaskState::Playable)
+                && item.playback_source.is_some()
+                && item.playback_session.is_some()
+        }));
+        assert_eq!(
+            vec![("BV1range".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert_eq!(
+            vec![
+                ("BV1range".to_owned(), Some("page:1".to_owned())),
+                ("BV1range".to_owned(), Some("page:2".to_owned())),
+            ],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_fails_stale_selection_without_planning() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1stale".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_SINGLE,
+                    selection_ids: vec!["page:404".to_owned()],
+                    range_start_index: 0,
+                    range_end_index: 0,
+                }),
+            }))
+            .await
+            .expect("stale selection task should be created")
+            .into_inner();
+
+        let failed = wait_for_task_state(&tasks, &created.id, TaskState::Failed).await;
+
+        assert!(failed.message.contains("was not found"));
+        assert_eq!(
+            vec![("BV1stale".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert!(
+            playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3321,7 +4025,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1scan-error", None)
+            .create_bilibili_playback_task("BV1scan-error", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3386,7 +4090,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1missing-root", None)
+            .create_bilibili_playback_task("BV1missing-root", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3451,7 +4155,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1scan-recover", None)
+            .create_bilibili_playback_task("BV1scan-recover", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3565,7 +4269,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1stale-library-item", None)
+            .create_bilibili_playback_task("BV1stale-library-item", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3656,7 +4360,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1scan-stale", None)
+            .create_bilibili_playback_task("BV1scan-stale", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3775,7 +4479,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3917,7 +4621,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -3997,7 +4701,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4079,7 +4783,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4149,7 +4853,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4252,7 +4956,7 @@ mod tests {
         );
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4327,7 +5031,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1cancelled", None)
+            .create_bilibili_playback_task("BV1cancelled", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4433,7 +5137,7 @@ mod tests {
             AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1corrupt-state", None)
+            .create_bilibili_playback_task("BV1corrupt-state", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4598,7 +5302,7 @@ mod tests {
         );
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -4685,7 +5389,7 @@ mod tests {
         );
         let creation = state
             .tasks
-            .create_bilibili_playback_task("BV1offline", None)
+            .create_bilibili_playback_task("BV1offline", None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -5006,7 +5710,7 @@ mod tests {
     ) -> (String, HlsPlaybackSession, String) {
         let creation = state
             .tasks
-            .create_bilibili_playback_task(source, None)
+            .create_bilibili_playback_task(source, None, None)
             .expect("playback task should be created");
         let metadata = playback_task_metadata(
             &creation.task.id,
@@ -5083,6 +5787,37 @@ mod tests {
             &'a self,
             _request: BilibiliPlaybackPlanningRequest,
         ) -> BilibiliPlaybackPlanningFuture<'a> {
+            Box::pin(async { Ok(sample_playback_plan()) })
+        }
+    }
+
+    struct StaticResolveAndRecordingPlaybackPlanner {
+        resolve_requests: ResolveRequestLog,
+        playback_requests: PlaybackRequestLog,
+        resolution: BilibiliInputResolution,
+    }
+
+    impl BilibiliPlaybackPlanner for StaticResolveAndRecordingPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            self.resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+                .push((request.source, request.options));
+            let resolution = self.resolution.clone();
+            Box::pin(async move { Ok(resolution) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            self.playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .push((request.source, request.selection_id));
             Box::pin(async { Ok(sample_playback_plan()) })
         }
     }
@@ -5292,6 +6027,47 @@ mod tests {
                     playback_variant("hevc", "hvc1.1.6.L120.90", 2_000_000, 20_000_000),
                 ],
             }],
+        }
+    }
+
+    fn sample_resolution_with_pages() -> BilibiliInputResolution {
+        BilibiliInputResolution {
+            source: "BV1range".to_owned(),
+            title: "Range video".to_owned(),
+            source_kind: "video".to_owned(),
+            default_selection_id: String::new(),
+            candidates: vec![
+                BilibiliResolvedCandidate {
+                    selection_id: "page:1".to_owned(),
+                    title: "Part 1".to_owned(),
+                    subtitle: "Page 1".to_owned(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-1".to_owned(),
+                    index: 1,
+                    duration_seconds: Some(60),
+                    cover_uri: String::new(),
+                },
+                BilibiliResolvedCandidate {
+                    selection_id: "page:2".to_owned(),
+                    title: "Part 2".to_owned(),
+                    subtitle: "Page 2".to_owned(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    duration_seconds: Some(61),
+                    cover_uri: String::new(),
+                },
+                BilibiliResolvedCandidate {
+                    selection_id: "page:3".to_owned(),
+                    title: "Part 3".to_owned(),
+                    subtitle: "Page 3".to_owned(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-3".to_owned(),
+                    index: 3,
+                    duration_seconds: Some(62),
+                    cover_uri: String::new(),
+                },
+            ],
         }
     }
 
