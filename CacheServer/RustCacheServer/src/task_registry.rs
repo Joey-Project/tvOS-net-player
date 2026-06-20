@@ -264,7 +264,11 @@ impl BilibiliTaskRegistry {
             if task.kind() == TaskKind::BilibiliProgressivePlayback {
                 task.playback_source = None;
                 task.playback_session = None;
-                clear_result_playback_metadata(&mut task.result_items);
+                clear_result_playback_metadata(
+                    &mut task.result_items,
+                    TaskState::Cancelled,
+                    CANCELLED_MESSAGE,
+                );
             }
 
             task.clone()
@@ -596,7 +600,11 @@ impl BilibiliTaskRegistry {
                 task.message = CANCELLED_BY_REQUEST_MESSAGE.to_owned();
                 task.playback_source = None;
                 task.playback_session = None;
-                clear_result_playback_metadata(&mut task.result_items);
+                clear_result_playback_metadata(
+                    &mut task.result_items,
+                    TaskState::Cancelled,
+                    CANCELLED_BY_REQUEST_MESSAGE,
+                );
                 task.updated_at = Some(copy_timestamp(&finished_at));
                 task.finished_at = Some(finished_at);
             } else {
@@ -762,7 +770,8 @@ impl BilibiliTaskRegistry {
                 return Ok(task.clone());
             }
 
-            task.playback_source = Some(playback_source.clone());
+            task.playback_source =
+                Some(primary_playback_source_for_refresh(task, &playback_source));
             refresh_result_item_playback_source(task, &normalized_id, &playback_source);
             task.clone()
         } else {
@@ -780,7 +789,8 @@ impl BilibiliTaskRegistry {
             };
 
             if task_uses_hls_session_as_primary(task, &normalized_id) {
-                task.playback_source = Some(playback_source.clone());
+                task.playback_source =
+                    Some(primary_playback_source_for_refresh(task, &playback_source));
             }
             refresh_result_item_playback_source(task, &normalized_id, &playback_source);
             task.clone()
@@ -836,11 +846,11 @@ impl BilibiliTaskRegistry {
 
             let finished_at = current_timestamp();
             task.state = TaskState::Failed.into();
-            task.message = message;
+            task.message = message.clone();
             task.library_item_id.clear();
             task.playback_source = None;
             task.playback_session = None;
-            clear_result_playback_metadata(&mut task.result_items);
+            clear_result_playback_metadata(&mut task.result_items, TaskState::Failed, &message);
             task.updated_at = Some(copy_timestamp(&finished_at));
             task.finished_at = Some(finished_at);
             task.clone()
@@ -882,11 +892,11 @@ impl BilibiliTaskRegistry {
 
             let finished_at = current_timestamp();
             task.state = TaskState::Failed.into();
-            task.message = message;
+            task.message = message.clone();
             task.library_item_id.clear();
             task.playback_source = None;
             task.playback_session = None;
-            clear_result_playback_metadata(&mut task.result_items);
+            clear_result_playback_metadata(&mut task.result_items, TaskState::Failed, &message);
             task.updated_at = Some(copy_timestamp(&finished_at));
             task.finished_at = Some(finished_at);
             task.clone()
@@ -949,7 +959,11 @@ impl BilibiliTaskRegistry {
         removed_task.library_item_id.clear();
         removed_task.playback_source = None;
         removed_task.playback_session = None;
-        clear_result_playback_metadata(&mut removed_task.result_items);
+        clear_result_playback_metadata(
+            &mut removed_task.result_items,
+            TaskState::Failed,
+            PLAYBACK_CACHE_DELETED_MESSAGE,
+        );
         removed_task.updated_at = Some(copy_timestamp(&finished_at));
         removed_task.finished_at = Some(finished_at);
         inner.download_options_by_id.remove(&normalized_task_id);
@@ -1045,6 +1059,22 @@ impl BilibiliTaskRegistry {
             return Vec::new();
         };
         playback_hls_session_ids(task)
+    }
+
+    pub fn interrupted_planning_result_session_ids(&self) -> HashSet<String> {
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .tasks_by_id
+            .values()
+            .filter(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && task.state() == TaskState::Failed
+                    && task.message == PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE
+            })
+            .flat_map(|task| task.result_items.iter())
+            .map(|item| item.id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect()
     }
 
     pub fn protected_hls_cache_session_ids(&self) -> HashSet<String> {
@@ -1179,7 +1209,11 @@ impl BilibiliTaskRegistry {
             task.library_item_id.clear();
             task.playback_source = None;
             task.playback_session = None;
-            clear_result_playback_metadata(&mut task.result_items);
+            clear_result_playback_metadata(
+                &mut task.result_items,
+                TaskState::Failed,
+                PLAYABLE_EXPIRED_AFTER_RESTART_MESSAGE,
+            );
             task.updated_at = Some(copy_timestamp(&updated_at));
             task.finished_at = Some(updated_at);
             changed_task_ids.push(task.id.clone());
@@ -1230,7 +1264,7 @@ impl BilibiliTaskRegistry {
                 };
 
             task.state = effective_state.into();
-            task.message = effective_message;
+            task.message = effective_message.clone();
             if effective_state == TaskState::Succeeded
                 && let Some(library_item_id) = library_item_id
             {
@@ -1248,7 +1282,11 @@ impl BilibiliTaskRegistry {
                 task.library_item_id.clear();
                 task.playback_source = None;
                 task.playback_session = None;
-                clear_result_playback_metadata(&mut task.result_items);
+                clear_result_playback_metadata(
+                    &mut task.result_items,
+                    effective_state,
+                    &effective_message,
+                );
             }
             let finished_at = current_timestamp();
             task.updated_at = Some(copy_timestamp(&finished_at));
@@ -1693,6 +1731,20 @@ fn refresh_result_item_playback_source(
     }
 }
 
+fn primary_playback_source_for_refresh(
+    task: &Task,
+    playback_source: &PlaybackSource,
+) -> PlaybackSource {
+    let mut refreshed = playback_source.clone();
+    refreshed.item_id = if task.state() == TaskState::Completed && !task.library_item_id.is_empty()
+    {
+        task.library_item_id.clone()
+    } else {
+        task.id.clone()
+    };
+    refreshed
+}
+
 fn task_uses_hls_session_as_primary(task: &Task, session_id: &str) -> bool {
     primary_hls_session_id(task).is_some_and(|primary_id| primary_id == session_id)
 }
@@ -1730,14 +1782,18 @@ fn result_item_state(item: &BilibiliTaskResultItem) -> Option<TaskState> {
     TaskState::try_from(item.state).ok()
 }
 
-fn clear_result_playback_metadata(items: &mut [BilibiliTaskResultItem]) {
+fn clear_result_playback_metadata(
+    items: &mut [BilibiliTaskResultItem],
+    terminal_state: TaskState,
+    terminal_message: &str,
+) {
     for item in items {
         if !matches!(
             result_item_state(item).unwrap_or(TaskState::Unspecified),
             TaskState::Failed | TaskState::Cancelled
         ) {
-            item.state = TaskState::Cancelled.into();
-            item.message = CANCELLED_BY_REQUEST_MESSAGE.to_owned();
+            item.state = terminal_state.into();
+            item.message = terminal_message.to_owned();
         }
         item.library_item_id.clear();
         item.playback_source = None;
@@ -1745,11 +1801,15 @@ fn clear_result_playback_metadata(items: &mut [BilibiliTaskResultItem]) {
     }
 }
 
-fn clear_progressive_playback_runtime_metadata(task: &mut Task) {
+fn clear_progressive_playback_runtime_metadata(
+    task: &mut Task,
+    terminal_state: TaskState,
+    terminal_message: &str,
+) {
     task.library_item_id.clear();
     task.playback_source = None;
     task.playback_session = None;
-    clear_result_playback_metadata(&mut task.result_items);
+    clear_result_playback_metadata(&mut task.result_items, terminal_state, terminal_message);
 }
 
 fn clear_unrestorable_result_playback_metadata(
@@ -1946,7 +2006,11 @@ fn restore_persisted_record(
         task.state = TaskState::Cancelled.into();
         task.message = CANCELLED_AFTER_RESTART_MESSAGE.to_owned();
         if task_kind == TaskKind::BilibiliProgressivePlayback {
-            clear_progressive_playback_runtime_metadata(&mut task);
+            clear_progressive_playback_runtime_metadata(
+                &mut task,
+                TaskState::Cancelled,
+                CANCELLED_AFTER_RESTART_MESSAGE,
+            );
         }
         task.updated_at = Some(copy_timestamp(&updated_at));
         task.finished_at = Some(updated_at);
@@ -1961,7 +2025,11 @@ fn restore_persisted_record(
         let updated_at = current_timestamp();
         task.state = TaskState::Failed.into();
         task.message = PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE.to_owned();
-        clear_progressive_playback_runtime_metadata(&mut task);
+        clear_progressive_playback_runtime_metadata(
+            &mut task,
+            TaskState::Failed,
+            PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE,
+        );
         task.updated_at = Some(copy_timestamp(&updated_at));
         task.finished_at = Some(updated_at);
     }
@@ -2646,8 +2714,10 @@ mod tests {
             .refresh_hls_playback_source(&child_session_id, refreshed_source.clone())
             .expect("secondary playback source should refresh");
 
+        let mut expected_primary_source = refreshed_source.clone();
+        expected_primary_source.item_id = created.task.id.clone();
         assert_eq!(TaskState::Playable, refreshed.state());
-        assert_eq!(Some(refreshed_source.clone()), refreshed.playback_source);
+        assert_eq!(Some(expected_primary_source), refreshed.playback_source);
         assert_eq!(2, refreshed.result_items.len());
         assert!(refreshed.result_items[0].playback_source.is_none());
         assert_eq!(
@@ -3187,8 +3257,12 @@ mod tests {
         );
         assert_eq!(1, restored_task.result_items.len());
         assert_eq!(
-            i32::from(TaskState::Cancelled),
+            i32::from(TaskState::Failed),
             restored_task.result_items[0].state
+        );
+        assert_eq!(
+            PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE,
+            restored_task.result_items[0].message
         );
         assert!(restored_task.result_items[0].library_item_id.is_empty());
         assert!(restored_task.result_items[0].playback_source.is_none());

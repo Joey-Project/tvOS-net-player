@@ -181,14 +181,30 @@ impl AppState {
                 &restorable_completed_session_ids,
             );
         }
+        let interrupted_planning_result_session_ids = if hls_cache_scan_succeeded {
+            tasks.interrupted_planning_result_session_ids()
+        } else {
+            HashSet::new()
+        };
         if tasks.persistence_available() && hls_cache_scan_succeeded {
             restored_hls_sessions.retain(|session| {
-                restored_hls_session_is_authorized(
+                let authorized = restored_hls_session_is_authorized(
                     &tasks,
                     &session.id,
                     &restorable_completed_session_ids,
                     completed_hls_cache_playback_supported,
-                )
+                );
+                if !authorized
+                    && interrupted_planning_result_session_ids.contains(&session.id)
+                    && !completed_cache_session_ids.contains(&session.id)
+                    && let Err(error) = hls_cache.remove_session(&session.id)
+                {
+                    eprintln!(
+                        "Failed to remove unauthorized restored HLS session {}: {error}",
+                        session.id
+                    );
+                }
+                authorized
             });
         } else {
             restored_hls_sessions.clear();

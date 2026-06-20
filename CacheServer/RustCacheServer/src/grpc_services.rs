@@ -5051,6 +5051,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_removes_incomplete_hls_session_after_interrupted_result_planning() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1interrupted-result-planning", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", creation.task.id);
+        let metadata = playback_task_metadata(
+            &child_session_id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist child HLS session");
+        state
+            .tasks
+            .update_playback_results(
+                &creation.task.id,
+                Some("Partially planned playback".to_owned()),
+                "Planning selected Bilibili playback results.".to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: child_session_id.clone(),
+                    selection_id: "page:2".to_owned(),
+                    title: "Part 2".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    state: TaskState::Playable.into(),
+                    message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(PlaybackSource {
+                        item_id: child_session_id.clone(),
+                        variant_id: metadata.playback_session.selected_variant_id.clone(),
+                        protocol: PlaybackProtocol::Hls.into(),
+                        uri: format!(
+                            "http://media.example.test:8080/hls/{child_session_id}/master.m3u8"
+                        ),
+                        expires_at: None,
+                    }),
+                    playback_session: Some(metadata.playback_session),
+                }],
+            )
+            .expect("partial playback results should persist");
+        let child_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&child_session_id);
+        assert!(child_session_dir.exists());
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("interrupted task should restore as failed");
+
+        assert_eq!(TaskState::Failed, restored_task.state());
+        assert!(restored.hls_sessions.get(&child_session_id).is_none());
+        assert!(!child_session_dir.exists());
+    }
+
+    #[tokio::test]
     async fn app_state_preserves_hls_tasks_when_cache_scan_fails() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -5975,6 +6053,14 @@ mod tests {
 
         assert_eq!(TaskState::Playable, restored_task.state());
         assert_eq!(
+            creation.task.id,
+            restored_task
+                .playback_source
+                .as_ref()
+                .expect("primary source should refresh")
+                .item_id
+        );
+        assert_eq!(
             expected_uri,
             restored_task
                 .playback_source
@@ -5983,6 +6069,14 @@ mod tests {
                 .uri
         );
         assert_eq!(2, restored_task.result_items.len());
+        assert_eq!(
+            child_session_id,
+            restored_task.result_items[1]
+                .playback_source
+                .as_ref()
+                .expect("secondary result source should refresh")
+                .item_id
+        );
         assert_eq!(
             expected_uri,
             restored_task.result_items[1]
