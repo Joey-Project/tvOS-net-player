@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::generated::tvos_net_player::v1::{
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
-    BilibiliPlaybackVariant, PlaybackSource, Task,
+    BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource, Task,
 };
 
 const TASK_STATE_SCHEMA_VERSION: u32 = 1;
@@ -117,6 +117,10 @@ struct PersistedTaskFile {
     bilibili_options: Option<PersistedBilibiliDownloadOptions>,
     #[serde(default)]
     bilibili_playback_options: Option<PersistedBilibiliPlaybackOptions>,
+    #[serde(default)]
+    bilibili_selection: Option<PersistedBilibiliTaskSelection>,
+    #[serde(default)]
+    result_items: Vec<PersistedBilibiliTaskResultItem>,
 }
 
 impl From<PersistedTaskRecord> for PersistedTaskFile {
@@ -140,6 +144,14 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
             playback_session: task
                 .playback_session
                 .map(PersistedBilibiliPlaybackSession::from),
+            bilibili_selection: task
+                .bilibili_selection
+                .map(PersistedBilibiliTaskSelection::from),
+            result_items: task
+                .result_items
+                .into_iter()
+                .map(PersistedBilibiliTaskResultItem::from)
+                .collect(),
             bilibili_options: record.options.map(PersistedBilibiliDownloadOptions::from),
             bilibili_playback_options: record
                 .playback_options
@@ -167,13 +179,104 @@ impl From<PersistedTaskFile> for PersistedTaskRecord {
                 finished_at: file.finished_at.map(Timestamp::from),
                 playback_source: file.playback_source.map(PlaybackSource::from),
                 playback_session: file.playback_session.map(BilibiliPlaybackSession::from),
-                bilibili_selection: None,
-                result_items: Vec::new(),
+                bilibili_selection: file.bilibili_selection.map(BilibiliTaskSelection::from),
+                result_items: file
+                    .result_items
+                    .into_iter()
+                    .map(BilibiliTaskResultItem::from)
+                    .collect(),
             },
             options: file.bilibili_options.map(BilibiliDownloadOptions::from),
             playback_options: file
                 .bilibili_playback_options
                 .map(BilibiliPlaybackOptions::from),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliTaskSelection {
+    mode: i32,
+    #[serde(default)]
+    selection_ids: Vec<String>,
+    range_start_index: u32,
+    range_end_index: u32,
+}
+
+impl From<BilibiliTaskSelection> for PersistedBilibiliTaskSelection {
+    fn from(selection: BilibiliTaskSelection) -> Self {
+        Self {
+            mode: selection.mode,
+            selection_ids: selection.selection_ids,
+            range_start_index: selection.range_start_index,
+            range_end_index: selection.range_end_index,
+        }
+    }
+}
+
+impl From<PersistedBilibiliTaskSelection> for BilibiliTaskSelection {
+    fn from(selection: PersistedBilibiliTaskSelection) -> Self {
+        Self {
+            mode: selection.mode,
+            selection_ids: selection.selection_ids,
+            range_start_index: selection.range_start_index,
+            range_end_index: selection.range_end_index,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliTaskResultItem {
+    id: String,
+    selection_id: String,
+    title: String,
+    subtitle: String,
+    source_kind: String,
+    content_id: String,
+    index: u32,
+    state: i32,
+    message: String,
+    library_item_id: String,
+    playback_source: Option<PersistedPlaybackSource>,
+    playback_session: Option<PersistedBilibiliPlaybackSession>,
+}
+
+impl From<BilibiliTaskResultItem> for PersistedBilibiliTaskResultItem {
+    fn from(item: BilibiliTaskResultItem) -> Self {
+        Self {
+            id: item.id,
+            selection_id: item.selection_id,
+            title: item.title,
+            subtitle: item.subtitle,
+            source_kind: item.source_kind,
+            content_id: item.content_id,
+            index: item.index,
+            state: item.state,
+            message: item.message,
+            library_item_id: item.library_item_id,
+            playback_source: item.playback_source.map(PersistedPlaybackSource::from),
+            playback_session: item
+                .playback_session
+                .map(PersistedBilibiliPlaybackSession::from),
+        }
+    }
+}
+
+impl From<PersistedBilibiliTaskResultItem> for BilibiliTaskResultItem {
+    fn from(item: PersistedBilibiliTaskResultItem) -> Self {
+        Self {
+            id: item.id,
+            selection_id: item.selection_id,
+            title: item.title,
+            subtitle: item.subtitle,
+            source_kind: item.source_kind,
+            content_id: item.content_id,
+            index: item.index,
+            state: item.state,
+            message: item.message,
+            library_item_id: item.library_item_id,
+            playback_source: item.playback_source.map(PlaybackSource::from),
+            playback_session: item.playback_session.map(BilibiliPlaybackSession::from),
         }
     }
 }
@@ -405,6 +508,10 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::tvos_net_player::v1::{
+        BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackProtocol,
+        TaskKind, TaskState,
+    };
 
     #[test]
     fn load_legacy_snapshot_defaults_bilibili_schema_fields() {
@@ -442,5 +549,98 @@ mod tests {
         assert_eq!(1, records.len());
         assert!(records[0].task.bilibili_selection.is_none());
         assert!(records[0].task.result_items.is_empty());
+    }
+
+    #[test]
+    fn round_trips_bilibili_selection_and_result_items() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let timestamp = Timestamp {
+            seconds: 100,
+            nanos: 0,
+        };
+        let selection = BilibiliTaskSelection {
+            mode: 4,
+            selection_ids: vec!["page:1".to_owned(), "page:2".to_owned()],
+            range_start_index: 0,
+            range_end_index: 0,
+        };
+        let playback_source = PlaybackSource {
+            item_id: "bilibili-playback-result-1".to_owned(),
+            variant_id: "h264".to_owned(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: "http://media.example.test:8080/hls/bilibili-playback-result-1/master.m3u8"
+                .to_owned(),
+            expires_at: None,
+        };
+        let playback_session = BilibiliPlaybackSession {
+            id: "bilibili-playback-result-1".to_owned(),
+            title: "Part 1".to_owned(),
+            content_id: "cid-1".to_owned(),
+            selected_variant_id: "h264".to_owned(),
+            selected_variant: Some(BilibiliPlaybackVariant {
+                id: "h264".to_owned(),
+                label: "1080p".to_owned(),
+                source_kind: "dash".to_owned(),
+                container: "mp4".to_owned(),
+                video_codec: "avc1".to_owned(),
+                audio_codec: "mp4a".to_owned(),
+                width: 1920,
+                height: 1080,
+                bitrate: 1_000_000,
+                size_bytes: 10_000_000,
+            }),
+            variants: Vec::new(),
+        };
+        let result_item = BilibiliTaskResultItem {
+            id: "bilibili-playback-result-1".to_owned(),
+            selection_id: "page:1".to_owned(),
+            title: "Part 1".to_owned(),
+            subtitle: "Page 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-1".to_owned(),
+            index: 1,
+            state: TaskState::Playable.into(),
+            message: "Playable online.".to_owned(),
+            library_item_id: String::new(),
+            playback_source: Some(playback_source.clone()),
+            playback_session: Some(playback_session.clone()),
+        };
+        TaskStateStore::new(path.clone())
+            .save(&[PersistedTaskRecord {
+                task: Task {
+                    id: "bilibili-playback-task".to_owned(),
+                    kind: TaskKind::BilibiliProgressivePlayback.into(),
+                    state: TaskState::Playable.into(),
+                    source: "BV1persist".to_owned(),
+                    title: "Persisted task".to_owned(),
+                    progress: 0.5,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    message: "Playable.".to_owned(),
+                    library_item_id: String::new(),
+                    created_at: Some(Timestamp {
+                        seconds: timestamp.seconds,
+                        nanos: timestamp.nanos,
+                    }),
+                    updated_at: Some(timestamp),
+                    finished_at: None,
+                    playback_source: Some(playback_source.clone()),
+                    playback_session: Some(playback_session.clone()),
+                    bilibili_selection: Some(selection.clone()),
+                    result_items: vec![result_item.clone()],
+                },
+                options: None,
+                playback_options: None,
+            }])
+            .expect("task state should persist");
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("task state should reload");
+
+        assert_eq!(1, records.len());
+        assert_eq!(Some(selection), records[0].task.bilibili_selection);
+        assert_eq!(vec![result_item], records[0].task.result_items);
     }
 }

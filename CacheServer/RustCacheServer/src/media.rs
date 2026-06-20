@@ -698,6 +698,10 @@ mod tests {
             BilibiliMediaRequestKind,
         },
         config::CacheServerOptions,
+        generated::tvos_net_player::v1::{
+            BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
+            PlaybackProtocol, PlaybackSource, TaskState,
+        },
         hls::{HlsMediaResource, HlsPlaybackSession, HlsVariant},
     };
 
@@ -729,9 +733,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -760,9 +762,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -806,10 +806,10 @@ mod tests {
             .cache_session_resources(&state.hls_upstream_client, &cached_session)
             .await
             .expect("session should cache");
-        state.hls_sessions.insert(hls_session(
-            "session-1",
-            "http://127.0.0.1:9/unreachable.m4s",
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
+        );
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -843,10 +843,10 @@ mod tests {
             })
             .await
             .expect("session should prewarm");
-        state.hls_sessions.insert(hls_session(
-            "session-1",
-            "http://127.0.0.1:9/unreachable.m4s",
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
+        );
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -880,10 +880,10 @@ mod tests {
             })
             .await
             .expect("session should prewarm");
-        state.hls_sessions.insert(hls_session(
-            "session-1",
-            "http://127.0.0.1:9/unreachable.m4s",
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
+        );
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -923,10 +923,10 @@ mod tests {
             })
             .await
             .expect("session should prewarm");
-        state.hls_sessions.insert(hls_session(
-            "session-1",
-            "http://127.0.0.1:9/unreachable.m4s",
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -963,10 +963,10 @@ mod tests {
             .cache_session_resources(&state.hls_upstream_client, &cached_session)
             .await
             .expect("session should cache");
-        state.hls_sessions.insert(hls_session(
-            "session-1",
-            "http://127.0.0.1:9/unreachable.m4s",
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -998,11 +998,10 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state.hls_sessions.insert(hls_session_with_backups(
-            "session-1",
-            &primary_url,
-            vec![backup_url],
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session_with_backups("session-1", &primary_url, vec![backup_url]),
+        );
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -1028,11 +1027,10 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state.hls_sessions.insert(hls_session_with_backups(
-            "session-1",
-            &primary_url,
-            vec![backup_url],
-        ));
+        insert_authorized_hls_session(
+            &state,
+            hls_session_with_backups("session-1", &primary_url, vec![backup_url]),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -1060,9 +1058,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -1087,9 +1083,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -1114,9 +1108,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -1139,9 +1131,7 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        state
-            .hls_sessions
-            .insert(hls_session("session-1", &upstream_url));
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -1189,6 +1179,74 @@ mod tests {
 
     fn parse(value: &'static str, size: u64) -> Option<ByteRange> {
         parse_range(Some(&HeaderValue::from_static(value)), size).unwrap()
+    }
+
+    fn insert_authorized_hls_session(state: &AppState, session: HlsPlaybackSession) {
+        let session_id = session.id.clone();
+        let variant_id = session.variant.id.clone();
+        let playback_source = PlaybackSource {
+            item_id: session_id.clone(),
+            variant_id: variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let playback_session = BilibiliPlaybackSession {
+            id: session_id.clone(),
+            title: session.title.clone(),
+            content_id: "cid-1".to_owned(),
+            selected_variant_id: variant_id.clone(),
+            selected_variant: Some(BilibiliPlaybackVariant {
+                id: variant_id,
+                label: "1920x1080".to_owned(),
+                source_kind: "dash".to_owned(),
+                container: "mp4".to_owned(),
+                video_codec: "avc1.640028".to_owned(),
+                audio_codec: String::new(),
+                width: session
+                    .variant
+                    .width
+                    .and_then(|width| i32::try_from(width).ok())
+                    .unwrap_or_default(),
+                height: session
+                    .variant
+                    .height
+                    .and_then(|height| i32::try_from(height).ok())
+                    .unwrap_or_default(),
+                bitrate: i64::try_from(session.variant.bandwidth).unwrap_or_default(),
+                size_bytes: 0,
+            }),
+            variants: Vec::new(),
+        };
+        state.hls_sessions.insert(session);
+        let task = state
+            .tasks
+            .create_bilibili_playback_task(&format!("BV1{session_id}"), None, None)
+            .expect("playback task should be created");
+        state
+            .tasks
+            .complete_playback_results_playable(
+                &task.task.id,
+                "Playable playback".to_owned(),
+                "Result is playable.".to_owned(),
+                playback_source.clone(),
+                playback_session.clone(),
+                vec![BilibiliTaskResultItem {
+                    id: session_id,
+                    selection_id: "page:1".to_owned(),
+                    title: "Episode".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-1".to_owned(),
+                    index: 1,
+                    state: TaskState::Playable.into(),
+                    message: "Playable".to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(playback_source),
+                    playback_session: Some(playback_session),
+                }],
+            )
+            .expect("playback task should authorize HLS session");
     }
 
     async fn start_hls_upstream() -> (String, JoinHandle<()>) {

@@ -36,6 +36,7 @@ use crate::{
 
 const BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
 const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT as u32;
+const BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1;
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
@@ -415,7 +416,7 @@ impl BbdownBilibiliAdapter {
     ) -> Result<ResolvedContent, BilibiliDownloadError> {
         let mut last_error = initial_error;
         let mut search =
-            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32);
         let mut best_resolved = None;
 
         while let Some(limit) = search.next_limit() {
@@ -627,6 +628,11 @@ fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
     bounded_resolve_selection(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
 }
 
+#[cfg(test)]
+fn resolve_truncation_probe_selection() -> Result<Selection, BilibiliDownloadError> {
+    bounded_resolve_selection(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32)
+}
+
 fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, BilibiliDownloadError> {
     match input {
         Input::Aid(_) | Input::Bvid(_) => Ok(None),
@@ -644,7 +650,9 @@ fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, Bilib
         | Input::FollowingFeed
         | Input::SpaceDynamic(_)
         | Input::History
-        | Input::WatchLater => Ok(Some(Selection::Latest)),
+        | Input::WatchLater => {
+            bounded_resolve_selection(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32).map(Some)
+        }
         Input::ShortLink(_) => Ok(None),
     }
 }
@@ -979,6 +987,7 @@ impl BilibiliInputResolution {
     fn from_resolved_content(source: String, input: &Input, resolved: ResolvedContent) -> Self {
         match resolved {
             ResolvedContent::Video(video) => {
+                let candidates_truncated = video.pages.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = video
                     .pages
                     .iter()
@@ -994,7 +1003,13 @@ impl BilibiliInputResolution {
                         cover_uri: video.cover_url.clone().unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, video.title, "video", candidates)
+                Self::with_candidates(
+                    source,
+                    video.title,
+                    "video",
+                    candidates,
+                    candidates_truncated,
+                )
             }
             ResolvedContent::Season(season) => {
                 let episodes = if resolve_should_use_full_episode_list(input) {
@@ -1002,6 +1017,7 @@ impl BilibiliInputResolution {
                 } else {
                     &season.selected_episodes
                 };
+                let candidates_truncated = episodes.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = episodes
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
@@ -1024,10 +1040,18 @@ impl BilibiliInputResolution {
                         }
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, season.season.title, "season", candidates)
+                Self::with_candidates(
+                    source,
+                    season.season.title,
+                    "season",
+                    candidates,
+                    candidates_truncated,
+                )
             }
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
+                let candidates_truncated =
+                    collection.selected_items.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
                 let candidates = collection
                     .selected_items
                     .iter()
@@ -1046,7 +1070,13 @@ impl BilibiliInputResolution {
                         cover_uri: item.cover_url.clone().unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
-                Self::with_candidates(source, collection.collection.title, source_kind, candidates)
+                Self::with_candidates(
+                    source,
+                    collection.collection.title,
+                    source_kind,
+                    candidates,
+                    candidates_truncated,
+                )
             }
         }
     }
@@ -1056,6 +1086,7 @@ impl BilibiliInputResolution {
         title: String,
         source_kind: impl Into<String>,
         candidates: Vec<BilibiliResolvedCandidate>,
+        candidates_truncated: bool,
     ) -> Self {
         let default_selection_id = if candidates.len() == 1 {
             candidates
@@ -1071,6 +1102,7 @@ impl BilibiliInputResolution {
             source_kind: source_kind.into(),
             candidates,
             default_selection_id,
+            candidates_truncated,
         }
     }
 }
@@ -2183,6 +2215,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_truncation_probe_selection_reads_one_extra_item() {
+        let selection =
+            resolve_truncation_probe_selection().expect("probe selection should be valid");
+
+        let Selection::Indices(indices) = selection else {
+            panic!("probe selection should use bounded indices");
+        };
+        assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
+        assert!(indices.contains(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32));
+        assert!(!indices.contains(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32 + 1));
+    }
+
+    #[test]
     fn resolve_selection_preserves_current_episode_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Episode(123)).unwrap(),
@@ -2208,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_uses_single_overview_requests_for_list_inputs() {
+    fn resolve_selection_uses_bounded_windows_for_list_inputs() {
         assert_eq!(
             resolve_selection_for_input(&Input::Season(123)).unwrap(),
             Some(Selection::Page(1))
@@ -2230,11 +2275,12 @@ mod tests {
             Input::RecommendationFeed,
             Input::History,
         ];
+        let bounded_selection = Some(resolve_truncation_probe_selection().unwrap());
 
         for input in list_inputs {
             assert_eq!(
                 resolve_selection_for_input(&input).unwrap(),
-                Some(Selection::Latest)
+                bounded_selection
             );
         }
     }
@@ -2557,14 +2603,14 @@ mod tests {
                     cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
                     pub_time: None,
                     owner: Some(owner.clone()),
-                    items: vec![selected_item.clone(), unselected_item],
+                    items: vec![selected_item.clone(), unselected_item.clone()],
                 },
-                selected_items: vec![selected_item],
+                selected_items: vec![selected_item, unselected_item],
             }),
         );
 
         assert_eq!(resolution.source_kind, "favorite");
-        assert_eq!(resolution.candidates.len(), 1);
+        assert_eq!(resolution.candidates.len(), 2);
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
@@ -2588,6 +2634,82 @@ mod tests {
                 cid: Some(270_001),
             })
         );
+    }
+
+    #[test]
+    fn collection_resolution_does_not_mark_exact_candidate_limit_truncated() {
+        let owner = bbdown_core::Owner {
+            mid: 123,
+            name: "Owner".to_owned(),
+        };
+        let selected_items = (1..=BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
+            .map(|index| test_collection_item(index, &format!("Item {index}"), Some(owner.clone())))
+            .collect::<Vec<_>>();
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "history".to_owned(),
+            &Input::History,
+            ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
+                collection: bbdown_core::VideoCollectionMetadata {
+                    id: None,
+                    kind: VideoCollectionKind::History,
+                    title: "History".to_owned(),
+                    description: String::new(),
+                    cover_url: None,
+                    pub_time: None,
+                    owner: Some(owner),
+                    items: selected_items.clone(),
+                },
+                selected_items,
+            }),
+        );
+
+        assert_eq!(
+            BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            resolution.candidates.len()
+        );
+        assert!(!resolution.candidates_truncated);
+    }
+
+    #[test]
+    fn collection_resolution_marks_over_limit_candidate_window_truncated() {
+        let owner = bbdown_core::Owner {
+            mid: 123,
+            name: "Owner".to_owned(),
+        };
+        let selected_items = (1..=BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32)
+            .map(|index| test_collection_item(index, &format!("Item {index}"), Some(owner.clone())))
+            .collect::<Vec<_>>();
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "history".to_owned(),
+            &Input::History,
+            ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
+                collection: bbdown_core::VideoCollectionMetadata {
+                    id: None,
+                    kind: VideoCollectionKind::History,
+                    title: "History".to_owned(),
+                    description: String::new(),
+                    cover_url: None,
+                    pub_time: None,
+                    owner: Some(owner),
+                    items: selected_items.clone(),
+                },
+                selected_items,
+            }),
+        );
+
+        assert_eq!(
+            BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            resolution.candidates.len()
+        );
+        assert_eq!(
+            BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32,
+            resolution
+                .candidates
+                .last()
+                .expect("limited candidates should not be empty")
+                .index
+        );
+        assert!(resolution.candidates_truncated);
     }
 
     #[test]
@@ -3263,6 +3385,25 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+        }
+    }
+
+    fn test_collection_item(
+        index: u32,
+        title: &str,
+        owner: Option<bbdown_core::Owner>,
+    ) -> bbdown_core::VideoCollectionItem {
+        bbdown_core::VideoCollectionItem {
+            index,
+            aid: 170_000 + u64::from(index),
+            bvid: Some(format!("BV1test{index}")),
+            cid: 270_000 + u64::from(index),
+            title: title.to_owned(),
+            cover_url: None,
+            description: String::new(),
+            pub_time: None,
+            owner,
+            duration_seconds: Some(index),
         }
     }
 

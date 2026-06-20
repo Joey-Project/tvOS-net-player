@@ -94,10 +94,15 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsBilibiliResolve: Bool {
         capabilities.contains(CacheServerCapability.bilibiliResolve)
     }
+
+    public var supportsBilibiliTaskSelection: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliTaskSelection)
+    }
 }
 
 public enum CacheServerCapability {
     public static let bilibiliResolve = "bilibiliResolve"
+    public static let bilibiliTaskSelection = "bilibiliTaskSelection"
     public static let libraryItemDelete = "libraryItemDelete"
 }
 
@@ -418,6 +423,7 @@ public struct BilibiliResolveResult: Equatable, Sendable {
     public let sourceKind: String
     public let candidates: [BilibiliResolvedCandidate]
     public let defaultSelectionID: String
+    public let candidatesTruncated: Bool
 
     public init(
         source: String,
@@ -426,11 +432,30 @@ public struct BilibiliResolveResult: Equatable, Sendable {
         candidates: [BilibiliResolvedCandidate],
         defaultSelectionID: String
     ) {
+        self.init(
+            source: source,
+            title: title,
+            sourceKind: sourceKind,
+            candidates: candidates,
+            defaultSelectionID: defaultSelectionID,
+            candidatesTruncated: false
+        )
+    }
+
+    public init(
+        source: String,
+        title: String,
+        sourceKind: String,
+        candidates: [BilibiliResolvedCandidate],
+        defaultSelectionID: String,
+        candidatesTruncated: Bool
+    ) {
         self.source = source
         self.title = title
         self.sourceKind = sourceKind
         self.candidates = candidates
         self.defaultSelectionID = defaultSelectionID
+        self.candidatesTruncated = candidatesTruncated
     }
 
     public var requiresSelection: Bool {

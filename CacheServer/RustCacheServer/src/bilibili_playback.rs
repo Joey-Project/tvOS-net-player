@@ -45,6 +45,7 @@ pub(crate) struct BilibiliInputResolution {
     pub source_kind: String,
     pub candidates: Vec<BilibiliResolvedCandidate>,
     pub default_selection_id: String,
+    pub candidates_truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

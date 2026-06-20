@@ -29,7 +29,9 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.currentTask?.id, "bilibili-playback-1")
         XCTAssertTrue(model.isWatching)
 
+        await client.waitForWatchSubscription()
         model.clearTask()
+        await client.waitForWatchTermination()
     }
 
     func testSubmitFallsBackToCreateWhenResolveIsUnsupported() async {

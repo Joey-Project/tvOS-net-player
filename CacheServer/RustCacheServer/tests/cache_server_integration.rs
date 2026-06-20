@@ -40,6 +40,14 @@ async fn serves_library_control_plane_and_http_range_media() {
         info.capabilities
             .contains(&(ServerCapability::BilibiliTasks as i32))
     );
+    assert!(
+        info.capabilities
+            .contains(&(ServerCapability::BilibiliResolve as i32))
+    );
+    assert!(
+        info.capabilities
+            .contains(&(ServerCapability::BilibiliTaskSelection as i32))
+    );
     assert!(info.capabilities.contains(&(ServerCapability::Hls as i32)));
     assert!(
         info.capabilities
