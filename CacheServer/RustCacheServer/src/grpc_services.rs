@@ -815,6 +815,12 @@ async fn run_explicit_bilibili_playback_planning(
         .await
     {
         Ok(resolution) => resolution,
+        Err(error) if cancellation.is_cancel_requested() => {
+            return state
+                .tasks
+                .complete_task_cancelled(&task_id, playback_error_message(error))
+                .is_ok();
+        }
         Err(error) => {
             return state
                 .tasks
@@ -2600,6 +2606,77 @@ mod tests {
             *playback_requests
                 .lock()
                 .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_cancels_during_explicit_resolution() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let (resolve_started_sender, resolve_started) = oneshot::channel();
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(CancelDuringResolutionPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolve_started: Mutex::new(Some(resolve_started_sender)),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range-resolve-cancel".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect("range task should be created")
+            .into_inner();
+
+        resolve_started
+            .await
+            .expect("explicit resolution should begin");
+        service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: created.id.clone(),
+            }))
+            .await
+            .expect("explicit selection task should accept cancellation");
+
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(cancelled.playback_source.is_none());
+        assert!(cancelled.playback_session.is_none());
+        assert!(cancelled.result_items.is_empty());
+        assert_eq!(
+            vec![("BV1range-resolve-cancel".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert!(
+            playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .is_empty()
         );
     }
 
@@ -7285,6 +7362,51 @@ mod tests {
                     })
                 }
             }
+        }
+    }
+
+    struct CancelDuringResolutionPlanner {
+        resolve_requests: ResolveRequestLog,
+        playback_requests: PlaybackRequestLog,
+        resolve_started: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl BilibiliPlaybackPlanner for CancelDuringResolutionPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            self.resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+                .push((request.source, request.options));
+            let resolve_started = self
+                .resolve_started
+                .lock()
+                .expect("resolve-started signal lock should not be poisoned")
+                .take();
+            Box::pin(async move {
+                if let Some(sender) = resolve_started {
+                    let _ = sender.send(());
+                }
+                while !request.cancellation.is_cancel_requested() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(BilibiliDownloadError::Cancelled(
+                    "Input resolution was cancelled.".to_owned(),
+                ))
+            })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            self.playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .push((request.source, request.selection_id));
+            Box::pin(async { Ok(sample_playback_plan()) })
         }
     }
 

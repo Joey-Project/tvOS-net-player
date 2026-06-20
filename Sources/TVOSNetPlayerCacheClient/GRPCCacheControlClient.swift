@@ -189,7 +189,35 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
     ) async throws -> CacheTask {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !normalizedSelectionID.isEmpty {
+        return try await createBilibiliPlaybackTask(
+            urlOrID: urlOrID,
+            selectionID: normalizedSelectionID,
+            selection: nil,
+            options: options
+        )
+    }
+
+    public func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selection: BilibiliTaskSelection?,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
+    ) async throws -> CacheTask {
+        try await createBilibiliPlaybackTask(
+            urlOrID: urlOrID,
+            selectionID: nil,
+            selection: selection,
+            options: options
+        )
+    }
+
+    private func createBilibiliPlaybackTask(
+        urlOrID: String,
+        selectionID: String?,
+        selection: BilibiliTaskSelection?,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !normalizedSelectionID.isEmpty || selection != nil {
             let serverInfo = try await getServerInfo()
             guard serverInfo.supportsBilibiliResolve else {
                 throw CacheControlClientUnsupportedFeature.bilibiliResolve
@@ -207,6 +235,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
             request.urlOrID = urlOrID
             request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
             request.selectionID = normalizedSelectionID
+            if let selection {
+                request.selection = TvosNetPlayer_V1_BilibiliTaskSelection(selection)
+            }
             let response = try await service.createBilibiliPlaybackTask(request, options: callOptions)
             return CacheTask(response)
         }
@@ -502,6 +533,47 @@ extension BilibiliTaskSelection {
             rangeStartIndex: Int(proto.rangeStartIndex),
             rangeEndIndex: Int(proto.rangeEndIndex)
         )
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliTaskSelection {
+    fileprivate init(_ selection: BilibiliTaskSelection) {
+        self.init()
+        mode = TvosNetPlayer_V1_BilibiliTaskSelectionMode(selection.mode)
+        selectionIds = selection.selectionIDs
+        rangeStartIndex = clampedSelectionIndex(selection.rangeStartIndex)
+        rangeEndIndex = clampedSelectionIndex(selection.rangeEndIndex)
+    }
+}
+
+private func clampedSelectionIndex(_ value: Int) -> UInt32 {
+    if value <= 0 {
+        return 0
+    }
+    if value >= Int(UInt32.max) {
+        return UInt32.max
+    }
+    return UInt32(value)
+}
+
+extension TvosNetPlayer_V1_BilibiliTaskSelectionMode {
+    fileprivate init(_ mode: String) {
+        switch mode {
+        case "default":
+            self = .default
+        case "current":
+            self = .current
+        case "single":
+            self = .single
+        case "multiple":
+            self = .multiple
+        case "range":
+            self = .range
+        case "all":
+            self = .all
+        default:
+            self = .unspecified
+        }
     }
 }
 
