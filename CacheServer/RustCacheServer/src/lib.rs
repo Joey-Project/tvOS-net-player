@@ -445,6 +445,10 @@ impl AppState {
             .lock()
             .expect("HLS cache quota enforcement lock poisoned");
         let was_registered = self.hls_sessions.get(session_id).is_some();
+        if was_registered && !self.registered_hls_session_is_authorized_for_serving(session_id) {
+            self.hls_sessions.remove(session_id);
+            return None;
+        }
         let Some(session) = self.hls_playback_session(session_id) else {
             self.fail_unrestorable_hls_playback_session_if_cache_is_accessible(session_id);
             return None;
@@ -459,6 +463,30 @@ impl AppState {
         }
         self.note_hls_cache_playback_use(session_id);
         Some(session)
+    }
+
+    fn registered_hls_session_is_authorized_for_serving(&self, session_id: &str) -> bool {
+        if self.completed_hls_task_is_authorized(session_id) {
+            return true;
+        }
+
+        let Ok(task) = self.tasks.get_task(session_id) else {
+            return self.tasks.is_playback_result_session_playable(
+                session_id,
+                self.supports_completed_hls_cache_playback(),
+            );
+        };
+        if task.kind() != TaskKind::BilibiliProgressivePlayback {
+            return false;
+        }
+
+        match task.state() {
+            TaskState::Playable => self
+                .tasks
+                .is_primary_hls_session_playable(&task.id, session_id),
+            TaskState::Completed => false,
+            _ => false,
+        }
     }
 
     pub(crate) fn delete_completed_hls_library_item(

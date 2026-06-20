@@ -1649,7 +1649,7 @@ fn normalized_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct BilibiliPlaybackSelectionPlan {
     task_selection: Option<BilibiliTaskSelection>,
     mode: BilibiliPlaybackSelectionPlanMode,
@@ -5371,6 +5371,84 @@ mod tests {
         assert_eq!(TaskState::Failed, restored_task.state());
         assert!(restored.hls_sessions.get(&child_session_id).is_none());
         assert!(!child_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn app_state_rejects_registered_unfinished_result_hls_session_for_serving() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1unfinished-result-session", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", creation.task.id);
+        let metadata = playback_task_metadata(
+            &child_session_id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist child HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .update_playback_results(
+                &creation.task.id,
+                Some("Partially planned playback".to_owned()),
+                "Planning selected Bilibili playback results.".to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: child_session_id.clone(),
+                    selection_id: "page:2".to_owned(),
+                    title: "Part 2".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    state: TaskState::Playable.into(),
+                    message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(PlaybackSource {
+                        item_id: child_session_id.clone(),
+                        variant_id: metadata.playback_session.selected_variant_id.clone(),
+                        protocol: PlaybackProtocol::Hls.into(),
+                        uri: format!(
+                            "http://media.example.test:8080/hls/{child_session_id}/master.m3u8"
+                        ),
+                        expires_at: None,
+                    }),
+                    playback_session: Some(metadata.playback_session),
+                }],
+            )
+            .expect("partial playback results should persist");
+
+        assert!(state.hls_sessions.get(&child_session_id).is_some());
+        assert!(
+            state
+                .hls_playback_session_for_serving(&child_session_id)
+                .is_none()
+        );
+        assert!(state.hls_sessions.get(&child_session_id).is_none());
+        let task = state
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("unfinished task should remain readable");
+        assert_eq!(TaskState::Preparing, task.state());
     }
 
     #[tokio::test]

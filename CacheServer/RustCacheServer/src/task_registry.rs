@@ -683,6 +683,11 @@ impl BilibiliTaskRegistry {
                 task.library_item_id.clear();
                 task.playback_source = None;
                 task.playback_session = None;
+                clear_result_playback_metadata(
+                    &mut task.result_items,
+                    TaskState::Cancelled,
+                    CANCELLED_BY_REQUEST_MESSAGE,
+                );
                 task.updated_at = Some(copy_timestamp(&finished_at));
                 task.finished_at = Some(finished_at);
             } else {
@@ -3503,6 +3508,86 @@ mod tests {
         assert!(stored.playback_session.is_none());
         assert!(recreated.created);
         assert_ne!(playable.id, recreated.task.id);
+    }
+
+    #[test]
+    fn hls_finalization_after_cancel_requested_clears_result_playback_metadata() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cancel-finalizer", None, None)
+            .expect("playback task should be created");
+        let primary_session_id = created.task.id.clone();
+        let child_session_id = format!("{primary_session_id}-result-2");
+        registry
+            .complete_playback_results_playable(
+                &primary_session_id,
+                "Playable playback".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&primary_session_id),
+                playback_session(&primary_session_id),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: primary_session_id.clone(),
+                        selection_id: "page:1".to_owned(),
+                        title: "Part 1".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-1".to_owned(),
+                        index: 1,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(playback_source(&primary_session_id)),
+                        playback_session: Some(playback_session(&primary_session_id)),
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_session_id.clone(),
+                        selection_id: "page:2".to_owned(),
+                        title: "Part 2".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-2".to_owned(),
+                        index: 2,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(playback_source(&child_session_id)),
+                        playback_session: Some(playback_session(&child_session_id)),
+                    },
+                ],
+            )
+            .expect("playback results should become playable");
+        {
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            let task = inner
+                .tasks_by_id
+                .get_mut(&primary_session_id)
+                .expect("task should exist");
+            task.state = TaskState::CancelRequested.into();
+            task.message = CANCEL_REQUESTED_MESSAGE.to_owned();
+        }
+
+        let cancelled = registry
+            .complete_playback_hls_session_cached(
+                &primary_session_id,
+                &primary_session_id,
+                format!("bilibili.hls.{primary_session_id}"),
+            )
+            .expect("late HLS finalization should complete cancellation");
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert_eq!(CANCELLED_BY_REQUEST_MESSAGE, cancelled.message);
+        assert!(cancelled.library_item_id.is_empty());
+        assert!(cancelled.playback_source.is_none());
+        assert!(cancelled.playback_session.is_none());
+        assert_eq!(2, cancelled.result_items.len());
+        for item in &cancelled.result_items {
+            assert_eq!(i32::from(TaskState::Cancelled), item.state);
+            assert_eq!(CANCELLED_BY_REQUEST_MESSAGE, item.message);
+            assert!(item.library_item_id.is_empty());
+            assert!(item.playback_source.is_none());
+            assert!(item.playback_session.is_none());
+        }
     }
 
     #[test]
