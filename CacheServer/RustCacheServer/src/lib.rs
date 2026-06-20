@@ -167,9 +167,11 @@ impl AppState {
         let restorable_completed_session_ids = completed_cache_session_ids
             .iter()
             .filter(|session_id| {
-                tasks.get_task(session_id).is_ok_and(|task| {
-                    task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
-                })
+                tasks
+                    .completed_playback_task_for_hls_session(session_id)
+                    .is_some_and(|task| {
+                        task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+                    })
             })
             .cloned()
             .collect();
@@ -250,18 +252,19 @@ impl AppState {
         }
 
         for session in restored_sessions {
-            let Ok(task) = self.tasks.get_task(&session.id) else {
+            let Some(task_id) = self
+                .tasks
+                .playable_task_id_for_primary_hls_session(&session.id)
+            else {
                 continue;
             };
-            if task.state() != TaskState::Playable {
-                continue;
-            }
             if completed_session_ids.contains(&session.id) {
                 self.hls_sessions
                     .insert(sanitized_completed_session(session));
                 match self.hls_cache.save_completed_session(session) {
                     Ok(()) => {
-                        match self.tasks.complete_playback_cached(
+                        match self.tasks.complete_playback_hls_session_cached(
+                            &task_id,
                             &session.id,
                             HlsCacheStore::completed_library_item_id(&session.id),
                         ) {
@@ -297,7 +300,7 @@ impl AppState {
             }
 
             self.enqueue_hls_cache_fill_demoted(
-                session.id.clone(),
+                task_id,
                 session.clone(),
                 HlsCacheFinalizationFailureMode::FailRestoredTask,
             );
@@ -460,7 +463,10 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return false;
         }
-        let Ok(task) = self.tasks.get_task(session_id) else {
+        let Some(task) = self
+            .tasks
+            .completed_playback_task_for_hls_session(session_id)
+        else {
             return false;
         };
 
@@ -702,7 +708,10 @@ impl AppState {
     }
 
     fn completed_hls_cache_entry_is_evictable(&self, entry: &HlsCacheCompletedEntry) -> bool {
-        let Ok(task) = self.tasks.get_task(&entry.session_id) else {
+        let Some(task) = self
+            .tasks
+            .completed_playback_task_for_hls_session(&entry.session_id)
+        else {
             return self.tasks.persistence_available();
         };
         if task.kind() != TaskKind::BilibiliProgressivePlayback {
@@ -723,7 +732,10 @@ impl AppState {
     }
 
     fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
-        let Ok(task) = self.tasks.get_task(&entry.session_id) else {
+        let Some(task) = self
+            .tasks
+            .completed_playback_task_for_hls_session(&entry.session_id)
+        else {
             return;
         };
         if task.kind() != TaskKind::BilibiliProgressivePlayback
@@ -776,6 +788,9 @@ impl AppState {
             return true;
         }
         let Ok(task) = self.tasks.get_task(session_id) else {
+            if self.completed_hls_task_is_authorized(session_id) {
+                return true;
+            }
             if !self.tasks.is_playback_result_session_playable(session_id) {
                 return false;
             }

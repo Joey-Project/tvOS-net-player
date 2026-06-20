@@ -997,7 +997,7 @@ async fn run_explicit_bilibili_playback_planning(
         Ok(task) => {
             if task.state() != TaskState::Playable {
                 remove_hls_sessions(&state, &planned_session_ids);
-            } else if primary_hls_session.id == task_id {
+            } else {
                 state.enqueue_hls_cache_fill_foreground(
                     task_id.clone(),
                     primary_hls_session,
@@ -1196,6 +1196,7 @@ pub(crate) async fn run_hls_cache_finalization(
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
     loop {
         let job = state.hls_fill_scheduler.next_job().await;
+        let session_id = job.session.id.clone();
         let outcome = run_hls_cache_finalization_inner(
             state.clone(),
             job.task_id.clone(),
@@ -1206,7 +1207,9 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
         .await;
         state.hls_fill_scheduler.finish_current(&job);
         if outcome == HlsCacheFinalizationOutcome::Preempted
-            && state.tasks.is_playback_task_playable(&job.task_id)
+            && state
+                .tasks
+                .is_primary_hls_session_playable(&job.task_id, &session_id)
         {
             let message = match job.priority {
                 crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
@@ -1246,10 +1249,14 @@ async fn run_hls_cache_finalization_inner(
     if !state.supports_completed_hls_cache_playback() {
         return HlsCacheFinalizationOutcome::Finished;
     }
+    let session_id = session.id.clone();
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
-        if !state.tasks.is_playback_task_playable(&task_id) {
+        if !state
+            .tasks
+            .is_primary_hls_session_playable(&task_id, &session_id)
+        {
             return HlsCacheFinalizationOutcome::Finished;
         }
         if preemption.is_preempted() {
@@ -1270,9 +1277,12 @@ async fn run_hls_cache_finalization_inner(
             () = sleep(Duration::from_millis(100)) => {}
         }
     };
-    let _eviction_protection = state.protect_hls_cache_session_from_eviction(&task_id);
+    let _eviction_protection = state.protect_hls_cache_session_from_eviction(&session_id);
     let control = || {
-        if !state.tasks.is_playback_task_playable(&task_id) {
+        if !state
+            .tasks
+            .is_primary_hls_session_playable(&task_id, &session_id)
+        {
             HlsCacheFillControl::Cancel
         } else if preemption.is_preempted() {
             HlsCacheFillControl::Preempt
@@ -1306,8 +1316,8 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.hls_sessions.remove(&task_id);
-            let _ = state.hls_cache.remove_session(&task_id);
+            state.hls_sessions.remove(&session_id);
+            let _ = state.hls_cache.remove_session(&session_id);
             return HlsCacheFinalizationOutcome::Finished;
         }
         Err(error) => {
@@ -1328,7 +1338,7 @@ async fn run_hls_cache_finalization_inner(
         .unwrap_or_default();
     if let Err(error) = state.enforce_hls_cache_quota_until_cancelled(
         "before_hls_finalization",
-        [task_id.clone()],
+        [session_id.clone()],
         projected_added_bytes,
         || control() != HlsCacheFillControl::Continue,
     ) {
@@ -1354,9 +1364,11 @@ async fn run_hls_cache_finalization_inner(
         .await
     {
         Ok(library_item_id) => {
-            let finalized = state
-                .tasks
-                .complete_playback_cached(&task_id, library_item_id);
+            let finalized = state.tasks.complete_playback_hls_session_cached(
+                &task_id,
+                &session_id,
+                library_item_id,
+            );
             match finalized {
                 Ok(task) if task.state() == TaskState::Completed => {
                     state
@@ -1364,7 +1376,7 @@ async fn run_hls_cache_finalization_inner(
                         .insert(sanitized_completed_session(&session));
                     if let Err(error) = state.enforce_hls_cache_quota(
                         "after_hls_finalization",
-                        [task_id.clone()],
+                        [session_id.clone()],
                         0,
                     ) {
                         eprintln!(
@@ -1373,20 +1385,23 @@ async fn run_hls_cache_finalization_inner(
                     }
                 }
                 Ok(_) | Err(_) => {
-                    state.hls_sessions.remove(&task_id);
-                    let _ = state.hls_cache.remove_session(&task_id);
+                    state.hls_sessions.remove(&session_id);
+                    let _ = state.hls_cache.remove_session(&session_id);
                 }
             }
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.hls_sessions.remove(&task_id);
-            let _ = state.hls_cache.remove_session(&task_id);
+            state.hls_sessions.remove(&session_id);
+            let _ = state.hls_cache.remove_session(&session_id);
         }
         Err(crate::hls_cache::HlsCacheError::Preempted) => {
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(error) => {
-            if !state.tasks.is_playback_task_playable(&task_id) {
+            if !state
+                .tasks
+                .is_primary_hls_session_playable(&task_id, &session_id)
+            {
                 return HlsCacheFinalizationOutcome::Finished;
             }
             match failure_mode {
@@ -1407,8 +1422,8 @@ async fn run_hls_cache_finalization_inner(
                     );
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
-                    state.hls_sessions.remove(&task_id);
-                    let _ = state.hls_cache.remove_session(&task_id);
+                    state.hls_sessions.remove(&session_id);
+                    let _ = state.hls_cache.remove_session(&session_id);
                     if let Err(status) = state.tasks.fail_playback_task_after_cache_restore(
                         &task_id,
                         format!("Failed to restore offline HLS cache after restart: {error}"),
@@ -2459,6 +2474,88 @@ mod tests {
                 .lock()
                 .expect("resolve request log should not be poisoned")
         );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_finalizes_later_primary_result_cache() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndScriptedPlaybackPlanner {
+                resolve_requests: Arc::new(Mutex::new(Vec::new())),
+                playback_requests: Arc::new(Mutex::new(Vec::new())),
+                resolution: sample_resolution_with_pages(),
+                results: Mutex::new(HashMap::from([
+                    (
+                        "page:1".to_owned(),
+                        Err(BilibiliDownloadError::Failed(
+                            "page 1 planning failed".to_owned(),
+                        )),
+                    ),
+                    (
+                        "page:2".to_owned(),
+                        Ok(sample_playback_plan_with_video_url(&upstream_url)),
+                    ),
+                ])),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let library_service = LibraryGrpcService::new(state.clone());
+        let task_service = TaskGrpcService::new(state);
+
+        let created = task_service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range-secondary-cache".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect("range task should be created")
+            .into_inner();
+
+        let completed = wait_for_task_state(&tasks, &created.id, TaskState::Completed).await;
+        let second_result_id = format!("{}-result-2", created.id);
+        let expected_item_id = format!("bilibili.hls.{second_result_id}");
+
+        assert_eq!(expected_item_id, completed.library_item_id);
+        assert_eq!(
+            expected_item_id,
+            completed
+                .playback_source
+                .as_ref()
+                .expect("completed task should expose cached source")
+                .item_id
+        );
+        assert_eq!(
+            i32::from(TaskState::Completed),
+            completed.result_items[1].state
+        );
+        assert_eq!(expected_item_id, completed.result_items[1].library_item_id);
+
+        let library_item = library_service
+            .get_library_item(Request::new(GetLibraryItemRequest {
+                id: expected_item_id,
+            }))
+            .await
+            .expect("secondary primary completed cache should be readable")
+            .into_inner();
+        assert_eq!(second_result_id, library_item.source_id);
     }
 
     #[tokio::test]

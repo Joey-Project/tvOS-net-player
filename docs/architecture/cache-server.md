@@ -106,7 +106,7 @@ Bilibili task selection/result execution:
 - `Task.bilibili_selection` persists the normalized selection intent, including legacy `selection_id` mapped to a single-selection intent.
 - `Task.result_items` persists per-result state, messages, library item IDs, playback sources, and playback session metadata.
 - The first successful result remains the primary compatibility playback item. The first selected candidate uses the task id as its HLS session id; later candidates use stable `task-id-result-N` HLS session ids and can be served by the LAN HLS endpoint.
-- Primary-result offline HLS cache fill continues to use the existing finalization path only when the primary session is the parent task id. Later-candidate result sessions are persisted and recoverable as playable HLS sessions; batch cache finalization policy remains deferred to the client UX/cache-management follow-up.
+- Primary-result offline HLS cache fill follows the actual primary HLS session id, even when the first successful result is a later `task-id-result-N` candidate. Non-primary result sessions are persisted and recoverable as playable HLS sessions; full batch cache finalization policy remains deferred to the client UX/cache-management follow-up.
 
 Cache deletion contract:
 
