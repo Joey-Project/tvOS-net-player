@@ -217,10 +217,13 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !normalizedSelectionID.isEmpty || selection != nil {
+        if let requiredCapability = Self.requiredCapabilityForBilibiliPlaybackTask(
+            selectionID: normalizedSelectionID,
+            selection: selection
+        ) {
             let serverInfo = try await getServerInfo()
-            guard serverInfo.supportsBilibiliTaskSelection else {
-                throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
+            guard serverInfo.capabilities.contains(requiredCapability) else {
+                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
             }
         }
 
@@ -241,6 +244,29 @@ public final class GRPCCacheControlClient: CacheControlClient {
             let response = try await service.createBilibiliPlaybackTask(request, options: callOptions)
             return CacheTask(response)
         }
+    }
+
+    static func requiredCapabilityForBilibiliPlaybackTask(
+        selectionID: String,
+        selection: BilibiliTaskSelection?
+    ) -> String? {
+        if selection != nil {
+            return CacheServerCapability.bilibiliTaskSelection
+        }
+        let normalizedSelectionID = selectionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedSelectionID.isEmpty {
+            return CacheServerCapability.bilibiliResolve
+        }
+        return nil
+    }
+
+    private static func unsupportedFeature(forMissingCapability capability: String)
+        -> CacheControlClientUnsupportedFeature
+    {
+        if capability == CacheServerCapability.bilibiliTaskSelection {
+            return .bilibiliTaskSelection
+        }
+        return .bilibiliResolve
     }
 
     public func getTask(id: String) async throws -> CacheTask {

@@ -110,6 +110,29 @@ final class CacheLibraryPaginationTests: XCTestCase {
         }
     }
 
+    func testGRPCBilibiliPlaybackCapabilityGateKeepsLegacySelectionIDCompatible() {
+        XCTAssertNil(
+            GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackTask(
+                selectionID: "  ",
+                selection: nil
+            )
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackTask(
+                selectionID: " page:2 ",
+                selection: nil
+            ),
+            CacheServerCapability.bilibiliResolve
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackTask(
+                selectionID: "page:2",
+                selection: BilibiliTaskSelection(mode: "single", selectionIDs: ["page:2"])
+            ),
+            CacheServerCapability.bilibiliTaskSelection
+        )
+    }
+
     func testGeneratedDeleteCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.libraryItemDelete),
