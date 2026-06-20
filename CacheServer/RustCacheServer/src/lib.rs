@@ -444,7 +444,16 @@ impl AppState {
             .hls_cache_quota_enforcement_lock
             .lock()
             .expect("HLS cache quota enforcement lock poisoned");
+        let was_registered = self.hls_sessions.get(session_id).is_some();
         let session = self.hls_playback_session(session_id)?;
+        if !was_registered || self.restored_hls_playback_source_needs_refresh(&session) {
+            refresh_restored_hls_playback_source_for_session(
+                &self.tasks,
+                &self.playback_uri_factory,
+                &session,
+                self.completed_hls_task_is_authorized(session_id),
+            );
+        }
         self.note_hls_cache_playback_use(session_id);
         Some(session)
     }
@@ -1003,6 +1012,14 @@ impl AppState {
         true
     }
 
+    fn restored_hls_playback_source_needs_refresh(&self, session: &HlsPlaybackSession) -> bool {
+        let existing_uri = self.tasks.hls_playback_source_uri(&session.id);
+        let restored_uri = self
+            .playback_uri_factory
+            .create_hls_master_playlist_for_restored_task(&session.id, existing_uri.as_deref());
+        existing_uri.as_deref() != Some(restored_uri.as_str())
+    }
+
     fn fail_completed_hls_task_after_cache_restore(&self, session_id: &str) {
         self.hls_sessions.remove(session_id);
         if let Err(status) = self.tasks.fail_completed_playback_task_after_cache_restore(
@@ -1023,7 +1040,20 @@ fn refresh_restored_hls_playback_source(
     session: &crate::hls::HlsPlaybackSession,
     completed_session_ids: &HashSet<String>,
 ) {
-    let is_completed_session = completed_session_ids.contains(&session.id);
+    refresh_restored_hls_playback_source_for_session(
+        tasks,
+        playback_uri_factory,
+        session,
+        completed_session_ids.contains(&session.id),
+    );
+}
+
+fn refresh_restored_hls_playback_source_for_session(
+    tasks: &BilibiliTaskRegistry,
+    playback_uri_factory: &PlaybackUriFactory,
+    session: &crate::hls::HlsPlaybackSession,
+    is_completed_session: bool,
+) {
     let item_id = if is_completed_session {
         HlsCacheStore::completed_library_item_id(&session.id)
     } else {

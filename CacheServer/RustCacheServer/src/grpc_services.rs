@@ -6334,6 +6334,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_lazy_restored_primary_hls_refreshes_uri_after_cache_scan_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let initial_options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://old-media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state = AppState::new_with_playback_planner(
+            initial_options.clone(),
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1lazy-primary", None, None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        let stale_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://old-media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                stale_source.clone(),
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+
+        let hls_root = root_path.join(".tvos-net-player").join("hls");
+        let mut unreadable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should exist")
+            .permissions();
+        unreadable_permissions.set_mode(0o000);
+        fs::set_permissions(&hls_root, unreadable_permissions)
+            .expect("HLS cache root should become unreadable");
+
+        let restored_options = CacheServerOptions {
+            public_media_base_uri: Some("http://restored-media.example.test:9090".to_owned()),
+            ..initial_options
+        };
+        let restored =
+            AppState::new_with_playback_planner(restored_options, Arc::new(EmptyPlaybackPlanner));
+        let preserved = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should stay persisted while cache scan fails");
+        assert_eq!(TaskState::Playable, preserved.state());
+        assert_eq!(
+            stale_source.uri,
+            preserved
+                .playback_source
+                .as_ref()
+                .expect("playback source should stay stale before lazy recovery")
+                .uri
+        );
+        assert!(restored.hls_sessions.get(&creation.task.id).is_none());
+
+        let mut readable_permissions = fs::metadata(&hls_root)
+            .expect("HLS cache root should remain present")
+            .permissions();
+        readable_permissions.set_mode(0o700);
+        fs::set_permissions(&hls_root, readable_permissions)
+            .expect("HLS cache root should become readable again");
+
+        let direct_master = crate::media::hls_master_playlist_get(
+            State(crate::media::MediaState::new(restored.clone())),
+            AxumPath(creation.task.id.clone()),
+        )
+        .await;
+
+        let expected_uri = format!(
+            "http://restored-media.example.test:9090/hls/{}/master.m3u8",
+            creation.task.id
+        );
+        assert_eq!(StatusCode::OK, direct_master.status());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_some());
+        let refreshed = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should still be available");
+        assert_eq!(
+            expected_uri,
+            refreshed
+                .playback_source
+                .as_ref()
+                .expect("playback source should refresh after lazy recovery")
+                .uri
+        );
+    }
+
+    #[tokio::test]
     async fn app_state_serves_restored_completed_child_primary_after_cache_scan_recovers() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6343,15 +6460,15 @@ mod tests {
             .path()
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
-        let options = CacheServerOptions {
+        let initial_options = CacheServerOptions {
             root_path: root_path.clone(),
             task_state_path: root_path.join(".state").join("tasks.json"),
-            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            public_media_base_uri: Some("http://old-media.example.test:8080".to_owned()),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         };
         let state = AppState::new_with_playback_planner(
-            options.clone(),
+            initial_options.clone(),
             Arc::new(StaticResolveAndScriptedPlaybackPlanner {
                 resolve_requests: Arc::new(Mutex::new(Vec::new())),
                 playback_requests: Arc::new(Mutex::new(Vec::new())),
@@ -6391,6 +6508,8 @@ mod tests {
         let completed = wait_for_task_state(&tasks, &created.id, TaskState::Completed).await;
         let child_session_id = format!("{}-result-2", created.id);
         let expected_item_id = format!("bilibili.hls.{child_session_id}");
+        let stale_uri =
+            format!("http://old-media.example.test:8080/hls/{child_session_id}/master.m3u8");
         assert_eq!(expected_item_id, completed.library_item_id);
 
         let hls_root = root_path.join(".tvos-net-player").join("hls");
@@ -6401,12 +6520,25 @@ mod tests {
         fs::set_permissions(&hls_root, unreadable_permissions)
             .expect("HLS cache root should become unreadable");
 
-        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_options = CacheServerOptions {
+            public_media_base_uri: Some("http://restored-media.example.test:9090".to_owned()),
+            ..initial_options
+        };
+        let restored =
+            AppState::new_with_playback_planner(restored_options, Arc::new(EmptyPlaybackPlanner));
         let preserved = restored
             .tasks
             .get_task(&created.id)
             .expect("completed task should stay persisted while cache scan fails");
         assert_eq!(TaskState::Completed, preserved.state());
+        assert_eq!(
+            stale_uri,
+            preserved
+                .playback_source
+                .as_ref()
+                .expect("playback source should stay stale before lazy recovery")
+                .uri
+        );
         assert!(restored.hls_sessions.get(&child_session_id).is_none());
 
         let mut readable_permissions = fs::metadata(&hls_root)
@@ -6424,6 +6556,31 @@ mod tests {
 
         assert_eq!(StatusCode::OK, direct_master.status());
         assert!(restored.hls_sessions.get(&child_session_id).is_some());
+        let expected_uri =
+            format!("http://restored-media.example.test:9090/hls/{child_session_id}/master.m3u8");
+        let refreshed = restored
+            .tasks
+            .get_task(&created.id)
+            .expect("completed task should still be available");
+        assert_eq!(
+            expected_uri,
+            refreshed
+                .playback_source
+                .as_ref()
+                .expect("primary source should refresh after lazy recovery")
+                .uri
+        );
+        assert_eq!(expected_item_id, refreshed.library_item_id);
+        assert_eq!(
+            expected_uri,
+            refreshed
+                .result_items
+                .iter()
+                .find(|item| item.id == child_session_id)
+                .and_then(|item| item.playback_source.as_ref())
+                .expect("child result source should refresh after lazy recovery")
+                .uri
+        );
     }
 
     #[tokio::test]
