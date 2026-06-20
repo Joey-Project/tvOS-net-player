@@ -613,7 +613,7 @@ struct ContentView: View {
 
     private func playBilibiliTaskResult(_ result: BilibiliTaskResultPresentation) async {
         let manualInteractionSequence = model.manualInteractionSequence
-        guard bilibiliModel.canPlay(result: result), let url = result.playbackURL else {
+        guard let url = bilibiliModel.playableURL(for: result) else {
             return
         }
 

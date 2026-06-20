@@ -276,7 +276,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func canPlay(result: BilibiliTaskResultPresentation) -> Bool {
-        !isSubmitting && !isResolving && !isCancelling && result.playbackURL != nil
+        playableURL(for: result) != nil
+    }
+
+    public func playableURL(for result: BilibiliTaskResultPresentation) -> URL? {
+        guard !isSubmitting && !isResolving && !isCancelling else {
+            return nil
+        }
+
+        return currentTaskResult(matching: result)?.playbackURL
     }
 
     public var canClear: Bool {
@@ -419,6 +427,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public var playableURL: URL? {
         currentTask?.playableBilibiliURL
+    }
+
+    private func currentTaskResult(
+        matching result: BilibiliTaskResultPresentation
+    ) -> BilibiliTaskResultPresentation? {
+        taskResults.first { $0.id == result.id }
     }
 
     public var displayTitle: String {
@@ -663,7 +677,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public func finishPreparedPlayback(result: BilibiliTaskResultPresentation, didStartPlayback: Bool) {
         guard let currentTask,
-            currentTask.bilibiliTaskResults.contains(where: { $0.id == result.id })
+            let currentResult = currentTask.bilibiliTaskResults.first(where: { $0.id == result.id })
         else {
             return
         }
@@ -671,9 +685,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         errorMessage = nil
         if didStartPlayback {
             activePlaybackTaskID = currentTask.id
-            activePlaybackResultID = result.id
-            activePlaybackLibraryItemID = normalizedNonEmpty(result.playbackLibraryItemID)
-            statusMessage = "Playing \(result.title)."
+            activePlaybackResultID = currentResult.id
+            activePlaybackLibraryItemID = normalizedNonEmpty(currentResult.playbackLibraryItemID)
+            statusMessage = "Playing \(currentResult.title)."
         } else {
             activePlaybackTaskID = nil
             activePlaybackResultID = nil

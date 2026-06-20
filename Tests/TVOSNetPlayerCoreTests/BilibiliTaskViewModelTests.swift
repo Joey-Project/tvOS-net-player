@@ -748,6 +748,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         let playableResult = model.playableTaskResults[0]
         XCTAssertTrue(model.canPlay(result: playableResult))
+        XCTAssertNotNil(model.playableURL(for: playableResult))
 
         let cancelTask = Task {
             await model.cancel(serverAddressText: "mac-mini.local:50051")
@@ -756,10 +757,46 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         XCTAssertTrue(model.isCancelling)
         XCTAssertFalse(model.canPlay(result: playableResult))
+        XCTAssertNil(model.playableURL(for: playableResult))
 
         await client.completeNextCancel(with: .success(.fixture(state: "TASK_STATE_CANCELLED")))
         await cancelTask.value
         XCTAssertFalse(model.isCancelling)
+    }
+
+    func testTaskResultPlaybackRevalidatesCurrentTaskMembership() async {
+        let childResultID = "bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: childResultID
+            )
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(resultItems: resultItems))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-result",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let playableResult = model.playableTaskResults[0]
+        XCTAssertTrue(model.canPlay(result: playableResult))
+        XCTAssertEqual(
+            model.playableURL(for: playableResult)?.absoluteString,
+            "http://mac-mini.local:8080/hls/\(childResultID)/master.m3u8"
+        )
+
+        model.clearTask()
+
+        XCTAssertFalse(model.canPlay(result: playableResult))
+        XCTAssertNil(model.playableURL(for: playableResult))
     }
 
     func testFinishPreparedPlaybackForTaskResultTracksCachedLibraryItem() async throws {
