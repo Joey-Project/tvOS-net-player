@@ -18,6 +18,7 @@ use crate::{
         BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
         BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource, Task, TaskKind, TaskState,
     },
+    hls_cache::HlsCacheStore,
     task_store::{PersistedTaskRecord, TaskStateStore},
 };
 
@@ -1822,17 +1823,24 @@ fn result_item_uses_hls_session(item: &BilibiliTaskResultItem, session_id: &str)
 fn result_item_hls_session_ids(item: &BilibiliTaskResultItem) -> Vec<String> {
     let mut ids = Vec::new();
     if let Some(session) = item.playback_session.as_ref() {
-        ids.push(session.id.clone());
+        push_hls_session_identity(&mut ids, &session.id);
     }
     if let Some(source) = item.playback_source.as_ref() {
-        ids.push(source.item_id.clone());
+        push_hls_session_identity(&mut ids, &source.item_id);
     }
     if item.playback_source.is_some() || item.playback_session.is_some() {
-        ids.push(item.id.clone());
+        push_hls_session_identity(&mut ids, &item.id);
     }
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn push_hls_session_identity(ids: &mut Vec<String>, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    ids.push(HlsCacheStore::session_id_from_library_item_id(id).unwrap_or_else(|| id.to_owned()));
 }
 
 fn completed_playback_task_id_for_hls_session_locked(
@@ -3025,9 +3033,16 @@ mod tests {
             .expect("primary session should become completed");
 
         let protected = registry.protected_hls_cache_session_ids();
+        let playback_session_ids = registry.playback_hls_session_ids(&created.task.id);
+        let primary_library_item_id = format!("bilibili.hls.{}", created.task.id);
 
         assert!(!protected.contains(&created.task.id));
+        assert!(!protected.contains(&primary_library_item_id));
         assert!(protected.contains(&child_session_id));
+        assert_eq!(
+            HashSet::from([created.task.id.clone(), child_session_id]),
+            playback_session_ids.into_iter().collect()
+        );
     }
 
     #[test]
