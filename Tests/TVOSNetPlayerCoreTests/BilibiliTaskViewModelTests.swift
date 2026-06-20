@@ -593,6 +593,57 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
     }
 
+    func testCompletedMultiResultTaskShowsOfflineReadyBadgeWhenSiblingsFailOrCancel() async {
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: "bilibili.hls.bilibili-playback-1"
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_FAILED",
+                message: "Planning failed."
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-3",
+                selectionID: "page:3",
+                title: "Part 3",
+                index: 3,
+                state: "TASK_STATE_CANCELLED",
+                message: "Cancelled."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    message: "Primary Bilibili playback result is cached.",
+                    libraryItemID: "bilibili.hls.bilibili-playback-1",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1partial-offline-failures",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.cancelledCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.hasPartialSuccess, true)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "1 of 3 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
+    }
+
     func testMultiResultTaskShowsFailureStatusBeforeAnyResultIsReady() async {
         let resultItems: [BilibiliTaskResultItem] = [
             .fixture(

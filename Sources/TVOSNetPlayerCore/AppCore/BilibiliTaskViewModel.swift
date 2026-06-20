@@ -805,10 +805,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
         if let summary = task.bilibiliTaskResultSummary,
             summary.totalCount > 1
         {
-            if summary.hasPartialSuccess {
-                return ProgressiveCacheStatusBadge(label: "Partial result success", systemImage: "checkmark.circle")
-            }
-
             if summary.cachedCount == summary.totalCount {
                 return ProgressiveCacheStatusBadge(
                     label: "Offline ready", systemImage: "externaldrive.fill.badge.checkmark")
@@ -819,6 +815,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     label: "\(summary.cachedCount) of \(summary.totalCount) offline ready",
                     systemImage: "externaldrive.badge.checkmark"
                 )
+            }
+
+            if summary.hasPartialSuccess {
+                return ProgressiveCacheStatusBadge(label: "Partial result success", systemImage: "checkmark.circle")
             }
 
             if summary.readyCount > 0 {
