@@ -1007,7 +1007,11 @@ impl BilibiliTaskRegistry {
             })
     }
 
-    pub fn is_playback_result_session_playable(&self, session_id: &str) -> bool {
+    pub fn is_playback_result_session_playable(
+        &self,
+        session_id: &str,
+        completed_cache_playback_supported: bool,
+    ) -> bool {
         let normalized_id = normalize(session_id);
         if normalized_id.is_empty() {
             return false;
@@ -1015,7 +1019,11 @@ impl BilibiliTaskRegistry {
         let inner = self.inner.lock().expect("task registry lock poisoned");
         inner.tasks_by_id.values().any(|task| {
             task.kind() == TaskKind::BilibiliProgressivePlayback
-                && matches!(task.state(), TaskState::Playable | TaskState::Completed)
+                && match task.state() {
+                    TaskState::Playable => true,
+                    TaskState::Completed => completed_cache_playback_supported,
+                    _ => false,
+                }
                 && task.result_items.iter().any(|item| {
                     item.id == normalized_id
                         && matches!(

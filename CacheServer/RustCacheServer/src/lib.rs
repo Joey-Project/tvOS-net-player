@@ -187,6 +187,7 @@ impl AppState {
                     &tasks,
                     &session.id,
                     &restorable_completed_session_ids,
+                    completed_hls_cache_playback_supported,
                 )
             });
         } else {
@@ -652,10 +653,14 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            if self.hls_cache_session_is_currently_protected_from_eviction(
-                &entry.session_id,
-                &stable_protected_session_ids,
-            ) {
+            let session_ids =
+                self.completed_hls_task_session_ids(&entry.session_id, &entry.library_item_id);
+            if session_ids.iter().any(|session_id| {
+                self.hls_cache_session_is_currently_protected_from_eviction(
+                    session_id,
+                    &stable_protected_session_ids,
+                )
+            }) {
                 continue;
             }
             if !self.completed_hls_cache_entry_is_evictable(&entry) {
@@ -665,14 +670,14 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            if self.hls_cache_session_is_currently_protected_from_eviction(
-                &entry.session_id,
-                &stable_protected_session_ids,
-            ) {
+            if session_ids.iter().any(|session_id| {
+                self.hls_cache_session_is_currently_protected_from_eviction(
+                    session_id,
+                    &stable_protected_session_ids,
+                )
+            }) {
                 continue;
             }
-            let session_ids =
-                self.completed_hls_task_session_ids(&entry.session_id, &entry.library_item_id);
             self.remove_hls_sessions(&session_ids)?;
             self.remove_evicted_completed_hls_task(&entry);
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
@@ -815,7 +820,10 @@ impl AppState {
             if self.completed_hls_task_is_authorized(session_id) {
                 return self.ensure_completed_hls_session_registered(session_id);
             }
-            if !self.tasks.is_playback_result_session_playable(session_id) {
+            if !self.tasks.is_playback_result_session_playable(
+                session_id,
+                self.supports_completed_hls_cache_playback(),
+            ) {
                 return false;
             }
             let Some(session) = self.hls_cache.playback_session(session_id) else {
@@ -910,9 +918,13 @@ fn restored_hls_session_is_authorized(
     tasks: &BilibiliTaskRegistry,
     session_id: &str,
     completed_session_ids: &HashSet<String>,
+    completed_hls_cache_playback_supported: bool,
 ) -> bool {
     let Ok(task) = tasks.get_task(session_id) else {
-        return tasks.is_playback_result_session_playable(session_id);
+        return tasks.is_playback_result_session_playable(
+            session_id,
+            completed_hls_cache_playback_supported,
+        );
     };
     if task.kind() != TaskKind::BilibiliProgressivePlayback {
         return false;

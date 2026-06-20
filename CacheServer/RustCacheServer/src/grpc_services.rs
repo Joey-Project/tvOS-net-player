@@ -912,8 +912,10 @@ async fn run_explicit_bilibili_playback_planning(
                     );
                 }
                 if primary.is_none() {
+                    let mut primary_playback_source = playback_source.clone();
+                    primary_playback_source.item_id = task_id.clone();
                     primary = Some((
-                        playback_source,
+                        primary_playback_source,
                         metadata.playback_session,
                         metadata.hls_session,
                         metadata.title,
@@ -2286,6 +2288,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_bilibili_playback_task_executes_all_selection_results() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1all".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_ALL,
+                    selection_ids: Vec::new(),
+                    range_start_index: 0,
+                    range_end_index: 0,
+                }),
+            }))
+            .await
+            .expect("all-selection task should be created")
+            .into_inner();
+
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+
+        assert_eq!(TaskState::Playable, playable.state());
+        assert_eq!(
+            Some(BILIBILI_TASK_SELECTION_MODE_ALL),
+            playable
+                .bilibili_selection
+                .as_ref()
+                .map(|selection| selection.mode)
+        );
+        assert_eq!(3, playable.result_items.len());
+        assert_eq!(created.id, playable.result_items[0].id);
+        assert_eq!(
+            format!("{}-result-2", created.id),
+            playable.result_items[1].id
+        );
+        assert_eq!(
+            format!("{}-result-3", created.id),
+            playable.result_items[2].id
+        );
+        assert_eq!(
+            vec![
+                "page:1".to_owned(),
+                "page:2".to_owned(),
+                "page:3".to_owned(),
+            ],
+            playable
+                .result_items
+                .iter()
+                .map(|item| item.selection_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(playable.result_items.iter().all(|item| {
+            item.state == i32::from(TaskState::Playable)
+                && item.playback_source.is_some()
+                && item.playback_session.is_some()
+        }));
+        assert_eq!(
+            vec![("BV1all".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert_eq!(
+            vec![
+                ("BV1all".to_owned(), Some("page:1".to_owned())),
+                ("BV1all".to_owned(), Some("page:2".to_owned())),
+                ("BV1all".to_owned(), Some("page:3".to_owned())),
+            ],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
     async fn create_bilibili_playback_task_fails_partial_range_resolution() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -2569,7 +2667,7 @@ mod tests {
                 .id
         );
         assert_eq!(
-            second_result_id,
+            created.id,
             playable
                 .playback_source
                 .as_ref()
@@ -3983,7 +4081,7 @@ mod tests {
             .complete_playback_hls_session_cached(
                 &creation.task.id,
                 &creation.task.id,
-                primary_library_item_id,
+                primary_library_item_id.clone(),
             )
             .expect("primary HLS session should become completed");
         state
@@ -4000,11 +4098,17 @@ mod tests {
             create_completed_hls_playback_task(&state, "BV1quota-evictable", &upstream_url).await;
 
         let summary = state
-            .enforce_hls_cache_quota("test", [creation.task.id.clone()], 0)
+            .enforce_hls_cache_quota("test", [child_session_id.clone()], 0)
             .expect("eviction should scan cache")
             .expect("quota should trigger eviction");
 
         assert_eq!(vec![evictable.task_id.clone()], summary.evicted_session_ids);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&primary_library_item_id)
+                .is_some()
+        );
         assert!(
             state
                 .hls_cache
@@ -4701,6 +4805,145 @@ mod tests {
             .await
             .expect_err("completed HLS playback source should be hidden");
         assert_eq!(tonic::Code::NotFound, source_error.code());
+    }
+
+    #[tokio::test]
+    async fn completed_child_hls_sessions_are_hidden_when_cache_playback_is_unsupported() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let mut state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1hidden-child", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", creation.task.id);
+        let primary_metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("primary playback metadata should map");
+        let child_metadata = playback_task_metadata(
+            &child_session_id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("child playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&primary_metadata.hls_session)
+            .expect("primary HLS session should persist");
+        state
+            .hls_cache
+            .save_session(&child_metadata.hls_session)
+            .expect("child HLS session should persist");
+        state
+            .hls_sessions
+            .insert(primary_metadata.hls_session.clone());
+        state
+            .hls_sessions
+            .insert(child_metadata.hls_session.clone());
+
+        let primary_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: primary_metadata
+                .playback_session
+                .selected_variant_id
+                .clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        let child_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: child_metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_results_playable(
+                &creation.task.id,
+                "Multi Result".to_owned(),
+                "All results are playable.".to_owned(),
+                primary_source.clone(),
+                primary_metadata.playback_session.clone(),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: creation.task.id.clone(),
+                        selection_id: "page:1".to_owned(),
+                        title: "Part 1".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-1".to_owned(),
+                        index: 1,
+                        state: TaskState::Playable.into(),
+                        message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(primary_source),
+                        playback_session: Some(primary_metadata.playback_session.clone()),
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_session_id.clone(),
+                        selection_id: "page:2".to_owned(),
+                        title: "Part 2".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-2".to_owned(),
+                        index: 2,
+                        state: TaskState::Playable.into(),
+                        message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(child_source),
+                        playback_session: Some(child_metadata.playback_session.clone()),
+                    },
+                ],
+            )
+            .expect("multi-result playback task should become playable");
+
+        let primary_library_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &primary_metadata.hls_session)
+            .await
+            .expect("primary HLS resources should cache");
+        state
+            .tasks
+            .complete_playback_hls_session_cached(
+                &creation.task.id,
+                &creation.task.id,
+                primary_library_item_id,
+            )
+            .expect("primary HLS session should become completed");
+
+        state.completed_hls_cache_playback_supported = false;
+        state.hls_sessions.remove(&child_session_id);
+
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_playback_session_for_serving(&child_session_id)
+                .is_none()
+        );
     }
 
     #[tokio::test]
