@@ -3,8 +3,8 @@ id: 20260619-b7e3f1
 title: Bilibili Task Schema Roadmap
 status: active
 created: 2026-06-19
-updated: 2026-06-19
-branch: wip/bilibili-task-schema-foundation
+updated: 2026-06-20
+branch: wip/bilibili-task-appcore-integration
 pr:
 supersedes:
   - 20260615-c8f4d2
@@ -47,6 +47,7 @@ superseded_by:
 Implementation notes:
 
 - PR 4A merged as `a498e676c5652b02a25ac283482225acd91b4a2c`.
+- PR 4B merged as `02cddd2d329be2fb82c31e1ae84b00f052774078`.
 - PR 4B keeps legacy `selection_id` playback behavior intact while mapping it to persisted single-selection intent.
 - PR 4B executes explicit single/multiple/range/all selection server-side by resolving Bilibili candidates, planning each selected result through BBDown Rust core, and publishing per-result HLS playback metadata through `Task.result_items`.
 - PR 4B advertises `SERVER_CAPABILITY_BILIBILI_TASK_SELECTION` separately from `SERVER_CAPABILITY_BILIBILI_RESOLVE` so newer clients do not send selection fields to schema-only/older resolver servers.
@@ -58,6 +59,17 @@ Implementation notes:
 - Preserve old-server compatibility and direct single-selection fallback behavior.
 - Add shared state for multi-result progress, partial success, and library handoff.
 - Cover tvOS/macOS shared behavior with Swift tests before adding platform-specific UI.
+
+Implementation notes:
+
+- PR 4C keeps `BilibiliTaskViewModel` in `TVOSNetPlayerCore` as the shared tvOS/macOS state owner for result schema consumption.
+- PR 4C submits selected resolved candidates with structured `BilibiliTaskSelection(mode: "single")` while falling back to legacy `selection_id` when an older cache server rejects task-selection requests.
+- PR 4C exposes shared presentation state for `Task.result_items`, including per-result playback URLs, ready/cached/failed/cancelled state, aggregate progress, partial-success status, and cached library-item deletion handoff.
+- PR 4C preserves primary playback compatibility by using the task-level playback source first and falling back to the first playable result item when the server publishes only per-result playback metadata.
+
+Validation evidence:
+
+- `swift test --filter BilibiliTaskViewModelTests` passed locally on 2026-06-20 after the shared AppCore integration changes.
 
 ### PR 4D: tvOS/macOS UX And Live E2E
 

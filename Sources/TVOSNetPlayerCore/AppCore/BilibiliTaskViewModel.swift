@@ -7,6 +7,77 @@ public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
     public let systemImage: String
 }
 
+public struct BilibiliTaskResultSummary: Equatable, Sendable {
+    public let totalCount: Int
+    public let readyCount: Int
+    public let cachedCount: Int
+    public let failedCount: Int
+    public let cancelledCount: Int
+    public let pendingCount: Int
+
+    public var completedCount: Int {
+        readyCount + failedCount + cancelledCount
+    }
+
+    public var progress: Double {
+        guard totalCount > 0 else {
+            return 0
+        }
+
+        return min(max(Double(completedCount) / Double(totalCount), 0), 1)
+    }
+
+    public var hasPartialSuccess: Bool {
+        readyCount > 0 && failedCount + cancelledCount > 0
+    }
+
+    public var statusMessage: String {
+        if cachedCount == totalCount {
+            return "\(totalCount) Bilibili results are cached for LAN playback."
+        }
+
+        if readyCount == totalCount {
+            return "\(totalCount) Bilibili results are ready to play."
+        }
+
+        if readyCount > 0 {
+            var message = "\(readyCount) of \(totalCount) Bilibili results are ready"
+            if failedCount > 0 {
+                message += "; \(failedCount) failed"
+            }
+            if cancelledCount > 0 {
+                message += "; \(cancelledCount) cancelled"
+            }
+            return "\(message)."
+        }
+
+        if failedCount == totalCount {
+            return "\(totalCount) Bilibili results failed."
+        }
+
+        if cancelledCount == totalCount {
+            return "\(totalCount) Bilibili results were cancelled."
+        }
+
+        return "Preparing \(totalCount) Bilibili results..."
+    }
+}
+
+public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let selectionID: String
+    public let title: String
+    public let subtitle: String
+    public let state: String
+    public let message: String
+    public let libraryItemID: String
+    public let playbackURL: URL?
+    public let isReady: Bool
+    public let isCached: Bool
+    public let isFailed: Bool
+    public let isCancelled: Bool
+}
+
 private struct BilibiliResolvedInputContext: Equatable {
     let source: String
     let endpoint: CacheServerEndpoint
@@ -165,6 +236,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask.flatMap(Self.progressiveCacheStatusBadge(for:))
     }
 
+    public var taskResults: [BilibiliTaskResultPresentation] {
+        currentTask?.bilibiliTaskResults ?? []
+    }
+
+    public var taskResultSummary: BilibiliTaskResultSummary? {
+        currentTask?.bilibiliTaskResultSummary
+    }
+
+    public var playableTaskResults: [BilibiliTaskResultPresentation] {
+        taskResults.filter { $0.playbackURL != nil }
+    }
+
     public var playableURL: URL? {
         currentTask?.playableBilibiliURL
     }
@@ -214,7 +297,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             await createPlaybackTask(
                 source: source,
-                selectionID: selectedCandidate.selectionID,
+                selection: Self.singleSelection(for: selectedCandidate.selectionID),
+                legacySelectionID: selectedCandidate.selectionID,
                 endpoint: endpoint,
                 options: options
             )
@@ -279,7 +363,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             await createPlaybackTask(
                 source: source,
-                selectionID: candidate.selectionID,
+                selection: Self.singleSelection(for: candidate.selectionID),
+                legacySelectionID: candidate.selectionID,
                 endpoint: endpoint,
                 sequence: sequence,
                 client: client,
@@ -298,7 +383,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
                 await createPlaybackTask(
                     source: source,
-                    selectionID: nil,
+                    selection: nil,
+                    legacySelectionID: nil,
                     endpoint: endpoint,
                     sequence: sequence,
                     client: client,
@@ -424,7 +510,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return false
         }
 
-        return currentTask.libraryItemID == libraryItemID
+        return currentTask.hasBilibiliLibraryItem(id: libraryItemID)
     }
 
     public func clearTask() {
@@ -447,7 +533,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     public func clearTaskIfCachedLibraryItemDeleted(id libraryItemID: String) -> Bool {
         guard let currentTask,
             !libraryItemID.isEmpty,
-            currentTask.libraryItemID == libraryItemID
+            currentTask.hasBilibiliLibraryItem(id: libraryItemID)
         else {
             return false
         }
@@ -480,13 +566,30 @@ public final class BilibiliTaskViewModel: ObservableObject {
         endpoint: CacheServerEndpoint,
         options: BilibiliPlaybackTaskOptions
     ) async {
+        await createPlaybackTask(
+            source: source,
+            selection: nil,
+            legacySelectionID: selectionID,
+            endpoint: endpoint,
+            options: options
+        )
+    }
+
+    private func createPlaybackTask(
+        source: String,
+        selection: BilibiliTaskSelection?,
+        legacySelectionID: String?,
+        endpoint: CacheServerEndpoint,
+        options: BilibiliPlaybackTaskOptions
+    ) async {
         operationSequence += 1
         activePlaybackTaskID = nil
         let sequence = operationSequence
         let client = clientFactory(endpoint)
         await createPlaybackTask(
             source: source,
-            selectionID: selectionID,
+            selection: selection,
+            legacySelectionID: legacySelectionID,
             endpoint: endpoint,
             sequence: sequence,
             client: client,
@@ -496,7 +599,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func createPlaybackTask(
         source: String,
-        selectionID: String?,
+        selection: BilibiliTaskSelection?,
+        legacySelectionID: String?,
         endpoint: CacheServerEndpoint,
         sequence: Int,
         client: any CacheControlClient,
@@ -511,9 +615,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         do {
             let task = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.createBilibiliPlaybackTask(
-                    urlOrID: source,
-                    selectionID: selectionID,
+                try await Self.createBilibiliPlaybackTask(
+                    client: client,
+                    source: source,
+                    selection: selection,
+                    legacySelectionID: legacySelectionID,
                     options: options
                 )
             }
@@ -536,6 +642,38 @@ public final class BilibiliTaskViewModel: ObservableObject {
             errorMessage = error.localizedDescription
             statusMessage = "Could not submit Bilibili playback task."
             isSubmitting = false
+        }
+    }
+
+    private static func createBilibiliPlaybackTask(
+        client: any CacheControlClient,
+        source: String,
+        selection: BilibiliTaskSelection?,
+        legacySelectionID: String?,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        guard let selection else {
+            return try await client.createBilibiliPlaybackTask(
+                urlOrID: source,
+                selectionID: legacySelectionID,
+                options: options
+            )
+        }
+
+        do {
+            return try await client.createBilibiliPlaybackTask(
+                urlOrID: source,
+                selection: selection,
+                options: options
+            )
+        } catch let unsupported as CacheControlClientUnsupportedFeature
+            where unsupported == .bilibiliTaskSelection
+        {
+            return try await client.createBilibiliPlaybackTask(
+                urlOrID: source,
+                selectionID: legacySelectionID,
+                options: options
+            )
         }
     }
 
@@ -599,6 +737,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private static func statusMessage(for task: CacheTask) -> String {
+        if let summary = task.bilibiliTaskResultSummary,
+            summary.totalCount > 1
+        {
+            return summary.statusMessage
+        }
+
         if task.isCompletedBilibiliTaskState {
             return "\(task.bilibiliDisplayTitle) is cached for LAN playback."
         }
@@ -634,6 +778,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private static func progressiveCacheStatusBadge(for task: CacheTask) -> ProgressiveCacheStatusBadge? {
         guard task.isProgressivePlayback else {
             return nil
+        }
+
+        if let summary = task.bilibiliTaskResultSummary,
+            summary.totalCount > 1,
+            summary.hasPartialSuccess
+        {
+            return ProgressiveCacheStatusBadge(label: "Partial result success", systemImage: "checkmark.circle")
         }
 
         if task.isCompletedBilibiliTaskState,
@@ -677,6 +828,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return nil
     }
 
+    private static func singleSelection(for selectionID: String) -> BilibiliTaskSelection {
+        BilibiliTaskSelection(mode: "single", selectionIDs: [selectionID])
+    }
+
     private static func withOperationTimeout<Value: Sendable>(
         _ timeout: Duration,
         operation: @Sendable @escaping () async throws -> Value
@@ -708,23 +863,64 @@ private extension CacheTask {
             return nil
         }
 
-        guard let playbackSource, playbackSource.isPlayableByTVOSClient else {
+        return topLevelPlayableBilibiliURL
+            ?? bilibiliTaskResults.first(where: { $0.playbackURL != nil })?.playbackURL
+    }
+
+    var topLevelPlayableBilibiliURL: URL? {
+        guard let expectedItemID = expectedBilibiliPlaybackSourceItemID else {
             return nil
         }
 
-        guard let expectedItemID = expectedBilibiliPlaybackSourceItemID,
-            playbackSource.itemID == expectedItemID
-        else {
-            return nil
+        return playbackSource.flatMap {
+            playableURL(for: $0, expectedItemID: expectedItemID)
         }
-
-        return playbackSource.explicitHTTPURL
     }
 
     var expectedBilibiliPlaybackSourceItemID: String? {
         let itemID = isCompletedBilibiliTaskState ? libraryItemID : id
         let trimmedItemID = itemID.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedItemID.isEmpty ? nil : trimmedItemID
+    }
+
+    var bilibiliTaskResults: [BilibiliTaskResultPresentation] {
+        resultItems.map { item in
+            BilibiliTaskResultPresentation(
+                id: item.id,
+                selectionID: item.selectionID,
+                title: item.displayTitle,
+                subtitle: item.subtitle,
+                state: item.state,
+                message: item.message,
+                libraryItemID: item.libraryItemID,
+                playbackURL: item.playableBilibiliURL,
+                isReady: item.isReadyBilibiliResultState,
+                isCached: item.isCompletedBilibiliResultState,
+                isFailed: item.isFailedBilibiliResultState,
+                isCancelled: item.isCancelledBilibiliResultState
+            )
+        }
+    }
+
+    var bilibiliTaskResultSummary: BilibiliTaskResultSummary? {
+        guard !resultItems.isEmpty else {
+            return nil
+        }
+
+        let readyCount = resultItems.filter(\.isReadyBilibiliResultState).count
+        let cachedCount = resultItems.filter(\.isCompletedBilibiliResultState).count
+        let failedCount = resultItems.filter(\.isFailedBilibiliResultState).count
+        let cancelledCount = resultItems.filter(\.isCancelledBilibiliResultState).count
+        let pendingCount = resultItems.count - readyCount - failedCount - cancelledCount
+
+        return BilibiliTaskResultSummary(
+            totalCount: resultItems.count,
+            readyCount: readyCount,
+            cachedCount: cachedCount,
+            failedCount: failedCount,
+            cancelledCount: cancelledCount,
+            pendingCount: max(pendingCount, 0)
+        )
     }
 
     var isPlayableBilibiliTaskState: Bool {
@@ -776,6 +972,86 @@ private extension CacheTask {
 
         return "\(Int((min(max(progress, 0), 0.99) * 100).rounded()))%"
     }
+
+    func hasBilibiliLibraryItem(id libraryItemID: String) -> Bool {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLibraryItemID.isEmpty else {
+            return false
+        }
+
+        if self.libraryItemID == trimmedLibraryItemID {
+            return true
+        }
+
+        return resultItems.contains { $0.libraryItemID == trimmedLibraryItemID }
+    }
+}
+
+private extension BilibiliTaskResultItem {
+    var displayTitle: String {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty {
+            return title
+        }
+
+        let subtitle = subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !subtitle.isEmpty {
+            return subtitle
+        }
+
+        return selectionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? id : selectionID
+    }
+
+    var playableBilibiliURL: URL? {
+        guard isReadyBilibiliResultState else {
+            return nil
+        }
+
+        guard let expectedItemID else {
+            return nil
+        }
+
+        return playbackSource.flatMap {
+            playableURL(for: $0, expectedItemID: expectedItemID)
+        }
+    }
+
+    var expectedItemID: String? {
+        let itemID = isCompletedBilibiliResultState ? libraryItemID : id
+        let trimmedItemID = itemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedItemID.isEmpty ? nil : trimmedItemID
+    }
+
+    var isReadyBilibiliResultState: Bool {
+        let state = normalizedBilibiliResultState
+        return state.contains("playable") || state.contains("completed")
+    }
+
+    var isCompletedBilibiliResultState: Bool {
+        normalizedBilibiliResultState.contains("completed")
+    }
+
+    var isFailedBilibiliResultState: Bool {
+        normalizedBilibiliResultState.contains("failed")
+    }
+
+    var isCancelledBilibiliResultState: Bool {
+        normalizedBilibiliResultState.contains("cancelled")
+    }
+
+    var normalizedBilibiliResultState: String {
+        state.lowercased().filter(\.isLetter)
+    }
+}
+
+private func playableURL(for source: CachePlaybackSource, expectedItemID: String) -> URL? {
+    guard source.isPlayableByTVOSClient,
+        source.itemID == expectedItemID
+    else {
+        return nil
+    }
+
+    return source.explicitHTTPURL
 }
 
 private extension BilibiliTaskViewModel {
