@@ -102,7 +102,7 @@ Bilibili task selection/result execution:
 
 - `CreateBilibiliPlaybackTaskRequest.selection_id` remains the legacy single-candidate path.
 - `CreateBilibiliPlaybackTaskRequest.selection` carries selection intent for default/current/single/multiple/range/all item requests. Default/current preserve legacy single-result planning; single/multiple/range/all resolve the input first and then plan each selected candidate.
-- `SERVER_CAPABILITY_BILIBILI_RESOLVE` gates resolver calls only; clients must require `SERVER_CAPABILITY_BILIBILI_TASK_SELECTION` before sending `selection_id` or `selection`.
+- `SERVER_CAPABILITY_BILIBILI_RESOLVE` gates resolver calls and the legacy `selection_id` single-candidate playback path. Clients must require `SERVER_CAPABILITY_BILIBILI_TASK_SELECTION` before sending the newer structured `selection` field.
 - `Task.library_item_id` remains the primary single-result compatibility field.
 - `Task.bilibili_selection` persists the normalized selection intent, including legacy `selection_id` mapped to a single-selection intent.
 - `Task.result_items` persists per-result state, messages, library item IDs, playback sources, and playback session metadata.
