@@ -298,7 +298,7 @@ struct ContentView: View {
 
                 if bilibiliModel.isWaitingForCandidateSelection {
                     Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
-                        ForEach(BilibiliCandidateSelectionMode.allCases) { mode in
+                        ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
                             Text(mode.title).tag(mode)
                         }
                     }
@@ -611,7 +611,7 @@ struct ContentView: View {
 
     private func playBilibiliTaskResult(_ result: BilibiliTaskResultPresentation) async {
         let manualInteractionSequence = model.manualInteractionSequence
-        guard let url = result.playbackURL else {
+        guard bilibiliModel.canPlay(result: result), let url = result.playbackURL else {
             return
         }
 

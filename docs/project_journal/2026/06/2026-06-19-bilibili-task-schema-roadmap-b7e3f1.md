@@ -97,6 +97,7 @@ Validation evidence:
   - Collection/feed-style inputs now enter the resolve-and-select flow instead of submitting directly through legacy create behavior.
   - Range selection uses a two-click start/end interaction, and the all-items option is disabled when the resolved candidate list is truncated.
   - Per-result Play actions now share the view-model playback guard so tvOS/macOS rows are disabled while cancellation is pending.
+  - tvOS/macOS selection mode controls now omit All for truncated resolve results, and row playback actions re-check the shared playback guard before loading.
   - Live e2e now requires exact selected result counts and verifies that HLS master/media playlist references stay on the LAN cache media listener.
 - Review-fix validation passed locally on 2026-06-20:
   - `swift test --filter BilibiliTaskViewModelTests`

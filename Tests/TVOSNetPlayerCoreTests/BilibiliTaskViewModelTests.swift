@@ -140,6 +140,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             var requests = await client.createdRequestsSnapshot()
             XCTAssertTrue(requests.isEmpty, source)
             XCTAssertTrue(model.isWaitingForCandidateSelection, source)
+            XCTAssertTrue(model.availableCandidateSelectionModes.contains(.all), source)
 
             model.candidateSelectionMode = .all
             await model.submit(serverAddressText: "mac-mini.local:50051")
@@ -374,6 +375,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertFalse(model.availableCandidateSelectionModes.contains(.all))
         model.candidateSelectionMode = .all
 
         XCTAssertFalse(model.canSubmit)

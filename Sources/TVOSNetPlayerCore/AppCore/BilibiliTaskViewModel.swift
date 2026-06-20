@@ -283,6 +283,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask != nil || errorMessage != nil || resolvedInput != nil
     }
 
+    public var availableCandidateSelectionModes: [BilibiliCandidateSelectionMode] {
+        var modes: [BilibiliCandidateSelectionMode] = [.single, .multiple, .range]
+        if canSelectAllResolvedCandidates {
+            modes.append(.all)
+        }
+        return modes
+    }
+
     public var resolvedCandidates: [BilibiliResolvedCandidate] {
         guard resolvedInputMatchesSource else {
             return []
