@@ -1316,6 +1316,52 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testCancelRequestedMultiResultTaskKeepsServerStatusMessage() async {
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_RUNNING",
+                message: "Preparing."
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PREPARING",
+                message: "Preparing."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(state: "TASK_STATE_PREPARING", resultItems: resultItems))
+            ],
+            cancelResponsesByID: [
+                "bilibili-playback-1": .fixture(
+                    state: "TASK_STATE_CANCEL_REQUESTED",
+                    message: "Cancelling task.",
+                    resultItems: resultItems
+                )
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1cancel-multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await model.cancel(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCEL_REQUESTED")
+        XCTAssertEqual(model.taskResultSummary?.pendingCount, 2)
+        XCTAssertEqual(model.statusMessage, "Cancelling task.")
+        XCTAssertFalse(model.canCancel)
+
+        model.clearTask()
+    }
+
     func testRetryUsesFailedTaskSource() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(source: "BV1original", state: "TASK_STATE_PREPARING")),

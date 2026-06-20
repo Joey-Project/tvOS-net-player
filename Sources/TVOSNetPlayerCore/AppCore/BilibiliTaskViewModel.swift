@@ -759,6 +759,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private static func statusMessage(for task: CacheTask) -> String {
+        if task.isCancellationPendingBilibiliTaskState {
+            let message = task.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return message.isEmpty ? "Cancelling \(task.bilibiliDisplayTitle)..." : message
+        }
+
+        if task.isCancelledBilibiliTaskState {
+            return "\(task.bilibiliDisplayTitle) was cancelled."
+        }
+
         if let summary = task.bilibiliTaskResultSummary,
             summary.totalCount > 1
         {
@@ -775,10 +784,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         if task.isFailedBilibiliTaskState {
             return failureMessage(for: task)
-        }
-
-        if task.isCancelledBilibiliTaskState {
-            return "\(task.bilibiliDisplayTitle) was cancelled."
         }
 
         if !task.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
