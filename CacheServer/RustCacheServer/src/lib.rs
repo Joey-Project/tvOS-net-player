@@ -445,7 +445,10 @@ impl AppState {
             .lock()
             .expect("HLS cache quota enforcement lock poisoned");
         let was_registered = self.hls_sessions.get(session_id).is_some();
-        let session = self.hls_playback_session(session_id)?;
+        let Some(session) = self.hls_playback_session(session_id) else {
+            self.fail_unrestorable_hls_playback_session_if_cache_is_accessible(session_id);
+            return None;
+        };
         if !was_registered || self.restored_hls_playback_source_needs_refresh(&session) {
             refresh_restored_hls_playback_source_for_session(
                 &self.tasks,
@@ -980,6 +983,12 @@ impl AppState {
 
         match task.state() {
             TaskState::Playable => {
+                if !self
+                    .tasks
+                    .is_primary_hls_session_playable(&task.id, session_id)
+                {
+                    return false;
+                }
                 let Some(session) = self.hls_cache.playback_session(session_id) else {
                     return false;
                 };
@@ -1029,6 +1038,24 @@ impl AppState {
         ) {
             eprintln!(
                 "Failed to mark completed HLS playback task {session_id} failed after cache restore validation: {status}"
+            );
+        }
+    }
+
+    fn fail_unrestorable_hls_playback_session_if_cache_is_accessible(&self, session_id: &str) {
+        if self.hls_cache.load_sessions().is_err() {
+            return;
+        }
+        self.hls_sessions.remove(session_id);
+        if let Err(status) = self
+            .tasks
+            .fail_unrestorable_playback_session_after_cache_restore(
+                session_id,
+                "Restored HLS media session was missing from the cache.".to_owned(),
+            )
+        {
+            eprintln!(
+                "Failed to mark unrestorable HLS playback session {session_id} after cache restore validation: {status}"
             );
         }
     }
@@ -1094,7 +1121,7 @@ fn restored_hls_session_is_authorized(
     }
 
     match task.state() {
-        TaskState::Playable => true,
+        TaskState::Playable => tasks.is_primary_hls_session_playable(&task.id, session_id),
         TaskState::Completed => {
             completed_session_ids.contains(session_id)
                 && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)

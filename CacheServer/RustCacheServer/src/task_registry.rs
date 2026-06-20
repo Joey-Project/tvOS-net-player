@@ -933,6 +933,66 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    pub fn fail_unrestorable_playback_session_after_cache_restore(
+        &self,
+        session_id: &str,
+        message: String,
+    ) -> Result<Option<Task>, Status> {
+        let normalized_session_id = normalize_required_id(session_id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = {
+            let Some(task) = inner.tasks_by_id.values_mut().find(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && matches!(task.state(), TaskState::Playable | TaskState::Completed)
+                    && (task_uses_hls_session_as_primary(task, &normalized_session_id)
+                        || task.result_items.iter().any(|item| {
+                            result_item_uses_hls_session(item, &normalized_session_id)
+                                && result_item_state(item).is_some_and(|state| {
+                                    matches!(state, TaskState::Playable | TaskState::Completed)
+                                })
+                        }))
+            }) else {
+                return Ok(None);
+            };
+
+            if task_uses_hls_session_as_primary(task, &normalized_session_id) {
+                let finished_at = current_timestamp();
+                task.state = TaskState::Failed.into();
+                task.message = message.clone();
+                task.library_item_id.clear();
+                task.playback_source = None;
+                task.playback_session = None;
+                clear_result_playback_metadata(&mut task.result_items, TaskState::Failed, &message);
+                task.updated_at = Some(copy_timestamp(&finished_at));
+                task.finished_at = Some(finished_at);
+            } else if clear_unrestorable_result_playback_metadata_for_session(
+                &mut task.result_items,
+                &normalized_session_id,
+                &message,
+            ) {
+                task.progress = result_items_progress(&task.result_items);
+                task.message = match task.state() {
+                    TaskState::Completed => "Completed offline cache restored; some Bilibili playback results expired after cache restore.".to_owned(),
+                    _ => "Playable online; some Bilibili playback results expired after cache restore.".to_owned(),
+                };
+                task.updated_at = Some(current_timestamp());
+            } else {
+                return Ok(None);
+            }
+
+            task.clone()
+        };
+        if task.state() == TaskState::Failed {
+            let terminal_task = Self::terminal_task_locked(&inner, &task);
+            Self::clear_active_task_locked(&mut inner, &terminal_task);
+        }
+        let snapshot = self.persistence_snapshot_locked(&mut inner);
+        Self::publish_locked(&mut inner, task.clone());
+        drop(inner);
+        self.persist_snapshot(snapshot);
+        Ok(Some(task))
+    }
+
     pub fn remove_completed_playback_task(
         &self,
         session_id: &str,
@@ -1861,6 +1921,29 @@ fn clear_unrestorable_result_playback_metadata(
         }
         item.state = TaskState::Failed.into();
         item.message = PLAYABLE_EXPIRED_AFTER_RESTART_MESSAGE.to_owned();
+        item.library_item_id.clear();
+        item.playback_source = None;
+        item.playback_session = None;
+        changed = true;
+    }
+    changed
+}
+
+fn clear_unrestorable_result_playback_metadata_for_session(
+    items: &mut [BilibiliTaskResultItem],
+    session_id: &str,
+    message: &str,
+) -> bool {
+    let mut changed = false;
+    for item in items {
+        if !result_item_state(item)
+            .is_some_and(|state| matches!(state, TaskState::Playable | TaskState::Completed))
+            || !result_item_uses_hls_session(item, session_id)
+        {
+            continue;
+        }
+        item.state = TaskState::Failed.into();
+        item.message = message.to_owned();
         item.library_item_id.clear();
         item.playback_source = None;
         item.playback_session = None;
@@ -3023,6 +3106,155 @@ mod tests {
         assert_eq!(library_item_id, completed.result_items[1].library_item_id);
         assert!(completed.result_items[1].playback_source.is_some());
         assert!(completed.result_items[1].playback_session.is_some());
+    }
+
+    #[test]
+    fn cache_restore_missing_primary_result_session_fails_playable_task() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task(
+                "BV1missing-primary-result",
+                Some(playback_options("1080p")),
+                None,
+            )
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let child_source = playback_source(&child_session_id);
+        let child_session = playback_session(&child_session_id);
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: created.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Failed.into(),
+                message: "page 1 planning failed".to_owned(),
+                library_item_id: String::new(),
+                playback_source: None,
+                playback_session: None,
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(child_source.clone()),
+                playback_session: Some(child_session.clone()),
+            },
+        ];
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Partially playable".to_owned(),
+                "1/2 Bilibili playback result(s) are playable.".to_owned(),
+                child_source,
+                child_session,
+                result_items,
+            )
+            .expect("playback results should become playable");
+
+        let failed = registry
+            .fail_unrestorable_playback_session_after_cache_restore(
+                &child_session_id,
+                "missing".to_owned(),
+            )
+            .expect("missing primary should be handled")
+            .expect("missing primary should update task");
+
+        assert_eq!(TaskState::Failed, failed.state());
+        assert_eq!("missing", failed.message);
+        assert!(failed.playback_source.is_none());
+        assert!(failed.playback_session.is_none());
+        assert!(
+            failed
+                .result_items
+                .iter()
+                .all(|item| item.playback_source.is_none() && item.playback_session.is_none())
+        );
+    }
+
+    #[test]
+    fn cache_restore_missing_secondary_result_session_keeps_primary_playable() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task(
+                "BV1missing-secondary-lazy",
+                Some(playback_options("1080p")),
+                None,
+            )
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: created.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&created.task.id)),
+                playback_session: Some(playback_session(&created.task.id)),
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(playback_source(&child_session_id)),
+                playback_session: Some(playback_session(&child_session_id)),
+            },
+        ];
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+                result_items,
+            )
+            .expect("playback results should become playable");
+
+        let playable = registry
+            .fail_unrestorable_playback_session_after_cache_restore(
+                &child_session_id,
+                "missing".to_owned(),
+            )
+            .expect("missing secondary should be handled")
+            .expect("missing secondary should update task");
+
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.playback_source.is_some());
+        assert!(playable.playback_session.is_some());
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            playable.result_items[0].state
+        );
+        assert!(playable.result_items[0].playback_source.is_some());
+        assert!(playable.result_items[0].playback_session.is_some());
+        assert_eq!(i32::from(TaskState::Failed), playable.result_items[1].state);
+        assert_eq!("missing", playable.result_items[1].message);
+        assert!(playable.result_items[1].playback_source.is_none());
+        assert!(playable.result_items[1].playback_session.is_none());
     }
 
     #[test]
