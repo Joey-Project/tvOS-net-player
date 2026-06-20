@@ -106,7 +106,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             )
             XCTFail("selected playback should require a client implementation")
         } catch {
-            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliTaskSelection)
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolve)
         }
     }
 

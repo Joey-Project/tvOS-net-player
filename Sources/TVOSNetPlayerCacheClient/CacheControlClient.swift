@@ -87,7 +87,7 @@ public extension CacheControlClient {
     ) async throws -> CacheTask {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard normalizedSelectionID.isEmpty else {
-            throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
+            throw CacheControlClientUnsupportedFeature.bilibiliResolve
         }
         return try await createBilibiliPlaybackTask(
             urlOrID: urlOrID,
