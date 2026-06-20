@@ -702,12 +702,17 @@ impl BilibiliTaskRegistry {
         id: &str,
         playback_source: PlaybackSource,
     ) -> Result<Task, Status> {
-        let normalized_id = normalize_required_id(id)?;
+        self.refresh_hls_playback_source(id, playback_source)
+    }
+
+    pub fn refresh_hls_playback_source(
+        &self,
+        session_id: &str,
+        playback_source: PlaybackSource,
+    ) -> Result<Task, Status> {
+        let normalized_id = normalize_required_id(session_id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        let task = {
-            let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
-                return Err(task_not_found());
-            };
+        let task = if let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) {
             if task.kind() != TaskKind::BilibiliProgressivePlayback {
                 return Err(Status::failed_precondition(
                     "Task is not a Bilibili progressive playback task.",
@@ -717,7 +722,27 @@ impl BilibiliTaskRegistry {
                 return Ok(task.clone());
             }
 
-            task.playback_source = Some(playback_source);
+            task.playback_source = Some(playback_source.clone());
+            refresh_result_item_playback_source(task, &normalized_id, &playback_source);
+            task.clone()
+        } else {
+            let Some(task) = inner.tasks_by_id.values_mut().find(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && matches!(task.state(), TaskState::Playable | TaskState::Completed)
+                    && task.result_items.iter().any(|item| {
+                        item.id == normalized_id
+                            && result_item_state(item).is_some_and(|state| {
+                                matches!(state, TaskState::Playable | TaskState::Completed)
+                            })
+                    })
+            }) else {
+                return Err(task_not_found());
+            };
+
+            if task_uses_hls_session_as_primary(task, &normalized_id) {
+                task.playback_source = Some(playback_source.clone());
+            }
+            refresh_result_item_playback_source(task, &normalized_id, &playback_source);
             task.clone()
         };
         let snapshot = self.persistence_snapshot_locked(&mut inner);
@@ -725,6 +750,24 @@ impl BilibiliTaskRegistry {
         drop(inner);
         self.persist_snapshot(snapshot);
         Ok(task)
+    }
+
+    pub fn hls_playback_source_uri(&self, session_id: &str) -> Option<String> {
+        let normalized_id = normalize(session_id);
+        if normalized_id.is_empty() {
+            return None;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .and_then(|task| playback_source_uri_for_session(task, &normalized_id))
+            .or_else(|| {
+                inner
+                    .tasks_by_id
+                    .values()
+                    .find_map(|task| playback_source_uri_for_session(task, &normalized_id))
+            })
     }
 
     pub fn complete_task_failed(&self, id: &str, message: String) -> Result<Task, Status> {
@@ -984,7 +1027,9 @@ impl BilibiliTaskRegistry {
                 continue;
             }
             let is_restorable = match task.state() {
-                TaskState::Playable => restorable_playable_session_ids.contains(&task.id),
+                TaskState::Playable => playback_hls_session_ids(task)
+                    .iter()
+                    .any(|session_id| restorable_playable_session_ids.contains(session_id)),
                 TaskState::Completed => restorable_completed_session_ids.contains(&task.id),
                 _ => true,
             };
@@ -998,6 +1043,7 @@ impl BilibiliTaskRegistry {
             task.library_item_id.clear();
             task.playback_source = None;
             task.playback_session = None;
+            clear_result_playback_metadata(&mut task.result_items);
             task.updated_at = Some(copy_timestamp(&updated_at));
             task.finished_at = Some(updated_at);
             changed_task_ids.push(task.id.clone());
@@ -1059,6 +1105,14 @@ impl BilibiliTaskRegistry {
                 && progress.is_finite()
             {
                 task.progress = progress.clamp(0.0, 1.0);
+            }
+            if task.kind() == TaskKind::BilibiliProgressivePlayback
+                && matches!(effective_state, TaskState::Failed | TaskState::Cancelled)
+            {
+                task.library_item_id.clear();
+                task.playback_source = None;
+                task.playback_session = None;
+                clear_result_playback_metadata(&mut task.result_items);
             }
             let finished_at = current_timestamp();
             task.updated_at = Some(copy_timestamp(&finished_at));
@@ -1488,10 +1542,53 @@ fn result_items_progress(items: &[BilibiliTaskResultItem]) -> f64 {
     (finished as f64 / items.len() as f64).clamp(0.0, 1.0)
 }
 
+fn refresh_result_item_playback_source(
+    task: &mut Task,
+    session_id: &str,
+    playback_source: &PlaybackSource,
+) {
+    for item in &mut task.result_items {
+        if item.id == session_id
+            && result_item_state(item)
+                .is_some_and(|state| matches!(state, TaskState::Playable | TaskState::Completed))
+        {
+            item.playback_source = Some(playback_source.clone());
+        }
+    }
+}
+
+fn task_uses_hls_session_as_primary(task: &Task, session_id: &str) -> bool {
+    task.playback_session
+        .as_ref()
+        .is_some_and(|session| session.id == session_id)
+        || task
+            .playback_source
+            .as_ref()
+            .is_some_and(|source| source.item_id == session_id)
+}
+
+fn playback_source_uri_for_session(task: &Task, session_id: &str) -> Option<String> {
+    task.playback_source
+        .as_ref()
+        .filter(|source| source.item_id == session_id || task.id == session_id)
+        .map(|source| source.uri.clone())
+        .or_else(|| {
+            task.result_items
+                .iter()
+                .find(|item| item.id == session_id)
+                .and_then(|item| item.playback_source.as_ref())
+                .map(|source| source.uri.clone())
+        })
+}
+
+fn result_item_state(item: &BilibiliTaskResultItem) -> Option<TaskState> {
+    TaskState::try_from(item.state).ok()
+}
+
 fn clear_result_playback_metadata(items: &mut [BilibiliTaskResultItem]) {
     for item in items {
         if !matches!(
-            TaskState::try_from(item.state).unwrap_or(TaskState::Unspecified),
+            result_item_state(item).unwrap_or(TaskState::Unspecified),
             TaskState::Failed | TaskState::Cancelled
         ) {
             item.state = TaskState::Cancelled.into();
@@ -2242,6 +2339,82 @@ mod tests {
 
         assert_eq!(TaskState::Playable, refreshed.state());
         assert_eq!(Some(refreshed_source), refreshed.playback_source);
+    }
+
+    #[test]
+    fn refresh_hls_playback_source_updates_secondary_result_uri() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task(
+                "BV1refresh-result",
+                Some(playback_options("1080p")),
+                None,
+            )
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let child_source = playback_source(&child_session_id);
+        let child_session = playback_session(&child_session_id);
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: created.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Failed.into(),
+                message: "page 1 planning failed".to_owned(),
+                library_item_id: String::new(),
+                playback_source: None,
+                playback_session: None,
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: "Playable".to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(child_source.clone()),
+                playback_session: Some(child_session.clone()),
+            },
+        ];
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Partially playable".to_owned(),
+                "1/2 Bilibili playback result(s) are playable.".to_owned(),
+                child_source,
+                child_session,
+                result_items,
+            )
+            .expect("playback results should become playable");
+        let mut refreshed_source = playback_source(&child_session_id);
+        let expected_uri =
+            format!("http://restored.example.test:9090/hls/{child_session_id}/master.m3u8");
+        refreshed_source.uri = expected_uri.clone();
+
+        let refreshed = registry
+            .refresh_hls_playback_source(&child_session_id, refreshed_source.clone())
+            .expect("secondary playback source should refresh");
+
+        assert_eq!(TaskState::Playable, refreshed.state());
+        assert_eq!(Some(refreshed_source.clone()), refreshed.playback_source);
+        assert_eq!(2, refreshed.result_items.len());
+        assert!(refreshed.result_items[0].playback_source.is_none());
+        assert_eq!(
+            Some(refreshed_source),
+            refreshed.result_items[1].playback_source
+        );
+        assert_eq!(
+            Some(expected_uri),
+            registry.hls_playback_source_uri(&child_session_id)
+        );
     }
 
     #[test]

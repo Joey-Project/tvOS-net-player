@@ -843,34 +843,23 @@ fn refresh_restored_hls_playback_source(
     session: &crate::hls::HlsPlaybackSession,
     completed_session_ids: &HashSet<String>,
 ) {
-    let Ok(task) = tasks.get_task(&session.id) else {
-        return;
+    let is_completed_session = completed_session_ids.contains(&session.id);
+    let item_id = if is_completed_session {
+        HlsCacheStore::completed_library_item_id(&session.id)
+    } else {
+        session.id.clone()
     };
-    if task.kind() != TaskKind::BilibiliProgressivePlayback {
-        return;
-    }
-
-    let item_id = match task.state() {
-        TaskState::Playable => session.id.clone(),
-        TaskState::Completed if completed_session_ids.contains(&session.id) => {
-            HlsCacheStore::completed_library_item_id(&session.id)
-        }
-        _ => return,
-    };
+    let existing_uri = tasks.hls_playback_source_uri(&session.id);
     let playback_source = PlaybackSource {
         item_id,
         variant_id: session.variant.id.clone(),
         protocol: PlaybackProtocol::Hls.into(),
-        uri: playback_uri_factory.create_hls_master_playlist_for_restored_task(
-            &session.id,
-            task.playback_source
-                .as_ref()
-                .map(|source| source.uri.as_str()),
-        ),
+        uri: playback_uri_factory
+            .create_hls_master_playlist_for_restored_task(&session.id, existing_uri.as_deref()),
         expires_at: None,
     };
 
-    if let Err(status) = tasks.refresh_playback_source(&session.id, playback_source) {
+    if let Err(status) = tasks.refresh_hls_playback_source(&session.id, playback_source) {
         eprintln!(
             "Failed to refresh restored HLS playback source for task {}: {status}",
             session.id

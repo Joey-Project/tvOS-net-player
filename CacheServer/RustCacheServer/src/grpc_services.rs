@@ -860,21 +860,13 @@ async fn run_explicit_bilibili_playback_planning(
 
     for (index, candidate) in candidates.iter().enumerate() {
         if cancellation.is_cancel_requested() {
-            mark_remaining_results_cancelled(&mut result_items[index..]);
-            let _ = state.tasks.update_playback_results(
+            return complete_cancelled_explicit_bilibili_playback(
+                &state,
                 &task_id,
-                Some(resolution.title.clone()),
-                "Cancelled while planning Bilibili playback results.".to_owned(),
-                result_items_progress(&result_items),
-                result_items.clone(),
+                &resolution.title,
+                &mut result_items,
+                &planned_session_ids,
             );
-            return state
-                .tasks
-                .complete_task_cancelled(
-                    &task_id,
-                    "Cancelled while planning Bilibili playback results.".to_owned(),
-                )
-                .is_ok();
         }
 
         let session_id = result_items[index].id.clone();
@@ -930,21 +922,17 @@ async fn run_explicit_bilibili_playback_planning(
                 successful_results += 1;
             }
             Err(error) if cancellation.is_cancel_requested() => {
-                mark_remaining_results_cancelled(&mut result_items[index..]);
-                let _ = state.tasks.update_playback_results(
-                    &task_id,
-                    Some(resolution.title.clone()),
-                    playback_error_message(error),
-                    result_items_progress(&result_items),
-                    result_items.clone(),
+                eprintln!(
+                    "Bilibili playback planning for task {task_id} observed cancellation after planner error: {}",
+                    playback_error_message(error)
                 );
-                return state
-                    .tasks
-                    .complete_task_cancelled(
-                        &task_id,
-                        "Cancelled while planning Bilibili playback results.".to_owned(),
-                    )
-                    .is_ok();
+                return complete_cancelled_explicit_bilibili_playback(
+                    &state,
+                    &task_id,
+                    &resolution.title,
+                    &mut result_items,
+                    &planned_session_ids,
+                );
             }
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
@@ -976,6 +964,15 @@ async fn run_explicit_bilibili_playback_planning(
             )
             .is_ok();
     };
+    if cancellation.is_cancel_requested() {
+        return complete_cancelled_explicit_bilibili_playback(
+            &state,
+            &task_id,
+            &resolution.title,
+            &mut result_items,
+            &planned_session_ids,
+        );
+    }
 
     let final_message = if successful_results == total {
         format!("All {total} Bilibili playback result(s) are playable.")
@@ -999,11 +996,8 @@ async fn run_explicit_bilibili_playback_planning(
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                for session_id in planned_session_ids {
-                    state.hls_sessions.remove(&session_id);
-                    let _ = state.hls_cache.remove_session(&session_id);
-                }
-            } else {
+                remove_hls_sessions(&state, &planned_session_ids);
+            } else if primary_hls_session.id == task_id {
                 state.enqueue_hls_cache_fill_foreground(
                     task_id.clone(),
                     primary_hls_session,
@@ -1013,13 +1007,35 @@ async fn run_explicit_bilibili_playback_planning(
             true
         }
         Err(_) => {
-            for session_id in planned_session_ids {
-                state.hls_sessions.remove(&session_id);
-                let _ = state.hls_cache.remove_session(&session_id);
-            }
+            remove_hls_sessions(&state, &planned_session_ids);
             false
         }
     }
+}
+
+fn complete_cancelled_explicit_bilibili_playback(
+    state: &AppState,
+    task_id: &str,
+    title: &str,
+    result_items: &mut [BilibiliTaskResultItem],
+    planned_session_ids: &[String],
+) -> bool {
+    mark_results_cancelled(result_items);
+    remove_hls_sessions(state, planned_session_ids);
+    let _ = state.tasks.update_playback_results(
+        task_id,
+        Some(title.to_owned()),
+        "Cancelled while planning Bilibili playback results.".to_owned(),
+        result_items_progress(result_items),
+        result_items.to_vec(),
+    );
+    state
+        .tasks
+        .complete_task_cancelled(
+            task_id,
+            "Cancelled while planning Bilibili playback results.".to_owned(),
+        )
+        .is_ok()
 }
 
 fn selected_bilibili_candidates(
@@ -1105,10 +1121,18 @@ fn bilibili_result_item(
     }
 }
 
-fn mark_remaining_results_cancelled(items: &mut [BilibiliTaskResultItem]) {
+fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
+    for session_id in session_ids {
+        state.hls_sessions.remove(session_id);
+        let _ = state.hls_cache.remove_session(session_id);
+    }
+}
+
+fn mark_results_cancelled(items: &mut [BilibiliTaskResultItem]) {
     for item in items {
         item.state = TaskState::Cancelled.into();
-        item.message = "Cancelled before this Bilibili playback result was planned.".to_owned();
+        item.message = "Cancelled while planning Bilibili playback results.".to_owned();
+        item.library_item_id.clear();
         item.playback_source = None;
         item.playback_session = None;
     }
@@ -2228,6 +2252,212 @@ mod tests {
             *playback_requests
                 .lock()
                 .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_cleans_planned_result_sessions_on_cancel() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_planned_sender, first_planned) = oneshot::channel();
+        let (second_started_sender, second_started) = oneshot::channel();
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(CancelDuringSecondSelectionPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+                first_planned: Mutex::new(Some(first_planned_sender)),
+                second_started: Mutex::new(Some(second_started_sender)),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state.clone());
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range-cancel".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect("range task should be created")
+            .into_inner();
+
+        first_planned
+            .await
+            .expect("first selected result should be planned");
+        second_started
+            .await
+            .expect("second selected result should begin planning");
+        let cancel_response = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: created.id.clone(),
+            }))
+            .await
+            .expect("explicit selection task should accept cancellation")
+            .into_inner();
+        assert!(matches!(
+            cancel_response.state(),
+            TaskState::CancelRequested | TaskState::Cancelled
+        ));
+
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+
+        assert!(cancelled.playback_source.is_none());
+        assert!(cancelled.playback_session.is_none());
+        assert_eq!(2, cancelled.result_items.len());
+        assert!(cancelled.result_items.iter().all(|item| {
+            item.state == i32::from(TaskState::Cancelled)
+                && item.library_item_id.is_empty()
+                && item.playback_source.is_none()
+                && item.playback_session.is_none()
+        }));
+        assert!(state.hls_sessions.get(&created.id).is_none());
+        assert!(state.hls_cache.playback_session(&created.id).is_none());
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&created.id)
+                .join("session.json")
+                .exists()
+        );
+        assert_eq!(
+            vec![("BV1range-cancel".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert_eq!(
+            vec![
+                ("BV1range-cancel".to_owned(), Some("page:1".to_owned())),
+                ("BV1range-cancel".to_owned(), Some("page:2".to_owned())),
+            ],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_uses_later_successful_result_as_primary() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndScriptedPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+                results: Mutex::new(HashMap::from([
+                    (
+                        "page:1".to_owned(),
+                        Err(BilibiliDownloadError::Failed(
+                            "page 1 planning failed".to_owned(),
+                        )),
+                    ),
+                    ("page:2".to_owned(), Ok(sample_playback_plan())),
+                ])),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1range-partial-success".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
+                    selection_ids: Vec::new(),
+                    range_start_index: 1,
+                    range_end_index: 2,
+                }),
+            }))
+            .await
+            .expect("range task should be created")
+            .into_inner();
+
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+        let second_result_id = format!("{}-result-2", created.id);
+
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.library_item_id.is_empty());
+        assert_eq!(
+            second_result_id,
+            playable
+                .playback_session
+                .as_ref()
+                .expect("playable task should expose primary session")
+                .id
+        );
+        assert_eq!(
+            second_result_id,
+            playable
+                .playback_source
+                .as_ref()
+                .expect("playable task should expose primary source")
+                .item_id
+        );
+        assert_eq!(2, playable.result_items.len());
+        assert_eq!(i32::from(TaskState::Failed), playable.result_items[0].state);
+        assert!(playable.result_items[0].playback_source.is_none());
+        assert!(playable.result_items[0].playback_session.is_none());
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            playable.result_items[1].state
+        );
+        assert!(playable.result_items[1].playback_source.is_some());
+        assert!(playable.result_items[1].playback_session.is_some());
+        assert_eq!(
+            vec![
+                (
+                    "BV1range-partial-success".to_owned(),
+                    Some("page:1".to_owned())
+                ),
+                (
+                    "BV1range-partial-success".to_owned(),
+                    Some("page:2".to_owned())
+                ),
+            ],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+        assert_eq!(
+            vec![("BV1range-partial-success".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
         );
     }
 
@@ -4835,6 +5065,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_refreshes_restored_secondary_result_hls_uri() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let initial_options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://old-media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state = AppState::new_with_playback_planner(
+            initial_options.clone(),
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1restore-secondary", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", creation.task.id);
+        let metadata = playback_task_metadata(
+            &child_session_id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist secondary HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        let stale_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://old-media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let result_items = vec![
+            BilibiliTaskResultItem {
+                id: creation.task.id.clone(),
+                selection_id: "page:1".to_owned(),
+                title: "Part 1".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-1".to_owned(),
+                index: 1,
+                state: TaskState::Failed.into(),
+                message: "page 1 planning failed".to_owned(),
+                library_item_id: String::new(),
+                playback_source: None,
+                playback_session: None,
+            },
+            BilibiliTaskResultItem {
+                id: child_session_id.clone(),
+                selection_id: "page:2".to_owned(),
+                title: "Part 2".to_owned(),
+                subtitle: String::new(),
+                source_kind: "video_page".to_owned(),
+                content_id: "cid-2".to_owned(),
+                index: 2,
+                state: TaskState::Playable.into(),
+                message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+                library_item_id: String::new(),
+                playback_source: Some(stale_source.clone()),
+                playback_session: Some(metadata.playback_session.clone()),
+            },
+        ];
+        state
+            .tasks
+            .complete_playback_results_playable(
+                &creation.task.id,
+                metadata.title,
+                "1/2 Bilibili playback result(s) are playable.".to_owned(),
+                stale_source,
+                metadata.playback_session,
+                result_items,
+            )
+            .expect("task should become partially playable");
+        let restored_options = CacheServerOptions {
+            public_media_base_uri: Some("http://restored-media.example.test:9090".to_owned()),
+            ..initial_options
+        };
+
+        let restored =
+            AppState::new_with_playback_planner(restored_options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&creation.task.id)
+            .expect("playable task should restore");
+        let expected_uri =
+            format!("http://restored-media.example.test:9090/hls/{child_session_id}/master.m3u8");
+
+        assert_eq!(TaskState::Playable, restored_task.state());
+        assert_eq!(
+            expected_uri,
+            restored_task
+                .playback_source
+                .as_ref()
+                .expect("primary source should refresh")
+                .uri
+        );
+        assert_eq!(2, restored_task.result_items.len());
+        assert_eq!(
+            expected_uri,
+            restored_task.result_items[1]
+                .playback_source
+                .as_ref()
+                .expect("secondary result source should refresh")
+                .uri
+        );
+        assert!(restored.hls_sessions.get(&child_session_id).is_some());
+    }
+
+    #[tokio::test]
     async fn app_state_scrubs_completed_hls_manifest_during_restart_recovery() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -5819,6 +6166,125 @@ mod tests {
                 .expect("playback request log should not be poisoned")
                 .push((request.source, request.selection_id));
             Box::pin(async { Ok(sample_playback_plan()) })
+        }
+    }
+
+    struct StaticResolveAndScriptedPlaybackPlanner {
+        resolve_requests: ResolveRequestLog,
+        playback_requests: PlaybackRequestLog,
+        resolution: BilibiliInputResolution,
+        results: Mutex<HashMap<String, PlaybackPlanningTestResult>>,
+    }
+
+    impl BilibiliPlaybackPlanner for StaticResolveAndScriptedPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            self.resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+                .push((request.source, request.options));
+            let resolution = self.resolution.clone();
+            Box::pin(async move { Ok(resolution) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let selection_id = request
+                .selection_id
+                .clone()
+                .expect("scripted planner should receive an explicit selection id");
+            self.playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .push((request.source, Some(selection_id.clone())));
+            let result = self
+                .results
+                .lock()
+                .expect("scripted playback results should not be poisoned")
+                .remove(&selection_id)
+                .expect("scripted playback result should exist");
+            Box::pin(async move { result })
+        }
+    }
+
+    struct CancelDuringSecondSelectionPlaybackPlanner {
+        resolve_requests: ResolveRequestLog,
+        playback_requests: PlaybackRequestLog,
+        resolution: BilibiliInputResolution,
+        first_planned: Mutex<Option<oneshot::Sender<()>>>,
+        second_started: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl BilibiliPlaybackPlanner for CancelDuringSecondSelectionPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            self.resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+                .push((request.source, request.options));
+            let resolution = self.resolution.clone();
+            Box::pin(async move { Ok(resolution) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let selection_id = request
+                .selection_id
+                .clone()
+                .expect("cancellable planner should receive an explicit selection id");
+            self.playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+                .push((request.source.clone(), Some(selection_id.clone())));
+            match selection_id.as_str() {
+                "page:1" => {
+                    let first_planned = self
+                        .first_planned
+                        .lock()
+                        .expect("first-planned signal lock should not be poisoned")
+                        .take();
+                    Box::pin(async move {
+                        if let Some(sender) = first_planned {
+                            let _ = sender.send(());
+                        }
+                        Ok(sample_playback_plan())
+                    })
+                }
+                "page:2" => {
+                    let second_started = self
+                        .second_started
+                        .lock()
+                        .expect("second-started signal lock should not be poisoned")
+                        .take();
+                    Box::pin(async move {
+                        if let Some(sender) = second_started {
+                            let _ = sender.send(());
+                        }
+                        while !request.cancellation.is_cancel_requested() {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(BilibiliDownloadError::Cancelled(
+                            "Playback planning was cancelled.".to_owned(),
+                        ))
+                    })
+                }
+                other => {
+                    let unexpected = other.to_owned();
+                    Box::pin(async move {
+                        Err(BilibiliDownloadError::Failed(format!(
+                            "Unexpected selection id {unexpected}"
+                        )))
+                    })
+                }
+            }
         }
     }
 
