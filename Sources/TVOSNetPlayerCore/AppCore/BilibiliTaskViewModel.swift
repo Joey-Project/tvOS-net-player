@@ -341,7 +341,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var canClearCandidateSelection: Bool {
-        isWaitingForCandidateSelection && selectedCandidateCount > 0
+        isWaitingForCandidateSelection
+            && !isSubmitting
+            && !isResolving
+            && !isCancelling
+            && selectedCandidateCount > 0
     }
 
     public var availableCandidateSelectionModes: [BilibiliCandidateSelectionMode] {
@@ -699,7 +703,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func clearResolvedCandidateSelection() {
-        guard isWaitingForCandidateSelection else {
+        guard canClearCandidateSelection else {
             return
         }
 

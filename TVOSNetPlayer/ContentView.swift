@@ -314,6 +314,10 @@ struct ContentView: View {
                 BilibiliFetchNoticeRow(notice: notice)
             }
 
+            if shouldShowStandaloneBilibiliNoticeAction {
+                bilibiliReResolveButton
+            }
+
             if bilibiliModel.isWaitingForCandidateSelection {
                 Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
                     ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
@@ -346,15 +350,7 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button {
-                        Task {
-                            await bilibiliModel.reResolve(serverAddressText: cacheModel.serverAddressText)
-                        }
-                    } label: {
-                        Label("Re-resolve", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!bilibiliModel.canReResolve)
+                    bilibiliReResolveButton
 
                     Button {
                         bilibiliModel.clearResolvedCandidateSelection()
@@ -463,6 +459,24 @@ struct ContentView: View {
                 .disabled(!bilibiliModel.canClear)
             }
         }
+    }
+
+    private var shouldShowStandaloneBilibiliNoticeAction: Bool {
+        bilibiliModel.fetchNotice?.actionTitle == "Re-resolve"
+            && bilibiliModel.canReResolve
+            && !bilibiliModel.isWaitingForCandidateSelection
+    }
+
+    private var bilibiliReResolveButton: some View {
+        Button {
+            Task {
+                await bilibiliModel.reResolve(serverAddressText: cacheModel.serverAddressText)
+            }
+        } label: {
+            Label("Re-resolve", systemImage: "arrow.triangle.2.circlepath")
+        }
+        .buttonStyle(.bordered)
+        .disabled(!bilibiliModel.canReResolve)
     }
 
     private var manualStreamControls: some View {

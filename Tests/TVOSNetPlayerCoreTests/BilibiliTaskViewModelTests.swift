@@ -705,6 +705,51 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(model.canSubmit)
     }
 
+    func testClearResolvedCandidateSelectionIsDisabledDuringSubmission() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(id: "task-selected", source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsCreateResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertTrue(model.canClearCandidateSelection)
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCreateRequestCount(1)
+
+        XCTAssertTrue(model.isSubmitting)
+        XCTAssertFalse(model.canClearCandidateSelection)
+
+        model.clearResolvedCandidateSelection()
+
+        XCTAssertEqual(model.selectedCandidateID, "page:1")
+        XCTAssertEqual(model.selectedCandidateCount, 1)
+        XCTAssertFalse(model.canSubmit)
+
+        await client.completeNextCreate(
+            with: .success(.fixture(id: "task-selected", source: "BV1multi", state: "TASK_STATE_PREPARING")))
+        await submitTask.value
+    }
+
     func testReResolveRefreshesCandidatesWithoutCreatingTask() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
