@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "description": "Canonical real Bilibili inputs for the tvOS-net-player LAN cache live e2e smoke suite.",
   "cases": [
     {
@@ -50,6 +50,96 @@
       "minimum_candidates": 1,
       "selection": "default_or_first",
       "requires_restricted_area_path": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "favorite-list",
+      "description": "Favorite list page; BILIBILI_LIVE_E2E_FAVORITE_URL must point at a currently available list for smoke validation. The committed sample is kept as a schema fixture because upstream selected-item resolution can be unavailable.",
+      "url": "https://www.bilibili.com/list/ml1103407912",
+      "url_env": "BILIBILI_LIVE_E2E_FAVORITE_URL",
+      "expected_source_kind": "favorite",
+      "expected_candidate_source_kind": "favorite",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_collection_list_validation": true,
+      "requires_stable_item_selection": true,
+      "requires_live_sample_override": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "space-videos",
+      "description": "Uploader space videos; BILIBILI_LIVE_E2E_SPACE_VIDEOS_URL can override the default uploader. Current Bilibili upstream commonly requires a web cookie.",
+      "url": "https://space.bilibili.com/2",
+      "url_env": "BILIBILI_LIVE_E2E_SPACE_VIDEOS_URL",
+      "expected_source_kind": "space",
+      "expected_candidate_source_kind": "space",
+      "minimum_candidates": 2,
+      "selection": "range_first_two",
+      "requires_collection_list_validation": true,
+      "requires_authentication": true,
+      "requires_stable_item_selection": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "space-collection",
+      "description": "Uploader collection/list page; BILIBILI_LIVE_E2E_COLLECTION_URL can override the default list.",
+      "url": "https://www.bilibili.com/list/1958703906?sid=547718",
+      "url_env": "BILIBILI_LIVE_E2E_COLLECTION_URL",
+      "expected_source_kind": "collection",
+      "expected_candidate_source_kind": "collection",
+      "minimum_candidates": 2,
+      "selection": "range_first_two",
+      "requires_collection_list_validation": true,
+      "requires_stable_item_selection": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "space-series",
+      "description": "Uploader series/list page; BILIBILI_LIVE_E2E_SERIES_URL must point at a currently available series for smoke validation. The committed sample is kept as a schema fixture because upstream planning can time out.",
+      "url": "https://www.bilibili.com/list/1958703906?sid=547718&type=series",
+      "url_env": "BILIBILI_LIVE_E2E_SERIES_URL",
+      "expected_source_kind": "series",
+      "expected_candidate_source_kind": "series",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_collection_list_validation": true,
+      "requires_stable_item_selection": true,
+      "requires_live_sample_override": true,
+      "timeout_seconds": 180,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "homepage-recommendations",
+      "description": "Homepage recommendation feed; BILIBILI_LIVE_E2E_RECOMMENDATIONS_URL can override the default homepage URL. Current Bilibili upstream commonly requires a web cookie.",
+      "url": "https://www.bilibili.com/",
+      "url_env": "BILIBILI_LIVE_E2E_RECOMMENDATIONS_URL",
+      "expected_source_kind": "recommendation",
+      "expected_candidate_source_kind": "recommendation",
+      "minimum_candidates": 2,
+      "selection": "multiple_first_two",
+      "requires_collection_list_validation": true,
+      "requires_authentication": true,
+      "requires_stable_item_selection": true,
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",

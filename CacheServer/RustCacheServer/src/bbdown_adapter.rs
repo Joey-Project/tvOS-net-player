@@ -2950,6 +2950,28 @@ mod tests {
             Some(Selection::Latest)
         );
         assert_eq!(
+            default_selection_for_input(&Input::CollectionList(456)),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::SeriesList(789)),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::SpaceCollectionList {
+                list_id: 456,
+                owner_mid: 123,
+            }),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
+            default_selection_for_input(&Input::SpaceSeriesList {
+                list_id: 789,
+                owner_mid: 123,
+            }),
+            Some(Selection::Latest)
+        );
+        assert_eq!(
             default_selection_for_input(&Input::CheeseEpisode(101)),
             Some(Selection::Current)
         );
@@ -3041,12 +3063,26 @@ mod tests {
         );
 
         let list_inputs = [
+            Input::SpaceVideos(123),
             Input::FavoriteList {
                 media_id: Some(456),
                 owner_mid: None,
             },
+            Input::CollectionList(456),
+            Input::SeriesList(789),
+            Input::SpaceCollectionList {
+                list_id: 456,
+                owner_mid: 123,
+            },
+            Input::SpaceSeriesList {
+                list_id: 789,
+                owner_mid: 123,
+            },
             Input::RecommendationFeed,
+            Input::FollowingFeed,
+            Input::SpaceDynamic(123),
             Input::History,
+            Input::WatchLater,
         ];
         let bounded_selection = Some(resolve_truncation_probe_selection().unwrap());
 
@@ -3407,6 +3443,69 @@ mod tests {
                 cid: Some(270_001),
             })
         );
+    }
+
+    #[test]
+    fn collection_resolution_maps_list_kinds_to_source_kinds() {
+        let owner = bbdown_core::Owner {
+            mid: 123,
+            name: "Owner".to_owned(),
+        };
+
+        for (kind, input, expected_source_kind) in [
+            (
+                VideoCollectionKind::Favorite,
+                Input::FavoriteList {
+                    media_id: Some(456),
+                    owner_mid: None,
+                },
+                "favorite",
+            ),
+            (VideoCollectionKind::Space, Input::SpaceVideos(123), "space"),
+            (
+                VideoCollectionKind::Collection,
+                Input::CollectionList(456),
+                "collection",
+            ),
+            (
+                VideoCollectionKind::Series,
+                Input::SeriesList(456),
+                "series",
+            ),
+            (
+                VideoCollectionKind::Recommendation,
+                Input::RecommendationFeed,
+                "recommendation",
+            ),
+        ] {
+            let selected_item = test_collection_item(
+                1,
+                &format!("{expected_source_kind} item"),
+                Some(owner.clone()),
+            );
+            let resolution = BilibiliInputResolution::from_resolved_content(
+                expected_source_kind.to_owned(),
+                &input,
+                ResolvedContent::Collection(bbdown_core::VideoCollectionResolution {
+                    collection: bbdown_core::VideoCollectionMetadata {
+                        id: Some(456),
+                        kind,
+                        title: format!("{expected_source_kind} list"),
+                        description: String::new(),
+                        cover_url: None,
+                        pub_time: None,
+                        owner: Some(owner.clone()),
+                        items: vec![selected_item.clone()],
+                    },
+                    selected_items: vec![selected_item],
+                }),
+            );
+
+            assert_eq!(resolution.source_kind, expected_source_kind);
+            assert_eq!(resolution.candidates.len(), 1);
+            assert_eq!(resolution.candidates[0].source_kind, expected_source_kind);
+            assert!(resolution.candidates[0].selection_id.starts_with("item:1:"));
+        }
     }
 
     #[test]

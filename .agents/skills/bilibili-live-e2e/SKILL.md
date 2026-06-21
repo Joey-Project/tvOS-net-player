@@ -30,9 +30,28 @@ just test-bilibili-live
 ```bash
 BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
+BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live
 ```
 
-6. Default runs skip `requires_authentication` cases. Run authenticated cases explicitly with `BILIBILI_LIVE_E2E_CASES`, or include all authenticated cases in an unfiltered local run with `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`. These cases require a BBDown credential file containing a web cookie; `access_key` alone is not enough for web-page fetch coverage. `authenticated-space-dynamic` defaults to `https://space.bilibili.com/2/dynamic`, but local validation should usually override it with an account-relevant uploader dynamic URL:
+6. Default runs skip `requires_collection_list_validation` cases. Collection/list cases cover favorite lists, uploader space videos, uploader collections, uploader series, and homepage recommendations; they are explicit because public-looking Bilibili list/feed APIs can require cookies, become empty, or change availability independently of the app. `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` includes unauthenticated collection/list cases with stable committed samples in an unfiltered local run. Authenticated collection/list cases still require `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` and a web-cookie credential, and cases marked `requires_live_sample_override` need a current URL override before they join the unfiltered smoke run:
+
+```bash
+BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1 just test-bilibili-live
+
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1 \
+BILIBILI_LIVE_E2E_FAVORITE_URL='https://www.bilibili.com/list/ml...' \
+BILIBILI_LIVE_E2E_SPACE_VIDEOS_URL='https://space.bilibili.com/<mid>' \
+BILIBILI_LIVE_E2E_COLLECTION_URL='https://www.bilibili.com/list/<mid>?sid=<sid>' \
+BILIBILI_LIVE_E2E_SERIES_URL='https://www.bilibili.com/list/<mid>?sid=<sid>&type=series' \
+BILIBILI_LIVE_E2E_RECOMMENDATIONS_URL='https://www.bilibili.com/' \
+BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1 \
+just test-bilibili-live
+```
+
+Explicit `BILIBILI_LIVE_E2E_CASES` filters bypass the default skip policy and are useful for investigating a committed sample or upstream failure, but stable smoke validation should provide URL overrides for `requires_live_sample_override` cases. These cases assert that the LAN server resolves list candidates with bounded stable `item:` selection ids and that generated HLS URLs stay on the LAN media listener. `space-videos` and `homepage-recommendations` currently require a BBDown web cookie in local validation.
+
+7. Default runs skip `requires_authentication` cases. Run authenticated cases explicitly with `BILIBILI_LIVE_E2E_CASES`, or include all authenticated cases in an unfiltered local run with `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`. These cases require a BBDown credential file containing a web cookie; `access_key` alone is not enough for web-page fetch coverage. `authenticated-space-dynamic` defaults to `https://space.bilibili.com/2/dynamic`, but local validation should usually override it with an account-relevant uploader dynamic URL:
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -47,7 +66,7 @@ just test-bilibili-live
 
 Authenticated failure messages are classified as `credential`, `empty_account_state`, `upstream_schema_or_availability`, `restricted_proxy`, or `server_bug` to keep live validation actionable.
 
-7. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Public BiliRoaming reverse proxies are web-mode API proxies, so use `BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY` and keep the fixture `prefer_tv_api` disabled for these cases. Proxy requests may include the configured `access_key`; use a self-hosted or otherwise trusted proxy for normal validation, and use public proxies only with a disposable/test credential or for explicit availability probing. Pass local restricted-area runtime settings through these environment variables:
+8. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Public BiliRoaming reverse proxies are web-mode API proxies, so use `BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY` and keep the fixture `prefer_tv_api` disabled for these cases. Proxy requests may include the configured `access_key`; use a self-hosted or otherwise trusted proxy for normal validation, and use public proxies only with a disposable/test credential or for explicit availability probing. Pass local restricted-area runtime settings through these environment variables:
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -58,7 +77,7 @@ just test-bilibili-live
 ```
 
 The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `access_key`, and `tv_access_key` fields. Do not commit real credentials or real proxy tokens.
-8. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, account state, or upstream availability.
+9. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, account state, or upstream availability.
 
 ## Scope
 

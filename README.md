@@ -48,15 +48,18 @@ just test-bilibili-live
 TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
 
-真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
+真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、favorite/space/collection/series/recommendation list fetch、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
 
 ```bash
 just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
+BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case 和 `requires_authentication` 的账号 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
+collection/list cases 默认跳过，需要通过 `BILIBILI_LIVE_E2E_CASES` 或 `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 显式运行，因为这些 Bilibili list/feed API 可能需要 cookie、为空或随上游状态波动。`BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 只把有稳定内置样例的非认证 collection/list case 加入未过滤 smoke；`space-videos` 和 `homepage-recommendations` 还需要 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 以及 web-cookie credential，`favorite-list` 和 `space-series` 需要用 `BILIBILI_LIVE_E2E_FAVORITE_URL` / `BILIBILI_LIVE_E2E_SERIES_URL` 指向当前可用样例后才加入未过滤 smoke。测试会确认候选项使用 LAN server 生成的 stable `item:` selection id，并且 HLS master/media playlist 不会逃逸到 Bilibili 源站 URL。
+
+默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case、`requires_collection_list_validation` 的 collection/list case、`requires_live_sample_override` 且未设置 URL override 的 case，以及 `requires_authentication` 的账号 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
