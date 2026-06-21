@@ -690,16 +690,83 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
-        guard CacheServerEndpoint.normalized(from: serverAddressText) != nil else {
+        guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
             statusMessage = "Cache server address is invalid."
             return
         }
 
+        let source = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else {
+            errorMessage = "Enter a Bilibili URL, BV, av, season, feed, history, or watch-later input."
+            statusMessage = "Bilibili input is required."
+            return
+        }
+
+        let options = currentPlaybackOptions
+
+        operationSequence += 1
+        activePlaybackTaskID = nil
+        activePlaybackResultID = nil
+        let sequence = operationSequence
+
+        stopWatching()
+        activeEndpoint = endpoint
+        currentTask = nil
         resolvedInput = nil
         resolvedInputContext = nil
         clearCandidateSelection()
-        await submit(serverAddressText: serverAddressText)
+        isResolving = true
+        isSubmitting = false
+        errorMessage = nil
+        statusMessage = "Resolving Bilibili input..."
+
+        let client = clientFactory(endpoint)
+
+        do {
+            let resolved = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.resolveBilibiliInput(urlOrID: source, options: options)
+            }
+
+            guard sequence == operationSequence else {
+                return
+            }
+
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
+                return
+            }
+
+            resolvedInput = resolved
+            resolvedInputContext = BilibiliResolvedInputContext(
+                source: source,
+                endpoint: endpoint,
+                options: options
+            )
+            applyResolvedCandidateDefaults(resolved)
+            isResolving = false
+
+            if resolved.candidates.isEmpty {
+                statusMessage = "No selectable Bilibili item was found."
+            } else if resolved.requiresSelection {
+                statusMessage = "Select a Bilibili item to play."
+            } else {
+                statusMessage = "Bilibili input resolved."
+            }
+        } catch {
+            guard sequence == operationSequence else {
+                return
+            }
+
+            currentTask = nil
+            resolvedInput = nil
+            resolvedInputContext = nil
+            clearCandidateSelection()
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not resolve Bilibili input."
+            isResolving = false
+            isSubmitting = false
+        }
     }
 
     public func clearResolvedCandidateSelection() {
