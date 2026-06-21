@@ -10,10 +10,11 @@ use tvos_net_player_cache_server::{
     AppState,
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
-        BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliTaskResultItem,
-        BilibiliTaskSelection, CancelTaskRequest, CreateBilibiliPlaybackTaskRequest,
-        GetBilibiliCredentialStatusRequest, GetTaskRequest, PlaybackProtocol, PlaybackSource,
-        ResolveBilibiliInputRequest, Task, TaskState, server_service_client::ServerServiceClient,
+        BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliResolveResult,
+        BilibiliResolvedCandidate, BilibiliTaskResultItem, BilibiliTaskSelection,
+        CancelTaskRequest, CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest,
+        GetTaskRequest, PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task,
+        TaskState, server_service_client::ServerServiceClient,
         task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
@@ -123,6 +124,7 @@ async fn run_live_case(
             )
         );
     }
+    assert_resolved_candidate_contract(case, &resolved);
 
     let selection = case.selection_request(&resolved);
     let created = task_client
@@ -481,12 +483,22 @@ struct LiveCase {
     #[serde(default)]
     url_env: Option<String>,
     expected_source_kind: String,
+    #[serde(default)]
+    expected_candidate_source_kind: Option<String>,
     minimum_candidates: usize,
     selection: SelectionPolicy,
     #[serde(default)]
     requires_restricted_area_path: bool,
     #[serde(default)]
     requires_authentication: bool,
+    #[serde(default)]
+    requires_collection_list_validation: bool,
+    #[serde(default)]
+    requires_stable_item_selection: bool,
+    #[serde(default)]
+    requires_live_sample_override: bool,
+    #[serde(default)]
+    expected_candidates_truncated: Option<bool>,
     playback_options: LivePlaybackOptions,
     timeout_seconds: Option<u64>,
 }
@@ -501,10 +513,14 @@ impl LiveCase {
             .unwrap_or_else(|| self.url.clone())
     }
 
-    fn selection_request(
-        &self,
-        resolved: &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolveResult,
-    ) -> LiveSelectionRequest {
+    fn has_source_override(&self) -> bool {
+        self.url_env
+            .as_deref()
+            .and_then(|env_key| env::var(env_key).ok())
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    fn selection_request(&self, resolved: &BilibiliResolveResult) -> LiveSelectionRequest {
         match self.selection {
             SelectionPolicy::DefaultOrFirst => {
                 let selection_id = resolved
@@ -599,7 +615,7 @@ impl LiveSelectionRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum SelectionPolicy {
     DefaultOrFirst,
@@ -639,10 +655,7 @@ impl EmptyStringExt for String {
     }
 }
 
-fn first_candidate_id(
-    case: &LiveCase,
-    resolved: &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolveResult,
-) -> String {
+fn first_candidate_id(case: &LiveCase, resolved: &BilibiliResolveResult) -> String {
     resolved
         .candidates
         .first()
@@ -653,7 +666,7 @@ fn first_candidate_id(
 
 fn first_candidate_ids(
     case: &LiveCase,
-    resolved: &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolveResult,
+    resolved: &BilibiliResolveResult,
     count: usize,
 ) -> Vec<String> {
     first_candidates(case, resolved, count)
@@ -664,10 +677,9 @@ fn first_candidate_ids(
 
 fn first_candidates<'a>(
     case: &LiveCase,
-    resolved: &'a tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolveResult,
+    resolved: &'a BilibiliResolveResult,
     count: usize,
-) -> Vec<&'a tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolvedCandidate>
-{
+) -> Vec<&'a BilibiliResolvedCandidate> {
     assert!(
         resolved.candidates.len() >= count,
         "{}: expected at least {} candidates, got {}",
@@ -676,6 +688,65 @@ fn first_candidates<'a>(
         resolved.candidates.len()
     );
     resolved.candidates.iter().take(count).collect()
+}
+
+fn assert_resolved_candidate_contract(case: &LiveCase, resolved: &BilibiliResolveResult) {
+    if let Some(expected) = case.expected_candidates_truncated {
+        assert_eq!(
+            expected, resolved.candidates_truncated,
+            "{}: unexpected candidates_truncated value",
+            case.id
+        );
+    }
+
+    if let Some(expected_source_kind) = case.expected_candidate_source_kind.as_deref() {
+        for candidate in &resolved.candidates {
+            assert_eq!(
+                expected_source_kind, candidate.source_kind,
+                "{}: candidate {} has unexpected source kind",
+                case.id, candidate.selection_id
+            );
+        }
+    }
+
+    if case.requires_stable_item_selection {
+        for candidate in &resolved.candidates {
+            assert_stable_item_candidate(case, candidate);
+        }
+    }
+}
+
+fn assert_stable_item_candidate(case: &LiveCase, candidate: &BilibiliResolvedCandidate) {
+    let selection_id = candidate.selection_id.as_str();
+    assert!(
+        selection_id.starts_with("item:"),
+        "{}: candidate selection id is not a stable collection item id: {}",
+        case.id,
+        selection_id
+    );
+    assert!(
+        selection_id.contains(":cid:"),
+        "{}: stable collection item id is missing cid: {}",
+        case.id,
+        selection_id
+    );
+    assert!(
+        selection_id.contains(":aid:") || selection_id.contains(":bvid:"),
+        "{}: stable collection item id is missing video identity: {}",
+        case.id,
+        selection_id
+    );
+    assert!(
+        (1..=100).contains(&candidate.index),
+        "{}: stable collection item index is outside the bounded candidate window: {}",
+        case.id,
+        candidate.index
+    );
+    assert!(
+        !candidate.content_id.trim().is_empty(),
+        "{}: stable collection item candidate has empty content id",
+        case.id
+    );
 }
 
 fn default_fixture_path() -> PathBuf {
@@ -694,6 +765,7 @@ enum LiveRunDecision {
 struct LiveRunPolicy {
     filter: Option<HashSet<String>>,
     include_authenticated: bool,
+    include_collection_list: bool,
 }
 
 impl LiveRunPolicy {
@@ -701,6 +773,7 @@ impl LiveRunPolicy {
         Self {
             filter: case_filter_from_env(),
             include_authenticated: env_flag("BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED"),
+            include_collection_list: env_flag("BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST"),
         }
     }
 
@@ -708,8 +781,20 @@ impl LiveRunPolicy {
         if self.filter.is_none() && case.requires_restricted_area_path {
             return LiveRunDecision::Skip("requires explicit restricted-area live validation");
         }
+        if self.filter.is_none()
+            && case.requires_collection_list_validation
+            && !self.include_collection_list
+        {
+            return LiveRunDecision::Skip("requires explicit collection/list live validation");
+        }
         if self.filter.is_none() && case.requires_authentication && !self.include_authenticated {
             return LiveRunDecision::Skip("requires authenticated live validation");
+        }
+        if self.filter.is_none()
+            && case.requires_live_sample_override
+            && !case.has_source_override()
+        {
+            return LiveRunDecision::Skip("requires live sample URL override");
         }
         LiveRunDecision::Run
     }
@@ -1078,6 +1163,82 @@ mod tests {
     }
 
     #[test]
+    fn fixture_set_includes_collection_list_fetch_cases() {
+        let fixture_set = LiveFixtureSet::load_from_path(default_fixture_path());
+        let cases = fixture_set
+            .cases
+            .iter()
+            .map(|case| (case.id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for (id, source_kind, env_key, selection) in [
+            (
+                "favorite-list",
+                "favorite",
+                "BILIBILI_LIVE_E2E_FAVORITE_URL",
+                SelectionPolicy::First,
+            ),
+            (
+                "space-videos",
+                "space",
+                "BILIBILI_LIVE_E2E_SPACE_VIDEOS_URL",
+                SelectionPolicy::RangeFirstTwo,
+            ),
+            (
+                "space-collection",
+                "collection",
+                "BILIBILI_LIVE_E2E_COLLECTION_URL",
+                SelectionPolicy::MultipleFirstTwo,
+            ),
+            (
+                "space-series",
+                "series",
+                "BILIBILI_LIVE_E2E_SERIES_URL",
+                SelectionPolicy::First,
+            ),
+            (
+                "homepage-recommendations",
+                "recommendation",
+                "BILIBILI_LIVE_E2E_RECOMMENDATIONS_URL",
+                SelectionPolicy::MultipleFirstTwo,
+            ),
+        ] {
+            let case = cases.get(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(case.expected_source_kind, source_kind);
+            assert_eq!(
+                case.expected_candidate_source_kind.as_deref(),
+                Some(source_kind)
+            );
+            assert_eq!(case.url_env.as_deref(), Some(env_key));
+            assert_eq!(case.selection, selection);
+            assert!(case.requires_collection_list_validation);
+            assert!(case.requires_stable_item_selection);
+            assert!(case.minimum_candidates >= 1);
+        }
+
+        assert!(cases["space-videos"].requires_authentication);
+        assert!(cases["homepage-recommendations"].requires_authentication);
+        assert!(cases["favorite-list"].requires_live_sample_override);
+        assert!(cases["space-series"].requires_live_sample_override);
+        assert!(!cases["space-collection"].requires_live_sample_override);
+        assert_eq!(cases["space-series"].timeout_seconds, Some(180));
+    }
+
+    #[test]
+    fn stable_item_candidate_contract_accepts_complete_identity() {
+        let case = test_case("space-videos", false, false);
+        let valid = BilibiliResolvedCandidate {
+            selection_id: "item:1:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+            source_kind: "space".to_owned(),
+            content_id: "BV1xx411c7mD".to_owned(),
+            index: 1,
+            ..Default::default()
+        };
+
+        assert_stable_item_candidate(&case, &valid);
+    }
+
+    #[test]
     fn run_policy_skips_authenticated_cases_by_default() {
         let policy = LiveRunPolicy::default();
         let case = test_case("authenticated-history", true, false);
@@ -1093,6 +1254,7 @@ mod tests {
         let policy = LiveRunPolicy {
             filter: None,
             include_authenticated: true,
+            include_collection_list: false,
         };
         let case = test_case("authenticated-history", true, false);
 
@@ -1104,8 +1266,108 @@ mod tests {
         let policy = LiveRunPolicy {
             filter: Some(parse_case_filter("authenticated-history".to_owned())),
             include_authenticated: false,
+            include_collection_list: false,
         };
         let case = test_case("authenticated-history", true, false);
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_skips_collection_list_cases_by_default() {
+        let policy = LiveRunPolicy::default();
+        let mut case = test_case("space-collection", false, false);
+        case.requires_collection_list_validation = true;
+
+        assert_eq!(
+            policy.run_decision(&case),
+            LiveRunDecision::Skip("requires explicit collection/list live validation")
+        );
+    }
+
+    #[test]
+    fn run_policy_runs_collection_list_cases_when_included() {
+        let policy = LiveRunPolicy {
+            filter: None,
+            include_authenticated: false,
+            include_collection_list: true,
+        };
+        let mut case = test_case("space-collection", false, false);
+        case.requires_collection_list_validation = true;
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_collection_list_include_still_skips_authenticated_collection_cases() {
+        let policy = LiveRunPolicy {
+            filter: None,
+            include_authenticated: false,
+            include_collection_list: true,
+        };
+        let mut case = test_case("space-videos", true, false);
+        case.requires_collection_list_validation = true;
+
+        assert_eq!(
+            policy.run_decision(&case),
+            LiveRunDecision::Skip("requires authenticated live validation")
+        );
+    }
+
+    #[test]
+    fn run_policy_collection_list_and_authenticated_include_runs_authenticated_collection_cases() {
+        let policy = LiveRunPolicy {
+            filter: None,
+            include_authenticated: true,
+            include_collection_list: true,
+        };
+        let mut case = test_case("space-videos", true, false);
+        case.requires_collection_list_validation = true;
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_collection_list_include_skips_cases_that_need_sample_override() {
+        let policy = LiveRunPolicy {
+            filter: None,
+            include_authenticated: false,
+            include_collection_list: true,
+        };
+        let mut case = test_case("favorite-list", false, false);
+        case.url_env = Some("BILIBILI_LIVE_E2E_TEST_SOURCE_OVERRIDE_DO_NOT_SET".to_owned());
+        case.requires_collection_list_validation = true;
+        case.requires_live_sample_override = true;
+
+        assert_eq!(
+            policy.run_decision(&case),
+            LiveRunDecision::Skip("requires live sample URL override")
+        );
+    }
+
+    #[test]
+    fn run_policy_explicit_filter_runs_cases_that_need_sample_override() {
+        let policy = LiveRunPolicy {
+            filter: Some(parse_case_filter("favorite-list".to_owned())),
+            include_authenticated: false,
+            include_collection_list: false,
+        };
+        let mut case = test_case("favorite-list", false, false);
+        case.requires_collection_list_validation = true;
+        case.requires_live_sample_override = true;
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_explicit_filter_runs_collection_list_cases() {
+        let policy = LiveRunPolicy {
+            filter: Some(parse_case_filter("space-collection".to_owned())),
+            include_authenticated: false,
+            include_collection_list: false,
+        };
+        let mut case = test_case("space-collection", false, false);
+        case.requires_collection_list_validation = true;
 
         assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
     }
@@ -1267,6 +1529,26 @@ mod tests {
     }
 
     #[test]
+    fn failure_classification_keeps_stalled_preparing_state_as_server_bug() {
+        let case = test_case("authenticated-following-feed", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_live_failure(
+                &case,
+                "task did not become playable",
+                "Preparing Bilibili playback plan.",
+                Some(&status)
+            ),
+            LiveFailureClass::ServerBug
+        );
+    }
+
+    #[test]
     fn failure_classification_labels_non_resolve_generic_as_server_bug() {
         let case = test_case("ordinary-video-playlist", false, false);
 
@@ -1286,10 +1568,15 @@ mod tests {
             url: "https://www.bilibili.com/account/history".to_owned(),
             url_env: None,
             expected_source_kind: "history".to_owned(),
+            expected_candidate_source_kind: None,
             minimum_candidates: 1,
             selection: SelectionPolicy::First,
             requires_restricted_area_path,
             requires_authentication,
+            requires_collection_list_validation: false,
+            requires_stable_item_selection: false,
+            requires_live_sample_override: false,
+            expected_candidates_truncated: None,
             playback_options: LivePlaybackOptions {
                 quality_preference: "360p".to_owned(),
                 encoding_preference: "h264".to_owned(),

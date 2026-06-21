@@ -83,6 +83,7 @@ superseded_by:
 
 ### PR 5: Collection/List Fetch Coverage
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-21-collection-list-fetch-coverage-d3b6e1.md`.
 - Add live and deterministic coverage for favorites, space videos, collections, series, and homepage recommendations.
 - Stress candidate windows, truncation flags, range/all behavior, and stable selection identity.
 - Ensure list changes cannot silently play a different item after resolve/create.
@@ -160,6 +161,13 @@ superseded_by:
   - `git diff --check`
   - `just ci`
   - `just test-bilibili-live`
+- PR 5 local gate:
+  - `cargo fmt --all`
+  - `cargo test --package tvos-net-player-cache-server --lib --locked`
+  - `cargo test --package tvos-net-player-cache-server --test bilibili_live_e2e --locked`
+  - `just test-bilibili-live`
+  - `BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live`
+  - Live probes showed `space-videos` and `homepage-recommendations` currently need a web cookie, `favorite-list` sample availability can fail upstream selection, and `space-series` sample can stall during playback planning; authenticated list/feed cases therefore need web-cookie opt-in, and favorite/series need URL overrides before joining unfiltered collection/list smoke coverage.
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
