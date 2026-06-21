@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status control plane、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -28,6 +28,7 @@
 - Bilibili credential control-plane workstream：`docs/project_journal/2026/06/2026-06-21-bilibili-credential-control-plane-a5d7c3.md`
 - Authenticated Bilibili page-fetch live fixtures workstream：`docs/project_journal/2026/06/2026-06-21-authenticated-page-fetch-fixtures-f6a8b0.md`
 - Bilibili collection/list fetch coverage workstream：`docs/project_journal/2026/06/2026-06-21-collection-list-fetch-coverage-d3b6e1.md`
+- Bilibili fetch UX polish workstream：`docs/project_journal/2026/06/2026-06-21-bilibili-fetch-ux-polish-b6f2a9.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers

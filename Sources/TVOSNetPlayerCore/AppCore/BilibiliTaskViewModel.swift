@@ -7,6 +7,34 @@ public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
     public let systemImage: String
 }
 
+public enum BilibiliFetchNoticeTone: String, Equatable, Sendable {
+    case info
+    case warning
+    case error
+}
+
+public struct BilibiliFetchNotice: Equatable, Sendable {
+    public let title: String
+    public let message: String
+    public let systemImage: String
+    public let tone: BilibiliFetchNoticeTone
+    public let actionTitle: String?
+
+    public init(
+        title: String,
+        message: String,
+        systemImage: String,
+        tone: BilibiliFetchNoticeTone,
+        actionTitle: String? = nil
+    ) {
+        self.title = title
+        self.message = message
+        self.systemImage = systemImage
+        self.tone = tone
+        self.actionTitle = actionTitle
+    }
+}
+
 public struct BilibiliTaskResultSummary: Equatable, Sendable {
     public let totalCount: Int
     public let readyCount: Int
@@ -303,6 +331,19 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask != nil || errorMessage != nil || resolvedInput != nil
     }
 
+    public var canReResolve: Bool {
+        !isSubmitting
+            && !isResolving
+            && !isCancelling
+            && currentTask == nil
+            && resolvedInputMatchesSource
+            && !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var canClearCandidateSelection: Bool {
+        isWaitingForCandidateSelection && selectedCandidateCount > 0
+    }
+
     public var availableCandidateSelectionModes: [BilibiliCandidateSelectionMode] {
         var modes: [BilibiliCandidateSelectionMode] = [.single, .multiple, .range]
         if canSelectAllResolvedCandidates {
@@ -431,6 +472,50 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public var taskResultSummary: BilibiliTaskResultSummary? {
         currentTask?.bilibiliTaskResultSummary
+    }
+
+    public var fetchNotice: BilibiliFetchNotice? {
+        if let errorNotice = Self.errorNotice(for: errorMessage, currentTask: currentTask) {
+            return errorNotice
+        }
+
+        guard resolvedInputMatchesSource, let resolvedInput else {
+            return nil
+        }
+
+        if resolvedInput.candidates.isEmpty {
+            return BilibiliFetchNotice(
+                title: "No items found",
+                message: "The resolved Bilibili list is empty for the current account or upstream page.",
+                systemImage: "tray",
+                tone: .warning,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        if resolvedInput.candidatesTruncated {
+            return BilibiliFetchNotice(
+                title: "Showing a bounded window",
+                message:
+                    "Only the first \(resolvedInput.candidates.count) resolved items are shown. Use a narrower URL or re-resolve before submitting a large batch.",
+                systemImage: "rectangle.stack.badge.exclamationmark",
+                tone: .warning,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        if Self.isVolatileResolvedSourceKind(resolvedInput.sourceKind) {
+            return BilibiliFetchNotice(
+                title: "List may change",
+                message:
+                    "This Bilibili list or feed can reorder between refreshes. Stable item IDs are sent when you submit selected items.",
+                systemImage: "arrow.triangle.2.circlepath",
+                tone: .info,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        return nil
     }
 
     public var playableTaskResults: [BilibiliTaskResultPresentation] {
@@ -594,6 +679,32 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         await submit(serverAddressText: serverAddressText)
+    }
+
+    public func reResolve(serverAddressText: String) async {
+        guard canReResolve else {
+            return
+        }
+
+        resolvedInput = nil
+        resolvedInputContext = nil
+        clearCandidateSelection()
+        await submit(serverAddressText: serverAddressText)
+    }
+
+    public func clearResolvedCandidateSelection() {
+        guard isWaitingForCandidateSelection else {
+            return
+        }
+
+        isNormalizingCandidateSelection = true
+        candidateSelectionMode = .multiple
+        selectedCandidateID = nil
+        selectedCandidateIDs = []
+        rangeStartCandidateID = nil
+        rangeEndCandidateID = nil
+        isChoosingRangeEnd = false
+        isNormalizingCandidateSelection = false
     }
 
     public func cancel(serverAddressText: String) async {
@@ -1275,6 +1386,66 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return "\(task.bilibiliDisplayTitle) failed."
     }
 
+    private static func errorNotice(
+        for errorMessage: String?,
+        currentTask: CacheTask?
+    ) -> BilibiliFetchNotice? {
+        guard let errorMessage else {
+            return nil
+        }
+
+        let normalized = errorMessage.lowercased()
+        if normalized.contains("login")
+            || normalized.contains("cookie")
+            || normalized.contains("credential")
+            || normalized.contains("auth")
+            || normalized.contains("unauthorized")
+        {
+            return BilibiliFetchNotice(
+                title: "Credentials required",
+                message:
+                    "This Bilibili page needs server-side web credentials. Refresh the LAN cache server credential file, then retry.",
+                systemImage: "person.crop.circle.badge.exclamationmark",
+                tone: .warning,
+                actionTitle: "Retry"
+            )
+        }
+
+        if normalized.contains("empty") || normalized.contains("no item") || normalized.contains("no selectable") {
+            return BilibiliFetchNotice(
+                title: "No items found",
+                message: "The resolved Bilibili list is empty for the current account or upstream page.",
+                systemImage: "tray",
+                tone: .warning,
+                actionTitle: "Retry"
+            )
+        }
+
+        guard currentTask?.isRetryableBilibiliTaskState == true || currentTask == nil else {
+            return nil
+        }
+
+        if normalized.contains("timed out")
+            || normalized.contains("timeout")
+            || normalized.contains("upstream")
+            || normalized.contains("rate")
+            || normalized.contains("api returned")
+            || normalized.contains("network")
+            || currentTask?.isRetryableBilibiliTaskState == true
+        {
+            return BilibiliFetchNotice(
+                title: "Retry available",
+                message:
+                    "The Bilibili request failed or timed out. Retry after the cache server reconnects or upstream rate limits clear.",
+                systemImage: "arrow.clockwise.circle",
+                tone: .error,
+                actionTitle: "Retry"
+            )
+        }
+
+        return nil
+    }
+
     private static func progressiveCacheStatusBadge(for task: CacheTask) -> ProgressiveCacheStatusBadge? {
         guard task.isProgressivePlayback else {
             return nil
@@ -1359,6 +1530,22 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private static func allSelection() -> BilibiliTaskSelection {
         BilibiliTaskSelection(mode: "all")
+    }
+
+    private static func isVolatileResolvedSourceKind(_ sourceKind: String) -> Bool {
+        switch normalizedBilibiliSourceKind(sourceKind) {
+        case "favorite", "space", "collection", "series", "history", "watchlater", "following", "dynamic",
+            "recommendations", "homepage", "feed":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func normalizedBilibiliSourceKind(_ sourceKind: String) -> String {
+        sourceKind
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     private static func withOperationTimeout<Value: Sendable>(

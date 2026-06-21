@@ -478,6 +478,200 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testTruncatedResolveShowsBoundedWindowNotice() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "fav123",
+                        sourceKind: "favorite",
+                        candidates: [
+                            .fixture(selectionID: "item:1", title: "Item 1", index: 1),
+                            .fixture(selectionID: "item:2", title: "Item 2", index: 2),
+                        ],
+                        defaultSelectionID: "",
+                        candidatesTruncated: true
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "fav123",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.fetchNotice?.title, "Showing a bounded window")
+        XCTAssertEqual(model.fetchNotice?.tone, .warning)
+        XCTAssertEqual(model.fetchNotice?.actionTitle, "Re-resolve")
+        XCTAssertFalse(model.availableCandidateSelectionModes.contains(.all))
+        XCTAssertTrue(model.canReResolve)
+    }
+
+    func testDynamicFeedResolveShowsVolatilityNotice() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "recommendations",
+                        sourceKind: "recommendations",
+                        candidates: [
+                            .fixture(selectionID: "item:1", title: "Feed Item 1", index: 1),
+                            .fixture(selectionID: "item:2", title: "Feed Item 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "recommendations",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.fetchNotice?.title, "List may change")
+        XCTAssertEqual(model.fetchNotice?.tone, .info)
+        XCTAssertTrue(model.canReResolve)
+    }
+
+    func testEmptyResolveShowsEmptyListNotice() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(.fixture(source: "history", sourceKind: "history", candidates: [], defaultSelectionID: ""))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "history",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.statusMessage, "No selectable Bilibili item was found.")
+        XCTAssertEqual(model.fetchNotice?.title, "No items found")
+        XCTAssertEqual(model.fetchNotice?.tone, .warning)
+        XCTAssertEqual(model.fetchNotice?.actionTitle, "Re-resolve")
+    }
+
+    func testCredentialResolveFailureShowsCredentialNotice() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .failure(FakeLocalizedError(message: "Login required: missing web cookie."))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "https://www.bilibili.com/account/history",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.statusMessage, "Could not resolve Bilibili input.")
+        XCTAssertEqual(model.fetchNotice?.title, "Credentials required")
+        XCTAssertEqual(model.fetchNotice?.tone, .warning)
+        XCTAssertEqual(model.fetchNotice?.actionTitle, "Retry")
+        XCTAssertTrue(model.canRetry)
+    }
+
+    func testRetryableTaskFailureShowsRetryNotice() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(source: "BV1rate", state: "TASK_STATE_FAILED", message: "API returned code -352."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1rate",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canRetry)
+        XCTAssertEqual(model.fetchNotice?.title, "Retry available")
+        XCTAssertEqual(model.fetchNotice?.tone, .error)
+        XCTAssertEqual(model.fetchNotice?.actionTitle, "Retry")
+    }
+
+    func testClearResolvedCandidateSelectionDisablesSelectionSubmit() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.selectedCandidateCount, 1)
+        XCTAssertTrue(model.canClearCandidateSelection)
+
+        model.clearResolvedCandidateSelection()
+
+        XCTAssertEqual(model.candidateSelectionMode, .multiple)
+        XCTAssertEqual(model.selectedCandidateCount, 0)
+        XCTAssertFalse(model.canSubmit)
+        XCTAssertFalse(model.canClearCandidateSelection)
+    }
+
+    func testReResolveRefreshesCandidatesWithoutCreatingTask() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "First result",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Old 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Old 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Second result",
+                        candidates: [
+                            .fixture(selectionID: "page:3", title: "New 3", index: 3),
+                            .fixture(selectionID: "page:4", title: "New 4", index: 4),
+                        ],
+                        defaultSelectionID: "page:4"
+                    )),
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.selectedCandidateID = "page:2"
+
+        await model.reResolve(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi"])
+        XCTAssertEqual(model.resolvedInput?.title, "Second result")
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:3", "page:4"])
+        XCTAssertEqual(model.selectedCandidateID, "page:4")
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
@@ -2241,6 +2435,14 @@ private enum FakeBilibiliCacheControlClientError: Error {
     case watchFailed
 }
 
+private struct FakeLocalizedError: LocalizedError {
+    let message: String
+
+    var errorDescription: String? {
+        message
+    }
+}
+
 private extension BilibiliTaskSelection {
     var legacySingleSelectionID: String? {
         guard mode.lowercased() == "single", selectionIDs.count == 1 else {
@@ -2255,6 +2457,7 @@ private extension BilibiliResolveResult {
     static func fixture(
         source: String = "BV1test",
         title: String = "Ready video",
+        sourceKind: String = "video",
         candidates: [BilibiliResolvedCandidate] = [
             .fixture()
         ],
@@ -2264,7 +2467,7 @@ private extension BilibiliResolveResult {
         Self(
             source: source.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title,
-            sourceKind: "video",
+            sourceKind: sourceKind,
             candidates: candidates,
             defaultSelectionID: defaultSelectionID,
             candidatesTruncated: candidatesTruncated

@@ -300,6 +300,10 @@ struct ContentView: View {
                         .lineLimit(3)
                 }
 
+                if let notice = bilibiliModel.fetchNotice {
+                    BilibiliFetchNoticeRow(notice: notice)
+                }
+
                 if bilibiliModel.isWaitingForCandidateSelection {
                     Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
                         ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
@@ -331,6 +335,24 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            Task {
+                                await bilibiliModel.reResolve(serverAddressText: cacheModel.serverAddressText)
+                            }
+                        } label: {
+                            Label("Re-resolve", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(!bilibiliModel.canReResolve)
+
+                        Button {
+                            bilibiliModel.clearResolvedCandidateSelection()
+                        } label: {
+                            Label("Clear Selection", systemImage: "xmark.circle")
+                        }
+                        .disabled(!bilibiliModel.canClearCandidateSelection)
                     }
 
                     ScrollView {
@@ -750,6 +772,37 @@ private struct BilibiliTaskResultRow: View {
             Image(systemName: result.statusSystemImage)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct BilibiliFetchNoticeRow: View {
+    let notice: BilibiliFetchNotice
+
+    private var color: Color {
+        switch notice.tone {
+        case .info:
+            return .secondary
+        case .warning:
+            return .orange
+        case .error:
+            return .red
+        }
+    }
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(notice.title)
+                    .font(.caption.weight(.semibold))
+                Text(notice.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+        } icon: {
+            Image(systemName: notice.systemImage)
+        }
+        .foregroundStyle(color)
     }
 }
 
