@@ -589,12 +589,20 @@ async fn run_bbdown_download_until_cancelled<T>(
             result = &mut future => {
                 return match result {
                     Ok(value) => Ok(value),
-                    Err(error) if error.is_cancelled() => Err(BilibiliDownloadError::Cancelled(
-                        cancellation
-                            .reason()
-                            .unwrap_or_else(|| error.to_string()),
-                    )),
-                    Err(error) => Err(failed(error)),
+                    Err(error) => {
+                        if is_cancel_requested() && !cancellation.is_cancelled() {
+                            cancellation.cancel_with_reason(cancellation_message);
+                        }
+                        if error.is_cancelled() || cancellation.is_cancelled() {
+                            Err(BilibiliDownloadError::Cancelled(
+                                cancellation
+                                    .reason()
+                                    .unwrap_or_else(|| error.to_string()),
+                            ))
+                        } else {
+                            Err(failed(error))
+                        }
+                    }
                 };
             }
             () = sleep(BBDOWN_CANCELLATION_POLL_INTERVAL) => {}
@@ -3839,6 +3847,28 @@ mod tests {
 
         assert!(cancellation.is_cancelled());
         assert!(observed_cancelled_token.load(Ordering::SeqCst));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Cancelled(message))
+                if message == "Cancelled while the BBDown download was running."
+        ));
+    }
+
+    #[tokio::test]
+    async fn bbdown_download_cancellation_wins_late_core_error() {
+        let cancellation = DownloadCancellationToken::new();
+        let future =
+            async { Err::<(), BbdownError>(BbdownError::InvalidInput("late failure".to_owned())) };
+
+        let result = run_bbdown_download_until_cancelled(
+            future,
+            &cancellation,
+            || true,
+            "Cancelled while the BBDown download was running.",
+        )
+        .await;
+
+        assert!(cancellation.is_cancelled());
         assert!(matches!(
             result,
             Err(BilibiliDownloadError::Cancelled(message))
