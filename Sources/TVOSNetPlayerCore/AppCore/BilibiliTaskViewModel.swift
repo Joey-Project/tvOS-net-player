@@ -704,6 +704,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
+            retryIntent = .reResolve
             errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
             statusMessage = "Cache server address is invalid."
             return
@@ -711,6 +712,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let source = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !source.isEmpty else {
+            retryIntent = .reResolve
             errorMessage = "Enter a Bilibili URL, BV, av, season, feed, history, or watch-later input."
             statusMessage = "Bilibili input is required."
             return
