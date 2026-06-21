@@ -509,6 +509,41 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(model.canReResolve)
     }
 
+    func testResolvedFetchNoticeClearsAfterPlaybackTaskSubmission() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "fav123",
+                        sourceKind: "favorite",
+                        candidates: [
+                            .fixture(selectionID: "item:1", title: "Item 1", index: 1),
+                            .fixture(selectionID: "item:2", title: "Item 2", index: 2),
+                        ],
+                        defaultSelectionID: "",
+                        candidatesTruncated: true
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "fav123", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "fav123",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.fetchNotice?.title, "Showing a bounded window")
+
+        model.selectedCandidateID = "item:1"
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.currentTask?.source, "fav123")
+        XCTAssertNil(model.fetchNotice)
+        XCTAssertFalse(model.canReResolve)
+    }
+
     func testDynamicFeedResolveShowsVolatilityNoticeForServerSourceKinds() async {
         for (source, sourceKind) in [
             ("recommendations", "recommendation"),
@@ -630,6 +665,44 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.selectedCandidateCount, 0)
         XCTAssertFalse(model.canSubmit)
         XCTAssertFalse(model.canClearCandidateSelection)
+    }
+
+    func testClearResolvedCandidateSelectionClearsStaleSubmitError() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: [
+                .failure(FakeLocalizedError(message: "Upstream timed out."))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertTrue(model.canSubmit)
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.errorMessage, "Upstream timed out.")
+        XCTAssertTrue(model.canRetry)
+        XCTAssertTrue(model.canClearCandidateSelection)
+
+        model.clearResolvedCandidateSelection()
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Select a Bilibili item to play.")
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.canSubmit)
     }
 
     func testReResolveRefreshesCandidatesWithoutCreatingTask() async {

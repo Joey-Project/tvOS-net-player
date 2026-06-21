@@ -479,7 +479,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return errorNotice
         }
 
-        guard resolvedInputMatchesSource, let resolvedInput else {
+        guard currentTask == nil, resolvedInputMatchesSource, let resolvedInput else {
             return nil
         }
 
@@ -704,6 +704,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         rangeStartCandidateID = nil
         rangeEndCandidateID = nil
         isChoosingRangeEnd = false
+        errorMessage = nil
+        statusMessage = "Select a Bilibili item to play."
         isNormalizingCandidateSelection = false
     }
 
