@@ -27,6 +27,8 @@ superseded_by:
 - Use `DownloadReport::summary().total_bytes` for completed byte totals so resumed bytes and freshly written bytes share BBDown's upstream summary semantics.
 - Coalesce high-frequency BBDown file progress events by byte/progress delta before publishing them to task watchers, while still publishing file start/completion and plan/entry state transitions.
 - Report a conservative total equal to downloaded bytes when BBDown has no expected file size, because task progress updates currently treat `total_bytes: None` as "leave the previous total unchanged".
+- Track multi-entry download progress from completed event count and current-entry byte ratio, because BBDown entry indices are source page/episode/item indices rather than guaranteed contiguous ordinals within a selected plan.
+- Cap an incomplete entry's active byte contribution until `EntryCompleted`, because BBDown reports files as they start and an entry can still have unstarted DASH audio, FLV segments, subtitles, danmaku, or cover files.
 - Do not persist high-frequency progress updates to disk; task lifecycle persistence remains unchanged.
 
 ## Validation

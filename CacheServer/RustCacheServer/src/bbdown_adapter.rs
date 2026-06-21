@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fmt::Display,
     future::Future,
@@ -41,7 +41,7 @@ const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIM
 const BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1;
 const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
-const ACTIVE_ENTRY_PROGRESS_CAP: f64 = 0.70;
+const ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP: f64 = 0.50;
 const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
@@ -665,7 +665,9 @@ impl DownloadProgressSink for BilibiliBbdownProgressSink {
 struct BilibiliBbdownProgressAccumulator {
     entry_count: Option<usize>,
     completed_entries: usize,
+    completed_entry_indices: HashSet<u32>,
     files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
+    active_entry_files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
     last_progress: f64,
     last_published_downloaded_bytes: u64,
     last_published_progress: f64,
@@ -694,12 +696,17 @@ impl BilibiliBbdownProgressAccumulator {
         match event {
             DownloadProgressEvent::PlanStarted { entry_count, .. } => {
                 self.entry_count = Some((*entry_count).max(1));
+                self.completed_entries = 0;
+                self.completed_entry_indices.clear();
+                self.files.clear();
+                self.active_entry_files.clear();
                 self.message_progress(
                     DOWNLOAD_PROGRESS_START,
                     format!("Downloading {entry_count} Bilibili entry(s)."),
                 )
             }
             DownloadProgressEvent::EntryStarted { index, title, .. } => {
+                self.active_entry_files.clear();
                 let progress = self.current_download_progress();
                 self.message_progress(
                     progress,
@@ -715,6 +722,14 @@ impl BilibiliBbdownProgressAccumulator {
                 ..
             } => {
                 self.files.insert(
+                    path.clone(),
+                    BilibiliBbdownFileProgress {
+                        resumed_from: *resumed_from,
+                        bytes_written: 0,
+                        expected_size: *expected_size,
+                    },
+                );
+                self.active_entry_files.insert(
                     path.clone(),
                     BilibiliBbdownFileProgress {
                         resumed_from: *resumed_from,
@@ -740,6 +755,10 @@ impl BilibiliBbdownProgressAccumulator {
                 file.resumed_from = *resumed_from;
                 file.bytes_written = *bytes_written;
                 file.expected_size = *expected_size;
+                let active_file = self.active_entry_files.entry(path.clone()).or_default();
+                active_file.resumed_from = *resumed_from;
+                active_file.bytes_written = *bytes_written;
+                active_file.expected_size = *expected_size;
                 self.throttled_bytes_progress(format!(
                     "Downloading {} for {entry_title}.",
                     download_file_kind_label(kind),
@@ -755,6 +774,14 @@ impl BilibiliBbdownProgressAccumulator {
                 ..
             } => {
                 self.files.insert(
+                    path.clone(),
+                    BilibiliBbdownFileProgress {
+                        resumed_from: *resumed_from,
+                        bytes_written: *bytes_written,
+                        expected_size: Some(*total_bytes),
+                    },
+                );
+                self.active_entry_files.insert(
                     path.clone(),
                     BilibiliBbdownFileProgress {
                         resumed_from: *resumed_from,
@@ -783,10 +810,13 @@ impl BilibiliBbdownProgressAccumulator {
                 )
             }
             DownloadProgressEvent::EntryCompleted { index, title, .. } => {
-                self.completed_entries = self
-                    .completed_entries
-                    .max(usize::try_from(*index).unwrap_or(usize::MAX))
-                    .min(self.entry_count.unwrap_or(usize::MAX));
+                if self.completed_entry_indices.insert(*index) {
+                    self.completed_entries = self
+                        .completed_entries
+                        .saturating_add(1)
+                        .min(self.entry_count.unwrap_or(usize::MAX));
+                }
+                self.active_entry_files.clear();
                 Some(self.published_bytes_progress(format!(
                     "Downloaded Bilibili entry {index}: {title}."
                 )))
@@ -860,7 +890,11 @@ impl BilibiliBbdownProgressAccumulator {
         let entry_count = self.entry_count.unwrap_or(1).max(1);
         let completed_entries = self.completed_entries.min(entry_count);
         let active_entry_ratio = if completed_entries < entry_count {
-            self.known_bytes_ratio().min(ACTIVE_ENTRY_PROGRESS_CAP)
+            // BBDown reports files as they start, so a DASH/FLV entry can have unstarted files
+            // that are not yet represented in byte totals. Keep active entry progress conservative
+            // until EntryCompleted confirms the whole entry is finished.
+            self.known_bytes_ratio()
+                .min(ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP)
         } else {
             0.0
         };
@@ -875,7 +909,8 @@ impl BilibiliBbdownProgressAccumulator {
     }
 
     fn known_bytes_ratio(&self) -> f64 {
-        let (downloaded_bytes, total_bytes) = self.known_bytes_snapshot();
+        let (downloaded_bytes, total_bytes) =
+            self.known_bytes_snapshot_for(&self.active_entry_files);
         let Some(total_bytes) = total_bytes else {
             return 0.0;
         };
@@ -886,10 +921,17 @@ impl BilibiliBbdownProgressAccumulator {
     }
 
     fn known_bytes_snapshot(&self) -> (u64, Option<u64>) {
+        self.known_bytes_snapshot_for(&self.files)
+    }
+
+    fn known_bytes_snapshot_for(
+        &self,
+        files: &HashMap<PathBuf, BilibiliBbdownFileProgress>,
+    ) -> (u64, Option<u64>) {
         let mut downloaded_bytes = 0_u64;
         let mut total_bytes = 0_u64;
-        let mut all_totals_known = !self.files.is_empty();
-        for file in self.files.values() {
+        let mut all_totals_known = !files.is_empty();
+        for file in files.values() {
             downloaded_bytes = downloaded_bytes.saturating_add(file.downloaded_bytes());
             if let Some(file_total_bytes) = file.total_bytes() {
                 total_bytes = total_bytes.saturating_add(file_total_bytes);
@@ -2368,6 +2410,14 @@ mod tests {
     use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
     use std::fs as std_fs;
 
+    fn assert_progress_near(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("progress should be set");
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected progress {expected}, got {actual}"
+        );
+    }
+
     #[test]
     fn maps_common_video_quality_preferences() {
         assert_eq!(video_quality_preference("1080p"), Some(80));
@@ -3487,6 +3537,211 @@ mod tests {
             })
             .expect("plan complete should report progress");
         assert_eq!(Some(DOWNLOAD_PROGRESS_END), plan_completed.progress);
+    }
+
+    #[test]
+    fn bbdown_multi_entry_progress_counts_completed_events_and_active_entry_bytes() {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+        accumulator
+            .record(&DownloadProgressEvent::PlanStarted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 2,
+            })
+            .expect("plan start should report progress");
+
+        accumulator
+            .record(&DownloadProgressEvent::EntryStarted {
+                index: 2,
+                title: "Page 2".to_owned(),
+                directory: PathBuf::from("out/2"),
+            })
+            .expect("entry start should report progress");
+        let first_path = PathBuf::from("out/2/video.m4s");
+        accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 2,
+                entry_title: "Page 2".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: first_path.clone(),
+                resumed_from: 0,
+                expected_size: Some(100),
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("file start should report progress");
+        accumulator
+            .record(&DownloadProgressEvent::FileCompleted {
+                entry_index: 2,
+                entry_title: "Page 2".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: first_path,
+                bytes_written: 100,
+                resumed_from: 0,
+                total_bytes: 100,
+            })
+            .expect("file complete should report progress");
+
+        let first_entry_done = accumulator
+            .record(&DownloadProgressEvent::EntryCompleted {
+                index: 2,
+                title: "Page 2".to_owned(),
+                directory: PathBuf::from("out/2"),
+                file_count: 1,
+                mux_output: None,
+            })
+            .expect("entry complete should report progress");
+        assert_progress_near(first_entry_done.progress, 0.45);
+        assert_eq!(Some(100), first_entry_done.downloaded_bytes);
+        assert_eq!(Some(100), first_entry_done.total_bytes);
+
+        accumulator
+            .record(&DownloadProgressEvent::EntryStarted {
+                index: 4,
+                title: "Page 4".to_owned(),
+                directory: PathBuf::from("out/4"),
+            })
+            .expect("entry start should report progress");
+        let second_path = PathBuf::from("out/4/video.m4s");
+        accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 4,
+                entry_title: "Page 4".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: second_path.clone(),
+                resumed_from: 0,
+                expected_size: Some(100),
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("file start should report progress");
+        let second_half_done = accumulator
+            .record(&DownloadProgressEvent::FileProgress {
+                entry_index: 4,
+                entry_title: "Page 4".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: second_path.clone(),
+                bytes_delta: 50,
+                bytes_written: 50,
+                resumed_from: 0,
+                expected_size: Some(100),
+            })
+            .expect("second entry progress should report progress");
+        assert_progress_near(second_half_done.progress, 0.625);
+        assert_eq!(Some(150), second_half_done.downloaded_bytes);
+        assert_eq!(Some(200), second_half_done.total_bytes);
+
+        accumulator
+            .record(&DownloadProgressEvent::FileCompleted {
+                entry_index: 4,
+                entry_title: "Page 4".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: second_path,
+                bytes_written: 100,
+                resumed_from: 0,
+                total_bytes: 100,
+            })
+            .expect("second file complete should report progress");
+        let all_entries_done = accumulator
+            .record(&DownloadProgressEvent::EntryCompleted {
+                index: 4,
+                title: "Page 4".to_owned(),
+                directory: PathBuf::from("out/4"),
+                file_count: 1,
+                mux_output: None,
+            })
+            .expect("second entry complete should report progress");
+        assert_progress_near(all_entries_done.progress, DOWNLOAD_PROGRESS_END);
+        assert_eq!(Some(200), all_entries_done.downloaded_bytes);
+        assert_eq!(Some(200), all_entries_done.total_bytes);
+    }
+
+    #[test]
+    fn bbdown_active_entry_progress_stays_conservative_until_entry_completes() {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+        accumulator
+            .record(&DownloadProgressEvent::PlanStarted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 1,
+            })
+            .expect("plan start should report progress");
+        accumulator
+            .record(&DownloadProgressEvent::EntryStarted {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: PathBuf::from("out/1"),
+            })
+            .expect("entry start should report progress");
+
+        let video_path = PathBuf::from("out/1/video.m4s");
+        accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: video_path.clone(),
+                resumed_from: 0,
+                expected_size: Some(100),
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("video start should report progress");
+        let video_done = accumulator
+            .record(&DownloadProgressEvent::FileCompleted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: video_path,
+                bytes_written: 100,
+                resumed_from: 0,
+                total_bytes: 100,
+            })
+            .expect("video complete should report progress");
+        assert_progress_near(video_done.progress, 0.45);
+        assert_eq!(Some(100), video_done.downloaded_bytes);
+        assert_eq!(Some(100), video_done.total_bytes);
+
+        let audio_path = PathBuf::from("out/1/audio.m4s");
+        let audio_started = accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Audio,
+                path: audio_path.clone(),
+                resumed_from: 0,
+                expected_size: Some(100),
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("audio start should report progress");
+        assert_progress_near(audio_started.progress, 0.45);
+        assert_eq!(Some(100), audio_started.downloaded_bytes);
+        assert_eq!(Some(200), audio_started.total_bytes);
+
+        accumulator
+            .record(&DownloadProgressEvent::FileCompleted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Audio,
+                path: audio_path,
+                bytes_written: 100,
+                resumed_from: 0,
+                total_bytes: 100,
+            })
+            .expect("audio complete should report progress");
+        let entry_done = accumulator
+            .record(&DownloadProgressEvent::EntryCompleted {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: PathBuf::from("out/1"),
+                file_count: 2,
+                mux_output: None,
+            })
+            .expect("entry complete should report progress");
+        assert_progress_near(entry_done.progress, DOWNLOAD_PROGRESS_END);
+        assert_eq!(Some(200), entry_done.downloaded_bytes);
+        assert_eq!(Some(200), entry_done.total_bytes);
     }
 
     #[test]
