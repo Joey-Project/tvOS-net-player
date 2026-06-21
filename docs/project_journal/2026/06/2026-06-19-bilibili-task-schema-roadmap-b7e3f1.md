@@ -3,12 +3,12 @@ id: 20260619-b7e3f1
 title: Bilibili Task Schema Roadmap
 status: completed
 created: 2026-06-19
-updated: 2026-06-20
+updated: 2026-06-21
 branch: wip/bilibili-task-ux-live-e2e
 pr:
 supersedes:
   - 20260615-c8f4d2
-superseded_by:
+superseded_by: 20260621-c9f0a2
 ---
 
 # Bilibili Task Schema Roadmap
@@ -26,7 +26,7 @@ superseded_by:
 - Server execution should be the second slice, so durable task state and BBDown planning semantics can be reviewed independently from client UI behavior.
 - Shared AppCore should consume the new result shape before platform-specific UI work, keeping tvOS and macOS behavior aligned.
 - The final slice should expose the UX and extend live e2e coverage once the shared logic is stable.
-- Physical Apple TV validation remains deferred until signing, pairing, and local device availability are ready.
+- Physical Apple TV validation remains deferred outside the current roadmap; practical validation for the next phase uses the macOS app.
 
 ## PR Plan
 
@@ -132,7 +132,7 @@ Validation evidence:
 
 ## Deferred
 
-- Physical Apple TV deployment validation.
+- Physical Apple TV deployment validation, deferred outside the current roadmap.
 - LAN-side transcoding policy and UI.
 - True segmented HLS output and segment-level prefetch.
 - Restricted-area Bangumi live e2e validation until local proxy/credential setup is confirmed.

@@ -1,13 +1,13 @@
 ---
 id: 20260615-c8f4d2
 title: BBDown 0.3.0 And Product UX Roadmap
-status: active
+status: completed
 created: 2026-06-15
-updated: 2026-06-15
+updated: 2026-06-21
 branch: wip/bbdown-030-bump
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20260621-c9f0a2
 ---
 
 # BBDown 0.3.0 And Product UX Roadmap
@@ -22,7 +22,8 @@ superseded_by:
 ## Current State
 
 - `master` contains the shared AppCore refactor and macOS frontend from PR #13 and PR #14.
-- `bbdown-core` is pinned to `BBDown-rust` `v0.3.0` for the LAN cache server.
+- This roadmap sequence is complete and superseded by the `BBDown-rust` `v0.5.0` roadmap.
+- The current LAN cache server `bbdown-core` baseline is `BBDown-rust` `v0.5.0`.
 - The LAN cache server already owns BBDown integration, progressive HLS playback, and offline HLS cache finalization.
 - Swift clients already expose `CreateBilibiliPlaybackTask`, `GetTask`, and `WatchTasks`.
 - AppCore currently exposes LAN cache server/library/playback state, but not a Bilibili task submission/progress workflow.

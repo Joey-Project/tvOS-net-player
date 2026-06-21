@@ -3,18 +3,18 @@ id: 20260616-a9d4c1
 title: Discovery Cache And Bilibili Roadmap
 status: completed
 created: 2026-06-16
-updated: 2026-06-18
+updated: 2026-06-21
 branch: wip/bilibili-resolve-select-schema
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20260621-c9f0a2
 ---
 
 # Discovery Cache And Bilibili Roadmap
 
 ## Summary
 
-- Physical Apple TV validation remains deferred until signing and device pairing are available.
+- Physical Apple TV validation remains deferred outside the current roadmap; practical validation for the next phase uses the macOS app.
 - Delivered the product slice as sequential PRs, each branched from updated `master` after the previous PR was merged.
 - Keep gRPC as the control plane and HTTP/HLS/Range URLs as the media plane.
 - Prioritize online playback responsiveness while making completed and partially prepared HLS cache more useful on weak networks.
@@ -88,7 +88,7 @@ superseded_by:
 
 ## Deferred
 
-- Physical Apple TV deployment validation.
+- Physical Apple TV deployment validation, deferred outside the current roadmap.
 - LAN-side transcoding policy and UI.
 - True segmented HLS output and segment-level prefetch.
 - Authentication/TLS for the LAN control plane.
@@ -244,4 +244,4 @@ superseded_by:
 
 - This roadmap sequence is complete on `master` through PR D / PR #23.
 - Defer candidate prewarm beyond selected-item first-frame prewarm until we have real usage data for multi-result browsing.
-- Physical Apple TV deployment validation remains tracked in `docs/PROJECT_TODO.md`.
+- Physical Apple TV deployment validation is deferred outside the current `docs/PROJECT_TODO.md` roadmap; use macOS app validation for the next phase.
