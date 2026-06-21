@@ -565,10 +565,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let options = currentPlaybackOptions
 
-        if isWaitingForCandidateSelection,
-            resolvedInputMatches(source: source, endpoint: endpoint, options: options)
-        {
-            guard let selectionRequest = candidateSelectionRequest else {
+        if resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
+            guard let selectionRequest = cachedResolvedPlaybackRequest else {
                 errorMessage = "Select Bilibili items before submitting playback."
                 statusMessage = "Bilibili item selection is required."
                 return
@@ -767,6 +765,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
         } catch {
             guard sequence == operationSequence else {
+                return
+            }
+
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
                 return
             }
 
@@ -1068,6 +1071,25 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 legacySelectionID: nil
             )
         }
+    }
+
+    private var cachedResolvedPlaybackRequest: BilibiliCandidateSelectionRequest? {
+        guard let resolvedInput else {
+            return nil
+        }
+
+        if resolvedInput.requiresSelection {
+            return candidateSelectionRequest
+        }
+
+        guard let candidate = selectedCandidate else {
+            return nil
+        }
+
+        return BilibiliCandidateSelectionRequest(
+            selection: Self.singleSelection(for: candidate.selectionID),
+            legacySelectionID: candidate.selectionID
+        )
     }
 
     private func candidate(withID id: String?) -> BilibiliResolvedCandidate? {

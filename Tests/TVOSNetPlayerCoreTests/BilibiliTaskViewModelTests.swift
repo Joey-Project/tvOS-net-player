@@ -892,6 +892,52 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testSubmitUsesSingleCandidateFromReResolveWithoutResolvingAgain() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi result",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Single result",
+                        candidates: [
+                            .fixture(selectionID: "page:solo", title: "Only Part", index: 1)
+                        ],
+                        defaultSelectionID: "page:solo"
+                    )),
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await model.reResolve(serverAddressText: "mac-mini.local:50051")
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:solo")
+        XCTAssertEqual(requests.first?.selection?.legacySingleSelectionID, "page:solo")
+
+        model.clearTask()
+    }
+
     func testReResolveWithInvalidEndpointKeepsExistingCandidates() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
@@ -1007,6 +1053,49 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi", "BV1multi"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testReResolveFailureIsIgnoredWhenInputChangesBeforeCompletion() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1old",
+                        title: "Resolved result",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1old",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setSuspendsResolveResponses(true)
+        let reResolveTask = Task {
+            await model.reResolve(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(2)
+        XCTAssertTrue(model.isResolving)
+
+        model.sourceText = "BV1new"
+        await client.completeNextResolve(with: .failure(FakeLocalizedError(message: "Old upstream timeout.")))
+        await reResolveTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolvedInput)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Bilibili input changed before resolve completed.")
         let requests = await client.createdRequestsSnapshot()
         XCTAssertTrue(requests.isEmpty)
     }
@@ -2626,6 +2715,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func setSuspendsCreateResponses(_ suspendsCreateResponses: Bool) {
         self.suspendsCreateResponses = suspendsCreateResponses
+    }
+
+    func setSuspendsResolveResponses(_ suspendsResolveResponses: Bool) {
+        self.suspendsResolveResponses = suspendsResolveResponses
     }
 
     func setSuspendsCancelResponses(_ suspendsCancelResponses: Bool) {
