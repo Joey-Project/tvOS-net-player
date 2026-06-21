@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "description": "Canonical real Bilibili inputs for the tvOS-net-player LAN cache live e2e smoke suite.",
   "cases": [
     {
@@ -50,6 +50,63 @@
       "minimum_candidates": 1,
       "selection": "default_or_first",
       "requires_restricted_area_path": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "authenticated-history",
+      "description": "Authenticated watch-history page; requires a BBDown web cookie and validates through LAN HLS playback for the first available normal video.",
+      "url": "https://www.bilibili.com/account/history",
+      "expected_source_kind": "history",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_authentication": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "authenticated-watch-later",
+      "description": "Authenticated watch-later list; requires a BBDown web cookie and validates through LAN HLS playback for the first available normal video.",
+      "url": "https://www.bilibili.com/watchlater",
+      "expected_source_kind": "watch_later",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_authentication": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "authenticated-following-feed",
+      "description": "Authenticated following dynamic feed; requires a BBDown web cookie and validates through LAN HLS playback for the first available normal-video archive card.",
+      "url": "https://t.bilibili.com/",
+      "expected_source_kind": "following",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_authentication": true,
+      "playback_options": {
+        "quality_preference": "360p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    },
+    {
+      "id": "authenticated-space-dynamic",
+      "description": "Authenticated uploader dynamic feed; BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL can override the default mid for account-specific validation.",
+      "url": "https://space.bilibili.com/2/dynamic",
+      "url_env": "BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL",
+      "expected_source_kind": "space_dynamic",
+      "minimum_candidates": 1,
+      "selection": "first",
+      "requires_authentication": true,
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",

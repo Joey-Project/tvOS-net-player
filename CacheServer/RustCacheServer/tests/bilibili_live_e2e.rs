@@ -10,9 +10,11 @@ use tvos_net_player_cache_server::{
     AppState,
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
-        BilibiliPlaybackOptions, BilibiliTaskResultItem, BilibiliTaskSelection, CancelTaskRequest,
-        CreateBilibiliPlaybackTaskRequest, GetTaskRequest, PlaybackProtocol, PlaybackSource,
-        ResolveBilibiliInputRequest, Task, TaskState, task_service_client::TaskServiceClient,
+        BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliTaskResultItem,
+        BilibiliTaskSelection, CancelTaskRequest, CreateBilibiliPlaybackTaskRequest,
+        GetBilibiliCredentialStatusRequest, GetTaskRequest, PlaybackProtocol, PlaybackSource,
+        ResolveBilibiliInputRequest, Task, TaskState, server_service_client::ServerServiceClient,
+        task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
 };
@@ -26,27 +28,41 @@ const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 #[ignore = "requires live Bilibili network access and is intentionally outside default CI"]
 async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     let fixture_set = LiveFixtureSet::load();
-    let filter = case_filter_from_env();
+    let run_policy = LiveRunPolicy::from_env();
     let server = LiveTestServer::start().await;
     let http = reqwest::Client::new();
     let mut ran_cases = 0usize;
+    let mut credential_status: Option<BilibiliCredentialStatus> = None;
 
     for case in fixture_set.cases.iter().filter(|case| {
-        filter
+        run_policy
+            .filter
             .as_ref()
             .is_none_or(|filter| filter.contains(&case.id))
     }) {
-        if filter.is_none() && case.requires_restricted_area_path {
-            println!(
-                "skipping {}: requires explicit restricted-area live validation",
-                case.id
-            );
-            continue;
+        match run_policy.run_decision(case) {
+            LiveRunDecision::Run => {}
+            LiveRunDecision::Skip(reason) => {
+                println!("skipping {}: {reason}", case.id);
+                continue;
+            }
+        }
+
+        if case.requires_authentication && credential_status.is_none() {
+            credential_status =
+                Some(fetch_bilibili_credential_status(server.channel().await).await);
         }
 
         ran_cases += 1;
         println!("running {}", case.id);
-        run_live_case(case, server.channel().await, &http, &server.media_url).await;
+        run_live_case(
+            case,
+            server.channel().await,
+            &http,
+            &server.media_url,
+            credential_status.as_ref(),
+        )
+        .await;
     }
 
     assert!(
@@ -60,17 +76,26 @@ async fn run_live_case(
     channel: tonic::transport::Channel,
     http: &reqwest::Client,
     media_url: &str,
+    credential_status: Option<&BilibiliCredentialStatus>,
 ) {
+    assert_authenticated_case_ready(case, credential_status);
+
     let mut task_client = TaskServiceClient::new(channel);
     let options = case.playback_options.to_proto();
+    let source = case.source();
 
     let resolved = task_client
         .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
-            url_or_id: case.url.clone(),
+            url_or_id: source.clone(),
             options: Some(options.clone()),
         }))
         .await
-        .unwrap_or_else(|error| panic!("{}: resolve failed: {error}", case.id))
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                live_failure_message(case, "resolve", &error.to_string(), credential_status)
+            )
+        })
         .into_inner();
 
     assert!(
@@ -83,27 +108,52 @@ async fn run_live_case(
         "{}: unexpected source kind",
         case.id
     );
-    assert!(
-        resolved.candidates.len() >= case.minimum_candidates,
-        "{}: expected at least {} candidates, got {}",
-        case.id,
-        case.minimum_candidates,
-        resolved.candidates.len()
-    );
+    if resolved.candidates.len() < case.minimum_candidates {
+        panic!(
+            "{}",
+            live_failure_message(
+                case,
+                "resolve candidates",
+                &format!(
+                    "expected at least {} candidates, got {}",
+                    case.minimum_candidates,
+                    resolved.candidates.len()
+                ),
+                credential_status,
+            )
+        );
+    }
 
     let selection = case.selection_request(&resolved);
     let created = task_client
         .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
-            url_or_id: case.url.clone(),
+            url_or_id: source,
             options: Some(options),
             selection_id: selection.legacy_selection_id.clone(),
             selection: Some(selection.selection.clone()),
         }))
         .await
-        .unwrap_or_else(|error| panic!("{}: create playback task failed: {error}", case.id))
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                live_failure_message(
+                    case,
+                    "create playback task",
+                    &error.to_string(),
+                    credential_status,
+                )
+            )
+        })
         .into_inner();
 
-    let playable = wait_for_playable_task(&mut task_client, case, &created.id, &selection).await;
+    let playable = wait_for_playable_task(
+        &mut task_client,
+        case,
+        &created.id,
+        &selection,
+        credential_status,
+    )
+    .await;
     let source = playable
         .playback_source
         .as_ref()
@@ -146,6 +196,7 @@ async fn wait_for_playable_task(
     case: &LiveCase,
     task_id: &str,
     selection: &LiveSelectionRequest,
+    credential_status: Option<&BilibiliCredentialStatus>,
 ) -> Task {
     let timeout = Duration::from_secs(case.timeout_seconds.unwrap_or(90));
     let deadline = tokio::time::Instant::now() + timeout;
@@ -166,19 +217,28 @@ async fn wait_for_playable_task(
             }
             TaskState::Failed | TaskState::Cancelled => {
                 panic!(
-                    "{}: task ended in {:?}: {}",
-                    case.id,
-                    task.state(),
-                    task.message
+                    "{}",
+                    live_failure_message(
+                        case,
+                        &format!("task ended in {:?}", task.state()),
+                        &task.message,
+                        credential_status,
+                    )
                 );
             }
             _ if tokio::time::Instant::now() >= deadline => {
                 panic!(
-                    "{}: task did not become playable within {:?}; last state {:?}: {}",
-                    case.id,
-                    timeout,
-                    task.state(),
-                    task.message
+                    "{}",
+                    live_failure_message(
+                        case,
+                        &format!(
+                            "task did not become playable within {:?}; last state {:?}",
+                            timeout,
+                            task.state()
+                        ),
+                        &task.message,
+                        credential_status,
+                    )
                 );
             }
             _ => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -403,6 +463,10 @@ impl LiveFixtureSet {
         let path = env::var_os("BILIBILI_LIVE_E2E_FIXTURE")
             .map(PathBuf::from)
             .unwrap_or_else(default_fixture_path);
+        Self::load_from_path(path)
+    }
+
+    fn load_from_path(path: PathBuf) -> Self {
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         serde_json::from_str(&text)
@@ -414,16 +478,29 @@ impl LiveFixtureSet {
 struct LiveCase {
     id: String,
     url: String,
+    #[serde(default)]
+    url_env: Option<String>,
     expected_source_kind: String,
     minimum_candidates: usize,
     selection: SelectionPolicy,
     #[serde(default)]
     requires_restricted_area_path: bool,
+    #[serde(default)]
+    requires_authentication: bool,
     playback_options: LivePlaybackOptions,
     timeout_seconds: Option<u64>,
 }
 
 impl LiveCase {
+    fn source(&self) -> String {
+        self.url_env
+            .as_deref()
+            .and_then(|env_key| env::var(env_key).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.url.clone())
+    }
+
     fn selection_request(
         &self,
         resolved: &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolveResult,
@@ -607,18 +684,244 @@ fn default_fixture_path() -> PathBuf {
         .join(".agents/skills/bilibili-live-e2e/references/live-cases.json")
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum LiveRunDecision {
+    Run,
+    Skip(&'static str),
+}
+
+#[derive(Debug, Default)]
+struct LiveRunPolicy {
+    filter: Option<HashSet<String>>,
+    include_authenticated: bool,
+}
+
+impl LiveRunPolicy {
+    fn from_env() -> Self {
+        Self {
+            filter: case_filter_from_env(),
+            include_authenticated: env_flag("BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED"),
+        }
+    }
+
+    fn run_decision(&self, case: &LiveCase) -> LiveRunDecision {
+        if self.filter.is_none() && case.requires_restricted_area_path {
+            return LiveRunDecision::Skip("requires explicit restricted-area live validation");
+        }
+        if self.filter.is_none() && case.requires_authentication && !self.include_authenticated {
+            return LiveRunDecision::Skip("requires authenticated live validation");
+        }
+        LiveRunDecision::Run
+    }
+}
+
 fn case_filter_from_env() -> Option<HashSet<String>> {
     env::var("BILIBILI_LIVE_E2E_CASES")
         .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect::<HashSet<_>>()
-        })
+        .map(parse_case_filter)
         .filter(|values| !values.is_empty())
+}
+
+fn parse_case_filter(value: String) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<HashSet<_>>()
+}
+
+fn env_flag(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+async fn fetch_bilibili_credential_status(
+    channel: tonic::transport::Channel,
+) -> BilibiliCredentialStatus {
+    ServerServiceClient::new(channel)
+        .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to read Bilibili credential status from live server: {error}")
+        })
+        .into_inner()
+}
+
+fn assert_authenticated_case_ready(case: &LiveCase, status: Option<&BilibiliCredentialStatus>) {
+    if !case.requires_authentication {
+        return;
+    }
+    let Some(status) = status else {
+        panic!(
+            "{}: credential failure: credential status was not fetched",
+            case.id
+        );
+    };
+    if status.credential_file_loaded && status.web_cookie_present {
+        return;
+    }
+
+    panic!(
+        "{}: credential failure: authenticated case requires a loaded BBDown credential file with a web cookie; {}",
+        case.id,
+        credential_status_summary(status)
+    );
+}
+
+fn credential_status_summary(status: &BilibiliCredentialStatus) -> String {
+    format!(
+        "state={} credential_file_loaded={} web_cookie_present={} access_key_present={} tv_access_key_present={}",
+        status.state,
+        status.credential_file_loaded,
+        status.web_cookie_present,
+        status.access_key_present,
+        status.tv_access_key_present
+    )
+}
+
+fn live_failure_message(
+    case: &LiveCase,
+    phase: &str,
+    detail: &str,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> String {
+    let class = classify_live_failure(case, phase, detail, credential_status);
+    format!("{}: {phase} failed [{}]: {detail}", case.id, class.as_str())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveFailureClass {
+    Credential,
+    EmptyAccountState,
+    UpstreamSchemaOrAvailability,
+    RestrictedProxy,
+    ServerBug,
+}
+
+impl LiveFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            LiveFailureClass::Credential => "credential",
+            LiveFailureClass::EmptyAccountState => "empty_account_state",
+            LiveFailureClass::UpstreamSchemaOrAvailability => "upstream_schema_or_availability",
+            LiveFailureClass::RestrictedProxy => "restricted_proxy",
+            LiveFailureClass::ServerBug => "server_bug",
+        }
+    }
+}
+
+fn classify_live_failure(
+    case: &LiveCase,
+    phase: &str,
+    detail: &str,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> LiveFailureClass {
+    let detail = detail.to_ascii_lowercase();
+    if case.requires_authentication
+        && credential_status
+            .is_some_and(|status| !status.credential_file_loaded || !status.web_cookie_present)
+    {
+        return LiveFailureClass::Credential;
+    }
+    if case.requires_authentication
+        && contains_any(
+            &detail,
+            &[
+                "credential",
+                "cookie",
+                "login",
+                "not logged",
+                "sessdata",
+                "csrf",
+                "unauthorized",
+                "-101",
+                "账号未登录",
+                "未登录",
+            ],
+        )
+    {
+        return LiveFailureClass::Credential;
+    }
+    if contains_any(
+        &detail,
+        &[
+            "selected bilibili item",
+            "selected collection item",
+            "was not found",
+            "no longer matches",
+        ],
+    ) {
+        return LiveFailureClass::UpstreamSchemaOrAvailability;
+    }
+    if case.requires_authentication
+        && contains_any(
+            &detail,
+            &[
+                "empty",
+                "no selected",
+                "no selectable",
+                "0 candidates",
+                "got 0",
+                "没有更多",
+            ],
+        )
+    {
+        return LiveFailureClass::EmptyAccountState;
+    }
+    if case.requires_restricted_area_path
+        && contains_any(
+            &detail,
+            &[
+                "area",
+                "region",
+                "restricted",
+                "proxy",
+                "地区",
+                "版权",
+                "不可观看",
+            ],
+        )
+    {
+        return LiveFailureClass::RestrictedProxy;
+    }
+    if phase.contains("resolve") || looks_like_upstream_planning_failure(&detail) {
+        return LiveFailureClass::UpstreamSchemaOrAvailability;
+    }
+    LiveFailureClass::ServerBug
+}
+
+fn looks_like_upstream_planning_failure(detail: &str) -> bool {
+    contains_any(
+        detail,
+        &[
+            "upstream",
+            "schema",
+            "availability",
+            "playurl",
+            "resolve",
+            "failed to fetch",
+            "request failed",
+            "network",
+            "connection",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "http status",
+            "status 429",
+            "status 500",
+            "status 502",
+            "status 503",
+            "status 504",
+            "missing field",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 struct LiveTestServer {
@@ -741,4 +1044,259 @@ async fn wait_for_grpc(grpc_url: &str) {
     }
 
     panic!("gRPC server did not start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_set_includes_authenticated_page_fetch_cases() {
+        let fixture_set = LiveFixtureSet::load_from_path(default_fixture_path());
+        let cases = fixture_set
+            .cases
+            .iter()
+            .map(|case| (case.id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for (id, source_kind) in [
+            ("authenticated-history", "history"),
+            ("authenticated-watch-later", "watch_later"),
+            ("authenticated-following-feed", "following"),
+            ("authenticated-space-dynamic", "space_dynamic"),
+        ] {
+            let case = cases.get(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert!(case.requires_authentication, "{id} should require auth");
+            assert_eq!(case.expected_source_kind, source_kind);
+            assert!(case.minimum_candidates >= 1);
+        }
+
+        assert_eq!(
+            cases["authenticated-space-dynamic"].url_env.as_deref(),
+            Some("BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL")
+        );
+    }
+
+    #[test]
+    fn run_policy_skips_authenticated_cases_by_default() {
+        let policy = LiveRunPolicy::default();
+        let case = test_case("authenticated-history", true, false);
+
+        assert_eq!(
+            policy.run_decision(&case),
+            LiveRunDecision::Skip("requires authenticated live validation")
+        );
+    }
+
+    #[test]
+    fn run_policy_runs_authenticated_cases_when_included() {
+        let policy = LiveRunPolicy {
+            filter: None,
+            include_authenticated: true,
+        };
+        let case = test_case("authenticated-history", true, false);
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_explicit_filter_runs_authenticated_cases() {
+        let policy = LiveRunPolicy {
+            filter: Some(parse_case_filter("authenticated-history".to_owned())),
+            include_authenticated: false,
+        };
+        let case = test_case("authenticated-history", true, false);
+
+        assert_eq!(policy.run_decision(&case), LiveRunDecision::Run);
+    }
+
+    #[test]
+    fn run_policy_still_skips_restricted_cases_by_default() {
+        let policy = LiveRunPolicy::default();
+        let case = test_case("bangumi-media-series", false, true);
+
+        assert_eq!(
+            policy.run_decision(&case),
+            LiveRunDecision::Skip("requires explicit restricted-area live validation")
+        );
+    }
+
+    #[test]
+    fn failure_classification_prefers_missing_credentials_for_auth_cases() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: false,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_live_failure(&case, "resolve", "upstream error", Some(&status)),
+            LiveFailureClass::Credential
+        );
+    }
+
+    #[test]
+    fn failure_classification_labels_empty_account_state() {
+        let case = test_case("authenticated-watch-later", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_live_failure(
+                &case,
+                "resolve",
+                "expected candidates, got 0",
+                Some(&status)
+            ),
+            LiveFailureClass::EmptyAccountState
+        );
+    }
+
+    #[test]
+    fn live_failure_message_labels_empty_resolved_candidates() {
+        let case = test_case("authenticated-watch-later", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        let message = live_failure_message(
+            &case,
+            "resolve candidates",
+            "expected at least 1 candidates, got 0",
+            Some(&status),
+        );
+
+        assert!(message.contains("[empty_account_state]"));
+    }
+
+    #[test]
+    fn failure_classification_keeps_public_zero_candidates_as_upstream() {
+        let case = test_case("ordinary-video-playlist", false, false);
+
+        assert_eq!(
+            classify_live_failure(
+                &case,
+                "resolve candidates",
+                "expected candidates, got 0",
+                None
+            ),
+            LiveFailureClass::UpstreamSchemaOrAvailability
+        );
+    }
+
+    #[test]
+    fn failure_classification_labels_stale_dynamic_selection_as_upstream() {
+        let case = test_case("authenticated-following-feed", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_live_failure(
+                &case,
+                "create",
+                "Selected Bilibili item BV1xx was not found in resolved candidates",
+                Some(&status)
+            ),
+            LiveFailureClass::UpstreamSchemaOrAvailability
+        );
+        assert_eq!(
+            classify_live_failure(
+                &case,
+                "create",
+                "selected item no longer matches the resolved candidate",
+                Some(&status)
+            ),
+            LiveFailureClass::UpstreamSchemaOrAvailability
+        );
+    }
+
+    #[test]
+    fn failure_classification_labels_restricted_proxy_errors() {
+        let case = test_case("bangumi-episode", false, true);
+
+        assert_eq!(
+            classify_live_failure(&case, "resolve", "region restricted", None),
+            LiveFailureClass::RestrictedProxy
+        );
+    }
+
+    #[test]
+    fn failure_classification_labels_generic_resolve_as_upstream() {
+        let case = test_case("authenticated-following-feed", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_live_failure(&case, "resolve", "unexpected JSON shape", Some(&status)),
+            LiveFailureClass::UpstreamSchemaOrAvailability
+        );
+    }
+
+    #[test]
+    fn failure_classification_labels_background_planning_upstream_errors() {
+        let case = test_case("authenticated-following-feed", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        for detail in [
+            "BBDown resolve failed: upstream schema changed",
+            "playurl request failed with HTTP status 503",
+            "network connection timed out while fetching Bilibili page",
+        ] {
+            assert_eq!(
+                classify_live_failure(&case, "task ended in Failed", detail, Some(&status)),
+                LiveFailureClass::UpstreamSchemaOrAvailability,
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_classification_labels_non_resolve_generic_as_server_bug() {
+        let case = test_case("ordinary-video-playlist", false, false);
+
+        assert_eq!(
+            classify_live_failure(&case, "task ended in Failed", "playlist write failed", None),
+            LiveFailureClass::ServerBug
+        );
+    }
+
+    fn test_case(
+        id: impl Into<String>,
+        requires_authentication: bool,
+        requires_restricted_area_path: bool,
+    ) -> LiveCase {
+        LiveCase {
+            id: id.into(),
+            url: "https://www.bilibili.com/account/history".to_owned(),
+            url_env: None,
+            expected_source_kind: "history".to_owned(),
+            minimum_candidates: 1,
+            selection: SelectionPolicy::First,
+            requires_restricted_area_path,
+            requires_authentication,
+            playback_options: LivePlaybackOptions {
+                quality_preference: "360p".to_owned(),
+                encoding_preference: "h264".to_owned(),
+                prefer_tv_api: false,
+                audio_language: String::new(),
+            },
+            timeout_seconds: None,
+        }
+    }
 }

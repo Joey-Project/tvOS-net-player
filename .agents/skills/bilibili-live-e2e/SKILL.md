@@ -11,7 +11,7 @@ Validate the real Bilibili path through the repo-owned Rust LAN cache server and
 
 ## Workflow
 
-1. Read `references/live-cases.json` before running or modifying the live suite. It contains the canonical four real URLs and their expected intent.
+1. Read `references/live-cases.json` before running or modifying the live suite. It contains the canonical real URLs and their expected intent.
 2. Read `references/restricted-api-proxies.json` before restricted-area validation. It records BiliRoaming public reverse proxies, sorted by latest known successful playback validation.
 3. Run the deterministic local gate first when changing code:
 
@@ -32,7 +32,22 @@ BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-6. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Public BiliRoaming reverse proxies are web-mode API proxies, so use `BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY` and keep the fixture `prefer_tv_api` disabled for these cases. Proxy requests may include the configured `access_key`; use a self-hosted or otherwise trusted proxy for normal validation, and use public proxies only with a disposable/test credential or for explicit availability probing. Pass local restricted-area runtime settings through these environment variables:
+6. Default runs skip `requires_authentication` cases. Run authenticated cases explicitly with `BILIBILI_LIVE_E2E_CASES`, or include all authenticated cases in an unfiltered local run with `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`. These cases require a BBDown credential file containing a web cookie; `access_key` alone is not enough for web-page fetch coverage. `authenticated-space-dynamic` defaults to `https://space.bilibili.com/2/dynamic`, but local validation should usually override it with an account-relevant uploader dynamic URL:
+
+```bash
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_CASES=authenticated-history,authenticated-watch-later,authenticated-following-feed \
+just test-bilibili-live
+
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL='https://space.bilibili.com/<mid>/dynamic' \
+BILIBILI_LIVE_E2E_CASES=authenticated-space-dynamic \
+just test-bilibili-live
+```
+
+Authenticated failure messages are classified as `credential`, `empty_account_state`, `upstream_schema_or_availability`, `restricted_proxy`, or `server_bug` to keep live validation actionable.
+
+7. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Public BiliRoaming reverse proxies are web-mode API proxies, so use `BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY` and keep the fixture `prefer_tv_api` disabled for these cases. Proxy requests may include the configured `access_key`; use a self-hosted or otherwise trusted proxy for normal validation, and use public proxies only with a disposable/test credential or for explicit availability probing. Pass local restricted-area runtime settings through these environment variables:
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -43,13 +58,13 @@ just test-bilibili-live
 ```
 
 The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `access_key`, and `tv_access_key` fields. Do not commit real credentials or real proxy tokens.
-7. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, or upstream availability.
+8. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, account state, or upstream availability.
 
 ## Scope
 
 - The live suite starts a local Rust cache server, resolves each Bilibili input, creates a progressive playback task, waits for a playable HLS source, and fetches the generated master playlist.
 - The suite does not run in default `just ci` or GitHub Actions.
-- The suite is for macOS/local development first; physical Apple TV validation remains a separate deploy path.
+- The suite is for macOS/local development first. Physical Apple TV validation is intentionally outside the current plan.
 - The media plane must remain HTTP/HLS through the LAN cache server. Do not make the Swift app fetch Bilibili media URLs directly to satisfy this test.
 - Public reverse proxies cannot be used with BBDown TV playurl mode. TV login remains useful for direct TV API checks, but restricted-area public proxy validation should use web/app planning paths. Treat public hosts as untrusted by default because restricted API proxy requests can include an `access_key`.
 

@@ -75,6 +75,7 @@ superseded_by:
 
 ### PR 4: Authenticated Page Fetch Live Fixtures
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-21-authenticated-page-fetch-fixtures-f6a8b0.md`.
 - Extend the repo-local live e2e skill with authenticated history, watch-later, following feed, and dynamic feed cases.
 - Use local credential files and keep these cases outside default CI.
 - Classify failures as credential, empty account state, upstream schema/availability, restricted proxy, or server bug.
