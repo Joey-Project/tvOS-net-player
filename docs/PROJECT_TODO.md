@@ -1,6 +1,5 @@
 # Project TODO
 
-- [pending] PR 1：接入 BBDown native progress 和 cancellation 到 server task state。
 - [pending] PR 2：扩展 Bilibili 下载 options schema，包括 audio language、AI subtitle policy 和 sidecar/danmaku controls。
 - [pending] PR 3：增加 server-owned credential health/control-plane foundation，不向客户端暴露 secret。
 - [pending] PR 4：增加 authenticated history、watch-later、following/dynamic live fixtures。
@@ -11,6 +10,7 @@
 - [pending] PR 9：推进 segment-level fill / prefetch。
 - [pending] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [pending] PR 11：增加 LAN transcoding foundation。
+- [completed] PR 1：接入 BBDown native progress 和 cancellation 到 server task state。
 - [completed] PR 0：升级 `bbdown-core` 到 `BBDown-rust` `v0.5.0`，刷新文档，并用现有 macOS/live e2e 路径验证基线。
 - [completed] 在共享 AppCore、tvOS app 和 macOS app 增加 Bilibili URL/BV task 提交和进度 UI。
 - [completed] 配置真实 BBDown restricted-area proxy/credentials 后，验证 `bangumi-media-series` 和 `bangumi-episode` 两个真实番剧 live e2e case；公共反代需要 web-mode restricted API proxy，不能走 TV API。

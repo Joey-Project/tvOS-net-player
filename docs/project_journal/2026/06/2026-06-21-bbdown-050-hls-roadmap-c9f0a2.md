@@ -26,6 +26,7 @@ superseded_by:
 ## Current State
 
 - PR 0 pins the cache server's `bbdown-core` dependency to `BBDown-rust` `v0.5.0`.
+- PR 1 maps BBDown native complete-download progress/cancellation into server task state.
 - Progressive Bilibili playback, HLS passthrough, durable HLS cache, watermark eviction, weak-network fill scheduling, Bonjour discovery, macOS/tvOS Bilibili task UI, and multi-result selection are implemented.
 - The live e2e skill records canonical ordinary video, multi-part video, Bangumi media, and Bangumi episode samples. Restricted Bangumi validation has passed locally with a private credential file and a web-mode restricted API proxy.
 - Public BiliRoaming reverse proxies are tracked as web-mode restricted API proxies and must not be paired with BBDown TV playurl mode.
@@ -52,6 +53,7 @@ superseded_by:
 
 ### PR 1: Native BBDown Progress And Cancellation
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-21-bbdown-native-progress-cancellation-d1a7b4.md`.
 - Map `DownloadProgressEvent` into `BilibiliTaskProgress` for complete-download tasks.
 - Bridge `BilibiliTaskCancellation` into `DownloadCancellationToken`.
 - Report terminal success, failure, and cancellation using BBDown summaries instead of only coarse adapter phases.
@@ -149,6 +151,14 @@ superseded_by:
   - `just ci`
   - `just test-bilibili-live` with default non-restricted live cases.
 - PR 0 restricted Bangumi live cases remain explicit credential/proxy validation and are covered by the later authenticated fixture PRs, not by the default PR 0 gate.
+- PR 1 local gate:
+  - `cargo fmt --all`
+  - `cargo test --package tvos-net-player-cache-server --locked`
+  - `python3 /Users/joey/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - `just ci`
+  - `just test-bilibili-live`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`

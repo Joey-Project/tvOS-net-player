@@ -31,7 +31,7 @@ superseded_by: 20260621-c9f0a2
 - The mux phase checks task cancellation before starting and while `ffmpeg` is running; cancellation kills and reaps the child process before returning a cancelled task result.
 - BV/av inputs default to current/first page, while ss/md inputs default to latest episode because the task result schema currently exposes one `library_item_id`.
 - `BBDown-rust` `v0.5.0` retains feed/history/watch-later inputs and the page/list fetch foundation; the cache server maps collection/feed-style inputs to the latest item by default for legacy single-result downloads until a richer task result schema is used.
-- Progress remains coarse-grained until the cache-server adapter maps BBDown `v0.5.0` native download progress and cancellation APIs into server task state.
+- Complete-download progress now maps BBDown `v0.5.0` native `DownloadProgressEvent` file-level byte updates into server task state, and running complete-download cancellation is bridged into BBDown `DownloadCancellationToken`.
 
 ## Next Steps
 

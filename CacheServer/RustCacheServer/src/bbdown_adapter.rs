@@ -1,21 +1,23 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fmt::Display,
     future::Future,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use bbdown_core::{
-    BiliClient, ClientConfig, CredentialStore, Credentials, DownloadArchive, DownloadFileKind,
-    DownloadOptions, DownloadReport, DuplicateDecision, EntryDownloadReport, Error as BbdownError,
-    HttpHeaderSpec, IndexSelection, Input, MediaRequestKind, MediaRequestSpec, MuxOptions,
-    MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata,
-    PlaybackCodecPreference, PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode,
-    ResolvedContent, RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection,
-    StreamSelection, VideoCollectionKind,
+    BiliClient, ClientConfig, CredentialStore, Credentials, DownloadArchive,
+    DownloadCancellationToken, DownloadFileKind, DownloadOptions, DownloadProgressEvent,
+    DownloadProgressSink, DownloadReport, DuplicateDecision, EntryDownloadReport,
+    Error as BbdownError, HttpHeaderSpec, IndexSelection, Input, MediaRequestKind,
+    MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
+    PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
+    PlaybackVariantKind, PlayurlMode, ResolvedContent, RestrictedArea, RestrictedAreaConfig,
+    RestrictedAreaProxy, Selection, StreamSelection, VideoCollectionKind,
 };
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
 
@@ -37,6 +39,10 @@ use crate::{
 const BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
 const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT as u32;
 const BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1;
+const DOWNLOAD_PROGRESS_START: f64 = 0.10;
+const DOWNLOAD_PROGRESS_END: f64 = 0.80;
+const ACTIVE_ENTRY_PROGRESS_CAP: f64 = 0.70;
+const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
@@ -277,19 +283,24 @@ impl BbdownBilibiliAdapter {
         }
 
         let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
-        let report = run_bbdown_until_cancelled(
-            client.download_plan_with_archive_decision(
+        let download_cancellation = DownloadCancellationToken::new();
+        let download_progress = BilibiliBbdownProgressSink::new(context.clone());
+        let report = run_bbdown_download_until_cancelled(
+            client.download_plan_with_archive_decision_with_progress_and_cancellation(
                 &plan,
                 download_options,
                 &mut archive,
                 DuplicateDecision::KeepBoth,
+                &download_progress,
+                &download_cancellation,
             ),
+            &download_cancellation,
             || context.is_cancel_requested(),
             "Cancelled while the BBDown download was running.",
         )
         .await?;
 
-        let downloaded_bytes = downloaded_bytes(&report);
+        let downloaded_bytes = report.summary().total_bytes;
         if context.is_cancel_requested() {
             cleanup_downloaded_media_sources(&report).await;
             return Err(BilibiliDownloadError::Cancelled(
@@ -560,6 +571,35 @@ where
     }
 }
 
+async fn run_bbdown_download_until_cancelled<T>(
+    future: impl Future<Output = Result<T, BbdownError>>,
+    cancellation: &DownloadCancellationToken,
+    is_cancel_requested: impl Fn() -> bool,
+    cancellation_message: &'static str,
+) -> Result<T, BilibiliDownloadError> {
+    tokio::pin!(future);
+    loop {
+        if is_cancel_requested() && !cancellation.is_cancelled() {
+            cancellation.cancel_with_reason(cancellation_message);
+        }
+
+        tokio::select! {
+            result = &mut future => {
+                return match result {
+                    Ok(value) => Ok(value),
+                    Err(error) if error.is_cancelled() => Err(BilibiliDownloadError::Cancelled(
+                        cancellation
+                            .reason()
+                            .unwrap_or_else(|| error.to_string()),
+                    )),
+                    Err(error) => Err(failed(error)),
+                };
+            }
+            () = sleep(BBDOWN_CANCELLATION_POLL_INTERVAL) => {}
+        }
+    }
+}
+
 async fn run_bbdown_core_until_cancelled<T>(
     future: impl Future<Output = Result<T, BbdownError>>,
     is_cancel_requested: &impl Fn() -> bool,
@@ -589,6 +629,262 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
         progress: Some(progress),
         message: Some(message.into()),
         ..BilibiliTaskProgress::default()
+    }
+}
+
+struct BilibiliBbdownProgressSink {
+    context: BilibiliDownloadContext,
+    accumulator: StdMutex<BilibiliBbdownProgressAccumulator>,
+}
+
+impl BilibiliBbdownProgressSink {
+    fn new(context: BilibiliDownloadContext) -> Self {
+        Self {
+            context,
+            accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+        }
+    }
+}
+
+impl DownloadProgressSink for BilibiliBbdownProgressSink {
+    fn on_download_progress(&self, event: &DownloadProgressEvent) {
+        let progress = self
+            .accumulator
+            .lock()
+            .ok()
+            .and_then(|mut accumulator| accumulator.record(event));
+        if let Some(progress) = progress {
+            self.context.report_progress(progress);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BilibiliBbdownProgressAccumulator {
+    entry_count: Option<usize>,
+    completed_entries: usize,
+    files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
+    last_progress: f64,
+}
+
+#[derive(Default)]
+struct BilibiliBbdownFileProgress {
+    resumed_from: u64,
+    bytes_written: u64,
+    expected_size: Option<u64>,
+}
+
+impl BilibiliBbdownFileProgress {
+    fn downloaded_bytes(&self) -> u64 {
+        self.resumed_from.saturating_add(self.bytes_written)
+    }
+
+    fn total_bytes(&self) -> Option<u64> {
+        self.expected_size
+            .map(|expected_size| expected_size.max(self.downloaded_bytes()))
+    }
+}
+
+impl BilibiliBbdownProgressAccumulator {
+    fn record(&mut self, event: &DownloadProgressEvent) -> Option<BilibiliTaskProgress> {
+        match event {
+            DownloadProgressEvent::PlanStarted { entry_count, .. } => {
+                self.entry_count = Some((*entry_count).max(1));
+                self.message_progress(
+                    DOWNLOAD_PROGRESS_START,
+                    format!("Downloading {entry_count} Bilibili entry(s)."),
+                )
+            }
+            DownloadProgressEvent::EntryStarted { index, title, .. } => {
+                let progress = self.current_download_progress();
+                self.message_progress(
+                    progress,
+                    format!("Downloading Bilibili entry {index}: {title}."),
+                )
+            }
+            DownloadProgressEvent::FileStarted {
+                entry_title,
+                kind,
+                path,
+                resumed_from,
+                expected_size,
+                ..
+            } => {
+                self.files.insert(
+                    path.clone(),
+                    BilibiliBbdownFileProgress {
+                        resumed_from: *resumed_from,
+                        bytes_written: 0,
+                        expected_size: *expected_size,
+                    },
+                );
+                Some(self.bytes_progress(format!(
+                    "Downloading {} for {entry_title}.",
+                    download_file_kind_label(kind),
+                )))
+            }
+            DownloadProgressEvent::FileProgress {
+                entry_title,
+                kind,
+                path,
+                bytes_written,
+                resumed_from,
+                expected_size,
+                ..
+            } => {
+                let file = self.files.entry(path.clone()).or_default();
+                file.resumed_from = *resumed_from;
+                file.bytes_written = *bytes_written;
+                file.expected_size = *expected_size;
+                Some(self.bytes_progress(format!(
+                    "Downloading {} for {entry_title}.",
+                    download_file_kind_label(kind),
+                )))
+            }
+            DownloadProgressEvent::FileCompleted {
+                entry_title,
+                kind,
+                path,
+                bytes_written,
+                resumed_from,
+                total_bytes,
+                ..
+            } => {
+                self.files.insert(
+                    path.clone(),
+                    BilibiliBbdownFileProgress {
+                        resumed_from: *resumed_from,
+                        bytes_written: *bytes_written,
+                        expected_size: Some(*total_bytes),
+                    },
+                );
+                Some(self.bytes_progress(format!(
+                    "Downloaded {} for {entry_title}.",
+                    download_file_kind_label(kind),
+                )))
+            }
+            DownloadProgressEvent::FileFailed {
+                entry_title,
+                kind,
+                error,
+                ..
+            } => {
+                let progress = self.current_download_progress();
+                self.message_progress(
+                    progress,
+                    format!(
+                        "Retrying {} for {entry_title} after BBDown error: {error}",
+                        download_file_kind_label(kind),
+                    ),
+                )
+            }
+            DownloadProgressEvent::EntryCompleted { index, title, .. } => {
+                self.completed_entries = self
+                    .completed_entries
+                    .max(usize::try_from(*index).unwrap_or(usize::MAX))
+                    .min(self.entry_count.unwrap_or(usize::MAX));
+                Some(self.bytes_progress(format!("Downloaded Bilibili entry {index}: {title}.")))
+            }
+            DownloadProgressEvent::PlanCompleted { entry_count, .. } => {
+                self.completed_entries = *entry_count;
+                self.message_progress(
+                    DOWNLOAD_PROGRESS_END,
+                    format!("Downloaded {entry_count} Bilibili entry(s)."),
+                )
+            }
+            DownloadProgressEvent::PlanCancelled { error, .. } => {
+                let progress = self.current_download_progress();
+                self.message_progress(progress, format!("BBDown download cancelled: {error}"))
+            }
+            DownloadProgressEvent::PlanFailed { error, .. } => {
+                let progress = self.current_download_progress();
+                self.message_progress(progress, format!("BBDown download failed: {error}"))
+            }
+            DownloadProgressEvent::MuxStarted { .. }
+            | DownloadProgressEvent::MuxCompleted { .. }
+            | DownloadProgressEvent::MuxFailed { .. }
+            | DownloadProgressEvent::EntryFailed { .. } => None,
+            _ => None,
+        }
+    }
+
+    fn bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
+        let (downloaded_bytes, total_bytes) = self.bytes_snapshot();
+        BilibiliTaskProgress {
+            progress: Some(self.current_download_progress()),
+            downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
+            total_bytes: total_bytes.map(to_i64_saturating),
+            message: Some(message),
+        }
+    }
+
+    fn message_progress(&mut self, progress: f64, message: String) -> Option<BilibiliTaskProgress> {
+        self.last_progress = self.last_progress.max(progress.clamp(0.0, 1.0));
+        Some(BilibiliTaskProgress {
+            progress: Some(self.last_progress),
+            message: Some(message),
+            ..BilibiliTaskProgress::default()
+        })
+    }
+
+    fn current_download_progress(&mut self) -> f64 {
+        let entry_count = self.entry_count.unwrap_or(1).max(1);
+        let completed_entries = self.completed_entries.min(entry_count);
+        let active_entry_ratio = if completed_entries < entry_count {
+            self.known_bytes_ratio().min(ACTIVE_ENTRY_PROGRESS_CAP)
+        } else {
+            0.0
+        };
+        let download_ratio =
+            ((completed_entries as f64) + active_entry_ratio) / (entry_count as f64);
+        let progress = DOWNLOAD_PROGRESS_START
+            + ((DOWNLOAD_PROGRESS_END - DOWNLOAD_PROGRESS_START) * download_ratio.clamp(0.0, 1.0));
+        self.last_progress = self
+            .last_progress
+            .max(progress.clamp(0.0, DOWNLOAD_PROGRESS_END));
+        self.last_progress
+    }
+
+    fn known_bytes_ratio(&self) -> f64 {
+        let (downloaded_bytes, total_bytes) = self.bytes_snapshot();
+        let Some(total_bytes) = total_bytes else {
+            return 0.0;
+        };
+        if total_bytes == 0 {
+            return 0.0;
+        }
+        (downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0)
+    }
+
+    fn bytes_snapshot(&self) -> (u64, Option<u64>) {
+        let mut downloaded_bytes = 0_u64;
+        let mut total_bytes = 0_u64;
+        let mut all_totals_known = !self.files.is_empty();
+        for file in self.files.values() {
+            downloaded_bytes = downloaded_bytes.saturating_add(file.downloaded_bytes());
+            if let Some(file_total_bytes) = file.total_bytes() {
+                total_bytes = total_bytes.saturating_add(file_total_bytes);
+            } else {
+                all_totals_known = false;
+            }
+        }
+        (
+            downloaded_bytes,
+            all_totals_known.then_some(total_bytes.max(downloaded_bytes)),
+        )
+    }
+}
+
+fn download_file_kind_label(kind: &DownloadFileKind) -> &'static str {
+    match kind {
+        DownloadFileKind::Video => "video",
+        DownloadFileKind::Audio => "audio",
+        DownloadFileKind::FlvSegment => "FLV segment",
+        DownloadFileKind::Cover => "cover",
+        DownloadFileKind::Subtitle => "subtitle",
+        DownloadFileKind::Danmaku => "danmaku",
+        DownloadFileKind::DanmakuAss => "danmaku ASS",
+        _ => "download file",
     }
 }
 
@@ -2004,15 +2300,6 @@ async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError>
     }
 }
 
-fn downloaded_bytes(report: &DownloadReport) -> u64 {
-    report
-        .entries
-        .iter()
-        .flat_map(|entry| &entry.files)
-        .map(|file| file.bytes_written.saturating_add(file.resumed_from))
-        .sum()
-}
-
 fn to_i64_saturating(value: u64) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
@@ -3083,6 +3370,116 @@ mod tests {
     }
 
     #[test]
+    fn bbdown_progress_events_map_file_bytes_into_task_progress() {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+
+        let plan_progress = accumulator
+            .record(&DownloadProgressEvent::PlanStarted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 1,
+            })
+            .expect("plan start should report progress");
+        assert_eq!(Some(DOWNLOAD_PROGRESS_START), plan_progress.progress);
+
+        let path = PathBuf::from("out/entry/video.m4s");
+        let started_progress = accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: path.clone(),
+                resumed_from: 25,
+                expected_size: Some(200),
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("file start should report progress");
+        assert_eq!(Some(25), started_progress.downloaded_bytes);
+        assert_eq!(Some(200), started_progress.total_bytes);
+
+        let file_progress = accumulator
+            .record(&DownloadProgressEvent::FileProgress {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: path.clone(),
+                bytes_delta: 75,
+                bytes_written: 75,
+                resumed_from: 25,
+                expected_size: Some(200),
+            })
+            .expect("file progress should report progress");
+        assert_eq!(Some(100), file_progress.downloaded_bytes);
+        assert_eq!(Some(200), file_progress.total_bytes);
+        let progress = file_progress.progress.expect("progress should be set");
+        assert!(progress > DOWNLOAD_PROGRESS_START);
+        assert!(progress < DOWNLOAD_PROGRESS_END);
+
+        let completed_progress = accumulator
+            .record(&DownloadProgressEvent::FileCompleted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path,
+                bytes_written: 175,
+                resumed_from: 25,
+                total_bytes: 200,
+            })
+            .expect("file complete should report progress");
+        assert_eq!(Some(200), completed_progress.downloaded_bytes);
+        assert_eq!(Some(200), completed_progress.total_bytes);
+
+        let plan_completed = accumulator
+            .record(&DownloadProgressEvent::PlanCompleted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 1,
+            })
+            .expect("plan complete should report progress");
+        assert_eq!(Some(DOWNLOAD_PROGRESS_END), plan_completed.progress);
+    }
+
+    #[tokio::test]
+    async fn bbdown_download_cancellation_uses_core_token() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let cancellation = DownloadCancellationToken::new();
+        let cancellation_for_future = cancellation.clone();
+        let observed_cancelled_token = Arc::new(AtomicBool::new(false));
+        let observed_cancelled_token_for_future = Arc::clone(&observed_cancelled_token);
+        let future = async move {
+            cancellation_for_future.cancelled().await;
+            observed_cancelled_token_for_future
+                .store(cancellation_for_future.is_cancelled(), Ordering::SeqCst);
+            Err::<(), BbdownError>(BbdownError::Cancelled {
+                reason: cancellation_for_future
+                    .reason()
+                    .unwrap_or_else(|| "missing reason".to_owned()),
+            })
+        };
+
+        let result = run_bbdown_download_until_cancelled(
+            future,
+            &cancellation,
+            || true,
+            "Cancelled while the BBDown download was running.",
+        )
+        .await;
+
+        assert!(cancellation.is_cancelled());
+        assert!(observed_cancelled_token.load(Ordering::SeqCst));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Cancelled(message))
+                if message == "Cancelled while the BBDown download was running."
+        ));
+    }
+
+    #[test]
     fn prefers_mux_outputs_before_raw_downloaded_files() {
         let report = DownloadReport {
             title: "Example".to_owned(),
@@ -3120,7 +3517,7 @@ mod tests {
                 PathBuf::from("out/entry/video.m4s")
             ]
         );
-        assert_eq!(downloaded_bytes(&report), 18);
+        assert_eq!(report.summary().total_bytes, 18);
     }
 
     #[test]
