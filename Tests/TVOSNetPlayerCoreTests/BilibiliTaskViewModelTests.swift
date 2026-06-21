@@ -752,6 +752,24 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testPlayablePartialTaskCapsBytePercentAtOverallProgress() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(progress: 0.45, downloadedBytes: 100, totalBytes: 100))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1partial",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Filling offline cache 45%")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "arrow.down.circle")
+
+        model.clearTask()
+    }
+
     func testMultiResultTaskExposesSummaryAndPlayableResultFallback() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [
@@ -2356,6 +2374,7 @@ private extension CacheTask {
         libraryItemID: String = "",
         playbackSourceItemID: String? = nil,
         message: String = "Bilibili playback session is playable.",
+        progress: Double? = nil,
         downloadedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
         resultItems: [BilibiliTaskResultItem] = []
@@ -2365,7 +2384,7 @@ private extension CacheTask {
             id: id,
             source: source,
             state: state,
-            progress: totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 1,
+            progress: progress ?? (totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 1),
             downloadedBytes: downloadedBytes,
             totalBytes: totalBytes,
             message: message,

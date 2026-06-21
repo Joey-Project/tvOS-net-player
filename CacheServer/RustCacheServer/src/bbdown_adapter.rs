@@ -1008,6 +1008,29 @@ impl BilibiliBbdownProgressAccumulator {
         self.known_bytes_snapshot_for(&self.files)
     }
 
+    fn completed_entries_bytes_snapshot(&self) -> (u64, Option<u64>) {
+        let mut downloaded_bytes = 0_u64;
+        let mut total_bytes = 0_u64;
+        let mut any_file = false;
+        let mut all_totals_known = true;
+        for (path, file) in &self.files {
+            if self.active_entry_files.contains_key(path) {
+                continue;
+            }
+            any_file = true;
+            downloaded_bytes = downloaded_bytes.saturating_add(file.downloaded_bytes());
+            if let Some(file_total_bytes) = file.total_bytes() {
+                total_bytes = total_bytes.saturating_add(file_total_bytes);
+            } else {
+                all_totals_known = false;
+            }
+        }
+        (
+            downloaded_bytes,
+            (any_file && all_totals_known).then_some(total_bytes.max(downloaded_bytes)),
+        )
+    }
+
     fn known_bytes_snapshot_for(
         &self,
         files: &HashMap<PathBuf, BilibiliBbdownFileProgress>,
@@ -1030,10 +1053,11 @@ impl BilibiliBbdownProgressAccumulator {
     }
 
     fn reported_bytes_snapshot(&self) -> (u64, Option<u64>) {
-        let (downloaded_bytes, known_total_bytes) = self.known_bytes_snapshot();
-        if self.active_entry_in_progress {
-            return (0, Some(0));
-        }
+        let (downloaded_bytes, known_total_bytes) = if self.active_entry_in_progress {
+            self.completed_entries_bytes_snapshot()
+        } else {
+            self.known_bytes_snapshot()
+        };
         if let Some(known_total_bytes) = known_total_bytes {
             return (downloaded_bytes, Some(known_total_bytes));
         }
@@ -3776,7 +3800,7 @@ mod tests {
             })
             .expect("entry start should report progress");
         let second_path = PathBuf::from("out/4/video.m4s");
-        accumulator
+        let second_started = accumulator
             .record(&DownloadProgressEvent::FileStarted {
                 entry_index: 4,
                 entry_title: "Page 4".to_owned(),
@@ -3788,6 +3812,9 @@ mod tests {
                 max_attempts: 1,
             })
             .expect("file start should report progress");
+        assert_progress_near(second_started.progress, 0.45);
+        assert_eq!(Some(100), second_started.downloaded_bytes);
+        assert_eq!(Some(100), second_started.total_bytes);
         let second_half_done = accumulator
             .record(&DownloadProgressEvent::FileProgress {
                 entry_index: 4,
@@ -3801,10 +3828,10 @@ mod tests {
             })
             .expect("second entry progress should report progress");
         assert_progress_near(second_half_done.progress, 0.625);
-        assert_eq!(Some(0), second_half_done.downloaded_bytes);
-        assert_eq!(Some(0), second_half_done.total_bytes);
+        assert_eq!(Some(100), second_half_done.downloaded_bytes);
+        assert_eq!(Some(100), second_half_done.total_bytes);
 
-        accumulator
+        let second_file_done = accumulator
             .record(&DownloadProgressEvent::FileCompleted {
                 entry_index: 4,
                 entry_title: "Page 4".to_owned(),
@@ -3815,6 +3842,9 @@ mod tests {
                 total_bytes: 100,
             })
             .expect("second file complete should report progress");
+        assert_progress_near(second_file_done.progress, 0.625);
+        assert_eq!(Some(100), second_file_done.downloaded_bytes);
+        assert_eq!(Some(100), second_file_done.total_bytes);
         let all_entries_done = accumulator
             .record(&DownloadProgressEvent::EntryCompleted {
                 index: 4,

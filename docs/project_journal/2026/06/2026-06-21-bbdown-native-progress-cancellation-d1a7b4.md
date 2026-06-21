@@ -26,7 +26,8 @@ superseded_by:
 - Preserve the existing coarse adapter phase boundaries: planning starts at 2%, BBDown download spans 10% to 80%, server muxing reports 80%, and library indexing reports 95%.
 - Use `DownloadReport::summary().total_bytes` for completed byte totals so resumed bytes and freshly written bytes share BBDown's upstream summary semantics.
 - Coalesce high-frequency BBDown file progress events by byte/progress delta before publishing them to task watchers, while still publishing file start/completion and plan/entry state transitions.
-- Report `downloaded_bytes: 0` and `total_bytes: 0` while a BBDown entry is still active, so persisted task state clears stale totals and clients fall back to adapter phase progress until `EntryCompleted` confirms the entry's full file universe.
+- While a BBDown entry is active, report only already completed entries' byte snapshot; if no completed entry bytes are known, report `0/0` so persisted task state clears stale totals and clients fall back to adapter phase progress until `EntryCompleted` confirms the active entry's full file universe.
+- Cap tvOS/macOS offline-cache percentage labels at the task's overall phase progress so completed-entry byte snapshots cannot make a multi-entry task look nearly complete before the full plan finishes.
 - Track multi-entry download progress from completed event count and current-entry byte ratio, because BBDown entry indices are source page/episode/item indices rather than guaranteed contiguous ordinals within a selected plan.
 - Cap an incomplete entry's active byte contribution until `EntryCompleted`, because BBDown reports files as they start and an entry can still have unstarted DASH audio, FLV segments, subtitles, danmaku, or cover files.
 - Preserve cancellation semantics when the task registry has already requested cancellation and BBDown returns a late non-cancel error before observing the token.

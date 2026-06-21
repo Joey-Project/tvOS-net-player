@@ -1511,7 +1511,9 @@ private extension CacheTask {
 
     var offlineCachePercentLabel: String? {
         if totalBytes > 0, downloadedBytes > 0 {
-            let ratio = min(max(Double(downloadedBytes) / Double(totalBytes), 0), 0.99)
+            let byteRatio = min(max(Double(downloadedBytes) / Double(totalBytes), 0), 0.99)
+            let overallRatio = progress > 0 ? min(max(progress, 0), 0.99) : byteRatio
+            let ratio = min(byteRatio, overallRatio)
             return "\(Int((ratio * 100).rounded()))%"
         }
 
