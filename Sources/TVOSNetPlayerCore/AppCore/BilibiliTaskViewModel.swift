@@ -686,6 +686,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
+        guard CacheServerEndpoint.normalized(from: serverAddressText) != nil else {
+            errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
+            statusMessage = "Cache server address is invalid."
+            return
+        }
+
         resolvedInput = nil
         resolvedInputContext = nil
         clearCandidateSelection()

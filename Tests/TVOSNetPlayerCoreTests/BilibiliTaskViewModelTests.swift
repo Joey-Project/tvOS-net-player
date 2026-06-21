@@ -750,6 +750,46 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testReResolveWithInvalidEndpointKeepsExistingCandidates() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Resolved result",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.selectedCandidateID = "page:2"
+
+        await model.reResolve(serverAddressText: "not a valid endpoint")
+
+        XCTAssertEqual(
+            model.errorMessage, "Use a cache server host and optional port before submitting Bilibili playback.")
+        XCTAssertEqual(model.statusMessage, "Cache server address is invalid.")
+        XCTAssertEqual(model.resolvedInput?.title, "Resolved result")
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])
+        XCTAssertEqual(model.selectedCandidateID, "page:2")
+        XCTAssertTrue(model.canSubmit)
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     func testSubmitReResolvesWhenEndpointChangesAfterCandidateSelection() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
