@@ -805,17 +805,15 @@ impl BilibiliBbdownProgressAccumulator {
             DownloadProgressEvent::FileFailed {
                 entry_title,
                 kind,
+                path,
                 error,
                 ..
             } => {
-                let progress = self.current_download_progress();
-                self.message_progress(
-                    progress,
-                    format!(
-                        "Retrying {} for {entry_title} after BBDown error: {error}",
-                        download_file_kind_label(kind),
-                    ),
-                )
+                self.rollback_file_progress(path);
+                Some(self.published_rollback_bytes_progress(format!(
+                    "Retrying {} for {entry_title} after BBDown error: {error}",
+                    download_file_kind_label(kind),
+                )))
             }
             DownloadProgressEvent::EntryCompleted { index, title, .. } => {
                 if self.completed_entry_indices.insert(*index) {
@@ -859,6 +857,13 @@ impl BilibiliBbdownProgressAccumulator {
         self.bytes_progress(downloaded_bytes, total_bytes, progress, message)
     }
 
+    fn published_rollback_bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
+        let progress = self.current_download_progress_allowing_rollback();
+        let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
+        self.mark_published(downloaded_bytes, progress);
+        self.bytes_progress(downloaded_bytes, total_bytes, progress, message)
+    }
+
     fn throttled_bytes_progress(&mut self, message: String) -> Option<BilibiliTaskProgress> {
         let progress = self.current_download_progress();
         let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
@@ -895,6 +900,21 @@ impl BilibiliBbdownProgressAccumulator {
     }
 
     fn current_download_progress(&mut self) -> f64 {
+        let progress = self.download_progress_from_current_state();
+        self.last_progress = self
+            .last_progress
+            .max(progress.clamp(0.0, DOWNLOAD_PROGRESS_END));
+        self.last_progress
+    }
+
+    fn current_download_progress_allowing_rollback(&mut self) -> f64 {
+        self.last_progress = self
+            .download_progress_from_current_state()
+            .clamp(0.0, DOWNLOAD_PROGRESS_END);
+        self.last_progress
+    }
+
+    fn download_progress_from_current_state(&self) -> f64 {
         let entry_count = self.entry_count.unwrap_or(1).max(1);
         let completed_entries = self.completed_entries.min(entry_count);
         let active_entry_ratio = if completed_entries < entry_count {
@@ -908,12 +928,8 @@ impl BilibiliBbdownProgressAccumulator {
         };
         let download_ratio =
             ((completed_entries as f64) + active_entry_ratio) / (entry_count as f64);
-        let progress = DOWNLOAD_PROGRESS_START
-            + ((DOWNLOAD_PROGRESS_END - DOWNLOAD_PROGRESS_START) * download_ratio.clamp(0.0, 1.0));
-        self.last_progress = self
-            .last_progress
-            .max(progress.clamp(0.0, DOWNLOAD_PROGRESS_END));
-        self.last_progress
+        DOWNLOAD_PROGRESS_START
+            + ((DOWNLOAD_PROGRESS_END - DOWNLOAD_PROGRESS_START) * download_ratio.clamp(0.0, 1.0))
     }
 
     fn known_bytes_ratio(&self) -> f64 {
@@ -970,7 +986,16 @@ impl BilibiliBbdownProgressAccumulator {
 
     fn mark_published(&mut self, downloaded_bytes: u64, progress: f64) {
         self.last_published_downloaded_bytes = downloaded_bytes;
-        self.last_published_progress = self.last_published_progress.max(progress);
+        self.last_published_progress = progress;
+    }
+
+    fn rollback_file_progress(&mut self, path: &Path) {
+        if let Some(file) = self.files.get_mut(path) {
+            file.bytes_written = 0;
+        }
+        if let Some(file) = self.active_entry_files.get_mut(path) {
+            file.bytes_written = 0;
+        }
     }
 }
 
@@ -2426,6 +2451,71 @@ mod tests {
         );
     }
 
+    fn accumulator_after_failed_bbdown_file_attempt()
+    -> (BilibiliBbdownProgressAccumulator, BilibiliTaskProgress) {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+        let path = PathBuf::from("out/entry/video.m4s");
+
+        accumulator
+            .record(&DownloadProgressEvent::PlanStarted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 1,
+            })
+            .expect("plan start should report progress");
+        accumulator
+            .record(&DownloadProgressEvent::EntryStarted {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: PathBuf::from("out/entry"),
+            })
+            .expect("entry start should report progress");
+        accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: path.clone(),
+                resumed_from: 0,
+                expected_size: Some(100),
+                attempt: 1,
+                max_attempts: 2,
+            })
+            .expect("file start should report progress");
+        let file_progress = accumulator
+            .record(&DownloadProgressEvent::FileProgress {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: path.clone(),
+                bytes_delta: 50,
+                bytes_written: 50,
+                resumed_from: 0,
+                expected_size: Some(100),
+            })
+            .expect("file progress should report progress");
+        assert_progress_near(file_progress.progress, 0.45);
+        assert_eq!(Some(50), file_progress.downloaded_bytes);
+        assert_eq!(Some(100), file_progress.total_bytes);
+
+        let failed_progress = accumulator
+            .record(&DownloadProgressEvent::FileFailed {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path,
+                attempt: 1,
+                max_attempts: 2,
+                error: "stream reset".to_owned(),
+            })
+            .expect("file failure should publish rolled-back byte progress");
+        assert_progress_near(failed_progress.progress, DOWNLOAD_PROGRESS_START);
+        assert_eq!(Some(0), failed_progress.downloaded_bytes);
+        assert_eq!(Some(100), failed_progress.total_bytes);
+
+        (accumulator, failed_progress)
+    }
+
     #[test]
     fn maps_common_video_quality_preferences() {
         assert_eq!(video_quality_preference("1080p"), Some(80));
@@ -3813,6 +3903,43 @@ mod tests {
             Some(to_i64_saturating(expected_downloaded)),
             published_progress.total_bytes
         );
+    }
+
+    #[test]
+    fn bbdown_file_failed_rolls_back_bytes_before_terminal_events() {
+        let (mut cancelled_accumulator, failed_progress) =
+            accumulator_after_failed_bbdown_file_attempt();
+        assert!(
+            failed_progress
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Retrying video"))
+        );
+
+        let plan_cancelled = cancelled_accumulator
+            .record(&DownloadProgressEvent::PlanCancelled {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                completed_entries: 0,
+                error: "cancelled".to_owned(),
+            })
+            .expect("plan cancellation should report progress");
+        assert_progress_near(plan_cancelled.progress, DOWNLOAD_PROGRESS_START);
+        assert_eq!(None, plan_cancelled.downloaded_bytes);
+        assert_eq!(None, plan_cancelled.total_bytes);
+
+        let (mut failed_accumulator, _) = accumulator_after_failed_bbdown_file_attempt();
+        let plan_failed = failed_accumulator
+            .record(&DownloadProgressEvent::PlanFailed {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                completed_entries: 0,
+                error: "download failed".to_owned(),
+            })
+            .expect("plan failure should report progress");
+        assert_progress_near(plan_failed.progress, DOWNLOAD_PROGRESS_START);
+        assert_eq!(None, plan_failed.downloaded_bytes);
+        assert_eq!(None, plan_failed.total_bytes);
     }
 
     #[tokio::test]

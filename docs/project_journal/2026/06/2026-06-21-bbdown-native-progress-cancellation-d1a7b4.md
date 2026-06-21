@@ -30,6 +30,7 @@ superseded_by:
 - Track multi-entry download progress from completed event count and current-entry byte ratio, because BBDown entry indices are source page/episode/item indices rather than guaranteed contiguous ordinals within a selected plan.
 - Cap an incomplete entry's active byte contribution until `EntryCompleted`, because BBDown reports files as they start and an entry can still have unstarted DASH audio, FLV segments, subtitles, danmaku, or cover files.
 - Preserve cancellation semantics when the task registry has already requested cancellation and BBDown returns a late non-cancel error before observing the token.
+- Roll back per-file accumulated bytes on BBDown `FileFailed`, because BBDown truncates failed attempts back to the attempt start offset before retrying, cancelling, or failing the plan.
 - Do not persist high-frequency progress updates to disk; task lifecycle persistence remains unchanged.
 
 ## Validation
