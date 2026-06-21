@@ -25,6 +25,8 @@ superseded_by:
 - Scope native cancellation to the BBDown download call, where `download_plan_with_archive_decision_with_progress_and_cancellation` provides both progress and cancellation.
 - Preserve the existing coarse adapter phase boundaries: planning starts at 2%, BBDown download spans 10% to 80%, server muxing reports 80%, and library indexing reports 95%.
 - Use `DownloadReport::summary().total_bytes` for completed byte totals so resumed bytes and freshly written bytes share BBDown's upstream summary semantics.
+- Coalesce high-frequency BBDown file progress events by byte/progress delta before publishing them to task watchers, while still publishing file start/completion and plan/entry state transitions.
+- Report a conservative total equal to downloaded bytes when BBDown has no expected file size, because task progress updates currently treat `total_bytes: None` as "leave the previous total unchanged".
 - Do not persist high-frequency progress updates to disk; task lifecycle persistence remains unchanged.
 
 ## Validation

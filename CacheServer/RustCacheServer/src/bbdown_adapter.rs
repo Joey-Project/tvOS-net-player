@@ -43,6 +43,8 @@ const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
 const ACTIVE_ENTRY_PROGRESS_CAP: f64 = 0.70;
 const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
@@ -665,6 +667,8 @@ struct BilibiliBbdownProgressAccumulator {
     completed_entries: usize,
     files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
     last_progress: f64,
+    last_published_downloaded_bytes: u64,
+    last_published_progress: f64,
 }
 
 #[derive(Default)]
@@ -718,7 +722,7 @@ impl BilibiliBbdownProgressAccumulator {
                         expected_size: *expected_size,
                     },
                 );
-                Some(self.bytes_progress(format!(
+                Some(self.published_bytes_progress(format!(
                     "Downloading {} for {entry_title}.",
                     download_file_kind_label(kind),
                 )))
@@ -736,10 +740,10 @@ impl BilibiliBbdownProgressAccumulator {
                 file.resumed_from = *resumed_from;
                 file.bytes_written = *bytes_written;
                 file.expected_size = *expected_size;
-                Some(self.bytes_progress(format!(
+                self.throttled_bytes_progress(format!(
                     "Downloading {} for {entry_title}.",
                     download_file_kind_label(kind),
-                )))
+                ))
             }
             DownloadProgressEvent::FileCompleted {
                 entry_title,
@@ -758,7 +762,7 @@ impl BilibiliBbdownProgressAccumulator {
                         expected_size: Some(*total_bytes),
                     },
                 );
-                Some(self.bytes_progress(format!(
+                Some(self.published_bytes_progress(format!(
                     "Downloaded {} for {entry_title}.",
                     download_file_kind_label(kind),
                 )))
@@ -783,7 +787,9 @@ impl BilibiliBbdownProgressAccumulator {
                     .completed_entries
                     .max(usize::try_from(*index).unwrap_or(usize::MAX))
                     .min(self.entry_count.unwrap_or(usize::MAX));
-                Some(self.bytes_progress(format!("Downloaded Bilibili entry {index}: {title}.")))
+                Some(self.published_bytes_progress(format!(
+                    "Downloaded Bilibili entry {index}: {title}."
+                )))
             }
             DownloadProgressEvent::PlanCompleted { entry_count, .. } => {
                 self.completed_entries = *entry_count;
@@ -808,10 +814,32 @@ impl BilibiliBbdownProgressAccumulator {
         }
     }
 
-    fn bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
-        let (downloaded_bytes, total_bytes) = self.bytes_snapshot();
+    fn published_bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
+        let progress = self.current_download_progress();
+        let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
+        self.mark_published(downloaded_bytes, progress);
+        self.bytes_progress(downloaded_bytes, total_bytes, progress, message)
+    }
+
+    fn throttled_bytes_progress(&mut self, message: String) -> Option<BilibiliTaskProgress> {
+        let progress = self.current_download_progress();
+        let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
+        if !self.should_publish_file_progress(downloaded_bytes, progress) {
+            return None;
+        }
+        self.mark_published(downloaded_bytes, progress);
+        Some(self.bytes_progress(downloaded_bytes, total_bytes, progress, message))
+    }
+
+    fn bytes_progress(
+        &self,
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+        progress: f64,
+        message: String,
+    ) -> BilibiliTaskProgress {
         BilibiliTaskProgress {
-            progress: Some(self.current_download_progress()),
+            progress: Some(progress),
             downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
             total_bytes: total_bytes.map(to_i64_saturating),
             message: Some(message),
@@ -820,6 +848,7 @@ impl BilibiliBbdownProgressAccumulator {
 
     fn message_progress(&mut self, progress: f64, message: String) -> Option<BilibiliTaskProgress> {
         self.last_progress = self.last_progress.max(progress.clamp(0.0, 1.0));
+        self.last_published_progress = self.last_progress;
         Some(BilibiliTaskProgress {
             progress: Some(self.last_progress),
             message: Some(message),
@@ -846,7 +875,7 @@ impl BilibiliBbdownProgressAccumulator {
     }
 
     fn known_bytes_ratio(&self) -> f64 {
-        let (downloaded_bytes, total_bytes) = self.bytes_snapshot();
+        let (downloaded_bytes, total_bytes) = self.known_bytes_snapshot();
         let Some(total_bytes) = total_bytes else {
             return 0.0;
         };
@@ -856,7 +885,7 @@ impl BilibiliBbdownProgressAccumulator {
         (downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0)
     }
 
-    fn bytes_snapshot(&self) -> (u64, Option<u64>) {
+    fn known_bytes_snapshot(&self) -> (u64, Option<u64>) {
         let mut downloaded_bytes = 0_u64;
         let mut total_bytes = 0_u64;
         let mut all_totals_known = !self.files.is_empty();
@@ -872,6 +901,26 @@ impl BilibiliBbdownProgressAccumulator {
             downloaded_bytes,
             all_totals_known.then_some(total_bytes.max(downloaded_bytes)),
         )
+    }
+
+    fn reported_bytes_snapshot(&self) -> (u64, Option<u64>) {
+        let (downloaded_bytes, known_total_bytes) = self.known_bytes_snapshot();
+        (
+            downloaded_bytes,
+            Some(known_total_bytes.unwrap_or(downloaded_bytes)),
+        )
+    }
+
+    fn should_publish_file_progress(&self, downloaded_bytes: u64, progress: f64) -> bool {
+        downloaded_bytes == 0
+            || downloaded_bytes.saturating_sub(self.last_published_downloaded_bytes)
+                >= DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES
+            || (progress - self.last_published_progress) >= DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION
+    }
+
+    fn mark_published(&mut self, downloaded_bytes: u64, progress: f64) {
+        self.last_published_downloaded_bytes = downloaded_bytes;
+        self.last_published_progress = self.last_published_progress.max(progress);
     }
 }
 
@@ -3438,6 +3487,69 @@ mod tests {
             })
             .expect("plan complete should report progress");
         assert_eq!(Some(DOWNLOAD_PROGRESS_END), plan_completed.progress);
+    }
+
+    #[test]
+    fn bbdown_file_progress_is_throttled_and_unknown_totals_remain_conservative() {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+        let path = PathBuf::from("out/entry/video.m4s");
+
+        accumulator
+            .record(&DownloadProgressEvent::PlanStarted {
+                title: "Example".to_owned(),
+                output_dir: PathBuf::from("out"),
+                entry_count: 1,
+            })
+            .expect("plan start should report progress");
+
+        let started_progress = accumulator
+            .record(&DownloadProgressEvent::FileStarted {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: path.clone(),
+                resumed_from: 25,
+                expected_size: None,
+                attempt: 1,
+                max_attempts: 1,
+            })
+            .expect("file start should report progress");
+        assert_eq!(Some(25), started_progress.downloaded_bytes);
+        assert_eq!(Some(25), started_progress.total_bytes);
+
+        let tiny_progress = accumulator.record(&DownloadProgressEvent::FileProgress {
+            entry_index: 1,
+            entry_title: "Entry".to_owned(),
+            kind: DownloadFileKind::Video,
+            path: path.clone(),
+            bytes_delta: 1,
+            bytes_written: 1,
+            resumed_from: 25,
+            expected_size: None,
+        });
+        assert!(tiny_progress.is_none());
+
+        let published_progress = accumulator
+            .record(&DownloadProgressEvent::FileProgress {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path,
+                bytes_delta: DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES,
+                bytes_written: DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES + 1,
+                resumed_from: 25,
+                expected_size: None,
+            })
+            .expect("large byte delta should report progress");
+        let expected_downloaded = DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES + 26;
+        assert_eq!(
+            Some(to_i64_saturating(expected_downloaded)),
+            published_progress.downloaded_bytes
+        );
+        assert_eq!(
+            Some(to_i64_saturating(expected_downloaded)),
+            published_progress.total_bytes
+        );
     }
 
     #[tokio::test]
