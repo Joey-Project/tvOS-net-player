@@ -186,6 +186,10 @@ private struct BilibiliCandidateSelectionRequest {
     let legacySelectionID: String?
 }
 
+private enum BilibiliRetryIntent {
+    case reResolve
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
@@ -235,6 +239,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var activePlaybackTaskID: String?
     private var activePlaybackLibraryItemID: String?
     private var activePlaybackResultID: String?
+    private var retryIntent: BilibiliRetryIntent?
     private var isNormalizingCandidateSelection = false
     private var isChoosingRangeEnd = false
 
@@ -543,6 +548,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard canSubmit else {
             return
         }
+        retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
@@ -676,6 +682,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func retry(serverAddressText: String) async {
+        if retryIntent == .reResolve, canReResolve {
+            await reResolve(serverAddressText: serverAddressText)
+            return
+        }
+
+        retryIntent = nil
         if let source = currentTask?.source.trimmingCharacters(in: .whitespacesAndNewlines),
             !source.isEmpty
         {
@@ -689,6 +701,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard canReResolve else {
             return
         }
+        retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
@@ -758,6 +771,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             currentTask = nil
             errorMessage = error.localizedDescription
             statusMessage = "Could not resolve Bilibili input."
+            retryIntent = .reResolve
             isResolving = false
             isSubmitting = false
         }
@@ -914,6 +928,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
+        retryIntent = nil
         currentTask = nil
         errorMessage = nil
         isSubmitting = false
@@ -1244,6 +1259,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     ) async {
         stopWatching()
         activeEndpoint = endpoint
+        retryIntent = nil
         isSubmitting = true
         isResolving = false
         errorMessage = nil

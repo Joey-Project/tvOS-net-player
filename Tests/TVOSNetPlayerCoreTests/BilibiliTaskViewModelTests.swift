@@ -946,6 +946,16 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                         defaultSelectionID: "page:1"
                     )),
                 .failure(FakeLocalizedError(message: "Upstream timed out.")),
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Refreshed result",
+                        candidates: [
+                            .fixture(selectionID: "page:3", title: "Part 3", index: 3),
+                            .fixture(selectionID: "page:4", title: "Part 4", index: 4),
+                        ],
+                        defaultSelectionID: "page:3"
+                    )),
             ],
             createResponses: []
         )
@@ -968,8 +978,16 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(model.canReResolve)
         XCTAssertFalse(model.isResolving)
 
+        await model.retry(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.statusMessage, "Select a Bilibili item to play.")
+        XCTAssertEqual(model.resolvedInput?.title, "Refreshed result")
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:3", "page:4"])
+        XCTAssertEqual(model.selectedCandidateID, "page:3")
+
         let resolvedRequests = await client.resolvedRequestsSnapshot()
-        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi"])
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi", "BV1multi"])
         let requests = await client.createdRequestsSnapshot()
         XCTAssertTrue(requests.isEmpty)
     }
