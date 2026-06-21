@@ -1535,7 +1535,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private static func isVolatileResolvedSourceKind(_ sourceKind: String) -> Bool {
         switch normalizedBilibiliSourceKind(sourceKind) {
         case "favorite", "space", "collection", "series", "history", "watchlater", "following", "dynamic",
-            "recommendations", "homepage", "feed":
+            "spacedynamic", "recommendation", "recommendations", "homepage", "feed":
             return true
         default:
             return false

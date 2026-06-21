@@ -509,32 +509,37 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(model.canReResolve)
     }
 
-    func testDynamicFeedResolveShowsVolatilityNotice() async {
-        let client = FakeBilibiliCacheControlClient(
-            resolveResponses: [
-                .success(
-                    .fixture(
-                        source: "recommendations",
-                        sourceKind: "recommendations",
-                        candidates: [
-                            .fixture(selectionID: "item:1", title: "Feed Item 1", index: 1),
-                            .fixture(selectionID: "item:2", title: "Feed Item 2", index: 2),
-                        ],
-                        defaultSelectionID: ""
-                    ))
-            ],
-            createResponses: []
-        )
-        let model = BilibiliTaskViewModel(
-            sourceText: "recommendations",
-            clientFactory: { _ in client }
-        )
+    func testDynamicFeedResolveShowsVolatilityNoticeForServerSourceKinds() async {
+        for (source, sourceKind) in [
+            ("recommendations", "recommendation"),
+            ("https://t.bilibili.com/", "space_dynamic"),
+        ] {
+            let client = FakeBilibiliCacheControlClient(
+                resolveResponses: [
+                    .success(
+                        .fixture(
+                            source: source,
+                            sourceKind: sourceKind,
+                            candidates: [
+                                .fixture(selectionID: "item:1", title: "Feed Item 1", index: 1),
+                                .fixture(selectionID: "item:2", title: "Feed Item 2", index: 2),
+                            ],
+                            defaultSelectionID: ""
+                        ))
+                ],
+                createResponses: []
+            )
+            let model = BilibiliTaskViewModel(
+                sourceText: source,
+                clientFactory: { _ in client }
+            )
 
-        await model.submit(serverAddressText: "mac-mini.local:50051")
+            await model.submit(serverAddressText: "mac-mini.local:50051")
 
-        XCTAssertEqual(model.fetchNotice?.title, "List may change")
-        XCTAssertEqual(model.fetchNotice?.tone, .info)
-        XCTAssertTrue(model.canReResolve)
+            XCTAssertEqual(model.fetchNotice?.title, "List may change", sourceKind)
+            XCTAssertEqual(model.fetchNotice?.tone, .info, sourceKind)
+            XCTAssertTrue(model.canReResolve, sourceKind)
+        }
     }
 
     func testEmptyResolveShowsEmptyListNotice() async {
