@@ -512,7 +512,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return BilibiliFetchNotice(
                 title: "List may change",
                 message:
-                    "This Bilibili list or feed can reorder between refreshes. Stable item IDs are sent when you submit selected items.",
+                    "This Bilibili list or feed can reorder between refreshes. Single and multiple selections submit stable item IDs; Range and All follow the refreshed list order.",
                 systemImage: "arrow.triangle.2.circlepath",
                 tone: .info,
                 actionTitle: "Re-resolve"
@@ -711,11 +711,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let sequence = operationSequence
 
         stopWatching()
-        activeEndpoint = endpoint
         currentTask = nil
-        resolvedInput = nil
-        resolvedInputContext = nil
-        clearCandidateSelection()
         isResolving = true
         isSubmitting = false
         errorMessage = nil
@@ -737,6 +733,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
+            activeEndpoint = endpoint
             resolvedInput = resolved
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
@@ -759,9 +756,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             currentTask = nil
-            resolvedInput = nil
-            resolvedInputContext = nil
-            clearCandidateSelection()
             errorMessage = error.localizedDescription
             statusMessage = "Could not resolve Bilibili input."
             isResolving = false
@@ -1474,12 +1468,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         let normalized = errorMessage.lowercased()
-        if normalized.contains("login")
-            || normalized.contains("cookie")
-            || normalized.contains("credential")
-            || normalized.contains("auth")
-            || normalized.contains("unauthorized")
-        {
+        if Self.isCredentialFailureMessage(normalized) {
             return BilibiliFetchNotice(
                 title: "Credentials required",
                 message:
@@ -1488,6 +1477,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 tone: .warning,
                 actionTitle: "Retry"
             )
+        }
+
+        if errorMessage.isQuotaOrStorageFailureMessage {
+            return nil
         }
 
         if normalized.contains("empty") || normalized.contains("no item") || normalized.contains("no selectable") {
@@ -1619,6 +1612,36 @@ public final class BilibiliTaskViewModel: ObservableObject {
         default:
             return false
         }
+    }
+
+    private static func isCredentialFailureMessage(_ normalizedMessage: String) -> Bool {
+        if normalizedMessage.contains("-101")
+            || normalizedMessage.contains("\u{672a}\u{767b}\u{5f55}")
+            || normalizedMessage.contains("not logged")
+            || normalizedMessage.contains("not login")
+            || normalizedMessage.contains("login")
+            || normalizedMessage.contains("cookie")
+            || normalizedMessage.contains("credential")
+            || normalizedMessage.contains("bili_jct")
+            || normalizedMessage.contains("access_key")
+            || normalizedMessage.contains("unauthorized")
+            || normalizedMessage.contains("unauthorised")
+            || normalizedMessage.contains("authentication")
+            || normalizedMessage.contains("authenticate")
+            || normalizedMessage.contains("authorization")
+            || normalizedMessage.contains("authorisation")
+        {
+            return true
+        }
+
+        let tokens = Set(
+            normalizedMessage
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+        )
+        return tokens.contains("auth")
+            || tokens.contains("sessdata")
+            || tokens.contains("csrf")
     }
 
     private static func normalizedBilibiliSourceKind(_ sourceKind: String) -> String {

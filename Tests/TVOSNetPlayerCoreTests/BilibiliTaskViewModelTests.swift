@@ -573,6 +573,11 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
             XCTAssertEqual(model.fetchNotice?.title, "List may change", sourceKind)
             XCTAssertEqual(model.fetchNotice?.tone, .info, sourceKind)
+            XCTAssertEqual(
+                model.fetchNotice?.message,
+                "This Bilibili list or feed can reorder between refreshes. Single and multiple selections submit stable item IDs; Range and All follow the refreshed list order.",
+                sourceKind
+            )
             XCTAssertTrue(model.canReResolve, sourceKind)
         }
     }
@@ -616,6 +621,49 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.fetchNotice?.tone, .warning)
         XCTAssertEqual(model.fetchNotice?.actionTitle, "Retry")
         XCTAssertTrue(model.canRetry)
+    }
+
+    func testBilibiliCredentialFailurePatternsShowCredentialNotice() async {
+        for message in [
+            "API returned code -101.",
+            "account \u{672a}\u{767b}\u{5f55}",
+            "not logged in",
+            "missing SESSDATA",
+            "csrf token is invalid",
+        ] {
+            let client = FakeBilibiliCacheControlClient(
+                resolveResponses: [
+                    .failure(FakeLocalizedError(message: message))
+                ],
+                createResponses: []
+            )
+            let model = BilibiliTaskViewModel(
+                sourceText: "https://t.bilibili.com/",
+                clientFactory: { _ in client }
+            )
+
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+
+            XCTAssertEqual(model.fetchNotice?.title, "Credentials required", message)
+            XCTAssertEqual(model.fetchNotice?.actionTitle, "Retry", message)
+        }
+    }
+
+    func testNonCredentialAuthorityFailureDoesNotShowCredentialNotice() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .failure(FakeLocalizedError(message: "Invalid URL authority for Bilibili input."))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "not a url",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertNotEqual(model.fetchNotice?.title, "Credentials required")
     }
 
     func testRetryableTaskFailureShowsRetryNotice() async {
@@ -880,6 +928,48 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testReResolveFailureKeepsExistingCandidatesAndSelection() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Resolved result",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    )),
+                .failure(FakeLocalizedError(message: "Upstream timed out.")),
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.selectedCandidateID = "page:2"
+
+        await model.reResolve(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.errorMessage, "Upstream timed out.")
+        XCTAssertEqual(model.statusMessage, "Could not resolve Bilibili input.")
+        XCTAssertEqual(model.resolvedInput?.title, "Resolved result")
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])
+        XCTAssertEqual(model.selectedCandidateID, "page:2")
+        XCTAssertTrue(model.canSubmit)
+        XCTAssertTrue(model.canReResolve)
+        XCTAssertFalse(model.isResolving)
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1multi", "BV1multi"])
         let requests = await client.createdRequestsSnapshot()
         XCTAssertTrue(requests.isEmpty)
     }
@@ -1650,6 +1740,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Quota blocked")
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "exclamationmark.triangle")
+        XCTAssertNil(model.fetchNotice)
     }
 
     func testDuplicateSubmitWhileSubmittingDoesNotInvalidateInFlightSubmission() async {
