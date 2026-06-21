@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、repo-local Bilibili live e2e skill、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS gRPC cache client、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、durable HLS offline cache manifests/recovery、completed-HLS quota/watermark eviction、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、repo-local Bilibili live e2e skill、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -23,6 +23,7 @@
 - Bilibili live e2e skill：`docs/project_journal/2026/06/2026-06-19-bilibili-live-e2e-skill-6e4b2a.md`
 - Bilibili task options/result schema roadmap：`docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - BBDown 0.5 and progressive HLS roadmap：`docs/project_journal/2026/06/2026-06-21-bbdown-050-hls-roadmap-c9f0a2.md`
+- BBDown native progress/cancellation workstream：`docs/project_journal/2026/06/2026-06-21-bbdown-native-progress-cancellation-d1a7b4.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
