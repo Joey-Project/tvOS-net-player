@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     generated::tvos_net_player::v1::{
-        BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
-        BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource, Task, TaskKind, TaskState,
+        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliPlaybackOptions,
+        BilibiliPlaybackSession, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
+        BilibiliTaskSelection, PlaybackSource, Task, TaskKind, TaskState,
     },
     hls_cache::HlsCacheStore,
     task_store::{PersistedTaskRecord, TaskStateStore},
@@ -1721,9 +1722,13 @@ struct ActiveBilibiliTaskKey {
     source: String,
     quality_preference: String,
     encoding_preference: String,
+    audio_language: String,
     prefer_tv_api: bool,
     download_subtitles: bool,
     download_danmaku: bool,
+    subtitle_ai_policy: i32,
+    download_cover: bool,
+    danmaku_formats: Vec<i32>,
 }
 
 impl ActiveBilibiliTaskKey {
@@ -1732,9 +1737,13 @@ impl ActiveBilibiliTaskKey {
         if let Some(options) = options {
             key.quality_preference = normalize_option_string(&options.quality_preference);
             key.encoding_preference = normalize_option_string(&options.encoding_preference);
+            key.audio_language = normalize_option_string(&options.audio_language);
             key.prefer_tv_api = options.prefer_tv_api;
             key.download_subtitles = options.download_subtitles;
             key.download_danmaku = options.download_danmaku;
+            key.subtitle_ai_policy = normalize_subtitle_ai_policy_key(options.subtitle_ai_policy);
+            key.download_cover = options.download_cover;
+            key.danmaku_formats = normalize_danmaku_format_keys(&options.danmaku_formats);
         }
         key
     }
@@ -1744,6 +1753,7 @@ impl ActiveBilibiliTaskKey {
         if let Some(options) = options {
             key.quality_preference = normalize_option_string(&options.quality_preference);
             key.encoding_preference = normalize_option_string(&options.encoding_preference);
+            key.audio_language = normalize_option_string(&options.audio_language);
             key.prefer_tv_api = options.prefer_tv_api;
         }
         key
@@ -1755,9 +1765,13 @@ impl ActiveBilibiliTaskKey {
             source: normalize(source),
             quality_preference: String::new(),
             encoding_preference: String::new(),
+            audio_language: String::new(),
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         }
     }
 }
@@ -1780,6 +1794,32 @@ fn normalize(value: &str) -> String {
 
 fn normalize_option_string(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn normalize_subtitle_ai_policy_key(value: i32) -> i32 {
+    match BilibiliSubtitleAiPolicy::try_from(value) {
+        Ok(BilibiliSubtitleAiPolicy::Unspecified | BilibiliSubtitleAiPolicy::Include) => {
+            BilibiliSubtitleAiPolicy::Unspecified.into()
+        }
+        Ok(policy) => policy.into(),
+        Err(_) => value,
+    }
+}
+
+fn normalize_danmaku_format_keys(values: &[i32]) -> Vec<i32> {
+    let mut normalized = values
+        .iter()
+        .copied()
+        .filter(|value| {
+            !matches!(
+                BilibiliDanmakuFormat::try_from(*value),
+                Ok(BilibiliDanmakuFormat::Unspecified)
+            )
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
 }
 
 fn normalize_required_id(id: &str) -> Result<String, Status> {
@@ -2553,6 +2593,10 @@ mod tests {
             prefer_tv_api: true,
             download_subtitles: true,
             download_danmaku: false,
+            audio_language: "ja-jp".to_owned(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::PreferNonAi.into(),
+            download_cover: true,
+            danmaku_formats: vec![BilibiliDanmakuFormat::Xml.into()],
         };
         let task = BilibiliTaskRegistry::with_persistence_path(&path)
             .create_bilibili_task("BV1persist", Some(options.clone()))
@@ -4065,6 +4109,10 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         }
     }
 
@@ -4073,6 +4121,7 @@ mod tests {
             quality_preference: quality_preference.to_owned(),
             encoding_preference: "h264".to_owned(),
             prefer_tv_api: false,
+            audio_language: String::new(),
         }
     }
 

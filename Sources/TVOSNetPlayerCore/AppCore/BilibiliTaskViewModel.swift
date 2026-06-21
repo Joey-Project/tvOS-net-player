@@ -163,6 +163,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
     @Published public var qualityPreference: String
     @Published public var encodingPreference: String
+    @Published public var audioLanguagePreference: String
     @Published public private(set) var currentTask: CacheTask?
     @Published public private(set) var statusMessage: String = "No Bilibili playback task submitted."
     @Published public private(set) var errorMessage: String?
@@ -213,6 +214,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         sourceText: String = "",
         qualityPreference: String = "",
         encodingPreference: String = "",
+        audioLanguagePreference: String = "",
         operationTimeout: Duration = .seconds(10),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
@@ -221,6 +223,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         self.sourceText = sourceText
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
+        self.audioLanguagePreference = audioLanguagePreference
         self.operationTimeout = operationTimeout
         self.clientFactory = clientFactory
     }
@@ -1634,7 +1637,8 @@ private extension BilibiliTaskViewModel {
     var currentPlaybackOptions: BilibiliPlaybackTaskOptions {
         BilibiliPlaybackTaskOptions(
             qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
-            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines)
+            encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 

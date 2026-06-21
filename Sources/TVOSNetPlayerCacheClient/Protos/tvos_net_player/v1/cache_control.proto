@@ -163,6 +163,24 @@ message BilibiliDownloadOptions {
   bool prefer_tv_api = 3;
   bool download_subtitles = 4;
   bool download_danmaku = 5;
+  string audio_language = 6;
+  BilibiliSubtitleAiPolicy subtitle_ai_policy = 7;
+  bool download_cover = 8;
+  repeated BilibiliDanmakuFormat danmaku_formats = 9;
+}
+
+enum BilibiliSubtitleAiPolicy {
+  BILIBILI_SUBTITLE_AI_POLICY_UNSPECIFIED = 0;
+  BILIBILI_SUBTITLE_AI_POLICY_INCLUDE = 1;
+  BILIBILI_SUBTITLE_AI_POLICY_PREFER_NON_AI = 2;
+  BILIBILI_SUBTITLE_AI_POLICY_EXCLUDE_AI = 3;
+  BILIBILI_SUBTITLE_AI_POLICY_ONLY_AI = 4;
+}
+
+enum BilibiliDanmakuFormat {
+  BILIBILI_DANMAKU_FORMAT_UNSPECIFIED = 0;
+  BILIBILI_DANMAKU_FORMAT_XML = 1;
+  BILIBILI_DANMAKU_FORMAT_ASS = 2;
 }
 
 message CreateBilibiliPlaybackTaskRequest {
@@ -176,6 +194,7 @@ message BilibiliPlaybackOptions {
   string quality_preference = 1;
   string encoding_preference = 2;
   bool prefer_tv_api = 3;
+  string audio_language = 4;
 }
 
 message ResolveBilibiliInputRequest {

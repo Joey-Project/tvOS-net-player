@@ -682,6 +682,7 @@ extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
         self.init()
         qualityPreference = options.qualityPreference
         encodingPreference = options.encodingPreference
+        audioLanguage = options.audioLanguagePreference
         preferTvApi = options.preferTVAPI
     }
 }

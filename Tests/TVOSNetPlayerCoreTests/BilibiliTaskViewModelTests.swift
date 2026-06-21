@@ -12,6 +12,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1test",
             qualityPreference: "1080p",
             encodingPreference: "h264",
+            audioLanguagePreference: "ja-jp",
             clientFactory: { _ in client }
         )
 
@@ -25,9 +26,11 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(requests.first?.selection?.selectionIDs, ["page:1"])
         XCTAssertEqual(requests.first?.options.qualityPreference, "1080p")
         XCTAssertEqual(requests.first?.options.encodingPreference, "h264")
+        XCTAssertEqual(requests.first?.options.audioLanguagePreference, "ja-jp")
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.count, 1)
         XCTAssertEqual(resolvedRequests.first?.urlOrID, "BV1test")
+        XCTAssertEqual(resolvedRequests.first?.options.audioLanguagePreference, "ja-jp")
         XCTAssertEqual(model.currentTask?.id, "bilibili-playback-1")
         XCTAssertTrue(model.isWatching)
 
@@ -72,6 +75,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1legacy",
             qualityPreference: "720p",
             encodingPreference: "h265",
+            audioLanguagePreference: "en-US",
             clientFactory: { _ in client }
         )
 
@@ -85,6 +89,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertNil(requests.first?.selectionID)
         XCTAssertEqual(requests.first?.options.qualityPreference, "720p")
         XCTAssertEqual(requests.first?.options.encodingPreference, "h265")
+        XCTAssertEqual(requests.first?.options.audioLanguagePreference, "en-US")
         XCTAssertEqual(model.currentTask?.source, "BV1legacy")
         XCTAssertFalse(model.isResolving)
 

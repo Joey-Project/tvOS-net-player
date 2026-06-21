@@ -404,15 +404,18 @@ public struct CachePlaybackSource: Equatable, Sendable {
 public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
     public let qualityPreference: String
     public let encodingPreference: String
+    public let audioLanguagePreference: String
     public let preferTVAPI: Bool
 
     public init(
         qualityPreference: String = "",
         encodingPreference: String = "",
+        audioLanguagePreference: String = "",
         preferTVAPI: Bool = false
     ) {
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
+        self.audioLanguagePreference = audioLanguagePreference
         self.preferTVAPI = preferTVAPI
     }
 }

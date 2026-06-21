@@ -440,6 +440,14 @@ struct PersistedBilibiliDownloadOptions {
     prefer_tv_api: bool,
     download_subtitles: bool,
     download_danmaku: bool,
+    #[serde(default)]
+    audio_language: String,
+    #[serde(default)]
+    subtitle_ai_policy: i32,
+    #[serde(default)]
+    download_cover: bool,
+    #[serde(default)]
+    danmaku_formats: Vec<i32>,
 }
 
 impl From<BilibiliDownloadOptions> for PersistedBilibiliDownloadOptions {
@@ -450,6 +458,10 @@ impl From<BilibiliDownloadOptions> for PersistedBilibiliDownloadOptions {
             prefer_tv_api: options.prefer_tv_api,
             download_subtitles: options.download_subtitles,
             download_danmaku: options.download_danmaku,
+            audio_language: options.audio_language,
+            subtitle_ai_policy: options.subtitle_ai_policy,
+            download_cover: options.download_cover,
+            danmaku_formats: options.danmaku_formats,
         }
     }
 }
@@ -462,6 +474,10 @@ impl From<PersistedBilibiliDownloadOptions> for BilibiliDownloadOptions {
             prefer_tv_api: options.prefer_tv_api,
             download_subtitles: options.download_subtitles,
             download_danmaku: options.download_danmaku,
+            audio_language: options.audio_language,
+            subtitle_ai_policy: options.subtitle_ai_policy,
+            download_cover: options.download_cover,
+            danmaku_formats: options.danmaku_formats,
         }
     }
 }
@@ -471,6 +487,8 @@ struct PersistedBilibiliPlaybackOptions {
     quality_preference: String,
     encoding_preference: String,
     prefer_tv_api: bool,
+    #[serde(default)]
+    audio_language: String,
 }
 
 impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
@@ -479,6 +497,7 @@ impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
             quality_preference: options.quality_preference,
             encoding_preference: options.encoding_preference,
             prefer_tv_api: options.prefer_tv_api,
+            audio_language: options.audio_language,
         }
     }
 }
@@ -489,6 +508,7 @@ impl From<PersistedBilibiliPlaybackOptions> for BilibiliPlaybackOptions {
             quality_preference: options.quality_preference,
             encoding_preference: options.encoding_preference,
             prefer_tv_api: options.prefer_tv_api,
+            audio_language: options.audio_language,
         }
     }
 }
@@ -509,8 +529,8 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 mod tests {
     use super::*;
     use crate::generated::tvos_net_player::v1::{
-        BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackProtocol,
-        TaskKind, TaskState,
+        BilibiliDanmakuFormat, BilibiliPlaybackVariant, BilibiliSubtitleAiPolicy,
+        BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackProtocol, TaskKind, TaskState,
     };
 
     #[test]
@@ -549,6 +569,74 @@ mod tests {
         assert_eq!(1, records.len());
         assert!(records[0].task.bilibili_selection.is_none());
         assert!(records[0].task.result_items.is_empty());
+    }
+
+    #[test]
+    fn load_legacy_bilibili_options_defaults_new_schema_fields() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "bilibili-options-legacy",
+      "kind": 1,
+      "state": 1,
+      "source": "BV1legacy",
+      "title": "Legacy options",
+      "progress": 0.0,
+      "downloaded_bytes": 0,
+      "total_bytes": 0,
+      "message": "Queued.",
+      "library_item_id": "",
+      "created_at": null,
+      "updated_at": null,
+      "finished_at": null,
+      "bilibili_options": {
+        "quality_preference": "1080p",
+        "encoding_preference": "",
+        "prefer_tv_api": true,
+        "download_subtitles": true,
+        "download_danmaku": false
+      },
+      "bilibili_playback_options": {
+        "quality_preference": "720p",
+        "encoding_preference": "h264",
+        "prefer_tv_api": false
+      }
+    }
+  ]
+}"#,
+        )
+        .expect("legacy options snapshot should be written");
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("legacy options snapshot should load");
+
+        let options = records[0]
+            .options
+            .as_ref()
+            .expect("download options should restore");
+        assert_eq!("1080p", options.quality_preference);
+        assert!(options.prefer_tv_api);
+        assert!(options.download_subtitles);
+        assert!(options.audio_language.is_empty());
+        assert_eq!(
+            BilibiliSubtitleAiPolicy::Unspecified,
+            options.subtitle_ai_policy()
+        );
+        assert!(!options.download_cover);
+        assert!(options.danmaku_formats.is_empty());
+
+        let playback_options = records[0]
+            .playback_options
+            .as_ref()
+            .expect("playback options should restore");
+        assert_eq!("720p", playback_options.quality_preference);
+        assert!(playback_options.audio_language.is_empty());
     }
 
     #[test]
@@ -630,8 +718,23 @@ mod tests {
                     bilibili_selection: Some(selection.clone()),
                     result_items: vec![result_item.clone()],
                 },
-                options: None,
-                playback_options: None,
+                options: Some(BilibiliDownloadOptions {
+                    quality_preference: "1080p".to_owned(),
+                    encoding_preference: String::new(),
+                    prefer_tv_api: false,
+                    download_subtitles: true,
+                    download_danmaku: true,
+                    audio_language: "ja-jp".to_owned(),
+                    subtitle_ai_policy: BilibiliSubtitleAiPolicy::PreferNonAi.into(),
+                    download_cover: true,
+                    danmaku_formats: vec![BilibiliDanmakuFormat::Ass.into()],
+                }),
+                playback_options: Some(BilibiliPlaybackOptions {
+                    quality_preference: "720p".to_owned(),
+                    encoding_preference: "h264".to_owned(),
+                    prefer_tv_api: false,
+                    audio_language: "ja-jp".to_owned(),
+                }),
             }])
             .expect("task state should persist");
 
@@ -642,5 +745,25 @@ mod tests {
         assert_eq!(1, records.len());
         assert_eq!(Some(selection), records[0].task.bilibili_selection);
         assert_eq!(vec![result_item], records[0].task.result_items);
+        let options = records[0]
+            .options
+            .as_ref()
+            .expect("download options should round-trip");
+        assert_eq!("ja-jp", options.audio_language);
+        assert_eq!(
+            BilibiliSubtitleAiPolicy::PreferNonAi,
+            options.subtitle_ai_policy()
+        );
+        assert!(options.download_cover);
+        assert_eq!(
+            vec![i32::from(BilibiliDanmakuFormat::Ass)],
+            options.danmaku_formats
+        );
+
+        let playback_options = records[0]
+            .playback_options
+            .as_ref()
+            .expect("playback options should round-trip");
+        assert_eq!("ja-jp", playback_options.audio_language);
     }
 }

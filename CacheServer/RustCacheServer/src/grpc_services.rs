@@ -2024,6 +2024,7 @@ mod tests {
                     quality_preference: "1080p".to_owned(),
                     encoding_preference: "h264".to_owned(),
                     prefer_tv_api: false,
+                    audio_language: "ja-jp".to_owned(),
                 }),
             }))
             .await
@@ -2959,6 +2960,7 @@ mod tests {
                         quality_preference: "1080p".to_owned(),
                         encoding_preference: "h264".to_owned(),
                         prefer_tv_api: false,
+                        audio_language: "ja-jp".to_owned(),
                     }),
                     selection_id: String::new(),
                     selection: None,
