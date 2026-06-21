@@ -48,7 +48,7 @@ just test-bilibili-live
 TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
 
-真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，固定覆盖普通视频、多 P 视频、番剧 media 页和番剧 episode 页四类输入。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
+真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
 
 ```bash
 just test-bilibili-live
@@ -56,7 +56,7 @@ BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
+默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case 和 `requires_authentication` 的账号 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -64,6 +64,14 @@ BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
 BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY='hk=https://proxy.example/playurl' \
 BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://proxy.example/api' \
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode \
+just test-bilibili-live
+```
+
+账号页面 fetch 验证需要 BBDown credential 文件里包含 web cookie；`access_key` 只能覆盖 TV API 路径，不能满足 web/反代路径。可以指定单个账号 case，或用 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 批量包含账号 case：
+
+```bash
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_CASES=authenticated-history \
 just test-bilibili-live
 ```
 

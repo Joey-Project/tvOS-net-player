@@ -1,6 +1,5 @@
 # Project TODO
 
-- [pending] PR 4：增加 authenticated history、watch-later、following/dynamic live fixtures。
 - [pending] PR 5：增加 favorite、space videos、collection、series、recommendations 的 collection/list fetch coverage。
 - [pending] PR 6：完善 Bilibili fetch UX，优先用 macOS app 做 validation。
 - [pending] PR 7：增加 progressive HLS ABR metadata foundation。
@@ -8,6 +7,7 @@
 - [pending] PR 9：推进 segment-level fill / prefetch。
 - [pending] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [pending] PR 11：增加 LAN transcoding foundation。
+- [completed] PR 4：增加 authenticated history、watch-later、following/dynamic live fixtures，默认跳过并通过 macOS/local live e2e opt-in 验证。
 - [completed] PR 3：增加 server-owned credential health/control-plane foundation，不向客户端暴露 secret。
 - [completed] PR 2：扩展 Bilibili 下载 options schema，包括 audio language、AI subtitle policy 和 sidecar/danmaku controls。
 - [completed] PR 1：接入 BBDown native progress 和 cancellation 到 server task state。
