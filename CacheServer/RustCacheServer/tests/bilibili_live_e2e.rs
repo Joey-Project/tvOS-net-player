@@ -1188,7 +1188,7 @@ mod tests {
                 "space-collection",
                 "collection",
                 "BILIBILI_LIVE_E2E_COLLECTION_URL",
-                SelectionPolicy::RangeFirstTwo,
+                SelectionPolicy::MultipleFirstTwo,
             ),
             (
                 "space-series",

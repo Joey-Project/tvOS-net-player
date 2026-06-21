@@ -29,8 +29,8 @@ superseded_by:
 
 ## Live Notes
 
-- Default `just test-bilibili-live` now skips collection/list fixtures unless `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` or an explicit `BILIBILI_LIVE_E2E_CASES` filter is supplied. The collection/list include flag only admits stable unauthenticated samples; authenticated list/feed cases still require `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`, and stale sample shapes marked `requires_live_sample_override` need a URL override before joining the unfiltered smoke run.
-- `space-collection` passed live validation with the committed sample URL.
+- Default `just test-bilibili-live` now skips collection/list fixtures unless `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` or an explicit `BILIBILI_LIVE_E2E_CASES` filter is supplied. The collection/list include flag admits eligible unauthenticated samples into a broader local sweep, but that sweep can still hit upstream availability or rate-limit errors; authenticated list/feed cases still require `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`, and stale sample shapes marked `requires_live_sample_override` need a URL override before joining the unfiltered sweep.
+- `space-collection` passed live validation with the committed sample URL and now uses the resolved stable `item:` ids when creating the playback task.
 - `space-videos` and `homepage-recommendations` currently return Bilibili `-101` without a web cookie, so they are documented as cookie-backed local validation cases.
 - The committed favorite sample currently fails upstream selected-item resolution, and the committed series sample can time out while preparing playback; both remain useful schema fixtures, but stable smoke validation should provide `BILIBILI_LIVE_E2E_FAVORITE_URL` / `BILIBILI_LIVE_E2E_SERIES_URL` overrides.
 

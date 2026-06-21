@@ -100,7 +100,7 @@
       "expected_source_kind": "collection",
       "expected_candidate_source_kind": "collection",
       "minimum_candidates": 2,
-      "selection": "range_first_two",
+      "selection": "multiple_first_two",
       "requires_collection_list_validation": true,
       "requires_stable_item_selection": true,
       "playback_options": {
