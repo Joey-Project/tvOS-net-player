@@ -40,6 +40,26 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: .plaintext
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                let response = try await service.getBilibiliCredentialStatus(
+                    TvosNetPlayer_V1_GetBilibiliCredentialStatusRequest(),
+                    options: callOptions
+                )
+                return BilibiliCredentialStatus(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliCredentialStatus
+        }
+    }
+
     public func listCacheRoots() async throws -> [CacheRoot] {
         try await withGRPCClient(
             transport: .http2NIOTS(
@@ -422,6 +442,24 @@ extension CacheServerSummary {
             version: proto.version,
             mediaBaseURIs: proto.mediaBaseUris,
             capabilities: proto.capabilities.map { String(describing: $0) }
+        )
+    }
+}
+
+extension BilibiliCredentialStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliCredentialStatus) {
+        self.init(
+            state: String(describing: proto.state),
+            message: proto.message,
+            credentialPathConfigured: proto.credentialPathConfigured,
+            credentialFileLoaded: proto.credentialFileLoaded,
+            hasWebCookie: proto.webCookiePresent,
+            hasAccessKey: proto.accessKeyPresent,
+            hasTVAccessKey: proto.tvAccessKeyPresent,
+            restrictedArea: proto.restrictedArea,
+            restrictedPlayURLProxyCount: proto.restrictedPlayurlProxyCount,
+            restrictedAPIProxyCount: proto.restrictedApiProxyCount,
+            checkedAt: proto.hasCheckedAt ? Date(proto.checkedAt) : nil
         )
     }
 }

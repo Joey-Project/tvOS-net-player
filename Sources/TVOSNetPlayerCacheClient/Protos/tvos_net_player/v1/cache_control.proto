@@ -13,6 +13,7 @@ option csharp_namespace = "TVOSNetPlayer.Cache.V1";
 service ServerService {
   rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfo);
   rpc CheckHealth(CheckHealthRequest) returns (HealthStatus);
+  rpc GetBilibiliCredentialStatus(GetBilibiliCredentialStatusRequest) returns (BilibiliCredentialStatus);
 }
 
 service LibraryService {
@@ -56,6 +57,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_LIBRARY_ITEM_DELETE = 5;
   SERVER_CAPABILITY_BILIBILI_RESOLVE = 6;
   SERVER_CAPABILITY_BILIBILI_TASK_SELECTION = 7;
+  SERVER_CAPABILITY_BILIBILI_CREDENTIAL_STATUS = 8;
 }
 
 message CheckHealthRequest {}
@@ -71,6 +73,30 @@ enum HealthState {
   HEALTH_STATE_SERVING = 1;
   HEALTH_STATE_DEGRADED = 2;
   HEALTH_STATE_NOT_SERVING = 3;
+}
+
+message GetBilibiliCredentialStatusRequest {}
+
+message BilibiliCredentialStatus {
+  BilibiliCredentialState state = 1;
+  string message = 2;
+  bool credential_path_configured = 3;
+  bool credential_file_loaded = 4;
+  bool web_cookie_present = 5;
+  bool access_key_present = 6;
+  bool tv_access_key_present = 7;
+  string restricted_area = 8;
+  uint32 restricted_playurl_proxy_count = 9;
+  uint32 restricted_api_proxy_count = 10;
+  google.protobuf.Timestamp checked_at = 11;
+}
+
+enum BilibiliCredentialState {
+  BILIBILI_CREDENTIAL_STATE_UNSPECIFIED = 0;
+  BILIBILI_CREDENTIAL_STATE_NOT_CONFIGURED = 1;
+  BILIBILI_CREDENTIAL_STATE_READY = 2;
+  BILIBILI_CREDENTIAL_STATE_DEGRADED = 3;
+  BILIBILI_CREDENTIAL_STATE_ERROR = 4;
 }
 
 message ListLibraryItemsRequest {
