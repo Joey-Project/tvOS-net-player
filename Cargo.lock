@@ -112,8 +112,8 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bbdown-core"
-version = "0.3.0"
-source = "git+https://github.com/Joey-Project/BBDown-rust?rev=4905a2f06b8038a979cf4d6078c7dd5f40f6a2d8#433591b6c14b97a4adfe189e6d8826fa699d8470"
+version = "0.5.0"
+source = "git+https://github.com/Joey-Project/BBDown-rust?rev=b5dde066561fc39c6387198f6e9a61513ee44eee#b5dde066561fc39c6387198f6e9a61513ee44eee"
 dependencies = [
  "base64",
  "flate2",

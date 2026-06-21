@@ -1779,6 +1779,7 @@ where
     Ok(Some(MuxReport {
         output_path,
         command: command_report(ffmpeg_path, &args),
+        chapter_count: 0,
     }))
 }
 
@@ -3107,6 +3108,7 @@ mod tests {
                 mux: Some(MuxReport {
                     output_path: PathBuf::from("out/entry/Entry.mp4"),
                     command: Vec::new(),
+                    chapter_count: 0,
                 }),
             }],
         };

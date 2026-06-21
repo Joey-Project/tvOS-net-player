@@ -3,11 +3,11 @@ id: 20260614-f3a9d1
 title: HLS Progressive Cache
 status: completed
 created: 2026-06-14
-updated: 2026-06-14
+updated: 2026-06-21
 branch: wip/offline-cache-finalization
 pr: https://github.com/Joey-Project/tvOS-net-player/pull/12
 supersedes: []
-superseded_by:
+superseded_by: 20260621-c9f0a2
 ---
 
 # HLS Progressive Cache
@@ -20,7 +20,7 @@ superseded_by:
 
 ## Current State
 
-- `BBDown-rust` `v0.3.0` is now the pinned core dependency; playback planning still provides media URLs, backup URLs, request headers, codec/mime metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
+- `BBDown-rust` `v0.5.0` is now the pinned core dependency; playback planning still provides media URLs, backup URLs, request headers, codec/mime metadata, cache keys, ABR groups, and AVPlayer-oriented selection hints.
 - The current LAN cache server adapter still uses the older complete-download path: BBDown core downloads selected media, then the server muxes a completed MP4 and publishes it as a library item.
 - The cache server now has a BBDown playback-planning adapter foundation that maps core playback plans into server-owned DTOs and selects AVPlayer-friendly variants for later progressive sessions.
 - The cache server now exposes progressive playback through `TaskService.CreateBilibiliPlaybackTask`: it creates a persisted `TASK_KIND_BILIBILI_PROGRESSIVE_PLAYBACK` task and returns it in `preparing` state immediately, while BBDown playback planning runs in the background.
@@ -29,7 +29,7 @@ superseded_by:
 - Startup now restores HLS session manifests into the runtime HLS registry. Persisted `playable`/`completed` progressive tasks remain usable when their manifest exists; only tasks missing a matching manifest are failed during startup reconcile.
 - The Swift cache client exposes `getTask(id:)` and `watchTasks(ids:)` so tvOS code can track background playback planning to a playable HLS source without repeating create calls.
 - Playback planning rejects Bilibili short links until `bbdown-core` exposes a resolved-input API that lets the server choose the correct default selection after short-link expansion.
-- Feed/history/watch-later style inputs added by `BBDown-rust` `v0.3.0` are accepted through the adapter with latest-item defaults; richer explicit selection and multi-item results remain deferred until the task options/result schema is designed.
+- Feed/history/watch-later style inputs and page/list fetch foundations retained by `BBDown-rust` `v0.5.0` are accepted through the adapter with latest-item defaults; richer explicit selection and multi-item results are now covered by later task selection work.
 - Existing architecture already reserves HLS playlists and segments over HTTP as the media-plane direction, so progressive playback should extend the current boundary rather than introduce gRPC media streaming or direct tvOS BBDown integration.
 
 ## PR Plan
@@ -70,7 +70,7 @@ superseded_by:
 
 ## Next Steps
 
-- Keep the existing complete-download adapter path as the fallback until progressive HLS is proven on physical Apple TV and real Bilibili sources.
+- Keep the existing complete-download adapter path as the fallback while progressive HLS is validated through the macOS app and real Bilibili sources. Physical Apple TV validation is deferred outside the current roadmap.
 - Add explicit cache eviction policy, cache management UI/API, and optional LAN-side transmux/transcode in later work.
 - Do not merge a PR while required CI is failing, review findings remain actionable, or GitHub reports unresolved review conversations.
 
