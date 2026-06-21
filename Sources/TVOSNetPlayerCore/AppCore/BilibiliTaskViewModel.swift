@@ -566,20 +566,22 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let options = currentPlaybackOptions
 
         if resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
-            guard let selectionRequest = cachedResolvedPlaybackRequest else {
+            if let selectionRequest = cachedResolvedPlaybackRequest {
+                await createPlaybackTask(
+                    source: source,
+                    selection: selectionRequest.selection,
+                    legacySelectionID: selectionRequest.legacySelectionID,
+                    endpoint: endpoint,
+                    options: options
+                )
+                return
+            }
+
+            if isWaitingForCandidateSelection {
                 errorMessage = "Select Bilibili items before submitting playback."
                 statusMessage = "Bilibili item selection is required."
                 return
             }
-
-            await createPlaybackTask(
-                source: source,
-                selection: selectionRequest.selection,
-                legacySelectionID: selectionRequest.legacySelectionID,
-                endpoint: endpoint,
-                options: options
-            )
-            return
         }
 
         operationSequence += 1

@@ -602,6 +602,41 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.fetchNotice?.actionTitle, "Re-resolve")
     }
 
+    func testSubmitAfterEmptyResolveReResolvesInput() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(.fixture(source: "history", sourceKind: "history", candidates: [], defaultSelectionID: "")),
+                .success(
+                    .fixture(
+                        source: "history",
+                        sourceKind: "history",
+                        candidates: [
+                            .fixture(selectionID: "history:1", title: "Recovered Item", index: 1)
+                        ],
+                        defaultSelectionID: "history:1"
+                    )),
+            ],
+            createResponses: [
+                .success(.fixture(source: "history", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "history",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["history", "history"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "history:1")
+
+        model.clearTask()
+    }
+
     func testCredentialResolveFailureShowsCredentialNotice() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
