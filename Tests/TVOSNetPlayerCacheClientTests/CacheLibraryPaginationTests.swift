@@ -16,6 +16,13 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedBilibiliCredentialStatusCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliCredentialStatus),
+            CacheServerCapability.bilibiliCredentialStatus
+        )
+    }
+
     func testBilibiliTaskSchemaMapsSelectionAndResultItems() {
         var proto = TvosNetPlayer_V1_Task()
         proto.id = "task-1"
@@ -70,6 +77,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             version: "0.1.0",
             mediaBaseURIs: [],
             capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliResolve,
                 CacheServerCapability.bilibiliTaskSelection,
             ]
@@ -82,8 +90,10 @@ final class CacheLibraryPaginationTests: XCTestCase {
             capabilities: []
         )
 
+        XCTAssertTrue(supported.supportsBilibiliCredentialStatus)
         XCTAssertTrue(supported.supportsBilibiliResolve)
         XCTAssertTrue(supported.supportsBilibiliTaskSelection)
+        XCTAssertFalse(unsupported.supportsBilibiliCredentialStatus)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
         XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
     }

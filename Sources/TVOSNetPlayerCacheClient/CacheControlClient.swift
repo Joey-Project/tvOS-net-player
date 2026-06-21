@@ -14,6 +14,7 @@ public struct CacheLibraryItemsPage: Equatable, Sendable {
 
 public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
+    func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
     func listLibraryItemsPage(
@@ -48,6 +49,7 @@ public protocol CacheControlClient: Sendable {
 
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case hlsCacheStatus
+    case bilibiliCredentialStatus
     case bilibiliResolve
     case bilibiliTaskSelection
 }
@@ -55,6 +57,10 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
 public extension CacheControlClient {
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+    }
+
+    func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus {
+        throw CacheControlClientUnsupportedFeature.bilibiliCredentialStatus
     }
 
     func resolveBilibiliInput(

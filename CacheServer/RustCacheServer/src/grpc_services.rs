@@ -1,5 +1,6 @@
 use std::{collections::HashSet, pin::Pin, sync::Arc, time::Duration};
 
+use bbdown_core::CredentialStore;
 use futures_core::Stream;
 use tokio::{sync::mpsc, time::sleep};
 use tokio_stream::wrappers::ReceiverStream;
@@ -16,12 +17,14 @@ use crate::{
         BilibiliResolvedCandidate as AdapterBilibiliResolvedCandidate,
     },
     bilibili_worker::BilibiliDownloadError,
+    config::BbdownRestrictedArea,
     generated::tvos_net_player::v1::{
-        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackVariant,
-        BilibiliResolveResult, BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate,
-        BilibiliTaskResultItem, BilibiliTaskSelection, CacheRoot, CancelTaskRequest,
-        CheckHealthRequest, CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest,
-        DeleteLibraryItemRequest, DeleteLibraryItemResponse, GetHlsCacheStatusRequest,
+        BilibiliCredentialState, BilibiliCredentialStatus, BilibiliPlaybackOptions,
+        BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliResolveResult,
+        BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliTaskResultItem,
+        BilibiliTaskSelection, CacheRoot, CancelTaskRequest, CheckHealthRequest,
+        CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
+        DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest, GetHlsCacheStatusRequest,
         GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
         HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
         HlsCacheStatus, LibraryItem, LibrarySource, ListCacheRootsRequest, ListCacheRootsResponse,
@@ -86,6 +89,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliTasks.into(),
                 ServerCapability::BilibiliResolve.into(),
                 ServerCapability::BilibiliTaskSelection.into(),
+                ServerCapability::BilibiliCredentialStatus.into(),
                 ServerCapability::Hls.into(),
             ],
         };
@@ -128,6 +132,108 @@ impl ServerService for ServerGrpcService {
             },
             checked_at: Some(current_timestamp()),
         }))
+    }
+
+    async fn get_bilibili_credential_status(
+        &self,
+        _request: Request<GetBilibiliCredentialStatusRequest>,
+    ) -> Result<Response<BilibiliCredentialStatus>, Status> {
+        Ok(Response::new(bilibili_credential_status(
+            &self.state.options,
+        )))
+    }
+}
+
+fn bilibili_credential_status(
+    options: &crate::config::CacheServerOptions,
+) -> BilibiliCredentialStatus {
+    let restricted_area_configured = options.bbdown_restricted_area.is_some()
+        || !options.bbdown_restricted_area_proxies.is_empty()
+        || !options.bbdown_restricted_api_proxies.is_empty();
+    let restricted_area = options
+        .bbdown_restricted_area
+        .map(restricted_area_label)
+        .unwrap_or_default()
+        .to_owned();
+    let base_status = || BilibiliCredentialStatus {
+        state: BilibiliCredentialState::Unspecified.into(),
+        message: String::new(),
+        credential_path_configured: options.bbdown_credential_path.is_some(),
+        credential_file_loaded: false,
+        web_cookie_present: false,
+        access_key_present: false,
+        tv_access_key_present: false,
+        restricted_area: restricted_area.clone(),
+        restricted_playurl_proxy_count: options.bbdown_restricted_area_proxies.len() as u32,
+        restricted_api_proxy_count: options.bbdown_restricted_api_proxies.len() as u32,
+        checked_at: Some(current_timestamp()),
+    };
+
+    let Some(path) = options.bbdown_credential_path.as_ref() else {
+        let mut status = base_status();
+        if restricted_area_configured {
+            status.state = BilibiliCredentialState::Degraded.into();
+            status.message =
+                "Restricted-area settings are configured without a BBDown credential file."
+                    .to_owned();
+        } else {
+            status.state = BilibiliCredentialState::NotConfigured.into();
+            status.message = "No BBDown credential file is configured.".to_owned();
+        }
+        return status;
+    };
+
+    if !path.is_file() {
+        let mut status = base_status();
+        status.state = BilibiliCredentialState::Error.into();
+        status.message = "Failed to load BBDown credential file.".to_owned();
+        return status;
+    }
+
+    match CredentialStore::new(path.clone()).load() {
+        Ok(credentials) => {
+            let mut status = base_status();
+            status.credential_file_loaded = true;
+            status.web_cookie_present = credentials
+                .cookie
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            status.access_key_present = credentials
+                .access_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            status.tv_access_key_present = credentials
+                .tv_access_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if status.web_cookie_present
+                || status.access_key_present
+                || status.tv_access_key_present
+            {
+                status.state = BilibiliCredentialState::Ready.into();
+                status.message = "BBDown credential file loaded.".to_owned();
+            } else {
+                status.state = BilibiliCredentialState::Degraded.into();
+                status.message =
+                    "BBDown credential file loaded but contains no credential material.".to_owned();
+            }
+            status
+        }
+        Err(_) => {
+            let mut status = base_status();
+            status.state = BilibiliCredentialState::Error.into();
+            status.message = "Failed to load BBDown credential file.".to_owned();
+            status
+        }
+    }
+}
+
+fn restricted_area_label(area: BbdownRestrictedArea) -> &'static str {
+    match area {
+        BbdownRestrictedArea::Cn => "cn",
+        BbdownRestrictedArea::Th => "th",
+        BbdownRestrictedArea::Hk => "hk",
+        BbdownRestrictedArea::Tw => "tw",
     }
 }
 
@@ -1890,8 +1996,9 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliPlaybackOptions, BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest,
-            DeleteLibraryItemRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
+            BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliTaskSelection,
+            CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
+            GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
             ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
@@ -1938,6 +2045,136 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::BilibiliTaskSelection as i32))
+        );
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliCredentialStatus as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bilibili_credential_status_reports_not_configured_without_secrets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let status = service
+            .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+            .await
+            .expect("credential status should succeed")
+            .into_inner();
+
+        assert_eq!(BilibiliCredentialState::NotConfigured, status.state());
+        assert!(!status.credential_path_configured);
+        assert!(!status.credential_file_loaded);
+        assert!(!status.web_cookie_present);
+        assert!(!status.access_key_present);
+        assert!(!status.tv_access_key_present);
+        assert!(status.restricted_area.is_empty());
+        assert_eq!(0, status.restricted_playurl_proxy_count);
+        assert_eq!(0, status.restricted_api_proxy_count);
+        assert!(
+            !status
+                .message
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bilibili_credential_status_reports_loaded_material_without_secret_values() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .join("cache")
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().join("cache"));
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{"cookie":"SESSDATA=secret","access_key":"access-token","tv_access_key":"tv-token"}"#,
+        )
+        .expect("credential file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credentials_path.clone()),
+            bbdown_restricted_area: Some(crate::config::BbdownRestrictedArea::Hk),
+            bbdown_restricted_area_proxies: vec![crate::config::BbdownRestrictedProxy {
+                area: Some(crate::config::BbdownRestrictedArea::Hk),
+                base_url: "https://playurl.example.test/secret/path?token=hidden".to_owned(),
+            }],
+            bbdown_restricted_api_proxies: vec![crate::config::BbdownRestrictedProxy {
+                area: None,
+                base_url: "https://api.example.test/secret/path?token=hidden".to_owned(),
+            }],
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let status = service
+            .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+            .await
+            .expect("credential status should succeed")
+            .into_inner();
+
+        assert_eq!(BilibiliCredentialState::Ready, status.state());
+        assert!(status.credential_path_configured);
+        assert!(status.credential_file_loaded);
+        assert!(status.web_cookie_present);
+        assert!(status.access_key_present);
+        assert!(status.tv_access_key_present);
+        assert_eq!("hk", status.restricted_area);
+        assert_eq!(1, status.restricted_playurl_proxy_count);
+        assert_eq!(1, status.restricted_api_proxy_count);
+        assert!(!status.message.contains("secret"));
+        assert!(!status.message.contains("token"));
+        assert!(
+            !status
+                .message
+                .contains(credentials_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bilibili_credential_status_reports_runtime_load_error_without_path() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .join("cache")
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().join("cache"));
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("missing-credentials.json");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credentials_path.clone()),
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let status = service
+            .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+            .await
+            .expect("credential status should succeed")
+            .into_inner();
+
+        assert_eq!(BilibiliCredentialState::Error, status.state());
+        assert!(status.credential_path_configured);
+        assert!(!status.credential_file_loaded);
+        assert!(
+            !status
+                .message
+                .contains(credentials_path.to_string_lossy().as_ref())
         );
     }
 

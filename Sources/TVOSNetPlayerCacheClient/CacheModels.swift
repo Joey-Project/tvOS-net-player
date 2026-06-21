@@ -98,12 +98,57 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsBilibiliTaskSelection: Bool {
         capabilities.contains(CacheServerCapability.bilibiliTaskSelection)
     }
+
+    public var supportsBilibiliCredentialStatus: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliCredentialStatus)
+    }
 }
 
 public enum CacheServerCapability {
+    public static let bilibiliCredentialStatus = "bilibiliCredentialStatus"
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
     public static let libraryItemDelete = "libraryItemDelete"
+}
+
+public struct BilibiliCredentialStatus: Equatable, Sendable {
+    public let state: String
+    public let message: String
+    public let credentialPathConfigured: Bool
+    public let credentialFileLoaded: Bool
+    public let hasWebCookie: Bool
+    public let hasAccessKey: Bool
+    public let hasTVAccessKey: Bool
+    public let restrictedArea: String
+    public let restrictedPlayURLProxyCount: UInt32
+    public let restrictedAPIProxyCount: UInt32
+    public let checkedAt: Date?
+
+    public init(
+        state: String,
+        message: String,
+        credentialPathConfigured: Bool,
+        credentialFileLoaded: Bool,
+        hasWebCookie: Bool,
+        hasAccessKey: Bool,
+        hasTVAccessKey: Bool,
+        restrictedArea: String,
+        restrictedPlayURLProxyCount: UInt32,
+        restrictedAPIProxyCount: UInt32,
+        checkedAt: Date?
+    ) {
+        self.state = state
+        self.message = message
+        self.credentialPathConfigured = credentialPathConfigured
+        self.credentialFileLoaded = credentialFileLoaded
+        self.hasWebCookie = hasWebCookie
+        self.hasAccessKey = hasAccessKey
+        self.hasTVAccessKey = hasTVAccessKey
+        self.restrictedArea = restrictedArea
+        self.restrictedPlayURLProxyCount = restrictedPlayURLProxyCount
+        self.restrictedAPIProxyCount = restrictedAPIProxyCount
+        self.checkedAt = checkedAt
+    }
 }
 
 public struct CacheRoot: Identifiable, Equatable, Sendable {
