@@ -722,6 +722,7 @@ struct BilibiliBbdownProgressAccumulator {
     completed_entry_indices: HashSet<u32>,
     files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
     active_entry_files: HashMap<PathBuf, BilibiliBbdownFileProgress>,
+    active_entry_in_progress: bool,
     last_progress: f64,
     last_published_downloaded_bytes: u64,
     last_published_progress: f64,
@@ -754,6 +755,7 @@ impl BilibiliBbdownProgressAccumulator {
                 self.completed_entry_indices.clear();
                 self.files.clear();
                 self.active_entry_files.clear();
+                self.active_entry_in_progress = false;
                 self.message_progress(
                     DOWNLOAD_PROGRESS_START,
                     format!("Downloading {entry_count} Bilibili entry(s)."),
@@ -761,6 +763,7 @@ impl BilibiliBbdownProgressAccumulator {
             }
             DownloadProgressEvent::EntryStarted { index, title, .. } => {
                 self.active_entry_files.clear();
+                self.active_entry_in_progress = true;
                 let progress = self.current_download_progress();
                 self.message_progress(
                     progress,
@@ -775,6 +778,7 @@ impl BilibiliBbdownProgressAccumulator {
                 expected_size,
                 ..
             } => {
+                self.active_entry_in_progress = true;
                 self.files.insert(
                     path.clone(),
                     BilibiliBbdownFileProgress {
@@ -805,6 +809,7 @@ impl BilibiliBbdownProgressAccumulator {
                 expected_size,
                 ..
             } => {
+                self.active_entry_in_progress = true;
                 let file = self.files.entry(path.clone()).or_default();
                 file.resumed_from = *resumed_from;
                 file.bytes_written = *bytes_written;
@@ -827,6 +832,7 @@ impl BilibiliBbdownProgressAccumulator {
                 total_bytes,
                 ..
             } => {
+                self.active_entry_in_progress = true;
                 self.files.insert(
                     path.clone(),
                     BilibiliBbdownFileProgress {
@@ -855,6 +861,7 @@ impl BilibiliBbdownProgressAccumulator {
                 error,
                 ..
             } => {
+                self.active_entry_in_progress = true;
                 self.rollback_file_progress(path);
                 Some(self.published_rollback_bytes_progress(format!(
                     "Retrying {} for {entry_title} after BBDown error: {error}",
@@ -869,22 +876,26 @@ impl BilibiliBbdownProgressAccumulator {
                         .min(self.entry_count.unwrap_or(usize::MAX));
                 }
                 self.active_entry_files.clear();
+                self.active_entry_in_progress = false;
                 Some(self.published_bytes_progress(format!(
                     "Downloaded Bilibili entry {index}: {title}."
                 )))
             }
             DownloadProgressEvent::PlanCompleted { entry_count, .. } => {
                 self.completed_entries = *entry_count;
+                self.active_entry_in_progress = false;
                 self.message_progress(
                     DOWNLOAD_PROGRESS_END,
                     format!("Downloaded {entry_count} Bilibili entry(s)."),
                 )
             }
             DownloadProgressEvent::PlanCancelled { error, .. } => {
+                self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
                 self.message_progress(progress, format!("BBDown download cancelled: {error}"))
             }
             DownloadProgressEvent::PlanFailed { error, .. } => {
+                self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
                 self.message_progress(progress, format!("BBDown download failed: {error}"))
             }
@@ -898,25 +909,28 @@ impl BilibiliBbdownProgressAccumulator {
 
     fn published_bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
         let progress = self.current_download_progress();
+        let (tracked_downloaded_bytes, _) = self.known_bytes_snapshot();
         let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
-        self.mark_published(downloaded_bytes, progress);
+        self.mark_published(tracked_downloaded_bytes, progress);
         self.bytes_progress(downloaded_bytes, total_bytes, progress, message)
     }
 
     fn published_rollback_bytes_progress(&mut self, message: String) -> BilibiliTaskProgress {
         let progress = self.current_download_progress_allowing_rollback();
+        let (tracked_downloaded_bytes, _) = self.known_bytes_snapshot();
         let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
-        self.mark_published(downloaded_bytes, progress);
+        self.mark_published(tracked_downloaded_bytes, progress);
         self.bytes_progress(downloaded_bytes, total_bytes, progress, message)
     }
 
     fn throttled_bytes_progress(&mut self, message: String) -> Option<BilibiliTaskProgress> {
         let progress = self.current_download_progress();
+        let (tracked_downloaded_bytes, _) = self.known_bytes_snapshot();
         let (downloaded_bytes, total_bytes) = self.reported_bytes_snapshot();
-        if !self.should_publish_file_progress(downloaded_bytes, progress) {
+        if !self.should_publish_file_progress(tracked_downloaded_bytes, progress) {
             return None;
         }
-        self.mark_published(downloaded_bytes, progress);
+        self.mark_published(tracked_downloaded_bytes, progress);
         Some(self.bytes_progress(downloaded_bytes, total_bytes, progress, message))
     }
 
@@ -1017,7 +1031,13 @@ impl BilibiliBbdownProgressAccumulator {
 
     fn reported_bytes_snapshot(&self) -> (u64, Option<u64>) {
         let (downloaded_bytes, known_total_bytes) = self.known_bytes_snapshot();
-        (downloaded_bytes, Some(known_total_bytes.unwrap_or(0)))
+        if self.active_entry_in_progress {
+            return (0, Some(0));
+        }
+        if let Some(known_total_bytes) = known_total_bytes {
+            return (downloaded_bytes, Some(known_total_bytes));
+        }
+        (0, Some(0))
     }
 
     fn should_publish_file_progress(&self, downloaded_bytes: u64, progress: f64) -> bool {
@@ -2538,8 +2558,8 @@ mod tests {
             })
             .expect("file progress should report progress");
         assert_progress_near(file_progress.progress, 0.45);
-        assert_eq!(Some(50), file_progress.downloaded_bytes);
-        assert_eq!(Some(100), file_progress.total_bytes);
+        assert_eq!(Some(0), file_progress.downloaded_bytes);
+        assert_eq!(Some(0), file_progress.total_bytes);
 
         let failed_progress = accumulator
             .record(&DownloadProgressEvent::FileFailed {
@@ -2554,7 +2574,7 @@ mod tests {
             .expect("file failure should publish rolled-back byte progress");
         assert_progress_near(failed_progress.progress, DOWNLOAD_PROGRESS_START);
         assert_eq!(Some(0), failed_progress.downloaded_bytes);
-        assert_eq!(Some(100), failed_progress.total_bytes);
+        assert_eq!(Some(0), failed_progress.total_bytes);
 
         (accumulator, failed_progress)
     }
@@ -3635,8 +3655,8 @@ mod tests {
                 max_attempts: 1,
             })
             .expect("file start should report progress");
-        assert_eq!(Some(25), started_progress.downloaded_bytes);
-        assert_eq!(Some(200), started_progress.total_bytes);
+        assert_eq!(Some(0), started_progress.downloaded_bytes);
+        assert_eq!(Some(0), started_progress.total_bytes);
 
         let file_progress = accumulator
             .record(&DownloadProgressEvent::FileProgress {
@@ -3650,8 +3670,8 @@ mod tests {
                 expected_size: Some(200),
             })
             .expect("file progress should report progress");
-        assert_eq!(Some(100), file_progress.downloaded_bytes);
-        assert_eq!(Some(200), file_progress.total_bytes);
+        assert_eq!(Some(0), file_progress.downloaded_bytes);
+        assert_eq!(Some(0), file_progress.total_bytes);
         let progress = file_progress.progress.expect("progress should be set");
         assert!(progress > DOWNLOAD_PROGRESS_START);
         assert!(progress < DOWNLOAD_PROGRESS_END);
@@ -3667,8 +3687,20 @@ mod tests {
                 total_bytes: 200,
             })
             .expect("file complete should report progress");
-        assert_eq!(Some(200), completed_progress.downloaded_bytes);
-        assert_eq!(Some(200), completed_progress.total_bytes);
+        assert_eq!(Some(0), completed_progress.downloaded_bytes);
+        assert_eq!(Some(0), completed_progress.total_bytes);
+
+        let entry_completed = accumulator
+            .record(&DownloadProgressEvent::EntryCompleted {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: PathBuf::from("out/entry"),
+                file_count: 1,
+                mux_output: None,
+            })
+            .expect("entry complete should report progress");
+        assert_eq!(Some(200), entry_completed.downloaded_bytes);
+        assert_eq!(Some(200), entry_completed.total_bytes);
 
         let plan_completed = accumulator
             .record(&DownloadProgressEvent::PlanCompleted {
@@ -3769,8 +3801,8 @@ mod tests {
             })
             .expect("second entry progress should report progress");
         assert_progress_near(second_half_done.progress, 0.625);
-        assert_eq!(Some(150), second_half_done.downloaded_bytes);
-        assert_eq!(Some(200), second_half_done.total_bytes);
+        assert_eq!(Some(0), second_half_done.downloaded_bytes);
+        assert_eq!(Some(0), second_half_done.total_bytes);
 
         accumulator
             .record(&DownloadProgressEvent::FileCompleted {
@@ -3840,8 +3872,8 @@ mod tests {
             })
             .expect("video complete should report progress");
         assert_progress_near(video_done.progress, 0.45);
-        assert_eq!(Some(100), video_done.downloaded_bytes);
-        assert_eq!(Some(100), video_done.total_bytes);
+        assert_eq!(Some(0), video_done.downloaded_bytes);
+        assert_eq!(Some(0), video_done.total_bytes);
 
         let audio_path = PathBuf::from("out/1/audio.m4s");
         let audio_started = accumulator
@@ -3857,8 +3889,8 @@ mod tests {
             })
             .expect("audio start should report progress");
         assert_progress_near(audio_started.progress, 0.45);
-        assert_eq!(Some(100), audio_started.downloaded_bytes);
-        assert_eq!(Some(200), audio_started.total_bytes);
+        assert_eq!(Some(0), audio_started.downloaded_bytes);
+        assert_eq!(Some(0), audio_started.total_bytes);
 
         accumulator
             .record(&DownloadProgressEvent::FileCompleted {
@@ -3910,7 +3942,7 @@ mod tests {
                 max_attempts: 1,
             })
             .expect("file start should report progress");
-        assert_eq!(Some(25), started_progress.downloaded_bytes);
+        assert_eq!(Some(0), started_progress.downloaded_bytes);
         assert_eq!(Some(0), started_progress.total_bytes);
 
         let tiny_progress = accumulator.record(&DownloadProgressEvent::FileProgress {
@@ -3937,11 +3969,7 @@ mod tests {
                 expected_size: None,
             })
             .expect("large byte delta should report progress");
-        let expected_downloaded = DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES + 26;
-        assert_eq!(
-            Some(to_i64_saturating(expected_downloaded)),
-            published_progress.downloaded_bytes
-        );
+        assert_eq!(Some(0), published_progress.downloaded_bytes);
         assert_eq!(Some(0), published_progress.total_bytes);
     }
 
