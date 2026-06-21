@@ -286,6 +286,10 @@ struct ContentView: View {
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 110)
 
+                    TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+
                     Spacer()
                 }
 

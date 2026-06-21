@@ -10,14 +10,14 @@ use std::{
 };
 
 use bbdown_core::{
-    BiliClient, ClientConfig, CredentialStore, Credentials, DownloadArchive,
+    BiliClient, ClientConfig, CredentialStore, Credentials, DanmakuFormat, DownloadArchive,
     DownloadCancellationToken, DownloadFileKind, DownloadOptions, DownloadProgressEvent,
     DownloadProgressSink, DownloadReport, DuplicateDecision, EntryDownloadReport,
     Error as BbdownError, HttpHeaderSpec, IndexSelection, Input, MediaRequestKind,
     MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
     PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
     PlaybackVariantKind, PlayurlMode, ResolvedContent, RestrictedArea, RestrictedAreaConfig,
-    RestrictedAreaProxy, Selection, StreamSelection, VideoCollectionKind,
+    RestrictedAreaProxy, Selection, StreamSelection, SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
     fs,
@@ -37,7 +37,9 @@ use crate::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
         BbdownRestrictedProxy as CacheBbdownRestrictedProxy, CacheServerOptions,
     },
-    generated::tvos_net_player::v1::BilibiliDownloadOptions,
+    generated::tvos_net_player::v1::{
+        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliSubtitleAiPolicy,
+    },
     library::LocalMediaLibrary,
     task_registry::BilibiliTaskProgress,
 };
@@ -373,12 +375,7 @@ impl BbdownBilibiliAdapter {
         &self,
         options: Option<&BilibiliDownloadOptions>,
     ) -> Result<DownloadOptions, BilibiliDownloadError> {
-        validate_supported_download_options(options)?;
-        Ok(DownloadOptions::new(self.output_dir.clone())
-            .with_stream_selection(stream_selection_from_options(options))
-            .with_subtitles(options.is_some_and(|options| options.download_subtitles))
-            .with_danmaku(options.is_some_and(|options| options.download_danmaku))
-            .with_mux(MuxOptions::Disabled))
+        download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
     fn client_for_options(&self, options: Option<&BilibiliDownloadOptions>) -> BiliClient {
@@ -2106,14 +2103,120 @@ fn validate_supported_download_options(
         )));
     }
 
+    let subtitle_ai_policy = subtitle_ai_policy_from_options(Some(options))?;
+    if !options.download_subtitles && subtitle_ai_policy != SubtitleAiPolicy::Include {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili subtitle_ai_policy requires download_subtitles.".to_owned(),
+        ));
+    }
+
+    let danmaku_formats = danmaku_formats_from_options(Some(options))?;
+    if !options.download_danmaku && danmaku_formats.is_some() {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili danmaku_formats requires download_danmaku.".to_owned(),
+        ));
+    }
+
     Ok(())
 }
 
+fn download_options_for_output_dir(
+    output_dir: PathBuf,
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<DownloadOptions, BilibiliDownloadError> {
+    validate_supported_download_options(options)?;
+
+    let mut download_options = DownloadOptions::new(output_dir)
+        .with_stream_selection(stream_selection_from_options(options))
+        .with_cover(options.is_some_and(|options| options.download_cover))
+        .with_subtitles(options.is_some_and(|options| options.download_subtitles))
+        .with_subtitle_ai_policy(subtitle_ai_policy_from_options(options)?)
+        .with_danmaku(options.is_some_and(|options| options.download_danmaku))
+        .with_mux(MuxOptions::Disabled);
+
+    if let Some(danmaku_formats) = danmaku_formats_from_options(options)? {
+        download_options = download_options.with_danmaku_formats(danmaku_formats);
+    }
+
+    Ok(download_options)
+}
+
 fn stream_selection_from_options(options: Option<&BilibiliDownloadOptions>) -> StreamSelection {
-    options
+    let video_quality = options
         .and_then(|options| video_quality_preference(&options.quality_preference))
-        .map(StreamSelection::video)
-        .unwrap_or_default()
+        .map(Some)
+        .unwrap_or_default();
+
+    let mut selection = StreamSelection::new(video_quality, None);
+    if let Some(audio_language) = options
+        .map(|options| options.audio_language.trim())
+        .filter(|audio_language| !audio_language.is_empty())
+    {
+        selection = selection.with_audio_language(audio_language.to_owned());
+    }
+    selection
+}
+
+fn subtitle_ai_policy_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<SubtitleAiPolicy, BilibiliDownloadError> {
+    let Some(options) = options else {
+        return Ok(SubtitleAiPolicy::Include);
+    };
+
+    match BilibiliSubtitleAiPolicy::try_from(options.subtitle_ai_policy) {
+        Ok(BilibiliSubtitleAiPolicy::Unspecified | BilibiliSubtitleAiPolicy::Include) => {
+            Ok(SubtitleAiPolicy::Include)
+        }
+        Ok(BilibiliSubtitleAiPolicy::PreferNonAi) => Ok(SubtitleAiPolicy::PreferNonAi),
+        Ok(BilibiliSubtitleAiPolicy::ExcludeAi) => Ok(SubtitleAiPolicy::ExcludeAi),
+        Ok(BilibiliSubtitleAiPolicy::OnlyAi) => Ok(SubtitleAiPolicy::OnlyAi),
+        Err(_) => Err(BilibiliDownloadError::Failed(format!(
+            "Unsupported Bilibili subtitle_ai_policy value: {}.",
+            options.subtitle_ai_policy
+        ))),
+    }
+}
+
+fn danmaku_formats_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<Option<Vec<DanmakuFormat>>, BilibiliDownloadError> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+
+    if options.danmaku_formats.is_empty() {
+        return Ok(None);
+    }
+
+    let mut include_xml = false;
+    let mut include_ass = false;
+    for value in &options.danmaku_formats {
+        match BilibiliDanmakuFormat::try_from(*value) {
+            Ok(BilibiliDanmakuFormat::Unspecified) => {}
+            Ok(BilibiliDanmakuFormat::Xml) => include_xml = true,
+            Ok(BilibiliDanmakuFormat::Ass) => include_ass = true,
+            Err(_) => {
+                return Err(BilibiliDownloadError::Failed(format!(
+                    "Unsupported Bilibili danmaku_format value: {value}."
+                )));
+            }
+        }
+    }
+
+    let mut formats = Vec::new();
+    if include_xml {
+        formats.push(DanmakuFormat::Xml);
+    }
+    if include_ass {
+        formats.push(DanmakuFormat::Ass);
+    }
+
+    if formats.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(formats))
+    }
 }
 
 fn video_quality_preference(value: &str) -> Option<u32> {
@@ -2620,9 +2723,55 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: true,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         };
 
         assert!(validate_supported_download_options(Some(&options)).is_ok());
+    }
+
+    #[test]
+    fn maps_extended_download_options_to_bbdown_core() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let options = BilibiliDownloadOptions {
+            quality_preference: "1080p".to_owned(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: true,
+            download_danmaku: true,
+            audio_language: "ja-JP".to_owned(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::ExcludeAi.into(),
+            download_cover: true,
+            danmaku_formats: vec![
+                BilibiliDanmakuFormat::Ass.into(),
+                BilibiliDanmakuFormat::Xml.into(),
+            ],
+        };
+
+        let download_options =
+            download_options_for_output_dir(temp.path().join("bbdown-output"), Some(&options))
+                .expect("extended options should be supported");
+
+        assert_eq!(download_options.stream_selection.video_quality, Some(80));
+        assert_eq!(
+            download_options.stream_selection.audio_language.as_deref(),
+            Some("ja-JP")
+        );
+        assert!(download_options.include_subtitles);
+        assert_eq!(
+            download_options.subtitle_ai_policy,
+            SubtitleAiPolicy::ExcludeAi
+        );
+        assert!(download_options.include_danmaku);
+        assert!(download_options.sidecars.cover);
+        assert!(download_options.sidecars.subtitles);
+        assert!(download_options.sidecars.danmaku);
+        assert_eq!(
+            download_options.danmaku_formats.as_slice(),
+            &[DanmakuFormat::Xml, DanmakuFormat::Ass]
+        );
     }
 
     #[test]
@@ -2633,6 +2782,10 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -2651,10 +2804,58 @@ mod tests {
             prefer_tv_api: true,
             download_subtitles: false,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         };
 
         let result = validate_supported_download_options(Some(&options));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_subtitle_ai_policy_without_subtitles() {
+        let options = BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::OnlyAi.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
+        };
+
+        let result = validate_supported_download_options(Some(&options));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("subtitle_ai_policy requires download_subtitles")
+        ));
+    }
+
+    #[test]
+    fn rejects_danmaku_formats_without_danmaku() {
+        let options = BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: vec![BilibiliDanmakuFormat::Ass.into()],
+        };
+
+        let result = validate_supported_download_options(Some(&options));
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("danmaku_formats requires download_danmaku")
+        ));
     }
 
     #[test]
@@ -4416,6 +4617,10 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         }
     }
 
@@ -4426,6 +4631,10 @@ mod tests {
             prefer_tv_api: false,
             download_subtitles: false,
             download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
         }
     }
 

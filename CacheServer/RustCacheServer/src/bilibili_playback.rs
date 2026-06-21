@@ -3,7 +3,9 @@ use std::{future::Future, pin::Pin};
 use crate::{
     bbdown_adapter::{BbdownBilibiliAdapter, BilibiliPlaybackPlan},
     bilibili_worker::BilibiliDownloadError,
-    generated::tvos_net_player::v1::{BilibiliDownloadOptions, BilibiliPlaybackOptions},
+    generated::tvos_net_player::v1::{
+        BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliSubtitleAiPolicy,
+    },
     task_registry::BilibiliTaskCancellation,
 };
 
@@ -106,5 +108,9 @@ fn playback_to_download_options(options: &BilibiliPlaybackOptions) -> BilibiliDo
         prefer_tv_api: options.prefer_tv_api,
         download_subtitles: false,
         download_danmaku: false,
+        audio_language: options.audio_language.clone(),
+        subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+        download_cover: false,
+        danmaku_formats: Vec::new(),
     }
 }

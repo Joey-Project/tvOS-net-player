@@ -299,6 +299,9 @@ struct ContentView: View {
 
                 TextField("Codec", text: $bilibiliModel.encodingPreference)
                     .textContentType(.none)
+
+                TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
+                    .textContentType(.none)
             }
 
             if let errorMessage = bilibiliModel.errorMessage {

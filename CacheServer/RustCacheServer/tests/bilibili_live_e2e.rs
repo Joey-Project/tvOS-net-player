@@ -537,6 +537,8 @@ struct LivePlaybackOptions {
     quality_preference: String,
     encoding_preference: String,
     prefer_tv_api: bool,
+    #[serde(default)]
+    audio_language: String,
 }
 
 impl LivePlaybackOptions {
@@ -545,6 +547,7 @@ impl LivePlaybackOptions {
             quality_preference: self.quality_preference.clone(),
             encoding_preference: self.encoding_preference.clone(),
             prefer_tv_api: self.prefer_tv_api,
+            audio_language: self.audio_language.clone(),
         }
     }
 }
