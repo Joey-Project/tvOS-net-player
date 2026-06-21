@@ -26,10 +26,11 @@ superseded_by:
 - Preserve the existing coarse adapter phase boundaries: planning starts at 2%, BBDown download spans 10% to 80%, server muxing reports 80%, and library indexing reports 95%.
 - Use `DownloadReport::summary().total_bytes` for completed byte totals so resumed bytes and freshly written bytes share BBDown's upstream summary semantics.
 - Coalesce high-frequency BBDown file progress events by byte/progress delta before publishing them to task watchers, while still publishing file start/completion and plan/entry state transitions.
-- Report a conservative total equal to downloaded bytes when BBDown has no expected file size, because task progress updates currently treat `total_bytes: None` as "leave the previous total unchanged".
+- Report `total_bytes: 0` when any active BBDown file has an unknown expected size, so persisted task state clears stale totals and clients fall back to adapter phase progress instead of rendering a misleading byte ratio.
 - Track multi-entry download progress from completed event count and current-entry byte ratio, because BBDown entry indices are source page/episode/item indices rather than guaranteed contiguous ordinals within a selected plan.
 - Cap an incomplete entry's active byte contribution until `EntryCompleted`, because BBDown reports files as they start and an entry can still have unstarted DASH audio, FLV segments, subtitles, danmaku, or cover files.
 - Preserve cancellation semantics when the task registry has already requested cancellation and BBDown returns a late non-cancel error before observing the token.
+- Give BBDown a bounded grace period to observe download cancellation and roll back partial files, then return `Cancelled` if the core future remains non-responsive so the worker does not hold the archive lock indefinitely.
 - Roll back per-file accumulated bytes on BBDown `FileFailed`, because BBDown truncates failed attempts back to the attempt start offset before retrying, cancelling, or failing the plan.
 - Do not persist high-frequency progress updates to disk; task lifecycle persistence remains unchanged.
 

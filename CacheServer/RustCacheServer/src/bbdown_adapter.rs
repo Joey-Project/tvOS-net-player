@@ -19,7 +19,13 @@ use bbdown_core::{
     PlaybackVariantKind, PlayurlMode, ResolvedContent, RestrictedArea, RestrictedAreaConfig,
     RestrictedAreaProxy, Selection, StreamSelection, VideoCollectionKind,
 };
-use tokio::{fs, io::AsyncReadExt, process::Command, sync::Mutex, time::sleep};
+use tokio::{
+    fs,
+    io::AsyncReadExt,
+    process::Command,
+    sync::Mutex,
+    time::{Instant, sleep},
+};
 
 use crate::{
     bilibili_playback::{BilibiliInputResolution, BilibiliResolvedCandidate},
@@ -43,6 +49,7 @@ const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
 const ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP: f64 = 0.50;
 const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
 
@@ -579,11 +586,48 @@ async fn run_bbdown_download_until_cancelled<T>(
     is_cancel_requested: impl Fn() -> bool,
     cancellation_message: &'static str,
 ) -> Result<T, BilibiliDownloadError> {
+    run_bbdown_download_until_cancelled_with_grace(
+        future,
+        cancellation,
+        is_cancel_requested,
+        cancellation_message,
+        BBDOWN_CANCELLATION_GRACE_PERIOD,
+    )
+    .await
+}
+
+async fn run_bbdown_download_until_cancelled_with_grace<T>(
+    future: impl Future<Output = Result<T, BbdownError>>,
+    cancellation: &DownloadCancellationToken,
+    is_cancel_requested: impl Fn() -> bool,
+    cancellation_message: &'static str,
+    cancellation_grace_period: Duration,
+) -> Result<T, BilibiliDownloadError> {
     tokio::pin!(future);
+    let mut cancellation_started_at: Option<Instant> = None;
     loop {
         if is_cancel_requested() && !cancellation.is_cancelled() {
             cancellation.cancel_with_reason(cancellation_message);
         }
+        if cancellation.is_cancelled() && cancellation_started_at.is_none() {
+            cancellation_started_at = Some(Instant::now());
+        }
+        if cancellation_started_at
+            .is_some_and(|started_at| started_at.elapsed() >= cancellation_grace_period)
+        {
+            return Err(BilibiliDownloadError::Cancelled(cancellation_reason(
+                cancellation,
+                cancellation_message,
+            )));
+        }
+
+        let poll_interval = cancellation_started_at
+            .map(|started_at| {
+                cancellation_grace_period
+                    .saturating_sub(started_at.elapsed())
+                    .min(BBDOWN_CANCELLATION_POLL_INTERVAL)
+            })
+            .unwrap_or(BBDOWN_CANCELLATION_POLL_INTERVAL);
 
         tokio::select! {
             result = &mut future => {
@@ -595,9 +639,7 @@ async fn run_bbdown_download_until_cancelled<T>(
                         }
                         if error.is_cancelled() || cancellation.is_cancelled() {
                             Err(BilibiliDownloadError::Cancelled(
-                                cancellation
-                                    .reason()
-                                    .unwrap_or_else(|| error.to_string()),
+                                cancellation_reason(cancellation, &error.to_string()),
                             ))
                         } else {
                             Err(failed(error))
@@ -605,9 +647,13 @@ async fn run_bbdown_download_until_cancelled<T>(
                     }
                 };
             }
-            () = sleep(BBDOWN_CANCELLATION_POLL_INTERVAL) => {}
+            () = sleep(poll_interval) => {}
         }
     }
+}
+
+fn cancellation_reason(cancellation: &DownloadCancellationToken, fallback: &str) -> String {
+    cancellation.reason().unwrap_or_else(|| fallback.to_owned())
 }
 
 async fn run_bbdown_core_until_cancelled<T>(
@@ -971,10 +1017,7 @@ impl BilibiliBbdownProgressAccumulator {
 
     fn reported_bytes_snapshot(&self) -> (u64, Option<u64>) {
         let (downloaded_bytes, known_total_bytes) = self.known_bytes_snapshot();
-        (
-            downloaded_bytes,
-            Some(known_total_bytes.unwrap_or(downloaded_bytes)),
-        )
+        (downloaded_bytes, Some(known_total_bytes.unwrap_or(0)))
     }
 
     fn should_publish_file_progress(&self, downloaded_bytes: u64, progress: f64) -> bool {
@@ -3868,7 +3911,7 @@ mod tests {
             })
             .expect("file start should report progress");
         assert_eq!(Some(25), started_progress.downloaded_bytes);
-        assert_eq!(Some(25), started_progress.total_bytes);
+        assert_eq!(Some(0), started_progress.total_bytes);
 
         let tiny_progress = accumulator.record(&DownloadProgressEvent::FileProgress {
             entry_index: 1,
@@ -3899,10 +3942,7 @@ mod tests {
             Some(to_i64_saturating(expected_downloaded)),
             published_progress.downloaded_bytes
         );
-        assert_eq!(
-            Some(to_i64_saturating(expected_downloaded)),
-            published_progress.total_bytes
-        );
+        assert_eq!(Some(0), published_progress.total_bytes);
     }
 
     #[test]
@@ -3992,6 +4032,26 @@ mod tests {
             &cancellation,
             || true,
             "Cancelled while the BBDown download was running.",
+        )
+        .await;
+
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Cancelled(message))
+                if message == "Cancelled while the BBDown download was running."
+        ));
+    }
+
+    #[tokio::test]
+    async fn bbdown_download_cancellation_times_out_nonresponsive_core_future() {
+        let cancellation = DownloadCancellationToken::new();
+        let result = run_bbdown_download_until_cancelled_with_grace(
+            std::future::pending::<Result<(), BbdownError>>(),
+            &cancellation,
+            || true,
+            "Cancelled while the BBDown download was running.",
+            Duration::from_millis(10),
         )
         .await;
 
