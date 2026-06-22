@@ -7,6 +7,34 @@ public struct ProgressiveCacheStatusBadge: Equatable, Sendable {
     public let systemImage: String
 }
 
+public enum BilibiliFetchNoticeTone: String, Equatable, Sendable {
+    case info
+    case warning
+    case error
+}
+
+public struct BilibiliFetchNotice: Equatable, Sendable {
+    public let title: String
+    public let message: String
+    public let systemImage: String
+    public let tone: BilibiliFetchNoticeTone
+    public let actionTitle: String?
+
+    public init(
+        title: String,
+        message: String,
+        systemImage: String,
+        tone: BilibiliFetchNoticeTone,
+        actionTitle: String? = nil
+    ) {
+        self.title = title
+        self.message = message
+        self.systemImage = systemImage
+        self.tone = tone
+        self.actionTitle = actionTitle
+    }
+}
+
 public struct BilibiliTaskResultSummary: Equatable, Sendable {
     public let totalCount: Int
     public let readyCount: Int
@@ -158,6 +186,10 @@ private struct BilibiliCandidateSelectionRequest {
     let legacySelectionID: String?
 }
 
+private enum BilibiliRetryIntent {
+    case reResolve
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var sourceText: String
@@ -207,6 +239,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var activePlaybackTaskID: String?
     private var activePlaybackLibraryItemID: String?
     private var activePlaybackResultID: String?
+    private var retryIntent: BilibiliRetryIntent?
     private var isNormalizingCandidateSelection = false
     private var isChoosingRangeEnd = false
 
@@ -301,6 +334,23 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public var canClear: Bool {
         currentTask != nil || errorMessage != nil || resolvedInput != nil
+    }
+
+    public var canReResolve: Bool {
+        !isSubmitting
+            && !isResolving
+            && !isCancelling
+            && currentTask == nil
+            && resolvedInputMatchesSource
+            && !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var canClearCandidateSelection: Bool {
+        isWaitingForCandidateSelection
+            && !isSubmitting
+            && !isResolving
+            && !isCancelling
+            && selectedCandidateCount > 0
     }
 
     public var availableCandidateSelectionModes: [BilibiliCandidateSelectionMode] {
@@ -433,6 +483,50 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask?.bilibiliTaskResultSummary
     }
 
+    public var fetchNotice: BilibiliFetchNotice? {
+        if let errorNotice = Self.errorNotice(for: errorMessage, currentTask: currentTask) {
+            return errorNotice
+        }
+
+        guard currentTask == nil, resolvedInputMatchesSource, let resolvedInput else {
+            return nil
+        }
+
+        if resolvedInput.candidates.isEmpty {
+            return BilibiliFetchNotice(
+                title: "No items found",
+                message: "The resolved Bilibili list is empty for the current account or upstream page.",
+                systemImage: "tray",
+                tone: .warning,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        if resolvedInput.candidatesTruncated {
+            return BilibiliFetchNotice(
+                title: "Showing a bounded window",
+                message:
+                    "Only the first \(resolvedInput.candidates.count) resolved items are shown. Use a narrower URL or re-resolve before submitting a large batch.",
+                systemImage: "rectangle.stack.badge.exclamationmark",
+                tone: .warning,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        if Self.isVolatileResolvedSourceKind(resolvedInput.sourceKind) {
+            return BilibiliFetchNotice(
+                title: "List may change",
+                message:
+                    "This Bilibili list or feed can reorder between refreshes. Single and multiple selections submit stable item IDs; Range and All follow the refreshed list order.",
+                systemImage: "arrow.triangle.2.circlepath",
+                tone: .info,
+                actionTitle: "Re-resolve"
+            )
+        }
+
+        return nil
+    }
+
     public var playableTaskResults: [BilibiliTaskResultPresentation] {
         taskResults.filter { $0.playbackURL != nil }
     }
@@ -454,6 +548,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard canSubmit else {
             return
         }
+        retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
@@ -470,23 +565,23 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let options = currentPlaybackOptions
 
-        if isWaitingForCandidateSelection,
-            resolvedInputMatches(source: source, endpoint: endpoint, options: options)
-        {
-            guard let selectionRequest = candidateSelectionRequest else {
+        if currentTask == nil, resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
+            if let selectionRequest = cachedResolvedPlaybackRequest {
+                await createPlaybackTask(
+                    source: source,
+                    selection: selectionRequest.selection,
+                    legacySelectionID: selectionRequest.legacySelectionID,
+                    endpoint: endpoint,
+                    options: options
+                )
+                return
+            }
+
+            if isWaitingForCandidateSelection {
                 errorMessage = "Select Bilibili items before submitting playback."
                 statusMessage = "Bilibili item selection is required."
                 return
             }
-
-            await createPlaybackTask(
-                source: source,
-                selection: selectionRequest.selection,
-                legacySelectionID: selectionRequest.legacySelectionID,
-                endpoint: endpoint,
-                options: options
-            )
-            return
         }
 
         operationSequence += 1
@@ -587,6 +682,12 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public func retry(serverAddressText: String) async {
+        if retryIntent == .reResolve, canReResolve {
+            await reResolve(serverAddressText: serverAddressText)
+            return
+        }
+
+        retryIntent = nil
         if let source = currentTask?.source.trimmingCharacters(in: .whitespacesAndNewlines),
             !source.isEmpty
         {
@@ -594,6 +695,110 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         await submit(serverAddressText: serverAddressText)
+    }
+
+    public func reResolve(serverAddressText: String) async {
+        guard canReResolve else {
+            return
+        }
+        retryIntent = nil
+
+        guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
+            retryIntent = .reResolve
+            errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
+            statusMessage = "Cache server address is invalid."
+            return
+        }
+
+        let source = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else {
+            retryIntent = .reResolve
+            errorMessage = "Enter a Bilibili URL, BV, av, season, feed, history, or watch-later input."
+            statusMessage = "Bilibili input is required."
+            return
+        }
+
+        let options = currentPlaybackOptions
+
+        operationSequence += 1
+        activePlaybackTaskID = nil
+        activePlaybackResultID = nil
+        let sequence = operationSequence
+
+        stopWatching()
+        currentTask = nil
+        isResolving = true
+        isSubmitting = false
+        errorMessage = nil
+        statusMessage = "Resolving Bilibili input..."
+
+        let client = clientFactory(endpoint)
+
+        do {
+            let resolved = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.resolveBilibiliInput(urlOrID: source, options: options)
+            }
+
+            guard sequence == operationSequence else {
+                return
+            }
+
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
+                return
+            }
+
+            activeEndpoint = endpoint
+            resolvedInput = resolved
+            resolvedInputContext = BilibiliResolvedInputContext(
+                source: source,
+                endpoint: endpoint,
+                options: options
+            )
+            applyResolvedCandidateDefaults(resolved)
+            isResolving = false
+
+            if resolved.candidates.isEmpty {
+                statusMessage = "No selectable Bilibili item was found."
+            } else if resolved.requiresSelection {
+                statusMessage = "Select a Bilibili item to play."
+            } else {
+                statusMessage = "Bilibili input resolved."
+            }
+        } catch {
+            guard sequence == operationSequence else {
+                return
+            }
+
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
+                return
+            }
+
+            currentTask = nil
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not resolve Bilibili input."
+            retryIntent = .reResolve
+            isResolving = false
+            isSubmitting = false
+        }
+    }
+
+    public func clearResolvedCandidateSelection() {
+        guard canClearCandidateSelection else {
+            return
+        }
+
+        isNormalizingCandidateSelection = true
+        candidateSelectionMode = .multiple
+        selectedCandidateID = nil
+        selectedCandidateIDs = []
+        rangeStartCandidateID = nil
+        rangeEndCandidateID = nil
+        isChoosingRangeEnd = false
+        errorMessage = nil
+        statusMessage = "Select a Bilibili item to play."
+        isNormalizingCandidateSelection = false
     }
 
     public func cancel(serverAddressText: String) async {
@@ -730,6 +935,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
+        retryIntent = nil
         currentTask = nil
         errorMessage = nil
         isSubmitting = false
@@ -867,6 +1073,25 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 legacySelectionID: nil
             )
         }
+    }
+
+    private var cachedResolvedPlaybackRequest: BilibiliCandidateSelectionRequest? {
+        guard let resolvedInput else {
+            return nil
+        }
+
+        if resolvedInput.requiresSelection {
+            return candidateSelectionRequest
+        }
+
+        guard let candidate = selectedCandidate else {
+            return nil
+        }
+
+        return BilibiliCandidateSelectionRequest(
+            selection: Self.singleSelection(for: candidate.selectionID),
+            legacySelectionID: candidate.selectionID
+        )
     }
 
     private func candidate(withID id: String?) -> BilibiliResolvedCandidate? {
@@ -1060,6 +1285,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     ) async {
         stopWatching()
         activeEndpoint = endpoint
+        retryIntent = nil
         isSubmitting = true
         isResolving = false
         errorMessage = nil
@@ -1275,6 +1501,65 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return "\(task.bilibiliDisplayTitle) failed."
     }
 
+    private static func errorNotice(
+        for errorMessage: String?,
+        currentTask: CacheTask?
+    ) -> BilibiliFetchNotice? {
+        guard let errorMessage else {
+            return nil
+        }
+
+        let normalized = errorMessage.lowercased()
+        if Self.isCredentialFailureMessage(normalized) {
+            return BilibiliFetchNotice(
+                title: "Credentials required",
+                message:
+                    "This Bilibili page needs server-side web credentials. Refresh the LAN cache server credential file, then retry.",
+                systemImage: "person.crop.circle.badge.exclamationmark",
+                tone: .warning,
+                actionTitle: "Retry"
+            )
+        }
+
+        if errorMessage.isQuotaOrStorageFailureMessage {
+            return nil
+        }
+
+        if normalized.contains("empty") || normalized.contains("no item") || normalized.contains("no selectable") {
+            return BilibiliFetchNotice(
+                title: "No items found",
+                message: "The resolved Bilibili list is empty for the current account or upstream page.",
+                systemImage: "tray",
+                tone: .warning,
+                actionTitle: "Retry"
+            )
+        }
+
+        guard currentTask?.isRetryableBilibiliTaskState == true || currentTask == nil else {
+            return nil
+        }
+
+        if normalized.contains("timed out")
+            || normalized.contains("timeout")
+            || normalized.contains("upstream")
+            || normalized.contains("rate")
+            || normalized.contains("api returned")
+            || normalized.contains("network")
+            || currentTask?.isRetryableBilibiliTaskState == true
+        {
+            return BilibiliFetchNotice(
+                title: "Retry available",
+                message:
+                    "The Bilibili request failed or timed out. Retry after the cache server reconnects or upstream rate limits clear.",
+                systemImage: "arrow.clockwise.circle",
+                tone: .error,
+                actionTitle: "Retry"
+            )
+        }
+
+        return nil
+    }
+
     private static func progressiveCacheStatusBadge(for task: CacheTask) -> ProgressiveCacheStatusBadge? {
         guard task.isProgressivePlayback else {
             return nil
@@ -1359,6 +1644,52 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private static func allSelection() -> BilibiliTaskSelection {
         BilibiliTaskSelection(mode: "all")
+    }
+
+    private static func isVolatileResolvedSourceKind(_ sourceKind: String) -> Bool {
+        switch normalizedBilibiliSourceKind(sourceKind) {
+        case "favorite", "space", "collection", "series", "history", "watchlater", "following", "dynamic",
+            "spacedynamic", "recommendation", "recommendations", "homepage", "feed":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isCredentialFailureMessage(_ normalizedMessage: String) -> Bool {
+        if normalizedMessage.contains("-101")
+            || normalizedMessage.contains("\u{672a}\u{767b}\u{5f55}")
+            || normalizedMessage.contains("not logged")
+            || normalizedMessage.contains("not login")
+            || normalizedMessage.contains("login")
+            || normalizedMessage.contains("cookie")
+            || normalizedMessage.contains("credential")
+            || normalizedMessage.contains("bili_jct")
+            || normalizedMessage.contains("access_key")
+            || normalizedMessage.contains("unauthorized")
+            || normalizedMessage.contains("unauthorised")
+            || normalizedMessage.contains("authentication")
+            || normalizedMessage.contains("authenticate")
+            || normalizedMessage.contains("authorization")
+            || normalizedMessage.contains("authorisation")
+        {
+            return true
+        }
+
+        let tokens = Set(
+            normalizedMessage
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+        )
+        return tokens.contains("auth")
+            || tokens.contains("sessdata")
+            || tokens.contains("csrf")
+    }
+
+    private static func normalizedBilibiliSourceKind(_ sourceKind: String) -> String {
+        sourceKind
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     private static func withOperationTimeout<Value: Sendable>(

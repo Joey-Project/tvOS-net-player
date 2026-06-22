@@ -91,6 +91,7 @@ superseded_by:
 
 ### PR 6: Bilibili Fetch UX Polish
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-21-bilibili-fetch-ux-polish-b6f2a9.md`.
 - Improve tvOS/macOS presentation for login-required inputs, empty lists, truncated candidate windows, dynamic-feed volatility, and retryable upstream failures.
 - Add clear re-resolve, clear selection, and recovery actions where they fit the existing UI.
 - Prioritize macOS validation ergonomics while preserving tvOS functional parity.
@@ -168,6 +169,12 @@ superseded_by:
   - `just test-bilibili-live`
   - `BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live`
   - Live probes showed `space-videos` and `homepage-recommendations` currently need a web cookie, `favorite-list` sample availability can fail upstream selection, and `space-series` sample can stall during playback planning; authenticated list/feed cases therefore need web-cookie opt-in, and favorite/series need URL overrides before joining unfiltered collection/list smoke coverage.
+- PR 6 local gate:
+  - `swift test --filter BilibiliTaskViewModelTests`
+  - `scripts/format.sh`
+  - `git diff --check`
+  - `scripts/lint.sh`
+  - `just ci`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
