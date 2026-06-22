@@ -92,7 +92,7 @@ impl HlsPlaybackSession {
             .iter()
             .map(HlsVariantMetadata::from_adapter)
             .collect();
-        session.alternate_variants = playable_alternate_variants(&session.variant.id, variants)?;
+        session.alternate_variants = playable_alternate_variants(selected_variant, variants)?;
         if !session
             .variants
             .iter()
@@ -595,12 +595,15 @@ fn audio_group_id(index: usize) -> String {
 }
 
 fn playable_alternate_variants(
-    selected_variant_id: &str,
+    selected_variant: &AdapterPlaybackVariant,
     variants: &[AdapterPlaybackVariant],
 ) -> Result<Vec<HlsVariant>, HlsSessionError> {
     let mut alternates = Vec::new();
     for variant in variants {
-        if variant.id == selected_variant_id || !is_avplayer_safe_alternate_variant(variant) {
+        if variant.id == selected_variant.id
+            || !is_switchable_alternate_variant(selected_variant, variant)
+            || !is_avplayer_safe_alternate_variant(variant)
+        {
             continue;
         }
         let index = alternates.len() + 1;
@@ -611,6 +614,21 @@ fn playable_alternate_variants(
         )?);
     }
     Ok(alternates)
+}
+
+fn is_switchable_alternate_variant(
+    selected_variant: &AdapterPlaybackVariant,
+    variant: &AdapterPlaybackVariant,
+) -> bool {
+    let Some(selected_abr) = &selected_variant.abr else {
+        return false;
+    };
+    let Some(variant_abr) = &variant.abr else {
+        return false;
+    };
+    selected_abr.switchable
+        && variant_abr.switchable
+        && selected_abr.group_id == variant_abr.group_id
 }
 
 fn is_avplayer_safe_alternate_variant(variant: &AdapterPlaybackVariant) -> bool {
@@ -634,11 +652,13 @@ fn variant_has_codec(
     request_codecs: Option<&str>,
     predicate: fn(&str) -> bool,
 ) -> bool {
+    if let Some(codecs) = request_codecs {
+        return codec_list_matches(codecs, predicate);
+    }
     variant
         .codecs
         .iter()
         .any(|codecs| codec_list_matches(codecs, predicate))
-        || request_codecs.is_some_and(|codecs| codec_list_matches(codecs, predicate))
 }
 
 fn codec_list_matches(codecs: &str, predicate: fn(&str) -> bool) -> bool {
@@ -700,12 +720,14 @@ mod tests {
 
     #[test]
     fn from_playback_entry_emits_avplayer_safe_alternate_hls_variants() {
-        let selected = dash_variant();
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
         let mut alternate = dash_variant();
         alternate.id = "h264-720p".to_owned();
         alternate.bandwidth = Some(600_000);
         alternate.width = Some(1280);
         alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
         alternate.video.as_mut().unwrap().url =
             "https://media.example.test/720p-video.m4s".to_owned();
         alternate.video.as_mut().unwrap().cache_key.source_hash =
@@ -750,25 +772,75 @@ mod tests {
 
     #[test]
     fn from_playback_entry_filters_unsafe_alternate_hls_variants() {
-        let selected = dash_variant();
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 6, true));
         let mut hevc = dash_variant();
         hevc.id = "hevc-1080p".to_owned();
         hevc.codecs = vec!["hev1.1.6.L120.90".to_owned()];
+        hevc.abr = Some(abr_level("dash-video", 1, 6, true));
         hevc.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
         let mut av1 = dash_variant();
         av1.id = "av1-1080p".to_owned();
         av1.codecs = vec!["av01.0.08M.08".to_owned()];
+        av1.abr = Some(abr_level("dash-video", 2, 6, true));
         av1.video.as_mut().unwrap().codecs = Some("av01.0.08M.08".to_owned());
+        let mut mismatched_video = dash_variant();
+        mismatched_video.id = "mismatched-video-codec".to_owned();
+        mismatched_video.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        mismatched_video.abr = Some(abr_level("dash-video", 3, 6, true));
+        mismatched_video.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+        let mut mismatched_audio = dash_variant();
+        mismatched_audio.id = "mismatched-audio-codec".to_owned();
+        mismatched_audio.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        mismatched_audio.abr = Some(abr_level("dash-video", 4, 6, true));
+        mismatched_audio.audio.as_mut().unwrap().codecs = Some("flac".to_owned());
         let mut flv = dash_variant();
         flv.id = "flv".to_owned();
         flv.kind = BilibiliPlaybackVariantKind::Flv;
+        flv.abr = Some(abr_level("dash-video", 5, 6, true));
 
         let session = HlsPlaybackSession::from_playback_entry(
             "session-1",
             "Episode",
             &selected,
             &AdapterAbrMetadata { groups: Vec::new() },
-            &[selected.clone(), hevc, av1, flv],
+            &[
+                selected.clone(),
+                hevc,
+                av1,
+                mismatched_video,
+                mismatched_audio,
+                flv,
+            ],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_filters_non_switchable_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 4, true));
+        let mut non_switchable = dash_variant();
+        non_switchable.id = "non-switchable".to_owned();
+        non_switchable.abr = Some(abr_level("dash-video", 1, 4, false));
+        let mut other_group = dash_variant();
+        other_group.id = "other-group".to_owned();
+        other_group.abr = Some(abr_level("dash-backup-video", 2, 4, true));
+        let mut missing_abr = dash_variant();
+        missing_abr.id = "missing-abr".to_owned();
+        missing_abr.abr = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), non_switchable, other_group, missing_abr],
         )
         .unwrap();
 
@@ -842,6 +914,20 @@ mod tests {
                 "mp4a.40.2",
             )),
             flv_segments: Vec::new(),
+        }
+    }
+
+    fn abr_level(
+        group_id: &str,
+        level_index: u32,
+        level_count: u32,
+        switchable: bool,
+    ) -> AdapterAbrLevel {
+        AdapterAbrLevel {
+            group_id: group_id.to_owned(),
+            level_index,
+            level_count,
+            switchable,
         }
     }
 

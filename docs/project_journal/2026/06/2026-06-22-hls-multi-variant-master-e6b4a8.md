@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-22
 updated: 2026-06-22
 branch: wip/hls-multi-variant-master
-pr:
+pr: 39
 supersedes:
   - 20260622-a3c9f4
 superseded_by:
@@ -15,20 +15,22 @@ superseded_by:
 
 ## Summary
 
-- PR 8 emits runtime HLS master playlists with multiple AVPlayer-safe DASH variants when BBDown provides compatible H.264/AAC candidates.
+- PR 8 emits runtime HLS master playlists with multiple AVPlayer-safe DASH variants when BBDown provides compatible H.264/AAC candidates in the same switchable ABR group as the selected variant.
 - Each alternate variant gets stable variant-specific playlist and media resource IDs such as `v1-video.m3u8` and `v1-video.m4s`.
 - Existing HLS media handlers remain cache-first and then upstream-fallback; the lookup path is now variant-aware because every playable resource has its own cache/resource ID.
 
 ## Decisions
 
 - The selected variant keeps the existing `video.m3u8` / `audio.m3u8` and `video.m4s` / `audio.m4s` IDs for compatibility with existing manifests and tests.
-- Alternate runtime variants are limited to DASH variants with H.264 video and AAC audio metadata. HEVC/AV1 variants stay out of the master playlist until platform capability and transcoding policy are explicit.
+- Alternate runtime variants are limited to switchable same-group DASH variants with H.264 video and AAC audio metadata. HEVC/AV1 variants stay out of the master playlist until platform capability and transcoding policy are explicit.
+- When media request codec metadata exists, it is authoritative for safety filtering; variant-level codec metadata is only a fallback for missing request-level codec data.
 - Completed offline HLS manifests still guarantee only the selected cached variant. When a session is finalized, upstream URLs/headers are scrubbed and runtime alternate variants are removed so offline master playlists cannot advertise uncached variants.
 
 ## Implementation
 
 - Added `HlsPlaybackSession.alternate_variants` and backward-compatible persistence with `#[serde(default)]`.
 - Built multi-variant master generation from the selected variant plus safe alternates, with per-variant audio groups and variant-specific media playlist IDs.
+- Tightened alternate filtering after review so variants must be in the selected variant's switchable ABR group and must pass media-request-level codec checks.
 - Updated media playlist/resource lookup to iterate all playable variants, allowing the existing cache/prewarm/upstream fallback path to work per variant.
 - Extended completed-manifest sanitization to clear alternate variants after finalization.
 
