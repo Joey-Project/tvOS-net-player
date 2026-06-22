@@ -1,4 +1,4 @@
-use std::{io::SeekFrom, sync::Arc};
+use std::{io::SeekFrom, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -12,7 +12,10 @@ use axum::{
     },
 };
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    time::Instant,
+};
 use tokio_util::io::ReaderStream;
 
 use crate::{
@@ -127,7 +130,12 @@ fn hls_master_playlist_response(
     let body = if head_only {
         Body::empty()
     } else {
-        Body::from(session.master_playlist())
+        Body::from(session.master_playlist_with_variant_filter(|variant| {
+            state
+                .state
+                .hls_network_policy
+                .variant_is_advertisable(&session_id, &variant.id)
+        }))
     };
 
     Response::builder()
@@ -150,7 +158,9 @@ async fn hls_segment_response(
     };
 
     if segment_id.ends_with(".m3u8") {
-        let Some(resource) = session.media_playlist_resource(&segment_id) else {
+        let Some((variant_id, resource)) =
+            session.media_playlist_resource_with_variant(&segment_id)
+        else {
             return empty_response(StatusCode::NOT_FOUND);
         };
         let initialization = if let Some(cached) = state
@@ -158,6 +168,7 @@ async fn hls_segment_response(
             .hls_cache
             .cached_resource(&session_id, &resource.id)
         {
+            state.state.hls_network_policy.record_cache_hit(&session_id);
             Mp4Initialization {
                 length: cached.initialization_length,
                 total_length: cached.total_length,
@@ -167,12 +178,17 @@ async fn hls_segment_response(
             .hls_cache
             .prewarmed_resource(&session_id, &resource.id)
         {
+            state.state.hls_network_policy.record_cache_hit(&session_id);
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
             }
         } else {
             let Ok(initialization) = load_hls_mp4_initialization(&state, &resource).await else {
+                state
+                    .state
+                    .hls_network_policy
+                    .record_upstream_failure(&session_id, &variant_id);
                 return text_response(
                     StatusCode::BAD_GATEWAY,
                     "HLS upstream MP4 initialization probe failed.\n",
@@ -205,7 +221,7 @@ async fn hls_segment_response(
             .expect("HLS media playlist response should build");
     }
 
-    let Some(resource) = session.media_resource(&segment_id) else {
+    let Some((variant_id, resource)) = session.media_resource_with_variant(&segment_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
@@ -214,6 +230,7 @@ async fn hls_segment_response(
         .hls_cache
         .open_cached_resource(&session_id, &resource.id)
     {
+        state.state.hls_network_policy.record_cache_hit(&session_id);
         let range = match parse_range(headers.get(RANGE), opened_file.size_bytes) {
             Ok(range) => range,
             Err(_) => {
@@ -236,9 +253,20 @@ async fn hls_segment_response(
         && let Some(range_header) = headers.get(RANGE)
     {
         let range = match parse_range(Some(range_header), opened_file.total_length) {
-            Ok(Some(range)) if range.end < opened_file.prefix_length => range,
+            Ok(Some(range)) if range.end < opened_file.prefix_length => {
+                state.state.hls_network_policy.record_cache_hit(&session_id);
+                range
+            }
             Ok(_) => {
-                return proxy_hls_media_resource(&state, resource, &headers, head_only).await;
+                return proxy_hls_media_resource(
+                    &state,
+                    &session_id,
+                    &variant_id,
+                    resource,
+                    &headers,
+                    head_only,
+                )
+                .await;
             }
             Err(_) => {
                 let mut response = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
@@ -253,11 +281,21 @@ async fn hls_segment_response(
         return build_prewarmed_file_response(opened_file, range, head_only).await;
     }
 
-    proxy_hls_media_resource(&state, resource, &headers, head_only).await
+    proxy_hls_media_resource(
+        &state,
+        &session_id,
+        &variant_id,
+        resource,
+        &headers,
+        head_only,
+    )
+    .await
 }
 
 async fn proxy_hls_media_resource(
     state: &MediaState,
+    session_id: &str,
+    variant_id: &str,
     resource: HlsMediaResource,
     headers: &HeaderMap,
     head_only: bool,
@@ -269,14 +307,37 @@ async fn proxy_hls_media_resource(
     let mut last_retryable_response = None;
     for url in urls {
         match send_hls_upstream_request(state, &resource, &url, headers, head_only).await {
-            Ok(response) if should_retry_hls_upstream_status(response.status()) => {
-                last_retryable_response = Some(response);
+            Ok(upstream) if should_retry_hls_upstream_status(upstream.response.status()) => {
+                state
+                    .state
+                    .hls_network_policy
+                    .record_upstream_retry(session_id, variant_id);
+                last_retryable_response = Some(upstream.response);
             }
-            Ok(response) => return response,
-            Err(_) => continue,
+            Ok(upstream) => {
+                if upstream.response.status().is_success() {
+                    state.state.hls_network_policy.record_upstream_success(
+                        session_id,
+                        variant_id,
+                        upstream.response_time,
+                    );
+                }
+                return upstream.response;
+            }
+            Err(_) => {
+                state
+                    .state
+                    .hls_network_policy
+                    .record_upstream_retry(session_id, variant_id);
+                continue;
+            }
         }
     }
 
+    state
+        .state
+        .hls_network_policy
+        .record_upstream_failure(session_id, variant_id);
     last_retryable_response.unwrap_or_else(|| {
         text_response(
             StatusCode::BAD_GATEWAY,
@@ -303,7 +364,7 @@ async fn send_hls_upstream_request(
     url: &str,
     headers: &HeaderMap,
     head_only: bool,
-) -> Result<Response<Body>, reqwest::Error> {
+) -> Result<HlsUpstreamResponse, reqwest::Error> {
     let method = if head_only { Method::HEAD } else { Method::GET };
     let mut request = hls_upstream_request_builder(state, resource, method, url);
     if let Some(range) = headers.get(RANGE)
@@ -312,16 +373,21 @@ async fn send_hls_upstream_request(
         request = request.header(RANGE.as_str(), range);
     }
 
+    let started_at = Instant::now();
     let upstream = request.send().await?;
+    let response_time = started_at.elapsed();
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_headers = upstream.headers().clone();
     if range_response_invalid(headers.get(RANGE), status, &upstream_headers) {
-        return Ok(text_response(
-            StatusCode::BAD_GATEWAY,
-            "HLS upstream ignored byte range request.\n",
-            head_only,
-        ));
+        return Ok(HlsUpstreamResponse {
+            response: text_response(
+                StatusCode::BAD_GATEWAY,
+                "HLS upstream ignored byte range request.\n",
+                head_only,
+            ),
+            response_time,
+        });
     }
 
     let mut response = Response::builder()
@@ -339,7 +405,15 @@ async fn send_hls_upstream_request(
         resource.content_type(),
     );
 
-    Ok(response)
+    Ok(HlsUpstreamResponse {
+        response,
+        response_time,
+    })
+}
+
+struct HlsUpstreamResponse {
+    response: Response<Body>,
+    response_time: Duration,
 }
 
 fn hls_upstream_request_builder(
@@ -749,6 +823,38 @@ mod tests {
         assert_eq!("bytes 1-3/10", response.headers()[CONTENT_RANGE]);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(b"ide", &body[..]);
+    }
+
+    #[tokio::test]
+    async fn hls_master_playlist_demotes_unhealthy_variant_from_network_policy() {
+        let (upstream_url, _upstream_task) = start_hls_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        insert_authorized_hls_session(
+            &state,
+            hls_session_with_alternate("session-1", &upstream_url),
+        );
+        state
+            .hls_network_policy
+            .record_upstream_failure("session-1", "h264-1080p");
+
+        let response =
+            hls_master_playlist_get(State(MediaState::new(state)), Path("session-1".to_owned()))
+                .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let master = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(master.contains("BANDWIDTH=600000"));
+        assert!(master.contains("segments/v1-video.m3u8\n"));
+        assert!(!master.contains("segments/video.m3u8\n"));
     }
 
     #[tokio::test]
@@ -1569,6 +1675,26 @@ mod tests {
 
     fn hls_session(id: &str, upstream_url: &str) -> HlsPlaybackSession {
         hls_session_with_backups(id, upstream_url, Vec::new())
+    }
+
+    fn hls_session_with_alternate(id: &str, upstream_url: &str) -> HlsPlaybackSession {
+        let mut session = hls_session_with_backups(id, upstream_url, Vec::new());
+        session.variant.id = "h264-1080p".to_owned();
+        session.variant.bandwidth = 1_000_000;
+        session.alternate_variants = vec![HlsVariant {
+            id: "h264-720p".to_owned(),
+            bandwidth: 600_000,
+            codecs: vec!["avc1.640028".to_owned()],
+            width: Some(1280),
+            height: Some(720),
+            duration_seconds: 60,
+            video: HlsMediaResource {
+                id: "v1-video.m4s".to_owned(),
+                request: media_request(upstream_url, Vec::new()),
+            },
+            audio: None,
+        }];
+        session
     }
 
     fn hls_session_with_backups(

@@ -489,7 +489,22 @@ extension HLSCacheStatus {
             lowWatermarkBytes: proto.lowWatermarkBytes,
             usedBytes: proto.usedBytes,
             completedSessionCount: Int(proto.completedSessionCount),
-            lastEviction: proto.hasLastEviction ? HLSCacheEvictionSummary(proto.lastEviction) : nil
+            lastEviction: proto.hasLastEviction ? HLSCacheEvictionSummary(proto.lastEviction) : nil,
+            weakNetwork: proto.hasWeakNetwork ? HLSWeakNetworkStatus(proto.weakNetwork) : nil
+        )
+    }
+}
+
+extension HLSWeakNetworkStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsWeakNetworkStatus) {
+        self.init(
+            state: String(describing: proto.state),
+            message: proto.message,
+            degradedSessionCount: Int(proto.degradedSessionCount),
+            unhealthyVariantCount: Int(proto.unhealthyVariantCount),
+            retryingVariantCount: Int(proto.retryingVariantCount),
+            cacheOnlySessionCount: Int(proto.cacheOnlySessionCount),
+            lastChangedAt: proto.hasLastChangedAt ? Date(proto.lastChangedAt) : nil
         )
     }
 }

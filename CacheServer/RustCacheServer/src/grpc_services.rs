@@ -27,12 +27,13 @@ use crate::{
         DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest, GetHlsCacheStatusRequest,
         GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
         HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
-        HlsCacheStatus, LibraryItem, LibrarySource, ListCacheRootsRequest, ListCacheRootsResponse,
-        ListLibraryItemsRequest, ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource,
-        RescanLibraryRequest, RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability,
-        ServerInfo, Task, TaskEvent, TaskKind, TaskState, WatchTasksRequest,
-        cache_service_server::CacheService, library_service_server::LibraryService,
-        server_service_server::ServerService, task_service_server::TaskService,
+        HlsCacheStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LibraryItem, LibrarySource,
+        ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
+        ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource, RescanLibraryRequest,
+        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task,
+        TaskEvent, TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
+        library_service_server::LibraryService, server_service_server::ServerService,
+        task_service_server::TaskService,
     },
     hls::HlsPlaybackSession,
     hls_cache::{
@@ -40,6 +41,9 @@ use crate::{
         completed_runtime_session, hls_session_declared_size_bytes, timestamp_from_system_time,
     },
     hls_fill_scheduler::HlsFillPreemptionToken,
+    hls_network_policy::{
+        HlsWeakNetworkSnapshot, HlsWeakNetworkState as RuntimeHlsWeakNetworkState,
+    },
     library::ROOT_ID,
     task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
 };
@@ -603,6 +607,7 @@ impl CacheService for CacheGrpcService {
         let status = self.state.hls_cache_status().map_err(|error| {
             Status::internal(format!("Failed to scan HLS cache status: {error}"))
         })?;
+        let weak_network = self.state.hls_weak_network_status();
         Ok(Response::new(HlsCacheStatus {
             eviction_enabled: status.policy.eviction_enabled(),
             max_bytes: i64_from_u64(status.policy.max_bytes),
@@ -620,6 +625,7 @@ impl CacheService for CacheGrpcService {
                 .last_eviction
                 .as_ref()
                 .map(proto_hls_eviction_summary),
+            weak_network: Some(proto_hls_weak_network_status(&weak_network)),
         }))
     }
 
@@ -661,6 +667,40 @@ fn proto_hls_eviction_summary(summary: &HlsCacheEvictionSummary) -> ProtoHlsCach
         evicted_session_ids: summary.evicted_session_ids.clone(),
         target_reached: summary.target_reached,
         completed_at: Some(timestamp_from_system_time(summary.completed_at)),
+    }
+}
+
+fn proto_hls_weak_network_status(snapshot: &HlsWeakNetworkSnapshot) -> HlsWeakNetworkStatus {
+    HlsWeakNetworkStatus {
+        state: proto_hls_weak_network_state(snapshot.state).into(),
+        message: snapshot.message.clone(),
+        degraded_session_count: snapshot
+            .degraded_session_count
+            .try_into()
+            .unwrap_or(i32::MAX),
+        unhealthy_variant_count: snapshot
+            .unhealthy_variant_count
+            .try_into()
+            .unwrap_or(i32::MAX),
+        retrying_variant_count: snapshot
+            .retrying_variant_count
+            .try_into()
+            .unwrap_or(i32::MAX),
+        cache_only_session_count: snapshot
+            .cache_only_session_count
+            .try_into()
+            .unwrap_or(i32::MAX),
+        last_changed_at: snapshot.last_changed_at.map(timestamp_from_system_time),
+    }
+}
+
+fn proto_hls_weak_network_state(state: RuntimeHlsWeakNetworkState) -> HlsWeakNetworkState {
+    match state {
+        RuntimeHlsWeakNetworkState::Normal => HlsWeakNetworkState::Normal,
+        RuntimeHlsWeakNetworkState::Retrying => HlsWeakNetworkState::Retrying,
+        RuntimeHlsWeakNetworkState::Degraded => HlsWeakNetworkState::Degraded,
+        RuntimeHlsWeakNetworkState::CacheOnly => HlsWeakNetworkState::CacheOnly,
+        RuntimeHlsWeakNetworkState::UpstreamFailed => HlsWeakNetworkState::UpstreamFailed,
     }
 }
 
@@ -4176,6 +4216,50 @@ mod tests {
         assert_eq!(fake_mp4().len() as i64, status.used_bytes);
         assert_eq!(1, status.completed_session_count);
         assert!(status.last_eviction.is_none());
+        let weak_network = status
+            .weak_network
+            .expect("weak network policy status should be present");
+        assert_eq!(HlsWeakNetworkState::Normal as i32, weak_network.state);
+        assert_eq!("HLS upstream policy normal.", weak_network.message);
+        assert_eq!(0, weak_network.unhealthy_variant_count);
+    }
+
+    #[tokio::test]
+    async fn get_hls_cache_status_reports_weak_network_policy() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        state
+            .hls_network_policy
+            .record_upstream_failure("session-1", "1080p");
+        let service = CacheGrpcService::new(state);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+
+        let weak_network = status
+            .weak_network
+            .expect("weak network policy status should be present");
+        assert_eq!(
+            HlsWeakNetworkState::UpstreamFailed as i32,
+            weak_network.state
+        );
+        assert_eq!(1, weak_network.degraded_session_count);
+        assert_eq!(1, weak_network.unhealthy_variant_count);
     }
 
     #[tokio::test]

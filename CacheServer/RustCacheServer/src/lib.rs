@@ -8,6 +8,7 @@ pub mod grpc_services;
 mod hls;
 mod hls_cache;
 mod hls_fill_scheduler;
+mod hls_network_policy;
 pub mod library;
 pub mod media;
 pub mod playback;
@@ -50,6 +51,7 @@ use crate::{
         HlsCacheStatusSnapshot, HlsCacheStore, sanitized_completed_session,
     },
     hls_fill_scheduler::HlsFillScheduler,
+    hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
@@ -80,6 +82,7 @@ pub struct AppState {
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
+    pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
@@ -230,6 +233,7 @@ impl AppState {
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
         let hls_fill_scheduler = HlsFillScheduler::default();
+        let hls_network_policy = HlsNetworkPolicy::default();
 
         let state = Self {
             options,
@@ -243,6 +247,7 @@ impl AppState {
             playback_planning_permits,
             hls_cache_finalization_permits,
             hls_fill_scheduler,
+            hls_network_policy,
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
@@ -590,6 +595,10 @@ impl AppState {
                 .expect("HLS cache eviction summary lock poisoned")
                 .clone(),
         })
+    }
+
+    pub(crate) fn hls_weak_network_status(&self) -> HlsWeakNetworkSnapshot {
+        self.hls_network_policy.snapshot()
     }
 
     pub(crate) fn protect_hls_cache_session_from_eviction(

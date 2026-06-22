@@ -116,6 +116,12 @@ public final class CacheLibraryViewModel: ObservableObject {
             let evicted = ByteCountFormatter.string(fromByteCount: eviction.evictedBytes, countStyle: .file)
             summary += " Last cleanup freed \(evicted)."
         }
+        if let weakNetwork = hlsCacheStatus.weakNetwork,
+            weakNetwork.isActive,
+            !weakNetwork.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            summary += " \(weakNetwork.message)"
+        }
         return summary
     }
 

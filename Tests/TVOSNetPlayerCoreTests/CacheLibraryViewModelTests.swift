@@ -116,6 +116,37 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheSummaryIncludesWeakNetworkPolicyStatus() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                usedBytes: 42,
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_DEGRADED",
+                    message: "Weak upstream detected; advertising lower HLS variants temporarily.",
+                    degradedSessionCount: 1,
+                    unhealthyVariantCount: 1,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Weak upstream detected") == true)
+    }
+
+    @MainActor
     func testRefreshDoesNotWaitForSlowHLSCacheStatus() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(
@@ -2425,7 +2456,8 @@ extension HLSCacheStatus {
         lowWatermarkPercent: Int = 80,
         usedBytes: Int64 = 0,
         completedSessionCount: Int = 0,
-        lastEviction: HLSCacheEvictionSummary? = nil
+        lastEviction: HLSCacheEvictionSummary? = nil,
+        weakNetwork: HLSWeakNetworkStatus? = nil
     ) -> Self {
         Self(
             evictionEnabled: evictionEnabled,
@@ -2436,7 +2468,8 @@ extension HLSCacheStatus {
             lowWatermarkBytes: maxBytes * Int64(lowWatermarkPercent) / 100,
             usedBytes: usedBytes,
             completedSessionCount: completedSessionCount,
-            lastEviction: lastEviction
+            lastEviction: lastEviction,
+            weakNetwork: weakNetwork
         )
     }
 }

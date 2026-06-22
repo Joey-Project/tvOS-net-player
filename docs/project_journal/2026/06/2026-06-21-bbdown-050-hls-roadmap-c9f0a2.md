@@ -3,7 +3,7 @@ id: 20260621-c9f0a2
 title: BBDown 0.5 And Progressive HLS Roadmap
 status: active
 created: 2026-06-21
-updated: 2026-06-21
+updated: 2026-06-22
 branch: wip/bbdown-050-roadmap-upgrade
 pr:
 supersedes:
@@ -119,6 +119,7 @@ superseded_by:
 
 ### PR 10: Adaptive Weak-Network Policy
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-22-hls-adaptive-weak-network-policy-d8e7c1.md`.
 - Detect slow or failing upstream paths and downgrade to lower compatible variants when possible.
 - Allow later upgrade when network behavior recovers.
 - Surface retrying, cache-only, partially cached, quota-blocked, and upstream-failed states in the shared UI.
@@ -192,6 +193,17 @@ superseded_by:
   - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_cache::tests:: --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
+- PR 10 local gate:
+  - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_network_policy::tests --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls::tests::master_playlist_filter --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server get_hls_cache_status_reports --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_master_playlist_demotes_unhealthy_variant_from_network_policy --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
+  - `swift test --filter CacheLibraryViewModelTests/testHLSCacheSummaryIncludesWeakNetworkPolicyStatus`
+  - `swift test`
+  - `git diff --check`
+  - `just ci`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
