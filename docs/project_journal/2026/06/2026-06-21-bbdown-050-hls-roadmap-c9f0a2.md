@@ -215,6 +215,8 @@ superseded_by:
   - `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/07780f1c323453fd738330fbf8fd70e2899d4409/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
   - `just ci`
   - `isolated_review stateful ... --entrypoint codex-readonly`: `LGTM`
+  - Independent PR review fix rerun: `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server transcoding::tests --lib`
+  - Independent PR review fix rerun: `just ci`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`

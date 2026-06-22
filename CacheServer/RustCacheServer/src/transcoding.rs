@@ -185,10 +185,8 @@ fn variant_has_codec(
     request: Option<&BilibiliMediaRequest>,
     predicate: fn(&str) -> bool,
 ) -> bool {
-    if let Some(codecs) = request.and_then(|request| request.codecs.as_deref())
-        && codec_list_matches(codecs, predicate)
-    {
-        return true;
+    if let Some(codecs) = request.and_then(|request| request.codecs.as_deref()) {
+        return codec_list_matches(codecs, predicate);
     }
 
     variant
@@ -273,6 +271,38 @@ mod tests {
         );
         assert_eq!(HlsTranscodingPlanState::Ready, enabled.state);
         assert_eq!("hevc", enabled.source_variant_id);
+    }
+
+    #[test]
+    fn request_video_codec_is_authoritative_for_compatibility() {
+        let mut variant = variant("mismatched-video", "avc1.640028", Some("mp4a.40.2"));
+        variant.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn request_audio_codec_is_authoritative_for_compatibility() {
+        let mut variant = variant("mismatched-audio", "avc1.640028", Some("mp4a.40.2"));
+        variant.audio.as_mut().unwrap().codecs = Some("flac".to_owned());
+
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
     }
 
     fn variant(id: &str, video_codec: &str, audio_codec: Option<&str>) -> BilibiliPlaybackVariant {
