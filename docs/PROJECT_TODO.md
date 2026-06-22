@@ -1,6 +1,6 @@
 # Project TODO
 
-- [pending] PR 9：推进 segment-level fill / prefetch。
+- [completed] PR 9：推进 segment-level fill / prefetch。
 - [pending] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [pending] PR 11：增加 LAN transcoding foundation。
 - [completed] PR 8：输出 multi-variant HLS master，并让运行时 cache/upstream fallback 变成 variant-aware；completed offline cache 仍只保证 selected variant。

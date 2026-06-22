@@ -1428,7 +1428,7 @@ async fn run_hls_cache_finalization_inner(
             downloaded_bytes: Some(0),
             total_bytes: hls_session_declared_size_bytes(&session)
                 .map(|value| value.try_into().unwrap_or(i64::MAX)),
-            message: Some("Playable online; prewarming offline cache.".to_owned()),
+            message: Some("Playable online; prefetching first playback window.".to_owned()),
         },
     );
     match state

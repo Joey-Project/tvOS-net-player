@@ -112,6 +112,7 @@ superseded_by:
 
 ### PR 9: Segment-Level Fill And Prefetch
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-22-hls-first-window-prefetch-b2d9c6.md`.
 - Move from whole-resource byte-range fill toward smaller cache units suitable for playback-position-aware prefetch.
 - Prioritize init data and the first playable segment window.
 - Schedule background fill by current playback position, recent user intent, and cache pressure.
@@ -185,6 +186,10 @@ superseded_by:
 - PR 8 local gate:
   - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls::tests:: --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_cache::tests:: --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
+- PR 9 local gate:
+  - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_cache::tests:: --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`

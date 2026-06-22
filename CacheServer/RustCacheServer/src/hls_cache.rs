@@ -35,6 +35,8 @@ const HLS_LIBRARY_ITEM_PREFIX: &str = "bilibili.hls.";
 const HLS_CACHE_VARIANT_LABEL: &str = "Offline HLS";
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
 const HLS_PREWARM_HEAD_BYTES: u64 = HLS_INITIALIZATION_SCAN_BYTES;
+const HLS_FIRST_WINDOW_PREFETCH_SECONDS: u64 = 30;
+const HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
@@ -407,6 +409,12 @@ impl HlsCacheStore {
             content_type: metadata.content_type,
             initialization_length: metadata.initialization_length,
             prefix_length: metadata.prefix_length,
+            target_prefix_length: metadata
+                .target_prefix_length
+                .unwrap_or(metadata.prefix_length),
+            target_window_seconds: metadata
+                .target_window_seconds
+                .unwrap_or(HLS_FIRST_WINDOW_PREFETCH_SECONDS),
             total_length: metadata.total_length,
             last_modified: file_metadata.modified().unwrap_or(UNIX_EPOCH),
         })
@@ -589,10 +597,15 @@ impl HlsCacheStore {
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
         check_fill_control(control)?;
-        if self.cached_resource(session_id, &resource.id).is_some()
-            || self.prewarmed_resource(session_id, &resource.id).is_some()
-        {
+        if self.cached_resource(session_id, &resource.id).is_some() {
             return Ok(());
+        }
+        if let Some(prewarmed) = self.prewarmed_resource(session_id, &resource.id) {
+            let target_prefix_length =
+                hls_first_window_prefetch_prefix_bytes(resource).min(prewarmed.total_length);
+            if prewarmed.prefix_length >= target_prefix_length {
+                return Ok(());
+            }
         }
 
         let session_dir = self.session_dir(session_id)?;
@@ -629,6 +642,8 @@ impl HlsCacheStore {
                         id: resource.id.clone(),
                         content_type: resource.content_type().to_owned(),
                         prefix_length: prefix.prefix_length,
+                        target_prefix_length: Some(prefix.target_prefix_length),
+                        target_window_seconds: Some(HLS_FIRST_WINDOW_PREFETCH_SECONDS),
                         total_length: prefix.total_length,
                         initialization_length: prefix.initialization_length,
                         cache_key: PersistedBilibiliMediaCacheKey::from(
@@ -1166,6 +1181,8 @@ pub(crate) struct PrewarmedHlsResource {
     pub(crate) content_type: String,
     pub(crate) initialization_length: u64,
     pub(crate) prefix_length: u64,
+    pub(crate) target_prefix_length: u64,
+    pub(crate) target_window_seconds: u64,
     pub(crate) total_length: u64,
     pub(crate) last_modified: SystemTime,
 }
@@ -1337,6 +1354,7 @@ async fn download_resource(
 
 struct DownloadedResourcePrefix {
     prefix_length: u64,
+    target_prefix_length: u64,
     total_length: u64,
     initialization_length: u64,
 }
@@ -1349,9 +1367,10 @@ async fn download_resource_prefix(
     control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
 ) -> Result<DownloadedResourcePrefix, HlsCacheError> {
     check_fill_control(control)?;
+    let target_prefix_length = hls_first_window_prefetch_prefix_bytes(resource);
     let mut request = client.get(url).header(
         reqwest::header::RANGE,
-        format!("bytes=0-{}", HLS_PREWARM_HEAD_BYTES - 1),
+        format!("bytes=0-{}", target_prefix_length - 1),
     );
     let mut requested_range = false;
     for header in &resource.request.headers {
@@ -1390,7 +1409,7 @@ async fn download_resource_prefix(
         ));
     }
     let prefix_length = end.saturating_add(1);
-    if prefix_length > HLS_PREWARM_HEAD_BYTES {
+    if prefix_length > target_prefix_length {
         return Err(HlsCacheError::InvalidResource(
             "HLS prewarm response exceeded bounded prefix length".to_owned(),
         ));
@@ -1447,9 +1466,34 @@ async fn download_resource_prefix(
 
     Ok(DownloadedResourcePrefix {
         prefix_length,
+        target_prefix_length,
         total_length,
         initialization_length,
     })
+}
+
+fn hls_first_window_prefetch_prefix_bytes(resource: &HlsMediaResource) -> u64 {
+    let bitrate_window_bytes = resource
+        .request
+        .bandwidth
+        .map(|bandwidth_bits_per_second| {
+            bandwidth_bits_per_second
+                .saturating_mul(HLS_FIRST_WINDOW_PREFETCH_SECONDS)
+                .saturating_add(7)
+                / 8
+        })
+        .unwrap_or_default();
+    let target = HLS_PREWARM_HEAD_BYTES
+        .saturating_add(bitrate_window_bytes)
+        .clamp(HLS_PREWARM_HEAD_BYTES, HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES);
+
+    resource
+        .request
+        .size
+        .filter(|size| *size > 0)
+        .map(|size| target.min(size))
+        .unwrap_or(target)
+        .max(1)
 }
 
 fn parse_content_range_header(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, u64)> {
@@ -2053,6 +2097,10 @@ struct PersistedHlsPrewarmedResource {
     id: String,
     content_type: String,
     prefix_length: u64,
+    #[serde(default)]
+    target_prefix_length: Option<u64>,
+    #[serde(default)]
+    target_window_seconds: Option<u64>,
     total_length: u64,
     initialization_length: u64,
     cache_key: PersistedBilibiliMediaCacheKey,
@@ -2654,6 +2702,247 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prewarm_records_first_window_target_metadata() {
+        let (upstream_url, _task) = start_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-prewarm-window", &upstream_url);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+
+        assert_eq!(fake_mp4().len() as u64, prewarmed.prefix_length);
+        assert_eq!(
+            hls_first_window_prefetch_prefix_bytes(&session.variant.video),
+            prewarmed.target_prefix_length
+        );
+        assert!(prewarmed.target_prefix_length > prewarmed.prefix_length);
+        assert_eq!(
+            HLS_FIRST_WINDOW_PREFETCH_SECONDS,
+            prewarmed.target_window_seconds
+        );
+    }
+
+    #[test]
+    fn prewarmed_resource_loads_legacy_metadata_without_target_fields() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-legacy-prewarm", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("prewarm resource should be written");
+        write_pretty_json(
+            &store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid"),
+            &serde_json::json!({
+                "schema_version": HLS_CACHE_SCHEMA_VERSION,
+                "id": "video.m4s",
+                "content_type": session.variant.video.content_type(),
+                "prefix_length": fake_mp4().len() as u64,
+                "total_length": fake_mp4().len() as u64,
+                "initialization_length": 28,
+                "cache_key": PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            }),
+        );
+
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("legacy prewarm metadata should load");
+
+        assert_eq!(fake_mp4().len() as u64, prewarmed.prefix_length);
+        assert_eq!(prewarmed.prefix_length, prewarmed.target_prefix_length);
+        assert_eq!(
+            HLS_FIRST_WINDOW_PREFETCH_SECONDS,
+            prewarmed.target_window_seconds
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_fetches_bandwidth_sized_first_window_prefix() {
+        let (upstream_url, _task) = start_large_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-large-prewarm-window", &upstream_url);
+        session.variant.video.request.size = Some(large_prefetch_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(800_000);
+        let target_prefix_length = hls_first_window_prefetch_prefix_bytes(&session.variant.video);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm first window");
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+
+        assert!(target_prefix_length > HLS_PREWARM_HEAD_BYTES);
+        assert_eq!(target_prefix_length, prewarmed.prefix_length);
+        assert_eq!(target_prefix_length, prewarmed.target_prefix_length);
+        assert_eq!(
+            large_prefetch_fake_mp4().len() as u64,
+            prewarmed.total_length
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_refetches_legacy_prefix_below_first_window_target() {
+        let (upstream_url, _task) = start_large_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-legacy-window-upgrade", &upstream_url);
+        session.variant.video.request.size = Some(large_prefetch_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(800_000);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid"),
+            &large_prefetch_fake_mp4()[..HLS_PREWARM_HEAD_BYTES as usize],
+        )
+        .expect("legacy prewarm resource should be written");
+        write_pretty_json(
+            &store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid"),
+            &serde_json::json!({
+                "schema_version": HLS_CACHE_SCHEMA_VERSION,
+                "id": "video.m4s",
+                "content_type": session.variant.video.content_type(),
+                "prefix_length": HLS_PREWARM_HEAD_BYTES,
+                "total_length": large_prefetch_fake_mp4().len() as u64,
+                "initialization_length": 28,
+                "cache_key": PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            }),
+        );
+        let target_prefix_length = hls_first_window_prefetch_prefix_bytes(&session.variant.video);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("legacy prewarm should upgrade to first-window target");
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+
+        assert!(target_prefix_length > HLS_PREWARM_HEAD_BYTES);
+        assert_eq!(target_prefix_length, prewarmed.prefix_length);
+        assert_eq!(target_prefix_length, prewarmed.target_prefix_length);
+    }
+
+    #[tokio::test]
+    async fn prewarm_keeps_legacy_prefix_when_upgrade_download_fails() {
+        let (upstream_url, _task) = start_invalid_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-legacy-window-upgrade-failure", &upstream_url);
+        session.variant.video.request.size = Some(large_prefetch_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(800_000);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid"),
+            &large_prefetch_fake_mp4()[..HLS_PREWARM_HEAD_BYTES as usize],
+        )
+        .expect("legacy prewarm resource should be written");
+        write_pretty_json(
+            &store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid"),
+            &serde_json::json!({
+                "schema_version": HLS_CACHE_SCHEMA_VERSION,
+                "id": "video.m4s",
+                "content_type": session.variant.video.content_type(),
+                "prefix_length": HLS_PREWARM_HEAD_BYTES,
+                "total_length": large_prefetch_fake_mp4().len() as u64,
+                "initialization_length": 28,
+                "cache_key": PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            }),
+        );
+        let target_prefix_length = hls_first_window_prefetch_prefix_bytes(&session.variant.video);
+        let client = reqwest::Client::new();
+
+        let error = store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect_err("failed prewarm upgrade should surface the upstream error");
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("legacy prewarm metadata should remain loadable");
+
+        assert!(error.to_string().contains("expected partial content"));
+        assert!(target_prefix_length > HLS_PREWARM_HEAD_BYTES);
+        assert_eq!(HLS_PREWARM_HEAD_BYTES, prewarmed.prefix_length);
+        assert_eq!(prewarmed.prefix_length, prewarmed.target_prefix_length);
+    }
+
+    #[test]
+    fn first_window_prefetch_target_uses_bandwidth_window() {
+        let mut session =
+            sample_session("session-prefetch-target", "https://example.test/video.m4s");
+        session.variant.video.request.size = Some(10 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(800_000);
+
+        assert_eq!(
+            HLS_PREWARM_HEAD_BYTES + 3_000_000,
+            hls_first_window_prefetch_prefix_bytes(&session.variant.video)
+        );
+    }
+
+    #[test]
+    fn first_window_prefetch_target_clamps_to_resource_size_and_maximum() {
+        let mut session =
+            sample_session("session-prefetch-clamp", "https://example.test/video.m4s");
+        session.variant.video.request.size = Some(512 * 1024);
+        session.variant.video.request.bandwidth = Some(800_000);
+        assert_eq!(
+            512 * 1024,
+            hls_first_window_prefetch_prefix_bytes(&session.variant.video)
+        );
+
+        session.variant.video.request.size = Some(20 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(20_000_000);
+        assert_eq!(
+            HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES,
+            hls_first_window_prefetch_prefix_bytes(&session.variant.video)
+        );
+    }
+
     #[test]
     fn hls_eviction_policy_derives_watermark_bytes() {
         let policy = HlsCacheEvictionPolicy {
@@ -3100,6 +3389,8 @@ mod tests {
             id: "video.m4s".to_owned(),
             content_type: session.variant.video.content_type().to_owned(),
             prefix_length: fake_mp4().len() as u64,
+            target_prefix_length: Some(fake_mp4().len() as u64),
+            target_window_seconds: Some(HLS_FIRST_WINDOW_PREFETCH_SECONDS),
             total_length: fake_mp4().len() as u64,
             initialization_length: 28,
             cache_key: PersistedBilibiliMediaCacheKey::from(
@@ -3507,6 +3798,8 @@ mod tests {
                 id: "video.m4s".to_owned(),
                 content_type: session.variant.video.content_type().to_owned(),
                 prefix_length: prewarm_prefix_length,
+                target_prefix_length: Some(prewarm_prefix_length),
+                target_window_seconds: Some(HLS_FIRST_WINDOW_PREFETCH_SECONDS),
                 total_length: fake_mp4().len() as u64,
                 initialization_length: 28,
                 cache_key: PersistedBilibiliMediaCacheKey::from(
@@ -3791,6 +4084,11 @@ mod tests {
         start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_prewarm_mp4))).await
     }
 
+    async fn start_large_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(Router::new().route("/video.m4s", get(upstream_large_prewarm_mp4)))
+            .await
+    }
+
     async fn start_headers_stalled_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(
             Router::new().route("/video.m4s", get(upstream_headers_stalled_mp4)),
@@ -3861,6 +4159,14 @@ mod tests {
     }
 
     async fn upstream_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        upstream_prewarm_mp4_bytes(headers, fake_mp4())
+    }
+
+    async fn upstream_large_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        upstream_prewarm_mp4_bytes(headers, large_prefetch_fake_mp4())
+    }
+
+    fn upstream_prewarm_mp4_bytes(headers: HeaderMap, body: Vec<u8>) -> Response<Body> {
         if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -3868,17 +4174,26 @@ mod tests {
                 .unwrap();
         }
 
-        let body = fake_mp4();
+        let requested_end = requested_prewarm_range_end(&headers).unwrap_or(body.len() as u64 - 1);
+        let prefix_length = (requested_end.saturating_add(1))
+            .min(body.len() as u64)
+            .max(1);
+        let prefix = body[..usize::try_from(prefix_length).unwrap()].to_vec();
         Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header(CONTENT_TYPE, "video/mp4")
-            .header(CONTENT_LENGTH, body.len().to_string())
+            .header(CONTENT_LENGTH, prefix_length.to_string())
             .header(
                 "content-range",
-                format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+                format!("bytes 0-{}/{}", prefix_length - 1, body.len()),
             )
-            .body(Body::from(body))
+            .body(Body::from(prefix))
             .unwrap()
+    }
+
+    fn requested_prewarm_range_end(headers: &HeaderMap) -> Option<u64> {
+        let value = headers.get(reqwest::header::RANGE)?.to_str().ok()?;
+        value.strip_prefix("bytes=0-")?.parse().ok()
     }
 
     async fn upstream_headers_stalled_mp4(headers: HeaderMap) -> Response<Body> {
@@ -4186,6 +4501,18 @@ mod tests {
         bytes.extend(mp4_box(*b"moov", b"metadata"));
         bytes.extend(mp4_box(*b"moof", b"frag"));
         bytes.extend(mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn large_prefetch_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(
+            *b"mdat",
+            &vec![0x55; usize::try_from(HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES).unwrap()],
+        ));
         bytes
     }
 
