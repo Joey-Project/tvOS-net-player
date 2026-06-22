@@ -1,5 +1,6 @@
 use crate::{
     bbdown_adapter::{BilibiliMediaRequest, BilibiliPlaybackVariant},
+    codecs::{codec_list_matches, is_aac_codec, is_h264_codec},
     config::CacheServerOptions,
 };
 
@@ -195,19 +196,6 @@ fn variant_has_codec(
         .any(|codecs| codec_list_matches(codecs, predicate))
 }
 
-fn codec_list_matches(codecs: &str, predicate: fn(&str) -> bool) -> bool {
-    codecs.split(',').any(predicate)
-}
-
-fn is_h264_codec(codec: &str) -> bool {
-    let codec = codec.trim().to_ascii_lowercase();
-    codec.starts_with("avc1") || codec.starts_with("avc3")
-}
-
-fn is_aac_codec(codec: &str) -> bool {
-    codec.trim().to_ascii_lowercase().starts_with("mp4a")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +288,19 @@ mod tests {
                 ..CacheServerOptions::default()
             },
             &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn non_aac_mp4a_audio_variant_requires_transcoding() {
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant("mp3-audio", "avc1.640028", Some("mp4a.6B")),
         );
 
         assert_eq!(HlsTranscodingPlanState::Ready, plan.state);

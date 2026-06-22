@@ -2,6 +2,7 @@ mod bbdown_adapter;
 mod bilibili_playback;
 pub mod bilibili_worker;
 mod bonjour;
+mod codecs;
 pub mod config;
 pub mod generated;
 pub mod grpc_services;

@@ -10,6 +10,7 @@ use crate::bbdown_adapter::{
     BilibiliPlaybackAbrLevel as AdapterAbrLevel, BilibiliPlaybackAbrMetadata as AdapterAbrMetadata,
     BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
+use crate::codecs::{codec_list_matches, is_aac_codec, is_h264_codec};
 use crate::transcoding::HlsTranscodingPlan;
 use url::Url;
 
@@ -767,19 +768,6 @@ fn variant_has_codec(
         .any(|codecs| codec_list_matches(codecs, predicate))
 }
 
-fn codec_list_matches(codecs: &str, predicate: fn(&str) -> bool) -> bool {
-    codecs.split(',').any(predicate)
-}
-
-fn is_h264_codec(codec: &str) -> bool {
-    let codec = codec.trim().to_ascii_lowercase();
-    codec.starts_with("avc1") || codec.starts_with("avc3")
-}
-
-fn is_aac_codec(codec: &str) -> bool {
-    codec.trim().to_ascii_lowercase().starts_with("mp4a")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,10 +1018,15 @@ mod tests {
         mismatched_audio.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
         mismatched_audio.abr = Some(abr_level("dash-video", 4, 6, true));
         mismatched_audio.audio.as_mut().unwrap().codecs = Some("flac".to_owned());
+        let mut mp3_audio = dash_variant();
+        mp3_audio.id = "mp3-audio-codec".to_owned();
+        mp3_audio.codecs = vec!["avc1.640028".to_owned(), "mp4a.6B".to_owned()];
+        mp3_audio.abr = Some(abr_level("dash-video", 5, 6, true));
+        mp3_audio.audio.as_mut().unwrap().codecs = Some("mp4a.6B".to_owned());
         let mut flv = dash_variant();
         flv.id = "flv".to_owned();
         flv.kind = BilibiliPlaybackVariantKind::Flv;
-        flv.abr = Some(abr_level("dash-video", 5, 6, true));
+        flv.abr = Some(abr_level("dash-video", 6, 7, true));
 
         let session = HlsPlaybackSession::from_playback_entry(
             "session-1",
@@ -1046,6 +1039,7 @@ mod tests {
                 av1,
                 mismatched_video,
                 mismatched_audio,
+                mp3_audio,
                 flv,
             ],
         )
