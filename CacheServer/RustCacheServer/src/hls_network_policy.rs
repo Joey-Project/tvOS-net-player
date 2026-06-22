@@ -74,7 +74,6 @@ impl HlsNetworkPolicy {
         state.prune_expired(now);
         let variant = state.variant_mut(session_id, variant_id);
         variant.retrying_until = Some(now + RETRYING_WINDOW);
-        variant.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
     }
 
@@ -99,7 +98,6 @@ impl HlsNetworkPolicy {
         } else {
             variant.consecutive_slow_responses = 0;
         }
-        variant.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
     }
 
@@ -116,7 +114,6 @@ impl HlsNetworkPolicy {
         variant.retrying_until = Some(now + RETRYING_WINDOW);
         variant.unhealthy_until = Some(now + DEGRADE_DURATION);
         variant.unhealthy_reason = Some(HlsWeakNetworkReason::UpstreamFailed);
-        variant.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
     }
 
@@ -130,7 +127,6 @@ impl HlsNetworkPolicy {
             return;
         }
         session.cache_only_until = Some(now + CACHE_ONLY_WINDOW);
-        session.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
     }
 
@@ -240,7 +236,6 @@ impl HlsNetworkPolicyState {
 struct HlsSessionNetworkState {
     variants: HashMap<String, HlsVariantNetworkState>,
     cache_only_until: Option<SystemTime>,
-    last_changed_at: Option<SystemTime>,
 }
 
 impl HlsSessionNetworkState {
@@ -258,7 +253,6 @@ struct HlsVariantNetworkState {
     retrying_until: Option<SystemTime>,
     unhealthy_until: Option<SystemTime>,
     unhealthy_reason: Option<HlsWeakNetworkReason>,
-    last_changed_at: Option<SystemTime>,
 }
 
 impl HlsVariantNetworkState {
