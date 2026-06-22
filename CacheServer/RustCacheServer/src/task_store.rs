@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::generated::tvos_net_player::v1::{
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
-    BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource, Task,
+    BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, LanTranscodingPlan,
+    PlaybackSource, Task,
 };
 
 const TASK_STATE_SCHEMA_VERSION: u32 = 1;
@@ -329,6 +330,8 @@ struct PersistedBilibiliPlaybackSession {
     selected_variant: Option<PersistedBilibiliPlaybackVariant>,
     #[serde(default)]
     variants: Vec<PersistedBilibiliPlaybackVariant>,
+    #[serde(default)]
+    transcoding_plan: Option<PersistedLanTranscodingPlan>,
 }
 
 impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
@@ -346,6 +349,9 @@ impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
                 .into_iter()
                 .map(PersistedBilibiliPlaybackVariant::from)
                 .collect(),
+            transcoding_plan: session
+                .transcoding_plan
+                .map(PersistedLanTranscodingPlan::from),
         }
     }
 }
@@ -363,6 +369,49 @@ impl From<PersistedBilibiliPlaybackSession> for BilibiliPlaybackSession {
                 .into_iter()
                 .map(BilibiliPlaybackVariant::from)
                 .collect(),
+            transcoding_plan: session.transcoding_plan.map(LanTranscodingPlan::from),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedLanTranscodingPlan {
+    state: i32,
+    profile_id: String,
+    reason: String,
+    source_variant_id: String,
+    target_container: String,
+    target_video_codec: String,
+    target_audio_codec: String,
+    output_protocol: i32,
+}
+
+impl From<LanTranscodingPlan> for PersistedLanTranscodingPlan {
+    fn from(plan: LanTranscodingPlan) -> Self {
+        Self {
+            state: plan.state,
+            profile_id: plan.profile_id,
+            reason: plan.reason,
+            source_variant_id: plan.source_variant_id,
+            target_container: plan.target_container,
+            target_video_codec: plan.target_video_codec,
+            target_audio_codec: plan.target_audio_codec,
+            output_protocol: plan.output_protocol,
+        }
+    }
+}
+
+impl From<PersistedLanTranscodingPlan> for LanTranscodingPlan {
+    fn from(plan: PersistedLanTranscodingPlan) -> Self {
+        Self {
+            state: plan.state,
+            profile_id: plan.profile_id,
+            reason: plan.reason,
+            source_variant_id: plan.source_variant_id,
+            target_container: plan.target_container,
+            target_video_codec: plan.target_video_codec,
+            target_audio_codec: plan.target_audio_codec,
+            output_protocol: plan.output_protocol,
         }
     }
 }
@@ -530,7 +579,8 @@ mod tests {
     use super::*;
     use crate::generated::tvos_net_player::v1::{
         BilibiliDanmakuFormat, BilibiliPlaybackVariant, BilibiliSubtitleAiPolicy,
-        BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackProtocol, TaskKind, TaskState,
+        BilibiliTaskResultItem, BilibiliTaskSelection, LanTranscodingPlan, LanTranscodingPlanState,
+        PlaybackProtocol, TaskKind, TaskState,
     };
 
     #[test]
@@ -679,6 +729,16 @@ mod tests {
                 size_bytes: 10_000_000,
             }),
             variants: Vec::new(),
+            transcoding_plan: Some(LanTranscodingPlan {
+                state: LanTranscodingPlanState::NotRequired.into(),
+                profile_id: "avplayer-h264-aac-hls-v1".to_owned(),
+                reason: "Already compatible.".to_owned(),
+                source_variant_id: "h264".to_owned(),
+                target_container: "hls/fmp4".to_owned(),
+                target_video_codec: "h264".to_owned(),
+                target_audio_codec: "aac".to_owned(),
+                output_protocol: PlaybackProtocol::Hls.into(),
+            }),
         };
         let result_item = BilibiliTaskResultItem {
             id: "bilibili-playback-result-1".to_owned(),
@@ -745,6 +805,15 @@ mod tests {
         assert_eq!(1, records.len());
         assert_eq!(Some(selection), records[0].task.bilibili_selection);
         assert_eq!(vec![result_item], records[0].task.result_items);
+        assert_eq!(
+            Some(LanTranscodingPlanState::NotRequired),
+            records[0]
+                .task
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.transcoding_plan.as_ref())
+                .map(|plan| plan.state())
+        );
         let options = records[0]
             .options
             .as_ref()

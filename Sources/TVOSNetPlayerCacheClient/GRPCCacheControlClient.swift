@@ -490,7 +490,24 @@ extension HLSCacheStatus {
             usedBytes: proto.usedBytes,
             completedSessionCount: Int(proto.completedSessionCount),
             lastEviction: proto.hasLastEviction ? HLSCacheEvictionSummary(proto.lastEviction) : nil,
-            weakNetwork: proto.hasWeakNetwork ? HLSWeakNetworkStatus(proto.weakNetwork) : nil
+            weakNetwork: proto.hasWeakNetwork ? HLSWeakNetworkStatus(proto.weakNetwork) : nil,
+            transcoding: proto.hasTranscoding ? LanTranscodingStatus(proto.transcoding) : nil
+        )
+    }
+}
+
+extension LanTranscodingStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_LanTranscodingStatus) {
+        self.init(
+            enabled: proto.enabled,
+            state: String(describing: proto.state),
+            message: proto.message,
+            profileID: proto.profileID,
+            targetContainer: proto.targetContainer,
+            targetVideoCodec: proto.targetVideoCodec,
+            targetAudioCodec: proto.targetAudioCodec,
+            maxConcurrentJobs: Int(proto.maxConcurrentJobs),
+            activeJobCount: Int(proto.activeJobCount)
         )
     }
 }
@@ -708,7 +725,25 @@ extension CacheBilibiliPlaybackSession {
             selectedVariant: proto.hasSelectedVariant
                 ? CacheBilibiliPlaybackVariant(proto.selectedVariant)
                 : nil,
-            variants: proto.variants.map(CacheBilibiliPlaybackVariant.init)
+            variants: proto.variants.map(CacheBilibiliPlaybackVariant.init),
+            transcodingPlan: proto.hasTranscodingPlan
+                ? LanTranscodingPlan(proto.transcodingPlan)
+                : nil
+        )
+    }
+}
+
+extension LanTranscodingPlan {
+    fileprivate init(_ proto: TvosNetPlayer_V1_LanTranscodingPlan) {
+        self.init(
+            state: String(describing: proto.state),
+            profileID: proto.profileID,
+            reason: proto.reason,
+            sourceVariantID: proto.sourceVariantID,
+            targetContainer: proto.targetContainer,
+            targetVideoCodec: proto.targetVideoCodec,
+            targetAudioCodec: proto.targetAudioCodec,
+            outputProtocol: String(describing: proto.outputProtocol)
         )
     }
 }

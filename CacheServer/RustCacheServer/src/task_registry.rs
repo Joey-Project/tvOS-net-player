@@ -4146,6 +4146,7 @@ mod tests {
                 },
             ),
             variants: Vec::new(),
+            transcoding_plan: None,
         }
     }
 

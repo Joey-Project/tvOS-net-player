@@ -10,6 +10,7 @@ use crate::bbdown_adapter::{
     BilibiliPlaybackAbrLevel as AdapterAbrLevel, BilibiliPlaybackAbrMetadata as AdapterAbrMetadata,
     BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
+use crate::transcoding::HlsTranscodingPlan;
 use url::Url;
 
 const VIDEO_SEGMENT_ID: &str = "video.m4s";
@@ -55,6 +56,7 @@ pub(crate) struct HlsPlaybackSession {
     pub(crate) advertise_alternate_variants: bool,
     pub(crate) abr: HlsAbrMetadata,
     pub(crate) variants: Vec<HlsVariantMetadata>,
+    pub(crate) transcoding: HlsTranscodingPlan,
 }
 
 impl HlsPlaybackSession {
@@ -78,6 +80,7 @@ impl HlsPlaybackSession {
             advertise_alternate_variants: true,
             abr: HlsAbrMetadata::default(),
             variants: vec![HlsVariantMetadata::from_adapter(variant)],
+            transcoding: HlsTranscodingPlan::default(),
         })
     }
 

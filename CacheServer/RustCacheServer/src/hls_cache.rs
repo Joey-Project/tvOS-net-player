@@ -27,6 +27,7 @@ use crate::{
         mp4_initialization_length, should_forward_media_request_header,
     },
     library::{OpenedMediaFile, open_read_no_follow},
+    transcoding::{HlsTranscodingPlan, HlsTranscodingPlanState},
 };
 
 const HLS_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -1603,6 +1604,14 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
+fn non_empty_or(value: String, fallback: String) -> String {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
 fn cache_path_contains_symlink(root_path: &Path, candidate_path: &Path) -> io::Result<bool> {
     let root_path = absolute_path(root_path);
     let candidate_path = absolute_path(candidate_path);
@@ -1699,6 +1708,8 @@ struct PersistedHlsSession {
     abr: PersistedHlsAbrMetadata,
     #[serde(default)]
     variants: Vec<PersistedHlsVariantMetadata>,
+    #[serde(default)]
+    transcoding: PersistedHlsTranscodingPlan,
 }
 
 impl From<HlsPlaybackSession> for PersistedHlsSession {
@@ -1719,6 +1730,7 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
                 .into_iter()
                 .map(PersistedHlsVariantMetadata::from)
                 .collect(),
+            transcoding: PersistedHlsTranscodingPlan::from(session.transcoding),
         }
     }
 }
@@ -1744,7 +1756,91 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
                 .into_iter()
                 .map(HlsVariantMetadata::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            transcoding: HlsTranscodingPlan::from(session.transcoding),
         })
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PersistedHlsTranscodingPlan {
+    #[serde(default)]
+    state: PersistedHlsTranscodingPlanState,
+    #[serde(default)]
+    profile_id: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    source_variant_id: String,
+    #[serde(default)]
+    target_container: String,
+    #[serde(default)]
+    target_video_codec: String,
+    #[serde(default)]
+    target_audio_codec: String,
+    #[serde(default)]
+    output_protocol: String,
+}
+
+impl From<HlsTranscodingPlan> for PersistedHlsTranscodingPlan {
+    fn from(plan: HlsTranscodingPlan) -> Self {
+        Self {
+            state: PersistedHlsTranscodingPlanState::from(plan.state),
+            profile_id: plan.profile_id,
+            reason: plan.reason,
+            source_variant_id: plan.source_variant_id,
+            target_container: plan.target_container,
+            target_video_codec: plan.target_video_codec,
+            target_audio_codec: plan.target_audio_codec,
+            output_protocol: plan.output_protocol,
+        }
+    }
+}
+
+impl From<PersistedHlsTranscodingPlan> for HlsTranscodingPlan {
+    fn from(plan: PersistedHlsTranscodingPlan) -> Self {
+        let defaults = HlsTranscodingPlan::default();
+        Self {
+            state: HlsTranscodingPlanState::from(plan.state),
+            profile_id: non_empty_or(plan.profile_id, defaults.profile_id),
+            reason: non_empty_or(plan.reason, defaults.reason),
+            source_variant_id: plan.source_variant_id,
+            target_container: non_empty_or(plan.target_container, defaults.target_container),
+            target_video_codec: non_empty_or(plan.target_video_codec, defaults.target_video_codec),
+            target_audio_codec: non_empty_or(plan.target_audio_codec, defaults.target_audio_codec),
+            output_protocol: non_empty_or(plan.output_protocol, defaults.output_protocol),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedHlsTranscodingPlanState {
+    #[default]
+    Disabled,
+    NotRequired,
+    Ready,
+    Unsupported,
+}
+
+impl From<HlsTranscodingPlanState> for PersistedHlsTranscodingPlanState {
+    fn from(state: HlsTranscodingPlanState) -> Self {
+        match state {
+            HlsTranscodingPlanState::Disabled => Self::Disabled,
+            HlsTranscodingPlanState::NotRequired => Self::NotRequired,
+            HlsTranscodingPlanState::Ready => Self::Ready,
+            HlsTranscodingPlanState::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl From<PersistedHlsTranscodingPlanState> for HlsTranscodingPlanState {
+    fn from(state: PersistedHlsTranscodingPlanState) -> Self {
+        match state {
+            PersistedHlsTranscodingPlanState::Disabled => Self::Disabled,
+            PersistedHlsTranscodingPlanState::NotRequired => Self::NotRequired,
+            PersistedHlsTranscodingPlanState::Ready => Self::Ready,
+            PersistedHlsTranscodingPlanState::Unsupported => Self::Unsupported,
+        }
     }
 }
 
@@ -2334,6 +2430,27 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_loads_hls_session_manifest_with_transcoding_plan() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-transcoding", "https://example.test/video.m4s");
+        session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Ready,
+            "hevc".to_owned(),
+            "HEVC source can be converted for AVPlayer.",
+        );
+
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let sessions = store.load_sessions().expect("session manifest should load");
+
+        assert_eq!(1, sessions.len());
+        assert_eq!(session.transcoding, sessions[0].transcoding);
+        assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
     fn completed_runtime_session_hides_alternates_from_new_master_but_keeps_lookup() {
         let mut session = sample_session("session-runtime", "https://example.test/video.m4s");
         attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
@@ -2366,6 +2483,7 @@ mod tests {
         object.remove("alternate_variants");
         object.remove("abr");
         object.remove("variants");
+        object.remove("transcoding");
 
         let manifest_path = store
             .session_dir("session-legacy")
@@ -2379,6 +2497,7 @@ mod tests {
         assert_eq!(1, sessions.len());
         assert!(sessions[0].abr.groups.is_empty());
         assert!(sessions[0].variants.is_empty());
+        assert_eq!(HlsTranscodingPlan::default(), sessions[0].transcoding);
         assert_eq!(session, sessions[0]);
     }
 
@@ -4359,6 +4478,7 @@ mod tests {
             advertise_alternate_variants: true,
             abr: Default::default(),
             variants: Vec::new(),
+            transcoding: Default::default(),
         }
     }
 

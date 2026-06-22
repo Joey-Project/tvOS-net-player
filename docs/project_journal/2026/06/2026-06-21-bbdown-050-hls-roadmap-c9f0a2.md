@@ -126,9 +126,11 @@ superseded_by:
 
 ### PR 11: LAN Transcoding Foundation
 
-- Add the server-side configuration, task-state, and media-pipeline boundary for optional LAN transcoding/transmuxing.
-- Start with conservative H.264/AAC HLS output goals for AVPlayer compatibility.
-- Keep automatic transcoding policy and expensive quality heuristics out of the first foundation PR.
+- Status: implemented by this slice.
+- Adds server-side configuration, capability/status reporting, task-state persistence, HLS manifest persistence, and media-pipeline planning boundaries for optional LAN transcoding/transmuxing.
+- Defines the conservative `avplayer-h264-aac-hls-v1` target profile with H.264 video, AAC audio, and HLS/fMP4 output for AVPlayer compatibility.
+- Marks playback sessions as `disabled`, `not_required`, `ready`, or `unsupported` for LAN transcoding without starting ffmpeg or changing existing playback behavior.
+- Keeps automatic transcoding policy, ffmpeg execution, expensive quality heuristics, and UI controls out of the first foundation PR.
 
 ## Validation Contract
 
@@ -146,7 +148,7 @@ superseded_by:
 
 - Physical Apple TV deployment and real-device playback validation.
 - Authentication/TLS for the LAN control plane.
-- Automatic transcoding quality policy beyond the initial foundation.
+- LAN transcoding execution jobs, automatic quality policy, and expensive quality heuristics beyond the initial foundation.
 
 ## Evidence
 
@@ -204,6 +206,15 @@ superseded_by:
   - `swift test`
   - `git diff --check`
   - `just ci`
+- PR 11 local gate:
+  - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
+  - `swift test`
+  - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml -- --check`
+  - `git diff --check`
+  - `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/07780f1c323453fd738330fbf8fd70e2899d4409/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
+  - `just ci`
+  - `isolated_review stateful ... --entrypoint codex-readonly`: `LGTM`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`

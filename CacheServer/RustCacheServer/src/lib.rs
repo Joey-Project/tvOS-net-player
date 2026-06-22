@@ -14,6 +14,7 @@ pub mod media;
 pub mod playback;
 pub mod task_registry;
 mod task_store;
+mod transcoding;
 
 use std::{
     collections::{HashMap, HashSet},

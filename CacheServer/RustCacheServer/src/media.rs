@@ -1501,6 +1501,7 @@ mod tests {
                 size_bytes: 0,
             }),
             variants: Vec::new(),
+            transcoding_plan: None,
         };
         state.hls_sessions.insert(session);
         let task = state
@@ -1990,6 +1991,7 @@ mod tests {
             advertise_alternate_variants: true,
             abr: Default::default(),
             variants: Vec::new(),
+            transcoding: Default::default(),
         }
     }
 
