@@ -1734,7 +1734,6 @@ impl TryFrom<PersistedHlsVariant> for HlsVariant {
     type Error = ();
 
     fn try_from(variant: PersistedHlsVariant) -> Result<Self, Self::Error> {
-        validate_cache_id(&variant.id).map_err(|_| ())?;
         Ok(Self {
             id: variant.id,
             bandwidth: variant.bandwidth,
@@ -2272,6 +2271,7 @@ mod tests {
         let store = temp_store(&temp);
         let mut session = sample_session("session-alternates", "https://example.test/video.m4s");
         attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+        session.alternate_variants[0].id = "h264:720p".to_owned();
 
         store
             .save_session(&session)

@@ -118,9 +118,8 @@ impl HlsPlaybackSession {
             } else {
                 format!("Variant {index}")
             };
-            let default = if index == 0 { "YES" } else { "NO" };
             playlist.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT={default},AUTOSELECT=YES,URI=\"segments/{}\"\n",
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/{}\"\n",
                 escape_quoted(&group_id),
                 escape_quoted(&name),
                 escape_quoted(&audio_playlist_id)
@@ -805,6 +804,7 @@ mod tests {
         assert_eq!(2, master.matches("#EXT-X-STREAM-INF").count());
         assert!(master.contains("URI=\"segments/audio.m3u8\""));
         assert!(master.contains("URI=\"segments/v1-audio.m3u8\""));
+        assert!(master.contains("GROUP-ID=\"audio-v1\",NAME=\"Variant 1\",DEFAULT=YES"));
         assert!(master.contains("AUDIO=\"audio-v1\""));
         assert!(master.contains("RESOLUTION=1280x720"));
         assert!(master.contains("segments/video.m3u8\n"));
