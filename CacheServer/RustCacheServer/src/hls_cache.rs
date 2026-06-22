@@ -16,13 +16,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     bbdown_adapter::{
         BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
+        BilibiliPlaybackVariantKind,
     },
     generated::tvos_net_player::v1::{
         LibraryItem, LibrarySource, MediaVariant, PlaybackProtocol, PlaybackSource,
     },
     hls::{
-        HlsMediaResource, HlsPlaybackSession, HlsVariant, mp4_initialization_length,
-        should_forward_media_request_header,
+        HlsAbrGroup, HlsAbrGroupKind, HlsAbrLevel, HlsAbrMetadata, HlsMediaResource,
+        HlsMediaResourceMetadata, HlsPlaybackSession, HlsVariant, HlsVariantMetadata,
+        mp4_initialization_length, should_forward_media_request_header,
     },
     library::{OpenedMediaFile, open_read_no_follow},
 };
@@ -1640,6 +1642,10 @@ struct PersistedHlsSession {
     id: String,
     title: String,
     variant: PersistedHlsVariant,
+    #[serde(default)]
+    abr: PersistedHlsAbrMetadata,
+    #[serde(default)]
+    variants: Vec<PersistedHlsVariantMetadata>,
 }
 
 impl From<HlsPlaybackSession> for PersistedHlsSession {
@@ -1649,6 +1655,12 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
             id: session.id,
             title: session.title,
             variant: PersistedHlsVariant::from(session.variant),
+            abr: PersistedHlsAbrMetadata::from(session.abr),
+            variants: session
+                .variants
+                .into_iter()
+                .map(PersistedHlsVariantMetadata::from)
+                .collect(),
         }
     }
 }
@@ -1662,6 +1674,12 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
             id: session.id,
             title: session.title,
             variant: HlsVariant::try_from(session.variant)?,
+            abr: HlsAbrMetadata::from(session.abr),
+            variants: session
+                .variants
+                .into_iter()
+                .map(HlsVariantMetadata::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -1709,6 +1727,267 @@ impl TryFrom<PersistedHlsVariant> for HlsVariant {
             video: HlsMediaResource::try_from(variant.video)?,
             audio: variant.audio.map(HlsMediaResource::try_from).transpose()?,
         })
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PersistedHlsAbrMetadata {
+    #[serde(default)]
+    groups: Vec<PersistedHlsAbrGroup>,
+}
+
+impl From<HlsAbrMetadata> for PersistedHlsAbrMetadata {
+    fn from(metadata: HlsAbrMetadata) -> Self {
+        Self {
+            groups: metadata
+                .groups
+                .into_iter()
+                .map(PersistedHlsAbrGroup::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<PersistedHlsAbrMetadata> for HlsAbrMetadata {
+    fn from(metadata: PersistedHlsAbrMetadata) -> Self {
+        Self {
+            groups: metadata.groups.into_iter().map(HlsAbrGroup::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsAbrGroup {
+    id: String,
+    kind: PersistedHlsAbrGroupKind,
+    #[serde(default)]
+    variant_ids: Vec<String>,
+    level_count: u32,
+    min_bandwidth: Option<u64>,
+    max_bandwidth: Option<u64>,
+}
+
+impl From<HlsAbrGroup> for PersistedHlsAbrGroup {
+    fn from(group: HlsAbrGroup) -> Self {
+        Self {
+            id: group.id,
+            kind: PersistedHlsAbrGroupKind::from(group.kind),
+            variant_ids: group.variant_ids,
+            level_count: group.level_count,
+            min_bandwidth: group.min_bandwidth,
+            max_bandwidth: group.max_bandwidth,
+        }
+    }
+}
+
+impl From<PersistedHlsAbrGroup> for HlsAbrGroup {
+    fn from(group: PersistedHlsAbrGroup) -> Self {
+        Self {
+            id: group.id,
+            kind: HlsAbrGroupKind::from(group.kind),
+            variant_ids: group.variant_ids,
+            level_count: group.level_count,
+            min_bandwidth: group.min_bandwidth,
+            max_bandwidth: group.max_bandwidth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedHlsAbrGroupKind {
+    DashVideo,
+    DashAudioOnly,
+}
+
+impl From<HlsAbrGroupKind> for PersistedHlsAbrGroupKind {
+    fn from(kind: HlsAbrGroupKind) -> Self {
+        match kind {
+            HlsAbrGroupKind::DashVideo => Self::DashVideo,
+            HlsAbrGroupKind::DashAudioOnly => Self::DashAudioOnly,
+        }
+    }
+}
+
+impl From<PersistedHlsAbrGroupKind> for HlsAbrGroupKind {
+    fn from(kind: PersistedHlsAbrGroupKind) -> Self {
+        match kind {
+            PersistedHlsAbrGroupKind::DashVideo => Self::DashVideo,
+            PersistedHlsAbrGroupKind::DashAudioOnly => Self::DashAudioOnly,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsVariantMetadata {
+    id: String,
+    kind: PersistedHlsVariantKind,
+    content_id: String,
+    bandwidth: Option<u64>,
+    #[serde(default)]
+    codecs: Vec<String>,
+    #[serde(default)]
+    mime_types: Vec<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    frame_rate: Option<String>,
+    duration_seconds: Option<u32>,
+    abr: Option<PersistedHlsAbrLevel>,
+    #[serde(default)]
+    media: Vec<PersistedHlsMediaResourceMetadata>,
+}
+
+impl From<HlsVariantMetadata> for PersistedHlsVariantMetadata {
+    fn from(variant: HlsVariantMetadata) -> Self {
+        Self {
+            id: variant.id,
+            kind: PersistedHlsVariantKind::from(variant.kind),
+            content_id: variant.content_id,
+            bandwidth: variant.bandwidth,
+            codecs: variant.codecs,
+            mime_types: variant.mime_types,
+            width: variant.width,
+            height: variant.height,
+            frame_rate: variant.frame_rate,
+            duration_seconds: variant.duration_seconds,
+            abr: variant.abr.map(PersistedHlsAbrLevel::from),
+            media: variant
+                .media
+                .into_iter()
+                .map(PersistedHlsMediaResourceMetadata::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistedHlsVariantMetadata> for HlsVariantMetadata {
+    type Error = ();
+
+    fn try_from(variant: PersistedHlsVariantMetadata) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: variant.id,
+            kind: BilibiliPlaybackVariantKind::from(variant.kind),
+            content_id: variant.content_id,
+            bandwidth: variant.bandwidth,
+            codecs: variant.codecs,
+            mime_types: variant.mime_types,
+            width: variant.width,
+            height: variant.height,
+            frame_rate: variant.frame_rate,
+            duration_seconds: variant.duration_seconds,
+            abr: variant.abr.map(HlsAbrLevel::from),
+            media: variant
+                .media
+                .into_iter()
+                .map(HlsMediaResourceMetadata::from)
+                .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedHlsVariantKind {
+    Dash,
+    Flv,
+}
+
+impl From<BilibiliPlaybackVariantKind> for PersistedHlsVariantKind {
+    fn from(kind: BilibiliPlaybackVariantKind) -> Self {
+        match kind {
+            BilibiliPlaybackVariantKind::Dash => Self::Dash,
+            BilibiliPlaybackVariantKind::Flv => Self::Flv,
+        }
+    }
+}
+
+impl From<PersistedHlsVariantKind> for BilibiliPlaybackVariantKind {
+    fn from(kind: PersistedHlsVariantKind) -> Self {
+        match kind {
+            PersistedHlsVariantKind::Dash => Self::Dash,
+            PersistedHlsVariantKind::Flv => Self::Flv,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsAbrLevel {
+    group_id: String,
+    level_index: u32,
+    level_count: u32,
+    switchable: bool,
+}
+
+impl From<HlsAbrLevel> for PersistedHlsAbrLevel {
+    fn from(level: HlsAbrLevel) -> Self {
+        Self {
+            group_id: level.group_id,
+            level_index: level.level_index,
+            level_count: level.level_count,
+            switchable: level.switchable,
+        }
+    }
+}
+
+impl From<PersistedHlsAbrLevel> for HlsAbrLevel {
+    fn from(level: PersistedHlsAbrLevel) -> Self {
+        Self {
+            group_id: level.group_id,
+            level_index: level.level_index,
+            level_count: level.level_count,
+            switchable: level.switchable,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsMediaResourceMetadata {
+    kind: PersistedBilibiliMediaRequestKind,
+    stream_id: Option<u32>,
+    mime_type: Option<String>,
+    codecs: Option<String>,
+    bandwidth: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    frame_rate: Option<String>,
+    size: Option<u64>,
+    duration_seconds: Option<u32>,
+    cache_key: PersistedBilibiliMediaCacheKey,
+}
+
+impl From<HlsMediaResourceMetadata> for PersistedHlsMediaResourceMetadata {
+    fn from(resource: HlsMediaResourceMetadata) -> Self {
+        Self {
+            kind: PersistedBilibiliMediaRequestKind::from(resource.kind),
+            stream_id: resource.stream_id,
+            mime_type: resource.mime_type,
+            codecs: resource.codecs,
+            bandwidth: resource.bandwidth,
+            width: resource.width,
+            height: resource.height,
+            frame_rate: resource.frame_rate,
+            size: resource.size,
+            duration_seconds: resource.duration_seconds,
+            cache_key: PersistedBilibiliMediaCacheKey::from(resource.cache_key),
+        }
+    }
+}
+
+impl From<PersistedHlsMediaResourceMetadata> for HlsMediaResourceMetadata {
+    fn from(resource: PersistedHlsMediaResourceMetadata) -> Self {
+        Self {
+            kind: BilibiliMediaRequestKind::from(resource.kind),
+            stream_id: resource.stream_id,
+            mime_type: resource.mime_type,
+            codecs: resource.codecs,
+            bandwidth: resource.bandwidth,
+            width: resource.width,
+            height: resource.height,
+            frame_rate: resource.frame_rate,
+            size: resource.size,
+            duration_seconds: resource.duration_seconds,
+            cache_key: BilibiliMediaCacheKey::from(resource.cache_key),
+        }
     }
 }
 
@@ -1947,6 +2226,54 @@ mod tests {
         let sessions = store.load_sessions().expect("session manifest should load");
 
         assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn saves_and_loads_hls_session_manifest_with_abr_metadata() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-abr", "https://example.test/video.m4s");
+        attach_sample_abr_metadata(&mut session);
+        session.abr.groups[0].variant_ids[1] = "hevc:1080p".to_owned();
+        session.variants[1].id = "hevc:1080p".to_owned();
+
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let sessions = store.load_sessions().expect("session manifest should load");
+
+        assert_eq!(1, sessions.len());
+        assert_eq!(session.abr, sessions[0].abr);
+        assert_eq!(session.variants, sessions[0].variants);
+        assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn loads_legacy_hls_session_manifest_without_abr_metadata() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-legacy", "https://example.test/video.m4s");
+        let mut manifest = serde_json::to_value(PersistedHlsSession::from(session.clone()))
+            .expect("manifest should serialize");
+        let object = manifest
+            .as_object_mut()
+            .expect("persisted session should be a JSON object");
+        object.remove("abr");
+        object.remove("variants");
+
+        let manifest_path = store
+            .session_dir("session-legacy")
+            .expect("session dir should be valid")
+            .join("session.json");
+        store
+            .write_json_atomically(&manifest_path, &manifest)
+            .expect("legacy manifest should save");
+        let sessions = store.load_sessions().expect("legacy manifest should load");
+
+        assert_eq!(1, sessions.len());
+        assert!(sessions[0].abr.groups.is_empty());
+        assert!(sessions[0].variants.is_empty());
+        assert_eq!(session, sessions[0]);
     }
 
     #[test]
@@ -2582,6 +2909,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
         let mut session = sample_session("session-scrubbed", &upstream_url);
+        attach_sample_abr_metadata(&mut session);
         let backup_url = "https://cdn-backup.example.test/video.m4s".to_owned();
         session.variant.video.request.backup_urls = vec![backup_url.clone()];
         session.variant.video.request.headers.extend([
@@ -2614,11 +2942,16 @@ mod tests {
         assert!(!manifest.contains(&backup_url));
         assert!(!manifest.contains("secret-token"));
         assert!(!manifest.contains("SESSDATA"));
+        assert!(manifest.contains("dash-video"));
+        assert!(manifest.contains("source-hash"));
+        assert!(manifest.contains("hevc-source-hash"));
         assert_eq!(1, sessions.len());
         let request = &sessions[0].variant.video.request;
         assert!(request.url.is_empty());
         assert!(request.backup_urls.is_empty());
         assert!(request.headers.is_empty());
+        assert_eq!(session.abr, sessions[0].abr);
+        assert_eq!(session.variants, sessions[0].variants);
         assert!(store.get_completed_library_item(&item_id).is_some());
     }
 
@@ -3643,6 +3976,8 @@ mod tests {
                 },
                 audio: None,
             },
+            abr: Default::default(),
+            variants: Vec::new(),
         }
     }
 
@@ -3656,6 +3991,95 @@ mod tests {
         audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
         session.variant.audio = Some(audio);
         session
+    }
+
+    fn attach_sample_abr_metadata(session: &mut HlsPlaybackSession) {
+        let h264_video = sample_resource_metadata(&session.variant.video.request);
+        let hevc_video = HlsMediaResourceMetadata {
+            kind: BilibiliMediaRequestKind::Video,
+            stream_id: Some(80),
+            mime_type: Some("video/mp4".to_owned()),
+            codecs: Some("hev1.1.6.L120.90".to_owned()),
+            bandwidth: Some(1_800_000),
+            width: Some(1920),
+            height: Some(1080),
+            frame_rate: Some("60".to_owned()),
+            size: Some(2048),
+            duration_seconds: Some(60),
+            cache_key: BilibiliMediaCacheKey {
+                content_id: "cid-1".to_owned(),
+                media_kind: BilibiliMediaRequestKind::Video,
+                stream_id: Some(80),
+                codecs: Some("hev1.1.6.L120.90".to_owned()),
+                source_hash: "hevc-source-hash".to_owned(),
+            },
+        };
+        session.abr = HlsAbrMetadata {
+            groups: vec![HlsAbrGroup {
+                id: "dash-video".to_owned(),
+                kind: HlsAbrGroupKind::DashVideo,
+                variant_ids: vec!["h264".to_owned(), "hevc".to_owned()],
+                level_count: 2,
+                min_bandwidth: Some(1_000_000),
+                max_bandwidth: Some(1_800_000),
+            }],
+        };
+        session.variants = vec![
+            HlsVariantMetadata {
+                id: "h264".to_owned(),
+                kind: BilibiliPlaybackVariantKind::Dash,
+                content_id: "cid-1".to_owned(),
+                bandwidth: Some(1_000_000),
+                codecs: vec!["avc1.640028".to_owned()],
+                mime_types: vec!["video/mp4".to_owned()],
+                width: Some(1920),
+                height: Some(1080),
+                frame_rate: Some("60".to_owned()),
+                duration_seconds: Some(60),
+                abr: Some(HlsAbrLevel {
+                    group_id: "dash-video".to_owned(),
+                    level_index: 0,
+                    level_count: 2,
+                    switchable: true,
+                }),
+                media: vec![h264_video],
+            },
+            HlsVariantMetadata {
+                id: "hevc".to_owned(),
+                kind: BilibiliPlaybackVariantKind::Dash,
+                content_id: "cid-1".to_owned(),
+                bandwidth: Some(1_800_000),
+                codecs: vec!["hev1.1.6.L120.90".to_owned()],
+                mime_types: vec!["video/mp4".to_owned()],
+                width: Some(1920),
+                height: Some(1080),
+                frame_rate: Some("60".to_owned()),
+                duration_seconds: Some(60),
+                abr: Some(HlsAbrLevel {
+                    group_id: "dash-video".to_owned(),
+                    level_index: 1,
+                    level_count: 2,
+                    switchable: true,
+                }),
+                media: vec![hevc_video],
+            },
+        ];
+    }
+
+    fn sample_resource_metadata(request: &BilibiliMediaRequest) -> HlsMediaResourceMetadata {
+        HlsMediaResourceMetadata {
+            kind: request.kind,
+            stream_id: request.stream_id,
+            mime_type: request.mime_type.clone(),
+            codecs: request.codecs.clone(),
+            bandwidth: request.bandwidth,
+            width: request.width,
+            height: request.height,
+            frame_rate: request.frame_rate.clone(),
+            size: request.size,
+            duration_seconds: request.duration_seconds,
+            cache_key: request.cache_key.clone(),
+        }
     }
 
     fn fake_mp4() -> Vec<u8> {

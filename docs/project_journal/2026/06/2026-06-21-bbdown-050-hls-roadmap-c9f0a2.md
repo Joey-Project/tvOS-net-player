@@ -98,6 +98,7 @@ superseded_by:
 
 ### PR 7: ABR Metadata Foundation
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-22-hls-abr-metadata-foundation-a3c9f4.md`.
 - Persist BBDown playback ABR group, level, variant, and media cache-key metadata in server-owned manifests.
 - Keep current single-variant playback behavior unchanged.
 - Add cache-status and recovery tests for variant-aware metadata.
@@ -175,6 +176,11 @@ superseded_by:
   - `git diff --check`
   - `scripts/lint.sh`
   - `just ci`
+- PR 7 local gate:
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_session_manifest --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server completed_session_manifest_scrubs_upstream_request_data --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`
 - Current Bilibili task schema roadmap journal: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`

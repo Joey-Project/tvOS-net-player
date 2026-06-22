@@ -1640,8 +1640,14 @@ fn playback_task_metadata(
         entry.title.clone()
     };
     let selected_variant = playback_variant_from_adapter(&selected.variant);
-    let hls_session = HlsPlaybackSession::from_selected_variant(task_id, &title, &selected.variant)
-        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let hls_session = HlsPlaybackSession::from_playback_entry(
+        task_id,
+        &title,
+        &selected.variant,
+        &entry.abr,
+        &entry.variants,
+    )
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let playback_session = BilibiliPlaybackSession {
         id: task_id.to_owned(),
         title: title.clone(),
@@ -1985,7 +1991,8 @@ mod tests {
     use crate::{
         bbdown_adapter::{
             BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
-            BilibiliMediaRequestKind, BilibiliPlaybackAbrMetadata, BilibiliPlaybackEntry,
+            BilibiliMediaRequestKind, BilibiliPlaybackAbrGroup, BilibiliPlaybackAbrGroupKind,
+            BilibiliPlaybackAbrLevel, BilibiliPlaybackAbrMetadata, BilibiliPlaybackEntry,
             BilibiliPlaybackVariantSelection, BilibiliPlaybackVariantSelectionPolicy,
             BilibiliSelectedPlaybackVariant,
         },
@@ -3244,7 +3251,31 @@ mod tests {
         assert_eq!("h264", session.selected_variant_id);
         assert_eq!(2, session.variants.len());
         assert_eq!("dash", session.selected_variant.unwrap().source_kind);
-        assert!(service.state.hls_sessions.get(&task.id).is_some());
+        let hls_session = service
+            .state
+            .hls_sessions
+            .get(&task.id)
+            .expect("runtime HLS session should exist");
+        assert_eq!("h264", hls_session.variant.id);
+        assert_eq!(1, hls_session.abr.groups.len());
+        assert_eq!("dash-video", hls_session.abr.groups[0].id);
+        assert_eq!(vec!["h264", "hevc"], hls_session.abr.groups[0].variant_ids);
+        assert_eq!(2, hls_session.variants.len());
+        assert_eq!(
+            "dash-video",
+            hls_session.variants[0].abr.as_ref().unwrap().group_id
+        );
+        assert_eq!(
+            "source-hash",
+            hls_session.variants[0].media[0].cache_key.source_hash
+        );
+        let restored_hls_session = service
+            .state
+            .hls_cache
+            .playback_session(&task.id)
+            .expect("persisted HLS session should exist");
+        assert_eq!(hls_session.abr, restored_hls_session.abr);
+        assert_eq!(hls_session.variants, restored_hls_session.variants);
 
         let cancelled = service
             .cancel_task(Request::new(CancelTaskRequest {
@@ -8476,7 +8507,11 @@ mod tests {
     }
 
     fn sample_playback_plan() -> BilibiliPlaybackPlan {
-        let selected_variant = playback_variant("h264", "avc1.640028", 1_000_000, 10_000_000);
+        let mut selected_variant = playback_variant("h264", "avc1.640028", 1_000_000, 10_000_000);
+        selected_variant.abr = Some(playback_abr_level(0, 2));
+        let mut alternate_variant =
+            playback_variant("hevc", "hvc1.1.6.L120.90", 2_000_000, 20_000_000);
+        alternate_variant.abr = Some(playback_abr_level(1, 2));
         BilibiliPlaybackPlan {
             title: "Example".to_owned(),
             entries: vec![BilibiliPlaybackEntry {
@@ -8488,7 +8523,7 @@ mod tests {
                 title: "Episode 1".to_owned(),
                 content_id: "BV1progressive-cid1".to_owned(),
                 duration_seconds: Some(60),
-                abr: BilibiliPlaybackAbrMetadata { groups: Vec::new() },
+                abr: sample_playback_abr_metadata(vec!["h264", "hevc"], 1_000_000, 2_000_000),
                 selected_variant: Some(BilibiliSelectedPlaybackVariant {
                     variant: selected_variant.clone(),
                     selection: BilibiliPlaybackVariantSelection {
@@ -8497,10 +8532,7 @@ mod tests {
                         score: 100,
                     },
                 }),
-                variants: vec![
-                    selected_variant,
-                    playback_variant("hevc", "hvc1.1.6.L120.90", 2_000_000, 20_000_000),
-                ],
+                variants: vec![selected_variant, alternate_variant],
             }],
         }
     }
@@ -8548,7 +8580,8 @@ mod tests {
     }
 
     fn sample_playback_plan_with_video_url(url: &str) -> BilibiliPlaybackPlan {
-        let selected_variant = playback_variant_with_url("h264", "avc1.640028", 1_000_000, url);
+        let mut selected_variant = playback_variant_with_url("h264", "avc1.640028", 1_000_000, url);
+        selected_variant.abr = Some(playback_abr_level(0, 1));
         BilibiliPlaybackPlan {
             title: "Example".to_owned(),
             entries: vec![BilibiliPlaybackEntry {
@@ -8560,7 +8593,7 @@ mod tests {
                 title: "Offline Episode".to_owned(),
                 content_id: "BV1offline-cid1".to_owned(),
                 duration_seconds: Some(60),
-                abr: BilibiliPlaybackAbrMetadata { groups: Vec::new() },
+                abr: sample_playback_abr_metadata(vec!["h264"], 1_000_000, 1_000_000),
                 selected_variant: Some(BilibiliSelectedPlaybackVariant {
                     variant: selected_variant.clone(),
                     selection: BilibiliPlaybackVariantSelection {
@@ -8631,6 +8664,36 @@ mod tests {
             )),
             audio: None,
             flv_segments: Vec::new(),
+        }
+    }
+
+    fn sample_playback_abr_metadata(
+        variant_ids: Vec<&str>,
+        min_bandwidth: u64,
+        max_bandwidth: u64,
+    ) -> BilibiliPlaybackAbrMetadata {
+        let level_count = variant_ids.len().try_into().unwrap_or(u32::MAX);
+        BilibiliPlaybackAbrMetadata {
+            groups: vec![BilibiliPlaybackAbrGroup {
+                id: "dash-video".to_owned(),
+                kind: BilibiliPlaybackAbrGroupKind::DashVideo,
+                variant_ids: variant_ids
+                    .into_iter()
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect(),
+                level_count,
+                min_bandwidth: Some(min_bandwidth),
+                max_bandwidth: Some(max_bandwidth),
+            }],
+        }
+    }
+
+    fn playback_abr_level(level_index: u32, level_count: u32) -> BilibiliPlaybackAbrLevel {
+        BilibiliPlaybackAbrLevel {
+            group_id: "dash-video".to_owned(),
+            level_index,
+            level_count,
+            switchable: true,
         }
     }
 
