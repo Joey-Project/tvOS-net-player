@@ -600,6 +600,10 @@ fn playable_alternate_variants(
     selected_variant: &AdapterPlaybackVariant,
     variants: &[AdapterPlaybackVariant],
 ) -> Result<Vec<HlsVariant>, HlsSessionError> {
+    if !is_avplayer_safe_alternate_variant(selected_variant) {
+        return Ok(Vec::new());
+    }
+
     let mut alternates = Vec::new();
     for variant in variants {
         if variant.id == selected_variant.id
@@ -634,8 +638,24 @@ fn hls_variant_codecs(
     }
     if let Some(audio_codecs) = audio.and_then(|audio| audio.codecs.as_deref()) {
         push_unique_codec(&mut codecs, audio_codecs);
+    } else if audio.is_some() {
+        push_matching_variant_codecs(&mut codecs, &variant.codecs, is_aac_codec);
     }
     codecs
+}
+
+fn push_matching_variant_codecs(
+    codecs: &mut Vec<String>,
+    variant_codecs: &[String],
+    predicate: fn(&str) -> bool,
+) {
+    for codec_list in variant_codecs {
+        for codec in codec_list.split(',') {
+            if predicate(codec) {
+                push_unique_codec(codecs, codec);
+            }
+        }
+    }
 }
 
 fn has_matching_audio_presence(
@@ -803,6 +823,62 @@ mod tests {
             "https://media.example.test/720p-video.m4s",
             resource.request.url
         );
+    }
+
+    #[test]
+    fn from_playback_entry_filters_alternates_when_selected_hls_variant_is_unsafe() {
+        let mut selected = dash_variant();
+        selected.id = "hevc-1080p".to_owned();
+        selected.codecs = vec!["hev1.1.6.L120.90".to_owned(), "mp4a.40.2".to_owned()];
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        selected.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_uses_variant_audio_codec_fallback_for_alternate_hls_variant() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+        alternate.audio.as_mut().unwrap().codecs = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert_eq!(1, session.alternate_variants.len());
+        assert_eq!(
+            vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()],
+            session.alternate_variants[0].codecs
+        );
+        let master = session.master_playlist();
+        assert!(master.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
+        assert!(master.contains("AUDIO=\"audio-v1\""));
     }
 
     #[test]
