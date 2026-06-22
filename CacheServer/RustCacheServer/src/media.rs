@@ -184,7 +184,9 @@ async fn hls_segment_response(
                 total_length: prewarmed.total_length,
             }
         } else {
-            let Ok(initialization) = load_hls_mp4_initialization(&state, &resource).await else {
+            let Ok(initialization) =
+                load_hls_mp4_initialization(&state, &session_id, &variant_id, &resource).await
+            else {
                 state
                     .state
                     .hls_network_policy
@@ -306,7 +308,11 @@ async fn proxy_hls_media_resource(
 
     let mut last_retryable_response = None;
     for url in urls {
-        match send_hls_upstream_request(state, &resource, &url, headers, head_only).await {
+        match send_hls_upstream_request(
+            state, session_id, variant_id, &resource, &url, headers, head_only,
+        )
+        .await
+        {
             Ok(upstream) if should_retry_hls_upstream_status(upstream.response.status()) => {
                 state
                     .state
@@ -314,16 +320,7 @@ async fn proxy_hls_media_resource(
                     .record_upstream_retry(session_id, variant_id);
                 last_retryable_response = Some(upstream.response);
             }
-            Ok(upstream) => {
-                if upstream.response.status().is_success() {
-                    state.state.hls_network_policy.record_upstream_success(
-                        session_id,
-                        variant_id,
-                        upstream.response_time,
-                    );
-                }
-                return upstream.response;
-            }
+            Ok(upstream) => return upstream.response,
             Err(_) => {
                 state
                     .state
@@ -360,6 +357,8 @@ fn text_response(status: StatusCode, body: &'static str, head_only: bool) -> Res
 
 async fn send_hls_upstream_request(
     state: &MediaState,
+    session_id: &str,
+    variant_id: &str,
     resource: &HlsMediaResource,
     url: &str,
     headers: &HeaderMap,
@@ -386,14 +385,28 @@ async fn send_hls_upstream_request(
                 "HLS upstream ignored byte range request.\n",
                 head_only,
             ),
-            response_time,
         });
     }
 
     let mut response = Response::builder()
         .status(status)
         .body(if head_only {
+            if status.is_success() {
+                state.state.hls_network_policy.record_upstream_success(
+                    session_id,
+                    variant_id,
+                    response_time,
+                );
+            }
             Body::empty()
+        } else if status.is_success() {
+            hls_policy_recording_body(
+                upstream,
+                state.state.hls_network_policy.clone(),
+                session_id.to_owned(),
+                variant_id.to_owned(),
+                started_at,
+            )
         } else {
             Body::from_stream(upstream.bytes_stream())
         })
@@ -405,15 +418,52 @@ async fn send_hls_upstream_request(
         resource.content_type(),
     );
 
-    Ok(HlsUpstreamResponse {
-        response,
-        response_time,
-    })
+    Ok(HlsUpstreamResponse { response })
 }
 
 struct HlsUpstreamResponse {
     response: Response<Body>,
-    response_time: Duration,
+}
+
+fn hls_policy_recording_body(
+    upstream: reqwest::Response,
+    policy: crate::hls_network_policy::HlsNetworkPolicy,
+    session_id: String,
+    variant_id: String,
+    started_at: Instant,
+) -> Body {
+    let stream = Box::pin(upstream.bytes_stream());
+    let stream = futures_util::stream::unfold(
+        (stream, policy, session_id, variant_id, started_at, false),
+        |(mut stream, policy, session_id, variant_id, started_at, failed)| async move {
+            match stream.next().await {
+                Some(Ok(bytes)) => Some((
+                    Ok::<_, reqwest::Error>(bytes),
+                    (stream, policy, session_id, variant_id, started_at, failed),
+                )),
+                Some(Err(error)) => {
+                    if !failed {
+                        policy.record_upstream_failure(&session_id, &variant_id);
+                    }
+                    Some((
+                        Err(error),
+                        (stream, policy, session_id, variant_id, started_at, true),
+                    ))
+                }
+                None => {
+                    if !failed {
+                        policy.record_upstream_success(
+                            &session_id,
+                            &variant_id,
+                            started_at.elapsed(),
+                        );
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Body::from_stream(stream)
 }
 
 fn hls_upstream_request_builder(
@@ -474,8 +524,15 @@ struct Mp4Initialization {
     total_length: u64,
 }
 
+struct Mp4InitializationProbe {
+    initialization: Mp4Initialization,
+    response_time: Duration,
+}
+
 async fn load_hls_mp4_initialization(
     state: &MediaState,
+    session_id: &str,
+    variant_id: &str,
     resource: &HlsMediaResource,
 ) -> Result<Mp4Initialization, ()> {
     let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
@@ -483,10 +540,19 @@ async fn load_hls_mp4_initialization(
     urls.extend(resource.request.backup_urls.clone());
 
     for url in urls {
-        if let Ok(initialization) =
-            load_hls_mp4_initialization_from_url(state, resource, &url).await
-        {
-            return Ok(initialization);
+        match load_hls_mp4_initialization_from_url(state, resource, &url).await {
+            Ok(probe) => {
+                state.state.hls_network_policy.record_upstream_success(
+                    session_id,
+                    variant_id,
+                    probe.response_time,
+                );
+                return Ok(probe.initialization);
+            }
+            Err(()) => state
+                .state
+                .hls_network_policy
+                .record_upstream_retry(session_id, variant_id),
         }
     }
 
@@ -497,7 +563,8 @@ async fn load_hls_mp4_initialization_from_url(
     state: &MediaState,
     resource: &HlsMediaResource,
     url: &str,
-) -> Result<Mp4Initialization, ()> {
+) -> Result<Mp4InitializationProbe, ()> {
+    let started_at = Instant::now();
     let upstream = hls_upstream_request_builder(state, resource, Method::GET, url)
         .header(
             RANGE,
@@ -528,9 +595,12 @@ async fn load_hls_mp4_initialization_from_url(
         return Err(());
     }
 
-    Ok(Mp4Initialization {
-        length,
-        total_length,
+    Ok(Mp4InitializationProbe {
+        initialization: Mp4Initialization {
+            length,
+            total_length,
+        },
+        response_time: started_at.elapsed(),
     })
 }
 
@@ -893,6 +963,39 @@ mod tests {
         assert!(playlist.contains(&format!(
             "#EXT-X-BYTERANGE:{media_length}@{initialization_length}"
         )));
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_records_retry_when_initialization_probe_uses_backup() {
+        let (primary_url, _primary_task) = start_hls_forbidden_upstream().await;
+        let (backup_url, _backup_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        insert_authorized_hls_session(
+            &state,
+            hls_session_with_backups("session-1", &primary_url, vec![backup_url]),
+        );
+
+        let response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let snapshot = state.hls_network_policy.snapshot();
+        assert_eq!(
+            crate::hls_network_policy::HlsWeakNetworkState::Retrying,
+            snapshot.state
+        );
+        assert_eq!(1, snapshot.retrying_variant_count);
     }
 
     #[tokio::test]

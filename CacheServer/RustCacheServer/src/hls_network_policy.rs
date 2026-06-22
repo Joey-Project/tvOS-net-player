@@ -155,7 +155,6 @@ impl HlsNetworkPolicyState {
 
     fn prune_expired(&mut self, now: SystemTime) {
         self.sessions.retain(|_, session| {
-            session.cache_only_until = session.cache_only_until.filter(|until| *until > now);
             session.variants.retain(|_, variant| {
                 variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
                 if variant.unhealthy_until.is_some_and(|until| until <= now) {
@@ -166,6 +165,9 @@ impl HlsNetworkPolicyState {
                 }
                 variant.retrying_until.is_some() || variant.unhealthy_until.is_some()
             });
+            session.cache_only_until = session
+                .cache_only_until
+                .filter(|until| *until > now && session.has_degraded_variant(now));
             !session.variants.is_empty() || session.cache_only_until.is_some()
         });
     }
@@ -422,5 +424,27 @@ mod tests {
         let snapshot = policy.snapshot_at(now + Duration::from_secs(1));
         assert_eq!(HlsWeakNetworkState::CacheOnly, snapshot.state);
         assert_eq!(1, snapshot.cache_only_session_count);
+    }
+
+    #[test]
+    fn cache_only_recovers_when_degraded_variant_recovers() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_failure_at("session", "1080p", now);
+        policy.record_cache_hit_at("session", now + DEGRADE_DURATION - Duration::from_secs(1));
+
+        assert_eq!(
+            HlsWeakNetworkState::CacheOnly,
+            policy
+                .snapshot_at(now + DEGRADE_DURATION - Duration::from_secs(1))
+                .state
+        );
+
+        let recovered_at = now + DEGRADE_DURATION + Duration::from_secs(1);
+        let snapshot = policy.snapshot_at(recovered_at);
+        assert_eq!(HlsWeakNetworkState::Normal, snapshot.state);
+        assert_eq!(0, snapshot.cache_only_session_count);
+        assert_eq!(0, snapshot.degraded_session_count);
     }
 }
