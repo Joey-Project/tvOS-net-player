@@ -1510,7 +1510,14 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
+    let mut session = completed_runtime_session(session);
+    session.alternate_variants.clear();
+    session
+}
+
+pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
+    session.advertise_alternate_variants = false;
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {
         sanitize_completed_resource(audio);
@@ -1643,6 +1650,8 @@ struct PersistedHlsSession {
     title: String,
     variant: PersistedHlsVariant,
     #[serde(default)]
+    alternate_variants: Vec<PersistedHlsVariant>,
+    #[serde(default)]
     abr: PersistedHlsAbrMetadata,
     #[serde(default)]
     variants: Vec<PersistedHlsVariantMetadata>,
@@ -1655,6 +1664,11 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
             id: session.id,
             title: session.title,
             variant: PersistedHlsVariant::from(session.variant),
+            alternate_variants: session
+                .alternate_variants
+                .into_iter()
+                .map(PersistedHlsVariant::from)
+                .collect(),
             abr: PersistedHlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -1674,6 +1688,12 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
             id: session.id,
             title: session.title,
             variant: HlsVariant::try_from(session.variant)?,
+            alternate_variants: session
+                .alternate_variants
+                .into_iter()
+                .map(HlsVariant::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            advertise_alternate_variants: true,
             abr: HlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -1716,7 +1736,6 @@ impl TryFrom<PersistedHlsVariant> for HlsVariant {
     type Error = ();
 
     fn try_from(variant: PersistedHlsVariant) -> Result<Self, Self::Error> {
-        validate_cache_id(&variant.id).map_err(|_| ())?;
         Ok(Self {
             id: variant.id,
             bandwidth: variant.bandwidth,
@@ -2249,6 +2268,44 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_loads_hls_session_manifest_with_alternate_variants() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-alternates", "https://example.test/video.m4s");
+        attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+        session.alternate_variants[0].id = "h264:720p".to_owned();
+
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let sessions = store.load_sessions().expect("session manifest should load");
+
+        assert_eq!(1, sessions.len());
+        assert_eq!(session.alternate_variants, sessions[0].alternate_variants);
+        assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn completed_runtime_session_hides_alternates_from_new_master_but_keeps_lookup() {
+        let mut session = sample_session("session-runtime", "https://example.test/video.m4s");
+        attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+
+        let runtime = completed_runtime_session(&session);
+
+        assert_eq!(1, runtime.alternate_variants.len());
+        assert!(!runtime.master_playlist().contains("segments/v1-video.m3u8"));
+        assert!(runtime.media_playlist_resource("v1-video.m3u8").is_some());
+        assert_eq!(
+            "https://example.test/720p-video.m4s",
+            runtime
+                .media_resource("v1-video.m4s")
+                .expect("runtime alternate resource should remain addressable")
+                .request
+                .url
+        );
+    }
+
+    #[test]
     fn loads_legacy_hls_session_manifest_without_abr_metadata() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
@@ -2258,6 +2315,7 @@ mod tests {
         let object = manifest
             .as_object_mut()
             .expect("persisted session should be a JSON object");
+        object.remove("alternate_variants");
         object.remove("abr");
         object.remove("variants");
 
@@ -2910,6 +2968,10 @@ mod tests {
         let store = temp_store(&temp);
         let mut session = sample_session("session-scrubbed", &upstream_url);
         attach_sample_abr_metadata(&mut session);
+        attach_sample_alternate_variant(
+            &mut session,
+            "https://cdn-alt.example.test/720p-video.m4s",
+        );
         let backup_url = "https://cdn-backup.example.test/video.m4s".to_owned();
         session.variant.video.request.backup_urls = vec![backup_url.clone()];
         session.variant.video.request.headers.extend([
@@ -2942,10 +3004,12 @@ mod tests {
         assert!(!manifest.contains(&backup_url));
         assert!(!manifest.contains("secret-token"));
         assert!(!manifest.contains("SESSDATA"));
+        assert!(!manifest.contains("cdn-alt.example.test"));
         assert!(manifest.contains("dash-video"));
         assert!(manifest.contains("source-hash"));
         assert!(manifest.contains("hevc-source-hash"));
         assert_eq!(1, sessions.len());
+        assert!(sessions[0].alternate_variants.is_empty());
         let request = &sessions[0].variant.video.request;
         assert!(request.url.is_empty());
         assert!(request.backup_urls.is_empty());
@@ -3976,6 +4040,8 @@ mod tests {
                 },
                 audio: None,
             },
+            alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
             abr: Default::default(),
             variants: Vec::new(),
         }
@@ -3991,6 +4057,38 @@ mod tests {
         audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
         session.variant.audio = Some(audio);
         session
+    }
+
+    fn attach_sample_alternate_variant(session: &mut HlsPlaybackSession, video_url: &str) {
+        let mut video = session.variant.video.clone();
+        video.id = "v1-video.m4s".to_owned();
+        video.request.url = video_url.to_owned();
+        video.request.bandwidth = Some(600_000);
+        video.request.width = Some(1280);
+        video.request.height = Some(720);
+        video.request.cache_key.source_hash = "h264-720p-video-source".to_owned();
+
+        let mut audio = session.variant.video.clone();
+        audio.id = "v1-audio.m4s".to_owned();
+        audio.request.kind = BilibiliMediaRequestKind::Audio;
+        audio.request.url = "https://example.test/720p-audio.m4s".to_owned();
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.width = None;
+        audio.request.height = None;
+        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.cache_key.source_hash = "h264-720p-audio-source".to_owned();
+
+        session.alternate_variants.push(HlsVariant {
+            id: "h264-720p".to_owned(),
+            bandwidth: 600_000,
+            codecs: vec!["avc1.640028".to_owned()],
+            width: Some(1280),
+            height: Some(720),
+            duration_seconds: 60,
+            video,
+            audio: Some(audio),
+        });
     }
 
     fn attach_sample_abr_metadata(session: &mut HlsPlaybackSession) {

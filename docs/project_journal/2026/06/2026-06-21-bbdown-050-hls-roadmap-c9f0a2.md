@@ -105,6 +105,7 @@ superseded_by:
 
 ### PR 8: Multi-Variant HLS Master
 
+- Status: implemented by `docs/project_journal/2026/06/2026-06-22-hls-multi-variant-master-e6b4a8.md`.
 - Emit compatible multi-variant HLS master playlists from persisted ABR metadata.
 - Prefer AVPlayer-safe H.264/AAC variants, adding HEVC/AV1 only when metadata and platform constraints make them safe.
 - Make cache-first and upstream fallback logic variant-aware.
@@ -180,6 +181,11 @@ superseded_by:
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_session_manifest --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server completed_session_manifest_scrubs_upstream_request_data --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server create_bilibili_playback_task_returns_preparing_and_plans_hls_session_in_background --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
+- PR 8 local gate:
+  - `cargo fmt --manifest-path CacheServer/RustCacheServer/Cargo.toml`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls::tests:: --lib`
+  - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server hls_cache::tests:: --lib`
   - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml --package tvos-net-player-cache-server --lib`
 - Current HLS progressive cache journal: `docs/project_journal/2026/06/2026-06-14-hls-progressive-cache-f3a9d1.md`
 - Current discovery/cache/Bilibili roadmap journal: `docs/project_journal/2026/06/2026-06-16-discovery-cache-bilibili-roadmap-a9d4c1.md`

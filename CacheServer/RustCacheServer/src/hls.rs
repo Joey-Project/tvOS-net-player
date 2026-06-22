@@ -12,8 +12,6 @@ use crate::bbdown_adapter::{
 };
 use url::Url;
 
-const VIDEO_PLAYLIST_ID: &str = "video.m3u8";
-const AUDIO_PLAYLIST_ID: &str = "audio.m3u8";
 const VIDEO_SEGMENT_ID: &str = "video.m4s";
 const AUDIO_SEGMENT_ID: &str = "audio.m4s";
 const DEFAULT_BANDWIDTH: u64 = 1_000_000;
@@ -53,6 +51,8 @@ pub(crate) struct HlsPlaybackSession {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) variant: HlsVariant,
+    pub(crate) alternate_variants: Vec<HlsVariant>,
+    pub(crate) advertise_alternate_variants: bool,
     pub(crate) abr: HlsAbrMetadata,
     pub(crate) variants: Vec<HlsVariantMetadata>,
 }
@@ -74,6 +74,8 @@ impl HlsPlaybackSession {
             id: session_id.to_owned(),
             title: title.to_owned(),
             variant: hls_variant,
+            alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
             abr: HlsAbrMetadata::default(),
             variants: vec![HlsVariantMetadata::from_adapter(variant)],
         })
@@ -92,6 +94,7 @@ impl HlsPlaybackSession {
             .iter()
             .map(HlsVariantMetadata::from_adapter)
             .collect();
+        session.alternate_variants = playable_alternate_variants(selected_variant, variants)?;
         if !session
             .variants
             .iter()
@@ -106,33 +109,51 @@ impl HlsPlaybackSession {
 
     pub(crate) fn master_playlist(&self) -> String {
         let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-        if self.variant.audio.is_some() {
-            playlist.push_str(
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/audio.m3u8\"\n",
-            );
+        let variants = self.advertised_variants().collect::<Vec<_>>();
+        for (index, variant) in variants.iter().enumerate() {
+            let Some(audio_playlist_id) = variant.audio_playlist_id() else {
+                continue;
+            };
+            let group_id = audio_group_id(index);
+            let name = if index == 0 {
+                "Default".to_owned()
+            } else {
+                format!("Variant {index}")
+            };
+            playlist.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"segments/{}\"\n",
+                escape_quoted(&group_id),
+                escape_quoted(&name),
+                escape_quoted(&audio_playlist_id)
+            ));
         }
 
-        playlist.push_str("#EXT-X-STREAM-INF:");
-        playlist.push_str(&format!("BANDWIDTH={}", self.variant.bandwidth));
-        if let Some(resolution) = self.variant.resolution() {
-            playlist.push_str(&format!(",RESOLUTION={resolution}"));
+        for (index, variant) in variants.iter().enumerate() {
+            playlist.push_str("#EXT-X-STREAM-INF:");
+            playlist.push_str(&format!("BANDWIDTH={}", variant.bandwidth));
+            if let Some(resolution) = variant.resolution() {
+                playlist.push_str(&format!(",RESOLUTION={resolution}"));
+            }
+            if let Some(codecs) = variant.codecs_attribute() {
+                playlist.push_str(&format!(",CODECS=\"{}\"", escape_quoted(&codecs)));
+            }
+            if variant.audio.is_some() {
+                playlist.push_str(&format!(
+                    ",AUDIO=\"{}\"",
+                    escape_quoted(&audio_group_id(index))
+                ));
+            }
+            playlist.push_str(&format!(
+                "\nsegments/{}\n",
+                escape_quoted(&variant.video_playlist_id())
+            ));
         }
-        if let Some(codecs) = self.variant.codecs_attribute() {
-            playlist.push_str(&format!(",CODECS=\"{}\"", escape_quoted(&codecs)));
-        }
-        if self.variant.audio.is_some() {
-            playlist.push_str(",AUDIO=\"audio\"");
-        }
-        playlist.push_str("\nsegments/video.m3u8\n");
         playlist
     }
 
     pub(crate) fn media_playlist_resource(&self, playlist_id: &str) -> Option<HlsMediaResource> {
-        match playlist_id {
-            VIDEO_PLAYLIST_ID => Some(self.variant.video.clone()),
-            AUDIO_PLAYLIST_ID => self.variant.audio.clone(),
-            _ => None,
-        }
+        self.media_playlist_resource_ref(playlist_id)
+            .map(|(_, resource)| resource.clone())
     }
 
     pub(crate) fn media_playlist(
@@ -141,11 +162,7 @@ impl HlsPlaybackSession {
         initialization_length: u64,
         total_length: u64,
     ) -> Option<String> {
-        let resource = match playlist_id {
-            VIDEO_PLAYLIST_ID => &self.variant.video,
-            AUDIO_PLAYLIST_ID => self.variant.audio.as_ref()?,
-            _ => return None,
-        };
+        let (variant, resource) = self.media_playlist_resource_ref(playlist_id)?;
         let media_length = total_length.checked_sub(initialization_length)?;
         if initialization_length == 0 || media_length == 0 {
             return None;
@@ -153,7 +170,7 @@ impl HlsPlaybackSession {
         let duration = resource
             .request
             .duration_seconds
-            .unwrap_or(self.variant.duration_seconds)
+            .unwrap_or(variant.duration_seconds)
             .max(DEFAULT_DURATION_SECONDS);
 
         Some(format!(
@@ -163,15 +180,52 @@ impl HlsPlaybackSession {
     }
 
     pub(crate) fn media_resource(&self, segment_id: &str) -> Option<HlsMediaResource> {
-        if segment_id == self.variant.video.id {
-            return Some(self.variant.video.clone());
-        }
+        for variant in self.resource_variants() {
+            if segment_id == variant.video.id {
+                return Some(variant.video.clone());
+            }
 
-        self.variant
-            .audio
-            .as_ref()
-            .filter(|audio| segment_id == audio.id)
-            .cloned()
+            if let Some(audio) = variant
+                .audio
+                .as_ref()
+                .filter(|audio| segment_id == audio.id)
+            {
+                return Some(audio.clone());
+            }
+        }
+        None
+    }
+
+    fn advertised_variants(&self) -> impl Iterator<Item = &HlsVariant> {
+        let alternate_count = if self.advertise_alternate_variants {
+            self.alternate_variants.len()
+        } else {
+            0
+        };
+        std::iter::once(&self.variant).chain(self.alternate_variants.iter().take(alternate_count))
+    }
+
+    fn resource_variants(&self) -> impl Iterator<Item = &HlsVariant> {
+        std::iter::once(&self.variant).chain(self.alternate_variants.iter())
+    }
+
+    fn media_playlist_resource_ref(
+        &self,
+        playlist_id: &str,
+    ) -> Option<(&HlsVariant, &HlsMediaResource)> {
+        for variant in self.resource_variants() {
+            if playlist_id == variant.video_playlist_id() {
+                return Some((variant, &variant.video));
+            }
+            if let Some(audio) = &variant.audio
+                && variant
+                    .audio_playlist_id()
+                    .is_some_and(|audio_playlist_id| playlist_id == audio_playlist_id)
+            {
+                return Some((variant, audio));
+            }
+        }
+        None
     }
 }
 
@@ -189,19 +243,33 @@ pub(crate) struct HlsVariant {
 
 impl HlsVariant {
     fn from_adapter(variant: &AdapterPlaybackVariant) -> Result<Self, HlsSessionError> {
+        Self::from_adapter_with_resource_ids(
+            variant,
+            VIDEO_SEGMENT_ID.to_owned(),
+            AUDIO_SEGMENT_ID.to_owned(),
+        )
+    }
+
+    fn from_adapter_with_resource_ids(
+        variant: &AdapterPlaybackVariant,
+        video_id: String,
+        audio_id: String,
+    ) -> Result<Self, HlsSessionError> {
         let Some(video) = variant.video.clone() else {
             return Err(HlsSessionError::new(
                 "Progressive HLS playback requires a video media request.",
             ));
         };
 
+        let audio = variant.audio.clone();
+        let codecs = hls_variant_codecs(variant, &video, audio.as_ref());
         Ok(Self {
             id: variant.id.clone(),
             bandwidth: variant
                 .bandwidth
                 .or(video.bandwidth)
                 .unwrap_or(DEFAULT_BANDWIDTH),
-            codecs: variant.codecs.clone(),
+            codecs,
             width: variant.width,
             height: variant.height,
             duration_seconds: variant
@@ -209,11 +277,11 @@ impl HlsVariant {
                 .or(video.duration_seconds)
                 .unwrap_or(DEFAULT_DURATION_SECONDS),
             video: HlsMediaResource {
-                id: VIDEO_SEGMENT_ID.to_owned(),
+                id: video_id,
                 request: video,
             },
-            audio: variant.audio.clone().map(|audio| HlsMediaResource {
-                id: AUDIO_SEGMENT_ID.to_owned(),
+            audio: audio.map(|audio| HlsMediaResource {
+                id: audio_id,
                 request: audio,
             }),
         })
@@ -239,6 +307,16 @@ impl HlsVariant {
             push_unique_codec(&mut codecs, audio_codecs);
         }
         (!codecs.is_empty()).then(|| codecs.join(","))
+    }
+
+    fn video_playlist_id(&self) -> String {
+        media_playlist_id(&self.video.id)
+    }
+
+    fn audio_playlist_id(&self) -> Option<String> {
+        self.audio
+            .as_ref()
+            .map(|audio| media_playlist_id(&audio.id))
     }
 }
 
@@ -513,6 +591,148 @@ fn push_unique_codec(codecs: &mut Vec<String>, codec: &str) {
     codecs.push(codec.to_owned());
 }
 
+fn media_playlist_id(resource_id: &str) -> String {
+    if let Some(stem) = resource_id.strip_suffix(".m4s") {
+        return format!("{stem}.m3u8");
+    }
+    format!("{resource_id}.m3u8")
+}
+
+fn audio_group_id(index: usize) -> String {
+    if index == 0 {
+        "audio".to_owned()
+    } else {
+        format!("audio-v{index}")
+    }
+}
+
+fn playable_alternate_variants(
+    selected_variant: &AdapterPlaybackVariant,
+    variants: &[AdapterPlaybackVariant],
+) -> Result<Vec<HlsVariant>, HlsSessionError> {
+    if !is_avplayer_safe_alternate_variant(selected_variant) {
+        return Ok(Vec::new());
+    }
+
+    let mut alternates = Vec::new();
+    for variant in variants {
+        if variant.id == selected_variant.id
+            || !is_switchable_alternate_variant(selected_variant, variant)
+            || !has_matching_audio_presence(selected_variant, variant)
+            || !is_avplayer_safe_alternate_variant(variant)
+        {
+            continue;
+        }
+        let index = alternates.len() + 1;
+        alternates.push(HlsVariant::from_adapter_with_resource_ids(
+            variant,
+            format!("v{index}-video.m4s"),
+            format!("v{index}-audio.m4s"),
+        )?);
+    }
+    Ok(alternates)
+}
+
+fn hls_variant_codecs(
+    variant: &AdapterPlaybackVariant,
+    video: &BilibiliMediaRequest,
+    audio: Option<&BilibiliMediaRequest>,
+) -> Vec<String> {
+    let mut codecs = Vec::new();
+    if let Some(video_codecs) = video.codecs.as_deref() {
+        push_unique_codec(&mut codecs, video_codecs);
+    } else {
+        for codec in &variant.codecs {
+            push_unique_codec(&mut codecs, codec);
+        }
+    }
+    if let Some(audio_codecs) = audio.and_then(|audio| audio.codecs.as_deref()) {
+        push_unique_codec(&mut codecs, audio_codecs);
+    } else if audio.is_some() {
+        push_matching_variant_codecs(&mut codecs, &variant.codecs, is_aac_codec);
+    }
+    codecs
+}
+
+fn push_matching_variant_codecs(
+    codecs: &mut Vec<String>,
+    variant_codecs: &[String],
+    predicate: fn(&str) -> bool,
+) {
+    for codec_list in variant_codecs {
+        for codec in codec_list.split(',') {
+            if predicate(codec) {
+                push_unique_codec(codecs, codec);
+            }
+        }
+    }
+}
+
+fn has_matching_audio_presence(
+    selected_variant: &AdapterPlaybackVariant,
+    variant: &AdapterPlaybackVariant,
+) -> bool {
+    selected_variant.audio.is_some() == variant.audio.is_some()
+}
+
+fn is_switchable_alternate_variant(
+    selected_variant: &AdapterPlaybackVariant,
+    variant: &AdapterPlaybackVariant,
+) -> bool {
+    let Some(selected_abr) = &selected_variant.abr else {
+        return false;
+    };
+    let Some(variant_abr) = &variant.abr else {
+        return false;
+    };
+    selected_abr.switchable
+        && variant_abr.switchable
+        && selected_abr.group_id == variant_abr.group_id
+}
+
+fn is_avplayer_safe_alternate_variant(variant: &AdapterPlaybackVariant) -> bool {
+    if variant.kind != BilibiliPlaybackVariantKind::Dash {
+        return false;
+    }
+    let Some(video) = &variant.video else {
+        return false;
+    };
+    if !variant_has_codec(variant, video.codecs.as_deref(), is_h264_codec) {
+        return false;
+    }
+    variant
+        .audio
+        .as_ref()
+        .is_none_or(|audio| variant_has_codec(variant, audio.codecs.as_deref(), is_aac_codec))
+}
+
+fn variant_has_codec(
+    variant: &AdapterPlaybackVariant,
+    request_codecs: Option<&str>,
+    predicate: fn(&str) -> bool,
+) -> bool {
+    if let Some(codecs) = request_codecs {
+        return codec_list_matches(codecs, predicate);
+    }
+    variant
+        .codecs
+        .iter()
+        .any(|codecs| codec_list_matches(codecs, predicate))
+}
+
+fn codec_list_matches(codecs: &str, predicate: fn(&str) -> bool) -> bool {
+    codecs.split(',').any(predicate)
+}
+
+fn is_h264_codec(codec: &str) -> bool {
+    let codec = codec.trim().to_ascii_lowercase();
+    codec.starts_with("avc1") || codec.starts_with("avc3")
+}
+
+fn is_aac_codec(codec: &str) -> bool {
+    codec.trim().to_ascii_lowercase().starts_with("mp4a")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +775,225 @@ mod tests {
 
         assert!(master.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
         assert!(!master.contains("mp4a.40.2,mp4a.40.2"));
+    }
+
+    #[test]
+    fn from_playback_entry_emits_avplayer_safe_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.codecs = vec!["hev1.1.6.L120.90".to_owned(), "mp4a.40.2".to_owned()];
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+        alternate.video.as_mut().unwrap().url =
+            "https://media.example.test/720p-video.m4s".to_owned();
+        alternate.video.as_mut().unwrap().cache_key.source_hash =
+            "h264-720p-video-source".to_owned();
+        alternate.audio.as_mut().unwrap().url =
+            "https://media.example.test/720p-audio.m4s".to_owned();
+        alternate.audio.as_mut().unwrap().cache_key.source_hash =
+            "h264-720p-audio-source".to_owned();
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert_eq!(1, session.alternate_variants.len());
+        assert_eq!(
+            vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()],
+            session.alternate_variants[0].codecs
+        );
+        let master = session.master_playlist();
+        assert_eq!(2, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(master.contains("URI=\"segments/audio.m3u8\""));
+        assert!(master.contains("URI=\"segments/v1-audio.m3u8\""));
+        assert!(master.contains("GROUP-ID=\"audio-v1\",NAME=\"Variant 1\",DEFAULT=YES"));
+        assert!(master.contains("AUDIO=\"audio-v1\""));
+        assert!(master.contains("RESOLUTION=1280x720"));
+        assert!(master.contains("segments/video.m3u8\n"));
+        assert!(master.contains("segments/v1-video.m3u8\n"));
+        assert!(!master.contains("hev1.1.6.L120.90"));
+
+        let video = session
+            .media_playlist("v1-video.m3u8", 128, 10_000)
+            .unwrap();
+        assert!(video.contains("#EXT-X-MAP:URI=\"v1-video.m4s\",BYTERANGE=\"128@0\""));
+        assert!(video.contains("v1-video.m4s"));
+        let audio = session.media_playlist_resource("v1-audio.m3u8").unwrap();
+        assert_eq!("v1-audio.m4s", audio.id);
+        let resource = session.media_resource("v1-video.m4s").unwrap();
+        assert_eq!(
+            "https://media.example.test/720p-video.m4s",
+            resource.request.url
+        );
+    }
+
+    #[test]
+    fn from_playback_entry_filters_alternates_when_selected_hls_variant_is_unsafe() {
+        let mut selected = dash_variant();
+        selected.id = "hevc-1080p".to_owned();
+        selected.codecs = vec!["hev1.1.6.L120.90".to_owned(), "mp4a.40.2".to_owned()];
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        selected.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_uses_variant_audio_codec_fallback_for_alternate_hls_variant() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+        alternate.audio.as_mut().unwrap().codecs = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert_eq!(1, session.alternate_variants.len());
+        assert_eq!(
+            vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()],
+            session.alternate_variants[0].codecs
+        );
+        let master = session.master_playlist();
+        assert!(master.contains("CODECS=\"avc1.640028,mp4a.40.2\""));
+        assert!(master.contains("AUDIO=\"audio-v1\""));
+    }
+
+    #[test]
+    fn from_playback_entry_filters_unsafe_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 6, true));
+        let mut hevc = dash_variant();
+        hevc.id = "hevc-1080p".to_owned();
+        hevc.codecs = vec!["hev1.1.6.L120.90".to_owned()];
+        hevc.abr = Some(abr_level("dash-video", 1, 6, true));
+        hevc.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+        let mut av1 = dash_variant();
+        av1.id = "av1-1080p".to_owned();
+        av1.codecs = vec!["av01.0.08M.08".to_owned()];
+        av1.abr = Some(abr_level("dash-video", 2, 6, true));
+        av1.video.as_mut().unwrap().codecs = Some("av01.0.08M.08".to_owned());
+        let mut mismatched_video = dash_variant();
+        mismatched_video.id = "mismatched-video-codec".to_owned();
+        mismatched_video.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        mismatched_video.abr = Some(abr_level("dash-video", 3, 6, true));
+        mismatched_video.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+        let mut mismatched_audio = dash_variant();
+        mismatched_audio.id = "mismatched-audio-codec".to_owned();
+        mismatched_audio.codecs = vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()];
+        mismatched_audio.abr = Some(abr_level("dash-video", 4, 6, true));
+        mismatched_audio.audio.as_mut().unwrap().codecs = Some("flac".to_owned());
+        let mut flv = dash_variant();
+        flv.id = "flv".to_owned();
+        flv.kind = BilibiliPlaybackVariantKind::Flv;
+        flv.abr = Some(abr_level("dash-video", 5, 6, true));
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[
+                selected.clone(),
+                hevc,
+                av1,
+                mismatched_video,
+                mismatched_audio,
+                flv,
+            ],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_filters_non_switchable_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 4, true));
+        let mut non_switchable = dash_variant();
+        non_switchable.id = "non-switchable".to_owned();
+        non_switchable.abr = Some(abr_level("dash-video", 1, 4, false));
+        let mut other_group = dash_variant();
+        other_group.id = "other-group".to_owned();
+        other_group.abr = Some(abr_level("dash-backup-video", 2, 4, true));
+        let mut missing_abr = dash_variant();
+        missing_abr.id = "missing-abr".to_owned();
+        missing_abr.abr = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), non_switchable, other_group, missing_abr],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_filters_audio_incompatible_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut audio_less = dash_variant();
+        audio_less.id = "audio-less".to_owned();
+        audio_less.abr = Some(abr_level("dash-video", 1, 2, true));
+        audio_less.audio = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), audio_less],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
     }
 
     #[test]
@@ -621,6 +1060,20 @@ mod tests {
                 "mp4a.40.2",
             )),
             flv_segments: Vec::new(),
+        }
+    }
+
+    fn abr_level(
+        group_id: &str,
+        level_index: u32,
+        level_count: u32,
+        switchable: bool,
+    ) -> AdapterAbrLevel {
+        AdapterAbrLevel {
+            group_id: group_id.to_owned(),
+            level_index,
+            level_count,
+            switchable,
         }
     }
 
