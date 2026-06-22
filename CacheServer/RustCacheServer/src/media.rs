@@ -1592,6 +1592,8 @@ mod tests {
                 },
                 audio: None,
             },
+            abr: Default::default(),
+            variants: Vec::new(),
         }
     }
 

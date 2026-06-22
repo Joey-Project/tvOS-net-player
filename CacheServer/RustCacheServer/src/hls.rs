@@ -5,8 +5,10 @@ use std::{
 };
 
 use crate::bbdown_adapter::{
-    BilibiliMediaRequest, BilibiliPlaybackVariant as AdapterPlaybackVariant,
-    BilibiliPlaybackVariantKind,
+    BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
+    BilibiliPlaybackAbrGroupKind as AdapterAbrGroupKind,
+    BilibiliPlaybackAbrLevel as AdapterAbrLevel, BilibiliPlaybackAbrMetadata as AdapterAbrMetadata,
+    BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
 use url::Url;
 
@@ -51,6 +53,8 @@ pub(crate) struct HlsPlaybackSession {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) variant: HlsVariant,
+    pub(crate) abr: HlsAbrMetadata,
+    pub(crate) variants: Vec<HlsVariantMetadata>,
 }
 
 impl HlsPlaybackSession {
@@ -65,38 +69,39 @@ impl HlsPlaybackSession {
             ));
         }
 
-        let Some(video) = variant.video.clone() else {
-            return Err(HlsSessionError::new(
-                "Progressive HLS playback requires a video media request.",
-            ));
-        };
-
+        let hls_variant = HlsVariant::from_adapter(variant)?;
         Ok(Self {
             id: session_id.to_owned(),
             title: title.to_owned(),
-            variant: HlsVariant {
-                id: variant.id.clone(),
-                bandwidth: variant
-                    .bandwidth
-                    .or(video.bandwidth)
-                    .unwrap_or(DEFAULT_BANDWIDTH),
-                codecs: variant.codecs.clone(),
-                width: variant.width,
-                height: variant.height,
-                duration_seconds: variant
-                    .duration_seconds
-                    .or(video.duration_seconds)
-                    .unwrap_or(DEFAULT_DURATION_SECONDS),
-                video: HlsMediaResource {
-                    id: VIDEO_SEGMENT_ID.to_owned(),
-                    request: video,
-                },
-                audio: variant.audio.clone().map(|audio| HlsMediaResource {
-                    id: AUDIO_SEGMENT_ID.to_owned(),
-                    request: audio,
-                }),
-            },
+            variant: hls_variant,
+            abr: HlsAbrMetadata::default(),
+            variants: vec![HlsVariantMetadata::from_adapter(variant)],
         })
+    }
+
+    pub(crate) fn from_playback_entry(
+        session_id: &str,
+        title: &str,
+        selected_variant: &AdapterPlaybackVariant,
+        abr: &AdapterAbrMetadata,
+        variants: &[AdapterPlaybackVariant],
+    ) -> Result<Self, HlsSessionError> {
+        let mut session = Self::from_selected_variant(session_id, title, selected_variant)?;
+        session.abr = HlsAbrMetadata::from_adapter(abr);
+        session.variants = variants
+            .iter()
+            .map(HlsVariantMetadata::from_adapter)
+            .collect();
+        if !session
+            .variants
+            .iter()
+            .any(|variant| variant.id == session.variant.id)
+        {
+            session
+                .variants
+                .push(HlsVariantMetadata::from_adapter(selected_variant));
+        }
+        Ok(session)
     }
 
     pub(crate) fn master_playlist(&self) -> String {
@@ -183,6 +188,37 @@ pub(crate) struct HlsVariant {
 }
 
 impl HlsVariant {
+    fn from_adapter(variant: &AdapterPlaybackVariant) -> Result<Self, HlsSessionError> {
+        let Some(video) = variant.video.clone() else {
+            return Err(HlsSessionError::new(
+                "Progressive HLS playback requires a video media request.",
+            ));
+        };
+
+        Ok(Self {
+            id: variant.id.clone(),
+            bandwidth: variant
+                .bandwidth
+                .or(video.bandwidth)
+                .unwrap_or(DEFAULT_BANDWIDTH),
+            codecs: variant.codecs.clone(),
+            width: variant.width,
+            height: variant.height,
+            duration_seconds: variant
+                .duration_seconds
+                .or(video.duration_seconds)
+                .unwrap_or(DEFAULT_DURATION_SECONDS),
+            video: HlsMediaResource {
+                id: VIDEO_SEGMENT_ID.to_owned(),
+                request: video,
+            },
+            audio: variant.audio.clone().map(|audio| HlsMediaResource {
+                id: AUDIO_SEGMENT_ID.to_owned(),
+                request: audio,
+            }),
+        })
+    }
+
     fn resolution(&self) -> Option<String> {
         match (self.width, self.height) {
             (Some(width), Some(height)) => Some(format!("{width}x{height}")),
@@ -203,6 +239,162 @@ impl HlsVariant {
             push_unique_codec(&mut codecs, audio_codecs);
         }
         (!codecs.is_empty()).then(|| codecs.join(","))
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HlsAbrMetadata {
+    pub(crate) groups: Vec<HlsAbrGroup>,
+}
+
+impl HlsAbrMetadata {
+    fn from_adapter(metadata: &AdapterAbrMetadata) -> Self {
+        Self {
+            groups: metadata
+                .groups
+                .iter()
+                .map(HlsAbrGroup::from_adapter)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsAbrGroup {
+    pub(crate) id: String,
+    pub(crate) kind: HlsAbrGroupKind,
+    pub(crate) variant_ids: Vec<String>,
+    pub(crate) level_count: u32,
+    pub(crate) min_bandwidth: Option<u64>,
+    pub(crate) max_bandwidth: Option<u64>,
+}
+
+impl HlsAbrGroup {
+    fn from_adapter(group: &crate::bbdown_adapter::BilibiliPlaybackAbrGroup) -> Self {
+        Self {
+            id: group.id.clone(),
+            kind: HlsAbrGroupKind::from_adapter(group.kind),
+            variant_ids: group.variant_ids.clone(),
+            level_count: group.level_count,
+            min_bandwidth: group.min_bandwidth,
+            max_bandwidth: group.max_bandwidth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsAbrGroupKind {
+    DashVideo,
+    DashAudioOnly,
+}
+
+impl HlsAbrGroupKind {
+    fn from_adapter(kind: AdapterAbrGroupKind) -> Self {
+        match kind {
+            AdapterAbrGroupKind::DashVideo => Self::DashVideo,
+            AdapterAbrGroupKind::DashAudioOnly => Self::DashAudioOnly,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsVariantMetadata {
+    pub(crate) id: String,
+    pub(crate) kind: BilibiliPlaybackVariantKind,
+    pub(crate) content_id: String,
+    pub(crate) bandwidth: Option<u64>,
+    pub(crate) codecs: Vec<String>,
+    pub(crate) mime_types: Vec<String>,
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+    pub(crate) frame_rate: Option<String>,
+    pub(crate) duration_seconds: Option<u32>,
+    pub(crate) abr: Option<HlsAbrLevel>,
+    pub(crate) media: Vec<HlsMediaResourceMetadata>,
+}
+
+impl HlsVariantMetadata {
+    fn from_adapter(variant: &AdapterPlaybackVariant) -> Self {
+        let mut media = Vec::new();
+        if let Some(video) = &variant.video {
+            media.push(HlsMediaResourceMetadata::from_request(video));
+        }
+        if let Some(audio) = &variant.audio {
+            media.push(HlsMediaResourceMetadata::from_request(audio));
+        }
+        media.extend(
+            variant
+                .flv_segments
+                .iter()
+                .map(HlsMediaResourceMetadata::from_request),
+        );
+
+        Self {
+            id: variant.id.clone(),
+            kind: variant.kind,
+            content_id: variant.content_id.clone(),
+            bandwidth: variant.bandwidth,
+            codecs: variant.codecs.clone(),
+            mime_types: variant.mime_types.clone(),
+            width: variant.width,
+            height: variant.height,
+            frame_rate: variant.frame_rate.clone(),
+            duration_seconds: variant.duration_seconds,
+            abr: variant.abr.as_ref().map(HlsAbrLevel::from_adapter),
+            media,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsAbrLevel {
+    pub(crate) group_id: String,
+    pub(crate) level_index: u32,
+    pub(crate) level_count: u32,
+    pub(crate) switchable: bool,
+}
+
+impl HlsAbrLevel {
+    fn from_adapter(level: &AdapterAbrLevel) -> Self {
+        Self {
+            group_id: level.group_id.clone(),
+            level_index: level.level_index,
+            level_count: level.level_count,
+            switchable: level.switchable,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsMediaResourceMetadata {
+    pub(crate) kind: BilibiliMediaRequestKind,
+    pub(crate) stream_id: Option<u32>,
+    pub(crate) mime_type: Option<String>,
+    pub(crate) codecs: Option<String>,
+    pub(crate) bandwidth: Option<u64>,
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+    pub(crate) frame_rate: Option<String>,
+    pub(crate) size: Option<u64>,
+    pub(crate) duration_seconds: Option<u32>,
+    pub(crate) cache_key: BilibiliMediaCacheKey,
+}
+
+impl HlsMediaResourceMetadata {
+    fn from_request(request: &BilibiliMediaRequest) -> Self {
+        Self {
+            kind: request.kind,
+            stream_id: request.stream_id,
+            mime_type: request.mime_type.clone(),
+            codecs: request.codecs.clone(),
+            bandwidth: request.bandwidth,
+            width: request.width,
+            height: request.height,
+            frame_rate: request.frame_rate.clone(),
+            size: request.size,
+            duration_seconds: request.duration_seconds,
+            cache_key: request.cache_key.clone(),
+        }
     }
 }
 
