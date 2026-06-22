@@ -576,6 +576,7 @@ async fn load_hls_mp4_initialization_from_url(
         .send()
         .await
         .map_err(|_| ())?;
+    let response_time = started_at.elapsed();
     let status = StatusCode::from_u16(upstream.status().as_u16()).map_err(|_| ())?;
     if should_retry_hls_upstream_status(status) || !status.is_success() {
         return Err(());
@@ -603,7 +604,7 @@ async fn load_hls_mp4_initialization_from_url(
             length,
             total_length,
         },
-        response_time: started_at.elapsed(),
+        response_time,
     })
 }
 
@@ -1005,6 +1006,39 @@ mod tests {
             snapshot.state
         );
         assert_eq!(1, snapshot.retrying_variant_count);
+    }
+
+    #[tokio::test]
+    async fn hls_media_playlist_slow_initialization_body_uses_header_latency_for_policy() {
+        let (upstream_url, _upstream_task) = start_hls_slow_initialization_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
+
+        let response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\""));
+        let snapshot = state.hls_network_policy.snapshot();
+        assert_eq!(
+            crate::hls_network_policy::HlsWeakNetworkState::Normal,
+            snapshot.state
+        );
+        assert_eq!(0, snapshot.retrying_variant_count);
+        assert_eq!(0, snapshot.degraded_session_count);
     }
 
     #[tokio::test]
@@ -1553,6 +1587,26 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_slow_initialization_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/video.m4s",
+                    get(upstream_slow_initialization_get).head(upstream_mp4_head),
+                ),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_large_mp4_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1689,6 +1743,34 @@ mod tests {
             .header(CONTENT_TYPE, "video/mp4")
             .body(Body::from_stream(stream))
             .expect("slow-body upstream response should build")
+    }
+
+    async fn upstream_slow_initialization_get(headers: HeaderMap) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return empty_response(StatusCode::FORBIDDEN);
+        }
+
+        let data = fake_mp4();
+        let Some((start, end)) = headers
+            .get(RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|range| parse_test_range(range, data.len()))
+        else {
+            return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        let chunk = Bytes::from(data[start..=end].to_vec());
+        let total_len = data.len();
+        let stream = futures_util::stream::unfold(Some(chunk), |chunk| async move {
+            let chunk = chunk?;
+            tokio::time::sleep(Duration::from_millis(3_100)).await;
+            Some((Ok::<Bytes, Infallible>(chunk), None))
+        });
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total_len}"))
+            .body(Body::from_stream(stream))
+            .expect("slow initialization upstream response should build")
     }
 
     async fn upstream_large_mp4_get(headers: HeaderMap) -> Response<Body> {
