@@ -30,6 +30,9 @@ pub struct CacheServerOptions {
     pub hls_cache_max_bytes: u64,
     pub hls_cache_high_watermark_percent: u8,
     pub hls_cache_low_watermark_percent: u8,
+    pub lan_transcoding_enabled: bool,
+    pub lan_transcoding_ffmpeg_path: PathBuf,
+    pub lan_transcoding_max_concurrent_jobs: usize,
     pub bilibili_worker_enabled: bool,
     pub bilibili_worker_max_concurrent_tasks: usize,
     pub bbdown_output_dir: Option<PathBuf>,
@@ -85,6 +88,9 @@ impl Default for CacheServerOptions {
             hls_cache_max_bytes: DEFAULT_HLS_CACHE_MAX_BYTES,
             hls_cache_high_watermark_percent: 90,
             hls_cache_low_watermark_percent: 80,
+            lan_transcoding_enabled: false,
+            lan_transcoding_ffmpeg_path: PathBuf::from("ffmpeg"),
+            lan_transcoding_max_concurrent_jobs: 1,
             bilibili_worker_enabled: true,
             bilibili_worker_max_concurrent_tasks: 1,
             bbdown_output_dir: None,
@@ -141,6 +147,16 @@ impl CacheServerOptions {
         if self.hls_cache_low_watermark_percent >= self.hls_cache_high_watermark_percent {
             return Err(ConfigError::new(
                 "HLS cache low watermark percent must be lower than the high watermark percent.",
+            ));
+        }
+        if self.lan_transcoding_max_concurrent_jobs == 0 {
+            return Err(ConfigError::new(
+                "LAN transcoding max concurrent jobs must be greater than zero.",
+            ));
+        }
+        if self.lan_transcoding_enabled && self.lan_transcoding_ffmpeg_path.as_os_str().is_empty() {
+            return Err(ConfigError::new(
+                "LAN transcoding ffmpeg path must not be empty when LAN transcoding is enabled.",
             ));
         }
         if self.bilibili_worker_enabled || self.bbdown_output_dir.is_some() {
@@ -298,6 +314,17 @@ impl CacheServerOptions {
                 self.hls_cache_low_watermark_percent = value.parse().map_err(|_| {
                     ConfigError::new(format!(
                         "invalid integer for --Cache:HlsCacheLowWatermarkPercent: {value}"
+                    ))
+                })?;
+            }
+            "Cache:LanTranscodingEnabled" => self.lan_transcoding_enabled = parse_bool(&value)?,
+            "Cache:LanTranscodingFfmpegPath" => {
+                self.lan_transcoding_ffmpeg_path = PathBuf::from(value);
+            }
+            "Cache:LanTranscodingMaxConcurrentJobs" => {
+                self.lan_transcoding_max_concurrent_jobs = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:LanTranscodingMaxConcurrentJobs: {value}"
                     ))
                 })?;
             }
@@ -674,6 +701,12 @@ mod tests {
             "85".to_owned(),
             "--Cache:HlsCacheLowWatermarkPercent".to_owned(),
             "70".to_owned(),
+            "--Cache:LanTranscodingEnabled".to_owned(),
+            "true".to_owned(),
+            "--Cache:LanTranscodingFfmpegPath".to_owned(),
+            "/opt/homebrew/bin/ffmpeg-transcode".to_owned(),
+            "--Cache:LanTranscodingMaxConcurrentJobs".to_owned(),
+            "2".to_owned(),
             "--Cache:BilibiliWorkerEnabled".to_owned(),
             "off".to_owned(),
             "--Cache:BilibiliWorkerMaxConcurrentTasks".to_owned(),
@@ -701,6 +734,12 @@ mod tests {
         assert_eq!(123456, options.hls_cache_max_bytes);
         assert_eq!(85, options.hls_cache_high_watermark_percent);
         assert_eq!(70, options.hls_cache_low_watermark_percent);
+        assert!(options.lan_transcoding_enabled);
+        assert_eq!(
+            PathBuf::from("/opt/homebrew/bin/ffmpeg-transcode"),
+            options.lan_transcoding_ffmpeg_path
+        );
+        assert_eq!(2, options.lan_transcoding_max_concurrent_jobs);
         assert_eq!(2, options.bilibili_worker_max_concurrent_tasks);
         assert_eq!(25, options.task_retention_max_terminal_tasks);
         assert_eq!(7, options.task_retention_terminal_age_days);
@@ -934,6 +973,19 @@ mod tests {
         assert!(zero_high.validate().is_err());
         assert!(equal_watermarks.validate().is_err());
         assert!(inverted_watermarks.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_lan_transcoding_concurrency() {
+        let result = CacheServerOptions::from_args([
+            "--Cache:LanTranscodingMaxConcurrentJobs".to_owned(),
+            "0".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("LAN transcoding max concurrent jobs")
+        ));
     }
 
     #[test]

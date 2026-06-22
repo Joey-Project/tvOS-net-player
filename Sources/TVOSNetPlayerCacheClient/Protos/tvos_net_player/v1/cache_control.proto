@@ -58,6 +58,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_RESOLVE = 6;
   SERVER_CAPABILITY_BILIBILI_TASK_SELECTION = 7;
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_STATUS = 8;
+  SERVER_CAPABILITY_LAN_TRANSCODING = 9;
 }
 
 message CheckHealthRequest {}
@@ -344,6 +345,7 @@ message BilibiliPlaybackSession {
   string selected_variant_id = 4;
   BilibiliPlaybackVariant selected_variant = 5;
   repeated BilibiliPlaybackVariant variants = 6;
+  LanTranscodingPlan transcoding_plan = 7;
 }
 
 message BilibiliPlaybackVariant {
@@ -378,6 +380,45 @@ message HlsCacheStatus {
   int32 completed_session_count = 8;
   HlsCacheEvictionSummary last_eviction = 9;
   HlsWeakNetworkStatus weak_network = 10;
+  LanTranscodingStatus transcoding = 11;
+}
+
+message LanTranscodingStatus {
+  bool enabled = 1;
+  LanTranscodingRuntimeState state = 2;
+  string message = 3;
+  string profile_id = 4;
+  string target_container = 5;
+  string target_video_codec = 6;
+  string target_audio_codec = 7;
+  uint32 max_concurrent_jobs = 8;
+  uint32 active_job_count = 9;
+}
+
+enum LanTranscodingRuntimeState {
+  LAN_TRANSCODING_RUNTIME_STATE_UNSPECIFIED = 0;
+  LAN_TRANSCODING_RUNTIME_STATE_DISABLED = 1;
+  LAN_TRANSCODING_RUNTIME_STATE_IDLE = 2;
+  LAN_TRANSCODING_RUNTIME_STATE_BUSY = 3;
+}
+
+message LanTranscodingPlan {
+  LanTranscodingPlanState state = 1;
+  string profile_id = 2;
+  string reason = 3;
+  string source_variant_id = 4;
+  string target_container = 5;
+  string target_video_codec = 6;
+  string target_audio_codec = 7;
+  PlaybackProtocol output_protocol = 8;
+}
+
+enum LanTranscodingPlanState {
+  LAN_TRANSCODING_PLAN_STATE_UNSPECIFIED = 0;
+  LAN_TRANSCODING_PLAN_STATE_DISABLED = 1;
+  LAN_TRANSCODING_PLAN_STATE_NOT_REQUIRED = 2;
+  LAN_TRANSCODING_PLAN_STATE_READY = 3;
+  LAN_TRANSCODING_PLAN_STATE_UNSUPPORTED = 4;
 }
 
 message HlsCacheEvictionSummary {

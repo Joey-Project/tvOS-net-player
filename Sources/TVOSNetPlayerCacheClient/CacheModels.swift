@@ -102,12 +102,17 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsBilibiliCredentialStatus: Bool {
         capabilities.contains(CacheServerCapability.bilibiliCredentialStatus)
     }
+
+    public var supportsLanTranscoding: Bool {
+        capabilities.contains(CacheServerCapability.lanTranscoding)
+    }
 }
 
 public enum CacheServerCapability {
     public static let bilibiliCredentialStatus = "bilibiliCredentialStatus"
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
+    public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
 }
 
@@ -208,6 +213,7 @@ public struct HLSCacheStatus: Equatable, Sendable {
     public let completedSessionCount: Int
     public let lastEviction: HLSCacheEvictionSummary?
     public let weakNetwork: HLSWeakNetworkStatus?
+    public let transcoding: LanTranscodingStatus?
 
     public init(
         evictionEnabled: Bool,
@@ -219,7 +225,8 @@ public struct HLSCacheStatus: Equatable, Sendable {
         usedBytes: Int64,
         completedSessionCount: Int,
         lastEviction: HLSCacheEvictionSummary?,
-        weakNetwork: HLSWeakNetworkStatus? = nil
+        weakNetwork: HLSWeakNetworkStatus? = nil,
+        transcoding: LanTranscodingStatus? = nil
     ) {
         self.evictionEnabled = evictionEnabled
         self.maxBytes = maxBytes
@@ -231,6 +238,41 @@ public struct HLSCacheStatus: Equatable, Sendable {
         self.completedSessionCount = completedSessionCount
         self.lastEviction = lastEviction
         self.weakNetwork = weakNetwork
+        self.transcoding = transcoding
+    }
+}
+
+public struct LanTranscodingStatus: Equatable, Sendable {
+    public let enabled: Bool
+    public let state: String
+    public let message: String
+    public let profileID: String
+    public let targetContainer: String
+    public let targetVideoCodec: String
+    public let targetAudioCodec: String
+    public let maxConcurrentJobs: Int
+    public let activeJobCount: Int
+
+    public init(
+        enabled: Bool,
+        state: String,
+        message: String,
+        profileID: String,
+        targetContainer: String,
+        targetVideoCodec: String,
+        targetAudioCodec: String,
+        maxConcurrentJobs: Int,
+        activeJobCount: Int
+    ) {
+        self.enabled = enabled
+        self.state = state
+        self.message = message
+        self.profileID = profileID
+        self.targetContainer = targetContainer
+        self.targetVideoCodec = targetVideoCodec
+        self.targetAudioCodec = targetAudioCodec
+        self.maxConcurrentJobs = maxConcurrentJobs
+        self.activeJobCount = activeJobCount
     }
 }
 
@@ -706,6 +748,7 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
     public let selectedVariantID: String
     public let selectedVariant: CacheBilibiliPlaybackVariant?
     public let variants: [CacheBilibiliPlaybackVariant]
+    public let transcodingPlan: LanTranscodingPlan?
 
     public init(
         id: String,
@@ -713,7 +756,8 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
         contentID: String,
         selectedVariantID: String,
         selectedVariant: CacheBilibiliPlaybackVariant?,
-        variants: [CacheBilibiliPlaybackVariant]
+        variants: [CacheBilibiliPlaybackVariant],
+        transcodingPlan: LanTranscodingPlan? = nil
     ) {
         self.id = id
         self.title = title
@@ -721,6 +765,38 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
         self.selectedVariantID = selectedVariantID
         self.selectedVariant = selectedVariant
         self.variants = variants
+        self.transcodingPlan = transcodingPlan
+    }
+}
+
+public struct LanTranscodingPlan: Equatable, Sendable {
+    public let state: String
+    public let profileID: String
+    public let reason: String
+    public let sourceVariantID: String
+    public let targetContainer: String
+    public let targetVideoCodec: String
+    public let targetAudioCodec: String
+    public let outputProtocol: String
+
+    public init(
+        state: String,
+        profileID: String,
+        reason: String,
+        sourceVariantID: String,
+        targetContainer: String,
+        targetVideoCodec: String,
+        targetAudioCodec: String,
+        outputProtocol: String
+    ) {
+        self.state = state
+        self.profileID = profileID
+        self.reason = reason
+        self.sourceVariantID = sourceVariantID
+        self.targetContainer = targetContainer
+        self.targetVideoCodec = targetVideoCodec
+        self.targetAudioCodec = targetAudioCodec
+        self.outputProtocol = outputProtocol
     }
 }
 

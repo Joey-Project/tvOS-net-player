@@ -17,7 +17,7 @@ use crate::{
         BilibiliResolvedCandidate as AdapterBilibiliResolvedCandidate,
     },
     bilibili_worker::BilibiliDownloadError,
-    config::BbdownRestrictedArea,
+    config::{BbdownRestrictedArea, CacheServerOptions},
     generated::tvos_net_player::v1::{
         BilibiliCredentialState, BilibiliCredentialStatus, BilibiliPlaybackOptions,
         BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliResolveResult,
@@ -27,11 +27,13 @@ use crate::{
         DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest, GetHlsCacheStatusRequest,
         GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
         HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
-        HlsCacheStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LibraryItem, LibrarySource,
-        ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
-        ListLibraryItemsResponse, PlaybackProtocol, PlaybackSource, RescanLibraryRequest,
-        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task,
-        TaskEvent, TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
+        HlsCacheStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
+        LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
+        LanTranscodingStatus, LibraryItem, LibrarySource, ListCacheRootsRequest,
+        ListCacheRootsResponse, ListLibraryItemsRequest, ListLibraryItemsResponse,
+        PlaybackProtocol, PlaybackSource, RescanLibraryRequest, RescanLibraryResponse,
+        ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task, TaskEvent, TaskKind,
+        TaskState, WatchTasksRequest, cache_service_server::CacheService,
         library_service_server::LibraryService, server_service_server::ServerService,
         task_service_server::TaskService,
     },
@@ -46,6 +48,10 @@ use crate::{
     },
     library::ROOT_ID,
     task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
+    transcoding::{
+        HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
+        LanTranscodingStatusSnapshot,
+    },
 };
 
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
@@ -113,6 +119,10 @@ impl ServerService for ServerGrpcService {
         if self.state.options.allow_library_item_delete {
             info.capabilities
                 .push(ServerCapability::LibraryItemDelete.into());
+        }
+        if self.state.options.lan_transcoding_enabled {
+            info.capabilities
+                .push(ServerCapability::LanTranscoding.into());
         }
 
         Ok(Response::new(info))
@@ -626,6 +636,9 @@ impl CacheService for CacheGrpcService {
                 .as_ref()
                 .map(proto_hls_eviction_summary),
             weak_network: Some(proto_hls_weak_network_status(&weak_network)),
+            transcoding: Some(proto_lan_transcoding_status(
+                &LanTranscodingStatusSnapshot::from_options(&self.state.options, 0),
+            )),
         }))
     }
 
@@ -701,6 +714,55 @@ fn proto_hls_weak_network_state(state: RuntimeHlsWeakNetworkState) -> HlsWeakNet
         RuntimeHlsWeakNetworkState::Degraded => HlsWeakNetworkState::Degraded,
         RuntimeHlsWeakNetworkState::CacheOnly => HlsWeakNetworkState::CacheOnly,
         RuntimeHlsWeakNetworkState::UpstreamFailed => HlsWeakNetworkState::UpstreamFailed,
+    }
+}
+
+fn proto_lan_transcoding_status(snapshot: &LanTranscodingStatusSnapshot) -> LanTranscodingStatus {
+    LanTranscodingStatus {
+        enabled: snapshot.enabled,
+        state: proto_lan_transcoding_runtime_state(snapshot.state).into(),
+        message: snapshot.message.clone(),
+        profile_id: snapshot.profile.id.clone(),
+        target_container: snapshot.profile.target_container.clone(),
+        target_video_codec: snapshot.profile.target_video_codec.clone(),
+        target_audio_codec: snapshot.profile.target_audio_codec.clone(),
+        max_concurrent_jobs: snapshot.max_concurrent_jobs.try_into().unwrap_or(u32::MAX),
+        active_job_count: snapshot.active_job_count.try_into().unwrap_or(u32::MAX),
+    }
+}
+
+fn proto_lan_transcoding_runtime_state(
+    state: LanTranscodingRuntimeState,
+) -> ProtoLanTranscodingRuntimeState {
+    match state {
+        LanTranscodingRuntimeState::Disabled => ProtoLanTranscodingRuntimeState::Disabled,
+        LanTranscodingRuntimeState::Idle => ProtoLanTranscodingRuntimeState::Idle,
+        LanTranscodingRuntimeState::Busy => ProtoLanTranscodingRuntimeState::Busy,
+    }
+}
+
+fn proto_lan_transcoding_plan(plan: &HlsTranscodingPlan) -> LanTranscodingPlan {
+    LanTranscodingPlan {
+        state: proto_lan_transcoding_plan_state(plan.state).into(),
+        profile_id: plan.profile_id.clone(),
+        reason: plan.reason.clone(),
+        source_variant_id: plan.source_variant_id.clone(),
+        target_container: plan.target_container.clone(),
+        target_video_codec: plan.target_video_codec.clone(),
+        target_audio_codec: plan.target_audio_codec.clone(),
+        output_protocol: match plan.output_protocol.as_str() {
+            "hls" => PlaybackProtocol::Hls.into(),
+            _ => PlaybackProtocol::Unspecified.into(),
+        },
+    }
+}
+
+fn proto_lan_transcoding_plan_state(state: HlsTranscodingPlanState) -> LanTranscodingPlanState {
+    match state {
+        HlsTranscodingPlanState::Disabled => LanTranscodingPlanState::Disabled,
+        HlsTranscodingPlanState::NotRequired => LanTranscodingPlanState::NotRequired,
+        HlsTranscodingPlanState::Ready => LanTranscodingPlanState::Ready,
+        HlsTranscodingPlanState::Unsupported => LanTranscodingPlanState::Unsupported,
     }
 }
 
@@ -893,7 +955,7 @@ async fn run_single_bilibili_playback_planning(
                 .is_ok();
         }
     };
-    let metadata = match playback_task_metadata(&task_id, plan) {
+    let metadata = match playback_task_metadata_with_options(&task_id, plan, &state.options) {
         Ok(metadata) => metadata,
         Err(error) => {
             return state
@@ -1030,7 +1092,7 @@ async fn run_explicit_bilibili_playback_planning(
             cancellation: cancellation.clone(),
         };
         let item_outcome = match state.playback_planner.plan(planning_request).await {
-            Ok(plan) => playback_task_metadata(&session_id, plan)
+            Ok(plan) => playback_task_metadata_with_options(&session_id, plan, &state.options)
                 .map_err(|error| BilibiliDownloadError::Failed(error.message().to_owned())),
             Err(error) => Err(error),
         };
@@ -1663,9 +1725,18 @@ struct PlaybackTaskMetadata {
     hls_session: HlsPlaybackSession,
 }
 
+#[cfg(test)]
 fn playback_task_metadata(
     task_id: &str,
     plan: BilibiliPlaybackPlan,
+) -> Result<PlaybackTaskMetadata, Status> {
+    playback_task_metadata_with_options(task_id, plan, &CacheServerOptions::default())
+}
+
+fn playback_task_metadata_with_options(
+    task_id: &str,
+    plan: BilibiliPlaybackPlan,
+    options: &CacheServerOptions,
 ) -> Result<PlaybackTaskMetadata, Status> {
     let entry = plan
         .entries
@@ -1680,7 +1751,7 @@ fn playback_task_metadata(
         entry.title.clone()
     };
     let selected_variant = playback_variant_from_adapter(&selected.variant);
-    let hls_session = HlsPlaybackSession::from_playback_entry(
+    let mut hls_session = HlsPlaybackSession::from_playback_entry(
         task_id,
         &title,
         &selected.variant,
@@ -1688,6 +1759,7 @@ fn playback_task_metadata(
         &entry.variants,
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    hls_session.transcoding = HlsTranscodingPlan::for_variant(options, &selected.variant);
     let playback_session = BilibiliPlaybackSession {
         id: task_id.to_owned(),
         title: title.clone(),
@@ -1699,6 +1771,7 @@ fn playback_task_metadata(
             .iter()
             .map(playback_variant_from_adapter)
             .collect(),
+        transcoding_plan: Some(proto_lan_transcoding_plan(&hls_session.transcoding)),
     };
 
     Ok(PlaybackTaskMetadata {
@@ -2098,6 +2171,38 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::BilibiliCredentialStatus as i32))
+        );
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::LanTranscoding as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_server_info_advertises_lan_transcoding_when_enabled() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            lan_transcoding_enabled: true,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let info = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::LanTranscoding as i32))
         );
     }
 
@@ -3379,6 +3484,19 @@ mod tests {
         assert_eq!("BV1progressive-cid1", session.content_id);
         assert_eq!("h264", session.selected_variant_id);
         assert_eq!(2, session.variants.len());
+        let transcoding_plan = session
+            .transcoding_plan
+            .as_ref()
+            .expect("playback session should expose a LAN transcoding plan");
+        assert_eq!(
+            LanTranscodingPlanState::NotRequired as i32,
+            transcoding_plan.state
+        );
+        assert_eq!("avplayer-h264-aac-hls-v1", transcoding_plan.profile_id);
+        assert_eq!(
+            PlaybackProtocol::Hls as i32,
+            transcoding_plan.output_protocol
+        );
         assert_eq!("dash", session.selected_variant.unwrap().source_kind);
         let hls_session = service
             .state
@@ -3386,6 +3504,10 @@ mod tests {
             .get(&task.id)
             .expect("runtime HLS session should exist");
         assert_eq!("h264", hls_session.variant.id);
+        assert_eq!(
+            HlsTranscodingPlanState::NotRequired,
+            hls_session.transcoding.state
+        );
         assert_eq!(1, hls_session.abr.groups.len());
         assert_eq!("dash-video", hls_session.abr.groups[0].id);
         assert_eq!(vec!["h264", "hevc"], hls_session.abr.groups[0].variant_ids);
@@ -3405,6 +3527,7 @@ mod tests {
             .expect("persisted HLS session should exist");
         assert_eq!(hls_session.abr, restored_hls_session.abr);
         assert_eq!(hls_session.variants, restored_hls_session.variants);
+        assert_eq!(hls_session.transcoding, restored_hls_session.transcoding);
 
         let cancelled = service
             .cancel_task(Request::new(CancelTaskRequest {
@@ -3416,6 +3539,42 @@ mod tests {
 
         assert_eq!(TaskState::Cancelled, cancelled.state());
         assert!(service.state.hls_sessions.get(&task.id).is_none());
+    }
+
+    #[test]
+    fn playback_metadata_marks_non_h264_variant_ready_for_lan_transcoding_when_enabled() {
+        let mut plan = sample_playback_plan();
+        let selected_hevc = plan.entries[0].variants[1].clone();
+        plan.entries[0].selected_variant = Some(BilibiliSelectedPlaybackVariant {
+            variant: selected_hevc,
+            selection: BilibiliPlaybackVariantSelection {
+                policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
+                codec_rank: Some(1),
+                score: 100,
+            },
+        });
+
+        let metadata = playback_task_metadata_with_options(
+            "bilibili-playback-transcoding",
+            plan,
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+        )
+        .expect("playback metadata should map");
+
+        assert_eq!(
+            HlsTranscodingPlanState::Ready,
+            metadata.hls_session.transcoding.state
+        );
+        let proto_plan = metadata
+            .playback_session
+            .transcoding_plan
+            .expect("proto playback session should include a transcoding plan");
+        assert_eq!(LanTranscodingPlanState::Ready as i32, proto_plan.state);
+        assert_eq!("hevc", proto_plan.source_variant_id);
+        assert_eq!(PlaybackProtocol::Hls as i32, proto_plan.output_protocol);
     }
 
     #[tokio::test]
@@ -4234,6 +4393,15 @@ mod tests {
         assert_eq!(HlsWeakNetworkState::Normal as i32, weak_network.state);
         assert_eq!("HLS upstream policy normal.", weak_network.message);
         assert_eq!(0, weak_network.unhealthy_variant_count);
+        let transcoding = status
+            .transcoding
+            .expect("LAN transcoding status should be present");
+        assert!(!transcoding.enabled);
+        assert_eq!(
+            ProtoLanTranscodingRuntimeState::Disabled as i32,
+            transcoding.state
+        );
+        assert_eq!("avplayer-h264-aac-hls-v1", transcoding.profile_id);
     }
 
     #[tokio::test]

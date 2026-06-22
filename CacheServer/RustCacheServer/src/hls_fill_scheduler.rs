@@ -322,6 +322,7 @@ mod tests {
             advertise_alternate_variants: true,
             abr: Default::default(),
             variants: Vec::new(),
+            transcoding: Default::default(),
         }
     }
 }

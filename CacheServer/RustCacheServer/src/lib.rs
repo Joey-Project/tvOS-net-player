@@ -2,6 +2,7 @@ mod bbdown_adapter;
 mod bilibili_playback;
 pub mod bilibili_worker;
 mod bonjour;
+mod codecs;
 pub mod config;
 pub mod generated;
 pub mod grpc_services;
@@ -14,6 +15,7 @@ pub mod media;
 pub mod playback;
 pub mod task_registry;
 mod task_store;
+mod transcoding;
 
 use std::{
     collections::{HashMap, HashSet},

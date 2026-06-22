@@ -23,6 +23,13 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedLanTranscodingCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.lanTranscoding),
+            CacheServerCapability.lanTranscoding
+        )
+    }
+
     func testBilibiliTaskSchemaMapsSelectionAndResultItems() {
         var proto = TvosNetPlayer_V1_Task()
         proto.id = "task-1"
@@ -32,6 +39,18 @@ final class CacheLibraryPaginationTests: XCTestCase {
         proto.title = "Schema video"
         proto.message = "Completed."
         proto.libraryItemID = "bilibili.hls.task-1"
+        proto.playbackSession.id = "task-1"
+        proto.playbackSession.title = "Schema video"
+        proto.playbackSession.contentID = "cid-1"
+        proto.playbackSession.selectedVariantID = "h264"
+        proto.playbackSession.transcodingPlan.state = .notRequired
+        proto.playbackSession.transcodingPlan.profileID = "avplayer-h264-aac-hls-v1"
+        proto.playbackSession.transcodingPlan.reason = "Already compatible."
+        proto.playbackSession.transcodingPlan.sourceVariantID = "h264"
+        proto.playbackSession.transcodingPlan.targetContainer = "hls/fmp4"
+        proto.playbackSession.transcodingPlan.targetVideoCodec = "h264"
+        proto.playbackSession.transcodingPlan.targetAudioCodec = "aac"
+        proto.playbackSession.transcodingPlan.outputProtocol = .hls
         proto.bilibiliSelection.mode = .range
         proto.bilibiliSelection.selectionIds = ["page:1", "page:2"]
         proto.bilibiliSelection.rangeStartIndex = 1
@@ -60,6 +79,9 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
         let expectedResultState = String(describing: TvosNetPlayer_V1_TaskState.completed)
         let expectedPlaybackProtocol = String(describing: TvosNetPlayer_V1_PlaybackProtocol.hls)
+        let expectedTranscodingState = String(
+            describing: TvosNetPlayer_V1_LanTranscodingPlanState.notRequired
+        )
 
         XCTAssertEqual(task.bilibiliSelection?.mode, expectedSelectionMode)
         XCTAssertEqual(task.bilibiliSelection?.selectionIDs, ["page:1", "page:2"])
@@ -68,6 +90,8 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(task.resultItems.map(\.selectionID), ["page:1"])
         XCTAssertEqual(task.resultItems.first?.state, expectedResultState)
         XCTAssertEqual(task.resultItems.first?.playbackSource?.playbackProtocol, expectedPlaybackProtocol)
+        XCTAssertEqual(task.playbackSession?.transcodingPlan?.state, expectedTranscodingState)
+        XCTAssertEqual(task.playbackSession?.transcodingPlan?.outputProtocol, expectedPlaybackProtocol)
     }
 
     func testCacheServerSummaryExposesBilibiliSupport() {
@@ -80,6 +104,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliResolve,
                 CacheServerCapability.bilibiliTaskSelection,
+                CacheServerCapability.lanTranscoding,
             ]
         )
         let unsupported = CacheServerSummary(
@@ -93,9 +118,11 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(supported.supportsBilibiliCredentialStatus)
         XCTAssertTrue(supported.supportsBilibiliResolve)
         XCTAssertTrue(supported.supportsBilibiliTaskSelection)
+        XCTAssertTrue(supported.supportsLanTranscoding)
         XCTAssertFalse(unsupported.supportsBilibiliCredentialStatus)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
         XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
+        XCTAssertFalse(unsupported.supportsLanTranscoding)
     }
 
     func testLegacyBilibiliPlaybackConformerUsesDefaultSelectionFallback() async throws {
