@@ -207,6 +207,7 @@ public struct HLSCacheStatus: Equatable, Sendable {
     public let usedBytes: Int64
     public let completedSessionCount: Int
     public let lastEviction: HLSCacheEvictionSummary?
+    public let weakNetwork: HLSWeakNetworkStatus?
 
     public init(
         evictionEnabled: Bool,
@@ -217,7 +218,8 @@ public struct HLSCacheStatus: Equatable, Sendable {
         lowWatermarkBytes: Int64,
         usedBytes: Int64,
         completedSessionCount: Int,
-        lastEviction: HLSCacheEvictionSummary?
+        lastEviction: HLSCacheEvictionSummary?,
+        weakNetwork: HLSWeakNetworkStatus? = nil
     ) {
         self.evictionEnabled = evictionEnabled
         self.maxBytes = maxBytes
@@ -228,6 +230,44 @@ public struct HLSCacheStatus: Equatable, Sendable {
         self.usedBytes = usedBytes
         self.completedSessionCount = completedSessionCount
         self.lastEviction = lastEviction
+        self.weakNetwork = weakNetwork
+    }
+}
+
+public struct HLSWeakNetworkStatus: Equatable, Sendable {
+    public let state: String
+    public let message: String
+    public let degradedSessionCount: Int
+    public let unhealthyVariantCount: Int
+    public let retryingVariantCount: Int
+    public let cacheOnlySessionCount: Int
+    public let lastChangedAt: Date?
+
+    public init(
+        state: String,
+        message: String,
+        degradedSessionCount: Int,
+        unhealthyVariantCount: Int,
+        retryingVariantCount: Int,
+        cacheOnlySessionCount: Int,
+        lastChangedAt: Date?
+    ) {
+        self.state = state
+        self.message = message
+        self.degradedSessionCount = degradedSessionCount
+        self.unhealthyVariantCount = unhealthyVariantCount
+        self.retryingVariantCount = retryingVariantCount
+        self.cacheOnlySessionCount = cacheOnlySessionCount
+        self.lastChangedAt = lastChangedAt
+    }
+
+    public var isActive: Bool {
+        switch state.normalizedCacheProtocolName.removingWeakNetworkStatePrefix {
+        case "", "unspecified", "normal":
+            false
+        default:
+            true
+        }
     }
 }
 
@@ -739,6 +779,15 @@ extension String {
 
     fileprivate var removingPlaybackProtocolPrefix: String {
         let prefix = "playbackprotocol"
+        guard hasPrefix(prefix) else {
+            return self
+        }
+
+        return String(dropFirst(prefix.count))
+    }
+
+    fileprivate var removingWeakNetworkStatePrefix: String {
+        let prefix = "hlsweaknetworkstate"
         guard hasPrefix(prefix) else {
             return self
         }

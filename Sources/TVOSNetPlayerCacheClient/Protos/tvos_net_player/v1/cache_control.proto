@@ -377,6 +377,7 @@ message HlsCacheStatus {
   int64 used_bytes = 7;
   int32 completed_session_count = 8;
   HlsCacheEvictionSummary last_eviction = 9;
+  HlsWeakNetworkStatus weak_network = 10;
 }
 
 message HlsCacheEvictionSummary {
@@ -389,6 +390,25 @@ message HlsCacheEvictionSummary {
   repeated string evicted_session_ids = 7;
   bool target_reached = 8;
   google.protobuf.Timestamp completed_at = 9;
+}
+
+message HlsWeakNetworkStatus {
+  HlsWeakNetworkState state = 1;
+  string message = 2;
+  int32 degraded_session_count = 3;
+  int32 unhealthy_variant_count = 4;
+  int32 retrying_variant_count = 5;
+  int32 cache_only_session_count = 6;
+  google.protobuf.Timestamp last_changed_at = 7;
+}
+
+enum HlsWeakNetworkState {
+  HLS_WEAK_NETWORK_STATE_UNSPECIFIED = 0;
+  HLS_WEAK_NETWORK_STATE_NORMAL = 1;
+  HLS_WEAK_NETWORK_STATE_RETRYING = 2;
+  HLS_WEAK_NETWORK_STATE_DEGRADED = 3;
+  HLS_WEAK_NETWORK_STATE_CACHE_ONLY = 4;
+  HLS_WEAK_NETWORK_STATE_UPSTREAM_FAILED = 5;
 }
 
 message CacheRoot {

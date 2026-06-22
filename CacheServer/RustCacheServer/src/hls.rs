@@ -107,9 +107,17 @@ impl HlsPlaybackSession {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub(crate) fn master_playlist(&self) -> String {
+        self.master_playlist_with_variant_filter(|_| true)
+    }
+
+    pub(crate) fn master_playlist_with_variant_filter(
+        &self,
+        is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
+    ) -> String {
         let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-        let variants = self.advertised_variants().collect::<Vec<_>>();
+        let variants = self.advertised_variants_with_filter(is_variant_advertisable);
         for (index, variant) in variants.iter().enumerate() {
             let Some(audio_playlist_id) = variant.audio_playlist_id() else {
                 continue;
@@ -151,9 +159,18 @@ impl HlsPlaybackSession {
         playlist
     }
 
+    #[cfg(test)]
     pub(crate) fn media_playlist_resource(&self, playlist_id: &str) -> Option<HlsMediaResource> {
         self.media_playlist_resource_ref(playlist_id)
             .map(|(_, resource)| resource.clone())
+    }
+
+    pub(crate) fn media_playlist_resource_with_variant(
+        &self,
+        playlist_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
+        self.media_playlist_resource_ref(playlist_id)
+            .map(|(variant, resource)| (variant.id.clone(), resource.clone()))
     }
 
     pub(crate) fn media_playlist(
@@ -180,9 +197,17 @@ impl HlsPlaybackSession {
     }
 
     pub(crate) fn media_resource(&self, segment_id: &str) -> Option<HlsMediaResource> {
+        self.media_resource_with_variant(segment_id)
+            .map(|(_, resource)| resource)
+    }
+
+    pub(crate) fn media_resource_with_variant(
+        &self,
+        segment_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
         for variant in self.resource_variants() {
             if segment_id == variant.video.id {
-                return Some(variant.video.clone());
+                return Some((variant.id.clone(), variant.video.clone()));
             }
 
             if let Some(audio) = variant
@@ -190,7 +215,7 @@ impl HlsPlaybackSession {
                 .as_ref()
                 .filter(|audio| segment_id == audio.id)
             {
-                return Some(audio.clone());
+                return Some((variant.id.clone(), audio.clone()));
             }
         }
         None
@@ -203,6 +228,25 @@ impl HlsPlaybackSession {
             0
         };
         std::iter::once(&self.variant).chain(self.alternate_variants.iter().take(alternate_count))
+    }
+
+    fn advertised_variants_with_filter(
+        &self,
+        is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
+    ) -> Vec<&HlsVariant> {
+        let advertised = self.advertised_variants().collect::<Vec<_>>();
+        let filtered = advertised
+            .iter()
+            .copied()
+            .filter(|variant| is_variant_advertisable(variant))
+            .collect::<Vec<_>>();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+
+        let mut fallback = advertised;
+        fallback.sort_by_key(|variant| variant.bandwidth);
+        fallback.into_iter().take(1).collect()
     }
 
     fn resource_variants(&self) -> impl Iterator<Item = &HlsVariant> {
@@ -834,6 +878,73 @@ mod tests {
             "https://media.example.test/720p-video.m4s",
             resource.request.url
         );
+    }
+
+    #[test]
+    fn master_playlist_filter_demotes_unhealthy_selected_variant() {
+        let mut selected = dash_variant();
+        selected.id = "h264-1080p".to_owned();
+        selected.bandwidth = Some(1_000_000);
+        selected.abr = Some(abr_level("dash-video", 1, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 0, 2, true));
+        alternate.video.as_mut().unwrap().url =
+            "https://media.example.test/720p-video.m4s".to_owned();
+        alternate.audio.as_mut().unwrap().url =
+            "https://media.example.test/720p-audio.m4s".to_owned();
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        let master =
+            session.master_playlist_with_variant_filter(|variant| variant.id != "h264-1080p");
+
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(master.contains("BANDWIDTH=600000"));
+        assert!(master.contains("RESOLUTION=1280x720"));
+        assert!(master.contains("URI=\"segments/v1-audio.m3u8\""));
+        assert!(master.contains("segments/v1-video.m3u8\n"));
+        assert!(!master.contains("segments/video.m3u8\n"));
+    }
+
+    #[test]
+    fn master_playlist_filter_keeps_lowest_variant_when_all_variants_are_unhealthy() {
+        let mut selected = dash_variant();
+        selected.id = "h264-1080p".to_owned();
+        selected.bandwidth = Some(1_000_000);
+        selected.abr = Some(abr_level("dash-video", 1, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 0, 2, true));
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        let master = session.master_playlist_with_variant_filter(|_| false);
+
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(master.contains("BANDWIDTH=600000"));
+        assert!(master.contains("segments/v1-video.m3u8\n"));
+        assert!(!master.contains("segments/video.m3u8\n"));
     }
 
     #[test]
