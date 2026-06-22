@@ -1,9 +1,9 @@
 # Project TODO
 
-- [pending] PR 8：输出 multi-variant HLS master 并让 cache/upstream fallback 变成 variant-aware。
 - [pending] PR 9：推进 segment-level fill / prefetch。
 - [pending] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [pending] PR 11：增加 LAN transcoding foundation。
+- [completed] PR 8：输出 multi-variant HLS master，并让运行时 cache/upstream fallback 变成 variant-aware；completed offline cache 仍只保证 selected variant。
 - [completed] PR 7：增加 progressive HLS ABR metadata foundation，保存 ABR group/level/variant/cache-key metadata 但不改变当前单 variant 播放。
 - [completed] PR 6：完善 Bilibili fetch UX，优先用 macOS app 做 validation。
 - [completed] PR 5：增加 favorite、space videos、collection、series、recommendations 的 collection/list fetch coverage。

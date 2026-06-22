@@ -318,6 +318,7 @@ mod tests {
                 },
                 audio: None,
             },
+            alternate_variants: Vec::new(),
             abr: Default::default(),
             variants: Vec::new(),
         }
