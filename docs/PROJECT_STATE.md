@@ -31,6 +31,7 @@
 - Bilibili fetch UX polish workstream：`docs/project_journal/2026/06/2026-06-21-bilibili-fetch-ux-polish-b6f2a9.md`
 - HLS ABR metadata foundation workstream：`docs/project_journal/2026/06/2026-06-22-hls-abr-metadata-foundation-a3c9f4.md`
 - HLS multi-variant master workstream：`docs/project_journal/2026/06/2026-06-22-hls-multi-variant-master-e6b4a8.md`
+- Playback controls / remote endpoint / HLS execution roadmap：`docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers

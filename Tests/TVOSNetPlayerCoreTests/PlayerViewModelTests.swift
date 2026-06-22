@@ -75,6 +75,78 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaybackControlsAreDisabledUntilPlayerLoads() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        XCTAssertFalse(model.canUsePlaybackControls)
+
+        model.load(streamURLText: "example.com/movie.m3u8")
+
+        XCTAssertTrue(model.canUsePlaybackControls)
+    }
+
+    @MainActor
+    func testPlaybackSpeedCanBeSelectedBeforePlayback() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        let sequence = model.manualInteractionSequence
+
+        model.setPlaybackSpeed(.oneAndHalf)
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence)
+        XCTAssertEqual(model.playbackSpeed, .oneAndHalf)
+        XCTAssertEqual(model.statusMessage, "Playback speed 1.5x selected.")
+    }
+
+    @MainActor
+    func testPlaybackSpeedSelectionDoesNotCancelPendingTransientPlayback() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        let sequence = model.manualInteractionSequence
+
+        model.setPlaybackSpeed(.oneAndHalf)
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/media/item-a/original",
+            ifManualInteractionSequenceMatches: sequence
+        )
+
+        XCTAssertTrue(didLoad)
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/media/item-a/original")
+        XCTAssertEqual(model.player?.defaultRate, PlayerPlaybackSpeed.oneAndHalf.rate)
+    }
+
+    @MainActor
+    func testPlaybackSpeedAppliesToLoadedPlayerDefaultRate() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.setPlaybackSpeed(.oneAndQuarter)
+
+        model.load(streamURLText: "example.com/movie.m3u8")
+
+        XCTAssertEqual(model.player?.defaultRate, PlayerPlaybackSpeed.oneAndQuarter.rate)
+        XCTAssertEqual(model.playbackSpeed, .oneAndQuarter)
+    }
+
+    @MainActor
+    func testSeekWithoutLoadedPlayerReportsNoStream() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+
+        model.skipForward()
+
+        XCTAssertEqual(model.statusMessage, "No stream loaded.")
+        XCTAssertFalse(model.canUsePlaybackControls)
+    }
+
+    @MainActor
+    func testSkipForwardAndBackwardUpdateStatus() {
+        let model = PlayerViewModel(defaults: defaults, autoplay: false)
+        model.load(streamURLText: "example.com/movie.m3u8")
+
+        model.skipForward()
+        XCTAssertEqual(model.statusMessage, "Skipped forward 10 seconds.")
+
+        model.skipBackward()
+        XCTAssertEqual(model.statusMessage, "Skipped back 10 seconds.")
+    }
+
+    @MainActor
     func testLoadWithStreamURLTextStoresNormalizedURL() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
 
