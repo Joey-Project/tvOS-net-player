@@ -22,15 +22,16 @@ superseded_by:
 ## Decisions
 
 - The selected variant keeps the existing `video.m3u8` / `audio.m3u8` and `video.m4s` / `audio.m4s` IDs for compatibility with existing manifests and tests.
-- Alternate runtime variants are limited to switchable same-group DASH variants with H.264 video and AAC audio metadata. HEVC/AV1 variants stay out of the master playlist until platform capability and transcoding policy are explicit.
-- When media request codec metadata exists, it is authoritative for safety filtering; variant-level codec metadata is only a fallback for missing request-level codec data.
+- Alternate runtime variants are limited to switchable same-group DASH variants with matching audio availability and H.264/AAC media request metadata. HEVC/AV1 variants stay out of the master playlist until platform capability and transcoding policy are explicit.
+- When media request codec metadata exists, it is authoritative for safety filtering and playlist `CODECS` attributes; variant-level codec metadata is only a fallback for missing request-level codec data.
 - Completed offline HLS manifests still guarantee only the selected cached variant. When a session is finalized, upstream URLs/headers are scrubbed and runtime alternate variants are removed so offline master playlists cannot advertise uncached variants.
 
 ## Implementation
 
 - Added `HlsPlaybackSession.alternate_variants` and backward-compatible persistence with `#[serde(default)]`.
 - Built multi-variant master generation from the selected variant plus safe alternates, with per-variant audio groups and variant-specific media playlist IDs.
-- Tightened alternate filtering after review so variants must be in the selected variant's switchable ABR group and must pass media-request-level codec checks.
+- Tightened alternate filtering after review so variants must be in the selected variant's switchable ABR group, match the selected variant's audio availability, and pass media-request-level codec checks.
+- Made runtime HLS variant codec attributes prefer media request codecs so stale variant-level metadata cannot advertise the wrong codec after safety filtering.
 - Updated media playlist/resource lookup to iterate all playable variants, allowing the existing cache/prewarm/upstream fallback path to work per variant.
 - Extended completed-manifest sanitization to clear alternate variants after finalization.
 

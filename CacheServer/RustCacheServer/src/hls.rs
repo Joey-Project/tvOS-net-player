@@ -251,13 +251,15 @@ impl HlsVariant {
             ));
         };
 
+        let audio = variant.audio.clone();
+        let codecs = hls_variant_codecs(variant, &video, audio.as_ref());
         Ok(Self {
             id: variant.id.clone(),
             bandwidth: variant
                 .bandwidth
                 .or(video.bandwidth)
                 .unwrap_or(DEFAULT_BANDWIDTH),
-            codecs: variant.codecs.clone(),
+            codecs,
             width: variant.width,
             height: variant.height,
             duration_seconds: variant
@@ -268,7 +270,7 @@ impl HlsVariant {
                 id: video_id,
                 request: video,
             },
-            audio: variant.audio.clone().map(|audio| HlsMediaResource {
+            audio: audio.map(|audio| HlsMediaResource {
                 id: audio_id,
                 request: audio,
             }),
@@ -602,6 +604,7 @@ fn playable_alternate_variants(
     for variant in variants {
         if variant.id == selected_variant.id
             || !is_switchable_alternate_variant(selected_variant, variant)
+            || !has_matching_audio_presence(selected_variant, variant)
             || !is_avplayer_safe_alternate_variant(variant)
         {
             continue;
@@ -614,6 +617,32 @@ fn playable_alternate_variants(
         )?);
     }
     Ok(alternates)
+}
+
+fn hls_variant_codecs(
+    variant: &AdapterPlaybackVariant,
+    video: &BilibiliMediaRequest,
+    audio: Option<&BilibiliMediaRequest>,
+) -> Vec<String> {
+    let mut codecs = Vec::new();
+    if let Some(video_codecs) = video.codecs.as_deref() {
+        push_unique_codec(&mut codecs, video_codecs);
+    } else {
+        for codec in &variant.codecs {
+            push_unique_codec(&mut codecs, codec);
+        }
+    }
+    if let Some(audio_codecs) = audio.and_then(|audio| audio.codecs.as_deref()) {
+        push_unique_codec(&mut codecs, audio_codecs);
+    }
+    codecs
+}
+
+fn has_matching_audio_presence(
+    selected_variant: &AdapterPlaybackVariant,
+    variant: &AdapterPlaybackVariant,
+) -> bool {
+    selected_variant.audio.is_some() == variant.audio.is_some()
 }
 
 fn is_switchable_alternate_variant(
@@ -725,6 +754,7 @@ mod tests {
         let mut alternate = dash_variant();
         alternate.id = "h264-720p".to_owned();
         alternate.bandwidth = Some(600_000);
+        alternate.codecs = vec!["hev1.1.6.L120.90".to_owned(), "mp4a.40.2".to_owned()];
         alternate.width = Some(1280);
         alternate.height = Some(720);
         alternate.abr = Some(abr_level("dash-video", 1, 2, true));
@@ -747,6 +777,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(1, session.alternate_variants.len());
+        assert_eq!(
+            vec!["avc1.640028".to_owned(), "mp4a.40.2".to_owned()],
+            session.alternate_variants[0].codecs
+        );
         let master = session.master_playlist();
         assert_eq!(2, master.matches("#EXT-X-STREAM-INF").count());
         assert!(master.contains("URI=\"segments/audio.m3u8\""));
@@ -755,6 +789,7 @@ mod tests {
         assert!(master.contains("RESOLUTION=1280x720"));
         assert!(master.contains("segments/video.m3u8\n"));
         assert!(master.contains("segments/v1-video.m3u8\n"));
+        assert!(!master.contains("hev1.1.6.L120.90"));
 
         let video = session
             .media_playlist("v1-video.m3u8", 128, 10_000)
@@ -841,6 +876,30 @@ mod tests {
             &selected,
             &AdapterAbrMetadata { groups: Vec::new() },
             &[selected.clone(), non_switchable, other_group, missing_abr],
+        )
+        .unwrap();
+
+        assert!(session.alternate_variants.is_empty());
+        let master = session.master_playlist();
+        assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
+        assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn from_playback_entry_filters_audio_incompatible_alternate_hls_variants() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut audio_less = dash_variant();
+        audio_less.id = "audio-less".to_owned();
+        audio_less.abr = Some(abr_level("dash-video", 1, 2, true));
+        audio_less.audio = None;
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), audio_less],
         )
         .unwrap();
 
