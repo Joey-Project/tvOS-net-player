@@ -52,6 +52,7 @@ pub(crate) struct HlsPlaybackSession {
     pub(crate) title: String,
     pub(crate) variant: HlsVariant,
     pub(crate) alternate_variants: Vec<HlsVariant>,
+    pub(crate) advertise_alternate_variants: bool,
     pub(crate) abr: HlsAbrMetadata,
     pub(crate) variants: Vec<HlsVariantMetadata>,
 }
@@ -74,6 +75,7 @@ impl HlsPlaybackSession {
             title: title.to_owned(),
             variant: hls_variant,
             alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
             abr: HlsAbrMetadata::default(),
             variants: vec![HlsVariantMetadata::from_adapter(variant)],
         })
@@ -107,7 +109,7 @@ impl HlsPlaybackSession {
 
     pub(crate) fn master_playlist(&self) -> String {
         let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-        let variants = self.playable_variants().collect::<Vec<_>>();
+        let variants = self.advertised_variants().collect::<Vec<_>>();
         for (index, variant) in variants.iter().enumerate() {
             let Some(audio_playlist_id) = variant.audio_playlist_id() else {
                 continue;
@@ -178,7 +180,7 @@ impl HlsPlaybackSession {
     }
 
     pub(crate) fn media_resource(&self, segment_id: &str) -> Option<HlsMediaResource> {
-        for variant in self.playable_variants() {
+        for variant in self.resource_variants() {
             if segment_id == variant.video.id {
                 return Some(variant.video.clone());
             }
@@ -194,7 +196,16 @@ impl HlsPlaybackSession {
         None
     }
 
-    fn playable_variants(&self) -> impl Iterator<Item = &HlsVariant> {
+    fn advertised_variants(&self) -> impl Iterator<Item = &HlsVariant> {
+        let alternate_count = if self.advertise_alternate_variants {
+            self.alternate_variants.len()
+        } else {
+            0
+        };
+        std::iter::once(&self.variant).chain(self.alternate_variants.iter().take(alternate_count))
+    }
+
+    fn resource_variants(&self) -> impl Iterator<Item = &HlsVariant> {
         std::iter::once(&self.variant).chain(self.alternate_variants.iter())
     }
 
@@ -202,7 +213,7 @@ impl HlsPlaybackSession {
         &self,
         playlist_id: &str,
     ) -> Option<(&HlsVariant, &HlsMediaResource)> {
-        for variant in self.playable_variants() {
+        for variant in self.resource_variants() {
             if playlist_id == variant.video_playlist_id() {
                 return Some((variant, &variant.video));
             }

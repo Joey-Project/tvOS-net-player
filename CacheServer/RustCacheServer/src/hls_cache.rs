@@ -1517,6 +1517,7 @@ pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPl
 
 pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
+    session.advertise_alternate_variants = false;
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {
         sanitize_completed_resource(audio);
@@ -1692,6 +1693,7 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
                 .into_iter()
                 .map(HlsVariant::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            advertise_alternate_variants: true,
             abr: HlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -2281,6 +2283,26 @@ mod tests {
         assert_eq!(1, sessions.len());
         assert_eq!(session.alternate_variants, sessions[0].alternate_variants);
         assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn completed_runtime_session_hides_alternates_from_new_master_but_keeps_lookup() {
+        let mut session = sample_session("session-runtime", "https://example.test/video.m4s");
+        attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+
+        let runtime = completed_runtime_session(&session);
+
+        assert_eq!(1, runtime.alternate_variants.len());
+        assert!(!runtime.master_playlist().contains("segments/v1-video.m3u8"));
+        assert!(runtime.media_playlist_resource("v1-video.m3u8").is_some());
+        assert_eq!(
+            "https://example.test/720p-video.m4s",
+            runtime
+                .media_resource("v1-video.m4s")
+                .expect("runtime alternate resource should remain addressable")
+                .request
+                .url
+        );
     }
 
     #[test]
@@ -4019,6 +4041,7 @@ mod tests {
                 audio: None,
             },
             alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
             abr: Default::default(),
             variants: Vec::new(),
         }

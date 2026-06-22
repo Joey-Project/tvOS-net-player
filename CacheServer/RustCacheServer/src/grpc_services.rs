@@ -3174,7 +3174,7 @@ mod tests {
 
         assert_eq!(1, runtime_session.alternate_variants.len());
         assert!(
-            runtime_session
+            !runtime_session
                 .master_playlist()
                 .contains("segments/v1-video.m3u8")
         );
