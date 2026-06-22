@@ -12,6 +12,8 @@ public enum CacheLibraryRefreshResult: Equatable, Sendable {
 public final class CacheLibraryViewModel: ObservableObject {
     public static let serverAddressDefaultsKey = "CacheServerAddress"
     private static let libraryPageSize = 50
+    private static let serverAddressGuidance =
+        "Use a cache server address or URL, such as mac-mini.local:50051 or https://cache.example.com."
 
     @Published public var serverAddressText: String {
         didSet {
@@ -166,7 +168,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             clearLoadedLibrary(
                 statusMessage: "Cache server address is invalid.",
-                errorMessage: "Use a host and optional port, such as mac-mini.local:50051."
+                errorMessage: Self.serverAddressGuidance
             )
             return .failed
         }
@@ -516,7 +518,7 @@ public final class CacheLibraryViewModel: ObservableObject {
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             isLoading = false
-            errorMessage = "Use a host and optional port, such as mac-mini.local:50051."
+            errorMessage = Self.serverAddressGuidance
             statusMessage = "Cache server address is invalid."
             return nil
         }
@@ -686,7 +688,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             nextErrorMessage = nil
         } else if currentEndpoint == nil {
             nextStatusMessage = "Cache server address is invalid."
-            nextErrorMessage = "Use a host and optional port, such as mac-mini.local:50051."
+            nextErrorMessage = Self.serverAddressGuidance
         } else {
             nextStatusMessage = "Refresh cache server to load videos."
             nextErrorMessage = nil

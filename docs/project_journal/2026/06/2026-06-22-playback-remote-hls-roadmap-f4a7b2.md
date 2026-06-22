@@ -23,8 +23,9 @@ superseded_by:
 ## Current State
 
 - The app can discover LAN cache servers through Bonjour and can manually connect to plaintext `host[:port]`/`http://host:port` gRPC endpoints.
-- Manual cache server URLs do not yet model `https://` remote endpoints, URL paths, Cloudflare Tunnel hostnames, or TLS gRPC transport.
-- PR 1 adds shared AppCore seek/skip/playback-speed controls and exposes them in both tvOS and macOS while preserving the SwiftUI `VideoPlayer` surface.
+- Remote endpoint support now accepts `https://` cache server origin URLs, applies scheme-aware defaults, and uses HTTP/2 TLS for the gRPC control plane.
+- Path-scoped gRPC URLs remain intentionally unsupported; Cloudflare Tunnel or reverse proxy deployments should route the cache control plane at the host root.
+- PR 1 added shared AppCore seek/skip/playback-speed controls and exposed them in both tvOS and macOS while preserving the SwiftUI `VideoPlayer` surface.
 - HLS playback has ABR metadata, multi-variant master output, first-window prefetch, adaptive weak-network policy, and LAN transcoding foundation, but transcoding execution and true fMP4 segment-index playlist splitting remain future work.
 
 ## PR Plan
@@ -39,10 +40,11 @@ superseded_by:
 
 ### PR 2: Remote Endpoint And CF Tunnel Support
 
-- Status: pending.
+- Status: implemented by this slice.
 - Extend `CacheServerEndpoint` from plaintext host/port parsing to a typed endpoint model with scheme-aware defaults.
 - Support `https://` gRPC endpoints and TLS transport for remote/Cloudflare Tunnel style control-plane access.
-- Validate that server-returned media URLs can use a public media base URI when the control plane is remote.
+- Preserve Bonjour/manual LAN behavior as `host:port` plaintext h2c and keep UI placeholders/error copy explicit about both local addresses and remote URLs.
+- Keep server-returned media URLs as the only media source authority; clients still do not derive Bilibili/media URLs from the control-plane endpoint.
 - Keep auth policy explicit and defer full credential/auth hardening.
 
 ### PR 3: LAN Transcoding Execution MVP
@@ -102,3 +104,8 @@ superseded_by:
   - `python3 /Users/joey/.codex/personal-sync/overlays/private/releases/5f1ab3fa5d9f7d534507216a2d6f765694f9b710/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/joey/Program/Codex-workspace/tvOS-net-player`
   - `git diff --check`
   - `just ci`
+- PR 2 focused validation:
+  - `swift test --filter CacheServerEndpointTests`
+  - `swift test --filter CacheLibraryViewModelTests/testRefreshAcceptsHTTPSCacheServerURL`
+  - `swift test --filter CacheLibraryViewModelTests`
+  - Full `just ci` passed with tvOS simulator, macOS app, Swift package, and Rust cache server tests.

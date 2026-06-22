@@ -1055,7 +1055,9 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.reResolve(serverAddressText: "not a valid endpoint")
 
         XCTAssertEqual(
-            model.errorMessage, "Use a cache server host and optional port before submitting Bilibili playback.")
+            model.errorMessage,
+            "Use a cache server address or URL, such as mac-mini.local:50051 or https://cache.example.com."
+        )
         XCTAssertEqual(model.statusMessage, "Cache server address is invalid.")
         XCTAssertEqual(model.resolvedInput?.title, "Resolved result")
         XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])

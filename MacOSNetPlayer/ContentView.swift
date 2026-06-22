@@ -56,7 +56,7 @@ struct ContentView: View {
                 pendingDeleteItem = nil
             }
         } message: { item in
-            Text("Delete \(item.displayTitle) from the LAN cache server.")
+            Text("Delete \(item.displayTitle) from the cache server.")
         }
     }
 
@@ -73,13 +73,16 @@ struct ContentView: View {
     private var cacheSidebar: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
-                TextField("mac-mini.local:50051", text: $cacheModel.serverAddressText)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit {
-                        Task {
-                            await cacheModel.refresh()
-                        }
+                TextField(
+                    "mac-mini.local:50051 or https://cache.example.com",
+                    text: $cacheModel.serverAddressText
+                )
+                .textFieldStyle(.roundedBorder)
+                .onSubmit {
+                    Task {
+                        await cacheModel.refresh()
                     }
+                }
 
                 Button {
                     Task {
