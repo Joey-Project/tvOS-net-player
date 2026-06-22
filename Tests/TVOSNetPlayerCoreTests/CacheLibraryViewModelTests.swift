@@ -68,6 +68,40 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshAcceptsHTTPSCacheServerURL() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Remote cache"),
+            items: [
+                .fixture(id: "remote-item", title: "Remote cached video")
+            ],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "https://cache.example.com",
+            defaults: defaults,
+            clientFactory: { endpoint in
+                endpoint.usesTLS
+                    ? client
+                    : FakeCacheControlClient(
+                        serverInfo: .fixture(name: "Unexpected plaintext cache"),
+                        items: [],
+                        playbackSource: .fixture()
+                    )
+            }
+        )
+
+        let refreshResult = await model.refresh()
+
+        XCTAssertEqual(refreshResult, .succeeded)
+        XCTAssertEqual(model.serverAddressText, "https://cache.example.com")
+        XCTAssertEqual(model.serverName, "Remote cache")
+        XCTAssertEqual(model.items.map(\.id), ["remote-item"])
+        XCTAssertEqual(
+            defaults.string(forKey: CacheLibraryViewModel.serverAddressDefaultsKey), "https://cache.example.com")
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
     func testRefreshLoadsCacheRoots() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -1190,7 +1224,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
     func testInvalidServerAddressDoesNotCallClient() async {
         let client = FakeCacheControlClient(serverInfo: .fixture(), items: [], playbackSource: .fixture())
         let model = CacheLibraryViewModel(
-            defaultServerAddressText: "https://mac-mini.local:50051",
+            defaultServerAddressText: "https://mac-mini.local:50051/grpc",
             defaults: defaults,
             clientFactory: { _ in client }
         )
@@ -1272,7 +1306,7 @@ final class CacheLibraryViewModelTests: XCTestCase {
         await client.waitForServerInfoRequest()
         XCTAssertTrue(model.isLoading)
 
-        model.serverAddressText = "https://server-a.local:50051"
+        model.serverAddressText = "https://server-a.local:50051/grpc"
 
         XCTAssertFalse(model.isLoading)
         XCTAssertTrue(model.items.isEmpty)

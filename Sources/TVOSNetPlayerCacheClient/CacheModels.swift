@@ -1,22 +1,67 @@
 import Foundation
 
+public enum CacheServerEndpointScheme: String, Equatable, Sendable {
+    case http
+    case https
+}
+
 public struct CacheServerEndpoint: Equatable, Sendable {
     public static let defaultPort = 50_051
+    public static let defaultTLSPort = 443
 
+    public let scheme: CacheServerEndpointScheme
     public let host: String
     public let port: Int
 
     public init(host: String, port: Int = Self.defaultPort) {
+        self.init(uncheckedHost: host, port: port, scheme: .http)
+    }
+
+    public init?(host: String, scheme: CacheServerEndpointScheme) {
+        self.init(
+            host: host,
+            port: Self.defaultPortValue(for: scheme, plaintextDefaultPort: Self.defaultPort),
+            scheme: scheme
+        )
+    }
+
+    public init?(host: String, port: Int, scheme: CacheServerEndpointScheme) {
+        guard Self.canUse(host: host, port: port, scheme: scheme) else {
+            return nil
+        }
+
+        self.init(uncheckedHost: host, port: port, scheme: scheme)
+    }
+
+    private init(uncheckedHost host: String, port: Int, scheme: CacheServerEndpointScheme) {
+        self.scheme = scheme
         self.host = host
         self.port = port
     }
 
     public var displayAddress: String {
-        if host.contains(":") && !(host.hasPrefix("[") && host.hasSuffix("]")) {
-            return "[\(host)]:\(port)"
+        let formattedHost = hostForDisplay
+        guard scheme == .https else {
+            return "\(formattedHost):\(port)"
         }
 
-        return "\(host):\(port)"
+        if port == Self.defaultTLSPort {
+            return "https://\(formattedHost)"
+        }
+
+        return "https://\(formattedHost):\(port)"
+    }
+
+    public var usesTLS: Bool {
+        scheme == .https
+    }
+
+    private var hostForDisplay: String {
+        if host.contains(":") && !(host.hasPrefix("[") && host.hasSuffix("]")) {
+            return "[\(host)]"
+        }
+
+        return host
     }
 
     var isIPv6Literal: Bool {
@@ -36,9 +81,24 @@ public struct CacheServerEndpoint: Equatable, Sendable {
         let candidate = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
         guard
             let components = URLComponents(string: candidate),
-            components.scheme?.lowercased() == "http",
+            let rawScheme = components.scheme?.lowercased(),
+            let scheme = CacheServerEndpointScheme(rawValue: rawScheme),
             var host = components.host?.trimmingCharacters(in: .whitespacesAndNewlines)
         else {
+            return nil
+        }
+
+        guard
+            components.user == nil,
+            components.password == nil,
+            components.query == nil,
+            components.fragment == nil,
+            components.path.isEmpty || components.path == "/"
+        else {
+            return nil
+        }
+
+        guard !(components.port == nil && hasExplicitPortSpecifier(in: candidate, scheme: rawScheme)) else {
             return nil
         }
 
@@ -50,12 +110,16 @@ public struct CacheServerEndpoint: Equatable, Sendable {
             return nil
         }
 
-        let port = components.port ?? defaultPort
+        guard scheme == .http || !isIPLiteral(host) else {
+            return nil
+        }
+
+        let port = components.port ?? defaultPortValue(for: scheme, plaintextDefaultPort: defaultPort)
         guard (1...65_535).contains(port) else {
             return nil
         }
 
-        return Self(host: host, port: port)
+        return Self(host: host, port: port, scheme: scheme)
     }
 
     private static func unbracketedIPv6Endpoint(from text: String, defaultPort: Int) -> Self? {
@@ -69,6 +133,78 @@ public struct CacheServerEndpoint: Equatable, Sendable {
         }
 
         return Self(host: text, port: defaultPort)
+    }
+
+    private static func defaultPortValue(
+        for scheme: CacheServerEndpointScheme,
+        plaintextDefaultPort: Int
+    ) -> Int {
+        switch scheme {
+        case .http:
+            return plaintextDefaultPort
+        case .https:
+            return Self.defaultTLSPort
+        }
+    }
+
+    private static func canUse(host: String, port: Int, scheme: CacheServerEndpointScheme) -> Bool {
+        guard !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        guard (1...65_535).contains(port) else {
+            return false
+        }
+        guard scheme == .http || !isIPLiteral(host) else {
+            return false
+        }
+
+        return true
+    }
+
+    private static func hasExplicitPortSpecifier(in candidate: String, scheme: String) -> Bool {
+        let prefix = "\(scheme)://"
+        guard candidate.lowercased().hasPrefix(prefix) else {
+            return false
+        }
+
+        let authorityStart = candidate.index(candidate.startIndex, offsetBy: prefix.count)
+        let authorityEnd =
+            candidate[authorityStart...].firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" })
+            ?? candidate.endIndex
+        let authority = candidate[authorityStart..<authorityEnd]
+        if authority.hasPrefix("[") {
+            guard let closingBracket = authority.firstIndex(of: "]") else {
+                return false
+            }
+            let portSeparator = authority.index(after: closingBracket)
+            return portSeparator < authority.endIndex && authority[portSeparator] == ":"
+        }
+
+        return authority.contains(":")
+    }
+
+    private static func isIPLiteral(_ host: String) -> Bool {
+        host.contains(":") || isIPv4Literal(host)
+    }
+
+    private static func isIPv4Literal(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else {
+            return false
+        }
+
+        return parts.allSatisfy { part in
+            guard
+                !part.isEmpty,
+                part.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") })
+            else {
+                return false
+            }
+            guard let value = Int(part), (0...255).contains(value) else {
+                return false
+            }
+            return true
+        }
     }
 }
 

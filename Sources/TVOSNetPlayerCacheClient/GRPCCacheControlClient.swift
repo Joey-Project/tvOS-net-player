@@ -28,7 +28,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
@@ -45,7 +45,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
             return try await withGRPCClient(
                 transport: .http2NIOTS(
                     target: endpoint.grpcTarget,
-                    transportSecurity: .plaintext
+                    transportSecurity: endpoint.grpcTransportSecurity
                 )
             ) { client in
                 let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
@@ -64,7 +64,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
@@ -80,7 +80,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
@@ -100,7 +100,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
@@ -118,7 +118,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
@@ -142,7 +142,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_LibraryService.Client(wrapping: client)
@@ -158,7 +158,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
@@ -177,7 +177,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
             return try await withGRPCClient(
                 transport: .http2NIOTS(
                     target: endpoint.grpcTarget,
-                    transportSecurity: .plaintext
+                    transportSecurity: endpoint.grpcTransportSecurity
                 )
             ) { client in
                 let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
@@ -250,7 +250,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         return try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
@@ -293,7 +293,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
@@ -308,7 +308,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
-                transportSecurity: .plaintext
+                transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
@@ -326,7 +326,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
                     try await withGRPCClient(
                         transport: .http2NIOTS(
                             target: endpoint.grpcTarget,
-                            transportSecurity: .plaintext
+                            transportSecurity: endpoint.grpcTransportSecurity
                         )
                     ) { client in
                         let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
@@ -379,13 +379,35 @@ public final class GRPCCacheControlClient: CacheControlClient {
 }
 
 extension CacheServerEndpoint {
-    var grpcTarget: any ResolvableTarget {
-        if isIPv6Literal {
-            return .ipv6(address: host, port: port)
+    var grpcTransportSecurity: HTTP2ClientTransport.TransportServices.TransportSecurity {
+        usesTLS ? .tls : .plaintext
+    }
+
+    var grpcTargetKind: CacheServerEndpointGRPCTargetKind {
+        if isIPv6Literal && !usesTLS {
+            return .ipv6Literal
         }
 
-        return .dns(host: host, port: port)
+        return .dns
     }
+
+    var grpcTarget: any ResolvableTarget {
+        switch grpcTargetKind {
+        case .ipv6Literal:
+            return .ipv6(address: host, port: port)
+        case .dns:
+            return .dns(host: host, port: grpcDNSTargetPort)
+        }
+    }
+
+    var grpcDNSTargetPort: Int? {
+        usesTLS && port == Self.defaultTLSPort ? nil : port
+    }
+}
+
+enum CacheServerEndpointGRPCTargetKind: Equatable {
+    case dns
+    case ipv6Literal
 }
 
 enum CacheLibraryPaginationError: Error, Equatable {

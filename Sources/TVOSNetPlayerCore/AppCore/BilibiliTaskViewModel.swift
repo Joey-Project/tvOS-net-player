@@ -192,6 +192,9 @@ private enum BilibiliRetryIntent {
 
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
+    private static let cacheServerAddressGuidance =
+        "Use a cache server address or URL, such as mac-mini.local:50051 or https://cache.example.com."
+
     @Published public var sourceText: String
     @Published public var qualityPreference: String
     @Published public var encodingPreference: String
@@ -551,7 +554,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
-            errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
+            errorMessage = Self.cacheServerAddressGuidance
             statusMessage = "Cache server address is invalid."
             return
         }
@@ -705,7 +708,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             retryIntent = .reResolve
-            errorMessage = "Use a cache server host and optional port before submitting Bilibili playback."
+            errorMessage = Self.cacheServerAddressGuidance
             statusMessage = "Cache server address is invalid."
             return
         }
@@ -811,7 +814,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
         guard let endpoint else {
-            errorMessage = "Use a cache server host and optional port before cancelling."
+            errorMessage = Self.cacheServerAddressGuidance
             statusMessage = "Cache server address is invalid."
             return
         }
@@ -1514,7 +1517,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return BilibiliFetchNotice(
                 title: "Credentials required",
                 message:
-                    "This Bilibili page needs server-side web credentials. Refresh the LAN cache server credential file, then retry.",
+                    "This Bilibili page needs server-side web credentials. Refresh the cache server credential file, then retry.",
                 systemImage: "person.crop.circle.badge.exclamationmark",
                 tone: .warning,
                 actionTitle: "Retry"

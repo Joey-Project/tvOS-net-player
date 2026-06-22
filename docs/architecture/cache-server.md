@@ -128,7 +128,8 @@ Cache deletion contract:
 
 - gRPC Swift 2 is the tvOS client library for the control plane.
 - The app deployment target is tvOS 18.0 because generated gRPC Swift 2 client code is available on tvOS 18.0 or newer.
-- The tvOS client uses the Network.framework-backed `GRPCNIOTransportHTTP2TransportServices` transport with plaintext h2c to the trusted LAN cache server.
+- The tvOS and macOS clients use the Network.framework-backed `GRPCNIOTransportHTTP2TransportServices` transport. Plaintext `host[:port]`/`http://host[:port]` endpoints target trusted LAN h2c; `https://host[:port]` endpoints target remote HTTP/2 TLS control-plane access such as Cloudflare Tunnel style hostnames.
+- Manual cache server URLs are origin URLs only. Path-prefixed gRPC URLs such as `https://cache.example.com/grpc` are not supported; reverse proxies should route the cache control plane at the configured host root. HTTPS endpoints must use DNS hostnames, not IP literals, so TLS SNI and hostname verification remain well-defined.
 - The tvOS and macOS apps declare `NSBonjourServices` for `_tvos-net-player._tcp`; discovery fills the same manual `host:port` control-plane address model that the gRPC client already uses.
 - `grpc-swift-nio-transport` is vendored under `Vendor/grpc-swift-nio-transport` at the 2.7.0 source level with a manifest-only Xcode linkage patch for `GRPCNIOTransportCore` direct dependencies. Remove the vendor and return to the upstream package URL once upstream declares the same direct dependencies and Xcode package product linking succeeds without the local patch.
 - The server runtime is Rust. `tonic` hosts the gRPC h2c control plane, and `axum` hosts the HTTP media listener. BBDown remains behind an adapter boundary and is not part of the server runtime contract.

@@ -87,7 +87,7 @@ struct ContentView: View {
                 pendingDeleteItem = nil
             }
         } message: { item in
-            Text("Delete \(item.displayTitle) from the LAN cache server.")
+            Text("Delete \(item.displayTitle) from the cache server.")
         }
     }
 
@@ -97,15 +97,18 @@ struct ContentView: View {
                 .font(.title2.weight(.semibold))
 
             VStack(alignment: .leading, spacing: 10) {
-                TextField("mac-mini.local:50051", text: $cacheModel.serverAddressText)
-                    .keyboardType(.URL)
-                    .submitLabel(.go)
-                    .onSubmit {
-                        Task {
-                            await cacheModel.refresh()
-                        }
+                TextField(
+                    "mac-mini.local:50051 or https://cache.example.com",
+                    text: $cacheModel.serverAddressText
+                )
+                .keyboardType(.URL)
+                .submitLabel(.go)
+                .onSubmit {
+                    Task {
+                        await cacheModel.refresh()
                     }
-                    .focused($focusedControl, equals: .cacheServerField)
+                }
+                .focused($focusedControl, equals: .cacheServerField)
 
                 if let errorMessage = cacheModel.errorMessage {
                     Text(errorMessage)
