@@ -41,6 +41,10 @@ impl HlsNetworkPolicy {
         self.record_cache_hit_at(session_id, SystemTime::now());
     }
 
+    pub(crate) fn remove_session(&self, session_id: &str) {
+        self.remove_session_at(session_id, SystemTime::now());
+    }
+
     pub(crate) fn snapshot(&self) -> HlsWeakNetworkSnapshot {
         self.snapshot_at(SystemTime::now())
     }
@@ -128,6 +132,14 @@ impl HlsNetworkPolicy {
         session.cache_only_until = Some(now + CACHE_ONLY_WINDOW);
         session.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
+    }
+
+    fn remove_session_at(&self, session_id: &str, now: SystemTime) {
+        let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_expired(now);
+        if state.sessions.remove(session_id).is_some() {
+            state.last_changed_at = Some(now);
+        }
     }
 
     pub(crate) fn snapshot_at(&self, now: SystemTime) -> HlsWeakNetworkSnapshot {
@@ -446,5 +458,24 @@ mod tests {
         assert_eq!(HlsWeakNetworkState::Normal, snapshot.state);
         assert_eq!(0, snapshot.cache_only_session_count);
         assert_eq!(0, snapshot.degraded_session_count);
+    }
+
+    #[test]
+    fn remove_session_clears_active_state() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_failure_at("session", "1080p", now);
+        let active = policy.snapshot_at(now + Duration::from_secs(1));
+        assert_eq!(HlsWeakNetworkState::UpstreamFailed, active.state);
+
+        policy.remove_session_at("session", now + Duration::from_secs(2));
+
+        let snapshot = policy.snapshot_at(now + Duration::from_secs(3));
+        assert_eq!(HlsWeakNetworkState::Normal, snapshot.state);
+        assert_eq!(0, snapshot.retrying_variant_count);
+        assert_eq!(0, snapshot.degraded_session_count);
+        assert_eq!(0, snapshot.unhealthy_variant_count);
+        assert_eq!(0, snapshot.cache_only_session_count);
     }
 }

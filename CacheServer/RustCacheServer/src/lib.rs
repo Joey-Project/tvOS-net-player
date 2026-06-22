@@ -451,7 +451,7 @@ impl AppState {
             .expect("HLS cache quota enforcement lock poisoned");
         let was_registered = self.hls_sessions.get(session_id).is_some();
         if was_registered && !self.registered_hls_session_is_authorized_for_serving(session_id) {
-            self.hls_sessions.remove(session_id);
+            self.remove_hls_playback_session(session_id);
             return None;
         }
         let Some(session) = self.hls_playback_session(session_id) else {
@@ -545,9 +545,14 @@ impl AppState {
                 continue;
             }
             self.hls_cache.remove_session(session_id)?;
-            self.hls_sessions.remove(session_id);
+            self.remove_hls_playback_session(session_id);
         }
         Ok(())
+    }
+
+    pub(crate) fn remove_hls_playback_session(&self, session_id: &str) {
+        self.hls_sessions.remove(session_id);
+        self.hls_network_policy.remove_session(session_id);
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
@@ -1067,7 +1072,7 @@ impl AppState {
     }
 
     fn fail_completed_hls_task_after_cache_restore(&self, session_id: &str) {
-        self.hls_sessions.remove(session_id);
+        self.remove_hls_playback_session(session_id);
         if let Err(status) = self.tasks.fail_completed_playback_task_after_cache_restore(
             session_id,
             "Restored completed HLS cache item did not match the persisted playback task."
@@ -1083,7 +1088,7 @@ impl AppState {
         if self.hls_cache.load_sessions().is_err() {
             return;
         }
-        self.hls_sessions.remove(session_id);
+        self.remove_hls_playback_session(session_id);
         if let Err(status) = self
             .tasks
             .fail_unrestorable_playback_session_after_cache_restore(

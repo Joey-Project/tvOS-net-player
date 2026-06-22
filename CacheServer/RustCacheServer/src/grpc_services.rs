@@ -571,7 +571,7 @@ impl TaskService for TaskGrpcService {
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
             for session_id in hls_session_ids {
-                self.state.hls_sessions.remove(&session_id);
+                self.state.remove_hls_playback_session(&session_id);
                 let _ = self.state.hls_cache.remove_session(&session_id);
             }
         }
@@ -919,7 +919,7 @@ async fn run_single_bilibili_playback_planning(
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                state.hls_sessions.remove(&task_id);
+                state.remove_hls_playback_session(&task_id);
                 let _ = state.hls_cache.remove_session(&task_id);
             } else {
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
@@ -936,7 +936,7 @@ async fn run_single_bilibili_playback_planning(
             true
         }
         Err(_) => {
-            state.hls_sessions.remove(&task_id);
+            state.remove_hls_playback_session(&task_id);
             let _ = state.hls_cache.remove_session(&task_id);
             false
         }
@@ -1288,7 +1288,7 @@ fn bilibili_result_item(
 
 fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
     for session_id in session_ids {
-        state.hls_sessions.remove(session_id);
+        state.remove_hls_playback_session(session_id);
         let _ = state.hls_cache.remove_session(session_id);
     }
 }
@@ -1481,7 +1481,7 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.hls_sessions.remove(&session_id);
+            state.remove_hls_playback_session(&session_id);
             let _ = state.hls_cache.remove_session(&session_id);
             return HlsCacheFinalizationOutcome::Finished;
         }
@@ -1550,13 +1550,13 @@ async fn run_hls_cache_finalization_inner(
                     }
                 }
                 Ok(_) | Err(_) => {
-                    state.hls_sessions.remove(&session_id);
+                    state.remove_hls_playback_session(&session_id);
                     let _ = state.hls_cache.remove_session(&session_id);
                 }
             }
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.hls_sessions.remove(&session_id);
+            state.remove_hls_playback_session(&session_id);
             let _ = state.hls_cache.remove_session(&session_id);
         }
         Err(crate::hls_cache::HlsCacheError::Preempted) => {
@@ -1587,7 +1587,7 @@ async fn run_hls_cache_finalization_inner(
                     );
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
-                    state.hls_sessions.remove(&session_id);
+                    state.remove_hls_playback_session(&session_id);
                     let _ = state.hls_cache.remove_session(&session_id);
                     if let Err(status) = state.tasks.fail_playback_task_after_cache_restore(
                         &task_id,
@@ -2050,6 +2050,7 @@ mod tests {
             ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
         hls_cache::sanitized_completed_session,
+        hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
     };
     use axum::{
         Router,
@@ -3939,6 +3940,13 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_some()
         );
+        state
+            .hls_network_policy
+            .record_upstream_failure(&completed.id, "h264");
+        assert_eq!(
+            RuntimeTestHlsWeakNetworkState::UpstreamFailed,
+            state.hls_weak_network_status().state
+        );
 
         let deleted = cache_service
             .delete_library_item(Request::new(DeleteLibraryItemRequest {
@@ -3955,6 +3963,10 @@ mod tests {
                 .is_none()
         );
         assert!(state.hls_sessions.get(&completed.id).is_none());
+        assert_eq!(
+            RuntimeTestHlsWeakNetworkState::Normal,
+            state.hls_weak_network_status().state
+        );
         assert!(state.tasks.get_task(&completed.id).is_err());
         assert!(
             !root_path
@@ -5618,7 +5630,7 @@ mod tests {
             .expect("primary HLS session should become completed");
 
         state.completed_hls_cache_playback_supported = false;
-        state.hls_sessions.remove(&child_session_id);
+        state.remove_hls_playback_session(&child_session_id);
 
         assert!(
             state
@@ -6111,7 +6123,7 @@ mod tests {
         .await;
         assert_eq!(StatusCode::OK, direct_master.status());
         assert!(restored.hls_sessions.get(&creation.task.id).is_some());
-        restored.hls_sessions.remove(&creation.task.id);
+        restored.remove_hls_playback_session(&creation.task.id);
 
         let library_service = LibraryGrpcService::new(restored.clone());
         let item = library_service
