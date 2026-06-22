@@ -597,10 +597,16 @@ impl HlsCacheStore {
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
         check_fill_control(control)?;
-        if self.cached_resource(session_id, &resource.id).is_some()
-            || self.prewarmed_resource(session_id, &resource.id).is_some()
-        {
+        if self.cached_resource(session_id, &resource.id).is_some() {
             return Ok(());
+        }
+        if let Some(prewarmed) = self.prewarmed_resource(session_id, &resource.id) {
+            let target_prefix_length =
+                hls_first_window_prefetch_prefix_bytes(resource).min(prewarmed.total_length);
+            if prewarmed.prefix_length >= target_prefix_length {
+                return Ok(());
+            }
+            self.remove_prewarmed_resource(session_id, &resource.id)?;
         }
 
         let session_dir = self.session_dir(session_id)?;
@@ -2799,6 +2805,58 @@ mod tests {
             large_prefetch_fake_mp4().len() as u64,
             prewarmed.total_length
         );
+    }
+
+    #[tokio::test]
+    async fn prewarm_refetches_legacy_prefix_below_first_window_target() {
+        let (upstream_url, _task) = start_large_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-legacy-window-upgrade", &upstream_url);
+        session.variant.video.request.size = Some(large_prefetch_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(800_000);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        std::fs::write(
+            store
+                .resource_prewarm_path(&session.id, "video.m4s")
+                .expect("prewarm resource path should be valid"),
+            &large_prefetch_fake_mp4()[..HLS_PREWARM_HEAD_BYTES as usize],
+        )
+        .expect("legacy prewarm resource should be written");
+        write_pretty_json(
+            &store
+                .resource_prewarm_metadata_path(&session.id, "video.m4s")
+                .expect("prewarm metadata path should be valid"),
+            &serde_json::json!({
+                "schema_version": HLS_CACHE_SCHEMA_VERSION,
+                "id": "video.m4s",
+                "content_type": session.variant.video.content_type(),
+                "prefix_length": HLS_PREWARM_HEAD_BYTES,
+                "total_length": large_prefetch_fake_mp4().len() as u64,
+                "initialization_length": 28,
+                "cache_key": PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            }),
+        );
+        let target_prefix_length = hls_first_window_prefetch_prefix_bytes(&session.variant.video);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("legacy prewarm should upgrade to first-window target");
+        let prewarmed = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+
+        assert!(target_prefix_length > HLS_PREWARM_HEAD_BYTES);
+        assert_eq!(target_prefix_length, prewarmed.prefix_length);
+        assert_eq!(target_prefix_length, prewarmed.target_prefix_length);
     }
 
     #[test]
