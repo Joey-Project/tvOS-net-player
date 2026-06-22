@@ -157,7 +157,6 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     public func setPlaybackSpeed(_ speed: PlayerPlaybackSpeed) {
-        markManualInteraction()
         playbackSpeed = speed
         guard let player else {
             statusMessage = "Playback speed \(speed.displayTitle) selected."
