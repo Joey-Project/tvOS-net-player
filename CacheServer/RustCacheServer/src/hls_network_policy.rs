@@ -67,6 +67,7 @@ impl HlsNetworkPolicy {
         now: SystemTime,
     ) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_expired(now);
         let variant = state.variant_mut(session_id, variant_id);
         variant.retrying_until = Some(now + RETRYING_WINDOW);
         variant.last_changed_at = Some(now);
@@ -81,10 +82,9 @@ impl HlsNetworkPolicy {
         now: SystemTime,
     ) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_expired(now);
         let variant = state.variant_mut(session_id, variant_id);
         variant.consecutive_failures = 0;
-        variant.unhealthy_until = None;
-        variant.unhealthy_reason = None;
         if response_time >= SLOW_RESPONSE_THRESHOLD {
             variant.consecutive_slow_responses += 1;
             variant.retrying_until = Some(now + RETRYING_WINDOW);
@@ -94,7 +94,6 @@ impl HlsNetworkPolicy {
             }
         } else {
             variant.consecutive_slow_responses = 0;
-            variant.retrying_until = None;
         }
         variant.last_changed_at = Some(now);
         state.last_changed_at = Some(now);
@@ -107,6 +106,7 @@ impl HlsNetworkPolicy {
         now: SystemTime,
     ) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_expired(now);
         let variant = state.variant_mut(session_id, variant_id);
         variant.consecutive_failures += 1;
         variant.retrying_until = Some(now + RETRYING_WINDOW);
@@ -118,6 +118,7 @@ impl HlsNetworkPolicy {
 
     pub(crate) fn record_cache_hit_at(&self, session_id: &str, now: SystemTime) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_expired(now);
         let Some(session) = state.sessions.get_mut(session_id) else {
             return;
         };
@@ -311,6 +312,36 @@ mod tests {
     }
 
     #[test]
+    fn fast_success_preserves_retrying_window() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_retry_at("session", "1080p", now);
+        policy.record_upstream_success_at(
+            "session",
+            "1080p",
+            Duration::from_millis(50),
+            now + Duration::from_secs(1),
+        );
+
+        assert!(policy.variant_is_advertisable_at(
+            "session",
+            "1080p",
+            now + Duration::from_secs(1)
+        ));
+        let snapshot = policy.snapshot_at(now + Duration::from_secs(1));
+        assert_eq!(HlsWeakNetworkState::Retrying, snapshot.state);
+        assert_eq!(1, snapshot.retrying_variant_count);
+
+        assert_eq!(
+            HlsWeakNetworkState::Normal,
+            policy
+                .snapshot_at(now + RETRYING_WINDOW + Duration::from_secs(1))
+                .state
+        );
+    }
+
+    #[test]
     fn upstream_failure_temporarily_hides_variant_then_recovers() {
         let policy = HlsNetworkPolicy::default();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
@@ -329,6 +360,33 @@ mod tests {
             HlsWeakNetworkState::Normal,
             policy.snapshot_at(recovered_at).state
         );
+    }
+
+    #[test]
+    fn fast_success_does_not_recover_degraded_variant_before_window() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_failure_at("session", "1080p", now);
+        policy.record_upstream_success_at(
+            "session",
+            "1080p",
+            Duration::from_millis(50),
+            now + Duration::from_secs(1),
+        );
+
+        assert!(!policy.variant_is_advertisable_at(
+            "session",
+            "1080p",
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(
+            HlsWeakNetworkState::UpstreamFailed,
+            policy.snapshot_at(now + Duration::from_secs(1)).state
+        );
+
+        let recovered_at = now + DEGRADE_DURATION + Duration::from_secs(1);
+        assert!(policy.variant_is_advertisable_at("session", "1080p", recovered_at));
     }
 
     #[test]

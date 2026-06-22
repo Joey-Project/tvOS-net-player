@@ -147,6 +147,38 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheSummaryIncludesWeakNetworkPolicyStatusWhenEvictionDisabled() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                evictionEnabled: false,
+                usedBytes: 42,
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_CACHE_ONLY",
+                    message: "Serving HLS from local cache while upstream is degraded.",
+                    degradedSessionCount: 1,
+                    unhealthyVariantCount: 1,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 1,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Serving HLS from local cache") == true)
+    }
+
+    @MainActor
     func testRefreshDoesNotWaitForSlowHLSCacheStatus() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(

@@ -105,7 +105,9 @@ public final class CacheLibraryViewModel: ObservableObject {
 
         let used = ByteCountFormatter.string(fromByteCount: hlsCacheStatus.usedBytes, countStyle: .file)
         guard hlsCacheStatus.evictionEnabled else {
-            return "HLS cache uses \(used)."
+            var summary = "HLS cache uses \(used)."
+            appendWeakNetworkSummary(to: &summary, from: hlsCacheStatus)
+            return summary
         }
 
         let max = ByteCountFormatter.string(fromByteCount: hlsCacheStatus.maxBytes, countStyle: .file)
@@ -116,13 +118,17 @@ public final class CacheLibraryViewModel: ObservableObject {
             let evicted = ByteCountFormatter.string(fromByteCount: eviction.evictedBytes, countStyle: .file)
             summary += " Last cleanup freed \(evicted)."
         }
+        appendWeakNetworkSummary(to: &summary, from: hlsCacheStatus)
+        return summary
+    }
+
+    private func appendWeakNetworkSummary(to summary: inout String, from hlsCacheStatus: HLSCacheStatus) {
         if let weakNetwork = hlsCacheStatus.weakNetwork,
             weakNetwork.isActive,
             !weakNetwork.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             summary += " \(weakNetwork.message)"
         }
-        return summary
     }
 
     public var hasPendingSearch: Bool {
