@@ -225,7 +225,7 @@ struct ContentView: View {
             manualStreamControls
             bilibiliControls
             selectedCacheItemControls
-            playerSurface
+            playbackArea
         }
         .padding(24)
     }
@@ -538,6 +538,13 @@ struct ContentView: View {
         }
     }
 
+    private var playbackArea: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            playerSurface
+            playbackControls
+        }
+    }
+
     private var playerSurface: some View {
         Group {
             if let player = model.player {
@@ -551,6 +558,39 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.black.opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var playbackControls: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.skipBackward()
+            } label: {
+                Label("10s", systemImage: "gobackward.10")
+            }
+            .disabled(!model.canUsePlaybackControls)
+
+            Button {
+                model.skipForward()
+            } label: {
+                Label("10s", systemImage: "goforward.10")
+            }
+            .disabled(!model.canUsePlaybackControls)
+
+            Picker("Speed", selection: playbackSpeedBinding) {
+                ForEach(PlayerPlaybackSpeed.allCases) { speed in
+                    Text(speed.displayTitle).tag(speed)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 280)
+        }
+    }
+
+    private var playbackSpeedBinding: Binding<PlayerPlaybackSpeed> {
+        Binding(
+            get: { model.playbackSpeed },
+            set: { model.setPlaybackSpeed($0) }
+        )
     }
 
     private func playCachedItem(_ item: CacheLibraryItem) async {
