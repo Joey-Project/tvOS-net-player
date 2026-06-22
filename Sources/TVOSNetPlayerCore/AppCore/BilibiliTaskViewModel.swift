@@ -565,7 +565,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         let options = currentPlaybackOptions
 
-        if resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
+        if currentTask == nil, resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
             if let selectionRequest = cachedResolvedPlaybackRequest {
                 await createPlaybackTask(
                     source: source,

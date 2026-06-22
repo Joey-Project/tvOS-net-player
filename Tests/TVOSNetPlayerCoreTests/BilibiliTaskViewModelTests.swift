@@ -973,6 +973,51 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitWithExistingTaskReResolvesInsteadOfReusingCachedSelection() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1dynamic",
+                        candidates: [
+                            .fixture(selectionID: "page:old", title: "Old Item", index: 1)
+                        ],
+                        defaultSelectionID: "page:old"
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1dynamic",
+                        candidates: [
+                            .fixture(selectionID: "page:new", title: "New Item", index: 1)
+                        ],
+                        defaultSelectionID: "page:new"
+                    )),
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1dynamic", state: "TASK_STATE_PREPARING")),
+                .success(.fixture(id: "bilibili-playback-2", source: "BV1dynamic", state: "TASK_STATE_PREPARING")),
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1dynamic",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertNotNil(model.currentTask)
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.map(\.urlOrID), ["BV1dynamic", "BV1dynamic"])
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.map(\.selectionID), ["page:old", "page:new"])
+        XCTAssertEqual(model.currentTask?.id, "bilibili-playback-2")
+
+        model.clearTask()
+    }
+
     func testReResolveWithInvalidEndpointKeepsExistingCandidates() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
