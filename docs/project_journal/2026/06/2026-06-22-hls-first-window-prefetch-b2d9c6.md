@@ -19,7 +19,7 @@ superseded_by:
 ## Current State
 - HLS prewarm now requests `1 MiB + 30 seconds` of the resource bitrate, capped at 8 MiB and clamped to known resource size when BBDown provides one.
 - Prewarmed resource metadata records the requested target prefix and target window seconds while preserving backwards compatibility with older `.prewarm.json` sidecars.
-- Existing prewarm sidecars are reused only when their prefix already covers the current first-window target; shorter legacy prefixes are discarded and refetched.
+- Existing prewarm sidecars are reused only when their prefix already covers the current first-window target; shorter legacy prefixes are upgraded while preserving the old prefix if the replacement fetch fails.
 - The HTTP media path continues to serve byte ranges from prewarmed partial resources when the requested range is fully covered, then falls back to upstream proxying otherwise.
 - The background finalizer task status now reports first playback window prefetch separately from later full offline cache fill.
 
