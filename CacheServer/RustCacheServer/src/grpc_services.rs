@@ -37,7 +37,7 @@ use crate::{
     hls::HlsPlaybackSession,
     hls_cache::{
         HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
-        hls_session_declared_size_bytes, sanitized_completed_session, timestamp_from_system_time,
+        completed_runtime_session, hls_session_declared_size_bytes, timestamp_from_system_time,
     },
     hls_fill_scheduler::HlsFillPreemptionToken,
     library::ROOT_ID,
@@ -1498,7 +1498,7 @@ async fn run_hls_cache_finalization_inner(
                 Ok(task) if task.state() == TaskState::Completed => {
                     state
                         .hls_sessions
-                        .insert(sanitized_completed_session(&session));
+                        .insert(completed_runtime_session(&session));
                     if let Err(error) = state.enforce_hls_cache_quota(
                         "after_hls_finalization",
                         [session_id.clone()],
@@ -2009,6 +2009,7 @@ mod tests {
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
             ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
+        hls_cache::sanitized_completed_session,
     };
     use axum::{
         Router,
@@ -3114,6 +3115,93 @@ mod tests {
             .expect("secondary primary completed cache should be readable")
             .into_inner();
         assert_eq!(second_result_id, library_item.source_id);
+    }
+
+    #[tokio::test]
+    async fn completed_playback_task_keeps_runtime_hls_alternates_after_finalization() {
+        let (selected_upstream_url, _selected_upstream_task) = start_mp4_upstream().await;
+        let (alternate_upstream_url, _alternate_upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let service = TaskGrpcService::new(state.clone());
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1runtime-alternate".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+        planner_started
+            .await
+            .expect("background playback planner should start");
+        plan_sender
+            .send(Ok(sample_playback_plan_with_alternate_video_urls(
+                &selected_upstream_url,
+                &alternate_upstream_url,
+            )))
+            .expect("test should send playback plan");
+
+        let completed = wait_for_task_state(&state.tasks, &created.id, TaskState::Completed).await;
+        let runtime_session = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(session) = state.hls_sessions.get(&completed.id)
+                    && session.variant.video.request.url.is_empty()
+                {
+                    break session;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed runtime HLS session should remain registered");
+
+        assert_eq!(1, runtime_session.alternate_variants.len());
+        assert!(
+            runtime_session
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
+        );
+        assert!(
+            runtime_session
+                .media_playlist_resource("v1-video.m3u8")
+                .is_some()
+        );
+        assert_eq!(
+            alternate_upstream_url,
+            runtime_session
+                .media_resource("v1-video.m4s")
+                .expect("runtime alternate media resource should remain serveable")
+                .request
+                .url
+        );
+
+        let persisted_session = state
+            .hls_cache
+            .completed_session(&completed.id)
+            .expect("completed HLS session should persist");
+        assert!(persisted_session.alternate_variants.is_empty());
+        assert!(
+            !persisted_session
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
+        );
     }
 
     #[tokio::test]
@@ -8603,6 +8691,43 @@ mod tests {
                     },
                 }),
                 variants: vec![selected_variant],
+            }],
+        }
+    }
+
+    fn sample_playback_plan_with_alternate_video_urls(
+        selected_url: &str,
+        alternate_url: &str,
+    ) -> BilibiliPlaybackPlan {
+        let mut selected_variant =
+            playback_variant_with_url("h264", "avc1.640028", 1_000_000, selected_url);
+        selected_variant.abr = Some(playback_abr_level(0, 2));
+        let mut alternate_variant =
+            playback_variant_with_url("h264-720p", "avc1.640028", 600_000, alternate_url);
+        alternate_variant.width = Some(1280);
+        alternate_variant.height = Some(720);
+        alternate_variant.abr = Some(playback_abr_level(1, 2));
+        BilibiliPlaybackPlan {
+            title: "Example".to_owned(),
+            entries: vec![BilibiliPlaybackEntry {
+                index: 1,
+                aid: 1,
+                bvid: Some("BV1offline".to_owned()),
+                cid: 1,
+                epid: None,
+                title: "Offline Episode".to_owned(),
+                content_id: "BV1offline-cid1".to_owned(),
+                duration_seconds: Some(60),
+                abr: sample_playback_abr_metadata(vec!["h264", "h264-720p"], 600_000, 1_000_000),
+                selected_variant: Some(BilibiliSelectedPlaybackVariant {
+                    variant: selected_variant.clone(),
+                    selection: BilibiliPlaybackVariantSelection {
+                        policy: BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault,
+                        codec_rank: Some(1),
+                        score: 100,
+                    },
+                }),
+                variants: vec![selected_variant, alternate_variant],
             }],
         }
     }

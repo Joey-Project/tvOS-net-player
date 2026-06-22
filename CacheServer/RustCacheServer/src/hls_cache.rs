@@ -1510,12 +1510,17 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
+    let mut session = completed_runtime_session(session);
+    session.alternate_variants.clear();
+    session
+}
+
+pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {
         sanitize_completed_resource(audio);
     }
-    session.alternate_variants.clear();
     session
 }
 
