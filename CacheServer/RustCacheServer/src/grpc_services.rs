@@ -637,7 +637,10 @@ impl CacheService for CacheGrpcService {
                 .map(proto_hls_eviction_summary),
             weak_network: Some(proto_hls_weak_network_status(&weak_network)),
             transcoding: Some(proto_lan_transcoding_status(
-                &LanTranscodingStatusSnapshot::from_options(&self.state.options, 0),
+                &LanTranscodingStatusSnapshot::from_options(
+                    &self.state.options,
+                    self.state.lan_transcoding_active_job_count(),
+                ),
             )),
         }))
     }
@@ -1561,7 +1564,7 @@ async fn run_hls_cache_finalization_inner(
     }
     let projected_added_bytes = state
         .hls_cache
-        .session_projected_remaining_size_bytes(&session)
+        .session_projected_finalization_added_size_bytes(&session)
         .unwrap_or_default();
     if let Err(error) = state.enforce_hls_cache_quota_until_cancelled(
         "before_hls_finalization",
@@ -1582,25 +1585,26 @@ async fn run_hls_cache_finalization_inner(
     let progress = hls_cache_progress_reporter(&state, &task_id);
     match state
         .hls_cache
-        .cache_session_resources_with_control(
+        .cache_session_resources_completion_with_control(
             &state.hls_upstream_client,
             &session,
             control,
             progress,
+            state.hls_transcoding_execution_config(),
         )
         .await
     {
-        Ok(library_item_id) => {
+        Ok(completion) => {
             let finalized = state.tasks.complete_playback_hls_session_cached(
                 &task_id,
                 &session_id,
-                library_item_id,
+                completion.library_item_id,
             );
             match finalized {
                 Ok(task) if task.state() == TaskState::Completed => {
                     state
                         .hls_sessions
-                        .insert(completed_runtime_session(&session));
+                        .insert(completed_runtime_session(&completion.session));
                     if let Err(error) = state.enforce_hls_cache_quota(
                         "after_hls_finalization",
                         [session_id.clone()],
@@ -2096,7 +2100,7 @@ mod tests {
     use std::{
         collections::HashMap,
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -7706,6 +7710,127 @@ mod tests {
         assert!(runtime_session.variant.video.request.headers.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_cache_finalizer_transcodes_ready_session_to_generated_runtime() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                lan_transcoding_enabled: true,
+                lan_transcoding_ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, mut hls_session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1transcode", &upstream_url);
+        mark_hls_session_transcoding_ready(&mut hls_session);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
+
+        run_hls_cache_finalization(
+            state.clone(),
+            task_id.clone(),
+            hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        )
+        .await;
+
+        let completed = state
+            .tasks
+            .get_task(&task_id)
+            .expect("task should remain readable");
+        let runtime_session = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("completed cache should keep a runtime HLS session");
+        let restored_session = state
+            .hls_cache
+            .completed_session(&task_id)
+            .expect("completed transcoded session should be persisted");
+        let item = state
+            .hls_cache
+            .get_completed_library_item(&library_item_id)
+            .expect("completed transcoded session should expose a library item");
+
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(library_item_id, completed.library_item_id);
+        assert_eq!("transcoded.m4s", runtime_session.variant.video.id);
+        assert_eq!("transcoded.m4s", restored_session.variant.video.id);
+        assert!(runtime_session.variant.audio.is_none());
+        assert!(runtime_session.variant.video.request.url.is_empty());
+        assert_eq!("avc1.64002A", item.variants[0].video_codec);
+        assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
+        assert_eq!(0, state.lan_transcoding_active_job_count());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_cache_finalizer_does_not_transcode_ready_session_when_disabled() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let ffmpeg_path = write_copying_fake_ffmpeg(temp.path());
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                lan_transcoding_enabled: false,
+                lan_transcoding_ffmpeg_path: ffmpeg_path,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, mut hls_session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1transcode-disabled", &upstream_url);
+        mark_hls_session_transcoding_ready(&mut hls_session);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
+
+        run_hls_cache_finalization(
+            state.clone(),
+            task_id.clone(),
+            hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        )
+        .await;
+
+        let task = state
+            .tasks
+            .get_task(&task_id)
+            .expect("task should remain readable");
+
+        assert_eq!(TaskState::Playable, task.state());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_none()
+        );
+        assert!(!temp.path().join("ffmpeg-args.log").exists());
+        assert_eq!(0, state.lan_transcoding_active_job_count());
+    }
+
     #[tokio::test]
     async fn app_state_hides_cancelled_hls_cache_session_after_restart() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
@@ -8395,6 +8520,26 @@ mod tests {
         assert!(matches!(error, crate::hls_cache::HlsCacheError::Preempted));
 
         PartialHlsTestTask { task_id }
+    }
+
+    fn mark_hls_session_transcoding_ready(session: &mut HlsPlaybackSession) {
+        let mut audio = session.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = BilibiliMediaRequestKind::Audio;
+        audio.request.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
+        audio.request.cache_key.source_hash = "audio-source-hash".to_owned();
+        session.variant.audio = Some(audio);
+        session.variant.codecs = vec!["hev1.1.6.L120.90".to_owned()];
+        session.variant.video.request.codecs = Some("hev1.1.6.L120.90".to_owned());
+        session.variant.video.request.cache_key.codecs = Some("hev1.1.6.L120.90".to_owned());
+        session.variant.video.request.cache_key.source_hash = "hevc-source-hash".to_owned();
+        session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Ready,
+            session.variant.id.clone(),
+            "HEVC source should be converted before completed offline cache exposure.",
+        );
     }
 
     fn create_playable_hls_playback_task(
@@ -9290,6 +9435,37 @@ mod tests {
         bytes.extend(mp4_box(*b"moof", b"frag"));
         bytes.extend(mp4_box(*b"mdat", b"media-data"));
         bytes
+    }
+
+    #[cfg(unix)]
+    fn write_copying_fake_ffmpeg(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-ffmpeg-copy");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+last=
+input=
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "-i" ] && [ -z "$input" ]; then
+    input=$arg
+  fi
+  last=$arg
+  previous=$arg
+done
+cp "$input" "$last"
+"#,
+        )
+        .expect("fake ffmpeg should be written");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake ffmpeg metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("fake ffmpeg should be executable");
+        path
     }
 
     fn mp4_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {

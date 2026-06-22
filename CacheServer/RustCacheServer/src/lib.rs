@@ -21,7 +21,10 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -50,7 +53,8 @@ use crate::{
     hls::{HlsPlaybackRegistry, HlsPlaybackSession},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
-        HlsCacheStatusSnapshot, HlsCacheStore, sanitized_completed_session,
+        HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
+        sanitized_completed_session,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -83,6 +87,8 @@ pub struct AppState {
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) lan_transcoding_permits: Arc<Semaphore>,
+    pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) completed_hls_cache_playback_supported: bool,
@@ -234,6 +240,10 @@ impl AppState {
         ));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
+        let lan_transcoding_permits = Arc::new(Semaphore::new(
+            options.lan_transcoding_max_concurrent_jobs.max(1),
+        ));
+        let lan_transcoding_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
 
@@ -248,6 +258,8 @@ impl AppState {
             playback_planner,
             playback_planning_permits,
             hls_cache_finalization_permits,
+            lan_transcoding_permits,
+            lan_transcoding_active_jobs,
             hls_fill_scheduler,
             hls_network_policy,
             completed_hls_cache_playback_supported,
@@ -601,6 +613,22 @@ impl AppState {
                 .lock()
                 .expect("HLS cache eviction summary lock poisoned")
                 .clone(),
+        })
+    }
+
+    pub(crate) fn lan_transcoding_active_job_count(&self) -> usize {
+        self.lan_transcoding_active_jobs.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn hls_transcoding_execution_config(&self) -> Option<HlsTranscodingExecutionConfig> {
+        if !self.options.lan_transcoding_enabled {
+            return None;
+        }
+
+        Some(HlsTranscodingExecutionConfig {
+            ffmpeg_path: self.options.lan_transcoding_ffmpeg_path.clone(),
+            permits: Arc::clone(&self.lan_transcoding_permits),
+            active_job_count: Arc::clone(&self.lan_transcoding_active_jobs),
         })
     }
 

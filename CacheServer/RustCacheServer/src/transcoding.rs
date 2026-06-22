@@ -1,3 +1,16 @@
+use std::{
+    ffi::OsString,
+    path::Path,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
+
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::sleep,
+};
+
 use crate::{
     bbdown_adapter::{BilibiliMediaRequest, BilibiliPlaybackVariant},
     codecs::{codec_list_matches, is_aac_codec, is_h264_codec},
@@ -5,10 +18,23 @@ use crate::{
 };
 
 pub(crate) const LAN_TRANSCODING_PROFILE_ID: &str = "avplayer-h264-aac-hls-v1";
+pub(crate) const LAN_TRANSCODING_VIDEO_CODEC: &str = "avc1.64002A";
+pub(crate) const LAN_TRANSCODING_AUDIO_CODEC: &str = "mp4a.40.2";
+pub(crate) const LAN_TRANSCODING_MAX_WIDTH: u32 = 1920;
+pub(crate) const LAN_TRANSCODING_MAX_HEIGHT: u32 = 1080;
+pub(crate) const LAN_TRANSCODING_MAX_FRAME_RATE: f64 = 60.0;
+pub(crate) const LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS: u64 = 10_000_000;
+pub(crate) const LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS: u64 = 128_000;
 const TARGET_CONTAINER: &str = "hls/fmp4";
 const TARGET_VIDEO_CODEC: &str = "h264";
 const TARGET_AUDIO_CODEC: &str = "aac";
 const OUTPUT_PROTOCOL: &str = "hls";
+const HLS_FFMPEG_TRANSCODE_LEVEL: &str = "4.2";
+const HLS_FFMPEG_TRANSCODE_VIDEO_MAXRATE: &str = "10000k";
+const HLS_FFMPEG_TRANSCODE_VIDEO_BUFSIZE: &str = "20000k";
+const HLS_FFMPEG_TRANSCODE_FILTER: &str = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=fps='min(source_fps,60)'";
+const FFMPEG_STDERR_TAIL_MAX_BYTES: usize = 16 * 1024;
+const FFMPEG_STDERR_TAIL_MAX_CHARS: usize = 1200;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LanTranscodingProfile {
@@ -105,6 +131,49 @@ pub(crate) struct HlsTranscodingPlan {
     pub(crate) output_protocol: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LanTranscodingJobControl {
+    Continue,
+    Cancel,
+    Preempt,
+}
+
+#[derive(Debug)]
+pub(crate) enum LanTranscodingError {
+    Io(std::io::Error),
+    Failed {
+        status: ExitStatus,
+        stderr_tail: String,
+    },
+    Cancelled,
+    Preempted,
+}
+
+impl From<std::io::Error> for LanTranscodingError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::fmt::Display for LanTranscodingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "LAN transcoding I/O error: {error}"),
+            Self::Failed {
+                status,
+                stderr_tail,
+            } => write!(
+                formatter,
+                "LAN transcoding ffmpeg failed with status {status}: {stderr_tail}"
+            ),
+            Self::Cancelled => formatter.write_str("LAN transcoding was cancelled"),
+            Self::Preempted => formatter.write_str("LAN transcoding was preempted"),
+        }
+    }
+}
+
+impl std::error::Error for LanTranscodingError {}
+
 impl Default for HlsTranscodingPlan {
     fn default() -> Self {
         Self::with_state(
@@ -170,6 +239,184 @@ impl HlsTranscodingPlan {
     }
 }
 
+pub(crate) async fn run_hls_ffmpeg_transcode<F>(
+    ffmpeg_path: &Path,
+    video_path: &Path,
+    audio_path: Option<&Path>,
+    output_path: &Path,
+    control: &F,
+) -> Result<(), LanTranscodingError>
+where
+    F: Fn() -> LanTranscodingJobControl,
+{
+    match control() {
+        LanTranscodingJobControl::Continue => {}
+        LanTranscodingJobControl::Cancel => return Err(LanTranscodingError::Cancelled),
+        LanTranscodingJobControl::Preempt => return Err(LanTranscodingError::Preempted),
+    }
+
+    let args = hls_ffmpeg_transcode_args(video_path, audio_path, output_path);
+    let mut child = Command::new(ffmpeg_path)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::other("LAN transcoding ffmpeg stderr pipe was not captured")
+    })?;
+    let stderr_task = tokio::spawn(read_ffmpeg_stderr_tail(stderr));
+
+    loop {
+        match control() {
+            LanTranscodingJobControl::Continue => {}
+            LanTranscodingJobControl::Cancel => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+                return Err(LanTranscodingError::Cancelled);
+            }
+            LanTranscodingJobControl::Preempt => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+                return Err(LanTranscodingError::Preempted);
+            }
+        }
+
+        if let Some(status) = child.try_wait()? {
+            let stderr = collect_ffmpeg_stderr(stderr_task).await?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(LanTranscodingError::Failed {
+                status,
+                stderr_tail: stderr_tail(&stderr),
+            });
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn hls_ffmpeg_transcode_args(
+    video_path: &Path,
+    audio_path: Option<&Path>,
+    output_path: &Path,
+) -> Vec<OsString> {
+    let mut args = Vec::new();
+    push_args(&mut args, ["-y", "-nostdin", "-i"]);
+    args.push(video_path.as_os_str().to_owned());
+    if let Some(audio_path) = audio_path {
+        args.push(OsString::from("-i"));
+        args.push(audio_path.as_os_str().to_owned());
+    }
+    push_args(&mut args, ["-map", "0:v:0"]);
+    if audio_path.is_some() {
+        push_args(&mut args, ["-map", "1:a:0"]);
+    }
+    push_args(
+        &mut args,
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "high",
+            "-level:v",
+            HLS_FFMPEG_TRANSCODE_LEVEL,
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            HLS_FFMPEG_TRANSCODE_FILTER,
+            "-maxrate",
+            HLS_FFMPEG_TRANSCODE_VIDEO_MAXRATE,
+            "-bufsize",
+            HLS_FFMPEG_TRANSCODE_VIDEO_BUFSIZE,
+        ],
+    );
+    if audio_path.is_some() {
+        push_args(&mut args, ["-c:a", "aac", "-b:a", "128k"]);
+    } else {
+        args.push(OsString::from("-an"));
+    }
+    push_args(
+        &mut args,
+        [
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+        ],
+    );
+    args.push(output_path.as_os_str().to_owned());
+    args
+}
+
+fn push_args<const N: usize>(args: &mut Vec<OsString>, values: [&str; N]) {
+    args.extend(values.into_iter().map(OsString::from));
+}
+
+async fn collect_ffmpeg_stderr(
+    stderr_task: tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+) -> Result<Vec<u8>, LanTranscodingError> {
+    match stderr_task.await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(LanTranscodingError::Io(error)),
+        Err(error) => Err(LanTranscodingError::Io(std::io::Error::other(error))),
+    }
+}
+
+async fn read_ffmpeg_stderr_tail<R>(mut stderr: R) -> Result<Vec<u8>, std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let bytes_read = stderr.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(tail);
+        }
+        append_ffmpeg_stderr_tail(&mut tail, &buffer[..bytes_read]);
+    }
+}
+
+fn append_ffmpeg_stderr_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= FFMPEG_STDERR_TAIL_MAX_BYTES {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - FFMPEG_STDERR_TAIL_MAX_BYTES..]);
+        return;
+    }
+
+    tail.extend_from_slice(bytes);
+    let overflow = tail.len().saturating_sub(FFMPEG_STDERR_TAIL_MAX_BYTES);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+}
+
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    let max_chars = FFMPEG_STDERR_TAIL_MAX_CHARS;
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
 fn variant_is_avplayer_h264_aac_hls_compatible(variant: &BilibiliPlaybackVariant) -> bool {
     let Some(video) = variant.video.as_ref() else {
         return false;
@@ -228,6 +475,38 @@ mod tests {
         assert_eq!(LanTranscodingRuntimeState::Busy, status.state);
         assert_eq!(1, status.active_job_count);
         assert_eq!(2, status.max_concurrent_jobs);
+    }
+
+    #[test]
+    fn hls_ffmpeg_args_pin_declared_h264_level() {
+        let args = hls_ffmpeg_transcode_args(
+            Path::new("video.m4s"),
+            Some(Path::new("audio.m4s")),
+            Path::new("output.m4s"),
+        );
+        let rendered = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("-profile:v\nhigh\n"));
+        assert!(rendered.contains("-level:v\n4.2\n"));
+        assert!(rendered.contains("-vf\nscale=w='min(1920,iw)'"));
+        assert!(rendered.contains("fps=fps='min(source_fps,60)'"));
+        assert!(rendered.contains("-maxrate\n10000k\n"));
+        assert!(rendered.contains("-bufsize\n20000k\n"));
+    }
+
+    #[test]
+    fn ffmpeg_stderr_tail_keeps_bounded_recent_bytes() {
+        let mut tail = Vec::new();
+
+        append_ffmpeg_stderr_tail(&mut tail, &vec![b'a'; FFMPEG_STDERR_TAIL_MAX_BYTES + 1024]);
+        append_ffmpeg_stderr_tail(&mut tail, b"synthetic ffmpeg error tail");
+
+        assert_eq!(FFMPEG_STDERR_TAIL_MAX_BYTES, tail.len());
+        assert!(tail.ends_with(b"synthetic ffmpeg error tail"));
     }
 
     #[test]
