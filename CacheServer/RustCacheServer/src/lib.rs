@@ -12,6 +12,7 @@ mod hls_fill_scheduler;
 mod hls_network_policy;
 pub mod library;
 pub mod media;
+mod mp4_segments;
 pub mod playback;
 pub mod task_registry;
 mod task_store;

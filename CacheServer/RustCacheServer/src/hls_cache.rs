@@ -29,10 +29,11 @@ use crate::{
     },
     hls::{
         HlsAbrGroup, HlsAbrGroupKind, HlsAbrLevel, HlsAbrMetadata, HlsMediaResource,
-        HlsMediaResourceMetadata, HlsPlaybackSession, HlsVariant, HlsVariantMetadata,
-        mp4_initialization_length, should_forward_media_request_header,
+        HlsMediaResourceMetadata, HlsMediaSegment, HlsPlaybackSession, HlsVariant,
+        HlsVariantMetadata, mp4_initialization_length, should_forward_media_request_header,
     },
     library::{OpenedMediaFile, open_read_no_follow},
+    mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
         LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
@@ -407,12 +408,18 @@ impl HlsCacheStore {
         {
             return None;
         }
+        let segments = validated_cached_segments(
+            metadata.segments,
+            metadata.initialization_length,
+            metadata.total_length,
+        );
 
         Some(CachedHlsResource {
             path: file_path,
             content_type: metadata.content_type,
             initialization_length: metadata.initialization_length,
             total_length: metadata.total_length,
+            segments,
             last_modified: file_metadata.modified().unwrap_or(UNIX_EPOCH),
         })
     }
@@ -784,6 +791,10 @@ impl HlsCacheStore {
                 "LAN transcoding output MP4 initialization range was invalid".to_owned(),
             ));
         }
+        let segments = hls_segments_from_mp4_ranges(
+            mp4_fragment_ranges(&temp_path, initialization_length, total_length)
+                .unwrap_or_default(),
+        );
         if let Err(error) = self.reject_cache_path_symlink(&output_path) {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(error.into());
@@ -797,6 +808,10 @@ impl HlsCacheStore {
             content_type: "video/mp4".to_owned(),
             total_length,
             initialization_length,
+            segments: segments
+                .into_iter()
+                .map(PersistedHlsMediaSegment::from)
+                .collect(),
             cache_key: PersistedBilibiliMediaCacheKey::from(
                 completed_session.variant.video.request.cache_key.clone(),
             ),
@@ -1290,6 +1305,10 @@ impl HlsCacheStore {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(error);
                     }
+                    let segments = hls_segments_from_mp4_ranges(
+                        mp4_fragment_ranges(&temp_path, initialization_length, total_length)
+                            .unwrap_or_default(),
+                    );
                     if let Err(error) = self.reject_cache_path_symlink(&resource_path) {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(error.into());
@@ -1301,6 +1320,10 @@ impl HlsCacheStore {
                         content_type: resource.content_type().to_owned(),
                         total_length,
                         initialization_length,
+                        segments: segments
+                            .into_iter()
+                            .map(PersistedHlsMediaSegment::from)
+                            .collect(),
                         cache_key: PersistedBilibiliMediaCacheKey::from(
                             resource.request.cache_key.clone(),
                         ),
@@ -1731,12 +1754,64 @@ fn managed_resource_id_from_file_name(file_name: &str) -> Option<&str> {
     Some(file_name)
 }
 
+fn hls_segments_from_mp4_ranges(ranges: Vec<Mp4SegmentRange>) -> Vec<HlsMediaSegment> {
+    ranges
+        .into_iter()
+        .map(|range| HlsMediaSegment {
+            byte_range_offset: range.offset,
+            byte_range_length: range.length,
+            duration_millis: range.duration_millis,
+        })
+        .collect()
+}
+
+fn validated_cached_segments(
+    segments: Vec<PersistedHlsMediaSegment>,
+    initialization_length: u64,
+    total_length: u64,
+) -> Vec<HlsMediaSegment> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut previous_end = initialization_length;
+    let mut validated = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if segment.byte_range_length == 0
+            || segment.duration_millis == 0
+            || segment.byte_range_offset != previous_end
+        {
+            return Vec::new();
+        }
+        let end = segment
+            .byte_range_offset
+            .checked_add(segment.byte_range_length);
+        let Some(end) = end else {
+            return Vec::new();
+        };
+        if end > total_length {
+            return Vec::new();
+        }
+        previous_end = end;
+        validated.push(HlsMediaSegment {
+            byte_range_offset: segment.byte_range_offset,
+            byte_range_length: segment.byte_range_length,
+            duration_millis: segment.duration_millis,
+        });
+    }
+    if previous_end == total_length {
+        validated
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CachedHlsResource {
     pub(crate) path: PathBuf,
     pub(crate) content_type: String,
     pub(crate) initialization_length: u64,
     pub(crate) total_length: u64,
+    pub(crate) segments: Vec<HlsMediaSegment>,
     pub(crate) last_modified: SystemTime,
 }
 
@@ -3026,7 +3101,27 @@ struct PersistedHlsCachedResource {
     content_type: String,
     total_length: u64,
     initialization_length: u64,
+    #[serde(default)]
+    segments: Vec<PersistedHlsMediaSegment>,
     cache_key: PersistedBilibiliMediaCacheKey,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsMediaSegment {
+    byte_range_offset: u64,
+    byte_range_length: u64,
+    #[serde(default)]
+    duration_millis: u64,
+}
+
+impl From<HlsMediaSegment> for PersistedHlsMediaSegment {
+    fn from(segment: HlsMediaSegment) -> Self {
+        Self {
+            byte_range_offset: segment.byte_range_offset,
+            byte_range_length: segment.byte_range_length,
+            duration_millis: segment.duration_millis,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4344,6 +4439,7 @@ mod tests {
                     content_type: resource.content_type().to_owned(),
                     total_length: source_size,
                     initialization_length: 28,
+                    segments: Vec::new(),
                     cache_key: PersistedBilibiliMediaCacheKey::from(
                         resource.request.cache_key.clone(),
                     ),
@@ -4693,6 +4789,128 @@ mod tests {
         assert!(store.get_completed_library_item(&item_id).is_none());
     }
 
+    #[test]
+    fn cached_resource_reads_persisted_segment_ranges() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session("session-segment-index", "https://example.test/video.m4s");
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let resource_path = store
+            .resource_path(&session.id, "video.m4s")
+            .expect("resource path should be valid");
+        let mp4 = multi_fragment_fake_mp4();
+        let segments = multi_fragment_fake_mp4_segments();
+        std::fs::write(&resource_path, &mp4).expect("cached resource should be written");
+        let metadata_path = store
+            .resource_metadata_path(&session.id, "video.m4s")
+            .expect("metadata path should be valid");
+        let mut metadata = cached_metadata_for_session(&session, "video.m4s");
+        metadata.total_length = mp4.len() as u64;
+        metadata.initialization_length = multi_fragment_fake_mp4_initialization_length();
+        metadata.segments = segments.clone();
+        write_pretty_json(&metadata_path, &metadata);
+
+        let cached = store
+            .cached_resource(&session.id, "video.m4s")
+            .expect("cached resource should load");
+
+        assert_eq!(
+            segments
+                .into_iter()
+                .map(|segment| HlsMediaSegment {
+                    byte_range_offset: segment.byte_range_offset,
+                    byte_range_length: segment.byte_range_length,
+                    duration_millis: segment.duration_millis,
+                })
+                .collect::<Vec<_>>(),
+            cached.segments
+        );
+    }
+
+    #[test]
+    fn cached_resource_accepts_legacy_metadata_without_segment_ranges() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "session-legacy-segment-index",
+            "https://example.test/video.m4s",
+        );
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let resource_path = store
+            .resource_path(&session.id, "video.m4s")
+            .expect("resource path should be valid");
+        std::fs::write(&resource_path, fake_mp4()).expect("cached resource should be written");
+        let metadata_path = store
+            .resource_metadata_path(&session.id, "video.m4s")
+            .expect("metadata path should be valid");
+        write_pretty_json(
+            &metadata_path,
+            &serde_json::json!({
+                "schema_version": HLS_CACHE_SCHEMA_VERSION,
+                "id": "video.m4s",
+                "content_type": session.variant.video.content_type(),
+                "total_length": fake_mp4().len() as u64,
+                "initialization_length": 28,
+                "cache_key": PersistedBilibiliMediaCacheKey::from(
+                    session.variant.video.request.cache_key.clone(),
+                ),
+            }),
+        );
+
+        let cached = store
+            .cached_resource(&session.id, "video.m4s")
+            .expect("legacy cached resource should load");
+
+        assert!(cached.segments.is_empty());
+    }
+
+    #[test]
+    fn cached_resource_drops_invalid_persisted_segment_ranges() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_session(
+            "session-invalid-segment-index",
+            "https://example.test/video.m4s",
+        );
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let resource_path = store
+            .resource_path(&session.id, "video.m4s")
+            .expect("resource path should be valid");
+        let mp4 = multi_fragment_fake_mp4();
+        std::fs::write(&resource_path, &mp4).expect("cached resource should be written");
+        let metadata_path = store
+            .resource_metadata_path(&session.id, "video.m4s")
+            .expect("metadata path should be valid");
+        let mut metadata = cached_metadata_for_session(&session, "video.m4s");
+        metadata.total_length = mp4.len() as u64;
+        metadata.initialization_length = multi_fragment_fake_mp4_initialization_length();
+        metadata.segments = vec![
+            PersistedHlsMediaSegment {
+                byte_range_offset: metadata.initialization_length,
+                byte_range_length: 10,
+                duration_millis: 1_000,
+            },
+            PersistedHlsMediaSegment {
+                byte_range_offset: metadata.initialization_length + 20,
+                byte_range_length: 10,
+                duration_millis: 1_000,
+            },
+        ];
+        write_pretty_json(&metadata_path, &metadata);
+
+        let cached = store
+            .cached_resource(&session.id, "video.m4s")
+            .expect("cached resource should load without invalid segment index");
+
+        assert!(cached.segments.is_empty());
+    }
+
     #[tokio::test]
     async fn rejects_short_hls_cache_response_with_declared_size() {
         let (upstream_url, _task) = start_short_mp4_upstream().await;
@@ -5018,6 +5236,7 @@ mod tests {
             content_type: session.variant.video.content_type().to_owned(),
             total_length: fake_mp4().len() as u64,
             initialization_length: 28,
+            segments: Vec::new(),
             cache_key: PersistedBilibiliMediaCacheKey::from(
                 session.variant.video.request.cache_key.clone(),
             ),
@@ -6356,6 +6575,82 @@ mod tests {
         bytes
     }
 
+    fn multi_fragment_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(
+            *b"moov",
+            &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+        ));
+        bytes.extend(moof_box(1_000));
+        bytes.extend(mp4_box(*b"mdat", b"first-media"));
+        bytes.extend(moof_box(2_000));
+        bytes.extend(mp4_box(*b"mdat", b"second-media"));
+        bytes
+    }
+
+    fn multi_fragment_fake_mp4_segments() -> Vec<PersistedHlsMediaSegment> {
+        let initialization_length = multi_fragment_fake_mp4_initialization_length();
+        let first_length = (moof_box(1_000).len() + mp4_box(*b"mdat", b"first-media").len()) as u64;
+        let second_length =
+            (moof_box(2_000).len() + mp4_box(*b"mdat", b"second-media").len()) as u64;
+        vec![
+            PersistedHlsMediaSegment {
+                byte_range_offset: initialization_length,
+                byte_range_length: first_length,
+                duration_millis: 1_000,
+            },
+            PersistedHlsMediaSegment {
+                byte_range_offset: initialization_length + first_length,
+                byte_range_length: second_length,
+                duration_millis: 2_000,
+            },
+        ]
+    }
+
+    fn multi_fragment_fake_mp4_initialization_length() -> u64 {
+        (mp4_box(*b"ftyp", b"isom").len()
+            + mp4_box(
+                *b"moov",
+                &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+            )
+            .len()) as u64
+    }
+
+    fn mdhd_box(timescale: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 0, 0]);
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(timescale.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(0_u16.to_be_bytes());
+        mp4_box(*b"mdhd", &payload)
+    }
+
+    fn moof_box(duration: u32) -> Vec<u8> {
+        mp4_box(
+            *b"moof",
+            &mp4_box(*b"traf", &[tfhd_box(1), trun_box(duration)].concat()),
+        )
+    }
+
+    fn tfhd_box(track_id: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 0, 0]);
+        payload.extend(track_id.to_be_bytes());
+        mp4_box(*b"tfhd", &payload)
+    }
+
+    fn trun_box(duration: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 1, 0]);
+        payload.extend(1_u32.to_be_bytes());
+        payload.extend(duration.to_be_bytes());
+        mp4_box(*b"trun", &payload)
+    }
+
     fn large_prefetch_fake_mp4() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(mp4_box(*b"ftyp", b"isom"));
@@ -6395,6 +6690,7 @@ mod tests {
             content_type: resource.content_type().to_owned(),
             total_length: fake_mp4().len() as u64,
             initialization_length: 28,
+            segments: Vec::new(),
             cache_key: PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone()),
         }
     }

@@ -17,7 +17,7 @@ jobs:
   apple-platforms:
     name: tvOS build and tests
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

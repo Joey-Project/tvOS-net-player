@@ -26,7 +26,7 @@ superseded_by:
 - Remote endpoint support now accepts `https://` cache server origin URLs, applies scheme-aware defaults, and uses HTTP/2 TLS for the gRPC control plane.
 - Path-scoped gRPC URLs remain intentionally unsupported; Cloudflare Tunnel or reverse proxy deployments should route the cache control plane at the host root.
 - PR 1 added shared AppCore seek/skip/playback-speed controls and exposed them in both tvOS and macOS while preserving the SwiftUI `VideoPlayer` surface.
-- HLS playback has ABR metadata, multi-variant master output, first-window prefetch, adaptive weak-network policy, LAN transcoding foundation, and a conservative ffmpeg execution MVP. True fMP4 segment-index playlist splitting remains future work.
+- HLS playback has ABR metadata, multi-variant master output, first-window prefetch, adaptive weak-network policy, LAN transcoding foundation, a conservative ffmpeg execution MVP, and completed-resource fMP4 segment-index playlist splitting.
 
 ## PR Plan
 
@@ -63,10 +63,10 @@ superseded_by:
 
 ### PR 4: fMP4 Segment-Index HLS Splitting
 
-- Status: pending.
-- Move beyond whole-resource byte-range playlist output by deriving safe segment boundaries from fMP4 metadata such as `sidx`/`moof`.
-- Keep playlist splitting conservative and avoid fabricated segment boundaries.
-- Feed smaller cache units into prefetch, fill, and weak-network policy.
+- Status: implemented by this slice.
+- Move beyond whole-resource byte-range playlist output for fully cached resources by deriving safe segment boundaries from top-level fMP4 `moof` plus following `mdat` ranges.
+- Keep playlist splitting conservative and avoid fabricated segment boundaries; runtime upstream, first-window prewarm, single-fragment files, malformed fragment metadata, and legacy metadata without segment ranges continue to use the single-range playlist shape.
+- Persist optional segment ranges in per-resource cache metadata so playlist requests do not rescan large media files.
 
 ### PR 5: Playback-Position-Aware Weak Offline UX
 
