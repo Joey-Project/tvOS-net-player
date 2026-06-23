@@ -169,18 +169,19 @@ fn session_id_from_hls_master_uri(uri: &str) -> Option<String> {
         _ => return None,
     }
 
-    let mut segments = parsed.path_segments()?;
-    if segments.next()? != "hls" {
+    let segments: Vec<_> = parsed.path_segments()?.collect();
+    if segments.len() < 3 {
         return None;
     }
-    let session_id = segments.next()?.trim();
+    let hls_segment_index = segments.len() - 3;
+    if segments[hls_segment_index] != "hls" {
+        return None;
+    }
+    let session_id = segments[hls_segment_index + 1].trim();
     if session_id.is_empty() {
         return None;
     }
-    if segments.next()? != "master.m3u8" {
-        return None;
-    }
-    if segments.next().is_some() {
+    if segments[hls_segment_index + 2] != "master.m3u8" {
         return None;
     }
 
@@ -243,6 +244,26 @@ mod tests {
         assert_eq!("session-1", snapshot.session_id);
         assert_eq!("h264", snapshot.variant_id);
         assert_eq!(42.0, snapshot.position_seconds);
+    }
+
+    #[test]
+    fn records_path_prefixed_hls_master_uri_progress() {
+        let tracker = HlsPlaybackProgressTracker::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        let outcome = tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/cache/hls/session-1/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 42.0,
+            duration_seconds: Some(120.0),
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now,
+        });
+
+        assert!(outcome.accepted);
+        assert_eq!("session-1", outcome.session_id);
+        assert_eq!("session-1", tracker.snapshot_at(now).session_id);
     }
 
     #[test]
