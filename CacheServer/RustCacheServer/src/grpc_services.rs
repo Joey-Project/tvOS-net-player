@@ -4861,6 +4861,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_hls_session_clears_playback_progress_status() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1removed-progress", &upstream_url);
+        let service = CacheGrpcService::new(state.clone());
+
+        service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: 120.0,
+                intent: ProtoPlaybackProgressIntent::Playing.into(),
+            }))
+            .await
+            .expect("playback progress should be accepted");
+
+        state.remove_hls_playback_session(&task_id);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::None as i32, playback.state);
+        assert_eq!("", playback.session_id);
+    }
+
+    #[tokio::test]
     async fn hls_cache_quota_evicts_oldest_completed_session_to_low_watermark() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");

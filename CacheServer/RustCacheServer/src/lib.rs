@@ -619,6 +619,7 @@ impl AppState {
     pub(crate) fn remove_hls_playback_session(&self, session_id: &str) {
         self.hls_sessions.remove(session_id);
         self.hls_network_policy.remove_session(session_id);
+        self.hls_playback_progress.remove_session(session_id);
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {

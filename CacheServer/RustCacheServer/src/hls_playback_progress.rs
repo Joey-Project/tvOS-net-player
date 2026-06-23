@@ -133,6 +133,14 @@ impl HlsPlaybackProgressTracker {
             .cloned()
             .unwrap_or_else(empty_snapshot)
     }
+
+    pub(crate) fn remove_session(&self, session_id: &str) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("HLS playback progress lock poisoned");
+        state.reports_by_session_id.remove(session_id);
+    }
 }
 
 impl HlsPlaybackProgressState {
@@ -344,6 +352,38 @@ mod tests {
         let snapshot = tracker.snapshot_at(now + Duration::from_secs(1));
         assert_eq!(HlsPlaybackActivityState::Active, snapshot.state);
         assert_eq!("active-session", snapshot.session_id);
+        assert_eq!(42.0, snapshot.position_seconds);
+    }
+
+    #[test]
+    fn removing_session_clears_matching_playback_progress() {
+        let tracker = HlsPlaybackProgressTracker::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/session-1/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 42.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now,
+        });
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/session-2/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 24.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now + Duration::from_secs(1),
+        });
+
+        tracker.remove_session("session-2");
+
+        let snapshot = tracker.snapshot_at(now + Duration::from_secs(1));
+        assert_eq!(HlsPlaybackActivityState::Active, snapshot.state);
+        assert_eq!("session-1", snapshot.session_id);
         assert_eq!(42.0, snapshot.position_seconds);
     }
 
