@@ -497,23 +497,23 @@ fn variant_h264_level_is_within_transcoding_profile(
     video: &BilibiliMediaRequest,
 ) -> bool {
     if let Some(codecs) = video.codecs.as_deref() {
-        return codec_list_h264_level_is_within_transcoding_profile(codecs);
+        return codec_list_h264_is_within_transcoding_profile(codecs);
     }
 
     variant
         .codecs
         .iter()
-        .all(|codecs| codec_list_h264_level_is_within_transcoding_profile(codecs))
+        .all(|codecs| codec_list_h264_is_within_transcoding_profile(codecs))
 }
 
-fn codec_list_h264_level_is_within_transcoding_profile(codecs: &str) -> bool {
+fn codec_list_h264_is_within_transcoding_profile(codecs: &str) -> bool {
     codecs
         .split(',')
         .filter(|codec| is_h264_codec(codec))
-        .all(h264_codec_level_is_within_transcoding_profile)
+        .all(h264_codec_is_within_transcoding_profile)
 }
 
-fn h264_codec_level_is_within_transcoding_profile(codec: &str) -> bool {
+fn h264_codec_is_within_transcoding_profile(codec: &str) -> bool {
     let codec = codec.trim().to_ascii_lowercase();
     let Some(profile_level_id) = codec
         .strip_prefix("avc1.")
@@ -530,7 +530,14 @@ fn h264_codec_level_is_within_transcoding_profile(codec: &str) -> bool {
         return true;
     }
 
-    u8::from_str_radix(&profile_level_id[4..6], 16).is_ok_and(|level| level <= 0x2A)
+    let profile_idc = u8::from_str_radix(&profile_level_id[0..2], 16).ok();
+    let level_idc = u8::from_str_radix(&profile_level_id[4..6], 16).ok();
+    profile_idc.is_some_and(h264_profile_is_within_transcoding_profile)
+        && level_idc.is_some_and(|level| level <= 0x2A)
+}
+
+fn h264_profile_is_within_transcoding_profile(profile_idc: u8) -> bool {
+    matches!(profile_idc, 0x42 | 0x4D | 0x64)
 }
 
 fn variant_has_codec(
@@ -688,6 +695,19 @@ mod tests {
                 ..CacheServerOptions::default()
             },
             &variant("h264-level-5", "avc1.640033", Some("mp4a.40.2")),
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn h264_aac_variant_with_unsupported_h264_profile_requires_transcoding() {
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant("h264-high-444", "avc1.F4002A", Some("mp4a.40.2")),
         );
 
         assert_eq!(HlsTranscodingPlanState::Ready, plan.state);

@@ -2005,7 +2005,7 @@ fn first_matching_codec<'a>(
 }
 
 fn is_audio_codec(codec: &str) -> bool {
-    codec.starts_with("mp4a.")
+    codec.trim().to_ascii_lowercase().starts_with("mp4a.")
 }
 
 fn is_video_codec(codec: &str) -> bool {
@@ -8144,6 +8144,36 @@ mod tests {
                 .state
         );
         assert_eq!("transcoded.m4s", restored_session.variant.video.id);
+    }
+
+    #[test]
+    fn hls_cache_session_metadata_classifies_uppercase_aac_codec() {
+        let mut adapter_variant = playback_variant("h264", "avc1.640028", 1_000_000, 10_000_000);
+        adapter_variant.codecs = vec!["MP4A.40.2".to_owned(), "avc1.640028".to_owned()];
+        adapter_variant.audio.as_mut().unwrap().codecs = Some("MP4A.40.2".to_owned());
+
+        let mut session =
+            HlsPlaybackSession::from_selected_variant("session-1", "Episode", &adapter_variant)
+                .expect("HLS session should be created");
+        session.variants[0].codecs = vec!["MP4A.40.2".to_owned(), "avc1.640028".to_owned()];
+        session.variants[0].media[0].codecs = Some("avc1.640028".to_owned());
+        session.variants[0].media[1].codecs = Some("MP4A.40.2".to_owned());
+
+        let playback_session = playback_session_from_hls_cache_session(&session);
+        let selected_variant = playback_session
+            .selected_variant
+            .as_ref()
+            .expect("selected variant metadata should be present");
+        let listed_variant = playback_session
+            .variants
+            .iter()
+            .find(|variant| variant.id == "h264")
+            .expect("listed variant metadata should be present");
+
+        assert_eq!("avc1.640028", selected_variant.video_codec);
+        assert_eq!("MP4A.40.2", selected_variant.audio_codec);
+        assert_eq!("avc1.640028", listed_variant.video_codec);
+        assert_eq!("MP4A.40.2", listed_variant.audio_codec);
     }
 
     #[cfg(unix)]
