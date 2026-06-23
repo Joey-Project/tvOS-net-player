@@ -286,6 +286,57 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testManualHLSCacheStatusRefreshCancelsInFlightScheduledRefresh() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatusResponses: [
+                .fixture(usedBytes: 42),
+                .fixture(
+                    usedBytes: 84,
+                    playback: HLSPlaybackProgressStatus(
+                        state: "HLS_PLAYBACK_ACTIVITY_STATE_RECENTLY_STOPPED",
+                        message: "Playback stopped; keeping the HLS cache session recent briefly.",
+                        sessionID: "session-1",
+                        libraryItemID: "bilibili.hls.session-1",
+                        variantID: "h264",
+                        playbackURI: "http://mac-mini.local:8080/hls/session-1/master.m3u8",
+                        positionSeconds: 120,
+                        durationSeconds: nil,
+                        lastIntent: "PLAYBACK_PROGRESS_INTENT_STOPPED",
+                        updatedAt: nil
+                    )
+                ),
+            ],
+            suspendedHLSCacheStatusCallCounts: [1]
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await client.waitForHLSCacheStatusRequest(callCount: 1)
+
+        let manualRefresh = Task {
+            await model.refreshHLSCacheStatus()
+        }
+        await client.waitForHLSCacheStatusRequest(callCount: 2)
+        await manualRefresh.value
+
+        XCTAssertEqual(model.hlsCacheStatus?.usedBytes, 84)
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Last playback stopped at 2:00") == true)
+
+        await client.releaseHLSCacheStatusRequest(callCount: 1)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(model.hlsCacheStatus?.usedBytes, 84)
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Last playback stopped at 2:00") == true)
+    }
+
+    @MainActor
     func testHLSCacheSummaryIncludesRecentlyStoppedPlaybackPositionStatus() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -2080,6 +2131,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let playbackSource: CachePlaybackSource
     let cacheRoots: [CacheRoot]
     let hlsCacheStatus: HLSCacheStatus?
+    let hlsCacheStatusResponses: [HLSCacheStatus]
     let cacheRootResponses: [[CacheRoot]]
     let deleteResponsesByItemID: [String: Bool]
     let deleteError: FakeCacheError?
@@ -2093,6 +2145,7 @@ private actor FakeCacheControlClient: CacheControlClient {
     let getServerInfoIgnoresCancellation: Bool
     let suspendServerInfoUntilReleased: Bool
     let suspendHLSCacheStatusUntilReleased: Bool
+    let suspendedHLSCacheStatusCallCounts: Set<Int>
     let suspendedServerInfoCallCounts: Set<Int>
     let suspendedCacheRootCallCounts: Set<Int>
     let suspendedLibraryPageTokens: Set<String>
@@ -2108,14 +2161,17 @@ private actor FakeCacheControlClient: CacheControlClient {
     private(set) var requestedDeleteItemIDs: [String] = []
     private(set) var requestedPlayback: (itemID: String, variantID: String)?
     private var cacheRootResponseIndex = 0
+    private var hlsCacheStatusResponseIndex = 0
     private var getServerInfoWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var serverInfoReleaseContinuations: [CheckedContinuation<Void, Never>] = []
     private var serverInfoCallReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var serverInfoRequestsReleased = false
     private var releasedServerInfoCallCounts: Set<Int> = []
-    private var hlsCacheStatusWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hlsCacheStatusWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var hlsCacheStatusReleaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var hlsCacheStatusCallReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var hlsCacheStatusRequestsReleased = false
+    private var releasedHLSCacheStatusCallCounts: Set<Int> = []
     private var cacheRootWaiters: [(minimumCallCount: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var cacheRootReleaseContinuations: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var releasedCacheRootCallCounts: Set<Int> = []
@@ -2139,6 +2195,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         playbackSource: CachePlaybackSource,
         cacheRoots: [CacheRoot] = [.fixture()],
         hlsCacheStatus: HLSCacheStatus? = nil,
+        hlsCacheStatusResponses: [HLSCacheStatus] = [],
         cacheRootResponses: [[CacheRoot]] = [],
         deleteResponsesByItemID: [String: Bool] = [:],
         deleteError: FakeCacheError? = nil,
@@ -2152,6 +2209,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         getServerInfoIgnoresCancellation: Bool = false,
         suspendServerInfoUntilReleased: Bool = false,
         suspendHLSCacheStatusUntilReleased: Bool = false,
+        suspendedHLSCacheStatusCallCounts: Set<Int> = [],
         suspendedServerInfoCallCounts: Set<Int> = [],
         suspendedCacheRootCallCounts: Set<Int> = [],
         suspendedLibraryPageTokens: Set<String> = [],
@@ -2163,6 +2221,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.playbackSource = playbackSource
         self.cacheRoots = cacheRoots
         self.hlsCacheStatus = hlsCacheStatus
+        self.hlsCacheStatusResponses = hlsCacheStatusResponses
         self.cacheRootResponses = cacheRootResponses
         self.deleteResponsesByItemID = deleteResponsesByItemID
         self.deleteError = deleteError
@@ -2176,6 +2235,7 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.getServerInfoIgnoresCancellation = getServerInfoIgnoresCancellation
         self.suspendServerInfoUntilReleased = suspendServerInfoUntilReleased
         self.suspendHLSCacheStatusUntilReleased = suspendHLSCacheStatusUntilReleased
+        self.suspendedHLSCacheStatusCallCounts = suspendedHLSCacheStatusCallCounts
         self.suspendedServerInfoCallCounts = suspendedServerInfoCallCounts
         self.suspendedCacheRootCallCounts = suspendedCacheRootCallCounts
         self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
@@ -2225,15 +2285,25 @@ private actor FakeCacheControlClient: CacheControlClient {
 
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         hlsCacheStatusCallCount += 1
+        let callCount = hlsCacheStatusCallCount
         notifyHLSCacheStatusWaiters()
-        if suspendHLSCacheStatusUntilReleased {
-            await waitForHLSCacheStatusRelease()
-        }
-        guard let hlsCacheStatus else {
+        let response: HLSCacheStatus
+        if hlsCacheStatusResponseIndex < hlsCacheStatusResponses.count {
+            response = hlsCacheStatusResponses[hlsCacheStatusResponseIndex]
+            hlsCacheStatusResponseIndex += 1
+        } else if let hlsCacheStatus {
+            response = hlsCacheStatus
+        } else {
             throw CacheControlClientUnsupportedFeature.hlsCacheStatus
         }
 
-        return hlsCacheStatus
+        if suspendHLSCacheStatusUntilReleased {
+            await waitForHLSCacheStatusRelease()
+        }
+        if suspendedHLSCacheStatusCallCounts.contains(callCount) {
+            await waitForHLSCacheStatusRelease(callCount: callCount)
+        }
+        return response
     }
 
     func listLibraryItemsPage(
@@ -2365,12 +2435,16 @@ private actor FakeCacheControlClient: CacheControlClient {
     }
 
     func waitForHLSCacheStatusRequest() async {
-        guard hlsCacheStatusCallCount == 0 else {
+        await waitForHLSCacheStatusRequest(callCount: 1)
+    }
+
+    func waitForHLSCacheStatusRequest(callCount: Int) async {
+        guard hlsCacheStatusCallCount < callCount else {
             return
         }
 
         await withCheckedContinuation { continuation in
-            hlsCacheStatusWaiters.append(continuation)
+            hlsCacheStatusWaiters.append((callCount, continuation))
         }
     }
 
@@ -2378,6 +2452,12 @@ private actor FakeCacheControlClient: CacheControlClient {
         hlsCacheStatusRequestsReleased = true
         let continuations = hlsCacheStatusReleaseContinuations
         hlsCacheStatusReleaseContinuations = []
+        continuations.forEach { $0.resume() }
+    }
+
+    func releaseHLSCacheStatusRequest(callCount: Int) {
+        releasedHLSCacheStatusCallCounts.insert(callCount)
+        let continuations = hlsCacheStatusCallReleaseContinuations.removeValue(forKey: callCount) ?? []
         continuations.forEach { $0.resume() }
     }
 
@@ -2456,9 +2536,16 @@ private actor FakeCacheControlClient: CacheControlClient {
     }
 
     private func notifyHLSCacheStatusWaiters() {
-        let continuations = hlsCacheStatusWaiters
-        hlsCacheStatusWaiters = []
-        continuations.forEach { $0.resume() }
+        var readyContinuations: [CheckedContinuation<Void, Never>] = []
+        hlsCacheStatusWaiters.removeAll { waiter in
+            guard hlsCacheStatusCallCount >= waiter.minimumCallCount else {
+                return false
+            }
+
+            readyContinuations.append(waiter.continuation)
+            return true
+        }
+        readyContinuations.forEach { $0.resume() }
     }
 
     private func waitForCacheRootRelease(callCount: Int) async {
@@ -2498,6 +2585,16 @@ private actor FakeCacheControlClient: CacheControlClient {
 
         await withCheckedContinuation { continuation in
             hlsCacheStatusReleaseContinuations.append(continuation)
+        }
+    }
+
+    private func waitForHLSCacheStatusRelease(callCount: Int) async {
+        guard !releasedHLSCacheStatusCallCounts.contains(callCount) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            hlsCacheStatusCallReleaseContinuations[callCount, default: []].append(continuation)
         }
     }
 

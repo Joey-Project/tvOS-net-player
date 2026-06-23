@@ -89,6 +89,8 @@ public final class PlayerViewModel: ObservableObject {
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
     private var playbackEndObserver: AnyCancellable?
+    private var playbackResumeObserver: AnyCancellable?
+    private weak var playbackProgressEndedItem: AVPlayerItem?
 
     public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
@@ -191,6 +193,7 @@ public final class PlayerViewModel: ObservableObject {
             nextPlayer.play()
         }
         observePlaybackEnd(for: nextPlayer.currentItem)
+        observePlaybackResume(for: nextPlayer)
         queueCurrentPlaybackProgressReport(intent: .started)
         startPlaybackProgressReporting()
     }
@@ -220,6 +223,7 @@ public final class PlayerViewModel: ObservableObject {
             durationSeconds: currentPlaybackDurationSeconds(),
             intent: .seek
         )
+        restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: nil)
 
         let label = Self.formattedSeekInterval(abs(offset))
         statusMessage =
@@ -336,10 +340,17 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func stopPlaybackProgressReporting() {
-        playbackProgressReportTask?.cancel()
-        playbackProgressReportTask = nil
+        stopPlaybackProgressHeartbeat()
         playbackEndObserver?.cancel()
         playbackEndObserver = nil
+        playbackResumeObserver?.cancel()
+        playbackResumeObserver = nil
+        playbackProgressEndedItem = nil
+    }
+
+    private func stopPlaybackProgressHeartbeat() {
+        playbackProgressReportTask?.cancel()
+        playbackProgressReportTask = nil
     }
 
     private func observePlaybackEnd(for item: AVPlayerItem?) {
@@ -360,14 +371,49 @@ public final class PlayerViewModel: ObservableObject {
             }
     }
 
+    private func observePlaybackResume(for player: AVPlayer) {
+        playbackResumeObserver = player.publisher(for: \.timeControlStatus)
+            .sink { [weak self, weak player] status in
+                guard status == .playing else {
+                    return
+                }
+
+                Task { @MainActor [weak self, weak player] in
+                    guard let self, let player, self.player === player else {
+                        return
+                    }
+                    self.restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: .playing)
+                }
+            }
+    }
+
     private func finishPlaybackProgressReporting(for item: AVPlayerItem) {
         guard player?.currentItem === item else {
             return
         }
         let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
-        stopPlaybackProgressReporting()
+        playbackProgressEndedItem = item
+        stopPlaybackProgressHeartbeat()
+        playbackEndObserver?.cancel()
+        playbackEndObserver = nil
         statusMessage = "Playback finished."
         requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
+    }
+
+    private func restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: PlaybackProgressIntent?) {
+        guard let player,
+            let currentItem = player.currentItem,
+            playbackProgressEndedItem === currentItem
+        else {
+            return
+        }
+
+        playbackProgressEndedItem = nil
+        observePlaybackEnd(for: currentItem)
+        if let immediateIntent {
+            queueCurrentPlaybackProgressReport(intent: immediateIntent)
+        }
+        startPlaybackProgressReporting()
     }
 
     private func periodicPlaybackProgressIntent() -> PlaybackProgressIntent? {

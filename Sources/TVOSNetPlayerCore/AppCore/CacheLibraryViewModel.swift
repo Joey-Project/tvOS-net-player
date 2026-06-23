@@ -503,6 +503,7 @@ public final class CacheLibraryViewModel: ObservableObject {
             return
         }
 
+        cancelHLSCacheStatusRefresh()
         await refreshHLSCacheStatus(
             client: clientFactory(endpoint),
             requestSequence: refreshSequence,

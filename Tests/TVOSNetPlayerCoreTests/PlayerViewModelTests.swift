@@ -334,6 +334,41 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testSeekAfterPlaybackEndRestartsPeriodicProgress() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let item = try XCTUnwrap(model.player?.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        try await Task.sleep(for: .milliseconds(100))
+
+        let reportsAfterEnd = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterEnd.map(\.intent), [.started, .stopped])
+
+        model.skipForward()
+        try await Task.sleep(for: .milliseconds(100))
+
+        let replayReports = await client.reportsSnapshot().dropFirst(reportsAfterEnd.count)
+        XCTAssertTrue(replayReports.contains { $0.intent == .seek })
+        XCTAssertTrue(replayReports.contains { $0.intent == .paused })
+    }
+
+    @MainActor
     func testPausedPlaybackProgressKeepsLeaseWarm() async throws {
         let client = FakePlaybackProgressClient()
         let endpoint = CacheServerEndpoint(host: "mac-mini.local")
