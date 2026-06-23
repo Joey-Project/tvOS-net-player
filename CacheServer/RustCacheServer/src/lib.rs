@@ -887,7 +887,7 @@ impl AppState {
                 continue;
             }
             self.hls_cache
-                .remove_session_managed_resources(&entry.session_id)?;
+                .remove_session_managed_resources_for_eviction(&entry.session_id)?;
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
             if evicted_session_id_set.insert(entry.session_id.clone()) {

@@ -57,6 +57,7 @@ superseded_by:
 - Keep cancellation, preemption, and ffmpeg failure paths from exposing the original `ready` session as a completed library item.
 - Keep original source resources lookup-only after completed-session transcoding so persisted manifests can be restored and already-fetched AVPlayer playlists can finish from local cache, while the completed master playlist does not advertise old source variants and hidden resources never fall back to upstream proxying.
 - Include projected generated transcode output in pre-finalization quota eviction so fully cached sources do not bypass high-watermark protection before ffmpeg writes the temporary output.
+- Make partial-cache eviction explicitly remove marker-active generated transcode artifacts so quota accounting matches bytes freed on disk.
 - Keep the conservative `avplayer-h264-aac-hls-v1` target profile.
 - Validate with cache-server unit/finalizer tests and the full repository gate before merge.
 
@@ -126,4 +127,5 @@ superseded_by:
   - `cargo test completed_runtime_session_scrubs_hidden_lookup_resources -- --nocapture`
   - `cargo test completed_playback_task_scrubs_runtime_hls_alternates_after_finalization -- --nocapture`
   - `cargo test hls_cache_finalizer_transcodes_ready_session_to_generated_runtime -- --nocapture`
+  - `cargo test eviction_resource_cleanup_removes_active_transcode_outputs -- --nocapture`
   - `just ci`

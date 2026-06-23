@@ -181,13 +181,32 @@ impl HlsCacheStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_session_managed_resources(&self, session_id: &str) -> io::Result<()> {
+        self.remove_session_managed_resources_inner(session_id, false)
+    }
+
+    pub(crate) fn remove_session_managed_resources_for_eviction(
+        &self,
+        session_id: &str,
+    ) -> io::Result<()> {
+        self.remove_session_managed_resources_inner(session_id, true)
+    }
+
+    fn remove_session_managed_resources_inner(
+        &self,
+        session_id: &str,
+        remove_transcode_outputs: bool,
+    ) -> io::Result<()> {
         let Some(session) = self.load_session(session_id) else {
             return Ok(());
         };
         for resource in session_unique_media_resources(&session) {
             self.remove_cached_resource(session_id, &resource.id)?;
             self.remove_prewarmed_resource(session_id, &resource.id)?;
+        }
+        if remove_transcode_outputs {
+            self.remove_transcode_generated_resources(session_id)?;
         }
         self.remove_unreferenced_session_managed_resources(&session)?;
         Ok(())
@@ -1425,6 +1444,15 @@ impl HlsCacheStore {
         self.remove_managed_cache_file_if_exists(
             &self.resource_prewarm_metadata_path(session_id, resource_id)?,
         )
+    }
+
+    fn remove_transcode_generated_resources(&self, session_id: &str) -> io::Result<()> {
+        self.remove_cached_resource(session_id, HLS_TRANSCODED_RESOURCE_ID)?;
+        self.remove_managed_cache_file_if_exists(&self.resource_path(
+            session_id,
+            &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+        )?)?;
+        self.remove_transcoding_commit_marker_if_exists(session_id)
     }
 
     fn remove_transcoding_commit_marker_if_exists(&self, session_id: &str) -> io::Result<()> {
@@ -5534,6 +5562,128 @@ mod tests {
             .usage_snapshot()
             .expect("usage snapshot should scan preserved manifest");
         assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
+    }
+
+    #[test]
+    fn eviction_resource_cleanup_removes_active_transcode_outputs() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_transcoding_ready_session(
+            "session-transcode-eviction-cleanup",
+            "https://example.test/video.m4s",
+        );
+        let completed_session = transcoded_completed_session(&session, fake_mp4().len() as u64);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            std::fs::write(
+                store
+                    .resource_path(&session.id, &resource.id)
+                    .expect("source resource path should be valid"),
+                fake_mp4(),
+            )
+            .expect("source resource should be written");
+            write_pretty_json(
+                &store
+                    .resource_metadata_path(&session.id, &resource.id)
+                    .expect("source metadata path should be valid"),
+                &cached_metadata_for_session(&session, &resource.id),
+            );
+        }
+        std::fs::write(
+            store
+                .resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temp path should be valid"),
+            b"active ffmpeg output",
+        )
+        .expect("transcode temp should be written");
+        let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &session)
+            .expect("active transcoding marker should be created");
+
+        let partial = store
+            .partial_cache_entries()
+            .expect("partial entries should scan")
+            .into_iter()
+            .find(|entry| entry.session_id == session.id)
+            .expect("active transcode bytes should be counted before eviction cleanup");
+        assert!(partial.size_bytes > (2 * fake_mp4().len()) as u64);
+
+        store
+            .remove_session_managed_resources_for_eviction(&session.id)
+            .expect("eviction cleanup should remove managed resources");
+
+        assert!(store.playback_session(&session.id).is_some());
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            assert!(store.cached_resource(&session.id, &resource.id).is_none());
+            assert!(
+                !store
+                    .resource_path(&session.id, &resource.id)
+                    .expect("source resource path should be valid")
+                    .exists()
+            );
+            assert!(
+                !store
+                    .resource_metadata_path(&session.id, &resource.id)
+                    .expect("source metadata path should be valid")
+                    .exists()
+            );
+        }
+        assert!(
+            store
+                .cached_resource(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .is_none()
+        );
+        assert!(
+            !store
+                .resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temp path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .transcoding_commit_marker_path(&session.id)
+                .expect("transcoding marker path should be valid")
+                .exists()
+        );
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should scan preserved manifest");
         assert_eq!(0, usage.used_bytes);
     }
 
