@@ -317,6 +317,9 @@ public final class PlayerViewModel: ObservableObject {
                 } catch {
                     return
                 }
+                guard !Task.isCancelled else {
+                    return
+                }
                 guard let intent = self?.periodicPlaybackProgressIntent() else {
                     continue
                 }

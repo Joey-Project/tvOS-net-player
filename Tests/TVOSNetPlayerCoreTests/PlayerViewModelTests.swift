@@ -289,6 +289,10 @@ final class PlayerViewModelTests: XCTestCase {
         let reports = await client.reportsSnapshot()
         XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
         XCTAssertEqual(model.statusMessage, "Playback finished.")
+
+        try await Task.sleep(for: .milliseconds(100))
+        let reportsAfterStopWindow = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterStopWindow.map(\.intent), [.started, .stopped])
     }
 
     @MainActor
