@@ -3461,7 +3461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_playback_task_keeps_runtime_hls_alternates_after_finalization() {
+    async fn completed_playback_task_scrubs_runtime_hls_alternates_after_finalization() {
         let (selected_upstream_url, _selected_upstream_task) = start_mp4_upstream().await;
         let (alternate_upstream_url, _alternate_upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -3529,9 +3529,9 @@ mod tests {
         let runtime_alternate = runtime_session
             .media_resource("v1-video.m4s")
             .expect("runtime alternate media resource should remain serveable");
-        assert_eq!(alternate_upstream_url, runtime_alternate.request.url);
+        assert!(runtime_alternate.request.url.is_empty());
         assert!(runtime_alternate.request.backup_urls.is_empty());
-        assert!(!runtime_alternate.request.headers.is_empty());
+        assert!(runtime_alternate.request.headers.is_empty());
 
         let persisted_session = state
             .hls_cache
@@ -8014,8 +8014,9 @@ mod tests {
         let runtime_source_video = runtime_session
             .media_resource("video.m4s")
             .expect("runtime source video lookup should remain addressable");
-        assert_eq!(upstream_url, runtime_source_video.request.url);
-        assert!(!runtime_source_video.request.headers.is_empty());
+        assert!(runtime_source_video.request.url.is_empty());
+        assert!(runtime_source_video.request.backup_urls.is_empty());
+        assert!(runtime_source_video.request.headers.is_empty());
         let restored_source_video = restored_session
             .media_resource("video.m4s")
             .expect("persisted source video lookup should remain addressable");

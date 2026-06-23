@@ -2343,14 +2343,7 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
-    let mut session = completed_runtime_session(session);
-    for variant in &mut session.alternate_variants {
-        sanitize_completed_resource(&mut variant.video);
-        if let Some(audio) = variant.audio.as_mut() {
-            sanitize_completed_resource(audio);
-        }
-    }
-    session
+    completed_runtime_session(session)
 }
 
 pub(crate) fn source_completed_session_for_restore(
@@ -2370,11 +2363,18 @@ pub(crate) fn source_completed_session_for_restore(
 pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
     session.advertise_alternate_variants = false;
-    sanitize_completed_resource(&mut session.variant.video);
-    if let Some(audio) = session.variant.audio.as_mut() {
-        sanitize_completed_resource(audio);
+    sanitize_completed_variant(&mut session.variant);
+    for variant in &mut session.alternate_variants {
+        sanitize_completed_variant(variant);
     }
     session
+}
+
+fn sanitize_completed_variant(variant: &mut HlsVariant) {
+    sanitize_completed_resource(&mut variant.video);
+    if let Some(audio) = variant.audio.as_mut() {
+        sanitize_completed_resource(audio);
+    }
 }
 
 fn sanitize_completed_resource(resource: &mut HlsMediaResource) {
@@ -3289,7 +3289,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_runtime_session_hides_alternates_from_new_master_but_keeps_lookup() {
+    fn completed_runtime_session_scrubs_hidden_lookup_resources() {
         let mut session = sample_session("session-runtime", "https://example.test/video.m4s");
         attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
 
@@ -3301,19 +3301,15 @@ mod tests {
         let alternate_video = runtime
             .media_resource("v1-video.m4s")
             .expect("runtime alternate video should remain addressable");
-        assert_eq!(
-            "https://example.test/720p-video.m4s",
-            alternate_video.request.url
-        );
-        assert!(!alternate_video.request.headers.is_empty());
+        assert!(alternate_video.request.url.is_empty());
+        assert!(alternate_video.request.backup_urls.is_empty());
+        assert!(alternate_video.request.headers.is_empty());
         let alternate_audio = runtime
             .media_resource("v1-audio.m4s")
             .expect("runtime alternate audio should remain addressable");
-        assert_eq!(
-            "https://example.test/720p-audio.m4s",
-            alternate_audio.request.url
-        );
-        assert!(!alternate_audio.request.headers.is_empty());
+        assert!(alternate_audio.request.url.is_empty());
+        assert!(alternate_audio.request.backup_urls.is_empty());
+        assert!(alternate_audio.request.headers.is_empty());
     }
 
     #[test]
