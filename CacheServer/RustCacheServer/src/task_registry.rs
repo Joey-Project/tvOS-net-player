@@ -825,6 +825,15 @@ impl BilibiliTaskRegistry {
         session_id: &str,
         playback_source: PlaybackSource,
     ) -> Result<Task, Status> {
+        self.refresh_hls_playback_source_with_metadata(session_id, playback_source, None)
+    }
+
+    pub fn refresh_hls_playback_source_with_metadata(
+        &self,
+        session_id: &str,
+        playback_source: PlaybackSource,
+        playback_session: Option<BilibiliPlaybackSession>,
+    ) -> Result<Task, Status> {
         let normalized_id = normalize_required_id(session_id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let task = if let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) {
@@ -839,7 +848,15 @@ impl BilibiliTaskRegistry {
 
             task.playback_source =
                 Some(primary_playback_source_for_refresh(task, &playback_source));
+            if let Some(playback_session) = playback_session.as_ref()
+                && task_uses_hls_session_as_primary(task, &normalized_id)
+            {
+                task.playback_session = Some(playback_session.clone());
+            }
             refresh_result_item_playback_source(task, &normalized_id, &playback_source);
+            if let Some(playback_session) = playback_session.as_ref() {
+                refresh_result_item_playback_session(task, &normalized_id, playback_session);
+            }
             task.clone()
         } else {
             let Some(task) = inner.tasks_by_id.values_mut().find(|task| {
@@ -858,8 +875,14 @@ impl BilibiliTaskRegistry {
             if task_uses_hls_session_as_primary(task, &normalized_id) {
                 task.playback_source =
                     Some(primary_playback_source_for_refresh(task, &playback_source));
+                if let Some(playback_session) = playback_session.as_ref() {
+                    task.playback_session = Some(playback_session.clone());
+                }
             }
             refresh_result_item_playback_source(task, &normalized_id, &playback_source);
+            if let Some(playback_session) = playback_session.as_ref() {
+                refresh_result_item_playback_session(task, &normalized_id, playback_session);
+            }
             task.clone()
         };
         let snapshot = self.persistence_snapshot_locked(&mut inner);
@@ -1904,6 +1927,21 @@ fn refresh_result_item_playback_source(
                 .is_some_and(|state| matches!(state, TaskState::Playable | TaskState::Completed))
         {
             item.playback_source = Some(playback_source.clone());
+        }
+    }
+}
+
+fn refresh_result_item_playback_session(
+    task: &mut Task,
+    session_id: &str,
+    playback_session: &BilibiliPlaybackSession,
+) {
+    for item in &mut task.result_items {
+        if result_item_state(item)
+            .is_some_and(|state| matches!(state, TaskState::Playable | TaskState::Completed))
+            && result_item_uses_hls_session(item, session_id)
+        {
+            item.playback_session = Some(playback_session.clone());
         }
     }
 }

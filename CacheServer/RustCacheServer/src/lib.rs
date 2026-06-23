@@ -48,7 +48,7 @@ use crate::{
     config::CacheServerOptions,
     grpc_services::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
-        TaskGrpcService,
+        TaskGrpcService, playback_session_from_hls_cache_session,
     },
     hls::{HlsPlaybackRegistry, HlsPlaybackSession},
     hls_cache::{
@@ -337,11 +337,16 @@ impl AppState {
                     .insert(sanitized_completed_session(session));
                 match self.hls_cache.save_completed_session(session) {
                     Ok(()) => {
-                        match self.tasks.complete_playback_hls_session_cached(
-                            &task_id,
-                            &session.id,
-                            HlsCacheStore::completed_library_item_id(&session.id),
-                        ) {
+                        let completed_playback_session =
+                            playback_session_from_hls_cache_session(session);
+                        match self
+                            .tasks
+                            .complete_playback_hls_session_cached_with_metadata(
+                                &task_id,
+                                &session.id,
+                                HlsCacheStore::completed_library_item_id(&session.id),
+                                completed_playback_session,
+                            ) {
                             Ok(task) if task.state() == TaskState::Completed => {
                                 if let Err(error) = self.enforce_hls_cache_quota(
                                     "after_hls_finalization",
@@ -1205,8 +1210,14 @@ fn refresh_restored_hls_playback_source_for_session(
             .create_hls_master_playlist_for_restored_task(&session.id, existing_uri.as_deref()),
         expires_at: None,
     };
+    let playback_session =
+        is_completed_session.then(|| playback_session_from_hls_cache_session(session));
 
-    if let Err(status) = tasks.refresh_hls_playback_source(&session.id, playback_source) {
+    if let Err(status) = tasks.refresh_hls_playback_source_with_metadata(
+        &session.id,
+        playback_source,
+        playback_session,
+    ) {
         eprintln!(
             "Failed to refresh restored HLS playback source for task {}: {status}",
             session.id

@@ -1790,7 +1790,7 @@ fn playback_task_metadata_with_options(
     })
 }
 
-fn playback_session_from_hls_cache_session(
+pub(crate) fn playback_session_from_hls_cache_session(
     session: &HlsPlaybackSession,
 ) -> BilibiliPlaybackSession {
     let selected_variant = playback_variant_from_hls_variant(&session.variant);
@@ -8029,6 +8029,124 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn app_state_restore_shortcut_updates_transcoded_playback_metadata() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            lan_transcoding_enabled: true,
+            lan_transcoding_ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1transcode-restore", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let metadata = playback_task_metadata_with_options(
+            &task_id,
+            sample_hevc_playback_plan_with_video_url(&upstream_url),
+            &options,
+        )
+        .expect("HEVC playback metadata should map");
+        let hls_session = metadata.hls_session.clone();
+        let library_item_id = HlsCacheStore::completed_library_item_id(&task_id);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: task_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &task_id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+
+        let completion = state
+            .hls_cache
+            .cache_session_resources_completion_with_control(
+                &state.hls_upstream_client,
+                &hls_session,
+                || HlsCacheFillControl::Continue,
+                |_| {},
+                state.hls_transcoding_execution_config(),
+            )
+            .await
+            .expect("startup crash-window cache completion should persist");
+        assert_eq!(library_item_id, completion.library_item_id);
+        assert_eq!(
+            HlsTranscodingPlanState::NotRequired,
+            completion.session.transcoding.state
+        );
+        assert_eq!("transcoded.m4s", completion.session.variant.video.id);
+        let still_playable = state
+            .tasks
+            .get_task(&task_id)
+            .expect("task should still model pre-crash playable state");
+        assert_eq!(TaskState::Playable, still_playable.state());
+        assert!(
+            still_playable
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.transcoding_plan.as_ref())
+                .is_some_and(|plan| plan.state == i32::from(LanTranscodingPlanState::Ready))
+        );
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let completed = restored
+            .tasks
+            .get_task(&task_id)
+            .expect("task should complete during startup restore");
+        let restored_session = restored
+            .hls_cache
+            .completed_session(&task_id)
+            .expect("completed transcoded session should remain persisted");
+
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(library_item_id, completed.library_item_id);
+        let completed_playback_session = completed
+            .playback_session
+            .as_ref()
+            .expect("startup restore should update completed playback session metadata");
+        let completed_selected_variant = completed_playback_session
+            .selected_variant
+            .as_ref()
+            .expect("startup restore should expose generated selected variant metadata");
+        assert_eq!("avc1.64002A", completed_selected_variant.video_codec);
+        assert_eq!("mp4a.40.2", completed_selected_variant.audio_codec);
+        assert_eq!(
+            i32::from(LanTranscodingPlanState::NotRequired),
+            completed_playback_session
+                .transcoding_plan
+                .as_ref()
+                .expect("startup restore should expose completed transcoding plan")
+                .state
+        );
+        assert_eq!("transcoded.m4s", restored_session.variant.video.id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn hls_cache_finalizer_does_not_transcode_ready_session_when_disabled() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -8186,6 +8304,13 @@ mod tests {
         assert_eq!(
             HlsTranscodingPlanState::Disabled,
             restored_session.transcoding.state
+        );
+        assert!(
+            restored_task
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.transcoding_plan.as_ref())
+                .is_some_and(|plan| plan.state == i32::from(LanTranscodingPlanState::Disabled))
         );
         assert!(
             restored
@@ -9459,6 +9584,40 @@ mod tests {
                     variant: selected_variant.clone(),
                     selection: BilibiliPlaybackVariantSelection {
                         policy: BilibiliPlaybackVariantSelectionPolicy::AvPlayerDefault,
+                        codec_rank: Some(1),
+                        score: 100,
+                    },
+                }),
+                variants: vec![selected_variant],
+            }],
+        }
+    }
+
+    fn sample_hevc_playback_plan_with_video_url(url: &str) -> BilibiliPlaybackPlan {
+        let mut selected_variant =
+            playback_variant_with_url("hevc", "hev1.1.6.L120.90", 2_000_000, url);
+        selected_variant.abr = Some(playback_abr_level(0, 1));
+        selected_variant.audio = Some(media_request_with_url(
+            BilibiliMediaRequestKind::Audio,
+            "mp4a.40.2",
+            url,
+        ));
+        BilibiliPlaybackPlan {
+            title: "Example".to_owned(),
+            entries: vec![BilibiliPlaybackEntry {
+                index: 1,
+                aid: 1,
+                bvid: Some("BV1offline".to_owned()),
+                cid: 1,
+                epid: None,
+                title: "Offline Episode".to_owned(),
+                content_id: "BV1offline-cid1".to_owned(),
+                duration_seconds: Some(60),
+                abr: sample_playback_abr_metadata(vec!["hevc"], 2_000_000, 2_000_000),
+                selected_variant: Some(BilibiliSelectedPlaybackVariant {
+                    variant: selected_variant.clone(),
+                    selection: BilibiliPlaybackVariantSelection {
+                        policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
                         codec_rank: Some(1),
                         score: 100,
                     },
