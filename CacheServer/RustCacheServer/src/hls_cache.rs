@@ -53,6 +53,7 @@ const HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const HLS_TRANSCODED_RESOURCE_ID: &str = "transcoded.m4s";
 const HLS_TRANSCODED_VIDEO_CODEC: &str = LAN_TRANSCODING_VIDEO_CODEC;
 const HLS_TRANSCODED_AUDIO_CODEC: &str = LAN_TRANSCODING_AUDIO_CODEC;
+const HLS_TRANSCODING_TEMP_FILE_SUFFIX: &str = ".transcode.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -700,7 +701,7 @@ impl HlsCacheStore {
             .transpose()?;
 
         let output_path = self.resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)?;
-        let temp_path = output_path.with_extension("transcode.tmp");
+        let temp_path = transcoding_temp_path_for_output(&output_path);
         self.prepare_temp_path(&temp_path)?;
         self.remove_cached_resource(&session.id, HLS_TRANSCODED_RESOURCE_ID)?;
 
@@ -773,6 +774,7 @@ impl HlsCacheStore {
         let mut retained = referenced_session_managed_file_names(session);
         if self.transcoding_commit_marker_is_active(session)? {
             insert_resource_managed_file_names(&mut retained, HLS_TRANSCODED_RESOURCE_ID);
+            retained.insert(transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID));
         }
         let entries = match fs::read_dir(session_dir) {
             Ok(entries) => entries,
@@ -1558,11 +1560,30 @@ fn insert_resource_managed_file_names(retained: &mut HashSet<String>, resource_i
 }
 
 fn is_managed_resource_file_name(file_name: &str) -> bool {
+    if is_transcoding_temp_file_name(file_name) {
+        return true;
+    }
     if file_name.ends_with(".tmp") {
         return false;
     }
     managed_resource_id_from_file_name(file_name)
         .is_some_and(|resource_id| validate_cache_id(resource_id).is_ok())
+}
+
+fn is_transcoding_temp_file_name(file_name: &str) -> bool {
+    file_name.ends_with(HLS_TRANSCODING_TEMP_FILE_SUFFIX)
+        && file_name == transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID)
+}
+
+fn transcoding_temp_path_for_output(output_path: &Path) -> PathBuf {
+    output_path.with_extension("transcode.tmp")
+}
+
+fn transcoding_temp_file_name(resource_id: &str) -> String {
+    Path::new(resource_id)
+        .with_extension("transcode.tmp")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn managed_resource_id_from_file_name(file_name: &str) -> Option<&str> {
@@ -3524,7 +3545,8 @@ mod tests {
                 &cached_metadata_for_session(session, resource_id),
             );
         }
-        for temp_name in ["video.tmp", "transcoded.transcode.tmp"] {
+        let transcode_temp_name = transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID);
+        for temp_name in ["video.tmp", transcode_temp_name.as_str()] {
             std::fs::write(
                 store
                     .resource_path(&completed_session.id, temp_name)
@@ -3572,14 +3594,21 @@ mod tests {
                     .exists()
             );
         }
-        for temp_name in ["video.tmp", "transcoded.transcode.tmp"] {
-            assert!(
-                store
-                    .resource_path(&completed_session.id, temp_name)
-                    .expect("temporary resource path should be valid")
-                    .exists()
-            );
-        }
+        assert!(
+            store
+                .resource_path(&completed_session.id, "video.tmp")
+                .expect("temporary resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &completed_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID)
+                )
+                .expect("temporary resource path should be valid")
+                .exists()
+        );
     }
 
     #[test]
@@ -3606,6 +3635,16 @@ mod tests {
                 .expect("generated metadata path should be valid"),
             &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
         );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"active ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
         let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
             .expect("active transcoding marker should be created");
 
@@ -3624,6 +3663,15 @@ mod tests {
             store
                 .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
                 .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
                 .exists()
         );
     }
@@ -3652,6 +3700,16 @@ mod tests {
                 .expect("generated metadata path should be valid"),
             &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
         );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"abandoned ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
 
         let usage = store
             .usage_snapshot()
@@ -3669,6 +3727,15 @@ mod tests {
             !store
                 .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
                 .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
                 .exists()
         );
     }

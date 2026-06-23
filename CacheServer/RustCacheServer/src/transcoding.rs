@@ -426,6 +426,111 @@ fn variant_is_avplayer_h264_aac_hls_compatible(variant: &BilibiliPlaybackVariant
             .audio
             .as_ref()
             .is_none_or(|audio| variant_has_codec(variant, Some(audio), is_aac_codec))
+        && variant_is_within_transcoding_profile_envelope(variant, video)
+        && variant_h264_level_is_within_transcoding_profile(variant, video)
+}
+
+fn variant_is_within_transcoding_profile_envelope(
+    variant: &BilibiliPlaybackVariant,
+    video: &BilibiliMediaRequest,
+) -> bool {
+    bounded_u32(variant.width, LAN_TRANSCODING_MAX_WIDTH)
+        && bounded_u32(video.width, LAN_TRANSCODING_MAX_WIDTH)
+        && bounded_u32(variant.height, LAN_TRANSCODING_MAX_HEIGHT)
+        && bounded_u32(video.height, LAN_TRANSCODING_MAX_HEIGHT)
+        && bounded_frame_rate(variant.frame_rate.as_deref())
+        && bounded_frame_rate(video.frame_rate.as_deref())
+        && bounded_u64(
+            variant.bandwidth,
+            transcoding_profile_total_bandwidth(variant.audio.is_some()),
+        )
+        && bounded_u64(video.bandwidth, LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS)
+        && variant
+            .audio
+            .as_ref()
+            .is_none_or(|audio| bounded_u64(audio.bandwidth, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS))
+}
+
+fn transcoding_profile_total_bandwidth(has_audio: bool) -> u64 {
+    LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS
+        + if has_audio {
+            LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS
+        } else {
+            0
+        }
+}
+
+fn bounded_u32(value: Option<u32>, max: u32) -> bool {
+    value.is_none_or(|value| value <= max)
+}
+
+fn bounded_u64(value: Option<u64>, max: u64) -> bool {
+    value.is_none_or(|value| value <= max)
+}
+
+fn bounded_frame_rate(frame_rate: Option<&str>) -> bool {
+    let Some(frame_rate) = frame_rate.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    parse_frame_rate(frame_rate).is_none_or(|rate| rate <= LAN_TRANSCODING_MAX_FRAME_RATE)
+}
+
+fn parse_frame_rate(frame_rate: &str) -> Option<f64> {
+    if let Some((numerator, denominator)) = frame_rate.split_once('/') {
+        let numerator = numerator.trim().parse::<f64>().ok()?;
+        let denominator = denominator.trim().parse::<f64>().ok()?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        let parsed = numerator / denominator;
+        return parsed.is_finite().then_some(parsed);
+    }
+    frame_rate
+        .parse::<f64>()
+        .ok()
+        .filter(|rate| rate.is_finite())
+}
+
+fn variant_h264_level_is_within_transcoding_profile(
+    variant: &BilibiliPlaybackVariant,
+    video: &BilibiliMediaRequest,
+) -> bool {
+    if let Some(codecs) = video.codecs.as_deref() {
+        return codec_list_h264_level_is_within_transcoding_profile(codecs);
+    }
+
+    variant
+        .codecs
+        .iter()
+        .all(|codecs| codec_list_h264_level_is_within_transcoding_profile(codecs))
+}
+
+fn codec_list_h264_level_is_within_transcoding_profile(codecs: &str) -> bool {
+    codecs
+        .split(',')
+        .filter(|codec| is_h264_codec(codec))
+        .all(h264_codec_level_is_within_transcoding_profile)
+}
+
+fn h264_codec_level_is_within_transcoding_profile(codec: &str) -> bool {
+    let codec = codec.trim().to_ascii_lowercase();
+    let Some(profile_level_id) = codec
+        .strip_prefix("avc1.")
+        .or_else(|| codec.strip_prefix("avc3."))
+        .and_then(|value| value.split('.').next())
+    else {
+        return true;
+    };
+    if profile_level_id.len() != 6
+        || !profile_level_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return true;
+    }
+
+    u8::from_str_radix(&profile_level_id[4..6], 16).is_ok_and(|level| level <= 0x2A)
 }
 
 fn variant_has_codec(
@@ -523,6 +628,72 @@ mod tests {
     }
 
     #[test]
+    fn h264_aac_variant_above_profile_dimensions_requires_transcoding() {
+        let mut variant = variant("h264-4k", "avc1.640028", Some("mp4a.40.2"));
+        variant.width = Some(3840);
+        variant.height = Some(2160);
+        variant.video.as_mut().unwrap().width = Some(3840);
+        variant.video.as_mut().unwrap().height = Some(2160);
+
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn h264_aac_variant_above_profile_frame_rate_requires_transcoding() {
+        let mut variant = variant("h264-120fps", "avc1.640028", Some("mp4a.40.2"));
+        variant.frame_rate = Some("120000/1000".to_owned());
+        variant.video.as_mut().unwrap().frame_rate = Some("120000/1000".to_owned());
+
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn h264_aac_variant_above_profile_bandwidth_requires_transcoding() {
+        let mut variant = variant("h264-high-bitrate", "avc1.640028", Some("mp4a.40.2"));
+        variant.bandwidth = Some(30_000_000);
+        variant.video.as_mut().unwrap().bandwidth = Some(30_000_000);
+
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant,
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
+    fn h264_aac_variant_above_profile_h264_level_requires_transcoding() {
+        let plan = HlsTranscodingPlan::for_variant(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant("h264-level-5", "avc1.640033", Some("mp4a.40.2")),
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+    }
+
+    #[test]
     fn non_h264_variant_is_ready_only_when_enabled() {
         let variant = variant("hevc", "hvc1.1.6.L120.90", Some("mp4a.40.2"));
 
@@ -616,7 +787,10 @@ mod tests {
             stream_id: None,
             mime_type: Some("video/mp4".to_owned()),
             codecs: Some(codecs.to_owned()),
-            bandwidth: Some(1_000_000),
+            bandwidth: Some(match kind {
+                BilibiliMediaRequestKind::Audio => LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
+                _ => 1_000_000,
+            }),
             width: Some(1920),
             height: Some(1080),
             frame_rate: None,
