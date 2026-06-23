@@ -317,10 +317,10 @@ public final class PlayerViewModel: ObservableObject {
                 } catch {
                     return
                 }
-                guard self?.isPlaybackProgressActivelyPlaying() == true else {
+                guard let intent = self?.periodicPlaybackProgressIntent() else {
                     continue
                 }
-                await self?.reportCurrentPlaybackProgress(intent: .playing)
+                await self?.reportCurrentPlaybackProgress(intent: intent)
             }
         }
     }
@@ -359,12 +359,19 @@ public final class PlayerViewModel: ObservableObject {
         statusMessage = "Playback finished."
     }
 
-    private func isPlaybackProgressActivelyPlaying() -> Bool {
+    private func periodicPlaybackProgressIntent() -> PlaybackProgressIntent? {
         guard let player else {
-            return false
+            return nil
         }
 
-        return player.rate != 0 || player.timeControlStatus == .playing
+        if player.rate != 0 || player.timeControlStatus == .playing {
+            return .playing
+        }
+
+        guard player.currentItem != nil else {
+            return nil
+        }
+        return .paused
     }
 
     private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) {

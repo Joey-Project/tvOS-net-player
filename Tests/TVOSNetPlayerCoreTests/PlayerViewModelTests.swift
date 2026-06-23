@@ -292,6 +292,37 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPausedPlaybackProgressKeepsLeaseWarm() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        try await Task.sleep(for: .milliseconds(100))
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertTrue(
+            reports.contains {
+                $0.intent == .paused
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-1/master.m3u8"
+            }
+        )
+    }
+
+    @MainActor
     func testStalePlaybackEndNotificationDoesNotStopNewPlayback() async throws {
         let client = FakePlaybackProgressClient()
         let endpoint = CacheServerEndpoint(host: "mac-mini.local")
