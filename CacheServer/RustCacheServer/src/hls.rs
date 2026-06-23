@@ -276,7 +276,6 @@ impl HlsPlaybackSession {
             return Some(split_media_playlist_for_resource(
                 resource,
                 initialization_length,
-                duration,
                 segments,
             ));
         }
@@ -395,13 +394,11 @@ impl HlsPlaybackSession {
 fn split_media_playlist_for_resource(
     resource: &HlsMediaResource,
     initialization_length: u64,
-    duration_seconds: u32,
     segments: &[HlsMediaSegment],
 ) -> String {
-    let segment_durations = distributed_segment_durations_millis(duration_seconds, segments.len());
-    let target_duration = segment_durations
+    let target_duration = segments
         .iter()
-        .map(|duration| duration.div_ceil(1_000))
+        .map(|segment| segment.duration_millis.div_ceil(1_000))
         .max()
         .unwrap_or(1)
         .max(1);
@@ -409,10 +406,10 @@ fn split_media_playlist_for_resource(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MAP:URI=\"{}\",BYTERANGE=\"{initialization_length}@0\"\n",
         resource.id,
     );
-    for (segment, duration_millis) in segments.iter().zip(segment_durations) {
+    for segment in segments {
         playlist.push_str(&format!(
             "#EXTINF:{},\n#EXT-X-BYTERANGE:{}@{}\n{}\n",
-            format_duration_millis(duration_millis),
+            format_duration_millis(segment.duration_millis),
             segment.byte_range_length,
             segment.byte_range_offset,
             resource.id
@@ -420,18 +417,6 @@ fn split_media_playlist_for_resource(
     }
     playlist.push_str("#EXT-X-ENDLIST\n");
     playlist
-}
-
-fn distributed_segment_durations_millis(duration_seconds: u32, segment_count: usize) -> Vec<u64> {
-    let segment_count = u64::try_from(segment_count).unwrap_or(u64::MAX).max(1);
-    let total_millis = u64::from(duration_seconds)
-        .max(u64::from(DEFAULT_DURATION_SECONDS))
-        .saturating_mul(1_000);
-    let base = total_millis / segment_count;
-    let remainder = total_millis % segment_count;
-    (0..segment_count)
-        .map(|index| base + u64::from(index < remainder))
-        .collect()
 }
 
 fn format_duration_millis(duration_millis: u64) -> String {
@@ -445,7 +430,10 @@ fn segments_are_valid_for_resource(
 ) -> bool {
     let mut previous_end = initialization_length;
     for segment in segments {
-        if segment.byte_range_length == 0 || segment.byte_range_offset < initialization_length {
+        if segment.byte_range_length == 0
+            || segment.duration_millis == 0
+            || segment.byte_range_offset != previous_end
+        {
             return false;
         }
         let Some(end) = segment
@@ -454,12 +442,12 @@ fn segments_are_valid_for_resource(
         else {
             return false;
         };
-        if end > total_length || segment.byte_range_offset < previous_end {
+        if end > total_length {
             return false;
         }
         previous_end = end;
     }
-    true
+    previous_end == total_length
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -713,6 +701,7 @@ impl HlsMediaResourceMetadata {
 pub(crate) struct HlsMediaSegment {
     pub(crate) byte_range_offset: u64,
     pub(crate) byte_range_length: u64,
+    pub(crate) duration_millis: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1005,14 +994,17 @@ mod tests {
             HlsMediaSegment {
                 byte_range_offset: 128,
                 byte_range_length: 1_000,
+                duration_millis: 10_000,
             },
             HlsMediaSegment {
                 byte_range_offset: 1_128,
                 byte_range_length: 2_000,
+                duration_millis: 20_000,
             },
             HlsMediaSegment {
                 byte_range_offset: 3_128,
                 byte_range_length: 3_000,
+                duration_millis: 31_000,
             },
         ];
 
@@ -1020,15 +1012,15 @@ mod tests {
             .media_playlist_with_segments("video.m3u8", 128, 6_128, &segments)
             .expect("media playlist should be created");
 
-        assert!(playlist.contains("#EXT-X-TARGETDURATION:21"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:31"));
         assert!(playlist.contains("#EXT-X-MAP:URI=\"video.m4s\",BYTERANGE=\"128@0\""));
-        assert!(playlist.contains("#EXTINF:20.334,\n#EXT-X-BYTERANGE:1000@128\nvideo.m4s"));
-        assert!(playlist.contains("#EXTINF:20.333,\n#EXT-X-BYTERANGE:2000@1128\nvideo.m4s"));
-        assert!(playlist.contains("#EXTINF:20.333,\n#EXT-X-BYTERANGE:3000@3128\nvideo.m4s"));
+        assert!(playlist.contains("#EXTINF:10.000,\n#EXT-X-BYTERANGE:1000@128\nvideo.m4s"));
+        assert!(playlist.contains("#EXTINF:20.000,\n#EXT-X-BYTERANGE:2000@1128\nvideo.m4s"));
+        assert!(playlist.contains("#EXTINF:31.000,\n#EXT-X-BYTERANGE:3000@3128\nvideo.m4s"));
     }
 
     #[test]
-    fn media_playlist_falls_back_when_cached_fragment_ranges_are_invalid() {
+    fn media_playlist_falls_back_when_cached_fragment_ranges_are_non_contiguous() {
         let session =
             HlsPlaybackSession::from_selected_variant("session-1", "Episode", &dash_variant())
                 .unwrap();
@@ -1036,10 +1028,39 @@ mod tests {
             HlsMediaSegment {
                 byte_range_offset: 100,
                 byte_range_length: 1_000,
+                duration_millis: 1_000,
             },
             HlsMediaSegment {
                 byte_range_offset: 1_128,
                 byte_range_length: 1_000,
+                duration_millis: 1_000,
+            },
+        ];
+
+        let playlist = session
+            .media_playlist_with_segments("video.m3u8", 128, 10_000, &invalid_segments)
+            .expect("media playlist should fall back to a single range");
+
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:60"));
+        assert!(playlist.contains("#EXT-X-BYTERANGE:9872@128"));
+        assert_eq!(1, playlist.matches("#EXTINF:").count());
+    }
+
+    #[test]
+    fn media_playlist_falls_back_when_cached_fragment_ranges_leave_tail_bytes() {
+        let session =
+            HlsPlaybackSession::from_selected_variant("session-1", "Episode", &dash_variant())
+                .unwrap();
+        let invalid_segments = vec![
+            HlsMediaSegment {
+                byte_range_offset: 128,
+                byte_range_length: 1_000,
+                duration_millis: 1_000,
+            },
+            HlsMediaSegment {
+                byte_range_offset: 1_128,
+                byte_range_length: 1_000,
+                duration_millis: 1_000,
             },
         ];
 

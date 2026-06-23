@@ -14,16 +14,16 @@ superseded_by:
 
 ## Summary
 
-- Added conservative fMP4 fragment range parsing for completed cached resources.
-- Persisted optional segment byte ranges in HLS cached-resource metadata with legacy fallback.
+- Added conservative fMP4 fragment range and timing parsing for completed cached resources.
+- Persisted optional segment byte ranges and durations in HLS cached-resource metadata with legacy fallback.
 - Updated HLS media playlist generation to emit multiple `EXTINF`/`EXT-X-BYTERANGE` entries when verified fragment ranges are available.
 
 ## Decisions
 
 - Segment splitting is currently completed-cache-only. Runtime upstream playback and first-window prewarm continue to use the existing single-range playlist shape.
-- The parser only trusts top-level fMP4 `moof` plus following `mdat` byte ranges. Single-fragment files, malformed fragments, or unsupported layouts fall back to the single-range playlist instead of fabricating boundaries.
+- The parser only trusts top-level fMP4 `moof` plus following `mdat` byte ranges with parseable fragment timing and full payload coverage through EOF. Single-fragment files, malformed fragments, missing timing, uncovered trailer boxes, or unsupported layouts fall back to the single-range playlist instead of fabricating boundaries.
 - Playlist requests consume persisted segment metadata and do not rescan large cached media files.
-- Segment durations are distributed from known resource duration across verified fragment boundaries until a later PR adds deeper timing metadata parsing.
+- Segment durations come from fMP4 timing metadata; split playlist output is disabled when that metadata is unavailable.
 
 ## Validation
 
