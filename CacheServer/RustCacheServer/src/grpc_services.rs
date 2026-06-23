@@ -3346,11 +3346,24 @@ mod tests {
             .hls_cache
             .completed_session(&completed.id)
             .expect("completed HLS session should persist");
-        assert!(persisted_session.alternate_variants.is_empty());
+        assert_eq!(1, persisted_session.alternate_variants.len());
         assert!(
             !persisted_session
                 .master_playlist()
                 .contains("segments/v1-video.m3u8")
+        );
+        assert!(
+            persisted_session
+                .media_playlist_resource("v1-video.m3u8")
+                .is_some()
+        );
+        assert_eq!(
+            "",
+            persisted_session
+                .media_resource("v1-video.m4s")
+                .expect("persisted alternate media resource should remain serveable")
+                .request
+                .url
         );
     }
 
@@ -7769,6 +7782,26 @@ mod tests {
         assert_eq!(library_item_id, completed.library_item_id);
         assert_eq!("transcoded.m4s", runtime_session.variant.video.id);
         assert_eq!("transcoded.m4s", restored_session.variant.video.id);
+        assert!(
+            runtime_session
+                .media_playlist_resource("video.m3u8")
+                .is_some()
+        );
+        assert!(
+            restored_session
+                .media_playlist_resource("video.m3u8")
+                .is_some()
+        );
+        assert!(
+            !runtime_session
+                .master_playlist()
+                .contains("segments/video.m3u8")
+        );
+        assert!(
+            runtime_session
+                .master_playlist()
+                .contains("segments/transcoded.m3u8")
+        );
         assert!(runtime_session.variant.audio.is_none());
         assert!(runtime_session.variant.video.request.url.is_empty());
         assert_eq!("avc1.64002A", item.variants[0].video_codec);
@@ -7829,6 +7862,119 @@ mod tests {
         );
         assert!(!temp.path().join("ffmpeg-args.log").exists());
         assert_eq!(0, state.lan_transcoding_active_job_count());
+    }
+
+    #[tokio::test]
+    async fn app_state_preserves_restored_ready_hls_session_when_lan_transcoding_disabled() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let base_options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            lan_transcoding_enabled: true,
+            ..CacheServerOptions::default()
+        };
+        let state = AppState::new_with_playback_planner(
+            base_options.clone(),
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, mut hls_session, library_item_id) = create_playable_hls_playback_task(
+            &state,
+            "BV1transcode-restore-disabled",
+            &upstream_url,
+        );
+        mark_hls_session_transcoding_ready(&mut hls_session);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
+
+        let restored = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                lan_transcoding_enabled: false,
+                ..base_options
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let restored_task = restored
+            .tasks
+            .get_task(&task_id)
+            .expect("playable task should survive disabled restore");
+
+        assert_eq!(TaskState::Playable, restored_task.state());
+        assert!(restored.hls_sessions.get(&task_id).is_some());
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_migrates_completed_ready_source_cache_after_upgrade() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            lan_transcoding_enabled: true,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let completed =
+            create_completed_hls_playback_task(&state, "BV1legacy-ready-cache", &upstream_url)
+                .await;
+        let mut legacy_session = state
+            .hls_cache
+            .playback_session(&completed.task_id)
+            .expect("legacy completed session should remain on disk");
+        legacy_session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Ready,
+            legacy_session.variant.id.clone(),
+            "Legacy completed cache was planned for LAN transcoding before execution was available.",
+        );
+        state
+            .hls_cache
+            .save_session(&legacy_session)
+            .expect("legacy ready completed session should persist");
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&completed.task_id)
+            .expect("completed task should survive legacy ready restore");
+        let restored_session = restored
+            .hls_cache
+            .completed_session(&completed.task_id)
+            .expect("legacy ready source cache should be restored as completed");
+
+        assert_eq!(TaskState::Completed, restored_task.state());
+        assert_eq!(completed.library_item_id, restored_task.library_item_id);
+        assert_eq!(
+            HlsTranscodingPlanState::Disabled,
+            restored_session.transcoding.state
+        );
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&completed.library_item_id)
+                .is_some()
+        );
     }
 
     #[tokio::test]

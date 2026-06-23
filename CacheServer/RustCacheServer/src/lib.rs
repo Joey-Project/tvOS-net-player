@@ -54,7 +54,7 @@ use crate::{
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
-        sanitized_completed_session,
+        sanitized_completed_session, source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -65,6 +65,7 @@ use crate::{
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
+    transcoding::HlsTranscodingPlanState,
 };
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
@@ -170,6 +171,38 @@ impl AppState {
             .map(|session| session.id.clone())
             .collect();
         let completed_hls_cache_playback_supported = library.supports_http_range_playback();
+        let source_completed_restore_session_ids = if completed_hls_cache_playback_supported {
+            restored_hls_sessions
+                .iter()
+                .filter(|session| {
+                    session.transcoding.state == HlsTranscodingPlanState::Ready
+                        && hls_cache.source_resources_are_complete(session)
+                        && tasks
+                            .completed_playback_task_for_hls_session(&session.id)
+                            .is_some_and(|task| {
+                                task.library_item_id
+                                    == HlsCacheStore::completed_library_item_id(&session.id)
+                            })
+                })
+                .map(|session| session.id.clone())
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        if !source_completed_restore_session_ids.is_empty() {
+            for session in &mut restored_hls_sessions {
+                if !source_completed_restore_session_ids.contains(&session.id) {
+                    continue;
+                }
+                *session = source_completed_session_for_restore(session);
+                if let Err(error) = hls_cache.save_completed_session(session) {
+                    eprintln!(
+                        "Failed to migrate restored completed HLS source session {}: {error}",
+                        session.id
+                    );
+                }
+            }
+        }
         let completed_cache_session_ids = if completed_hls_cache_playback_supported {
             hls_cache.completed_session_ids(&restored_hls_sessions)
         } else {
@@ -294,6 +327,11 @@ impl AppState {
             else {
                 continue;
             };
+            if session.transcoding.state == HlsTranscodingPlanState::Ready
+                && self.hls_transcoding_execution_config().is_none()
+            {
+                continue;
+            }
             if completed_session_ids.contains(&session.id) {
                 self.hls_sessions
                     .insert(sanitized_completed_session(session));

@@ -185,12 +185,7 @@ impl HlsCacheStore {
         let Some(session) = self.load_session(session_id) else {
             return Ok(());
         };
-        for resource in session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
-        {
+        for resource in session_unique_media_resources(&session) {
             self.remove_cached_resource(session_id, &resource.id)?;
             self.remove_prewarmed_resource(session_id, &resource.id)?;
         }
@@ -335,6 +330,10 @@ impl HlsCacheStore {
     pub(crate) fn completed_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
         let session = self.load_session(session_id)?;
         self.session_is_complete(&session).then_some(session)
+    }
+
+    pub(crate) fn source_resources_are_complete(&self, session: &HlsPlaybackSession) -> bool {
+        self.source_session_resources_are_complete(session)
     }
 
     pub(crate) fn playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
@@ -1033,6 +1032,10 @@ impl HlsCacheStore {
         if session.transcoding.state == HlsTranscodingPlanState::Ready {
             return false;
         }
+        self.source_session_resources_are_complete(session)
+    }
+
+    fn source_session_resources_are_complete(&self, session: &HlsPlaybackSession) -> bool {
         self.cached_resource(&session.id, &session.variant.video.id)
             .is_some()
             && session
@@ -1140,11 +1143,8 @@ impl HlsCacheStore {
     }
 
     fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> io::Result<u64> {
-        let source_size = session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
+        let source_size = session_unique_media_resources(session)
+            .into_iter()
             .map(|resource| self.resource_managed_size(&session.id, &resource.id))
             .sum::<u64>();
         Ok(source_size.saturating_add(self.active_transcode_managed_size(session)?))
@@ -1199,22 +1199,16 @@ impl HlsCacheStore {
     }
 
     fn resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
-        session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
+        session_unique_media_resources(session)
+            .into_iter()
             .filter_map(|resource| self.cached_resource(&session.id, &resource.id))
             .map(|resource| resource.last_modified)
             .collect()
     }
 
     fn managed_resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
-        session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
+        session_unique_media_resources(session)
+            .into_iter()
             .filter_map(|resource| {
                 self.cached_resource(&session.id, &resource.id)
                     .map(|resource| resource.last_modified)
@@ -1652,15 +1646,29 @@ impl Drop for HlsTranscodingCommitGuard {
 
 fn referenced_session_managed_file_names(session: &HlsPlaybackSession) -> HashSet<String> {
     let mut retained = HashSet::from(["session.json".to_owned()]);
-    for resource in session
-        .variant
-        .audio
-        .iter()
-        .chain(std::iter::once(&session.variant.video))
-    {
+    for resource in session_unique_media_resources(session) {
         insert_resource_managed_file_names(&mut retained, &resource.id);
     }
     retained
+}
+
+fn session_unique_media_resources(session: &HlsPlaybackSession) -> Vec<&HlsMediaResource> {
+    let mut seen = HashSet::new();
+    session_media_resources(session)
+        .filter(|resource| seen.insert(resource.id.clone()))
+        .collect()
+}
+
+fn session_media_resources(
+    session: &HlsPlaybackSession,
+) -> impl Iterator<Item = &HlsMediaResource> {
+    std::iter::once(&session.variant)
+        .chain(session.alternate_variants.iter())
+        .flat_map(variant_media_resources)
+}
+
+fn variant_media_resources(variant: &HlsVariant) -> impl Iterator<Item = &HlsMediaResource> {
+    variant.audio.iter().chain(std::iter::once(&variant.video))
 }
 
 fn insert_resource_managed_file_names(retained: &mut HashSet<String>, resource_id: &str) {
@@ -2128,6 +2136,8 @@ fn transcoded_completed_session(
     output_size: u64,
 ) -> HlsPlaybackSession {
     let mut completed = session.clone();
+    let mut hidden_lookup_variants = vec![session.variant.clone()];
+    hidden_lookup_variants.extend(session.alternate_variants.clone());
     let had_audio = session.variant.audio.is_some();
     let codecs = transcoded_codecs(had_audio);
     let cache_key = transcoded_cache_key(session, &codecs);
@@ -2164,7 +2174,7 @@ fn transcoded_completed_session(
         video: resource,
         audio: None,
     };
-    completed.alternate_variants.clear();
+    completed.alternate_variants = hidden_lookup_variants;
     completed.advertise_alternate_variants = false;
     completed.abr = HlsAbrMetadata::default();
     completed.variants = vec![HlsVariantMetadata {
@@ -2345,7 +2355,26 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = completed_runtime_session(session);
-    session.alternate_variants.clear();
+    for variant in &mut session.alternate_variants {
+        sanitize_completed_resource(&mut variant.video);
+        if let Some(audio) = variant.audio.as_mut() {
+            sanitize_completed_resource(audio);
+        }
+    }
+    session
+}
+
+pub(crate) fn source_completed_session_for_restore(
+    session: &HlsPlaybackSession,
+) -> HlsPlaybackSession {
+    let mut session = session.clone();
+    if session.transcoding.state == HlsTranscodingPlanState::Ready {
+        session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Disabled,
+            session.transcoding.source_variant_id.clone(),
+            "LAN transcoding was unavailable during restore; serving the completed source HLS cache.",
+        );
+    }
     session
 }
 
@@ -2493,6 +2522,8 @@ struct PersistedHlsSession {
     variant: PersistedHlsVariant,
     #[serde(default)]
     alternate_variants: Vec<PersistedHlsVariant>,
+    #[serde(default = "default_advertise_alternate_variants")]
+    advertise_alternate_variants: bool,
     #[serde(default)]
     abr: PersistedHlsAbrMetadata,
     #[serde(default)]
@@ -2513,6 +2544,7 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
                 .into_iter()
                 .map(PersistedHlsVariant::from)
                 .collect(),
+            advertise_alternate_variants: session.advertise_alternate_variants,
             abr: PersistedHlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -2538,7 +2570,7 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
                 .into_iter()
                 .map(HlsVariant::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
-            advertise_alternate_variants: true,
+            advertise_alternate_variants: session.advertise_alternate_variants,
             abr: HlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -2548,6 +2580,10 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
             transcoding: HlsTranscodingPlan::from(session.transcoding),
         })
     }
+}
+
+fn default_advertise_alternate_variants() -> bool {
+    true
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -3294,6 +3330,7 @@ mod tests {
             .as_object_mut()
             .expect("persisted session should be a JSON object");
         object.remove("alternate_variants");
+        object.remove("advertise_alternate_variants");
         object.remove("abr");
         object.remove("variants");
         object.remove("transcoding");
@@ -3553,13 +3590,13 @@ mod tests {
         assert_eq!(fake_mp4().len() as u64, cached.total_length);
         assert_eq!(28, cached.initialization_length);
         assert!(
-            !store
+            store
                 .resource_path("session-transcoded", "video.m4s")
                 .unwrap()
                 .exists()
         );
         assert!(
-            !store
+            store
                 .resource_path("session-transcoded", "audio.m4s")
                 .unwrap()
                 .exists()
@@ -3581,6 +3618,17 @@ mod tests {
             reloaded
                 .master_playlist()
                 .contains("segments/transcoded.m3u8")
+        );
+        assert!(!reloaded.master_playlist().contains("segments/video.m3u8"));
+        assert!(reloaded.media_playlist_resource("video.m3u8").is_some());
+        assert!(reloaded.media_resource("video.m4s").is_some());
+        assert_eq!(
+            "",
+            reloaded
+                .media_resource("video.m4s")
+                .expect("source lookup resource should remain addressable")
+                .request
+                .url
         );
     }
 
@@ -3650,7 +3698,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_snapshot_removes_orphaned_transcoding_sources_after_manifest_rewrite() {
+    fn usage_snapshot_retains_transcoded_source_lookup_resources_after_manifest_rewrite() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
         let source_session =
@@ -3709,7 +3757,7 @@ mod tests {
             .expect("usage snapshot should repair orphaned resources");
 
         assert_eq!(1, usage.completed_session_count);
-        assert_eq!(fake_mp4().len() as u64, usage.used_bytes);
+        assert_eq!(3 * fake_mp4().len() as u64, usage.used_bytes);
         assert!(
             store
                 .cached_resource(&completed_session.id, HLS_TRANSCODED_RESOURCE_ID)
@@ -3717,13 +3765,13 @@ mod tests {
         );
         for resource_id in ["video.m4s", "audio.m4s"] {
             assert!(
-                !store
+                store
                     .resource_path(&completed_session.id, resource_id)
                     .expect("resource path should be valid")
                     .exists()
             );
             assert!(
-                !store
+                store
                     .resource_metadata_path(&completed_session.id, resource_id)
                     .expect("metadata path should be valid")
                     .exists()
@@ -4852,11 +4900,33 @@ mod tests {
         assert!(manifest.contains("source-hash"));
         assert!(manifest.contains("hevc-source-hash"));
         assert_eq!(1, sessions.len());
-        assert!(sessions[0].alternate_variants.is_empty());
+        assert_eq!(1, sessions[0].alternate_variants.len());
         let request = &sessions[0].variant.video.request;
         assert!(request.url.is_empty());
         assert!(request.backup_urls.is_empty());
         assert!(request.headers.is_empty());
+        let alternate_video_request = &sessions[0].alternate_variants[0].video.request;
+        assert!(alternate_video_request.url.is_empty());
+        assert!(alternate_video_request.backup_urls.is_empty());
+        assert!(alternate_video_request.headers.is_empty());
+        let alternate_audio_request = &sessions[0].alternate_variants[0]
+            .audio
+            .as_ref()
+            .expect("alternate audio should remain for lookup")
+            .request;
+        assert!(alternate_audio_request.url.is_empty());
+        assert!(alternate_audio_request.backup_urls.is_empty());
+        assert!(alternate_audio_request.headers.is_empty());
+        assert!(
+            !sessions[0]
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
+        );
+        assert!(
+            sessions[0]
+                .media_playlist_resource("v1-video.m3u8")
+                .is_some()
+        );
         assert_eq!(session.abr, sessions[0].abr);
         assert_eq!(session.variants, sessions[0].variants);
         assert!(store.get_completed_library_item(&item_id).is_some());
@@ -6133,15 +6203,17 @@ mod tests {
         session: &HlsPlaybackSession,
         resource_id: &str,
     ) -> PersistedHlsCachedResource {
+        let resource = session_unique_media_resources(session)
+            .into_iter()
+            .find(|resource| resource.id == resource_id)
+            .unwrap_or(&session.variant.video);
         PersistedHlsCachedResource {
             schema_version: HLS_CACHE_SCHEMA_VERSION,
             id: resource_id.to_owned(),
-            content_type: session.variant.video.content_type().to_owned(),
+            content_type: resource.content_type().to_owned(),
             total_length: fake_mp4().len() as u64,
             initialization_length: 28,
-            cache_key: PersistedBilibiliMediaCacheKey::from(
-                session.variant.video.request.cache_key.clone(),
-            ),
+            cache_key: PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone()),
         }
     }
 
