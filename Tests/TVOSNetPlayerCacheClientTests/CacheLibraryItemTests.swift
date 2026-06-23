@@ -80,6 +80,21 @@ final class CacheLibraryItemTests: XCTestCase {
         XCTAssertEqual(item.availabilityLabel, "LAN file")
     }
 
+    func testPlaybackProgressPositionLabelRejectsOversizedValues() {
+        let status = HLSPlaybackProgressStatus.fixture(positionSeconds: .greatestFiniteMagnitude)
+
+        XCTAssertNil(status.positionLabel)
+    }
+
+    func testPlaybackProgressPositionLabelIgnoresOversizedDuration() {
+        let status = HLSPlaybackProgressStatus.fixture(
+            positionSeconds: 42,
+            durationSeconds: .greatestFiniteMagnitude
+        )
+
+        XCTAssertEqual(status.positionLabel, "0:42")
+    }
+
     func testPlaybackSourceSupportsHTTPFileAndHLSProtocols() {
         let protocolNames = ["httpFile", "PLAYBACK_PROTOCOL_HTTP_FILE", "hls", "PLAYBACK_PROTOCOL_HLS"]
 
@@ -214,6 +229,26 @@ extension CachePlaybackSource {
             variantID: "original",
             playbackProtocol: playbackProtocol,
             uri: uri
+        )
+    }
+}
+
+extension HLSPlaybackProgressStatus {
+    fileprivate static func fixture(
+        positionSeconds: Double = 0,
+        durationSeconds: Double? = nil
+    ) -> Self {
+        Self(
+            state: "HLS_PLAYBACK_ACTIVITY_STATE_ACTIVE",
+            message: "Playback is active.",
+            sessionID: "session-1",
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264",
+            playbackURI: "http://mac-mini.local:8080/hls/session-1/master.m3u8",
+            positionSeconds: positionSeconds,
+            durationSeconds: durationSeconds,
+            lastIntent: "PLAYBACK_PROGRESS_INTENT_PLAYING",
+            updatedAt: Date(timeIntervalSince1970: 0)
         )
     }
 }

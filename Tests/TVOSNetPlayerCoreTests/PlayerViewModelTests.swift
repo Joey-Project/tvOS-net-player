@@ -292,6 +292,51 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testStalePlaybackEndNotificationDoesNotStopNewPlayback() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let firstContext = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+        let secondContext = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-2",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: firstContext
+        )
+        let firstItem = try XCTUnwrap(model.player?.currentItem)
+
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: firstItem)
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-2/master.m3u8",
+            progressContext: secondContext
+        )
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/hls/session-2/master.m3u8")
+        XCTAssertEqual(model.statusMessage, "Playing http://mac-mini.local:8080/hls/session-2/master.m3u8")
+        let reports = await client.reportsSnapshot()
+        XCTAssertFalse(
+            reports.contains {
+                $0.intent == .stopped
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-2/master.m3u8"
+            }
+        )
+    }
+
+    @MainActor
     func testTransientLoadWithStaleManualSequenceDoesNotReplaceManualPlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let staleSequence = model.manualInteractionSequence

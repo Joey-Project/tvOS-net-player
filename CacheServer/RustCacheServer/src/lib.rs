@@ -62,7 +62,7 @@ use crate::{
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
     hls_playback_progress::{
         HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressRecordOutcome,
-        PlaybackProgressReport,
+        PlaybackProgressReport, session_id_from_report,
     },
     library::LocalMediaLibrary,
     media::{
@@ -692,6 +692,26 @@ impl AppState {
         &self,
         report: PlaybackProgressReport,
     ) -> PlaybackProgressRecordOutcome {
+        let Some(session_id) = session_id_from_report(&report) else {
+            return PlaybackProgressRecordOutcome {
+                accepted: false,
+                session_id: String::new(),
+                message: "Playback URI does not identify an HLS cache session.".to_owned(),
+            };
+        };
+
+        let _quota_lock = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
+        if !self.registered_hls_session_is_authorized_for_serving(&session_id) {
+            return PlaybackProgressRecordOutcome {
+                accepted: false,
+                session_id,
+                message: "Playback URI does not identify a known HLS cache session.".to_owned(),
+            };
+        }
+
         let outcome = self.hls_playback_progress.record(report);
         if outcome.accepted {
             self.note_hls_cache_playback_use(&outcome.session_id);

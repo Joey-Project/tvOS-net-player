@@ -540,7 +540,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public func playbackProgressContext(serverAddressText: String) -> PlayerPlaybackProgressContext? {
         guard let currentTask,
-            let endpoint = CacheServerEndpoint.normalized(from: serverAddressText),
+            let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
             let playbackURL = currentTask.playableBilibiliURL
         else {
             return nil
@@ -560,7 +560,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         serverAddressText: String
     ) -> PlayerPlaybackProgressContext? {
         guard let currentTask,
-            let endpoint = CacheServerEndpoint.normalized(from: serverAddressText),
+            let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
             let resultItem = currentTask.resultItems.first(where: { $0.id == result.id }),
             let playbackURL = resultItem.playableBilibiliURL
         else {
@@ -573,6 +573,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             libraryItemID: resultItem.playableBilibiliLibraryItemID ?? resultItem.playbackSource?.itemID ?? "",
             variantID: resultItem.playbackSource?.variantID ?? ""
         )
+    }
+
+    private func playbackProgressEndpoint(serverAddressText: String) -> CacheServerEndpoint? {
+        activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
     }
 
     public var displayTitle: String {

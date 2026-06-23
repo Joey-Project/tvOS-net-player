@@ -153,7 +153,7 @@ impl HlsPlaybackProgressState {
     }
 }
 
-fn session_id_from_report(report: &PlaybackProgressReport) -> Option<String> {
+pub(crate) fn session_id_from_report(report: &PlaybackProgressReport) -> Option<String> {
     let library_item_id = report.library_item_id.trim();
     if let Some(session_id) = HlsCacheStore::session_id_from_library_item_id(library_item_id) {
         return Some(session_id);

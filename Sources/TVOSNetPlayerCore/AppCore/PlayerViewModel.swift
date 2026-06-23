@@ -339,14 +339,21 @@ public final class PlayerViewModel: ObservableObject {
 
         playbackEndObserver = NotificationCenter.default
             .publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.finishPlaybackProgressReporting()
+            .sink { [weak self] notification in
+                let endedItem = notification.object as? AVPlayerItem
+                Task { @MainActor [weak self, endedItem] in
+                    guard let endedItem, self?.player?.currentItem === endedItem else {
+                        return
+                    }
+                    self?.finishPlaybackProgressReporting(for: endedItem)
                 }
             }
     }
 
-    private func finishPlaybackProgressReporting() {
+    private func finishPlaybackProgressReporting(for item: AVPlayerItem) {
+        guard player?.currentItem === item else {
+            return
+        }
         queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         statusMessage = "Playback finished."

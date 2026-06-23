@@ -4759,6 +4759,62 @@ mod tests {
 
     #[tokio::test]
     async fn report_playback_progress_updates_hls_cache_status() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1playback-progress", &upstream_url);
+        let service = CacheGrpcService::new(state);
+
+        let report = service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: 120.0,
+                intent: ProtoPlaybackProgressIntent::Seek.into(),
+            }))
+            .await
+            .expect("playback progress should be accepted")
+            .into_inner();
+
+        assert!(report.accepted);
+        assert_eq!(task_id, report.session_id);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::Active as i32, playback.state);
+        assert_eq!(task_id, playback.session_id);
+        assert_eq!("h264", playback.variant_id);
+        assert_eq!(42.0, playback.position_seconds);
+        assert_eq!(120.0, playback.duration_seconds);
+        assert_eq!(
+            ProtoPlaybackProgressIntent::Seek as i32,
+            playback.last_intent
+        );
+    }
+
+    #[tokio::test]
+    async fn report_playback_progress_rejects_unknown_hls_cache_session() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -4777,19 +4833,20 @@ mod tests {
 
         let report = service
             .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
-                playback_uri: "http://media.example.test:8080/hls/session-1/master.m3u8".to_owned(),
+                playback_uri: "http://media.example.test:8080/hls/unknown-session/master.m3u8"
+                    .to_owned(),
                 library_item_id: String::new(),
                 variant_id: "h264".to_owned(),
                 position_seconds: 42.0,
                 duration_seconds: 120.0,
-                intent: ProtoPlaybackProgressIntent::Seek.into(),
+                intent: ProtoPlaybackProgressIntent::Playing.into(),
             }))
             .await
-            .expect("playback progress should be accepted")
+            .expect("unknown playback progress should return a result")
             .into_inner();
 
-        assert!(report.accepted);
-        assert_eq!("session-1", report.session_id);
+        assert!(!report.accepted);
+        assert_eq!("unknown-session", report.session_id);
 
         let status = service
             .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
@@ -4799,15 +4856,8 @@ mod tests {
         let playback = status
             .playback
             .expect("HLS playback progress status should be present");
-        assert_eq!(ProtoHlsPlaybackActivityState::Active as i32, playback.state);
-        assert_eq!("session-1", playback.session_id);
-        assert_eq!("h264", playback.variant_id);
-        assert_eq!(42.0, playback.position_seconds);
-        assert_eq!(120.0, playback.duration_seconds);
-        assert_eq!(
-            ProtoPlaybackProgressIntent::Seek as i32,
-            playback.last_intent
-        );
+        assert_eq!(ProtoHlsPlaybackActivityState::None as i32, playback.state);
+        assert_eq!("", playback.session_id);
     }
 
     #[tokio::test]

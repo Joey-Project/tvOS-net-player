@@ -427,6 +427,8 @@ public struct PlaybackProgressReportResult: Equatable, Sendable {
 }
 
 public struct HLSPlaybackProgressStatus: Equatable, Sendable {
+    private static let maximumFormattedPlaybackSeconds = 100 * 365 * 24 * 60 * 60
+
     public let state: String
     public let message: String
     public let sessionID: String
@@ -475,15 +477,25 @@ public struct HLSPlaybackProgressStatus: Equatable, Sendable {
             return nil
         }
 
-        let current = Self.formattedPlaybackTime(positionSeconds)
+        guard let current = Self.formattedPlaybackTime(positionSeconds) else {
+            return nil
+        }
         guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else {
             return current
         }
 
-        return "\(current) of \(Self.formattedPlaybackTime(durationSeconds))"
+        guard let duration = Self.formattedPlaybackTime(durationSeconds) else {
+            return current
+        }
+
+        return "\(current) of \(duration)"
     }
 
-    private static func formattedPlaybackTime(_ seconds: Double) -> String {
+    private static func formattedPlaybackTime(_ seconds: Double) -> String? {
+        guard seconds.isFinite, seconds >= 0, seconds <= Double(maximumFormattedPlaybackSeconds) else {
+            return nil
+        }
+
         let roundedSeconds = max(0, Int(seconds.rounded()))
         let hours = roundedSeconds / 3_600
         let minutes = (roundedSeconds % 3_600) / 60

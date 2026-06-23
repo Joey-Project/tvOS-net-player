@@ -1532,6 +1532,43 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testPlaybackProgressContextUsesActiveEndpoint() async throws {
+        let childResultID = "bilibili-playback-1-result-2"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: childResultID,
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_PLAYABLE",
+                playbackSourceItemID: childResultID
+            )
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(resultItems: resultItems))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1active-endpoint",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "server-a.local:50051")
+
+        let expectedEndpoint = CacheServerEndpoint(host: "server-a.local", port: 50_051)
+        let taskContext = try XCTUnwrap(
+            model.playbackProgressContext(serverAddressText: "server-b.local:50051")
+        )
+        XCTAssertEqual(taskContext.endpoint, expectedEndpoint)
+
+        let result = try XCTUnwrap(model.playableTaskResults.first)
+        let resultContext = try XCTUnwrap(
+            model.playbackProgressContext(for: result, serverAddressText: "server-b.local:50051")
+        )
+        XCTAssertEqual(resultContext.endpoint, expectedEndpoint)
+
+        model.clearTask()
+    }
+
     func testTaskResultPlaybackIsDisabledWhileCancellationIsPending() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [
