@@ -37,7 +37,7 @@ use crate::{
         library_service_server::LibraryService, server_service_server::ServerService,
         task_service_server::TaskService,
     },
-    hls::HlsPlaybackSession,
+    hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
         HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
         completed_runtime_session, hls_session_declared_size_bytes, timestamp_from_system_time,
@@ -1595,11 +1595,16 @@ async fn run_hls_cache_finalization_inner(
         .await
     {
         Ok(completion) => {
-            let finalized = state.tasks.complete_playback_hls_session_cached(
-                &task_id,
-                &session_id,
-                completion.library_item_id,
-            );
+            let completed_playback_session =
+                playback_session_from_hls_cache_session(&completion.session);
+            let finalized = state
+                .tasks
+                .complete_playback_hls_session_cached_with_metadata(
+                    &task_id,
+                    &session_id,
+                    completion.library_item_id,
+                    completed_playback_session,
+                );
             match finalized {
                 Ok(task) if task.state() == TaskState::Completed => {
                     state
@@ -1785,6 +1790,96 @@ fn playback_task_metadata_with_options(
     })
 }
 
+fn playback_session_from_hls_cache_session(
+    session: &HlsPlaybackSession,
+) -> BilibiliPlaybackSession {
+    let selected_variant = playback_variant_from_hls_variant(&session.variant);
+    let mut variants = session
+        .variants
+        .iter()
+        .map(playback_variant_from_hls_metadata)
+        .collect::<Vec<_>>();
+    if variants.is_empty()
+        || !variants
+            .iter()
+            .any(|variant| variant.id == selected_variant.id)
+    {
+        variants.push(selected_variant.clone());
+    }
+
+    BilibiliPlaybackSession {
+        id: session.id.clone(),
+        title: session.title.clone(),
+        content_id: session
+            .variants
+            .iter()
+            .find(|variant| variant.id == session.variant.id)
+            .map(|variant| variant.content_id.clone())
+            .filter(|content_id| !content_id.trim().is_empty())
+            .unwrap_or_else(|| session.variant.video.request.cache_key.content_id.clone()),
+        selected_variant_id: session.variant.id.clone(),
+        selected_variant: Some(selected_variant),
+        variants,
+        transcoding_plan: Some(proto_lan_transcoding_plan(&session.transcoding)),
+    }
+}
+
+fn playback_variant_from_hls_variant(variant: &HlsVariant) -> BilibiliPlaybackVariant {
+    BilibiliPlaybackVariant {
+        id: variant.id.clone(),
+        label: hls_variant_label(variant.id.as_str(), variant.width, variant.height),
+        source_kind: playback_variant_kind_name(BilibiliPlaybackVariantKind::Dash).to_owned(),
+        container: playback_variant_container(BilibiliPlaybackVariantKind::Dash).to_owned(),
+        video_codec: hls_variant_video_codec(variant),
+        audio_codec: hls_variant_audio_codec(variant),
+        width: variant
+            .width
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i32::MAX),
+        height: variant
+            .height
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i32::MAX),
+        bitrate: variant.bandwidth.try_into().unwrap_or(i64::MAX),
+        size_bytes: hls_variant_size_bytes(variant)
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i64::MAX),
+    }
+}
+
+fn playback_variant_from_hls_metadata(metadata: &HlsVariantMetadata) -> BilibiliPlaybackVariant {
+    BilibiliPlaybackVariant {
+        id: metadata.id.clone(),
+        label: hls_variant_label(metadata.id.as_str(), metadata.width, metadata.height),
+        source_kind: playback_variant_kind_name(metadata.kind).to_owned(),
+        container: playback_variant_container(metadata.kind).to_owned(),
+        video_codec: hls_metadata_video_codec(metadata),
+        audio_codec: hls_metadata_audio_codec(metadata),
+        width: metadata
+            .width
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i32::MAX),
+        height: metadata
+            .height
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i32::MAX),
+        bitrate: metadata
+            .bandwidth
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i64::MAX),
+        size_bytes: hls_metadata_size_bytes(metadata)
+            .unwrap_or_default()
+            .try_into()
+            .unwrap_or(i64::MAX),
+    }
+}
+
 fn playback_variant_from_adapter(variant: &AdapterPlaybackVariant) -> BilibiliPlaybackVariant {
     BilibiliPlaybackVariant {
         id: variant.id.clone(),
@@ -1817,6 +1912,104 @@ fn playback_variant_from_adapter(variant: &AdapterPlaybackVariant) -> BilibiliPl
             .try_into()
             .unwrap_or(i64::MAX),
     }
+}
+
+fn hls_variant_label(id: &str, width: Option<u32>, height: Option<u32>) -> String {
+    match (width, height) {
+        (Some(width), Some(height)) => format!("{width}x{height}"),
+        _ => id.to_owned(),
+    }
+}
+
+fn hls_variant_video_codec(variant: &HlsVariant) -> String {
+    first_matching_codec(variant.codecs.iter().map(String::as_str), is_video_codec)
+        .or_else(|| first_matching_codec(variant.video.request.codecs.as_deref(), is_video_codec))
+        .unwrap_or_default()
+}
+
+fn hls_variant_audio_codec(variant: &HlsVariant) -> String {
+    variant
+        .audio
+        .as_ref()
+        .and_then(|audio| first_matching_codec(audio.request.codecs.as_deref(), is_audio_codec))
+        .or_else(|| first_matching_codec(variant.codecs.iter().map(String::as_str), is_audio_codec))
+        .or_else(|| first_matching_codec(variant.video.request.codecs.as_deref(), is_audio_codec))
+        .unwrap_or_default()
+}
+
+fn hls_variant_size_bytes(variant: &HlsVariant) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut found = false;
+    for resource in std::iter::once(&variant.video).chain(variant.audio.iter()) {
+        if let Some(size_bytes) = resource.request.size {
+            total = total.saturating_add(size_bytes);
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+fn hls_metadata_video_codec(metadata: &HlsVariantMetadata) -> String {
+    first_matching_codec(metadata.codecs.iter().map(String::as_str), is_video_codec)
+        .or_else(|| {
+            first_matching_codec(
+                metadata
+                    .media
+                    .iter()
+                    .filter_map(|media| media.codecs.as_deref()),
+                is_video_codec,
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn hls_metadata_audio_codec(metadata: &HlsVariantMetadata) -> String {
+    first_matching_codec(metadata.codecs.iter().map(String::as_str), is_audio_codec)
+        .or_else(|| {
+            first_matching_codec(
+                metadata
+                    .media
+                    .iter()
+                    .filter_map(|media| media.codecs.as_deref()),
+                is_audio_codec,
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn hls_metadata_size_bytes(metadata: &HlsVariantMetadata) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut found = false;
+    for media in &metadata.media {
+        if let Some(size_bytes) = media.size {
+            total = total.saturating_add(size_bytes);
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+fn first_matching_codec<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    predicate: impl Fn(&str) -> bool,
+) -> Option<String> {
+    for value in values {
+        for codec in value.split(',') {
+            let codec = codec.trim();
+            if !codec.is_empty() && predicate(codec) {
+                return Some(codec.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn is_audio_codec(codec: &str) -> bool {
+    codec.starts_with("mp4a.")
+}
+
+fn is_video_codec(codec: &str) -> bool {
+    !is_audio_codec(codec)
 }
 
 fn playback_variant_label(variant: &AdapterPlaybackVariant) -> String {
@@ -3336,9 +3529,9 @@ mod tests {
         let runtime_alternate = runtime_session
             .media_resource("v1-video.m4s")
             .expect("runtime alternate media resource should remain serveable");
-        assert!(runtime_alternate.request.url.is_empty());
+        assert_eq!(alternate_upstream_url, runtime_alternate.request.url);
         assert!(runtime_alternate.request.backup_urls.is_empty());
-        assert!(runtime_alternate.request.headers.is_empty());
+        assert!(!runtime_alternate.request.headers.is_empty());
 
         let persisted_session = state
             .hls_cache
@@ -3355,14 +3548,12 @@ mod tests {
                 .media_playlist_resource("v1-video.m3u8")
                 .is_some()
         );
-        assert_eq!(
-            "",
-            persisted_session
-                .media_resource("v1-video.m4s")
-                .expect("persisted alternate media resource should remain serveable")
-                .request
-                .url
-        );
+        let persisted_alternate = persisted_session
+            .media_resource("v1-video.m4s")
+            .expect("persisted alternate media resource should remain serveable");
+        assert!(persisted_alternate.request.url.is_empty());
+        assert!(persisted_alternate.request.backup_urls.is_empty());
+        assert!(persisted_alternate.request.headers.is_empty());
     }
 
     #[tokio::test]
@@ -7778,6 +7969,24 @@ mod tests {
 
         assert_eq!(TaskState::Completed, completed.state());
         assert_eq!(library_item_id, completed.library_item_id);
+        let completed_playback_session = completed
+            .playback_session
+            .as_ref()
+            .expect("completed task should expose generated playback session metadata");
+        let completed_selected_variant = completed_playback_session
+            .selected_variant
+            .as_ref()
+            .expect("completed task should expose selected generated variant metadata");
+        assert_eq!("avc1.64002A", completed_selected_variant.video_codec);
+        assert_eq!("mp4a.40.2", completed_selected_variant.audio_codec);
+        assert_eq!(
+            i32::from(LanTranscodingPlanState::NotRequired),
+            completed_playback_session
+                .transcoding_plan
+                .as_ref()
+                .expect("completed task should expose generated transcoding plan")
+                .state
+        );
         assert_eq!("transcoded.m4s", runtime_session.variant.video.id);
         assert_eq!("transcoded.m4s", restored_session.variant.video.id);
         assert!(
@@ -7805,9 +8014,14 @@ mod tests {
         let runtime_source_video = runtime_session
             .media_resource("video.m4s")
             .expect("runtime source video lookup should remain addressable");
-        assert!(runtime_source_video.request.url.is_empty());
-        assert!(runtime_source_video.request.backup_urls.is_empty());
-        assert!(runtime_source_video.request.headers.is_empty());
+        assert_eq!(upstream_url, runtime_source_video.request.url);
+        assert!(!runtime_source_video.request.headers.is_empty());
+        let restored_source_video = restored_session
+            .media_resource("video.m4s")
+            .expect("persisted source video lookup should remain addressable");
+        assert!(restored_source_video.request.url.is_empty());
+        assert!(restored_source_video.request.backup_urls.is_empty());
+        assert!(restored_source_video.request.headers.is_empty());
         assert_eq!("avc1.64002A", item.variants[0].video_codec);
         assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
         assert_eq!(0, state.lan_transcoding_active_job_count());

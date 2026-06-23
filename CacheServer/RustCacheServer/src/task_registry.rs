@@ -651,6 +651,31 @@ impl BilibiliTaskRegistry {
         session_id: &str,
         library_item_id: String,
     ) -> Result<Task, Status> {
+        self.complete_playback_hls_session_cached_inner(task_id, session_id, library_item_id, None)
+    }
+
+    pub fn complete_playback_hls_session_cached_with_metadata(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        library_item_id: String,
+        completed_playback_session: BilibiliPlaybackSession,
+    ) -> Result<Task, Status> {
+        self.complete_playback_hls_session_cached_inner(
+            task_id,
+            session_id,
+            library_item_id,
+            Some(completed_playback_session),
+        )
+    }
+
+    fn complete_playback_hls_session_cached_inner(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        library_item_id: String,
+        completed_playback_session: Option<BilibiliPlaybackSession>,
+    ) -> Result<Task, Status> {
         let normalized_task_id = normalize_required_id(task_id)?;
         let normalized_session_id = normalize_required_id(session_id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
@@ -698,7 +723,13 @@ impl BilibiliTaskRegistry {
                 task.library_item_id = library_item_id.clone();
                 if let Some(playback_source) = task.playback_source.as_mut() {
                     playback_source.item_id = library_item_id.clone();
+                    if let Some(playback_session) = &completed_playback_session {
+                        playback_source.variant_id = playback_session.selected_variant_id.clone();
+                    }
                     playback_source.expires_at = None;
+                }
+                if let Some(playback_session) = &completed_playback_session {
+                    task.playback_session = Some(playback_session.clone());
                 }
                 for item in &mut task.result_items {
                     if result_item_uses_hls_session(item, &normalized_session_id) {
@@ -707,7 +738,14 @@ impl BilibiliTaskRegistry {
                         item.library_item_id = library_item_id.clone();
                         if let Some(playback_source) = item.playback_source.as_mut() {
                             playback_source.item_id = library_item_id.clone();
+                            if let Some(playback_session) = &completed_playback_session {
+                                playback_source.variant_id =
+                                    playback_session.selected_variant_id.clone();
+                            }
                             playback_source.expires_at = None;
+                        }
+                        if let Some(playback_session) = &completed_playback_session {
+                            item.playback_session = Some(playback_session.clone());
                         }
                     }
                 }
@@ -3394,6 +3432,111 @@ mod tests {
         assert!(completed.result_items[1].library_item_id.is_empty());
         assert!(completed.result_items[1].playback_source.is_some());
         assert!(completed.result_items[1].playback_session.is_some());
+    }
+
+    #[test]
+    fn hls_completion_updates_completed_playback_session_metadata() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1completed-generated-metadata", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        let mut completed_session = playback_session(&child_session_id);
+        completed_session.title = "Generated playback".to_owned();
+        completed_session.selected_variant_id = "h264-generated".to_owned();
+        if let Some(selected_variant) = completed_session.selected_variant.as_mut() {
+            selected_variant.id = "h264-generated".to_owned();
+            selected_variant.video_codec = "avc1.64002A".to_owned();
+            selected_variant.audio_codec = "mp4a.40.2".to_owned();
+            selected_variant.size_bytes = 42;
+        }
+        completed_session.variants = completed_session
+            .selected_variant
+            .clone()
+            .into_iter()
+            .collect();
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&child_session_id),
+                playback_session(&child_session_id),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: created.task.id.clone(),
+                        selection_id: "page:1".to_owned(),
+                        title: "Part 1".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-1".to_owned(),
+                        index: 1,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(playback_source(&created.task.id)),
+                        playback_session: Some(playback_session(&created.task.id)),
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_session_id.clone(),
+                        selection_id: "page:2".to_owned(),
+                        title: "Part 2".to_owned(),
+                        subtitle: String::new(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-2".to_owned(),
+                        index: 2,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        library_item_id: String::new(),
+                        playback_source: Some(playback_source(&child_session_id)),
+                        playback_session: Some(playback_session(&child_session_id)),
+                    },
+                ],
+            )
+            .expect("multi-result playback task should become playable");
+        let library_item_id = format!("bilibili.hls.{child_session_id}");
+
+        registry
+            .complete_playback_hls_session_cached_with_metadata(
+                &created.task.id,
+                &child_session_id,
+                library_item_id.clone(),
+                completed_session.clone(),
+            )
+            .expect("primary child session should become completed");
+        let completed = registry
+            .get_task(&created.task.id)
+            .expect("completed task should remain readable");
+
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(
+            "Generated playback",
+            completed
+                .playback_session
+                .as_ref()
+                .expect("task should keep completed playback session metadata")
+                .title
+        );
+        assert_eq!(
+            "h264-generated",
+            completed
+                .playback_source
+                .as_ref()
+                .expect("task should keep completed playback source")
+                .variant_id
+        );
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            completed.result_items[0].state
+        );
+        assert_eq!(
+            i32::from(TaskState::Completed),
+            completed.result_items[1].state
+        );
+        assert_eq!(
+            Some(completed_session),
+            completed.result_items[1].playback_session.clone()
+        );
     }
 
     #[test]

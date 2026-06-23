@@ -2343,7 +2343,14 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
-    completed_runtime_session(session)
+    let mut session = completed_runtime_session(session);
+    for variant in &mut session.alternate_variants {
+        sanitize_completed_resource(&mut variant.video);
+        if let Some(audio) = variant.audio.as_mut() {
+            sanitize_completed_resource(audio);
+        }
+    }
+    session
 }
 
 pub(crate) fn source_completed_session_for_restore(
@@ -2366,12 +2373,6 @@ pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlay
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {
         sanitize_completed_resource(audio);
-    }
-    for variant in &mut session.alternate_variants {
-        sanitize_completed_resource(&mut variant.video);
-        if let Some(audio) = variant.audio.as_mut() {
-            sanitize_completed_resource(audio);
-        }
     }
     session
 }
@@ -3300,12 +3301,44 @@ mod tests {
         let alternate_video = runtime
             .media_resource("v1-video.m4s")
             .expect("runtime alternate video should remain addressable");
-        assert!(alternate_video.request.url.is_empty());
-        assert!(alternate_video.request.backup_urls.is_empty());
-        assert!(alternate_video.request.headers.is_empty());
+        assert_eq!(
+            "https://example.test/720p-video.m4s",
+            alternate_video.request.url
+        );
+        assert!(!alternate_video.request.headers.is_empty());
         let alternate_audio = runtime
             .media_resource("v1-audio.m4s")
             .expect("runtime alternate audio should remain addressable");
+        assert_eq!(
+            "https://example.test/720p-audio.m4s",
+            alternate_audio.request.url
+        );
+        assert!(!alternate_audio.request.headers.is_empty());
+    }
+
+    #[test]
+    fn sanitized_completed_session_scrubs_hidden_lookup_resources() {
+        let mut session = sample_session("session-sanitized", "https://example.test/video.m4s");
+        attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+
+        let sanitized = sanitized_completed_session(&session);
+
+        assert_eq!(1, sanitized.alternate_variants.len());
+        assert!(
+            !sanitized
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
+        );
+        assert!(sanitized.media_playlist_resource("v1-video.m3u8").is_some());
+        let alternate_video = sanitized
+            .media_resource("v1-video.m4s")
+            .expect("sanitized alternate video lookup should remain addressable");
+        assert!(alternate_video.request.url.is_empty());
+        assert!(alternate_video.request.backup_urls.is_empty());
+        assert!(alternate_video.request.headers.is_empty());
+        let alternate_audio = sanitized
+            .media_resource("v1-audio.m4s")
+            .expect("sanitized alternate audio lookup should remain addressable");
         assert!(alternate_audio.request.url.is_empty());
         assert!(alternate_audio.request.backup_urls.is_empty());
         assert!(alternate_audio.request.headers.is_empty());
