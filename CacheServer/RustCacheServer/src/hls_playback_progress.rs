@@ -129,15 +129,25 @@ impl HlsPlaybackProgressTracker {
             .expect("HLS playback progress lock poisoned");
         state.prune_expired(now);
         state
-            .reports_by_session_id
-            .values()
-            .max_by_key(|snapshot| snapshot.updated_at)
+            .latest_snapshot()
             .cloned()
             .unwrap_or_else(empty_snapshot)
     }
 }
 
 impl HlsPlaybackProgressState {
+    fn latest_snapshot(&self) -> Option<&HlsPlaybackProgressSnapshot> {
+        self.reports_by_session_id
+            .values()
+            .filter(|snapshot| snapshot.state == HlsPlaybackActivityState::Active)
+            .max_by_key(|snapshot| snapshot.updated_at)
+            .or_else(|| {
+                self.reports_by_session_id
+                    .values()
+                    .max_by_key(|snapshot| snapshot.updated_at)
+            })
+    }
+
     fn prune_expired(&mut self, now: SystemTime) {
         self.reports_by_session_id.retain(|_, snapshot| {
             let ttl = match snapshot.state {
@@ -305,6 +315,36 @@ mod tests {
 
         assert!(!outcome.accepted);
         assert!(outcome.session_id.is_empty());
+    }
+
+    #[test]
+    fn active_report_takes_priority_over_newer_stopped_report() {
+        let tracker = HlsPlaybackProgressTracker::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/active-session/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 42.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now,
+        });
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/stopped-session/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 12.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Stopped,
+            reported_at: now + Duration::from_secs(1),
+        });
+
+        let snapshot = tracker.snapshot_at(now + Duration::from_secs(1));
+        assert_eq!(HlsPlaybackActivityState::Active, snapshot.state);
+        assert_eq!("active-session", snapshot.session_id);
+        assert_eq!(42.0, snapshot.position_seconds);
     }
 
     #[test]
