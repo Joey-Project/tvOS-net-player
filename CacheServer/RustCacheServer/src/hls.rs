@@ -169,14 +169,7 @@ impl HlsPlaybackSession {
             .map(|(_, resource)| resource.clone())
     }
 
-    pub(crate) fn media_playlist_resource_with_variant(
-        &self,
-        playlist_id: &str,
-    ) -> Option<(String, HlsMediaResource)> {
-        self.media_playlist_resource_ref(playlist_id)
-            .map(|(variant, resource)| (variant.id.clone(), resource.clone()))
-    }
-
+    #[cfg(test)]
     pub(crate) fn media_playlist(
         &self,
         playlist_id: &str,
@@ -184,6 +177,33 @@ impl HlsPlaybackSession {
         total_length: u64,
     ) -> Option<String> {
         let (variant, resource) = self.media_playlist_resource_ref(playlist_id)?;
+        Self::media_playlist_for_resource(variant, resource, initialization_length, total_length)
+    }
+
+    pub(crate) fn servable_media_playlist_resource_with_variant(
+        &self,
+        playlist_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
+        self.servable_media_playlist_resource_ref(playlist_id)
+            .map(|(variant, resource)| (variant.id.clone(), resource.clone()))
+    }
+
+    pub(crate) fn servable_media_playlist(
+        &self,
+        playlist_id: &str,
+        initialization_length: u64,
+        total_length: u64,
+    ) -> Option<String> {
+        let (variant, resource) = self.servable_media_playlist_resource_ref(playlist_id)?;
+        Self::media_playlist_for_resource(variant, resource, initialization_length, total_length)
+    }
+
+    fn media_playlist_for_resource(
+        variant: &HlsVariant,
+        resource: &HlsMediaResource,
+        initialization_length: u64,
+        total_length: u64,
+    ) -> Option<String> {
         let media_length = total_length.checked_sub(initialization_length)?;
         if initialization_length == 0 || media_length == 0 {
             return None;
@@ -209,7 +229,21 @@ impl HlsPlaybackSession {
         &self,
         segment_id: &str,
     ) -> Option<(String, HlsMediaResource)> {
-        for variant in self.resource_variants() {
+        Self::media_resource_with_variant_from(self.resource_variants(), segment_id)
+    }
+
+    pub(crate) fn servable_media_resource_with_variant(
+        &self,
+        segment_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
+        Self::media_resource_with_variant_from(self.advertised_variants(), segment_id)
+    }
+
+    fn media_resource_with_variant_from<'a>(
+        variants: impl Iterator<Item = &'a HlsVariant>,
+        segment_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
+        for variant in variants {
             if segment_id == variant.video.id {
                 return Some((variant.id.clone(), variant.video.clone()));
             }
@@ -257,11 +291,26 @@ impl HlsPlaybackSession {
         std::iter::once(&self.variant).chain(self.alternate_variants.iter())
     }
 
+    #[cfg(test)]
     fn media_playlist_resource_ref(
         &self,
         playlist_id: &str,
     ) -> Option<(&HlsVariant, &HlsMediaResource)> {
-        for variant in self.resource_variants() {
+        Self::media_playlist_resource_ref_from(self.resource_variants(), playlist_id)
+    }
+
+    fn servable_media_playlist_resource_ref(
+        &self,
+        playlist_id: &str,
+    ) -> Option<(&HlsVariant, &HlsMediaResource)> {
+        Self::media_playlist_resource_ref_from(self.advertised_variants(), playlist_id)
+    }
+
+    fn media_playlist_resource_ref_from<'a>(
+        variants: impl Iterator<Item = &'a HlsVariant>,
+        playlist_id: &str,
+    ) -> Option<(&'a HlsVariant, &'a HlsMediaResource)> {
+        for variant in variants {
             if playlist_id == variant.video_playlist_id() {
                 return Some((variant, &variant.video));
             }
@@ -868,6 +917,75 @@ mod tests {
         assert_eq!(
             "https://media.example.test/720p-video.m4s",
             resource.request.url
+        );
+    }
+
+    #[test]
+    fn hidden_alternate_resources_are_lookup_only() {
+        let mut selected = dash_variant();
+        selected.abr = Some(abr_level("dash-video", 0, 2, true));
+        let mut alternate = dash_variant();
+        alternate.id = "h264-720p".to_owned();
+        alternate.bandwidth = Some(600_000);
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.abr = Some(abr_level("dash-video", 1, 2, true));
+        alternate.video.as_mut().unwrap().url =
+            "https://media.example.test/720p-video.m4s".to_owned();
+        alternate.video.as_mut().unwrap().cache_key.source_hash =
+            "h264-720p-video-source".to_owned();
+        alternate.audio.as_mut().unwrap().url =
+            "https://media.example.test/720p-audio.m4s".to_owned();
+        alternate.audio.as_mut().unwrap().cache_key.source_hash =
+            "h264-720p-audio-source".to_owned();
+
+        let mut session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+        session.advertise_alternate_variants = false;
+
+        assert!(session.master_playlist().contains("segments/video.m3u8\n"));
+        assert!(
+            !session
+                .master_playlist()
+                .contains("segments/v1-video.m3u8\n")
+        );
+        assert!(session.media_playlist_resource("v1-video.m3u8").is_some());
+        assert!(session.media_resource("v1-video.m4s").is_some());
+        assert!(
+            session
+                .servable_media_playlist_resource_with_variant("v1-video.m3u8")
+                .is_none()
+        );
+        assert!(
+            session
+                .servable_media_resource_with_variant("v1-video.m4s")
+                .is_none()
+        );
+        assert!(
+            session
+                .servable_media_playlist("v1-video.m3u8", 128, 10_000)
+                .is_none()
+        );
+        assert!(
+            session
+                .servable_media_playlist_resource_with_variant("video.m3u8")
+                .is_some()
+        );
+        assert!(
+            session
+                .servable_media_resource_with_variant("video.m4s")
+                .is_some()
+        );
+        assert!(
+            session
+                .servable_media_playlist("video.m3u8", 128, 10_000)
+                .is_some()
         );
     }
 
