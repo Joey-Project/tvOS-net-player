@@ -87,6 +87,7 @@ public final class PlayerViewModel: ObservableObject {
     private var playbackProgressContext: PlayerPlaybackProgressContext?
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
+    private var playbackEndObserver: AnyCancellable?
 
     public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
@@ -187,6 +188,7 @@ public final class PlayerViewModel: ObservableObject {
         if autoplay {
             nextPlayer.play()
         }
+        observePlaybackEnd(for: nextPlayer.currentItem)
         queueCurrentPlaybackProgressReport(intent: .started)
         startPlaybackProgressReporting()
     }
@@ -315,6 +317,9 @@ public final class PlayerViewModel: ObservableObject {
                 } catch {
                     return
                 }
+                guard self?.isPlaybackProgressActivelyPlaying() == true else {
+                    continue
+                }
                 await self?.reportCurrentPlaybackProgress(intent: .playing)
             }
         }
@@ -323,6 +328,36 @@ public final class PlayerViewModel: ObservableObject {
     private func stopPlaybackProgressReporting() {
         playbackProgressReportTask?.cancel()
         playbackProgressReportTask = nil
+        playbackEndObserver?.cancel()
+        playbackEndObserver = nil
+    }
+
+    private func observePlaybackEnd(for item: AVPlayerItem?) {
+        guard let item else {
+            return
+        }
+
+        playbackEndObserver = NotificationCenter.default
+            .publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.finishPlaybackProgressReporting()
+                }
+            }
+    }
+
+    private func finishPlaybackProgressReporting() {
+        queueCurrentPlaybackProgressReport(intent: .stopped)
+        stopPlaybackProgressReporting()
+        statusMessage = "Playback finished."
+    }
+
+    private func isPlaybackProgressActivelyPlaying() -> Bool {
+        guard let player else {
+            return false
+        }
+
+        return player.rate != 0 || player.timeControlStatus == .playing
     }
 
     private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) {

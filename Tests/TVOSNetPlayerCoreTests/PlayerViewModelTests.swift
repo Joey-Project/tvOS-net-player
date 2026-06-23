@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 import TVOSNetPlayerCacheClient
 @testable import TVOSNetPlayerCore
@@ -258,6 +259,36 @@ final class PlayerViewModelTests: XCTestCase {
 
         let reports = await client.reportsSnapshot()
         XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testPlaybackEndReportsStoppedAndStopsPeriodicProgress() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let item = try XCTUnwrap(model.player?.currentItem)
+
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        try await Task.sleep(for: .milliseconds(100))
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.statusMessage, "Playback finished.")
     }
 
     @MainActor
