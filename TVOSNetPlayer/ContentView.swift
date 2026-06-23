@@ -67,6 +67,11 @@ struct ContentView: View {
                 await autoConnectDiscoveredServerIfNeeded()
             }
         }
+        .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
+            Task {
+                await refreshPlaybackProgressStatus()
+            }
+        }
         .confirmationDialog(
             "Delete Cached Video?",
             isPresented: Binding(
@@ -744,9 +749,6 @@ struct ContentView: View {
         cacheModel.clearPlaybackStatus()
         bilibiliModel.clearPlaybackStatus()
         model.stop()
-        Task {
-            await refreshPlaybackProgressStatus()
-        }
     }
 
     private func clearManualStream() {

@@ -325,6 +325,7 @@ final class PlayerViewModelTests: XCTestCase {
 
         let reports = await client.reportsSnapshot()
         XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 1)
         XCTAssertEqual(model.statusMessage, "Playback finished.")
 
         try await Task.sleep(for: .milliseconds(100))
@@ -497,6 +498,40 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.loadedURL)
         XCTAssertNil(model.player)
         XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
+    }
+
+    @MainActor
+    func testClearRequestsPlaybackProgressStatusRefreshAfterQueuedStop() async {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 0)
+
+        model.clear()
+        await model.flushPlaybackProgressReports()
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 1)
+        XCTAssertEqual(model.streamURLText, "")
+        XCTAssertNil(model.loadedURL)
+        XCTAssertNil(model.player)
     }
 }
 

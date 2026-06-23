@@ -78,6 +78,7 @@ public final class PlayerViewModel: ObservableObject {
     @Published public private(set) var validationMessage: String?
     @Published public private(set) var playbackSpeed: PlayerPlaybackSpeed = .normal
     @Published public private(set) var playbackProgressReportingMessage: String?
+    @Published public private(set) var playbackProgressStatusRefreshRequestID = 0
     public private(set) var manualInteractionSequence = 0
 
     private let defaults: UserDefaults
@@ -169,8 +170,9 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func load(url: URL, persist: Bool, progressContext: PlayerPlaybackProgressContext?) {
-        queueCurrentPlaybackProgressReport(intent: .stopped)
+        let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
+        requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
 
         let nextPlayer = AVPlayer(url: url)
         nextPlayer.defaultRate = playbackSpeed.rate
@@ -242,13 +244,14 @@ public final class PlayerViewModel: ObservableObject {
 
     public func stop() {
         markManualInteraction()
-        queueCurrentPlaybackProgressReport(intent: .stopped)
+        let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         player?.pause()
         player = nil
         loadedURL = nil
         playbackProgressContext = nil
         statusMessage = "Stopped."
+        requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
     }
 
     public func clear() {
@@ -361,9 +364,10 @@ public final class PlayerViewModel: ObservableObject {
         guard player?.currentItem === item else {
             return
         }
-        queueCurrentPlaybackProgressReport(intent: .stopped)
+        let queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
         stopPlaybackProgressReporting()
         statusMessage = "Playback finished."
+        requestPlaybackProgressStatusRefreshIfNeeded(queuedStoppedReport)
     }
 
     private func periodicPlaybackProgressIntent() -> PlaybackProgressIntent? {
@@ -381,14 +385,23 @@ public final class PlayerViewModel: ObservableObject {
         return .paused
     }
 
-    private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) {
+    @discardableResult
+    private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) -> Bool {
         guard let report = currentPlaybackProgressReport(intent: intent),
             let endpoint = playbackProgressContext?.endpoint
         else {
-            return
+            return false
         }
 
         queuePlaybackProgressReport(report, endpoint: endpoint)
+        return true
+    }
+
+    private func requestPlaybackProgressStatusRefreshIfNeeded(_ shouldRefresh: Bool) {
+        guard shouldRefresh else {
+            return
+        }
+        playbackProgressStatusRefreshRequestID += 1
     }
 
     private func queuePlaybackProgressReport(
