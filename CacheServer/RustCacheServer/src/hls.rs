@@ -198,6 +198,24 @@ impl HlsPlaybackSession {
         Self::media_playlist_for_resource(variant, resource, initialization_length, total_length)
     }
 
+    pub(crate) fn lookup_media_playlist_resource_with_variant(
+        &self,
+        playlist_id: &str,
+    ) -> Option<(String, HlsMediaResource)> {
+        self.media_playlist_resource_ref(playlist_id)
+            .map(|(variant, resource)| (variant.id.clone(), resource.clone()))
+    }
+
+    pub(crate) fn lookup_media_playlist(
+        &self,
+        playlist_id: &str,
+        initialization_length: u64,
+        total_length: u64,
+    ) -> Option<String> {
+        let (variant, resource) = self.media_playlist_resource_ref(playlist_id)?;
+        Self::media_playlist_for_resource(variant, resource, initialization_length, total_length)
+    }
+
     fn media_playlist_for_resource(
         variant: &HlsVariant,
         resource: &HlsMediaResource,
@@ -291,7 +309,6 @@ impl HlsPlaybackSession {
         std::iter::once(&self.variant).chain(self.alternate_variants.iter())
     }
 
-    #[cfg(test)]
     fn media_playlist_resource_ref(
         &self,
         playlist_id: &str,

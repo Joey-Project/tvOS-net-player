@@ -55,7 +55,7 @@ superseded_by:
 - Pin generated output to H.264 High@4.2/AAC, cap video at 1080p60 with a 10 Mbps video VBV envelope plus 128 kbps audio, and persist matching completed-session metadata.
 - Persist the generated completed session manifest so restart recovery restores the generated playback resource rather than the original incompatible source resources.
 - Keep cancellation, preemption, and ffmpeg failure paths from exposing the original `ready` session as a completed library item.
-- Keep original source resources lookup-only after completed-session transcoding so persisted manifests can be restored without exposing old source playlist or segment IDs through the HTTP HLS serving path.
+- Keep original source resources lookup-only after completed-session transcoding so persisted manifests can be restored and already-fetched AVPlayer playlists can finish from local cache, while the completed master playlist does not advertise old source variants and hidden resources never fall back to upstream proxying.
 - Include projected generated transcode output in pre-finalization quota eviction so fully cached sources do not bypass high-watermark protection before ffmpeg writes the temporary output.
 - Keep the conservative `avplayer-h264-aac-hls-v1` target profile.
 - Validate with cache-server unit/finalizer tests and the full repository gate before merge.
@@ -121,7 +121,8 @@ superseded_by:
   - `cargo test finalization_projection_includes_generated_transcode_output -- --nocapture`
   - `cargo test caches_transcoded_session_and_restores_generated_manifest -- --nocapture`
   - `cargo test hidden_alternate_resources_are_lookup_only -- --nocapture`
-  - `cargo test hls_segment_rejects_hidden_completed_source_cached_resource -- --nocapture`
+  - `cargo test hls_segment_serves_hidden_completed_source_from_cache_only -- --nocapture`
+  - `cargo test hls_segment_rejects_hidden_completed_source_without_cache -- --nocapture`
   - `cargo test completed_runtime_session_scrubs_hidden_lookup_resources -- --nocapture`
   - `cargo test completed_playback_task_scrubs_runtime_hls_alternates_after_finalization -- --nocapture`
   - `cargo test hls_cache_finalizer_transcodes_ready_session_to_generated_runtime -- --nocapture`
