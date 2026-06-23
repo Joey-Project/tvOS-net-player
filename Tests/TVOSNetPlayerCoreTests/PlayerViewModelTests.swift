@@ -21,6 +21,20 @@ final class PlayerViewModelTests: XCTestCase {
         super.tearDown()
     }
 
+    private static func waitForReports(
+        from client: FakePlaybackProgressClient,
+        minimumCount: Int
+    ) async -> [PlaybackProgressReport] {
+        for _ in 0..<100 {
+            let reports = await client.reportsSnapshot()
+            if reports.count >= minimumCount {
+                return reports
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await client.reportsSnapshot()
+    }
+
     func testNormalizesBareHostAsHTTPURL() {
         let url = PlayerViewModel.normalizedHTTPURL(from: "192.168.1.10:8080/video.mp4")
 
@@ -321,9 +335,8 @@ final class PlayerViewModelTests: XCTestCase {
         let item = try XCTUnwrap(model.player?.currentItem)
 
         NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
-        try await Task.sleep(for: .milliseconds(100))
 
-        let reports = await client.reportsSnapshot()
+        let reports = await Self.waitForReports(from: client, minimumCount: 2)
         XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
         XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 1)
         XCTAssertEqual(model.statusMessage, "Playback finished.")
@@ -355,15 +368,16 @@ final class PlayerViewModelTests: XCTestCase {
         )
         let item = try XCTUnwrap(model.player?.currentItem)
         NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
-        try await Task.sleep(for: .milliseconds(100))
 
-        let reportsAfterEnd = await client.reportsSnapshot()
+        let reportsAfterEnd = await Self.waitForReports(from: client, minimumCount: 2)
         XCTAssertEqual(reportsAfterEnd.map(\.intent), [.started, .stopped])
 
         model.skipForward()
-        try await Task.sleep(for: .milliseconds(100))
 
-        let replayReports = await client.reportsSnapshot().dropFirst(reportsAfterEnd.count)
+        let replayReports = await Self.waitForReports(
+            from: client,
+            minimumCount: reportsAfterEnd.count + 2
+        ).dropFirst(reportsAfterEnd.count)
         XCTAssertTrue(replayReports.contains { $0.intent == .seek })
         XCTAssertTrue(replayReports.contains { $0.intent == .paused })
     }
@@ -388,9 +402,8 @@ final class PlayerViewModelTests: XCTestCase {
             streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
             progressContext: context
         )
-        try await Task.sleep(for: .milliseconds(100))
 
-        let reports = await client.reportsSnapshot()
+        let reports = await Self.waitForReports(from: client, minimumCount: 2)
         XCTAssertTrue(
             reports.contains {
                 $0.intent == .paused
