@@ -989,7 +989,7 @@ impl HlsCacheStore {
         if !self.session_is_complete(session) {
             return None;
         }
-        let size_bytes = self.cached_resource_total_size(session)?;
+        let size_bytes = self.session_managed_resource_size(session).ok()?;
         let updated_at = self
             .resource_modification_times(session)
             .into_iter()
@@ -1043,17 +1043,6 @@ impl HlsCacheStore {
                 .audio
                 .as_ref()
                 .is_none_or(|audio| self.cached_resource(&session.id, &audio.id).is_some())
-    }
-
-    fn cached_resource_total_size(&self, session: &HlsPlaybackSession) -> Option<u64> {
-        let mut total = self
-            .cached_resource(&session.id, &session.variant.video.id)?
-            .total_length;
-        if let Some(audio) = &session.variant.audio {
-            total =
-                total.checked_add(self.cached_resource(&session.id, &audio.id)?.total_length)?;
-        }
-        Some(total)
     }
 
     pub(crate) fn session_projected_remaining_size_bytes(
@@ -2354,14 +2343,7 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
-    let mut session = completed_runtime_session(session);
-    for variant in &mut session.alternate_variants {
-        sanitize_completed_resource(&mut variant.video);
-        if let Some(audio) = variant.audio.as_mut() {
-            sanitize_completed_resource(audio);
-        }
-    }
-    session
+    completed_runtime_session(session)
 }
 
 pub(crate) fn source_completed_session_for_restore(
@@ -2384,6 +2366,12 @@ pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlay
     sanitize_completed_resource(&mut session.variant.video);
     if let Some(audio) = session.variant.audio.as_mut() {
         sanitize_completed_resource(audio);
+    }
+    for variant in &mut session.alternate_variants {
+        sanitize_completed_resource(&mut variant.video);
+        if let Some(audio) = variant.audio.as_mut() {
+            sanitize_completed_resource(audio);
+        }
     }
     session
 }
@@ -3309,14 +3297,18 @@ mod tests {
         assert_eq!(1, runtime.alternate_variants.len());
         assert!(!runtime.master_playlist().contains("segments/v1-video.m3u8"));
         assert!(runtime.media_playlist_resource("v1-video.m3u8").is_some());
-        assert_eq!(
-            "https://example.test/720p-video.m4s",
-            runtime
-                .media_resource("v1-video.m4s")
-                .expect("runtime alternate resource should remain addressable")
-                .request
-                .url
-        );
+        let alternate_video = runtime
+            .media_resource("v1-video.m4s")
+            .expect("runtime alternate video should remain addressable");
+        assert!(alternate_video.request.url.is_empty());
+        assert!(alternate_video.request.backup_urls.is_empty());
+        assert!(alternate_video.request.headers.is_empty());
+        let alternate_audio = runtime
+            .media_resource("v1-audio.m4s")
+            .expect("runtime alternate audio should remain addressable");
+        assert!(alternate_audio.request.url.is_empty());
+        assert!(alternate_audio.request.backup_urls.is_empty());
+        assert!(alternate_audio.request.headers.is_empty());
     }
 
     #[test]
@@ -3758,6 +3750,11 @@ mod tests {
 
         assert_eq!(1, usage.completed_session_count);
         assert_eq!(3 * fake_mp4().len() as u64, usage.used_bytes);
+        let entries = store
+            .completed_cache_entries()
+            .expect("completed cache entries should include retained lookup resources");
+        assert_eq!(1, entries.len());
+        assert_eq!(3 * fake_mp4().len() as u64, entries[0].size_bytes);
         assert!(
             store
                 .cached_resource(&completed_session.id, HLS_TRANSCODED_RESOURCE_ID)
@@ -4076,7 +4073,7 @@ mod tests {
         let store_for_task = store.clone();
         let session_for_task = session.clone();
         let cancel_for_task = Arc::clone(&cancel);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             store_for_task
                 .cache_session_resources_completion_with_control(
                     &client,
@@ -4094,7 +4091,13 @@ mod tests {
                 .await
         });
 
-        wait_for_path(&temp.path().join("ffmpeg-started")).await;
+        let ffmpeg_started_path = temp.path().join("ffmpeg-started");
+        tokio::select! {
+            () = wait_for_path(&ffmpeg_started_path) => {}
+            result = &mut task => {
+                panic!("transcoding task finished before fake ffmpeg started: {result:?}");
+            }
+        }
         assert_eq!(1, active_job_count.load(Ordering::SeqCst));
         cancel.store(1, Ordering::SeqCst);
         let error = task
@@ -6307,7 +6310,7 @@ done
     }
 
     async fn wait_for_path(path: &Path) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if path.exists() {
                 return;

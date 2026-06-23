@@ -3333,14 +3333,12 @@ mod tests {
                 .media_playlist_resource("v1-video.m3u8")
                 .is_some()
         );
-        assert_eq!(
-            alternate_upstream_url,
-            runtime_session
-                .media_resource("v1-video.m4s")
-                .expect("runtime alternate media resource should remain serveable")
-                .request
-                .url
-        );
+        let runtime_alternate = runtime_session
+            .media_resource("v1-video.m4s")
+            .expect("runtime alternate media resource should remain serveable");
+        assert!(runtime_alternate.request.url.is_empty());
+        assert!(runtime_alternate.request.backup_urls.is_empty());
+        assert!(runtime_alternate.request.headers.is_empty());
 
         let persisted_session = state
             .hls_cache
@@ -7804,6 +7802,12 @@ mod tests {
         );
         assert!(runtime_session.variant.audio.is_none());
         assert!(runtime_session.variant.video.request.url.is_empty());
+        let runtime_source_video = runtime_session
+            .media_resource("video.m4s")
+            .expect("runtime source video lookup should remain addressable");
+        assert!(runtime_source_video.request.url.is_empty());
+        assert!(runtime_source_video.request.backup_urls.is_empty());
+        assert!(runtime_source_video.request.headers.is_empty());
         assert_eq!("avc1.64002A", item.variants[0].video_codec);
         assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
         assert_eq!(0, state.lan_transcoding_active_job_count());
