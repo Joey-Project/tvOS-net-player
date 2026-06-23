@@ -3,15 +3,21 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::StatusCode;
 use futures_util::StreamExt;
 use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 
 use crate::{
     bbdown_adapter::{
@@ -27,7 +33,13 @@ use crate::{
         mp4_initialization_length, should_forward_media_request_header,
     },
     library::{OpenedMediaFile, open_read_no_follow},
-    transcoding::{HlsTranscodingPlan, HlsTranscodingPlanState},
+    transcoding::{
+        HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
+        LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
+        LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS, LAN_TRANSCODING_MAX_WIDTH,
+        LAN_TRANSCODING_VIDEO_CODEC, LanTranscodingError, LanTranscodingJobControl,
+        run_hls_ffmpeg_transcode,
+    },
 };
 
 const HLS_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -38,6 +50,13 @@ const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
 const HLS_PREWARM_HEAD_BYTES: u64 = HLS_INITIALIZATION_SCAN_BYTES;
 const HLS_FIRST_WINDOW_PREFETCH_SECONDS: u64 = 30;
 const HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const HLS_TRANSCODED_RESOURCE_ID: &str = "transcoded.m4s";
+const HLS_TRANSCODED_VIDEO_CODEC: &str = LAN_TRANSCODING_VIDEO_CODEC;
+const HLS_TRANSCODED_AUDIO_CODEC: &str = LAN_TRANSCODING_AUDIO_CODEC;
+const HLS_TRANSCODING_TEMP_FILE_SUFFIX: &str = ".transcode.tmp";
+const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
+const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
+const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
@@ -106,6 +125,19 @@ pub(crate) struct HlsCachePartialEntry {
     pub(crate) updated_at: SystemTime,
 }
 
+#[derive(Clone)]
+pub(crate) struct HlsTranscodingExecutionConfig {
+    pub(crate) ffmpeg_path: PathBuf,
+    pub(crate) permits: Arc<Semaphore>,
+    pub(crate) active_job_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsCacheCompletion {
+    pub(crate) library_item_id: String,
+    pub(crate) session: HlsPlaybackSession,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFillControl {
     Continue,
@@ -149,19 +181,34 @@ impl HlsCacheStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_session_managed_resources(&self, session_id: &str) -> io::Result<()> {
+        self.remove_session_managed_resources_inner(session_id, false)
+    }
+
+    pub(crate) fn remove_session_managed_resources_for_eviction(
+        &self,
+        session_id: &str,
+    ) -> io::Result<()> {
+        self.remove_session_managed_resources_inner(session_id, true)
+    }
+
+    fn remove_session_managed_resources_inner(
+        &self,
+        session_id: &str,
+        remove_transcode_outputs: bool,
+    ) -> io::Result<()> {
         let Some(session) = self.load_session(session_id) else {
             return Ok(());
         };
-        for resource in session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
-        {
+        for resource in session_unique_media_resources(&session) {
             self.remove_cached_resource(session_id, &resource.id)?;
             self.remove_prewarmed_resource(session_id, &resource.id)?;
         }
+        if remove_transcode_outputs {
+            self.remove_transcode_generated_resources(session_id)?;
+        }
+        self.remove_unreferenced_session_managed_resources(&session)?;
         Ok(())
     }
 
@@ -263,6 +310,7 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn completed_cache_entries(&self) -> io::Result<Vec<HlsCacheCompletedEntry>> {
+        self.remove_unreferenced_managed_resources()?;
         let mut entries = self
             .load_sessions()?
             .iter()
@@ -277,11 +325,13 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn partial_cache_entries(&self) -> io::Result<Vec<HlsCachePartialEntry>> {
-        let mut entries = self
-            .load_sessions()?
-            .iter()
-            .filter_map(|session| self.partial_cache_entry(session))
-            .collect::<Vec<_>>();
+        self.remove_unreferenced_managed_resources()?;
+        let mut entries = Vec::new();
+        for session in self.load_sessions()? {
+            if let Some(entry) = self.partial_cache_entry(&session)? {
+                entries.push(entry);
+            }
+        }
         entries.sort_by(|left, right| {
             left.updated_at
                 .cmp(&right.updated_at)
@@ -299,6 +349,10 @@ impl HlsCacheStore {
     pub(crate) fn completed_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
         let session = self.load_session(session_id)?;
         self.session_is_complete(&session).then_some(session)
+    }
+
+    pub(crate) fn source_resources_are_complete(&self, session: &HlsPlaybackSession) -> bool {
+        self.source_session_resources_are_complete(session)
     }
 
     pub(crate) fn playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
@@ -475,6 +529,7 @@ impl HlsCacheStore {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn cache_session_resources_with_control<F, P>(
         &self,
         client: &reqwest::Client,
@@ -486,6 +541,26 @@ impl HlsCacheStore {
         F: Fn() -> HlsCacheFillControl + Send + Sync,
         P: Fn(HlsCacheFillProgress) + Send + Sync,
     {
+        Ok(self
+            .cache_session_resources_completion_with_control(
+                client, session, control, progress, None,
+            )
+            .await?
+            .library_item_id)
+    }
+
+    pub(crate) async fn cache_session_resources_completion_with_control<F, P>(
+        &self,
+        client: &reqwest::Client,
+        session: &HlsPlaybackSession,
+        control: F,
+        progress: P,
+        transcoding: Option<HlsTranscodingExecutionConfig>,
+    ) -> Result<HlsCacheCompletion, HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+        P: Fn(HlsCacheFillProgress) + Send + Sync,
+    {
         if let Err(error) = check_fill_control(&control) {
             if matches!(&error, HlsCacheError::Cancelled) {
                 let _ = self.remove_session(&session.id);
@@ -493,7 +568,7 @@ impl HlsCacheStore {
             return Err(error);
         }
         let result = self
-            .cache_session_resources_inner(client, session, &control, &progress)
+            .cache_session_resources_inner(client, session, &control, &progress, transcoding)
             .await;
         if matches!(&result, Err(HlsCacheError::Cancelled)) {
             let _ = self.remove_session(&session.id);
@@ -527,7 +602,8 @@ impl HlsCacheStore {
         session: &HlsPlaybackSession,
         control: &F,
         progress: &P,
-    ) -> Result<String, HlsCacheError>
+        transcoding: Option<HlsTranscodingExecutionConfig>,
+    ) -> Result<HlsCacheCompletion, HlsCacheError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
         P: Fn(HlsCacheFillProgress) + Send + Sync,
@@ -581,10 +657,225 @@ impl HlsCacheStore {
                 total_bytes,
             });
         }
-        self.save_completed_session(session)?;
+        let transcode_commit_guard = HlsTranscodingCommitGuard::create_if_needed(self, session)?;
+        let completed_session = self
+            .transcode_cached_session_if_needed(
+                session,
+                transcoding,
+                control,
+                &transcode_commit_guard,
+            )
+            .await?;
+        transcode_commit_guard.refresh()?;
+        self.save_completed_session(&completed_session)?;
+        transcode_commit_guard.finish();
+        if completed_session.variant.video.id == HLS_TRANSCODED_RESOURCE_ID
+            && let Err(error) =
+                self.remove_unreferenced_session_managed_resources(&completed_session)
+        {
+            eprintln!(
+                "Failed to remove unreferenced HLS source resources after LAN transcoding: {error}"
+            );
+        }
         self.remove_prewarmed_session_resources(session)?;
 
-        Ok(Self::completed_library_item_id(&session.id))
+        Ok(HlsCacheCompletion {
+            library_item_id: Self::completed_library_item_id(&session.id),
+            session: completed_session,
+        })
+    }
+
+    async fn transcode_cached_session_if_needed<F>(
+        &self,
+        session: &HlsPlaybackSession,
+        transcoding: Option<HlsTranscodingExecutionConfig>,
+        control: &F,
+        transcode_commit_guard: &HlsTranscodingCommitGuard,
+    ) -> Result<HlsPlaybackSession, HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        if session.transcoding.state != HlsTranscodingPlanState::Ready {
+            return Ok(session.clone());
+        }
+        let Some(transcoding) = transcoding else {
+            return Err(HlsCacheError::InvalidResource(
+                "LAN transcoding was planned but no execution config was provided".to_owned(),
+            ));
+        };
+
+        let _permit = acquire_transcoding_permit(&transcoding, control).await?;
+        let _active_job = ActiveTranscodingJob::start(Arc::clone(&transcoding.active_job_count));
+        transcode_commit_guard.refresh()?;
+
+        let cached_video = self
+            .cached_resource(&session.id, &session.variant.video.id)
+            .ok_or_else(|| {
+                HlsCacheError::InvalidResource(
+                    "LAN transcoding source video was not cached".to_owned(),
+                )
+            })?;
+        let cached_audio = session
+            .variant
+            .audio
+            .as_ref()
+            .map(|audio| {
+                self.cached_resource(&session.id, &audio.id).ok_or_else(|| {
+                    HlsCacheError::InvalidResource(
+                        "LAN transcoding source audio was not cached".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+
+        let output_path = self.resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)?;
+        let temp_path = transcoding_temp_path_for_output(&output_path);
+        self.prepare_temp_path(&temp_path)?;
+        self.remove_cached_resource(&session.id, HLS_TRANSCODED_RESOURCE_ID)?;
+
+        let marker_refresh_error = Mutex::new(None);
+        let transcode_result = run_hls_ffmpeg_transcode(
+            &transcoding.ffmpeg_path,
+            &cached_video.path,
+            cached_audio.as_ref().map(|audio| audio.path.as_path()),
+            &temp_path,
+            &|| match control() {
+                HlsCacheFillControl::Continue => {
+                    if let Err(error) = transcode_commit_guard.refresh_if_due() {
+                        if let Ok(mut stored_error) = marker_refresh_error.lock()
+                            && stored_error.is_none()
+                        {
+                            *stored_error = Some(error);
+                        }
+                        return LanTranscodingJobControl::Cancel;
+                    }
+                    LanTranscodingJobControl::Continue
+                }
+                HlsCacheFillControl::Cancel => LanTranscodingJobControl::Cancel,
+                HlsCacheFillControl::Preempt => LanTranscodingJobControl::Preempt,
+            },
+        )
+        .await;
+        let marker_refresh_error = {
+            marker_refresh_error
+                .lock()
+                .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))?
+                .take()
+        };
+        if let Some(error) = marker_refresh_error {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = transcode_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(hls_cache_error_from_transcoding(error));
+        }
+        transcode_commit_guard.refresh()?;
+        if let Err(error) = check_fill_control(control) {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+
+        let total_length = tokio::fs::metadata(&temp_path).await?.len();
+        let initialization_length = cached_mp4_initialization_length(&temp_path).await?;
+        if initialization_length == 0 || initialization_length >= total_length {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(HlsCacheError::InvalidResource(
+                "LAN transcoding output MP4 initialization range was invalid".to_owned(),
+            ));
+        }
+        if let Err(error) = self.reject_cache_path_symlink(&output_path) {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error.into());
+        }
+        tokio::fs::rename(&temp_path, &output_path).await?;
+
+        let completed_session = transcoded_completed_session(session, total_length);
+        let metadata = PersistedHlsCachedResource {
+            schema_version: HLS_CACHE_SCHEMA_VERSION,
+            id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
+            content_type: "video/mp4".to_owned(),
+            total_length,
+            initialization_length,
+            cache_key: PersistedBilibiliMediaCacheKey::from(
+                completed_session.variant.video.request.cache_key.clone(),
+            ),
+        };
+        self.write_json_atomically(
+            &self.resource_metadata_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)?,
+            &metadata,
+        )?;
+        Ok(completed_session)
+    }
+
+    fn remove_unreferenced_managed_resources(&self) -> io::Result<()> {
+        for session in self.load_sessions()? {
+            self.remove_unreferenced_session_managed_resources(&session)?;
+        }
+        Ok(())
+    }
+
+    fn remove_unreferenced_session_managed_resources(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> io::Result<()> {
+        let session_dir = self.session_dir(&session.id)?;
+        self.reject_cache_path_symlink(&session_dir)?;
+        let mut retained = referenced_session_managed_file_names(session);
+        if self.transcoding_commit_marker_is_active(session)? {
+            insert_resource_managed_file_names(&mut retained, HLS_TRANSCODED_RESOURCE_ID);
+            retained.insert(transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID));
+        }
+        let entries = match fs::read_dir(session_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if retained.contains(file_name) || !is_managed_resource_file_name(file_name) {
+                continue;
+            }
+            self.remove_managed_cache_file_if_exists(&entry.path())?;
+        }
+        Ok(())
+    }
+
+    fn transcoding_commit_marker_is_active(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> io::Result<bool> {
+        let marker_path = self.transcoding_commit_marker_path(&session.id)?;
+        self.reject_cache_path_symlink(&marker_path)?;
+        let metadata = match fs::metadata(&marker_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "HLS transcoding commit marker already exists and is not a file",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+
+        if session.transcoding.state != HlsTranscodingPlanState::Ready {
+            self.remove_transcoding_commit_marker_if_exists(&session.id)?;
+            return Ok(false);
+        }
+
+        match metadata.modified()?.elapsed() {
+            Ok(age) if age > HLS_TRANSCODING_COMMIT_MARKER_TTL => {
+                self.remove_transcoding_commit_marker_if_exists(&session.id)?;
+                Ok(false)
+            }
+            Ok(_) | Err(_) => Ok(true),
+        }
     }
 
     async fn prewarm_resource<F>(
@@ -687,12 +978,7 @@ impl HlsCacheStore {
                 protocol: PlaybackProtocol::Hls.into(),
                 container: "hls".to_owned(),
                 video_codec: session.variant.codecs.first().cloned().unwrap_or_default(),
-                audio_codec: session
-                    .variant
-                    .audio
-                    .as_ref()
-                    .and_then(|audio| audio.request.codecs.clone())
-                    .unwrap_or_default(),
+                audio_codec: completed_variant_audio_codec(&session.variant),
                 width: session
                     .variant
                     .width
@@ -722,7 +1008,7 @@ impl HlsCacheStore {
         if !self.session_is_complete(session) {
             return None;
         }
-        let size_bytes = self.cached_resource_total_size(session)?;
+        let size_bytes = self.session_managed_resource_size(session).ok()?;
         let updated_at = self
             .resource_modification_times(session)
             .into_iter()
@@ -737,13 +1023,16 @@ impl HlsCacheStore {
         })
     }
 
-    fn partial_cache_entry(&self, session: &HlsPlaybackSession) -> Option<HlsCachePartialEntry> {
+    fn partial_cache_entry(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> io::Result<Option<HlsCachePartialEntry>> {
         if self.session_is_complete(session) {
-            return None;
+            return Ok(None);
         }
-        let size_bytes = self.session_managed_resource_size(session);
+        let size_bytes = self.session_managed_resource_size(session)?;
         if size_bytes == 0 {
-            return None;
+            return Ok(None);
         }
         let updated_at = self
             .managed_resource_modification_times(session)
@@ -751,14 +1040,21 @@ impl HlsCacheStore {
             .max()
             .unwrap_or(UNIX_EPOCH);
 
-        Some(HlsCachePartialEntry {
+        Ok(Some(HlsCachePartialEntry {
             session_id: session.id.clone(),
             size_bytes,
             updated_at,
-        })
+        }))
     }
 
     fn session_is_complete(&self, session: &HlsPlaybackSession) -> bool {
+        if session.transcoding.state == HlsTranscodingPlanState::Ready {
+            return false;
+        }
+        self.source_session_resources_are_complete(session)
+    }
+
+    fn source_session_resources_are_complete(&self, session: &HlsPlaybackSession) -> bool {
         self.cached_resource(&session.id, &session.variant.video.id)
             .is_some()
             && session
@@ -766,17 +1062,6 @@ impl HlsCacheStore {
                 .audio
                 .as_ref()
                 .is_none_or(|audio| self.cached_resource(&session.id, &audio.id).is_some())
-    }
-
-    fn cached_resource_total_size(&self, session: &HlsPlaybackSession) -> Option<u64> {
-        let mut total = self
-            .cached_resource(&session.id, &session.variant.video.id)?
-            .total_length;
-        if let Some(audio) = &session.variant.audio {
-            total =
-                total.checked_add(self.cached_resource(&session.id, &audio.id)?.total_length)?;
-        }
-        Some(total)
     }
 
     pub(crate) fn session_projected_remaining_size_bytes(
@@ -801,22 +1086,92 @@ impl HlsCacheStore {
         Some(total)
     }
 
-    fn managed_usage_size_bytes(&self) -> io::Result<u64> {
-        let mut total = 0_u64;
-        for session in self.load_sessions()? {
-            total = total.saturating_add(self.session_managed_resource_size(&session));
-        }
-        Ok(total)
+    pub(crate) fn session_projected_finalization_added_size_bytes(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> Option<u64> {
+        let remaining_source_bytes = self
+            .session_projected_remaining_size_bytes(session)
+            .unwrap_or_default();
+        let transcoded_output_bytes =
+            self.session_projected_transcode_output_size_bytes(session)?;
+        remaining_source_bytes.checked_add(transcoded_output_bytes)
     }
 
-    fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> u64 {
-        session
+    fn session_projected_transcode_output_size_bytes(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> Option<u64> {
+        if session.transcoding.state != HlsTranscodingPlanState::Ready {
+            return Some(0);
+        }
+
+        let duration_bytes = u64::from(session.variant.duration_seconds)
+            .checked_mul(transcoded_bandwidth(session.variant.audio.is_some()))?
+            .checked_add(7)?
+            / 8;
+        let known_source_bytes = self
+            .session_known_source_size_floor(session)
+            .unwrap_or_default();
+        Some(duration_bytes.max(known_source_bytes))
+    }
+
+    fn session_known_source_size_floor(&self, session: &HlsPlaybackSession) -> Option<u64> {
+        let mut total = 0_u64;
+        let mut found_known_size = false;
+        for resource in session
             .variant
             .audio
             .iter()
             .chain(std::iter::once(&session.variant.video))
+        {
+            let known_size = resource
+                .request
+                .size
+                .into_iter()
+                .chain(
+                    self.cached_resource(&session.id, &resource.id)
+                        .map(|cached| cached.total_length),
+                )
+                .max();
+            if let Some(known_size) = known_size {
+                found_known_size = true;
+                total = total.checked_add(known_size)?;
+            }
+        }
+        found_known_size.then_some(total)
+    }
+
+    fn managed_usage_size_bytes(&self) -> io::Result<u64> {
+        let mut total = 0_u64;
+        for session in self.load_sessions()? {
+            total = total.saturating_add(self.session_managed_resource_size(&session)?);
+        }
+        Ok(total)
+    }
+
+    fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> io::Result<u64> {
+        let source_size = session_unique_media_resources(session)
+            .into_iter()
             .map(|resource| self.resource_managed_size(&session.id, &resource.id))
-            .sum()
+            .sum::<u64>();
+        Ok(source_size.saturating_add(self.active_transcode_managed_size(session)?))
+    }
+
+    fn active_transcode_managed_size(&self, session: &HlsPlaybackSession) -> io::Result<u64> {
+        if !self.transcoding_commit_marker_is_active(session)? {
+            return Ok(0);
+        }
+        let generated_size = self
+            .resource_managed_size(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+            .max(self.managed_file_size(
+                &self.resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)?,
+            )?);
+        let temp_size = self.managed_file_size(&self.resource_path(
+            &session.id,
+            &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+        )?)?;
+        Ok(generated_size.saturating_add(temp_size))
     }
 
     fn resource_managed_size(&self, session_id: &str, resource_id: &str) -> u64 {
@@ -826,6 +1181,16 @@ impl HlsCacheStore {
             prewarmed.prefix_length
         } else {
             0
+        }
+    }
+
+    fn managed_file_size(&self, path: &Path) -> io::Result<u64> {
+        self.reject_cache_path_symlink(path)?;
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+            Ok(_) => Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
         }
     }
 
@@ -842,22 +1207,16 @@ impl HlsCacheStore {
     }
 
     fn resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
-        session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
+        session_unique_media_resources(session)
+            .into_iter()
             .filter_map(|resource| self.cached_resource(&session.id, &resource.id))
             .map(|resource| resource.last_modified)
             .collect()
     }
 
     fn managed_resource_modification_times(&self, session: &HlsPlaybackSession) -> Vec<SystemTime> {
-        session
-            .variant
-            .audio
-            .iter()
-            .chain(std::iter::once(&session.variant.video))
+        session_unique_media_resources(session)
+            .into_iter()
             .filter_map(|resource| {
                 self.cached_resource(&session.id, &resource.id)
                     .map(|resource| resource.last_modified)
@@ -1065,6 +1424,12 @@ impl HlsCacheStore {
             .join(format!("{resource_id}.prewarm.json")))
     }
 
+    fn transcoding_commit_marker_path(&self, session_id: &str) -> io::Result<PathBuf> {
+        Ok(self
+            .session_dir(session_id)?
+            .join(HLS_TRANSCODING_COMMIT_MARKER_FILE))
+    }
+
     fn remove_cached_resource(&self, session_id: &str, resource_id: &str) -> io::Result<()> {
         self.remove_managed_cache_file_if_exists(&self.resource_path(session_id, resource_id)?)?;
         self.remove_managed_cache_file_if_exists(
@@ -1079,6 +1444,35 @@ impl HlsCacheStore {
         self.remove_managed_cache_file_if_exists(
             &self.resource_prewarm_metadata_path(session_id, resource_id)?,
         )
+    }
+
+    fn remove_transcode_generated_resources(&self, session_id: &str) -> io::Result<()> {
+        self.remove_cached_resource(session_id, HLS_TRANSCODED_RESOURCE_ID)?;
+        self.remove_managed_cache_file_if_exists(&self.resource_path(
+            session_id,
+            &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+        )?)?;
+        self.remove_transcoding_commit_marker_if_exists(session_id)
+    }
+
+    fn remove_transcoding_commit_marker_if_exists(&self, session_id: &str) -> io::Result<()> {
+        let path = self.transcoding_commit_marker_path(session_id)?;
+        self.reject_cache_path_symlink(&path)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS transcoding commit marker path must not be a symlink",
+            )),
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(self.transcoding_commit_marker_path(session_id)?)
+            }
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "HLS transcoding commit marker already exists and is not a file",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn remove_managed_cache_file_if_exists(&self, path: &Path) -> io::Result<()> {
@@ -1165,6 +1559,176 @@ impl HlsCacheStore {
         self.reject_cache_path_symlink(path).ok()?;
         fs::read(path).ok()
     }
+}
+
+struct HlsTranscodingCommitGuard {
+    store: HlsCacheStore,
+    session_id: String,
+    active: bool,
+    last_refresh: Mutex<Option<Instant>>,
+}
+
+impl HlsTranscodingCommitGuard {
+    fn create_if_needed(store: &HlsCacheStore, session: &HlsPlaybackSession) -> io::Result<Self> {
+        let mut guard = Self {
+            store: store.clone(),
+            session_id: session.id.clone(),
+            active: false,
+            last_refresh: Mutex::new(None),
+        };
+        if session.transcoding.state != HlsTranscodingPlanState::Ready {
+            return Ok(guard);
+        }
+
+        let marker_path = store.transcoding_commit_marker_path(&session.id)?;
+        store.prepare_temp_path(&marker_path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)?;
+        file.write_all(b"active\n")?;
+        file.sync_all()?;
+        guard.active = true;
+        *guard
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))? =
+            Some(Instant::now());
+        Ok(guard)
+    }
+
+    fn refresh(&self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let marker_path = self
+            .store
+            .transcoding_commit_marker_path(&self.session_id)?;
+        self.store.reject_cache_path_symlink(&marker_path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&marker_path)?;
+        file.write_all(b"active\n")?;
+        file.sync_all()?;
+        *self
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))? =
+            Some(Instant::now());
+        Ok(())
+    }
+
+    fn refresh_if_due(&self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let should_refresh = self
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))?
+            .is_none_or(|last_refresh| {
+                now.duration_since(last_refresh) >= HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL
+            });
+        if should_refresh {
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) {
+        if self.active
+            && let Err(error) = self
+                .store
+                .remove_transcoding_commit_marker_if_exists(&self.session_id)
+        {
+            eprintln!("Failed to remove HLS transcoding commit marker: {error}");
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for HlsTranscodingCommitGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .store
+                .remove_transcoding_commit_marker_if_exists(&self.session_id);
+        }
+    }
+}
+
+fn referenced_session_managed_file_names(session: &HlsPlaybackSession) -> HashSet<String> {
+    let mut retained = HashSet::from(["session.json".to_owned()]);
+    for resource in session_unique_media_resources(session) {
+        insert_resource_managed_file_names(&mut retained, &resource.id);
+    }
+    retained
+}
+
+fn session_unique_media_resources(session: &HlsPlaybackSession) -> Vec<&HlsMediaResource> {
+    let mut seen = HashSet::new();
+    session_media_resources(session)
+        .filter(|resource| seen.insert(resource.id.clone()))
+        .collect()
+}
+
+fn session_media_resources(
+    session: &HlsPlaybackSession,
+) -> impl Iterator<Item = &HlsMediaResource> {
+    std::iter::once(&session.variant)
+        .chain(session.alternate_variants.iter())
+        .flat_map(variant_media_resources)
+}
+
+fn variant_media_resources(variant: &HlsVariant) -> impl Iterator<Item = &HlsMediaResource> {
+    variant.audio.iter().chain(std::iter::once(&variant.video))
+}
+
+fn insert_resource_managed_file_names(retained: &mut HashSet<String>, resource_id: &str) {
+    retained.insert(resource_id.to_owned());
+    retained.insert(format!("{resource_id}.json"));
+    retained.insert(format!("{resource_id}.prewarm"));
+    retained.insert(format!("{resource_id}.prewarm.json"));
+}
+
+fn is_managed_resource_file_name(file_name: &str) -> bool {
+    if is_transcoding_temp_file_name(file_name) {
+        return true;
+    }
+    if file_name.ends_with(".tmp") {
+        return false;
+    }
+    managed_resource_id_from_file_name(file_name)
+        .is_some_and(|resource_id| validate_cache_id(resource_id).is_ok())
+}
+
+fn is_transcoding_temp_file_name(file_name: &str) -> bool {
+    file_name.ends_with(HLS_TRANSCODING_TEMP_FILE_SUFFIX)
+        && file_name == transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID)
+}
+
+fn transcoding_temp_path_for_output(output_path: &Path) -> PathBuf {
+    output_path.with_extension("transcode.tmp")
+}
+
+fn transcoding_temp_file_name(resource_id: &str) -> String {
+    Path::new(resource_id)
+        .with_extension("transcode.tmp")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn managed_resource_id_from_file_name(file_name: &str) -> Option<&str> {
+    for suffix in [".prewarm.json", ".prewarm", ".json"] {
+        if let Some(resource_id) = file_name.strip_suffix(suffix) {
+            return Some(resource_id);
+        }
+    }
+    Some(file_name)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1532,6 +2096,243 @@ fn check_fill_control(
     }
 }
 
+async fn acquire_transcoding_permit<F>(
+    config: &HlsTranscodingExecutionConfig,
+    control: &F,
+) -> Result<OwnedSemaphorePermit, HlsCacheError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
+    check_fill_control(control)?;
+    let permit = Arc::clone(&config.permits).acquire_owned();
+    tokio::pin!(permit);
+    loop {
+        check_fill_control(control)?;
+        let result = tokio::select! {
+            permit = &mut permit => permit,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
+                continue;
+            }
+        };
+        return result.map_err(|_| {
+            HlsCacheError::InvalidResource(
+                "LAN transcoding worker limiter is unavailable".to_owned(),
+            )
+        });
+    }
+}
+
+struct ActiveTranscodingJob {
+    active_job_count: Arc<AtomicUsize>,
+}
+
+impl ActiveTranscodingJob {
+    fn start(active_job_count: Arc<AtomicUsize>) -> Self {
+        active_job_count.fetch_add(1, Ordering::SeqCst);
+        Self { active_job_count }
+    }
+}
+
+impl Drop for ActiveTranscodingJob {
+    fn drop(&mut self) {
+        self.active_job_count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn hls_cache_error_from_transcoding(error: LanTranscodingError) -> HlsCacheError {
+    match error {
+        LanTranscodingError::Cancelled => HlsCacheError::Cancelled,
+        LanTranscodingError::Preempted => HlsCacheError::Preempted,
+        LanTranscodingError::Io(error) => HlsCacheError::Io(error),
+        LanTranscodingError::Failed { .. } => HlsCacheError::InvalidResource(error.to_string()),
+    }
+}
+
+fn transcoded_completed_session(
+    session: &HlsPlaybackSession,
+    output_size: u64,
+) -> HlsPlaybackSession {
+    let mut completed = session.clone();
+    let mut hidden_lookup_variants = vec![session.variant.clone()];
+    hidden_lookup_variants.extend(session.alternate_variants.clone());
+    let had_audio = session.variant.audio.is_some();
+    let codecs = transcoded_codecs(had_audio);
+    let cache_key = transcoded_cache_key(session, &codecs);
+    let source_video = &session.variant.video.request;
+    let (width, height) = transcoded_dimensions(session.variant.width, session.variant.height);
+    let frame_rate = transcoded_frame_rate(source_video.frame_rate.as_deref());
+    let bandwidth = transcoded_bandwidth(had_audio);
+    let resource = HlsMediaResource {
+        id: HLS_TRANSCODED_RESOURCE_ID.to_owned(),
+        request: BilibiliMediaRequest {
+            kind: BilibiliMediaRequestKind::Video,
+            stream_id: source_video.stream_id,
+            url: String::new(),
+            backup_urls: Vec::new(),
+            headers: Vec::new(),
+            mime_type: Some("video/mp4".to_owned()),
+            codecs: Some(codecs.join(",")),
+            bandwidth: Some(bandwidth),
+            width,
+            height,
+            frame_rate: frame_rate.clone(),
+            size: Some(output_size),
+            duration_seconds: Some(session.variant.duration_seconds),
+            cache_key: cache_key.clone(),
+        },
+    };
+    completed.variant = HlsVariant {
+        id: session.variant.id.clone(),
+        bandwidth,
+        codecs: codecs.clone(),
+        width,
+        height,
+        duration_seconds: session.variant.duration_seconds,
+        video: resource,
+        audio: None,
+    };
+    completed.alternate_variants = hidden_lookup_variants;
+    completed.advertise_alternate_variants = false;
+    completed.abr = HlsAbrMetadata::default();
+    completed.variants = vec![HlsVariantMetadata {
+        id: completed.variant.id.clone(),
+        kind: BilibiliPlaybackVariantKind::Dash,
+        content_id: source_video.cache_key.content_id.clone(),
+        bandwidth: Some(bandwidth),
+        codecs: codecs.clone(),
+        mime_types: vec!["video/mp4".to_owned()],
+        width,
+        height,
+        frame_rate: frame_rate.clone(),
+        duration_seconds: Some(completed.variant.duration_seconds),
+        abr: None,
+        media: vec![HlsMediaResourceMetadata {
+            kind: BilibiliMediaRequestKind::Video,
+            stream_id: source_video.stream_id,
+            mime_type: Some("video/mp4".to_owned()),
+            codecs: Some(codecs.join(",")),
+            bandwidth: Some(bandwidth),
+            width,
+            height,
+            frame_rate,
+            size: Some(output_size),
+            duration_seconds: Some(completed.variant.duration_seconds),
+            cache_key,
+        }],
+    }];
+    completed.transcoding = HlsTranscodingPlan::with_state(
+        HlsTranscodingPlanState::NotRequired,
+        session.variant.id.clone(),
+        "LAN transcoding completed; serving generated AVPlayer-compatible HLS/fMP4 output.",
+    );
+    completed
+}
+
+fn transcoded_dimensions(width: Option<u32>, height: Option<u32>) -> (Option<u32>, Option<u32>) {
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            let width_scale = f64::from(LAN_TRANSCODING_MAX_WIDTH) / f64::from(width);
+            let height_scale = f64::from(LAN_TRANSCODING_MAX_HEIGHT) / f64::from(height);
+            let scale = width_scale.min(height_scale).min(1.0);
+            (
+                Some(round_to_even_dimension(
+                    f64::from(width) * scale,
+                    width.min(LAN_TRANSCODING_MAX_WIDTH),
+                )),
+                Some(round_to_even_dimension(
+                    f64::from(height) * scale,
+                    height.min(LAN_TRANSCODING_MAX_HEIGHT),
+                )),
+            )
+        }
+        (width, height) => (
+            width.map(|width| {
+                let bound = width.min(LAN_TRANSCODING_MAX_WIDTH);
+                round_to_even_dimension(f64::from(bound), bound)
+            }),
+            height.map(|height| {
+                let bound = height.min(LAN_TRANSCODING_MAX_HEIGHT);
+                round_to_even_dimension(f64::from(bound), bound)
+            }),
+        ),
+    }
+}
+
+fn round_to_even_dimension(value: f64, bound: u32) -> u32 {
+    let rounded = ((value / 2.0).round() as u32).saturating_mul(2);
+    let max_even = if bound.is_multiple_of(2) {
+        bound
+    } else {
+        bound.saturating_sub(1)
+    };
+    rounded.min(max_even).max(2)
+}
+
+fn transcoded_frame_rate(frame_rate: Option<&str>) -> Option<String> {
+    let frame_rate = frame_rate?.trim();
+    if frame_rate.is_empty() {
+        return None;
+    }
+    let parsed = parse_frame_rate(frame_rate)?;
+    if parsed > LAN_TRANSCODING_MAX_FRAME_RATE {
+        return Some(LAN_TRANSCODING_MAX_FRAME_RATE.to_string());
+    }
+    Some(frame_rate.to_owned())
+}
+
+fn parse_frame_rate(frame_rate: &str) -> Option<f64> {
+    if let Some((numerator, denominator)) = frame_rate.split_once('/') {
+        let numerator = numerator.trim().parse::<f64>().ok()?;
+        let denominator = denominator.trim().parse::<f64>().ok()?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        let parsed = numerator / denominator;
+        return parsed.is_finite().then_some(parsed);
+    }
+    frame_rate
+        .parse::<f64>()
+        .ok()
+        .filter(|rate| rate.is_finite())
+}
+
+fn transcoded_bandwidth(had_audio: bool) -> u64 {
+    LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS
+        + if had_audio {
+            LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS
+        } else {
+            0
+        }
+}
+
+fn transcoded_codecs(had_audio: bool) -> Vec<String> {
+    let mut codecs = vec![HLS_TRANSCODED_VIDEO_CODEC.to_owned()];
+    if had_audio {
+        codecs.push(HLS_TRANSCODED_AUDIO_CODEC.to_owned());
+    }
+    codecs
+}
+
+fn transcoded_cache_key(session: &HlsPlaybackSession, codecs: &[String]) -> BilibiliMediaCacheKey {
+    let source_video = &session.variant.video.request.cache_key;
+    let audio_hash = session
+        .variant
+        .audio
+        .as_ref()
+        .map(|audio| audio.request.cache_key.source_hash.as_str())
+        .unwrap_or("no-audio");
+    BilibiliMediaCacheKey {
+        content_id: source_video.content_id.clone(),
+        media_kind: BilibiliMediaRequestKind::Video,
+        stream_id: source_video.stream_id,
+        codecs: Some(codecs.join(",")),
+        source_hash: format!(
+            "lan-transcoded:{}:{}:{}",
+            session.transcoding.profile_id, source_video.source_hash, audio_hash
+        ),
+    }
+}
+
 fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
     let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
     if !resource.request.url.trim().is_empty() {
@@ -1539,6 +2340,21 @@ fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
     }
     urls.extend(resource.request.backup_urls.clone());
     urls
+}
+
+fn completed_variant_audio_codec(variant: &HlsVariant) -> String {
+    variant
+        .audio
+        .as_ref()
+        .and_then(|audio| audio.request.codecs.clone())
+        .or_else(|| {
+            variant
+                .codecs
+                .iter()
+                .find(|codec| codec.trim().starts_with("mp4a."))
+                .cloned()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> Option<u64> {
@@ -1555,19 +2371,38 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 }
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
-    let mut session = completed_runtime_session(session);
-    session.alternate_variants.clear();
+    completed_runtime_session(session)
+}
+
+pub(crate) fn source_completed_session_for_restore(
+    session: &HlsPlaybackSession,
+) -> HlsPlaybackSession {
+    let mut session = session.clone();
+    if session.transcoding.state == HlsTranscodingPlanState::Ready {
+        session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Disabled,
+            session.transcoding.source_variant_id.clone(),
+            "LAN transcoding was unavailable during restore; serving the completed source HLS cache.",
+        );
+    }
     session
 }
 
 pub(crate) fn completed_runtime_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = session.clone();
     session.advertise_alternate_variants = false;
-    sanitize_completed_resource(&mut session.variant.video);
-    if let Some(audio) = session.variant.audio.as_mut() {
-        sanitize_completed_resource(audio);
+    sanitize_completed_variant(&mut session.variant);
+    for variant in &mut session.alternate_variants {
+        sanitize_completed_variant(variant);
     }
     session
+}
+
+fn sanitize_completed_variant(variant: &mut HlsVariant) {
+    sanitize_completed_resource(&mut variant.video);
+    if let Some(audio) = variant.audio.as_mut() {
+        sanitize_completed_resource(audio);
+    }
 }
 
 fn sanitize_completed_resource(resource: &mut HlsMediaResource) {
@@ -1704,6 +2539,8 @@ struct PersistedHlsSession {
     variant: PersistedHlsVariant,
     #[serde(default)]
     alternate_variants: Vec<PersistedHlsVariant>,
+    #[serde(default = "default_advertise_alternate_variants")]
+    advertise_alternate_variants: bool,
     #[serde(default)]
     abr: PersistedHlsAbrMetadata,
     #[serde(default)]
@@ -1724,6 +2561,7 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
                 .into_iter()
                 .map(PersistedHlsVariant::from)
                 .collect(),
+            advertise_alternate_variants: session.advertise_alternate_variants,
             abr: PersistedHlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -1749,7 +2587,7 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
                 .into_iter()
                 .map(HlsVariant::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
-            advertise_alternate_variants: true,
+            advertise_alternate_variants: session.advertise_alternate_variants,
             abr: HlsAbrMetadata::from(session.abr),
             variants: session
                 .variants
@@ -1759,6 +2597,10 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
             transcoding: HlsTranscodingPlan::from(session.transcoding),
         })
     }
+}
+
+fn default_advertise_alternate_variants() -> bool {
+    true
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -2359,6 +3201,9 @@ impl From<PersistedBilibiliMediaRequestKind> for BilibiliMediaRequestKind {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
     use axum::{
         Router,
         body::Body,
@@ -2375,6 +3220,27 @@ mod tests {
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(temp.path())),
         )
+    }
+
+    #[cfg(unix)]
+    fn set_file_modified_time(path: &Path, modified: SystemTime) {
+        let modified = modified
+            .duration_since(UNIX_EPOCH)
+            .expect("test mtime should be after UNIX epoch");
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .expect("test path should not contain interior nul bytes");
+        let times = [
+            libc::timeval {
+                tv_sec: modified.as_secs() as libc::time_t,
+                tv_usec: modified.subsec_micros() as libc::suseconds_t,
+            },
+            libc::timeval {
+                tv_sec: modified.as_secs() as libc::time_t,
+                tv_usec: modified.subsec_micros() as libc::suseconds_t,
+            },
+        ];
+        let result = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(0, result, "test should update file mtime");
     }
 
     #[test]
@@ -2451,7 +3317,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_runtime_session_hides_alternates_from_new_master_but_keeps_lookup() {
+    fn completed_runtime_session_scrubs_hidden_lookup_resources() {
         let mut session = sample_session("session-runtime", "https://example.test/video.m4s");
         attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
 
@@ -2460,14 +3326,46 @@ mod tests {
         assert_eq!(1, runtime.alternate_variants.len());
         assert!(!runtime.master_playlist().contains("segments/v1-video.m3u8"));
         assert!(runtime.media_playlist_resource("v1-video.m3u8").is_some());
-        assert_eq!(
-            "https://example.test/720p-video.m4s",
-            runtime
-                .media_resource("v1-video.m4s")
-                .expect("runtime alternate resource should remain addressable")
-                .request
-                .url
+        let alternate_video = runtime
+            .media_resource("v1-video.m4s")
+            .expect("runtime alternate video should remain addressable");
+        assert!(alternate_video.request.url.is_empty());
+        assert!(alternate_video.request.backup_urls.is_empty());
+        assert!(alternate_video.request.headers.is_empty());
+        let alternate_audio = runtime
+            .media_resource("v1-audio.m4s")
+            .expect("runtime alternate audio should remain addressable");
+        assert!(alternate_audio.request.url.is_empty());
+        assert!(alternate_audio.request.backup_urls.is_empty());
+        assert!(alternate_audio.request.headers.is_empty());
+    }
+
+    #[test]
+    fn sanitized_completed_session_scrubs_hidden_lookup_resources() {
+        let mut session = sample_session("session-sanitized", "https://example.test/video.m4s");
+        attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
+
+        let sanitized = sanitized_completed_session(&session);
+
+        assert_eq!(1, sanitized.alternate_variants.len());
+        assert!(
+            !sanitized
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
         );
+        assert!(sanitized.media_playlist_resource("v1-video.m3u8").is_some());
+        let alternate_video = sanitized
+            .media_resource("v1-video.m4s")
+            .expect("sanitized alternate video lookup should remain addressable");
+        assert!(alternate_video.request.url.is_empty());
+        assert!(alternate_video.request.backup_urls.is_empty());
+        assert!(alternate_video.request.headers.is_empty());
+        let alternate_audio = sanitized
+            .media_resource("v1-audio.m4s")
+            .expect("sanitized alternate audio lookup should remain addressable");
+        assert!(alternate_audio.request.url.is_empty());
+        assert!(alternate_audio.request.backup_urls.is_empty());
+        assert!(alternate_audio.request.headers.is_empty());
     }
 
     #[test]
@@ -2481,6 +3379,7 @@ mod tests {
             .as_object_mut()
             .expect("persisted session should be a JSON object");
         object.remove("alternate_variants");
+        object.remove("advertise_alternate_variants");
         object.remove("abr");
         object.remove("variants");
         object.remove("transcoding");
@@ -2687,6 +3586,587 @@ mod tests {
         assert_eq!(28, cached.initialization_length);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caches_transcoded_session_and_restores_generated_manifest() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_transcoding_ready_session("session-transcoded", &upstream_url);
+        let active_job_count = Arc::new(AtomicUsize::new(0));
+        let config = HlsTranscodingExecutionConfig {
+            ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+            permits: Arc::new(Semaphore::new(1)),
+            active_job_count: Arc::clone(&active_job_count),
+        };
+        let client = reqwest::Client::new();
+
+        let completion = store
+            .cache_session_resources_completion_with_control(
+                &client,
+                &session,
+                || HlsCacheFillControl::Continue,
+                |_| {},
+                Some(config),
+            )
+            .await
+            .expect("transcoding-ready session should cache and transcode");
+        let item = store
+            .get_completed_library_item(&completion.library_item_id)
+            .expect("transcoded session should expose a completed item");
+        let cached = store
+            .cached_resource("session-transcoded", HLS_TRANSCODED_RESOURCE_ID)
+            .expect("generated HLS resource should be cached");
+        let reloaded = temp_store(&temp)
+            .completed_session("session-transcoded")
+            .expect("completed transcoded session should restore after restart");
+        let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log"))
+            .expect("fake ffmpeg args should be logged");
+
+        assert_eq!(0, active_job_count.load(Ordering::SeqCst));
+        assert_eq!(
+            HLS_TRANSCODED_RESOURCE_ID,
+            completion.session.variant.video.id
+        );
+        assert_eq!(HLS_TRANSCODED_RESOURCE_ID, reloaded.variant.video.id);
+        assert!(completion.session.variant.audio.is_none());
+        assert_eq!(
+            HlsTranscodingPlanState::NotRequired,
+            completion.session.transcoding.state
+        );
+        assert_eq!(HLS_TRANSCODED_VIDEO_CODEC, item.variants[0].video_codec);
+        assert_eq!("mp4a.40.2", item.variants[0].audio_codec);
+        assert_eq!(fake_mp4().len() as u64, cached.total_length);
+        assert_eq!(28, cached.initialization_length);
+        assert!(
+            store
+                .resource_path("session-transcoded", "video.m4s")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            store
+                .resource_path("session-transcoded", "audio.m4s")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !store
+                .transcoding_commit_marker_path("session-transcoded")
+                .unwrap()
+                .exists()
+        );
+        assert!(args_log.contains("-c:v\nlibx264\n"));
+        assert!(args_log.contains("-c:a\naac\n"));
+        assert!(args_log.contains("-level:v\n4.2\n"));
+        assert!(args_log.contains("-vf\nscale=w='min(1920,iw)'"));
+        assert!(args_log.contains("fps=fps='min(source_fps,60)'"));
+        assert!(args_log.contains("-maxrate\n10000k\n"));
+        assert!(args_log.contains("-bufsize\n20000k\n"));
+        assert!(
+            reloaded
+                .master_playlist()
+                .contains("segments/transcoded.m3u8")
+        );
+        assert!(!reloaded.master_playlist().contains("segments/video.m3u8"));
+        assert!(reloaded.media_playlist_resource("video.m3u8").is_some());
+        assert!(reloaded.media_resource("video.m4s").is_some());
+        assert_eq!(
+            "",
+            reloaded
+                .media_resource("video.m4s")
+                .expect("source lookup resource should remain addressable")
+                .request
+                .url
+        );
+    }
+
+    #[test]
+    fn transcoded_completed_session_advertises_capped_output_profile() {
+        let mut source_session =
+            sample_transcoding_ready_session("session-transcoded-profile", "https://example.test");
+        source_session.variant.bandwidth = 30_000_000;
+        source_session.variant.width = Some(3840);
+        source_session.variant.height = Some(2160);
+        source_session.variant.video.request.bandwidth = Some(30_000_000);
+        source_session.variant.video.request.width = Some(3840);
+        source_session.variant.video.request.height = Some(2160);
+        source_session.variant.video.request.frame_rate = Some("120000/1000".to_owned());
+
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        let expected_bandwidth =
+            LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS + LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS;
+
+        assert_eq!(
+            vec![
+                HLS_TRANSCODED_VIDEO_CODEC.to_owned(),
+                HLS_TRANSCODED_AUDIO_CODEC.to_owned()
+            ],
+            completed_session.variant.codecs
+        );
+        assert_eq!(expected_bandwidth, completed_session.variant.bandwidth);
+        assert_eq!(Some(1920), completed_session.variant.width);
+        assert_eq!(Some(1080), completed_session.variant.height);
+        assert_eq!(
+            Some("60".to_owned()),
+            completed_session.variant.video.request.frame_rate
+        );
+        assert_eq!(
+            Some(expected_bandwidth),
+            completed_session.variant.video.request.bandwidth
+        );
+        assert_eq!(Some(1920), completed_session.variant.video.request.width);
+        assert_eq!(Some(1080), completed_session.variant.video.request.height);
+        assert_eq!(
+            Some(expected_bandwidth),
+            completed_session.variants[0].bandwidth
+        );
+        assert_eq!(Some(1920), completed_session.variants[0].width);
+        assert_eq!(Some(1080), completed_session.variants[0].height);
+        assert_eq!(
+            Some("60".to_owned()),
+            completed_session.variants[0].frame_rate
+        );
+    }
+
+    #[test]
+    fn transcoded_dimensions_match_even_ffmpeg_bounds() {
+        assert_eq!(
+            (Some(1920), Some(1080)),
+            transcoded_dimensions(Some(3840), Some(2160))
+        );
+        assert_eq!(
+            (Some(608), Some(1080)),
+            transcoded_dimensions(Some(2160), Some(3840))
+        );
+        assert_eq!(
+            (Some(852), Some(480)),
+            transcoded_dimensions(Some(853), Some(480))
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_retains_transcoded_source_lookup_resources_after_manifest_rewrite() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_session =
+            sample_transcoding_ready_session("session-transcoded-orphans", "https://example.test");
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        store
+            .save_completed_session(&completed_session)
+            .expect("completed manifest should save");
+
+        for (session, resource_id) in [
+            (&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+            (&source_session, "video.m4s"),
+            (&source_session, "audio.m4s"),
+        ] {
+            std::fs::write(
+                store
+                    .resource_path(&completed_session.id, resource_id)
+                    .expect("resource path should be valid"),
+                fake_mp4(),
+            )
+            .expect("resource should be written");
+            write_pretty_json(
+                &store
+                    .resource_metadata_path(&completed_session.id, resource_id)
+                    .expect("metadata path should be valid"),
+                &cached_metadata_for_session(session, resource_id),
+            );
+        }
+        let transcode_temp_name = transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID);
+        for temp_name in ["video.tmp", transcode_temp_name.as_str()] {
+            std::fs::write(
+                store
+                    .resource_path(&completed_session.id, temp_name)
+                    .expect("temporary resource path should be valid"),
+                b"active temporary writer payload",
+            )
+            .expect("temporary resource should be written");
+        }
+
+        assert!(
+            store
+                .resource_path(&completed_session.id, "video.m4s")
+                .expect("source video path should be valid")
+                .exists()
+        );
+        assert!(
+            store
+                .resource_path(&completed_session.id, "audio.m4s")
+                .expect("source audio path should be valid")
+                .exists()
+        );
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should repair orphaned resources");
+
+        assert_eq!(1, usage.completed_session_count);
+        assert_eq!(3 * fake_mp4().len() as u64, usage.used_bytes);
+        let entries = store
+            .completed_cache_entries()
+            .expect("completed cache entries should include retained lookup resources");
+        assert_eq!(1, entries.len());
+        assert_eq!(3 * fake_mp4().len() as u64, entries[0].size_bytes);
+        assert!(
+            store
+                .cached_resource(&completed_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .is_some()
+        );
+        for resource_id in ["video.m4s", "audio.m4s"] {
+            assert!(
+                store
+                    .resource_path(&completed_session.id, resource_id)
+                    .expect("resource path should be valid")
+                    .exists()
+            );
+            assert!(
+                store
+                    .resource_metadata_path(&completed_session.id, resource_id)
+                    .expect("metadata path should be valid")
+                    .exists()
+            );
+        }
+        assert!(
+            store
+                .resource_path(&completed_session.id, "video.tmp")
+                .expect("temporary resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &completed_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID)
+                )
+                .expect("temporary resource path should be valid")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_snapshot_preserves_generated_transcode_output_while_manifest_is_ready() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_session =
+            sample_transcoding_ready_session("session-transcoding-window", "https://example.test");
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        store
+            .save_session(&source_session)
+            .expect("ready manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"active ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
+        let guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
+            .expect("active transcoding marker should be created");
+        let marker_path = store
+            .transcoding_commit_marker_path(&source_session.id)
+            .expect("transcoding marker path should be valid");
+        set_file_modified_time(
+            &marker_path,
+            SystemTime::now()
+                .checked_sub(HLS_TRANSCODING_COMMIT_MARKER_TTL + Duration::from_secs(1))
+                .expect("test stale marker time should be valid"),
+        );
+        guard
+            .refresh()
+            .expect("active transcoding marker should refresh");
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should preserve active transcode output");
+
+        assert_eq!(
+            fake_mp4().len() as u64 + b"active ffmpeg output".len() as u64,
+            usage.used_bytes
+        );
+        assert_eq!(0, usage.completed_session_count);
+        assert!(
+            store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_snapshot_removes_stale_transcode_output_for_ready_manifest() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_session =
+            sample_transcoding_ready_session("session-stale-transcode", "https://example.test");
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        store
+            .save_session(&source_session)
+            .expect("ready manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"stale ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
+        let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
+            .expect("stale transcoding marker should be created");
+        let marker_path = store
+            .transcoding_commit_marker_path(&source_session.id)
+            .expect("transcoding marker path should be valid");
+        set_file_modified_time(
+            &marker_path,
+            SystemTime::now()
+                .checked_sub(HLS_TRANSCODING_COMMIT_MARKER_TTL + Duration::from_secs(1))
+                .expect("test stale marker time should be valid"),
+        );
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should clean stale transcode output");
+
+        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
+        assert!(
+            !store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_removes_abandoned_transcode_output_for_ready_manifest() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_session =
+            sample_transcoding_ready_session("session-abandoned-transcode", "https://example.test");
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        store
+            .save_session(&source_session)
+            .expect("ready manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"abandoned ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should clean abandoned transcode output");
+
+        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
+        assert!(
+            !store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcoding_failure_does_not_expose_original_ready_session_as_completed() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_transcoding_ready_session("session-transcode-fail", &upstream_url);
+        let config = HlsTranscodingExecutionConfig {
+            ffmpeg_path: write_failing_fake_ffmpeg(temp.path()),
+            permits: Arc::new(Semaphore::new(1)),
+            active_job_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let client = reqwest::Client::new();
+
+        let error = store
+            .cache_session_resources_completion_with_control(
+                &client,
+                &session,
+                || HlsCacheFillControl::Continue,
+                |_| {},
+                Some(config),
+            )
+            .await
+            .expect_err("ffmpeg failure should fail cache completion");
+
+        assert!(
+            matches!(error, HlsCacheError::InvalidResource(message) if message.contains("LAN transcoding ffmpeg failed"))
+        );
+        assert!(
+            store
+                .get_completed_library_item("bilibili.hls.session-transcode-fail")
+                .is_none()
+        );
+        assert!(
+            store
+                .partial_cache_entries()
+                .expect("partial entries should scan")
+                .iter()
+                .any(|entry| entry.session_id == "session-transcode-fail")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcoding_cancellation_cleans_session_and_releases_active_job() {
+        let (upstream_url, _task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_transcoding_ready_session("session-transcode-cancel", &upstream_url);
+        let active_job_count = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicUsize::new(0));
+        let config = HlsTranscodingExecutionConfig {
+            ffmpeg_path: write_blocking_fake_ffmpeg(temp.path()),
+            permits: Arc::new(Semaphore::new(1)),
+            active_job_count: Arc::clone(&active_job_count),
+        };
+        let client = reqwest::Client::new();
+        let store_for_task = store.clone();
+        let session_for_task = session.clone();
+        let cancel_for_task = Arc::clone(&cancel);
+        let mut task = tokio::spawn(async move {
+            store_for_task
+                .cache_session_resources_completion_with_control(
+                    &client,
+                    &session_for_task,
+                    move || {
+                        if cancel_for_task.load(Ordering::SeqCst) == 0 {
+                            HlsCacheFillControl::Continue
+                        } else {
+                            HlsCacheFillControl::Cancel
+                        }
+                    },
+                    |_| {},
+                    Some(config),
+                )
+                .await
+        });
+
+        let ffmpeg_started_path = temp.path().join("ffmpeg-started");
+        tokio::select! {
+            () = wait_for_path(&ffmpeg_started_path) => {}
+            result = &mut task => {
+                panic!("transcoding task finished before fake ffmpeg started: {result:?}");
+            }
+        }
+        assert_eq!(1, active_job_count.load(Ordering::SeqCst));
+        cancel.store(1, Ordering::SeqCst);
+        let error = task
+            .await
+            .expect("transcoding task should not panic")
+            .expect_err("cancelled ffmpeg should fail with cancellation");
+
+        assert!(matches!(error, HlsCacheError::Cancelled));
+        assert_eq!(0, active_job_count.load(Ordering::SeqCst));
+        assert!(store.playback_session("session-transcode-cancel").is_none());
+    }
+
     #[tokio::test]
     async fn usage_snapshot_counts_completed_hls_cache_entries() {
         let (upstream_url, _task) = start_mp4_upstream().await;
@@ -2818,6 +4298,69 @@ mod tests {
         assert_eq!(
             Some(resource_size),
             store.session_projected_remaining_size_bytes(&session)
+        );
+    }
+
+    #[test]
+    fn finalization_projection_includes_generated_transcode_output() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_transcoding_ready_session(
+            "session-transcode-projection",
+            "https://example.test/video.m4s",
+        );
+        let source_size = fake_mp4().len() as u64;
+        session.variant.video.request.size = Some(source_size);
+        session
+            .variant
+            .audio
+            .as_mut()
+            .expect("sample transcoding session should include audio")
+            .request
+            .size = Some(source_size);
+
+        store
+            .save_session(&session)
+            .expect("session should be persisted");
+        for resource in session
+            .variant
+            .audio
+            .iter()
+            .chain(std::iter::once(&session.variant.video))
+        {
+            let path = store
+                .resource_path(&session.id, &resource.id)
+                .expect("resource path should be valid");
+            std::fs::create_dir_all(path.parent().expect("resource should have a parent"))
+                .expect("session cache directory should be created");
+            std::fs::write(&path, fake_mp4()).expect("cached resource should be written");
+            write_pretty_json(
+                &store
+                    .resource_metadata_path(&session.id, &resource.id)
+                    .expect("metadata path should be valid"),
+                &PersistedHlsCachedResource {
+                    schema_version: HLS_CACHE_SCHEMA_VERSION,
+                    id: resource.id.clone(),
+                    content_type: resource.content_type().to_owned(),
+                    total_length: source_size,
+                    initialization_length: 28,
+                    cache_key: PersistedBilibiliMediaCacheKey::from(
+                        resource.request.cache_key.clone(),
+                    ),
+                },
+            );
+        }
+
+        let expected_transcoded_output_bytes =
+            u64::from(session.variant.duration_seconds) * transcoded_bandwidth(true) / 8;
+
+        assert_eq!(
+            Some(0),
+            store.session_projected_remaining_size_bytes(&session)
+        );
+        assert_eq!(
+            Some(expected_transcoded_output_bytes),
+            store.session_projected_finalization_added_size_bytes(&session)
         );
     }
 
@@ -3417,11 +4960,33 @@ mod tests {
         assert!(manifest.contains("source-hash"));
         assert!(manifest.contains("hevc-source-hash"));
         assert_eq!(1, sessions.len());
-        assert!(sessions[0].alternate_variants.is_empty());
+        assert_eq!(1, sessions[0].alternate_variants.len());
         let request = &sessions[0].variant.video.request;
         assert!(request.url.is_empty());
         assert!(request.backup_urls.is_empty());
         assert!(request.headers.is_empty());
+        let alternate_video_request = &sessions[0].alternate_variants[0].video.request;
+        assert!(alternate_video_request.url.is_empty());
+        assert!(alternate_video_request.backup_urls.is_empty());
+        assert!(alternate_video_request.headers.is_empty());
+        let alternate_audio_request = &sessions[0].alternate_variants[0]
+            .audio
+            .as_ref()
+            .expect("alternate audio should remain for lookup")
+            .request;
+        assert!(alternate_audio_request.url.is_empty());
+        assert!(alternate_audio_request.backup_urls.is_empty());
+        assert!(alternate_audio_request.headers.is_empty());
+        assert!(
+            !sessions[0]
+                .master_playlist()
+                .contains("segments/v1-video.m3u8")
+        );
+        assert!(
+            sessions[0]
+                .media_playlist_resource("v1-video.m3u8")
+                .is_some()
+        );
         assert_eq!(session.abr, sessions[0].abr);
         assert_eq!(session.variants, sessions[0].variants);
         assert!(store.get_completed_library_item(&item_id).is_some());
@@ -3926,10 +5491,29 @@ mod tests {
                 ),
             },
         );
+        std::fs::write(
+            store
+                .resource_path(&session.id, "stale.m4s")
+                .expect("stale resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("stale resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&session.id, "stale.m4s")
+                .expect("stale metadata path should be valid"),
+            &cached_metadata_for_session(&session, "stale.m4s"),
+        );
 
         assert!(store.playback_session("session-resource-cleanup").is_some());
         assert!(store.cached_resource(&session.id, "video.m4s").is_some());
         assert!(store.prewarmed_resource(&session.id, "video.m4s").is_some());
+        assert!(
+            store
+                .resource_path(&session.id, "stale.m4s")
+                .expect("stale resource path should be valid")
+                .exists()
+        );
 
         store
             .remove_session_managed_resources("session-resource-cleanup")
@@ -3952,6 +5536,18 @@ mod tests {
         );
         assert!(
             !store
+                .resource_path(&session.id, "stale.m4s")
+                .expect("stale resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&session.id, "stale.m4s")
+                .expect("stale metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
                 .resource_prewarm_path(&session.id, "video.m4s")
                 .expect("prewarm resource path should be valid")
                 .exists()
@@ -3966,6 +5562,128 @@ mod tests {
             .usage_snapshot()
             .expect("usage snapshot should scan preserved manifest");
         assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
+    }
+
+    #[test]
+    fn eviction_resource_cleanup_removes_active_transcode_outputs() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let session = sample_transcoding_ready_session(
+            "session-transcode-eviction-cleanup",
+            "https://example.test/video.m4s",
+        );
+        let completed_session = transcoded_completed_session(&session, fake_mp4().len() as u64);
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            std::fs::write(
+                store
+                    .resource_path(&session.id, &resource.id)
+                    .expect("source resource path should be valid"),
+                fake_mp4(),
+            )
+            .expect("source resource should be written");
+            write_pretty_json(
+                &store
+                    .resource_metadata_path(&session.id, &resource.id)
+                    .expect("source metadata path should be valid"),
+                &cached_metadata_for_session(&session, &resource.id),
+            );
+        }
+        std::fs::write(
+            store
+                .resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temp path should be valid"),
+            b"active ffmpeg output",
+        )
+        .expect("transcode temp should be written");
+        let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &session)
+            .expect("active transcoding marker should be created");
+
+        let partial = store
+            .partial_cache_entries()
+            .expect("partial entries should scan")
+            .into_iter()
+            .find(|entry| entry.session_id == session.id)
+            .expect("active transcode bytes should be counted before eviction cleanup");
+        assert!(partial.size_bytes > (2 * fake_mp4().len()) as u64);
+
+        store
+            .remove_session_managed_resources_for_eviction(&session.id)
+            .expect("eviction cleanup should remove managed resources");
+
+        assert!(store.playback_session(&session.id).is_some());
+        for resource in std::iter::once(&session.variant.video).chain(session.variant.audio.iter())
+        {
+            assert!(store.cached_resource(&session.id, &resource.id).is_none());
+            assert!(
+                !store
+                    .resource_path(&session.id, &resource.id)
+                    .expect("source resource path should be valid")
+                    .exists()
+            );
+            assert!(
+                !store
+                    .resource_metadata_path(&session.id, &resource.id)
+                    .expect("source metadata path should be valid")
+                    .exists()
+            );
+        }
+        assert!(
+            store
+                .cached_resource(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .is_none()
+        );
+        assert!(
+            !store
+                .resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_path(
+                    &session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temp path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .transcoding_commit_marker_path(&session.id)
+                .expect("transcoding marker path should be valid")
+                .exists()
+        );
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should scan preserved manifest");
         assert_eq!(0, usage.used_bytes);
     }
 
@@ -4494,6 +6212,20 @@ mod tests {
         session
     }
 
+    fn sample_transcoding_ready_session(id: &str, url: &str) -> HlsPlaybackSession {
+        let mut session = sample_session_with_audio(id, url);
+        session.variant.codecs = vec!["hev1.1.6.L120.90".to_owned()];
+        session.variant.video.request.codecs = Some("hev1.1.6.L120.90".to_owned());
+        session.variant.video.request.cache_key.codecs = Some("hev1.1.6.L120.90".to_owned());
+        session.variant.video.request.cache_key.source_hash = "hevc-source-hash".to_owned();
+        session.transcoding = HlsTranscodingPlan::with_state(
+            HlsTranscodingPlanState::Ready,
+            session.variant.id.clone(),
+            "HEVC source should be converted before completed offline cache exposure.",
+        );
+        session
+    }
+
     fn attach_sample_alternate_variant(session: &mut HlsPlaybackSession, video_url: &str) {
         let mut video = session.variant.video.clone();
         video.id = "v1-video.m4s".to_owned();
@@ -4653,15 +6385,17 @@ mod tests {
         session: &HlsPlaybackSession,
         resource_id: &str,
     ) -> PersistedHlsCachedResource {
+        let resource = session_unique_media_resources(session)
+            .into_iter()
+            .find(|resource| resource.id == resource_id)
+            .unwrap_or(&session.variant.video);
         PersistedHlsCachedResource {
             schema_version: HLS_CACHE_SCHEMA_VERSION,
             id: resource_id.to_owned(),
-            content_type: session.variant.video.content_type().to_owned(),
+            content_type: resource.content_type().to_owned(),
             total_length: fake_mp4().len() as u64,
             initialization_length: 28,
-            cache_key: PersistedBilibiliMediaCacheKey::from(
-                session.variant.video.request.cache_key.clone(),
-            ),
+            cache_key: PersistedBilibiliMediaCacheKey::from(resource.request.cache_key.clone()),
         }
     }
 
@@ -4676,5 +6410,96 @@ mod tests {
             .iter()
             .map(|entry| entry.session_id.as_str())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn write_copying_fake_ffmpeg(dir: &Path) -> PathBuf {
+        write_executable(
+            dir.join("fake-ffmpeg-copy"),
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+args_log="$script_dir/ffmpeg-args.log"
+: > "$args_log"
+last=
+input=
+previous=
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$args_log"
+  if [ "$previous" = "-i" ] && [ -z "$input" ]; then
+    input=$arg
+  fi
+  last=$arg
+  previous=$arg
+done
+cp "$input" "$last"
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_failing_fake_ffmpeg(dir: &Path) -> PathBuf {
+        write_executable(
+            dir.join("fake-ffmpeg-fail"),
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' 'synthetic transcoding failure' >&2
+exit 42
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_blocking_fake_ffmpeg(dir: &Path) -> PathBuf {
+        write_executable(
+            dir.join("fake-ffmpeg-blocking"),
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+: > "$script_dir/ffmpeg-started"
+last=
+input=
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "-i" ] && [ -z "$input" ]; then
+    input=$arg
+  fi
+  last=$arg
+  previous=$arg
+done
+cp "$input" "$last"
+while :; do
+  sleep 1
+done
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: PathBuf, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(&path, script).expect("fake ffmpeg should be written");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake ffmpeg metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("fake ffmpeg should be executable");
+        path
+    }
+
+    async fn wait_for_path(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

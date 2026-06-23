@@ -154,6 +154,11 @@ impl CacheServerOptions {
                 "LAN transcoding max concurrent jobs must be greater than zero.",
             ));
         }
+        if self.lan_transcoding_enabled && self.lan_transcoding_max_concurrent_jobs > 1 {
+            return Err(ConfigError::new(
+                "LAN transcoding max concurrent jobs currently supports exactly one job while the HLS cache fill worker is single-threaded.",
+            ));
+        }
         if self.lan_transcoding_enabled && self.lan_transcoding_ffmpeg_path.as_os_str().is_empty() {
             return Err(ConfigError::new(
                 "LAN transcoding ffmpeg path must not be empty when LAN transcoding is enabled.",
@@ -706,7 +711,7 @@ mod tests {
             "--Cache:LanTranscodingFfmpegPath".to_owned(),
             "/opt/homebrew/bin/ffmpeg-transcode".to_owned(),
             "--Cache:LanTranscodingMaxConcurrentJobs".to_owned(),
-            "2".to_owned(),
+            "1".to_owned(),
             "--Cache:BilibiliWorkerEnabled".to_owned(),
             "off".to_owned(),
             "--Cache:BilibiliWorkerMaxConcurrentTasks".to_owned(),
@@ -739,7 +744,7 @@ mod tests {
             PathBuf::from("/opt/homebrew/bin/ffmpeg-transcode"),
             options.lan_transcoding_ffmpeg_path
         );
-        assert_eq!(2, options.lan_transcoding_max_concurrent_jobs);
+        assert_eq!(1, options.lan_transcoding_max_concurrent_jobs);
         assert_eq!(2, options.bilibili_worker_max_concurrent_tasks);
         assert_eq!(25, options.task_retention_max_terminal_tasks);
         assert_eq!(7, options.task_retention_terminal_age_days);
@@ -986,6 +991,35 @@ mod tests {
             result,
             Err(ConfigError { message }) if message.contains("LAN transcoding max concurrent jobs")
         ));
+    }
+
+    #[test]
+    fn rejects_parallel_lan_transcoding_concurrency_until_fill_worker_supports_it() {
+        let result = CacheServerOptions::from_args([
+            "--Cache:LanTranscodingEnabled".to_owned(),
+            "true".to_owned(),
+            "--Cache:LanTranscodingMaxConcurrentJobs".to_owned(),
+            "2".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("currently supports exactly one")
+        ));
+    }
+
+    #[test]
+    fn allows_reserved_lan_transcoding_concurrency_when_disabled() {
+        let options = CacheServerOptions::from_args([
+            "--Cache:LanTranscodingEnabled".to_owned(),
+            "false".to_owned(),
+            "--Cache:LanTranscodingMaxConcurrentJobs".to_owned(),
+            "2".to_owned(),
+        ])
+        .expect("disabled LAN transcoding should ignore reserved parallelism");
+
+        assert!(!options.lan_transcoding_enabled);
+        assert_eq!(2, options.lan_transcoding_max_concurrent_jobs);
     }
 
     #[test]

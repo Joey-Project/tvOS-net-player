@@ -158,9 +158,15 @@ async fn hls_segment_response(
     };
 
     if segment_id.ends_with(".m3u8") {
-        let Some((variant_id, resource)) =
-            session.media_playlist_resource_with_variant(&segment_id)
-        else {
+        let (variant_id, resource, advertised_resource) = if let Some((variant_id, resource)) =
+            session.servable_media_playlist_resource_with_variant(&segment_id)
+        {
+            (variant_id, resource, true)
+        } else if let Some((variant_id, resource)) =
+            session.lookup_media_playlist_resource_with_variant(&segment_id)
+        {
+            (variant_id, resource, false)
+        } else {
             return empty_response(StatusCode::NOT_FOUND);
         };
         let initialization = if let Some(cached) = state
@@ -173,6 +179,8 @@ async fn hls_segment_response(
                 length: cached.initialization_length,
                 total_length: cached.total_length,
             }
+        } else if !advertised_resource {
+            return empty_response(StatusCode::NOT_FOUND);
         } else if let Some(prewarmed) = state
             .state
             .hls_cache
@@ -199,11 +207,20 @@ async fn hls_segment_response(
             };
             initialization
         };
-        let Some(playlist) = session.media_playlist(
-            &segment_id,
-            initialization.length,
-            initialization.total_length,
-        ) else {
+        let playlist = if advertised_resource {
+            session.servable_media_playlist(
+                &segment_id,
+                initialization.length,
+                initialization.total_length,
+            )
+        } else {
+            session.lookup_media_playlist(
+                &segment_id,
+                initialization.length,
+                initialization.total_length,
+            )
+        };
+        let Some(playlist) = playlist else {
             return text_response(
                 StatusCode::BAD_GATEWAY,
                 "HLS upstream MP4 initialization range was invalid.\n",
@@ -223,7 +240,13 @@ async fn hls_segment_response(
             .expect("HLS media playlist response should build");
     }
 
-    let Some((variant_id, resource)) = session.media_resource_with_variant(&segment_id) else {
+    let (variant_id, resource, advertised_resource) = if let Some((variant_id, resource)) =
+        session.servable_media_resource_with_variant(&segment_id)
+    {
+        (variant_id, resource, true)
+    } else if let Some((variant_id, resource)) = session.media_resource_with_variant(&segment_id) {
+        (variant_id, resource, false)
+    } else {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
@@ -246,6 +269,10 @@ async fn hls_segment_response(
             }
         };
         return build_file_response(opened_file, range, head_only).await;
+    }
+
+    if !advertised_resource {
+        return empty_response(StatusCode::NOT_FOUND);
     }
 
     if let Some(opened_file) = state
@@ -1236,6 +1263,116 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&fake_mp4()[1..=3], &body[..]);
+    }
+
+    #[tokio::test]
+    async fn hls_segment_serves_hidden_completed_source_from_cache_only() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let cached_session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &cached_session)
+            .await
+            .expect("source session should cache");
+        assert!(
+            state
+                .hls_cache
+                .open_cached_resource("session-1", "video.m4s")
+                .is_some()
+        );
+
+        let mut completed_session = hls_session("session-1", "http://127.0.0.1:9/generated.m4s");
+        completed_session.variant.id = "transcoded-h264".to_owned();
+        completed_session.variant.video.id = "transcoded.m4s".to_owned();
+        completed_session.variant.video.request.url.clear();
+        completed_session.variant.video.request.backup_urls.clear();
+        completed_session.variant.video.request.headers.clear();
+        completed_session
+            .variant
+            .video
+            .request
+            .cache_key
+            .source_hash = "transcoded-video-source".to_owned();
+        completed_session.alternate_variants = vec![cached_session.variant.clone()];
+        completed_session.advertise_alternate_variants = false;
+        insert_authorized_hls_session(&state, completed_session);
+
+        let playlist_response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, playlist_response.status());
+        let playlist_body = to_bytes(playlist_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let playlist_body = String::from_utf8(playlist_body.to_vec()).unwrap();
+        assert!(playlist_body.contains("video.m4s"));
+
+        let segment_response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, segment_response.status());
+        let body = to_bytes(segment_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&fake_mp4()[..], &body[..]);
+    }
+
+    #[tokio::test]
+    async fn hls_segment_rejects_hidden_completed_source_without_cache() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let source_session = hls_session("session-1", "http://127.0.0.1:9/source.m4s");
+        let mut completed_session = hls_session("session-1", "http://127.0.0.1:9/generated.m4s");
+        completed_session.variant.id = "transcoded-h264".to_owned();
+        completed_session.variant.video.id = "transcoded.m4s".to_owned();
+        completed_session.variant.video.request.url.clear();
+        completed_session.variant.video.request.backup_urls.clear();
+        completed_session.variant.video.request.headers.clear();
+        completed_session
+            .variant
+            .video
+            .request
+            .cache_key
+            .source_hash = "transcoded-video-source".to_owned();
+        completed_session.alternate_variants = vec![source_session.variant.clone()];
+        completed_session.advertise_alternate_variants = false;
+        insert_authorized_hls_session(&state, completed_session);
+
+        let playlist_response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::NOT_FOUND, playlist_response.status());
+
+        let segment_response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::NOT_FOUND, segment_response.status());
     }
 
     #[tokio::test]

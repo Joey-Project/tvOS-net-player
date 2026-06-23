@@ -21,7 +21,10 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -45,12 +48,13 @@ use crate::{
     config::CacheServerOptions,
     grpc_services::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
-        TaskGrpcService,
+        TaskGrpcService, playback_session_from_hls_cache_session,
     },
     hls::{HlsPlaybackRegistry, HlsPlaybackSession},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
-        HlsCacheStatusSnapshot, HlsCacheStore, sanitized_completed_session,
+        HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
+        sanitized_completed_session, source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -61,6 +65,7 @@ use crate::{
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
+    transcoding::HlsTranscodingPlanState,
 };
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
@@ -83,6 +88,8 @@ pub struct AppState {
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) lan_transcoding_permits: Arc<Semaphore>,
+    pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) completed_hls_cache_playback_supported: bool,
@@ -164,6 +171,38 @@ impl AppState {
             .map(|session| session.id.clone())
             .collect();
         let completed_hls_cache_playback_supported = library.supports_http_range_playback();
+        let source_completed_restore_session_ids = if completed_hls_cache_playback_supported {
+            restored_hls_sessions
+                .iter()
+                .filter(|session| {
+                    session.transcoding.state == HlsTranscodingPlanState::Ready
+                        && hls_cache.source_resources_are_complete(session)
+                        && tasks
+                            .completed_playback_task_for_hls_session(&session.id)
+                            .is_some_and(|task| {
+                                task.library_item_id
+                                    == HlsCacheStore::completed_library_item_id(&session.id)
+                            })
+                })
+                .map(|session| session.id.clone())
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        if !source_completed_restore_session_ids.is_empty() {
+            for session in &mut restored_hls_sessions {
+                if !source_completed_restore_session_ids.contains(&session.id) {
+                    continue;
+                }
+                *session = source_completed_session_for_restore(session);
+                if let Err(error) = hls_cache.save_completed_session(session) {
+                    eprintln!(
+                        "Failed to migrate restored completed HLS source session {}: {error}",
+                        session.id
+                    );
+                }
+            }
+        }
         let completed_cache_session_ids = if completed_hls_cache_playback_supported {
             hls_cache.completed_session_ids(&restored_hls_sessions)
         } else {
@@ -234,6 +273,10 @@ impl AppState {
         ));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
+        let lan_transcoding_permits = Arc::new(Semaphore::new(
+            options.lan_transcoding_max_concurrent_jobs.max(1),
+        ));
+        let lan_transcoding_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
 
@@ -248,6 +291,8 @@ impl AppState {
             playback_planner,
             playback_planning_permits,
             hls_cache_finalization_permits,
+            lan_transcoding_permits,
+            lan_transcoding_active_jobs,
             hls_fill_scheduler,
             hls_network_policy,
             completed_hls_cache_playback_supported,
@@ -282,16 +327,26 @@ impl AppState {
             else {
                 continue;
             };
+            if session.transcoding.state == HlsTranscodingPlanState::Ready
+                && self.hls_transcoding_execution_config().is_none()
+            {
+                continue;
+            }
             if completed_session_ids.contains(&session.id) {
                 self.hls_sessions
                     .insert(sanitized_completed_session(session));
                 match self.hls_cache.save_completed_session(session) {
                     Ok(()) => {
-                        match self.tasks.complete_playback_hls_session_cached(
-                            &task_id,
-                            &session.id,
-                            HlsCacheStore::completed_library_item_id(&session.id),
-                        ) {
+                        let completed_playback_session =
+                            playback_session_from_hls_cache_session(session);
+                        match self
+                            .tasks
+                            .complete_playback_hls_session_cached_with_metadata(
+                                &task_id,
+                                &session.id,
+                                HlsCacheStore::completed_library_item_id(&session.id),
+                                completed_playback_session,
+                            ) {
                             Ok(task) if task.state() == TaskState::Completed => {
                                 if let Err(error) = self.enforce_hls_cache_quota(
                                     "after_hls_finalization",
@@ -604,6 +659,22 @@ impl AppState {
         })
     }
 
+    pub(crate) fn lan_transcoding_active_job_count(&self) -> usize {
+        self.lan_transcoding_active_jobs.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn hls_transcoding_execution_config(&self) -> Option<HlsTranscodingExecutionConfig> {
+        if !self.options.lan_transcoding_enabled {
+            return None;
+        }
+
+        Some(HlsTranscodingExecutionConfig {
+            ffmpeg_path: self.options.lan_transcoding_ffmpeg_path.clone(),
+            permits: Arc::clone(&self.lan_transcoding_permits),
+            active_job_count: Arc::clone(&self.lan_transcoding_active_jobs),
+        })
+    }
+
     pub(crate) fn hls_weak_network_status(&self) -> HlsWeakNetworkSnapshot {
         self.hls_network_policy.snapshot()
     }
@@ -816,7 +887,7 @@ impl AppState {
                 continue;
             }
             self.hls_cache
-                .remove_session_managed_resources(&entry.session_id)?;
+                .remove_session_managed_resources_for_eviction(&entry.session_id)?;
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
             if evicted_session_id_set.insert(entry.session_id.clone()) {
@@ -1139,8 +1210,14 @@ fn refresh_restored_hls_playback_source_for_session(
             .create_hls_master_playlist_for_restored_task(&session.id, existing_uri.as_deref()),
         expires_at: None,
     };
+    let playback_session =
+        is_completed_session.then(|| playback_session_from_hls_cache_session(session));
 
-    if let Err(status) = tasks.refresh_hls_playback_source(&session.id, playback_source) {
+    if let Err(status) = tasks.refresh_hls_playback_source_with_metadata(
+        &session.id,
+        playback_source,
+        playback_session,
+    ) {
         eprintln!(
             "Failed to refresh restored HLS playback source for task {}: {status}",
             session.id

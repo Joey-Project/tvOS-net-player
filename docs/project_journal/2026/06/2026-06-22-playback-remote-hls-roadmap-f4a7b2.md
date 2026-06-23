@@ -3,7 +3,7 @@ id: 20260622-f4a7b2
 title: Playback Controls Remote Endpoint And HLS Execution Roadmap
 status: active
 created: 2026-06-22
-updated: 2026-06-22
+updated: 2026-06-23
 branch:
 pr:
 supersedes:
@@ -26,7 +26,7 @@ superseded_by:
 - Remote endpoint support now accepts `https://` cache server origin URLs, applies scheme-aware defaults, and uses HTTP/2 TLS for the gRPC control plane.
 - Path-scoped gRPC URLs remain intentionally unsupported; Cloudflare Tunnel or reverse proxy deployments should route the cache control plane at the host root.
 - PR 1 added shared AppCore seek/skip/playback-speed controls and exposed them in both tvOS and macOS while preserving the SwiftUI `VideoPlayer` surface.
-- HLS playback has ABR metadata, multi-variant master output, first-window prefetch, adaptive weak-network policy, and LAN transcoding foundation, but transcoding execution and true fMP4 segment-index playlist splitting remain future work.
+- HLS playback has ABR metadata, multi-variant master output, first-window prefetch, adaptive weak-network policy, LAN transcoding foundation, and a conservative ffmpeg execution MVP. True fMP4 segment-index playlist splitting remains future work.
 
 ## PR Plan
 
@@ -49,11 +49,17 @@ superseded_by:
 
 ### PR 3: LAN Transcoding Execution MVP
 
-- Status: pending.
+- Status: implemented by this slice.
 - Add the ffmpeg/job-runner execution path behind the existing LAN transcoding foundation.
-- Persist task execution state, output HLS manifests, cancellation, recovery, and failure reasons.
+- Rewrite completed HLS cache sessions that require LAN transcoding to a generated AVPlayer-compatible fMP4 resource served through the existing server-owned HLS URL path.
+- Pin generated output to H.264 High@4.2/AAC, cap video at 1080p60 with a 10 Mbps video VBV envelope plus 128 kbps audio, and persist matching completed-session metadata.
+- Persist the generated completed session manifest so restart recovery restores the generated playback resource rather than the original incompatible source resources.
+- Keep cancellation, preemption, and ffmpeg failure paths from exposing the original `ready` session as a completed library item.
+- Keep original source resources lookup-only after completed-session transcoding so persisted manifests can be restored and already-fetched AVPlayer playlists can finish from local cache, while the completed master playlist does not advertise old source variants and hidden resources never fall back to upstream proxying.
+- Include projected generated transcode output in pre-finalization quota eviction so fully cached sources do not bypass high-watermark protection before ffmpeg writes the temporary output.
+- Make partial-cache eviction explicitly remove marker-active generated transcode artifacts so quota accounting matches bytes freed on disk.
 - Keep the conservative `avplayer-h264-aac-hls-v1` target profile.
-- Validate with cache-server integration tests and macOS playback smoke where possible.
+- Validate with cache-server unit/finalizer tests and the full repository gate before merge.
 
 ### PR 4: fMP4 Segment-Index HLS Splitting
 
@@ -109,3 +115,17 @@ superseded_by:
   - `swift test --filter CacheLibraryViewModelTests/testRefreshAcceptsHTTPSCacheServerURL`
   - `swift test --filter CacheLibraryViewModelTests`
   - Full `just ci` passed with tvOS simulator, macOS app, Swift package, and Rust cache server tests.
+- PR 3 focused validation:
+  - `cargo test transcoding_ -- --nocapture`
+  - `cargo test hls_ffmpeg_args_pin_declared_h264_level -- --nocapture`
+  - `cargo test transcoded_completed_session_advertises_capped_output_profile -- --nocapture`
+  - `cargo test finalization_projection_includes_generated_transcode_output -- --nocapture`
+  - `cargo test caches_transcoded_session_and_restores_generated_manifest -- --nocapture`
+  - `cargo test hidden_alternate_resources_are_lookup_only -- --nocapture`
+  - `cargo test hls_segment_serves_hidden_completed_source_from_cache_only -- --nocapture`
+  - `cargo test hls_segment_rejects_hidden_completed_source_without_cache -- --nocapture`
+  - `cargo test completed_runtime_session_scrubs_hidden_lookup_resources -- --nocapture`
+  - `cargo test completed_playback_task_scrubs_runtime_hls_alternates_after_finalization -- --nocapture`
+  - `cargo test hls_cache_finalizer_transcodes_ready_session_to_generated_runtime -- --nocapture`
+  - `cargo test eviction_resource_cleanup_removes_active_transcode_outputs -- --nocapture`
+  - `just ci`
