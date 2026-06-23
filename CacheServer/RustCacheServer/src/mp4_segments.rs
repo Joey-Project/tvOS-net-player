@@ -36,7 +36,7 @@ impl Mp4BoxHeader {
 
 #[derive(Default)]
 struct Mp4TimingContext {
-    timescale: Option<u32>,
+    timescale_by_track: HashMap<u32, u32>,
     default_sample_duration_by_track: HashMap<u32, u32>,
 }
 
@@ -146,7 +146,7 @@ fn parse_timing_context(
         offset = end;
     }
 
-    if context.timescale.is_some() {
+    if !context.timescale_by_track.is_empty() {
         Ok(Some(context))
     } else {
         Ok(None)
@@ -162,30 +162,83 @@ fn parse_moov_timing(payload: &[u8], context: &mut Mp4TimingContext) -> Option<(
 }
 
 fn parse_trak_timing(payload: &[u8], context: &mut Mp4TimingContext) -> Option<()> {
+    let mut track_id = None;
+    let mut timescale = None;
     visit_child_boxes(payload, |kind, child_payload| match &kind {
-        b"mdia" => parse_mdia_timing(child_payload, context),
+        b"tkhd" => {
+            let parsed = parse_tkhd_track_id(child_payload)?;
+            if parsed == 0 {
+                return None;
+            }
+            match track_id {
+                Some(existing) if existing != parsed => None,
+                Some(_) => Some(()),
+                None => {
+                    track_id = Some(parsed);
+                    Some(())
+                }
+            }
+        }
+        b"mdia" => {
+            let Some(parsed) = parse_mdia_timescale(child_payload)? else {
+                return Some(());
+            };
+            if parsed == 0 {
+                return None;
+            }
+            match timescale {
+                Some(existing) if existing != parsed => None,
+                Some(_) => Some(()),
+                None => {
+                    timescale = Some(parsed);
+                    Some(())
+                }
+            }
+        }
         _ => Some(()),
-    })
+    })?;
+    let track_id = track_id?;
+    let timescale = timescale?;
+    match context.timescale_by_track.get(&track_id).copied() {
+        Some(existing) if existing != timescale => None,
+        Some(_) => Some(()),
+        None => {
+            context.timescale_by_track.insert(track_id, timescale);
+            Some(())
+        }
+    }
 }
 
-fn parse_mdia_timing(payload: &[u8], context: &mut Mp4TimingContext) -> Option<()> {
+fn parse_tkhd_track_id(payload: &[u8]) -> Option<u32> {
+    let version = *payload.first()?;
+    let offset = match version {
+        0 => 12,
+        1 => 20,
+        _ => return None,
+    };
+    read_u32(payload, offset)
+}
+
+fn parse_mdia_timescale(payload: &[u8]) -> Option<Option<u32>> {
+    let mut timescale = None;
     visit_child_boxes(payload, |kind, child_payload| {
         if kind != *b"mdhd" {
             return Some(());
         }
-        let timescale = parse_mdhd_timescale(child_payload)?;
-        if timescale == 0 {
+        let parsed = parse_mdhd_timescale(child_payload)?;
+        if parsed == 0 {
             return None;
         }
-        match context.timescale {
-            Some(existing) if existing != timescale => None,
+        match timescale {
+            Some(existing) if existing != parsed => None,
             Some(_) => Some(()),
             None => {
-                context.timescale = Some(timescale);
+                timescale = Some(parsed);
                 Some(())
             }
         }
-    })
+    })?;
+    Some(timescale)
 }
 
 fn parse_mdhd_timescale(payload: &[u8]) -> Option<u32> {
@@ -236,46 +289,36 @@ fn parse_moof_duration_millis(
     header: Mp4BoxHeader,
     timing: &Mp4TimingContext,
 ) -> io::Result<Option<u64>> {
-    let Some(timescale) = timing.timescale.filter(|timescale| *timescale > 0) else {
-        return Ok(None);
-    };
     let Some(payload) = read_box_payload(file, header)? else {
         return Ok(None);
     };
-    let Some(duration_units) = parse_moof_duration_units(&payload, timing) else {
-        return Ok(None);
-    };
-    let duration_millis = duration_units
-        .checked_mul(1_000)
-        .and_then(|duration| duration.checked_add(u64::from(timescale) - 1))
-        .map(|duration| duration / u64::from(timescale));
-    Ok(duration_millis.filter(|duration| *duration > 0))
+    Ok(parse_moof_duration_millis_from_payload(&payload, timing))
 }
 
-fn parse_moof_duration_units(payload: &[u8], timing: &Mp4TimingContext) -> Option<u64> {
-    let mut track_id = None;
-    let mut duration_units = 0_u64;
+fn parse_moof_duration_millis_from_payload(
+    payload: &[u8],
+    timing: &Mp4TimingContext,
+) -> Option<u64> {
+    let mut duration_millis = None;
     visit_child_boxes(payload, |kind, child_payload| {
         if kind != *b"traf" {
             return Some(());
         }
         let (traf_track_id, traf_duration_units) =
             parse_traf_duration_units(child_payload, timing)?;
-        match track_id {
-            Some(existing) if existing != traf_track_id => None,
-            Some(_) => {
-                duration_units = duration_units.checked_add(traf_duration_units)?;
-                Some(())
-            }
-            None => {
-                track_id = Some(traf_track_id);
-                duration_units = traf_duration_units;
-                Some(())
-            }
-        }
+        let timescale = timing
+            .timescale_by_track
+            .get(&traf_track_id)
+            .copied()
+            .filter(|timescale| *timescale > 0)?;
+        let traf_duration_millis = traf_duration_units
+            .checked_mul(1_000)
+            .and_then(|duration| duration.checked_add(u64::from(timescale) - 1))
+            .map(|duration| duration / u64::from(timescale))?;
+        duration_millis = Some(duration_millis.unwrap_or(0_u64).max(traf_duration_millis));
+        Some(())
     })?;
-    track_id?;
-    (duration_units > 0).then_some(duration_units)
+    duration_millis.filter(|duration| *duration > 0)
 }
 
 fn parse_traf_duration_units(payload: &[u8], timing: &Mp4TimingContext) -> Option<(u32, u64)> {
@@ -344,7 +387,7 @@ fn parse_tfhd(payload: &[u8]) -> Option<Tfhd> {
 
 fn parse_trun_duration_units(payload: &[u8], default_sample_duration: Option<u32>) -> Option<u64> {
     let flags = full_box_flags(payload)?;
-    let sample_count = usize::try_from(read_u32(payload, 4)?).ok()?;
+    let sample_count = u64::from(read_u32(payload, 4)?);
     let sample_duration_present = flags & 0x000100 != 0;
     let sample_size_present = flags & 0x000200 != 0;
     let sample_flags_present = flags & 0x000400 != 0;
@@ -356,15 +399,30 @@ fn parse_trun_duration_units(payload: &[u8], default_sample_duration: Option<u32
     if flags & 0x000004 != 0 {
         offset = offset.checked_add(4)?;
     }
+    let entry_bytes = (if sample_duration_present { 4_usize } else { 0 })
+        + (if sample_size_present { 4 } else { 0 })
+        + (if sample_flags_present { 4 } else { 0 })
+        + (if sample_composition_time_offset_present {
+            4
+        } else {
+            0
+        });
+    let sample_bytes = u64::try_from(entry_bytes).ok()?.checked_mul(sample_count)?;
+    let payload_len = u64::try_from(payload.len()).ok()?;
+    let offset_u64 = u64::try_from(offset).ok()?;
+    if offset_u64.checked_add(sample_bytes)? > payload_len {
+        return None;
+    }
+    if !sample_duration_present {
+        let sample_duration = default_sample_duration?;
+        return u64::from(sample_duration).checked_mul(sample_count);
+    }
+
+    let sample_count = usize::try_from(sample_count).ok()?;
     let mut duration_units = 0_u64;
     for _ in 0..sample_count {
-        let sample_duration = if sample_duration_present {
-            let duration = read_u32(payload, offset)?;
-            offset = offset.checked_add(4)?;
-            duration
-        } else {
-            default_sample_duration?
-        };
+        let sample_duration = read_u32(payload, offset)?;
+        offset = offset.checked_add(4)?;
         duration_units = duration_units.checked_add(u64::from(sample_duration))?;
         if sample_size_present {
             offset = offset.checked_add(4)?;
@@ -610,6 +668,44 @@ mod tests {
     }
 
     #[test]
+    fn reads_fragment_durations_from_multiple_tracks() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("fragmented-av.mp4");
+        let bytes = multi_track_fragmented_mp4(&[
+            (1_000, 48_480, b"first-media".as_slice()),
+            (2_000, 96_000, b"second-media".as_slice()),
+        ]);
+        std::fs::write(&path, &bytes).expect("test mp4 should be written");
+        let initialization_length = multi_track_init_mp4().len() as u64;
+
+        let ranges = mp4_fragment_ranges(&path, initialization_length, bytes.len() as u64)
+            .expect("fragment ranges should parse");
+
+        assert_eq!(
+            vec![
+                Mp4SegmentRange {
+                    offset: initialization_length,
+                    length: (moof_box_with_tracks(&[(1, 1_000), (2, 48_480)]).len()
+                        + mp4_box(*b"mdat", b"first-media").len())
+                        as u64,
+                    duration_millis: 1_010,
+                },
+                Mp4SegmentRange {
+                    offset: initialization_length
+                        + (moof_box_with_tracks(&[(1, 1_000), (2, 48_480)]).len()
+                            + mp4_box(*b"mdat", b"first-media").len())
+                            as u64,
+                    length: (moof_box_with_tracks(&[(1, 2_000), (2, 96_000)]).len()
+                        + mp4_box(*b"mdat", b"second-media").len())
+                        as u64,
+                    duration_millis: 2_000,
+                },
+            ],
+            ranges
+        );
+    }
+
+    #[test]
     fn returns_no_index_for_single_fragment() {
         let temp = TempDir::new().expect("temp dir should be created");
         let path = temp.path().join("single-fragment.mp4");
@@ -674,6 +770,26 @@ mod tests {
         assert!(ranges.is_empty());
     }
 
+    #[test]
+    fn trun_default_sample_duration_uses_constant_time_duration_sum() {
+        let payload = trun_default_sample_count_payload(u32::MAX);
+
+        let duration_units =
+            parse_trun_duration_units(&payload, Some(2)).expect("duration should parse");
+
+        assert_eq!(u64::from(u32::MAX) * 2, duration_units);
+        assert!(parse_trun_duration_units(&payload, None).is_none());
+    }
+
+    #[test]
+    fn trun_per_sample_duration_requires_payload_for_sample_count() {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 1, 0]);
+        payload.extend(u32::MAX.to_be_bytes());
+
+        assert!(parse_trun_duration_units(&payload, Some(1)).is_none());
+    }
+
     fn fragmented_mp4(fragments: &[(u32, &[u8])]) -> Vec<u8> {
         let mut bytes = init_mp4();
         for (duration, mdat) in fragments {
@@ -683,14 +799,51 @@ mod tests {
         bytes
     }
 
+    fn multi_track_fragmented_mp4(fragments: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let mut bytes = multi_track_init_mp4();
+        for (video_duration, audio_duration, mdat) in fragments {
+            bytes.extend(moof_box_with_tracks(&[
+                (1, *video_duration),
+                (2, *audio_duration),
+            ]));
+            bytes.extend(mp4_box(*b"mdat", mdat));
+        }
+        bytes
+    }
+
     fn init_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", &trak_box(1, 1_000)));
+        bytes
+    }
+
+    fn multi_track_init_mp4() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(mp4_box(*b"ftyp", b"isom"));
         bytes.extend(mp4_box(
             *b"moov",
-            &mp4_box(*b"trak", &mp4_box(*b"mdia", &mdhd_box(1_000))),
+            &[trak_box(1, 1_000), trak_box(2, 48_000)].concat(),
         ));
         bytes
+    }
+
+    fn trak_box(track_id: u32, timescale: u32) -> Vec<u8> {
+        mp4_box(
+            *b"trak",
+            &[tkhd_box(track_id), mp4_box(*b"mdia", &mdhd_box(timescale))].concat(),
+        )
+    }
+
+    fn tkhd_box(track_id: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 0, 0]);
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(track_id.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u64.to_be_bytes());
+        mp4_box(*b"tkhd", &payload)
     }
 
     fn untimed_init_mp4() -> Vec<u8> {
@@ -713,9 +866,22 @@ mod tests {
     }
 
     fn moof_box(duration: u32) -> Vec<u8> {
+        moof_box_with_tracks(&[(1, duration)])
+    }
+
+    fn moof_box_with_tracks(track_durations: &[(u32, u32)]) -> Vec<u8> {
         mp4_box(
             *b"moof",
-            &mp4_box(*b"traf", &[tfhd_box(1), trun_box(duration)].concat()),
+            &track_durations
+                .iter()
+                .map(|(track_id, duration)| {
+                    mp4_box(
+                        *b"traf",
+                        &[tfhd_box(*track_id), trun_box(*duration)].concat(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .concat(),
         )
     }
 
@@ -732,6 +898,13 @@ mod tests {
         payload.extend(1_u32.to_be_bytes());
         payload.extend(duration.to_be_bytes());
         mp4_box(*b"trun", &payload)
+    }
+
+    fn trun_default_sample_count_payload(sample_count: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend([0, 0, 0, 0]);
+        payload.extend(sample_count.to_be_bytes());
+        payload
     }
 
     fn mp4_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
