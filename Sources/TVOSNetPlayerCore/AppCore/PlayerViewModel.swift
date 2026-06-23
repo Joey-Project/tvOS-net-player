@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import TVOSNetPlayerCacheClient
 
 public enum PlayerPlaybackSpeed: Float, CaseIterable, Hashable, Identifiable, Sendable {
     case threeQuarter = 0.75
@@ -33,6 +34,34 @@ public enum PlayerPlaybackSpeed: Float, CaseIterable, Hashable, Identifiable, Se
     }
 }
 
+public struct PlayerPlaybackProgressContext: Equatable, Sendable {
+    public let endpoint: CacheServerEndpoint
+    public let playbackURI: String
+    public let libraryItemID: String
+    public let variantID: String
+
+    public init(
+        endpoint: CacheServerEndpoint,
+        playbackURI: String = "",
+        libraryItemID: String = "",
+        variantID: String = ""
+    ) {
+        self.endpoint = endpoint
+        self.playbackURI = playbackURI
+        self.libraryItemID = libraryItemID
+        self.variantID = variantID
+    }
+
+    func withPlaybackURI(_ playbackURI: String) -> Self {
+        Self(
+            endpoint: endpoint,
+            playbackURI: playbackURI,
+            libraryItemID: libraryItemID,
+            variantID: variantID
+        )
+    }
+}
+
 @MainActor
 public final class PlayerViewModel: ObservableObject {
     public static let lastStreamURLDefaultsKey = "LastStreamURLText"
@@ -48,10 +77,15 @@ public final class PlayerViewModel: ObservableObject {
     @Published public private(set) var statusMessage: String
     @Published public private(set) var validationMessage: String?
     @Published public private(set) var playbackSpeed: PlayerPlaybackSpeed = .normal
+    @Published public private(set) var playbackProgressReportingMessage: String?
     public private(set) var manualInteractionSequence = 0
 
     private let defaults: UserDefaults
     private let autoplay: Bool
+    private let cacheClientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
+    private let playbackProgressReportInterval: Duration?
+    private var playbackProgressContext: PlayerPlaybackProgressContext?
+    private var playbackProgressReportTask: Task<Void, Never>?
 
     public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
@@ -61,9 +95,19 @@ public final class PlayerViewModel: ObservableObject {
         player != nil
     }
 
-    public init(defaultStreamURLText: String? = nil, defaults: UserDefaults = .standard, autoplay: Bool = true) {
+    public init(
+        defaultStreamURLText: String? = nil,
+        defaults: UserDefaults = .standard,
+        autoplay: Bool = true,
+        playbackProgressReportInterval: Duration? = .seconds(15),
+        cacheClientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
+            GRPCCacheControlClient(endpoint: $0)
+        }
+    ) {
         self.defaults = defaults
         self.autoplay = autoplay
+        self.playbackProgressReportInterval = playbackProgressReportInterval
+        self.cacheClientFactory = cacheClientFactory
 
         let initialStreamURLText = defaultStreamURLText ?? defaults.string(forKey: Self.lastStreamURLDefaultsKey) ?? ""
         streamURLText = initialStreamURLText
@@ -71,6 +115,10 @@ public final class PlayerViewModel: ObservableObject {
             initialStreamURLText.isEmpty
             ? "Ready for an HTTP or HTTPS stream on your network."
             : "Ready to replay \(initialStreamURLText)."
+    }
+
+    deinit {
+        playbackProgressReportTask?.cancel()
     }
 
     public func load() {
@@ -81,7 +129,7 @@ public final class PlayerViewModel: ObservableObject {
             return
         }
 
-        load(url: url, persist: true)
+        load(url: url, persist: true, progressContext: nil)
     }
 
     public func load(streamURLText: String) {
@@ -90,7 +138,10 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     @discardableResult
-    public func loadTransient(streamURLText: String) -> Bool {
+    public func loadTransient(
+        streamURLText: String,
+        progressContext: PlayerPlaybackProgressContext? = nil
+    ) -> Bool {
         guard let url = Self.normalizedHTTPURL(from: streamURLText) else {
             validationMessage = "Use an HTTP or HTTPS URL."
             statusMessage = "Cannot load this stream."
@@ -98,24 +149,33 @@ public final class PlayerViewModel: ObservableObject {
         }
 
         markManualInteraction()
-        load(url: url, persist: false)
+        load(url: url, persist: false, progressContext: progressContext)
         return true
     }
 
     @discardableResult
-    public func loadTransient(streamURLText: String, ifManualInteractionSequenceMatches expectedSequence: Int) -> Bool {
+    public func loadTransient(
+        streamURLText: String,
+        progressContext: PlayerPlaybackProgressContext? = nil,
+        ifManualInteractionSequenceMatches expectedSequence: Int
+    ) -> Bool {
         guard manualInteractionSequence == expectedSequence else {
             return false
         }
 
-        return loadTransient(streamURLText: streamURLText)
+        return loadTransient(streamURLText: streamURLText, progressContext: progressContext)
     }
 
-    private func load(url: URL, persist: Bool) {
+    private func load(url: URL, persist: Bool, progressContext: PlayerPlaybackProgressContext?) {
+        queueCurrentPlaybackProgressReport(intent: .stopped)
+        stopPlaybackProgressReporting()
+
         let nextPlayer = AVPlayer(url: url)
         nextPlayer.defaultRate = playbackSpeed.rate
         player = nextPlayer
         loadedURL = url
+        playbackProgressContext = progressContext?.withPlaybackURI(url.absoluteString)
+        playbackProgressReportingMessage = nil
         validationMessage = nil
         if persist {
             streamURLText = url.absoluteString
@@ -126,6 +186,8 @@ public final class PlayerViewModel: ObservableObject {
         if autoplay {
             nextPlayer.play()
         }
+        queueCurrentPlaybackProgressReport(intent: .started)
+        startPlaybackProgressReporting()
     }
 
     public func skipBackward() {
@@ -148,6 +210,11 @@ public final class PlayerViewModel: ObservableObject {
         let targetSeconds = max(0, baseSeconds + offset)
         let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
         player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        queuePlaybackProgressReport(
+            positionSeconds: targetSeconds,
+            durationSeconds: currentPlaybackDurationSeconds(),
+            intent: .seek
+        )
 
         let label = Self.formattedSeekInterval(abs(offset))
         statusMessage =
@@ -172,9 +239,12 @@ public final class PlayerViewModel: ObservableObject {
 
     public func stop() {
         markManualInteraction()
+        queueCurrentPlaybackProgressReport(intent: .stopped)
+        stopPlaybackProgressReporting()
         player?.pause()
         player = nil
         loadedURL = nil
+        playbackProgressContext = nil
         statusMessage = "Stopped."
     }
 
@@ -210,8 +280,132 @@ public final class PlayerViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func reportCurrentPlaybackProgress(
+        intent: PlaybackProgressIntent = .playing
+    ) async -> PlaybackProgressReportResult? {
+        guard let report = currentPlaybackProgressReport(intent: intent),
+            let endpoint = playbackProgressContext?.endpoint
+        else {
+            return nil
+        }
+
+        do {
+            let result = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
+            playbackProgressReportingMessage = result.accepted ? nil : result.message
+            return result
+        } catch let error as CacheControlClientUnsupportedFeature where error == .playbackProgressReporting {
+            playbackProgressReportingMessage = nil
+            return nil
+        } catch {
+            playbackProgressReportingMessage = "Could not report playback position."
+            return nil
+        }
+    }
+
     private func markManualInteraction() {
         manualInteractionSequence += 1
+    }
+
+    private func startPlaybackProgressReporting() {
+        guard playbackProgressContext != nil, let playbackProgressReportInterval else {
+            return
+        }
+
+        playbackProgressReportTask?.cancel()
+        playbackProgressReportTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: playbackProgressReportInterval)
+                } catch {
+                    return
+                }
+                await self?.reportCurrentPlaybackProgress(intent: .playing)
+            }
+        }
+    }
+
+    private func stopPlaybackProgressReporting() {
+        playbackProgressReportTask?.cancel()
+        playbackProgressReportTask = nil
+    }
+
+    private func queueCurrentPlaybackProgressReport(intent: PlaybackProgressIntent) {
+        guard let report = currentPlaybackProgressReport(intent: intent),
+            let endpoint = playbackProgressContext?.endpoint
+        else {
+            return
+        }
+
+        queuePlaybackProgressReport(report, endpoint: endpoint)
+    }
+
+    private func queuePlaybackProgressReport(
+        positionSeconds: Double,
+        durationSeconds: Double?,
+        intent: PlaybackProgressIntent
+    ) {
+        guard let context = playbackProgressContext else {
+            return
+        }
+
+        let report = PlaybackProgressReport(
+            playbackURI: context.playbackURI,
+            libraryItemID: context.libraryItemID,
+            variantID: context.variantID,
+            positionSeconds: positionSeconds,
+            durationSeconds: durationSeconds,
+            intent: intent
+        )
+        queuePlaybackProgressReport(report, endpoint: context.endpoint)
+    }
+
+    private func queuePlaybackProgressReport(
+        _ report: PlaybackProgressReport,
+        endpoint: CacheServerEndpoint
+    ) {
+        playbackProgressReportingMessage = nil
+        let cacheClientFactory = cacheClientFactory
+        Task {
+            do {
+                _ = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
+            } catch {
+                // Playback progress is advisory; never interrupt local AVPlayer controls.
+            }
+        }
+    }
+
+    private func currentPlaybackProgressReport(intent: PlaybackProgressIntent) -> PlaybackProgressReport? {
+        guard let context = playbackProgressContext else {
+            return nil
+        }
+
+        return PlaybackProgressReport(
+            playbackURI: context.playbackURI,
+            libraryItemID: context.libraryItemID,
+            variantID: context.variantID,
+            positionSeconds: currentPlaybackPositionSeconds(),
+            durationSeconds: currentPlaybackDurationSeconds(),
+            intent: intent
+        )
+    }
+
+    private func currentPlaybackPositionSeconds() -> Double {
+        guard let player else {
+            return 0
+        }
+
+        let seconds = player.currentTime().seconds
+        return seconds.isFinite && seconds > 0 ? seconds : 0
+    }
+
+    private func currentPlaybackDurationSeconds() -> Double? {
+        guard let player else {
+            return nil
+        }
+
+        let seconds = player.currentItem?.duration.seconds ?? 0
+        return seconds.isFinite && seconds > 0 ? seconds : nil
     }
 
     public nonisolated static func normalizedHTTPURL(from text: String) -> URL? {

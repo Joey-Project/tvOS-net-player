@@ -131,6 +131,26 @@ public final class CacheLibraryViewModel: ObservableObject {
         {
             summary += " \(weakNetwork.message)"
         }
+        if let playback = hlsCacheStatus.playback {
+            appendPlaybackSummary(to: &summary, from: playback)
+        }
+    }
+
+    private func appendPlaybackSummary(to summary: inout String, from playback: HLSPlaybackProgressStatus) {
+        let message = playback.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard playback.isActive || playback.isRecentlyStopped else {
+            return
+        }
+
+        if let positionLabel = playback.positionLabel {
+            let playbackMessage =
+                playback.isActive
+                ? " Active playback at \(positionLabel)."
+                : " Last playback stopped at \(positionLabel)."
+            summary += playbackMessage
+        } else if !message.isEmpty {
+            summary += " \(message)"
+        }
     }
 
     public var hasPendingSearch: Bool {

@@ -2,7 +2,7 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS/macOS gRPC cache client with LAN plaintext and remote HTTPS endpoint support、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、runtime multi-variant HLS master playlist、durable HLS offline cache manifests/recovery、completed cached-resource fMP4 segment-index HLS playlist splitting、progressive HLS ABR metadata manifests、completed-HLS quota/watermark eviction、LAN transcoding execution MVP、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS/macOS gRPC cache client with LAN plaintext and remote HTTPS endpoint support、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、runtime multi-variant HLS master playlist、durable HLS offline cache manifests/recovery、completed cached-resource fMP4 segment-index HLS playlist splitting、playback-position-aware HLS progress reporting/status foundation、progressive HLS ABR metadata manifests、completed-HLS quota/watermark eviction、LAN transcoding execution MVP、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -33,6 +33,7 @@
 - HLS multi-variant master workstream：`docs/project_journal/2026/06/2026-06-22-hls-multi-variant-master-e6b4a8.md`
 - Playback controls / remote endpoint / HLS execution roadmap：`docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - HLS segment-index splitting workstream：`docs/project_journal/2026/06/2026-06-23-hls-segment-index-splitting-c1e4d8.md`
+- Playback-position weak/offline UX workstream：`docs/project_journal/2026/06/2026-06-23-playback-position-weak-offline-ux-d5b7e2.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers

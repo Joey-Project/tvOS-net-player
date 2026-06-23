@@ -35,6 +35,7 @@ service TaskService {
 service CacheService {
   rpc ListCacheRoots(ListCacheRootsRequest) returns (ListCacheRootsResponse);
   rpc GetHlsCacheStatus(GetHlsCacheStatusRequest) returns (HlsCacheStatus);
+  rpc ReportPlaybackProgress(ReportPlaybackProgressRequest) returns (ReportPlaybackProgressResponse);
   rpc DeleteLibraryItem(DeleteLibraryItemRequest) returns (DeleteLibraryItemResponse);
 }
 
@@ -381,6 +382,7 @@ message HlsCacheStatus {
   HlsCacheEvictionSummary last_eviction = 9;
   HlsWeakNetworkStatus weak_network = 10;
   LanTranscodingStatus transcoding = 11;
+  HlsPlaybackProgressStatus playback = 12;
 }
 
 message LanTranscodingStatus {
@@ -450,6 +452,50 @@ enum HlsWeakNetworkState {
   HLS_WEAK_NETWORK_STATE_DEGRADED = 3;
   HLS_WEAK_NETWORK_STATE_CACHE_ONLY = 4;
   HLS_WEAK_NETWORK_STATE_UPSTREAM_FAILED = 5;
+}
+
+message ReportPlaybackProgressRequest {
+  string playback_uri = 1;
+  string library_item_id = 2;
+  string variant_id = 3;
+  double position_seconds = 4;
+  double duration_seconds = 5;
+  PlaybackProgressIntent intent = 6;
+}
+
+message ReportPlaybackProgressResponse {
+  bool accepted = 1;
+  string session_id = 2;
+  string message = 3;
+}
+
+message HlsPlaybackProgressStatus {
+  HlsPlaybackActivityState state = 1;
+  string message = 2;
+  string session_id = 3;
+  string library_item_id = 4;
+  string variant_id = 5;
+  string playback_uri = 6;
+  double position_seconds = 7;
+  double duration_seconds = 8;
+  PlaybackProgressIntent last_intent = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+enum HlsPlaybackActivityState {
+  HLS_PLAYBACK_ACTIVITY_STATE_UNSPECIFIED = 0;
+  HLS_PLAYBACK_ACTIVITY_STATE_NONE = 1;
+  HLS_PLAYBACK_ACTIVITY_STATE_ACTIVE = 2;
+  HLS_PLAYBACK_ACTIVITY_STATE_RECENTLY_STOPPED = 3;
+}
+
+enum PlaybackProgressIntent {
+  PLAYBACK_PROGRESS_INTENT_UNSPECIFIED = 0;
+  PLAYBACK_PROGRESS_INTENT_STARTED = 1;
+  PLAYBACK_PROGRESS_INTENT_PLAYING = 2;
+  PLAYBACK_PROGRESS_INTENT_SEEK = 3;
+  PLAYBACK_PROGRESS_INTENT_PAUSED = 4;
+  PLAYBACK_PROGRESS_INTENT_STOPPED = 5;
 }
 
 message CacheRoot {

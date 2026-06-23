@@ -70,10 +70,11 @@ superseded_by:
 
 ### PR 5: Playback-Position-Aware Weak Offline UX
 
-- Status: pending.
-- Add a lightweight app-to-server playback-position signal or equivalent control-plane hook.
-- Use playback position, recent user intent, and cache state to prioritize fill/prefetch.
-- Improve weak/offline UI around retrying, cache-only, partially cached, quota-blocked, and upstream-failed states.
+- Status: implemented by this slice.
+- Add a lightweight app-to-server playback-position signal through `CacheService.ReportPlaybackProgress`.
+- Track active/recent HLS playback position in the LAN cache server and expose it through `CacheService.GetHlsCacheStatus`.
+- Improve weak/offline cache status UX by surfacing active/recent playback position next to quota, weak-network, and LAN transcoding state.
+- Keep segment-level fill/prefetch reordering as a follow-up on top of the stable playback progress signal.
 
 ### PR 6: Batch Cache Finalization And Sidecar Options UX
 

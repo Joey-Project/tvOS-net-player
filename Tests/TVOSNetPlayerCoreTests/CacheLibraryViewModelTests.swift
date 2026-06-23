@@ -213,6 +213,74 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheSummaryIncludesPlaybackPositionStatus() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                usedBytes: 42,
+                playback: HLSPlaybackProgressStatus(
+                    state: "HLS_PLAYBACK_ACTIVITY_STATE_ACTIVE",
+                    message: "Playback is active; keeping nearby HLS cache warm.",
+                    sessionID: "session-1",
+                    libraryItemID: "bilibili.hls.session-1",
+                    variantID: "h264",
+                    playbackURI: "http://mac-mini.local:8080/hls/session-1/master.m3u8",
+                    positionSeconds: 83,
+                    durationSeconds: 300,
+                    lastIntent: "PLAYBACK_PROGRESS_INTENT_PLAYING",
+                    updatedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Active playback at 1:23 of 5:00") == true)
+    }
+
+    @MainActor
+    func testHLSCacheSummaryIncludesRecentlyStoppedPlaybackPositionStatus() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                usedBytes: 42,
+                playback: HLSPlaybackProgressStatus(
+                    state: "HLS_PLAYBACK_ACTIVITY_STATE_RECENTLY_STOPPED",
+                    message: "Playback stopped; keeping the HLS cache session recent briefly.",
+                    sessionID: "session-1",
+                    libraryItemID: "bilibili.hls.session-1",
+                    variantID: "h264",
+                    playbackURI: "http://mac-mini.local:8080/hls/session-1/master.m3u8",
+                    positionSeconds: 120,
+                    durationSeconds: nil,
+                    lastIntent: "PLAYBACK_PROGRESS_INTENT_STOPPED",
+                    updatedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertTrue(model.hlsCacheSummary?.contains("Last playback stopped at 2:00") == true)
+    }
+
+    @MainActor
     func testRefreshDoesNotWaitForSlowHLSCacheStatus() async {
         let item = CacheLibraryItem.fixture(id: "item-a", title: "Server A item")
         let client = FakeCacheControlClient(
@@ -2523,7 +2591,8 @@ extension HLSCacheStatus {
         usedBytes: Int64 = 0,
         completedSessionCount: Int = 0,
         lastEviction: HLSCacheEvictionSummary? = nil,
-        weakNetwork: HLSWeakNetworkStatus? = nil
+        weakNetwork: HLSWeakNetworkStatus? = nil,
+        playback: HLSPlaybackProgressStatus? = nil
     ) -> Self {
         Self(
             evictionEnabled: evictionEnabled,
@@ -2535,7 +2604,8 @@ extension HLSCacheStatus {
             usedBytes: usedBytes,
             completedSessionCount: completedSessionCount,
             lastEviction: lastEviction,
-            weakNetwork: weakNetwork
+            weakNetwork: weakNetwork,
+            playback: playback
         )
     }
 }

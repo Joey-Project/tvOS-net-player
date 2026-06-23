@@ -1,4 +1,5 @@
 import XCTest
+import TVOSNetPlayerCacheClient
 @testable import TVOSNetPlayerCore
 
 final class PlayerViewModelTests: XCTestCase {
@@ -189,6 +190,42 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testTransientLoadCanReportPlaybackProgressWithContext() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let result = await model.reportCurrentPlaybackProgress(intent: .playing)
+
+        XCTAssertTrue(didLoad)
+        XCTAssertEqual(result?.accepted, true)
+        let reports = await client.reportsSnapshot()
+        XCTAssertTrue(
+            reports.contains {
+                $0.intent == .playing
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-1/master.m3u8"
+                    && $0.libraryItemID == "bilibili.hls.session-1"
+                    && $0.variantID == "h264"
+            }
+        )
+        XCTAssertNil(model.playbackProgressReportingMessage)
+    }
+
+    @MainActor
     func testTransientLoadWithStaleManualSequenceDoesNotReplaceManualPlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let staleSequence = model.manualInteractionSequence
@@ -278,4 +315,70 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.player)
         XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
     }
+}
+
+private actor FakePlaybackProgressClient: CacheControlClient {
+    private var reports: [PlaybackProgressReport] = []
+
+    func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
+        reports.append(report)
+        return PlaybackProgressReportResult(
+            accepted: true,
+            sessionID: "session-1",
+            message: "Playback progress recorded."
+        )
+    }
+
+    func reportsSnapshot() -> [PlaybackProgressReport] {
+        reports
+    }
+
+    func getServerInfo() async throws -> CacheServerSummary {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func listCacheRoots() async throws -> [CacheRoot] {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func listLibraryItemsPage(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) async throws -> CacheLibraryItemsPage {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func getTask(id: String) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: FakePlaybackProgressClientError.notImplemented)
+        }
+    }
+
+    func cancelTask(id: String) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+}
+
+private enum FakePlaybackProgressClientError: Error {
+    case notImplemented
 }

@@ -495,6 +495,11 @@ struct ContentView: View {
                     .font(.callout)
                     .foregroundStyle(.red)
             }
+            if let playbackProgressReportingMessage = model.playbackProgressReportingMessage {
+                Text(playbackProgressReportingMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 18) {
                 Button(action: loadManualStream) {
@@ -605,8 +610,10 @@ struct ContentView: View {
             return
         }
 
+        let progressContext = playbackProgressContext(for: item, playbackURL: url)
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.clearPlaybackStatus()
@@ -688,8 +695,12 @@ struct ContentView: View {
         }
 
         cacheModel.clearPlaybackStatus()
+        let progressContext = bilibiliModel.playbackProgressContext(
+            serverAddressText: cacheModel.serverAddressText
+        )
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
@@ -702,8 +713,13 @@ struct ContentView: View {
         }
 
         cacheModel.clearPlaybackStatus()
+        let progressContext = bilibiliModel.playbackProgressContext(
+            for: result,
+            serverAddressText: cacheModel.serverAddressText
+        )
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
@@ -725,6 +741,22 @@ struct ContentView: View {
         cacheModel.clearPlaybackStatus()
         bilibiliModel.clearPlaybackStatus()
         model.clear()
+    }
+
+    private func playbackProgressContext(
+        for item: CacheLibraryItem,
+        playbackURL: URL
+    ) -> PlayerPlaybackProgressContext? {
+        guard let endpoint = CacheServerEndpoint.normalized(from: cacheModel.serverAddressText) else {
+            return nil
+        }
+
+        return PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            playbackURI: playbackURL.absoluteString,
+            libraryItemID: item.id,
+            variantID: item.primaryVariantID ?? ""
+        )
     }
 }
 
