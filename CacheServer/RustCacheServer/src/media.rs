@@ -20,7 +20,10 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState,
-    hls::{HlsMediaResource, mp4_initialization_length, should_forward_media_request_header},
+    hls::{
+        HlsMediaResource, HlsMediaSegment, mp4_initialization_length,
+        should_forward_media_request_header,
+    },
     hls_cache::OpenedPrewarmedHlsResource,
     library::OpenedMediaFile,
 };
@@ -178,6 +181,7 @@ async fn hls_segment_response(
             Mp4Initialization {
                 length: cached.initialization_length,
                 total_length: cached.total_length,
+                segments: cached.segments,
             }
         } else if !advertised_resource {
             return empty_response(StatusCode::NOT_FOUND);
@@ -190,6 +194,7 @@ async fn hls_segment_response(
             Mp4Initialization {
                 length: prewarmed.initialization_length,
                 total_length: prewarmed.total_length,
+                segments: Vec::new(),
             }
         } else {
             let Ok(initialization) =
@@ -212,12 +217,14 @@ async fn hls_segment_response(
                 &segment_id,
                 initialization.length,
                 initialization.total_length,
+                &initialization.segments,
             )
         } else {
             session.lookup_media_playlist(
                 &segment_id,
                 initialization.length,
                 initialization.total_length,
+                &initialization.segments,
             )
         };
         let Some(playlist) = playlist else {
@@ -548,10 +555,11 @@ fn range_response_invalid(
     returned_range != expected_range
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Mp4Initialization {
     length: u64,
     total_length: u64,
+    segments: Vec<HlsMediaSegment>,
 }
 
 struct Mp4InitializationProbe {
@@ -630,6 +638,7 @@ async fn load_hls_mp4_initialization_from_url(
         initialization: Mp4Initialization {
             length,
             total_length,
+            segments: Vec::new(),
         },
         response_time,
     })
