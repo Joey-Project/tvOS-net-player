@@ -421,16 +421,16 @@ public final class PlayerViewModel: ObservableObject {
             do {
                 let result = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
                 if updatesReportingMessage {
-                    playbackProgressReportingMessage = result.accepted ? nil : result.message
+                    self.playbackProgressReportingMessage = result.accepted ? nil : result.message
                 }
                 return result
             } catch let error as CacheControlClientUnsupportedFeature where error == .playbackProgressReporting {
                 if updatesReportingMessage {
-                    playbackProgressReportingMessage = nil
+                    self.playbackProgressReportingMessage = nil
                 }
             } catch {
                 if updatesReportingMessage {
-                    playbackProgressReportingMessage = "Could not report playback position."
+                    self.playbackProgressReportingMessage = "Could not report playback position."
                 }
             }
 
