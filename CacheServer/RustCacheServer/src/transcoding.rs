@@ -570,7 +570,7 @@ mod tests {
         let status = LanTranscodingStatusSnapshot::from_options(
             &CacheServerOptions {
                 lan_transcoding_enabled: true,
-                lan_transcoding_max_concurrent_jobs: 2,
+                lan_transcoding_max_concurrent_jobs: 1,
                 ..CacheServerOptions::default()
             },
             1,
@@ -579,7 +579,7 @@ mod tests {
         assert!(status.enabled);
         assert_eq!(LanTranscodingRuntimeState::Busy, status.state);
         assert_eq!(1, status.active_job_count);
-        assert_eq!(2, status.max_concurrent_jobs);
+        assert_eq!(1, status.max_concurrent_jobs);
     }
 
     #[test]

@@ -190,7 +190,7 @@ Configuration:
 - `Cache:BBDownFfmpegPath`: `ffmpeg` executable path. Defaults to `ffmpeg` from `PATH`.
 - `Cache:LanTranscodingEnabled`: enables LAN transcoding planning/execution and advertises `SERVER_CAPABILITY_LAN_TRANSCODING`. Defaults to `false`.
 - `Cache:LanTranscodingFfmpegPath`: `ffmpeg` executable path for LAN transcoding execution. Defaults to `ffmpeg` from `PATH`.
-- `Cache:LanTranscodingMaxConcurrentJobs`: maximum LAN transcoding job concurrency. Defaults to `1`; must be greater than zero.
+- `Cache:LanTranscodingMaxConcurrentJobs`: LAN transcoding job concurrency. The execution MVP currently supports exactly `1` because the HLS cache fill worker is single-threaded; values above `1` are rejected until parallel fill workers are implemented.
 - `Cache:BBDownCredentialPath`: optional BBDown credential JSON path. Supported fields are `cookie`, `access_key`, and `tv_access_key`.
 - `Cache:BBDownRestrictedArea`: optional restricted-area hint: `cn`, `th`, `hk`, or `tw`.
 - `Cache:BBDownRestrictedAreaProxy`: optional comma-separated restricted-area playurl proxy specs. Each spec is `[area=]URL`; the URL must use `http` or `https`.

@@ -312,11 +312,12 @@ impl HlsCacheStore {
 
     pub(crate) fn partial_cache_entries(&self) -> io::Result<Vec<HlsCachePartialEntry>> {
         self.remove_unreferenced_managed_resources()?;
-        let mut entries = self
-            .load_sessions()?
-            .iter()
-            .filter_map(|session| self.partial_cache_entry(session))
-            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for session in self.load_sessions()? {
+            if let Some(entry) = self.partial_cache_entry(&session)? {
+                entries.push(entry);
+            }
+        }
         entries.sort_by(|left, right| {
             left.updated_at
                 .cmp(&right.updated_at)
@@ -1004,13 +1005,16 @@ impl HlsCacheStore {
         })
     }
 
-    fn partial_cache_entry(&self, session: &HlsPlaybackSession) -> Option<HlsCachePartialEntry> {
+    fn partial_cache_entry(
+        &self,
+        session: &HlsPlaybackSession,
+    ) -> io::Result<Option<HlsCachePartialEntry>> {
         if self.session_is_complete(session) {
-            return None;
+            return Ok(None);
         }
-        let size_bytes = self.session_managed_resource_size(session);
+        let size_bytes = self.session_managed_resource_size(session)?;
         if size_bytes == 0 {
-            return None;
+            return Ok(None);
         }
         let updated_at = self
             .managed_resource_modification_times(session)
@@ -1018,11 +1022,11 @@ impl HlsCacheStore {
             .max()
             .unwrap_or(UNIX_EPOCH);
 
-        Some(HlsCachePartialEntry {
+        Ok(Some(HlsCachePartialEntry {
             session_id: session.id.clone(),
             size_bytes,
             updated_at,
-        })
+        }))
     }
 
     fn session_is_complete(&self, session: &HlsPlaybackSession) -> bool {
@@ -1130,19 +1134,36 @@ impl HlsCacheStore {
     fn managed_usage_size_bytes(&self) -> io::Result<u64> {
         let mut total = 0_u64;
         for session in self.load_sessions()? {
-            total = total.saturating_add(self.session_managed_resource_size(&session));
+            total = total.saturating_add(self.session_managed_resource_size(&session)?);
         }
         Ok(total)
     }
 
-    fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> u64 {
-        session
+    fn session_managed_resource_size(&self, session: &HlsPlaybackSession) -> io::Result<u64> {
+        let source_size = session
             .variant
             .audio
             .iter()
             .chain(std::iter::once(&session.variant.video))
             .map(|resource| self.resource_managed_size(&session.id, &resource.id))
-            .sum()
+            .sum::<u64>();
+        Ok(source_size.saturating_add(self.active_transcode_managed_size(session)?))
+    }
+
+    fn active_transcode_managed_size(&self, session: &HlsPlaybackSession) -> io::Result<u64> {
+        if !self.transcoding_commit_marker_is_active(session)? {
+            return Ok(0);
+        }
+        let generated_size = self
+            .resource_managed_size(&session.id, HLS_TRANSCODED_RESOURCE_ID)
+            .max(self.managed_file_size(
+                &self.resource_path(&session.id, HLS_TRANSCODED_RESOURCE_ID)?,
+            )?);
+        let temp_size = self.managed_file_size(&self.resource_path(
+            &session.id,
+            &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+        )?)?;
+        Ok(generated_size.saturating_add(temp_size))
     }
 
     fn resource_managed_size(&self, session_id: &str, resource_id: &str) -> u64 {
@@ -1152,6 +1173,16 @@ impl HlsCacheStore {
             prewarmed.prefix_length
         } else {
             0
+        }
+    }
+
+    fn managed_file_size(&self, path: &Path) -> io::Result<u64> {
+        self.reject_cache_path_symlink(path)?;
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+            Ok(_) => Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
         }
     }
 
@@ -3769,6 +3800,10 @@ mod tests {
             .usage_snapshot()
             .expect("usage snapshot should preserve active transcode output");
 
+        assert_eq!(
+            fake_mp4().len() as u64 + b"active ffmpeg output".len() as u64,
+            usage.used_bytes
+        );
         assert_eq!(0, usage.completed_session_count);
         assert!(
             store
