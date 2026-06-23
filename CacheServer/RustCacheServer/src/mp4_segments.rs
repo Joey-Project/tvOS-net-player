@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+const MAX_TIMING_BOX_PAYLOAD_LENGTH: u64 = 16 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Mp4SegmentRange {
     pub(crate) offset: u64,
@@ -136,7 +138,9 @@ fn parse_timing_context(
             return Ok(None);
         }
         if header.kind == *b"moov" {
-            let Some(payload) = read_box_payload(file, header)? else {
+            let Some(payload) =
+                read_box_payload_limited(file, header, MAX_TIMING_BOX_PAYLOAD_LENGTH)?
+            else {
                 return Ok(None);
             };
             if parse_moov_timing(&payload, &mut context).is_none() {
@@ -289,7 +293,8 @@ fn parse_moof_duration_millis(
     header: Mp4BoxHeader,
     timing: &Mp4TimingContext,
 ) -> io::Result<Option<u64>> {
-    let Some(payload) = read_box_payload(file, header)? else {
+    let Some(payload) = read_box_payload_limited(file, header, MAX_TIMING_BOX_PAYLOAD_LENGTH)?
+    else {
         return Ok(None);
     };
     Ok(parse_moof_duration_millis_from_payload(&payload, timing))
@@ -299,25 +304,35 @@ fn parse_moof_duration_millis_from_payload(
     payload: &[u8],
     timing: &Mp4TimingContext,
 ) -> Option<u64> {
-    let mut duration_millis = None;
+    let mut duration_units_by_track = HashMap::new();
     visit_child_boxes(payload, |kind, child_payload| {
         if kind != *b"traf" {
             return Some(());
         }
         let (traf_track_id, traf_duration_units) =
             parse_traf_duration_units(child_payload, timing)?;
+        if !timing.timescale_by_track.contains_key(&traf_track_id) {
+            return None;
+        }
+        let total_duration = duration_units_by_track
+            .entry(traf_track_id)
+            .or_insert(0_u64);
+        *total_duration = total_duration.checked_add(traf_duration_units)?;
+        Some(())
+    })?;
+    let mut duration_millis = None;
+    for (track_id, duration_units) in duration_units_by_track {
         let timescale = timing
             .timescale_by_track
-            .get(&traf_track_id)
+            .get(&track_id)
             .copied()
             .filter(|timescale| *timescale > 0)?;
-        let traf_duration_millis = traf_duration_units
+        let track_duration_millis = duration_units
             .checked_mul(1_000)
             .and_then(|duration| duration.checked_add(u64::from(timescale) - 1))
             .map(|duration| duration / u64::from(timescale))?;
-        duration_millis = Some(duration_millis.unwrap_or(0_u64).max(traf_duration_millis));
-        Some(())
-    })?;
+        duration_millis = Some(duration_millis.unwrap_or(0_u64).max(track_duration_millis));
+    }
     duration_millis.filter(|duration| *duration > 0)
 }
 
@@ -521,13 +536,20 @@ fn read_box_header(
     }))
 }
 
-fn read_box_payload(file: &mut File, header: Mp4BoxHeader) -> io::Result<Option<Vec<u8>>> {
+fn read_box_payload_limited(
+    file: &mut File,
+    header: Mp4BoxHeader,
+    max_payload_length: u64,
+) -> io::Result<Option<Vec<u8>>> {
     let Some(payload_offset) = header.payload_offset() else {
         return Ok(None);
     };
     let Some(payload_length) = header.payload_length() else {
         return Ok(None);
     };
+    if payload_length > max_payload_length {
+        return Ok(None);
+    }
     let Ok(payload_length) = usize::try_from(payload_length) else {
         return Ok(None);
     };
@@ -603,6 +625,8 @@ fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -706,6 +730,25 @@ mod tests {
     }
 
     #[test]
+    fn sums_multiple_traf_durations_for_same_track_before_selecting_longest_track() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("fragmented-split-traf.mp4");
+        let mut bytes = multi_track_init_mp4();
+        let initialization_length = bytes.len() as u64;
+        bytes.extend(moof_box_with_tracks(&[(1, 400), (1, 600), (2, 47_000)]));
+        bytes.extend(mp4_box(*b"mdat", b"first-media"));
+        bytes.extend(moof_box_with_tracks(&[(1, 1_000), (2, 48_000)]));
+        bytes.extend(mp4_box(*b"mdat", b"second-media"));
+        std::fs::write(&path, &bytes).expect("test mp4 should be written");
+
+        let ranges = mp4_fragment_ranges(&path, initialization_length, bytes.len() as u64)
+            .expect("fragment ranges should parse");
+
+        assert_eq!(2, ranges.len());
+        assert_eq!(1_000, ranges[0].duration_millis);
+    }
+
+    #[test]
     fn returns_no_index_for_single_fragment() {
         let temp = TempDir::new().expect("temp dir should be created");
         let path = temp.path().join("single-fragment.mp4");
@@ -751,6 +794,36 @@ mod tests {
 
         let ranges = mp4_fragment_ranges(&path, initialization_length, bytes.len() as u64)
             .expect("fragment ranges should parse");
+
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn returns_no_index_when_moof_payload_exceeds_limit() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let path = temp.path().join("oversized-moof.mp4");
+        let initialization = init_mp4();
+        let initialization_length = initialization.len() as u64;
+        let moof_size = MAX_TIMING_BOX_PAYLOAD_LENGTH + 9;
+        let total_length = initialization_length + moof_size;
+        let mut file = File::create(&path).expect("test mp4 should be created");
+        file.write_all(&initialization)
+            .expect("initialization should be written");
+        file.seek(SeekFrom::Start(initialization_length))
+            .expect("moof header should be seekable");
+        file.write_all(
+            &u32::try_from(moof_size)
+                .expect("test moof size should fit u32")
+                .to_be_bytes(),
+        )
+        .expect("moof size should be written");
+        file.write_all(b"moof")
+            .expect("moof kind should be written");
+        file.set_len(total_length)
+            .expect("oversized moof payload should be sparse");
+
+        let ranges = mp4_fragment_ranges(&path, initialization_length, total_length)
+            .expect("fragment range parsing should not fail");
 
         assert!(ranges.is_empty());
     }
