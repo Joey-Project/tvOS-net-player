@@ -4,10 +4,10 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::StatusCode;
@@ -56,6 +56,7 @@ const HLS_TRANSCODED_AUDIO_CODEC: &str = LAN_TRANSCODING_AUDIO_CODEC;
 const HLS_TRANSCODING_TEMP_FILE_SUFFIX: &str = ".transcode.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
+const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
@@ -639,8 +640,14 @@ impl HlsCacheStore {
         }
         let transcode_commit_guard = HlsTranscodingCommitGuard::create_if_needed(self, session)?;
         let completed_session = self
-            .transcode_cached_session_if_needed(session, transcoding, control)
+            .transcode_cached_session_if_needed(
+                session,
+                transcoding,
+                control,
+                &transcode_commit_guard,
+            )
             .await?;
+        transcode_commit_guard.refresh()?;
         self.save_completed_session(&completed_session)?;
         transcode_commit_guard.finish();
         if completed_session.variant.video.id == HLS_TRANSCODED_RESOURCE_ID
@@ -664,6 +671,7 @@ impl HlsCacheStore {
         session: &HlsPlaybackSession,
         transcoding: Option<HlsTranscodingExecutionConfig>,
         control: &F,
+        transcode_commit_guard: &HlsTranscodingCommitGuard,
     ) -> Result<HlsPlaybackSession, HlsCacheError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
@@ -679,6 +687,7 @@ impl HlsCacheStore {
 
         let _permit = acquire_transcoding_permit(&transcoding, control).await?;
         let _active_job = ActiveTranscodingJob::start(Arc::clone(&transcoding.active_job_count));
+        transcode_commit_guard.refresh()?;
 
         let cached_video = self
             .cached_resource(&session.id, &session.variant.video.id)
@@ -705,22 +714,44 @@ impl HlsCacheStore {
         self.prepare_temp_path(&temp_path)?;
         self.remove_cached_resource(&session.id, HLS_TRANSCODED_RESOURCE_ID)?;
 
+        let marker_refresh_error = Mutex::new(None);
         let transcode_result = run_hls_ffmpeg_transcode(
             &transcoding.ffmpeg_path,
             &cached_video.path,
             cached_audio.as_ref().map(|audio| audio.path.as_path()),
             &temp_path,
             &|| match control() {
-                HlsCacheFillControl::Continue => LanTranscodingJobControl::Continue,
+                HlsCacheFillControl::Continue => {
+                    if let Err(error) = transcode_commit_guard.refresh_if_due() {
+                        if let Ok(mut stored_error) = marker_refresh_error.lock()
+                            && stored_error.is_none()
+                        {
+                            *stored_error = Some(error);
+                        }
+                        return LanTranscodingJobControl::Cancel;
+                    }
+                    LanTranscodingJobControl::Continue
+                }
                 HlsCacheFillControl::Cancel => LanTranscodingJobControl::Cancel,
                 HlsCacheFillControl::Preempt => LanTranscodingJobControl::Preempt,
             },
         )
         .await;
+        let marker_refresh_error = {
+            marker_refresh_error
+                .lock()
+                .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))?
+                .take()
+        };
+        if let Some(error) = marker_refresh_error {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error.into());
+        }
         if let Err(error) = transcode_result {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(hls_cache_error_from_transcoding(error));
         }
+        transcode_commit_guard.refresh()?;
         if let Err(error) = check_fill_control(control) {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(error);
@@ -1492,6 +1523,7 @@ struct HlsTranscodingCommitGuard {
     store: HlsCacheStore,
     session_id: String,
     active: bool,
+    last_refresh: Mutex<Option<Instant>>,
 }
 
 impl HlsTranscodingCommitGuard {
@@ -1500,6 +1532,7 @@ impl HlsTranscodingCommitGuard {
             store: store.clone(),
             session_id: session.id.clone(),
             active: false,
+            last_refresh: Mutex::new(None),
         };
         if session.transcoding.state != HlsTranscodingPlanState::Ready {
             return Ok(guard);
@@ -1514,7 +1547,54 @@ impl HlsTranscodingCommitGuard {
         file.write_all(b"active\n")?;
         file.sync_all()?;
         guard.active = true;
+        *guard
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))? =
+            Some(Instant::now());
         Ok(guard)
+    }
+
+    fn refresh(&self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let marker_path = self
+            .store
+            .transcoding_commit_marker_path(&self.session_id)?;
+        self.store.reject_cache_path_symlink(&marker_path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&marker_path)?;
+        file.write_all(b"active\n")?;
+        file.sync_all()?;
+        *self
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))? =
+            Some(Instant::now());
+        Ok(())
+    }
+
+    fn refresh_if_due(&self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let should_refresh = self
+            .last_refresh
+            .lock()
+            .map_err(|_| io::Error::other("HLS transcoding marker refresh state was poisoned"))?
+            .is_none_or(|last_refresh| {
+                now.duration_since(last_refresh) >= HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL
+            });
+        if should_refresh {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     fn finish(mut self) {
@@ -3037,6 +3117,9 @@ impl From<PersistedBilibiliMediaRequestKind> for BilibiliMediaRequestKind {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
     use axum::{
         Router,
         body::Body,
@@ -3053,6 +3136,27 @@ mod tests {
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(temp.path())),
         )
+    }
+
+    #[cfg(unix)]
+    fn set_file_modified_time(path: &Path, modified: SystemTime) {
+        let modified = modified
+            .duration_since(UNIX_EPOCH)
+            .expect("test mtime should be after UNIX epoch");
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .expect("test path should not contain interior nul bytes");
+        let times = [
+            libc::timeval {
+                tv_sec: modified.as_secs() as libc::time_t,
+                tv_usec: modified.subsec_micros() as libc::suseconds_t,
+            },
+            libc::timeval {
+                tv_sec: modified.as_secs() as libc::time_t,
+                tv_usec: modified.subsec_micros() as libc::suseconds_t,
+            },
+        ];
+        let result = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(0, result, "test should update file mtime");
     }
 
     #[test]
@@ -3611,6 +3715,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn usage_snapshot_preserves_generated_transcode_output_while_manifest_is_ready() {
         let temp = TempDir::new().expect("temp dir should be created");
@@ -3645,8 +3750,20 @@ mod tests {
             b"active ffmpeg output",
         )
         .expect("transcode temporary file should be written");
-        let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
+        let guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
             .expect("active transcoding marker should be created");
+        let marker_path = store
+            .transcoding_commit_marker_path(&source_session.id)
+            .expect("transcoding marker path should be valid");
+        set_file_modified_time(
+            &marker_path,
+            SystemTime::now()
+                .checked_sub(HLS_TRANSCODING_COMMIT_MARKER_TTL + Duration::from_secs(1))
+                .expect("test stale marker time should be valid"),
+        );
+        guard
+            .refresh()
+            .expect("active transcoding marker should refresh");
 
         let usage = store
             .usage_snapshot()
@@ -3667,6 +3784,82 @@ mod tests {
         );
         assert!(
             store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_snapshot_removes_stale_transcode_output_for_ready_manifest() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let source_session =
+            sample_transcoding_ready_session("session-stale-transcode", "https://example.test");
+        let completed_session =
+            transcoded_completed_session(&source_session, fake_mp4().len() as u64);
+        store
+            .save_session(&source_session)
+            .expect("ready manifest should save");
+        std::fs::write(
+            store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid"),
+            fake_mp4(),
+        )
+        .expect("generated resource should be written");
+        write_pretty_json(
+            &store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid"),
+            &cached_metadata_for_session(&completed_session, HLS_TRANSCODED_RESOURCE_ID),
+        );
+        std::fs::write(
+            store
+                .resource_path(
+                    &source_session.id,
+                    &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
+                )
+                .expect("transcode temporary path should be valid"),
+            b"stale ffmpeg output",
+        )
+        .expect("transcode temporary file should be written");
+        let _guard = HlsTranscodingCommitGuard::create_if_needed(&store, &source_session)
+            .expect("stale transcoding marker should be created");
+        let marker_path = store
+            .transcoding_commit_marker_path(&source_session.id)
+            .expect("transcoding marker path should be valid");
+        set_file_modified_time(
+            &marker_path,
+            SystemTime::now()
+                .checked_sub(HLS_TRANSCODING_COMMIT_MARKER_TTL + Duration::from_secs(1))
+                .expect("test stale marker time should be valid"),
+        );
+
+        let usage = store
+            .usage_snapshot()
+            .expect("usage snapshot should clean stale transcode output");
+
+        assert_eq!(0, usage.completed_session_count);
+        assert_eq!(0, usage.used_bytes);
+        assert!(
+            !store
+                .resource_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated resource path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
+                .resource_metadata_path(&source_session.id, HLS_TRANSCODED_RESOURCE_ID)
+                .expect("generated metadata path should be valid")
+                .exists()
+        );
+        assert!(
+            !store
                 .resource_path(
                     &source_session.id,
                     &transcoding_temp_file_name(HLS_TRANSCODED_RESOURCE_ID),
