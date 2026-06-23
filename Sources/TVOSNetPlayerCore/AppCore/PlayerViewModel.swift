@@ -86,6 +86,7 @@ public final class PlayerViewModel: ObservableObject {
     private let playbackProgressReportInterval: Duration?
     private var playbackProgressContext: PlayerPlaybackProgressContext?
     private var playbackProgressReportTask: Task<Void, Never>?
+    private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
 
     public var canClear: Bool {
         !streamURLText.isEmpty || player != nil || validationMessage != nil
@@ -290,17 +291,11 @@ public final class PlayerViewModel: ObservableObject {
             return nil
         }
 
-        do {
-            let result = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
-            playbackProgressReportingMessage = result.accepted ? nil : result.message
-            return result
-        } catch let error as CacheControlClientUnsupportedFeature where error == .playbackProgressReporting {
-            playbackProgressReportingMessage = nil
-            return nil
-        } catch {
-            playbackProgressReportingMessage = "Could not report playback position."
-            return nil
-        }
+        return await queuePlaybackProgressReport(
+            report,
+            endpoint: endpoint,
+            updatesReportingMessage: true
+        ).value
     }
 
     private func markManualInteraction() {
@@ -360,19 +355,37 @@ public final class PlayerViewModel: ObservableObject {
         queuePlaybackProgressReport(report, endpoint: context.endpoint)
     }
 
+    @discardableResult
     private func queuePlaybackProgressReport(
         _ report: PlaybackProgressReport,
-        endpoint: CacheServerEndpoint
-    ) {
+        endpoint: CacheServerEndpoint,
+        updatesReportingMessage: Bool = false
+    ) -> Task<PlaybackProgressReportResult?, Never> {
         playbackProgressReportingMessage = nil
+        let previousReportTask = playbackProgressReportChain
         let cacheClientFactory = cacheClientFactory
-        Task {
+        let reportTask = Task<PlaybackProgressReportResult?, Never> { @MainActor in
+            _ = await previousReportTask?.value
             do {
-                _ = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
+                let result = try await cacheClientFactory(endpoint).reportPlaybackProgress(report)
+                if updatesReportingMessage {
+                    playbackProgressReportingMessage = result.accepted ? nil : result.message
+                }
+                return result
+            } catch let error as CacheControlClientUnsupportedFeature where error == .playbackProgressReporting {
+                if updatesReportingMessage {
+                    playbackProgressReportingMessage = nil
+                }
             } catch {
-                // Playback progress is advisory; never interrupt local AVPlayer controls.
+                if updatesReportingMessage {
+                    playbackProgressReportingMessage = "Could not report playback position."
+                }
             }
+
+            return nil
         }
+        playbackProgressReportChain = reportTask
+        return reportTask
     }
 
     private func currentPlaybackProgressReport(intent: PlaybackProgressIntent) -> PlaybackProgressReport? {

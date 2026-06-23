@@ -747,6 +747,9 @@ struct ContentView: View {
         for item: CacheLibraryItem,
         playbackURL: URL
     ) -> PlayerPlaybackProgressContext? {
+        guard item.isOfflineHLSCache else {
+            return nil
+        }
         guard let endpoint = CacheServerEndpoint.normalized(from: cacheModel.serverAddressText) else {
             return nil
         }

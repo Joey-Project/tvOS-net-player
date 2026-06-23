@@ -226,6 +226,41 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlaybackProgressReportsAreSerialized() async throws {
+        let client = FakePlaybackProgressClient(delayFirstReport: true)
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        model.stop()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let callCountBeforeResume = await client.reportCallCountSnapshot()
+        let reportsBeforeResume = await client.reportsSnapshot()
+        XCTAssertEqual(callCountBeforeResume, 1)
+        XCTAssertTrue(reportsBeforeResume.isEmpty)
+
+        await client.resumeFirstReport()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
     func testTransientLoadWithStaleManualSequenceDoesNotReplaceManualPlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let staleSequence = model.manualInteractionSequence
@@ -318,9 +353,22 @@ final class PlayerViewModelTests: XCTestCase {
 }
 
 private actor FakePlaybackProgressClient: CacheControlClient {
+    private let delayFirstReport: Bool
     private var reports: [PlaybackProgressReport] = []
+    private var reportCallCount = 0
+    private var firstReportContinuation: CheckedContinuation<Void, Never>?
+
+    init(delayFirstReport: Bool = false) {
+        self.delayFirstReport = delayFirstReport
+    }
 
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
+        reportCallCount += 1
+        if delayFirstReport, reportCallCount == 1 {
+            await withCheckedContinuation { continuation in
+                firstReportContinuation = continuation
+            }
+        }
         reports.append(report)
         return PlaybackProgressReportResult(
             accepted: true,
@@ -331,6 +379,15 @@ private actor FakePlaybackProgressClient: CacheControlClient {
 
     func reportsSnapshot() -> [PlaybackProgressReport] {
         reports
+    }
+
+    func reportCallCountSnapshot() -> Int {
+        reportCallCount
+    }
+
+    func resumeFirstReport() {
+        firstReportContinuation?.resume()
+        firstReportContinuation = nil
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
