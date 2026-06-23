@@ -496,6 +496,20 @@ public final class CacheLibraryViewModel: ObservableObject {
         hlsCacheStatus = status
     }
 
+    public func refreshHLSCacheStatus() async {
+        guard let endpoint = loadedEndpoint,
+            CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
+        else {
+            return
+        }
+
+        await refreshHLSCacheStatus(
+            client: clientFactory(endpoint),
+            requestSequence: refreshSequence,
+            endpoint: endpoint
+        )
+    }
+
     private func scheduleHLSCacheStatusRefresh(
         client: any CacheControlClient,
         requestSequence: Int,

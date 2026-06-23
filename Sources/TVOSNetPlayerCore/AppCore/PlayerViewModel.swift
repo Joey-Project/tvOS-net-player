@@ -300,6 +300,10 @@ public final class PlayerViewModel: ObservableObject {
         ).value
     }
 
+    public func flushPlaybackProgressReports() async {
+        _ = await playbackProgressReportChain?.value
+    }
+
     private func markManualInteraction() {
         manualInteractionSequence += 1
     }

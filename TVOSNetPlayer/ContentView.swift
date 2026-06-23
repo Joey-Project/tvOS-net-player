@@ -618,6 +618,9 @@ struct ContentView: View {
         )
         bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func deleteCachedItem(_ item: CacheLibraryItem) async {
@@ -704,6 +707,9 @@ struct ContentView: View {
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func playBilibiliTaskResult(_ result: BilibiliTaskResultPresentation) async {
@@ -723,6 +729,9 @@ struct ContentView: View {
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func loadManualStream() {
@@ -735,6 +744,9 @@ struct ContentView: View {
         cacheModel.clearPlaybackStatus()
         bilibiliModel.clearPlaybackStatus()
         model.stop()
+        Task {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func clearManualStream() {
@@ -760,6 +772,11 @@ struct ContentView: View {
             libraryItemID: item.id,
             variantID: item.primaryVariantID ?? ""
         )
+    }
+
+    private func refreshPlaybackProgressStatus() async {
+        await model.flushPlaybackProgressReports()
+        await cacheModel.refreshHLSCacheStatus()
     }
 }
 
