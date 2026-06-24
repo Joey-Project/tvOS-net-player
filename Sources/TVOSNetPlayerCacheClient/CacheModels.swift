@@ -813,6 +813,53 @@ public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
     }
 }
 
+public enum BilibiliSubtitleAIPolicy: String, CaseIterable, Equatable, Hashable, Sendable {
+    case unspecified
+    case include
+    case preferNonAI
+    case excludeAI
+    case onlyAI
+}
+
+public enum BilibiliDanmakuFormat: String, CaseIterable, Equatable, Hashable, Sendable {
+    case xml
+    case ass
+}
+
+public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
+    public let qualityPreference: String
+    public let encodingPreference: String
+    public let audioLanguagePreference: String
+    public let preferTVAPI: Bool
+    public let downloadSubtitles: Bool
+    public let downloadDanmaku: Bool
+    public let downloadCover: Bool
+    public let subtitleAIPolicy: BilibiliSubtitleAIPolicy
+    public let danmakuFormats: [BilibiliDanmakuFormat]
+
+    public init(
+        qualityPreference: String = "",
+        encodingPreference: String = "",
+        audioLanguagePreference: String = "",
+        preferTVAPI: Bool = false,
+        downloadSubtitles: Bool = false,
+        downloadDanmaku: Bool = false,
+        downloadCover: Bool = false,
+        subtitleAIPolicy: BilibiliSubtitleAIPolicy = .unspecified,
+        danmakuFormats: [BilibiliDanmakuFormat] = []
+    ) {
+        self.qualityPreference = qualityPreference
+        self.encodingPreference = encodingPreference
+        self.audioLanguagePreference = audioLanguagePreference
+        self.preferTVAPI = preferTVAPI
+        self.downloadSubtitles = downloadSubtitles
+        self.downloadDanmaku = downloadDanmaku
+        self.downloadCover = downloadCover
+        self.subtitleAIPolicy = subtitleAIPolicy
+        self.danmakuFormats = danmakuFormats
+    }
+}
+
 public struct BilibiliResolveResult: Equatable, Sendable {
     public let source: String
     public let title: String

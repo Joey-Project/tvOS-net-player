@@ -129,6 +129,14 @@ impl HlsFillScheduler {
         self.notify.notify_one();
     }
 
+    #[cfg(test)]
+    pub(crate) fn worker_started_for_tests(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("HLS fill scheduler lock poisoned")
+            .worker_started
+    }
+
     fn enqueue(
         &self,
         task_id: String,

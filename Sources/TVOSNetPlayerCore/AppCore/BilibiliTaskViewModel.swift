@@ -190,6 +190,50 @@ private enum BilibiliRetryIntent {
     case reResolve
 }
 
+public enum BilibiliTaskSubmissionMode: String, CaseIterable, Identifiable {
+    case playback
+    case download
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .playback:
+            return "Playback"
+        case .download:
+            return "Download"
+        }
+    }
+}
+
+public extension BilibiliSubtitleAIPolicy {
+    var title: String {
+        switch self {
+        case .unspecified:
+            return "Default"
+        case .include:
+            return "Include AI"
+        case .preferNonAI:
+            return "Prefer Non-AI"
+        case .excludeAI:
+            return "Exclude AI"
+        case .onlyAI:
+            return "Only AI"
+        }
+    }
+}
+
+public extension BilibiliDanmakuFormat {
+    var title: String {
+        switch self {
+        case .xml:
+            return "XML"
+        case .ass:
+            return "ASS"
+        }
+    }
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
     private static let cacheServerAddressGuidance =
@@ -199,6 +243,32 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var qualityPreference: String
     @Published public var encodingPreference: String
     @Published public var audioLanguagePreference: String
+    @Published public var submissionMode: BilibiliTaskSubmissionMode = .playback {
+        didSet {
+            if submissionMode == .download {
+                resolvedInput = nil
+                resolvedInputContext = nil
+                clearCandidateSelection()
+            }
+        }
+    }
+    @Published public var downloadSubtitles = false {
+        didSet {
+            if !downloadSubtitles {
+                subtitleAIPolicy = .unspecified
+            }
+        }
+    }
+    @Published public var downloadDanmaku = false {
+        didSet {
+            if !downloadDanmaku {
+                danmakuFormats = []
+            }
+        }
+    }
+    @Published public var downloadCover = false
+    @Published public var subtitleAIPolicy: BilibiliSubtitleAIPolicy = .unspecified
+    @Published public var danmakuFormats: Set<BilibiliDanmakuFormat> = []
     @Published public private(set) var currentTask: CacheTask?
     @Published public private(set) var statusMessage: String = "No Bilibili playback task submitted."
     @Published public private(set) var errorMessage: String?
@@ -451,6 +521,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
         if isSubmitting {
             return "Submitting"
         }
+        if submissionMode == .download {
+            return "Download"
+        }
         if isWaitingForCandidateSelection {
             switch candidateSelectionMode {
             case .single:
@@ -534,6 +607,27 @@ public final class BilibiliTaskViewModel: ObservableObject {
         taskResults.filter { $0.playbackURL != nil }
     }
 
+    public var availableSubtitleAIPolicies: [BilibiliSubtitleAIPolicy] {
+        BilibiliSubtitleAIPolicy.allCases
+    }
+
+    public var availableDanmakuFormats: [BilibiliDanmakuFormat] {
+        BilibiliDanmakuFormat.allCases
+    }
+
+    public func isDanmakuFormatSelected(_ format: BilibiliDanmakuFormat) -> Bool {
+        danmakuFormats.contains(format)
+    }
+
+    public func setDanmakuFormat(_ format: BilibiliDanmakuFormat, selected: Bool) {
+        if selected {
+            downloadDanmaku = true
+            danmakuFormats.insert(format)
+        } else {
+            danmakuFormats.remove(format)
+        }
+    }
+
     public var playableURL: URL? {
         currentTask?.playableBilibiliURL
     }
@@ -604,6 +698,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard !source.isEmpty else {
             errorMessage = "Enter a Bilibili URL, BV, av, season, feed, history, or watch-later input."
             statusMessage = "Bilibili input is required."
+            return
+        }
+
+        if submissionMode == .download {
+            await createDownloadTask(
+                source: source,
+                endpoint: endpoint,
+                options: currentDownloadOptions
+            )
             return
         }
 
@@ -994,14 +1097,31 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     @discardableResult
     public func clearTaskIfCachedLibraryItemDeleted(id libraryItemID: String) -> Bool {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let currentTask,
-            !libraryItemID.isEmpty,
-            currentTask.hasBilibiliLibraryItem(id: libraryItemID)
+            !trimmedLibraryItemID.isEmpty,
+            currentTask.hasBilibiliLibraryItem(id: trimmedLibraryItemID)
         else {
             return false
         }
 
-        clearTask()
+        guard !currentTask.hasTopLevelBilibiliLibraryItem(id: trimmedLibraryItemID) else {
+            clearTask()
+            return true
+        }
+
+        guard let updatedTask = currentTask.clearingBilibiliResultLibraryItem(id: trimmedLibraryItemID) else {
+            return false
+        }
+
+        self.currentTask = updatedTask
+        if isActivePlaybackLibraryItem(id: trimmedLibraryItemID) {
+            clearPlaybackStatus()
+        } else {
+            statusMessage = Self.statusMessage(for: updatedTask)
+        }
+        errorMessage = nil
+        retryIntent = nil
         return true
     }
 
@@ -1352,7 +1472,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
             applyTaskUpdate(task)
             isSubmitting = false
-            if !task.isTerminalBilibiliTaskState {
+            if task.shouldKeepWatchingBilibiliTask {
                 startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
             }
         } catch {
@@ -1363,6 +1483,56 @@ public final class BilibiliTaskViewModel: ObservableObject {
             currentTask = nil
             errorMessage = error.localizedDescription
             statusMessage = "Could not submit Bilibili playback task."
+            isSubmitting = false
+        }
+    }
+
+    private func createDownloadTask(
+        source: String,
+        endpoint: CacheServerEndpoint,
+        options: BilibiliDownloadTaskOptions
+    ) async {
+        operationSequence += 1
+        activePlaybackTaskID = nil
+        activePlaybackResultID = nil
+        activePlaybackLibraryItemID = nil
+        let sequence = operationSequence
+        let client = clientFactory(endpoint)
+
+        stopWatching()
+        activeEndpoint = endpoint
+        retryIntent = nil
+        currentTask = nil
+        resolvedInput = nil
+        resolvedInputContext = nil
+        clearCandidateSelection()
+        isSubmitting = true
+        isResolving = false
+        errorMessage = nil
+        statusMessage = "Submitting Bilibili download task..."
+
+        do {
+            let task = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.createBilibiliTask(urlOrID: source, options: options)
+            }
+
+            guard sequence == operationSequence else {
+                return
+            }
+
+            applyTaskUpdate(task)
+            isSubmitting = false
+            if task.shouldKeepWatchingBilibiliTask {
+                startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
+            }
+        } catch {
+            guard sequence == operationSequence else {
+                return
+            }
+
+            currentTask = nil
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not submit Bilibili download task."
             isSubmitting = false
         }
     }
@@ -1444,6 +1614,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
         if task.isTerminalBilibiliTaskState {
             isCancelling = false
+        }
+        if !task.shouldKeepWatchingBilibiliTask {
             stopWatching()
         }
     }
@@ -1895,6 +2067,18 @@ private extension CacheTask {
             || state.contains("completed")
     }
 
+    var shouldKeepWatchingBilibiliTask: Bool {
+        if !isTerminalBilibiliTaskState {
+            return true
+        }
+        guard normalizedBilibiliTaskState.contains("completed") else {
+            return false
+        }
+        return resultItems.contains { item in
+            item.isReadyBilibiliResultState && !item.isCompletedBilibiliResultState
+        }
+    }
+
     var normalizedBilibiliTaskState: String {
         state.lowercased().filter(\.isLetter)
     }
@@ -1920,15 +2104,93 @@ private extension CacheTask {
             return false
         }
 
+        if hasTopLevelBilibiliLibraryItem(id: trimmedLibraryItemID) {
+            return true
+        }
+
+        return resultItems.contains { $0.hasBilibiliLibraryItem(id: trimmedLibraryItemID) }
+    }
+
+    func hasTopLevelBilibiliLibraryItem(id libraryItemID: String) -> Bool {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLibraryItemID.isEmpty else {
+            return false
+        }
+
         if self.libraryItemID == trimmedLibraryItemID {
             return true
         }
 
-        return resultItems.contains { $0.libraryItemID == trimmedLibraryItemID }
+        return playbackSource?.itemID == trimmedLibraryItemID
+    }
+
+    func clearingBilibiliResultLibraryItem(id libraryItemID: String) -> CacheTask? {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLibraryItemID.isEmpty else {
+            return nil
+        }
+
+        var didClearResult = false
+        let updatedResultItems = resultItems.map { item in
+            guard item.hasBilibiliLibraryItem(id: trimmedLibraryItemID) else {
+                return item
+            }
+
+            didClearResult = true
+            return item.clearingDeletedBilibiliLibraryItem()
+        }
+
+        guard didClearResult else {
+            return nil
+        }
+
+        return CacheTask(
+            id: id,
+            kind: kind,
+            state: state,
+            source: source,
+            title: title,
+            progress: progress,
+            downloadedBytes: downloadedBytes,
+            totalBytes: totalBytes,
+            message: message,
+            libraryItemID: self.libraryItemID,
+            playbackSource: playbackSource,
+            playbackSession: playbackSession,
+            bilibiliSelection: bilibiliSelection,
+            resultItems: updatedResultItems
+        )
     }
 }
 
 private extension BilibiliTaskResultItem {
+    func hasBilibiliLibraryItem(id libraryItemID: String) -> Bool {
+        let trimmedLibraryItemID = libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLibraryItemID.isEmpty else {
+            return false
+        }
+
+        return self.libraryItemID == trimmedLibraryItemID
+            || playbackSource?.itemID == trimmedLibraryItemID
+    }
+
+    func clearingDeletedBilibiliLibraryItem() -> BilibiliTaskResultItem {
+        BilibiliTaskResultItem(
+            id: id,
+            selectionID: selectionID,
+            title: title,
+            subtitle: subtitle,
+            sourceKind: sourceKind,
+            contentID: contentID,
+            index: index,
+            state: "TASK_STATE_FAILED",
+            message: "Cached Bilibili result was deleted.",
+            libraryItemID: "",
+            playbackSource: nil,
+            playbackSession: nil
+        )
+    }
+
     var displayTitle: String {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !title.isEmpty {
@@ -1944,7 +2206,7 @@ private extension BilibiliTaskResultItem {
     }
 
     var playableBilibiliURL: URL? {
-        guard isReadyBilibiliResultState else {
+        guard isPlayableBilibiliResultState else {
             return nil
         }
 
@@ -1975,6 +2237,13 @@ private extension BilibiliTaskResultItem {
     var isReadyBilibiliResultState: Bool {
         let state = normalizedBilibiliResultState
         return state.contains("playable") || state.contains("completed")
+    }
+
+    var isPlayableBilibiliResultState: Bool {
+        isReadyBilibiliResultState
+            || (isFailedBilibiliResultState
+                && playbackSource != nil
+                && message.localizedCaseInsensitiveContains("offline cache fill failed"))
     }
 
     var isCompletedBilibiliResultState: Bool {
@@ -2026,6 +2295,19 @@ private extension BilibiliTaskViewModel {
             qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
             encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines),
             audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    var currentDownloadOptions: BilibiliDownloadTaskOptions {
+        BilibiliDownloadTaskOptions(
+            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            encodingPreference: "",
+            audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            downloadSubtitles: downloadSubtitles,
+            downloadDanmaku: downloadDanmaku,
+            downloadCover: downloadCover,
+            subtitleAIPolicy: subtitleAIPolicy,
+            danmakuFormats: availableDanmakuFormats.filter { danmakuFormats.contains($0) }
         )
     }
 

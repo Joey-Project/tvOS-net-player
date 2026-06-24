@@ -1663,7 +1663,7 @@ mod tests {
                 playback_source.clone(),
                 playback_session.clone(),
                 vec![BilibiliTaskResultItem {
-                    id: session_id,
+                    id: session_id.clone(),
                     selection_id: "page:1".to_owned(),
                     title: "Episode".to_owned(),
                     subtitle: String::new(),
@@ -1678,6 +1678,12 @@ mod tests {
                 }],
             )
             .expect("playback task should authorize HLS session");
+        assert!(
+            state
+                .tasks
+                .is_playback_result_session_playable(&session_id, false),
+            "inserted HLS fixture session should be authorized through its result item"
+        );
     }
 
     async fn start_hls_upstream() -> (String, JoinHandle<()>) {

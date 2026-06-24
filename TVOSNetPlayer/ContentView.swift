@@ -301,15 +301,28 @@ struct ContentView: View {
                 }
                 .focused($focusedControl, equals: .bilibiliField)
 
+            Picker("Mode", selection: $bilibiliModel.submissionMode) {
+                ForEach(BilibiliTaskSubmissionMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
             HStack(spacing: 10) {
                 TextField("Quality", text: $bilibiliModel.qualityPreference)
                     .textContentType(.none)
 
-                TextField("Codec", text: $bilibiliModel.encodingPreference)
-                    .textContentType(.none)
+                if bilibiliModel.submissionMode == .playback {
+                    TextField("Codec", text: $bilibiliModel.encodingPreference)
+                        .textContentType(.none)
+                }
 
                 TextField("Audio", text: $bilibiliModel.audioLanguagePreference)
                     .textContentType(.none)
+            }
+
+            if bilibiliModel.submissionMode == .download {
+                bilibiliDownloadOptions
             }
 
             if let errorMessage = bilibiliModel.errorMessage {
@@ -465,6 +478,36 @@ struct ContentView: View {
                     Label("Clear", systemImage: "trash")
                 }
                 .disabled(!bilibiliModel.canClear)
+            }
+        }
+    }
+
+    private var bilibiliDownloadOptions: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 16) {
+                Toggle("Subtitles", isOn: $bilibiliModel.downloadSubtitles)
+                Toggle("Danmaku", isOn: $bilibiliModel.downloadDanmaku)
+                Toggle("Cover", isOn: $bilibiliModel.downloadCover)
+            }
+
+            Picker("Subtitle AI", selection: $bilibiliModel.subtitleAIPolicy) {
+                ForEach(bilibiliModel.availableSubtitleAIPolicies, id: \.self) { policy in
+                    Text(policy.title).tag(policy)
+                }
+            }
+            .disabled(!bilibiliModel.downloadSubtitles)
+
+            HStack(spacing: 16) {
+                ForEach(bilibiliModel.availableDanmakuFormats, id: \.self) { format in
+                    Toggle(
+                        format.title,
+                        isOn: Binding(
+                            get: { bilibiliModel.isDanmakuFormatSelected(format) },
+                            set: { bilibiliModel.setDanmakuFormat(format, selected: $0) }
+                        )
+                    )
+                    .disabled(!bilibiliModel.downloadDanmaku)
+                }
             }
         }
     }

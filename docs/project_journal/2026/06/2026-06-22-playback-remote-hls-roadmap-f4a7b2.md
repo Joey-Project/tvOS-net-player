@@ -3,7 +3,7 @@ id: 20260622-f4a7b2
 title: Playback Controls Remote Endpoint And HLS Execution Roadmap
 status: active
 created: 2026-06-22
-updated: 2026-06-23
+updated: 2026-06-24
 branch:
 pr:
 supersedes:
@@ -78,10 +78,12 @@ superseded_by:
 
 ### PR 6: Batch Cache Finalization And Sidecar Options UX
 
-- Status: pending.
-- Define UX and server/client behavior for multi-result batch cache finalization beyond the primary selected resource.
-- Complete client-facing controls for sidecar artifacts and download options such as subtitle, danmaku, cover, and audio-language preferences.
-- Ensure the complete-download workflow and progressive-playback workflow stay distinct where their cache semantics differ.
+- Status: in progress.
+- Extend server-side HLS cache finalization so every playable selected result can be finalized, restored, and authorized as a completed cache item, not only the task's primary playback session.
+- Keep primary playback completion behavior unchanged: the task-level playback source and library item still represent the primary playback session, while secondary completed results retain their own result-level library item metadata.
+- Add Swift cache-client model and gRPC mapping for complete-download `BilibiliDownloadOptions`, including subtitle, danmaku, cover, danmaku format, subtitle AI policy, and audio-language fields.
+- Expose a tvOS/macOS Bilibili `Playback`/`Download` mode split so sidecar controls submit complete-download tasks while progressive playback continues to submit only stream-selection preferences.
+- Cover the behavior with focused Rust registry/finalizer tests and Swift cache-client model/mapping tests before running the full gate.
 
 ## Validation Contract
 
