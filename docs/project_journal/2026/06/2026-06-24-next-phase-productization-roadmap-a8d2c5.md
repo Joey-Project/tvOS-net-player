@@ -23,7 +23,7 @@ superseded_by:
 
 ## Current State
 
-- PRs through `Batch Cache Finalization And Sidecar Options UX` are complete on `master`.
+- PRs through `Batch Cache Finalization And Sidecar Options UX` are complete on the repository default branch advertised by `origin/HEAD`.
 - The app supports Bonjour/manual/remote HTTPS cache endpoints, shared tvOS/macOS player controls, progressive Bilibili HLS playback, completed-HLS offline cache, quota/watermark eviction, adaptive weak-network policy, playback-position reporting, LAN transcoding execution MVP, segment-index playlist splitting, multi-result Bilibili selection, and complete-download sidecar/options controls.
 - The live e2e skill has canonical ordinary video, multi-part video, Bangumi media, Bangumi episode, authenticated page-fetch, and collection/list fixture definitions. Restricted and authenticated cases remain opt-in because they depend on local credentials, proxy availability, and account state.
 - `docs/PROJECT_TODO.md` is the cross-workstream backlog entrypoint. This journal is the durable plan for the next PR sequence.
@@ -90,8 +90,7 @@ superseded_by:
 
 ## Validation Contract
 
-- The repository default branch is currently `master`; branch/update steps intentionally target `origin/master`.
-- Each implementation PR starts from updated `master` and lands on a focused `wip/<topic>` branch.
+- Each implementation PR starts from the updated repository default branch advertised by `origin/HEAD` and lands on a focused `wip/<topic>` branch.
 - Each PR must pass the full local gate, including `just ci`, plus relevant focused tests or live/macOS validation called out by that PR.
 - Each PR must pass GitHub CI and required repository checks.
 - Each PR must complete the requested review gates before merge:
@@ -99,7 +98,7 @@ superseded_by:
   - `independent-codex-pr-review`.
   - `offline-frozen-diff-review`.
 - All actionable PR comments and unresolved conversations must be addressed or resolved before merge.
-- After each merge, update local `master` from `origin/master` before branching the next PR.
+- After each merge, update the local branch that tracks `origin/HEAD` before branching the next PR.
 - Pause before PR 6 and discuss the schema before implementing it.
 
 ## Deferred
