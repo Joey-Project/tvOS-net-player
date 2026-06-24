@@ -10,6 +10,7 @@ mod hls;
 mod hls_cache;
 mod hls_fill_scheduler;
 mod hls_network_policy;
+mod hls_playback_progress;
 pub mod library;
 pub mod media;
 mod mp4_segments;
@@ -59,6 +60,10 @@ use crate::{
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
+    hls_playback_progress::{
+        HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressRecordOutcome,
+        PlaybackProgressReport, session_id_from_report,
+    },
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
@@ -93,6 +98,7 @@ pub struct AppState {
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
+    pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
@@ -280,6 +286,7 @@ impl AppState {
         let lan_transcoding_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
+        let hls_playback_progress = HlsPlaybackProgressTracker::default();
 
         let state = Self {
             options,
@@ -296,6 +303,7 @@ impl AppState {
             lan_transcoding_active_jobs,
             hls_fill_scheduler,
             hls_network_policy,
+            hls_playback_progress,
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
@@ -611,6 +619,7 @@ impl AppState {
     pub(crate) fn remove_hls_playback_session(&self, session_id: &str) {
         self.hls_sessions.remove(session_id);
         self.hls_network_policy.remove_session(session_id);
+        self.hls_playback_progress.remove_session(session_id);
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
@@ -678,6 +687,41 @@ impl AppState {
 
     pub(crate) fn hls_weak_network_status(&self) -> HlsWeakNetworkSnapshot {
         self.hls_network_policy.snapshot()
+    }
+
+    pub(crate) fn record_hls_playback_progress(
+        &self,
+        report: PlaybackProgressReport,
+    ) -> PlaybackProgressRecordOutcome {
+        let Some(session_id) = session_id_from_report(&report) else {
+            return PlaybackProgressRecordOutcome {
+                accepted: false,
+                session_id: String::new(),
+                message: "Playback URI does not identify an HLS cache session.".to_owned(),
+            };
+        };
+
+        let _quota_lock = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
+        if !self.registered_hls_session_is_authorized_for_serving(&session_id) {
+            return PlaybackProgressRecordOutcome {
+                accepted: false,
+                session_id,
+                message: "Playback URI does not identify a known HLS cache session.".to_owned(),
+            };
+        }
+
+        let outcome = self.hls_playback_progress.record(report);
+        if outcome.accepted {
+            self.note_hls_cache_playback_use(&outcome.session_id);
+        }
+        outcome
+    }
+
+    pub(crate) fn hls_playback_progress_status(&self) -> HlsPlaybackProgressSnapshot {
+        self.hls_playback_progress.snapshot()
     }
 
     pub(crate) fn protect_hls_cache_session_from_eviction(

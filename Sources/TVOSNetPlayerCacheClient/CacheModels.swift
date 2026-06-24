@@ -350,6 +350,7 @@ public struct HLSCacheStatus: Equatable, Sendable {
     public let lastEviction: HLSCacheEvictionSummary?
     public let weakNetwork: HLSWeakNetworkStatus?
     public let transcoding: LanTranscodingStatus?
+    public let playback: HLSPlaybackProgressStatus?
 
     public init(
         evictionEnabled: Bool,
@@ -362,7 +363,8 @@ public struct HLSCacheStatus: Equatable, Sendable {
         completedSessionCount: Int,
         lastEviction: HLSCacheEvictionSummary?,
         weakNetwork: HLSWeakNetworkStatus? = nil,
-        transcoding: LanTranscodingStatus? = nil
+        transcoding: LanTranscodingStatus? = nil,
+        playback: HLSPlaybackProgressStatus? = nil
     ) {
         self.evictionEnabled = evictionEnabled
         self.maxBytes = maxBytes
@@ -375,6 +377,134 @@ public struct HLSCacheStatus: Equatable, Sendable {
         self.lastEviction = lastEviction
         self.weakNetwork = weakNetwork
         self.transcoding = transcoding
+        self.playback = playback
+    }
+}
+
+public enum PlaybackProgressIntent: String, Equatable, Sendable {
+    case started
+    case playing
+    case seek
+    case paused
+    case stopped
+}
+
+public struct PlaybackProgressReport: Equatable, Sendable {
+    public let playbackURI: String
+    public let libraryItemID: String
+    public let variantID: String
+    public let positionSeconds: Double
+    public let durationSeconds: Double?
+    public let intent: PlaybackProgressIntent
+
+    public init(
+        playbackURI: String,
+        libraryItemID: String = "",
+        variantID: String = "",
+        positionSeconds: Double,
+        durationSeconds: Double? = nil,
+        intent: PlaybackProgressIntent
+    ) {
+        self.playbackURI = playbackURI
+        self.libraryItemID = libraryItemID
+        self.variantID = variantID
+        self.positionSeconds = positionSeconds
+        self.durationSeconds = durationSeconds
+        self.intent = intent
+    }
+}
+
+public struct PlaybackProgressReportResult: Equatable, Sendable {
+    public let accepted: Bool
+    public let sessionID: String
+    public let message: String
+
+    public init(accepted: Bool, sessionID: String, message: String) {
+        self.accepted = accepted
+        self.sessionID = sessionID
+        self.message = message
+    }
+}
+
+public struct HLSPlaybackProgressStatus: Equatable, Sendable {
+    private static let maximumFormattedPlaybackSeconds = 100 * 365 * 24 * 60 * 60
+
+    public let state: String
+    public let message: String
+    public let sessionID: String
+    public let libraryItemID: String
+    public let variantID: String
+    public let playbackURI: String
+    public let positionSeconds: Double
+    public let durationSeconds: Double?
+    public let lastIntent: String
+    public let updatedAt: Date?
+
+    public init(
+        state: String,
+        message: String,
+        sessionID: String,
+        libraryItemID: String,
+        variantID: String,
+        playbackURI: String,
+        positionSeconds: Double,
+        durationSeconds: Double?,
+        lastIntent: String,
+        updatedAt: Date?
+    ) {
+        self.state = state
+        self.message = message
+        self.sessionID = sessionID
+        self.libraryItemID = libraryItemID
+        self.variantID = variantID
+        self.playbackURI = playbackURI
+        self.positionSeconds = positionSeconds
+        self.durationSeconds = durationSeconds
+        self.lastIntent = lastIntent
+        self.updatedAt = updatedAt
+    }
+
+    public var isActive: Bool {
+        state.normalizedCacheProtocolName.removingPlaybackActivityStatePrefix == "active"
+    }
+
+    public var isRecentlyStopped: Bool {
+        state.normalizedCacheProtocolName.removingPlaybackActivityStatePrefix == "recentlystopped"
+    }
+
+    public var positionLabel: String? {
+        guard positionSeconds.isFinite, positionSeconds >= 0 else {
+            return nil
+        }
+
+        guard let current = Self.formattedPlaybackTime(positionSeconds) else {
+            return nil
+        }
+        guard let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 else {
+            return current
+        }
+
+        guard let duration = Self.formattedPlaybackTime(durationSeconds) else {
+            return current
+        }
+
+        return "\(current) of \(duration)"
+    }
+
+    private static func formattedPlaybackTime(_ seconds: Double) -> String? {
+        guard seconds.isFinite, seconds >= 0, seconds <= Double(maximumFormattedPlaybackSeconds) else {
+            return nil
+        }
+
+        let roundedSeconds = max(0, Int(seconds.rounded()))
+        let hours = roundedSeconds / 3_600
+        let minutes = (roundedSeconds % 3_600) / 60
+        let seconds = roundedSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }
 
@@ -1000,6 +1130,15 @@ extension String {
 
     fileprivate var removingWeakNetworkStatePrefix: String {
         let prefix = "hlsweaknetworkstate"
+        guard hasPrefix(prefix) else {
+            return self
+        }
+
+        return String(dropFirst(prefix.count))
+    }
+
+    fileprivate var removingPlaybackActivityStatePrefix: String {
+        let prefix = "hlsplaybackactivitystate"
         guard hasPrefix(prefix) else {
             return self
         }

@@ -17,6 +17,7 @@ public protocol CacheControlClient: Sendable {
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
+    func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult
     func listLibraryItemsPage(
         pageToken: String,
         pageSize: Int,
@@ -52,11 +53,16 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case bilibiliCredentialStatus
     case bilibiliResolve
     case bilibiliTaskSelection
+    case playbackProgressReporting
 }
 
 public extension CacheControlClient {
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         throw CacheControlClientUnsupportedFeature.hlsCacheStatus
+    }
+
+    func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
+        throw CacheControlClientUnsupportedFeature.playbackProgressReporting
     }
 
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus {

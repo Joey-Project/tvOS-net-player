@@ -1,4 +1,9 @@
-use std::{collections::HashSet, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use bbdown_core::CredentialStore;
 use futures_core::Stream;
@@ -27,13 +32,15 @@ use crate::{
         DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest, GetHlsCacheStatusRequest,
         GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
         HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
-        HlsCacheStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
+        HlsCacheStatus, HlsPlaybackActivityState as ProtoHlsPlaybackActivityState,
+        HlsPlaybackProgressStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
         LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
         LanTranscodingStatus, LibraryItem, LibrarySource, ListCacheRootsRequest,
         ListCacheRootsResponse, ListLibraryItemsRequest, ListLibraryItemsResponse,
-        PlaybackProtocol, PlaybackSource, RescanLibraryRequest, RescanLibraryResponse,
-        ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task, TaskEvent, TaskKind,
-        TaskState, WatchTasksRequest, cache_service_server::CacheService,
+        PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
+        ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
+        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task,
+        TaskEvent, TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
         library_service_server::LibraryService, server_service_server::ServerService,
         task_service_server::TaskService,
     },
@@ -45,6 +52,10 @@ use crate::{
     hls_fill_scheduler::HlsFillPreemptionToken,
     hls_network_policy::{
         HlsWeakNetworkSnapshot, HlsWeakNetworkState as RuntimeHlsWeakNetworkState,
+    },
+    hls_playback_progress::{
+        HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
+        PlaybackProgressReport,
     },
     library::ROOT_ID,
     task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
@@ -618,6 +629,7 @@ impl CacheService for CacheGrpcService {
             Status::internal(format!("Failed to scan HLS cache status: {error}"))
         })?;
         let weak_network = self.state.hls_weak_network_status();
+        let playback = self.state.hls_playback_progress_status();
         Ok(Response::new(HlsCacheStatus {
             eviction_enabled: status.policy.eviction_enabled(),
             max_bytes: i64_from_u64(status.policy.max_bytes),
@@ -642,6 +654,42 @@ impl CacheService for CacheGrpcService {
                     self.state.lan_transcoding_active_job_count(),
                 ),
             )),
+            playback: Some(proto_hls_playback_progress_status(&playback)),
+        }))
+    }
+
+    async fn report_playback_progress(
+        &self,
+        request: Request<ReportPlaybackProgressRequest>,
+    ) -> Result<Response<ReportPlaybackProgressResponse>, Status> {
+        let request = request.into_inner();
+        if !request.position_seconds.is_finite() || request.position_seconds < 0.0 {
+            return Err(Status::invalid_argument(
+                "Playback position must be a finite non-negative value.",
+            ));
+        }
+        if !request.duration_seconds.is_finite() || request.duration_seconds < 0.0 {
+            return Err(Status::invalid_argument(
+                "Playback duration must be zero or a finite non-negative value.",
+            ));
+        }
+
+        let intent = playback_progress_intent_from_proto(request.intent())?;
+        let report = PlaybackProgressReport {
+            playback_uri: request.playback_uri,
+            library_item_id: request.library_item_id,
+            variant_id: request.variant_id,
+            position_seconds: request.position_seconds,
+            duration_seconds: (request.duration_seconds > 0.0).then_some(request.duration_seconds),
+            intent,
+            reported_at: SystemTime::now(),
+        };
+        let outcome = self.state.record_hls_playback_progress(report);
+
+        Ok(Response::new(ReportPlaybackProgressResponse {
+            accepted: outcome.accepted,
+            session_id: outcome.session_id,
+            message: outcome.message,
         }))
     }
 
@@ -717,6 +765,59 @@ fn proto_hls_weak_network_state(state: RuntimeHlsWeakNetworkState) -> HlsWeakNet
         RuntimeHlsWeakNetworkState::Degraded => HlsWeakNetworkState::Degraded,
         RuntimeHlsWeakNetworkState::CacheOnly => HlsWeakNetworkState::CacheOnly,
         RuntimeHlsWeakNetworkState::UpstreamFailed => HlsWeakNetworkState::UpstreamFailed,
+    }
+}
+
+fn proto_hls_playback_progress_status(
+    snapshot: &HlsPlaybackProgressSnapshot,
+) -> HlsPlaybackProgressStatus {
+    HlsPlaybackProgressStatus {
+        state: proto_hls_playback_activity_state(snapshot.state).into(),
+        message: snapshot.message.clone(),
+        session_id: snapshot.session_id.clone(),
+        library_item_id: snapshot.library_item_id.clone(),
+        variant_id: snapshot.variant_id.clone(),
+        playback_uri: snapshot.playback_uri.clone(),
+        position_seconds: snapshot.position_seconds,
+        duration_seconds: snapshot.duration_seconds.unwrap_or_default(),
+        last_intent: proto_playback_progress_intent(snapshot.last_intent).into(),
+        updated_at: (snapshot.state != HlsPlaybackActivityState::None)
+            .then(|| timestamp_from_system_time(snapshot.updated_at)),
+    }
+}
+
+fn proto_hls_playback_activity_state(
+    state: HlsPlaybackActivityState,
+) -> ProtoHlsPlaybackActivityState {
+    match state {
+        HlsPlaybackActivityState::None => ProtoHlsPlaybackActivityState::None,
+        HlsPlaybackActivityState::Active => ProtoHlsPlaybackActivityState::Active,
+        HlsPlaybackActivityState::RecentlyStopped => ProtoHlsPlaybackActivityState::RecentlyStopped,
+    }
+}
+
+fn proto_playback_progress_intent(intent: PlaybackProgressIntent) -> ProtoPlaybackProgressIntent {
+    match intent {
+        PlaybackProgressIntent::Started => ProtoPlaybackProgressIntent::Started,
+        PlaybackProgressIntent::Playing => ProtoPlaybackProgressIntent::Playing,
+        PlaybackProgressIntent::Seek => ProtoPlaybackProgressIntent::Seek,
+        PlaybackProgressIntent::Paused => ProtoPlaybackProgressIntent::Paused,
+        PlaybackProgressIntent::Stopped => ProtoPlaybackProgressIntent::Stopped,
+    }
+}
+
+fn playback_progress_intent_from_proto(
+    intent: ProtoPlaybackProgressIntent,
+) -> Result<PlaybackProgressIntent, Status> {
+    match intent {
+        ProtoPlaybackProgressIntent::Started => Ok(PlaybackProgressIntent::Started),
+        ProtoPlaybackProgressIntent::Playing => Ok(PlaybackProgressIntent::Playing),
+        ProtoPlaybackProgressIntent::Seek => Ok(PlaybackProgressIntent::Seek),
+        ProtoPlaybackProgressIntent::Paused => Ok(PlaybackProgressIntent::Paused),
+        ProtoPlaybackProgressIntent::Stopped => Ok(PlaybackProgressIntent::Stopped),
+        ProtoPlaybackProgressIntent::Unspecified => Err(Status::invalid_argument(
+            "Playback progress intent is required.",
+        )),
     }
 }
 
@@ -4608,6 +4709,14 @@ mod tests {
             transcoding.state
         );
         assert_eq!("avplayer-h264-aac-hls-v1", transcoding.profile_id);
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::None as i32, playback.state);
+        assert_eq!(
+            "No active HLS playback position reported.",
+            playback.message
+        );
     }
 
     #[tokio::test]
@@ -4646,6 +4755,156 @@ mod tests {
         );
         assert_eq!(1, weak_network.degraded_session_count);
         assert_eq!(1, weak_network.unhealthy_variant_count);
+    }
+
+    #[tokio::test]
+    async fn report_playback_progress_updates_hls_cache_status() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1playback-progress", &upstream_url);
+        let service = CacheGrpcService::new(state);
+
+        let report = service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: 120.0,
+                intent: ProtoPlaybackProgressIntent::Seek.into(),
+            }))
+            .await
+            .expect("playback progress should be accepted")
+            .into_inner();
+
+        assert!(report.accepted);
+        assert_eq!(task_id, report.session_id);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::Active as i32, playback.state);
+        assert_eq!(task_id, playback.session_id);
+        assert_eq!("h264", playback.variant_id);
+        assert_eq!(42.0, playback.position_seconds);
+        assert_eq!(120.0, playback.duration_seconds);
+        assert_eq!(
+            ProtoPlaybackProgressIntent::Seek as i32,
+            playback.last_intent
+        );
+    }
+
+    #[tokio::test]
+    async fn report_playback_progress_rejects_unknown_hls_cache_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = CacheGrpcService::new(state);
+
+        let report = service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: "http://media.example.test:8080/hls/unknown-session/master.m3u8"
+                    .to_owned(),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: 120.0,
+                intent: ProtoPlaybackProgressIntent::Playing.into(),
+            }))
+            .await
+            .expect("unknown playback progress should return a result")
+            .into_inner();
+
+        assert!(!report.accepted);
+        assert_eq!("unknown-session", report.session_id);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::None as i32, playback.state);
+        assert_eq!("", playback.session_id);
+    }
+
+    #[tokio::test]
+    async fn removed_hls_session_clears_playback_progress_status() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1removed-progress", &upstream_url);
+        let service = CacheGrpcService::new(state.clone());
+
+        service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: 120.0,
+                intent: ProtoPlaybackProgressIntent::Playing.into(),
+            }))
+            .await
+            .expect("playback progress should be accepted");
+
+        state.remove_hls_playback_session(&task_id);
+
+        let status = service
+            .get_hls_cache_status(Request::new(GetHlsCacheStatusRequest {}))
+            .await
+            .expect("HLS cache status should load")
+            .into_inner();
+        let playback = status
+            .playback
+            .expect("HLS playback progress status should be present");
+        assert_eq!(ProtoHlsPlaybackActivityState::None as i32, playback.state);
+        assert_eq!("", playback.session_id);
     }
 
     #[tokio::test]

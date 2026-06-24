@@ -538,6 +538,47 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask?.playableBilibiliURL
     }
 
+    public func playbackProgressContext(serverAddressText: String) -> PlayerPlaybackProgressContext? {
+        guard let currentTask,
+            let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
+            let playbackURL = currentTask.playableBilibiliURL
+        else {
+            return nil
+        }
+
+        let playbackSource = currentTask.playableBilibiliPlaybackSource
+        return PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            playbackURI: playbackURL.absoluteString,
+            libraryItemID: currentTask.playableBilibiliLibraryItemID ?? playbackSource?.itemID ?? "",
+            variantID: playbackSource?.variantID ?? ""
+        )
+    }
+
+    public func playbackProgressContext(
+        for result: BilibiliTaskResultPresentation,
+        serverAddressText: String
+    ) -> PlayerPlaybackProgressContext? {
+        guard let currentTask,
+            let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
+            let resultItem = currentTask.resultItems.first(where: { $0.id == result.id }),
+            let playbackURL = resultItem.playableBilibiliURL
+        else {
+            return nil
+        }
+
+        return PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            playbackURI: playbackURL.absoluteString,
+            libraryItemID: resultItem.playableBilibiliLibraryItemID ?? resultItem.playbackSource?.itemID ?? "",
+            variantID: resultItem.playbackSource?.variantID ?? ""
+        )
+    }
+
+    private func playbackProgressEndpoint(serverAddressText: String) -> CacheServerEndpoint? {
+        activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
+    }
+
     public var displayTitle: String {
         guard let currentTask else {
             let source = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1733,6 +1774,18 @@ private extension CacheTask {
 
         return topLevelPlayableBilibiliURL
             ?? bilibiliTaskResults.first(where: { $0.playbackURL != nil })?.playbackURL
+    }
+
+    var playableBilibiliPlaybackSource: CachePlaybackSource? {
+        guard isProgressivePlayback, isPlayableBilibiliTaskState else {
+            return nil
+        }
+
+        if topLevelPlayableBilibiliURL != nil {
+            return playbackSource
+        }
+
+        return resultItems.first { $0.playableBilibiliURL != nil }?.playbackSource
     }
 
     var playableBilibiliLibraryItemID: String? {

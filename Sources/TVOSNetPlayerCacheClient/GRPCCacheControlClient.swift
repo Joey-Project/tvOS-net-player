@@ -92,6 +92,30 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_CacheService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_ReportPlaybackProgressRequest()
+                request.playbackUri = report.playbackURI
+                request.libraryItemID = report.libraryItemID
+                request.variantID = report.variantID
+                request.positionSeconds = report.positionSeconds
+                request.durationSeconds = report.durationSeconds ?? 0
+                request.intent = TvosNetPlayer_V1_PlaybackProgressIntent(report.intent)
+                let response = try await service.reportPlaybackProgress(request, options: callOptions)
+                return PlaybackProgressReportResult(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.playbackProgressReporting
+        }
+    }
+
     public func listLibraryItemsPage(
         pageToken: String = "",
         pageSize: Int = 50,
@@ -513,7 +537,35 @@ extension HLSCacheStatus {
             completedSessionCount: Int(proto.completedSessionCount),
             lastEviction: proto.hasLastEviction ? HLSCacheEvictionSummary(proto.lastEviction) : nil,
             weakNetwork: proto.hasWeakNetwork ? HLSWeakNetworkStatus(proto.weakNetwork) : nil,
-            transcoding: proto.hasTranscoding ? LanTranscodingStatus(proto.transcoding) : nil
+            transcoding: proto.hasTranscoding ? LanTranscodingStatus(proto.transcoding) : nil,
+            playback: proto.hasPlayback ? HLSPlaybackProgressStatus(proto.playback) : nil
+        )
+    }
+}
+
+extension PlaybackProgressReportResult {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ReportPlaybackProgressResponse) {
+        self.init(
+            accepted: proto.accepted,
+            sessionID: proto.sessionID,
+            message: proto.message
+        )
+    }
+}
+
+extension HLSPlaybackProgressStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsPlaybackProgressStatus) {
+        self.init(
+            state: String(describing: proto.state),
+            message: proto.message,
+            sessionID: proto.sessionID,
+            libraryItemID: proto.libraryItemID,
+            variantID: proto.variantID,
+            playbackURI: proto.playbackUri,
+            positionSeconds: proto.positionSeconds,
+            durationSeconds: proto.durationSeconds > 0 ? proto.durationSeconds : nil,
+            lastIntent: String(describing: proto.lastIntent),
+            updatedAt: proto.hasUpdatedAt ? Date(proto.updatedAt) : nil
         )
     }
 }
@@ -794,6 +846,23 @@ extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
         encodingPreference = options.encodingPreference
         audioLanguage = options.audioLanguagePreference
         preferTvApi = options.preferTVAPI
+    }
+}
+
+extension TvosNetPlayer_V1_PlaybackProgressIntent {
+    fileprivate init(_ intent: PlaybackProgressIntent) {
+        switch intent {
+        case .started:
+            self = .started
+        case .playing:
+            self = .playing
+        case .seek:
+            self = .seek
+        case .paused:
+            self = .paused
+        case .stopped:
+            self = .stopped
+        }
     }
 }
 

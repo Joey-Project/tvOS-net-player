@@ -1,4 +1,6 @@
+import AVFoundation
 import XCTest
+import TVOSNetPlayerCacheClient
 @testable import TVOSNetPlayerCore
 
 final class PlayerViewModelTests: XCTestCase {
@@ -17,6 +19,20 @@ final class PlayerViewModelTests: XCTestCase {
         defaults = nil
         defaultsSuiteName = nil
         super.tearDown()
+    }
+
+    private static func waitForReports(
+        from client: FakePlaybackProgressClient,
+        minimumCount: Int
+    ) async -> [PlaybackProgressReport] {
+        for _ in 0..<100 {
+            let reports = await client.reportsSnapshot()
+            if reports.count >= minimumCount {
+                return reports
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await client.reportsSnapshot()
     }
 
     func testNormalizesBareHostAsHTTPURL() {
@@ -189,6 +205,259 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testTransientLoadCanReportPlaybackProgressWithContext() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        let didLoad = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let result = await model.reportCurrentPlaybackProgress(intent: .playing)
+
+        XCTAssertTrue(didLoad)
+        XCTAssertEqual(result?.accepted, true)
+        let reports = await client.reportsSnapshot()
+        XCTAssertTrue(
+            reports.contains {
+                $0.intent == .playing
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-1/master.m3u8"
+                    && $0.libraryItemID == "bilibili.hls.session-1"
+                    && $0.variantID == "h264"
+            }
+        )
+        XCTAssertNil(model.playbackProgressReportingMessage)
+    }
+
+    @MainActor
+    func testPlaybackProgressReportsAreSerialized() async throws {
+        let client = FakePlaybackProgressClient(delayFirstReport: true)
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        model.stop()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let callCountBeforeResume = await client.reportCallCountSnapshot()
+        let reportsBeforeResume = await client.reportsSnapshot()
+        XCTAssertEqual(callCountBeforeResume, 1)
+        XCTAssertTrue(reportsBeforeResume.isEmpty)
+
+        await client.resumeFirstReport()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testFlushPlaybackProgressReportsWaitsForQueuedStartedReport() async throws {
+        let client = FakePlaybackProgressClient(delayFirstReport: true)
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let flushTask = Task {
+            await model.flushPlaybackProgressReports()
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        let callCountBeforeResume = await client.reportCallCountSnapshot()
+        let reportsBeforeResume = await client.reportsSnapshot()
+        XCTAssertEqual(callCountBeforeResume, 1)
+        XCTAssertTrue(reportsBeforeResume.isEmpty)
+
+        await client.resumeFirstReport()
+        await flushTask.value
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started])
+    }
+
+    @MainActor
+    func testPlaybackEndReportsStoppedAndStopsPeriodicProgress() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let item = try XCTUnwrap(model.player?.currentItem)
+
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+
+        let reports = await Self.waitForReports(from: client, minimumCount: 2)
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 1)
+        XCTAssertEqual(model.statusMessage, "Playback finished.")
+
+        try await Task.sleep(for: .milliseconds(100))
+        let reportsAfterStopWindow = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterStopWindow.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testSeekAfterPlaybackEndRestartsPeriodicProgress() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+        let item = try XCTUnwrap(model.player?.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+
+        let reportsAfterEnd = await Self.waitForReports(from: client, minimumCount: 2)
+        XCTAssertEqual(reportsAfterEnd.map(\.intent), [.started, .stopped])
+
+        model.skipForward()
+
+        let replayReports = await Self.waitForReports(
+            from: client,
+            minimumCount: reportsAfterEnd.count + 2
+        ).dropFirst(reportsAfterEnd.count)
+        XCTAssertTrue(replayReports.contains { $0.intent == .seek })
+        XCTAssertTrue(replayReports.contains { $0.intent == .paused })
+    }
+
+    @MainActor
+    func testPausedPlaybackProgressKeepsLeaseWarm() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: .milliseconds(25),
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+
+        let reports = await Self.waitForReports(from: client, minimumCount: 2)
+        XCTAssertTrue(
+            reports.contains {
+                $0.intent == .paused
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-1/master.m3u8"
+            }
+        )
+    }
+
+    @MainActor
+    func testStalePlaybackEndNotificationDoesNotStopNewPlayback() async throws {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let firstContext = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+        let secondContext = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-2",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: firstContext
+        )
+        let firstItem = try XCTUnwrap(model.player?.currentItem)
+
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: firstItem)
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-2/master.m3u8",
+            progressContext: secondContext
+        )
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(model.loadedURL?.absoluteString, "http://mac-mini.local:8080/hls/session-2/master.m3u8")
+        XCTAssertEqual(model.statusMessage, "Playing http://mac-mini.local:8080/hls/session-2/master.m3u8")
+        let reports = await client.reportsSnapshot()
+        XCTAssertFalse(
+            reports.contains {
+                $0.intent == .stopped
+                    && $0.playbackURI == "http://mac-mini.local:8080/hls/session-2/master.m3u8"
+            }
+        )
+    }
+
+    @MainActor
     func testTransientLoadWithStaleManualSequenceDoesNotReplaceManualPlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let staleSequence = model.manualInteractionSequence
@@ -278,4 +547,126 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.player)
         XCTAssertNil(defaults.string(forKey: PlayerViewModel.lastStreamURLDefaultsKey))
     }
+
+    @MainActor
+    func testClearRequestsPlaybackProgressStatusRefreshAfterQueuedStop() async {
+        let client = FakePlaybackProgressClient()
+        let endpoint = CacheServerEndpoint(host: "mac-mini.local")
+        let model = PlayerViewModel(
+            defaults: defaults,
+            autoplay: false,
+            playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        let context = PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            libraryItemID: "bilibili.hls.session-1",
+            variantID: "h264"
+        )
+
+        _ = model.loadTransient(
+            streamURLText: "mac-mini.local:8080/hls/session-1/master.m3u8",
+            progressContext: context
+        )
+
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 0)
+
+        model.clear()
+        await model.flushPlaybackProgressReports()
+
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.playbackProgressStatusRefreshRequestID, 1)
+        XCTAssertEqual(model.streamURLText, "")
+        XCTAssertNil(model.loadedURL)
+        XCTAssertNil(model.player)
+    }
+}
+
+private actor FakePlaybackProgressClient: CacheControlClient {
+    private let delayFirstReport: Bool
+    private var reports: [PlaybackProgressReport] = []
+    private var reportCallCount = 0
+    private var firstReportContinuation: CheckedContinuation<Void, Never>?
+
+    init(delayFirstReport: Bool = false) {
+        self.delayFirstReport = delayFirstReport
+    }
+
+    func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult {
+        reportCallCount += 1
+        if delayFirstReport, reportCallCount == 1 {
+            await withCheckedContinuation { continuation in
+                firstReportContinuation = continuation
+            }
+        }
+        reports.append(report)
+        return PlaybackProgressReportResult(
+            accepted: true,
+            sessionID: "session-1",
+            message: "Playback progress recorded."
+        )
+    }
+
+    func reportsSnapshot() -> [PlaybackProgressReport] {
+        reports
+    }
+
+    func reportCallCountSnapshot() -> Int {
+        reportCallCount
+    }
+
+    func resumeFirstReport() {
+        firstReportContinuation?.resume()
+        firstReportContinuation = nil
+    }
+
+    func getServerInfo() async throws -> CacheServerSummary {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func listCacheRoots() async throws -> [CacheRoot] {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func listLibraryItemsPage(
+        pageToken: String,
+        pageSize: Int,
+        searchText: String?
+    ) async throws -> CacheLibraryItemsPage {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func deleteLibraryItem(id: String) async throws -> Bool {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func getTask(id: String) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: FakePlaybackProgressClientError.notImplemented)
+        }
+    }
+
+    func cancelTask(id: String) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+
+    func createBilibiliPlaybackTask(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions
+    ) async throws -> CacheTask {
+        throw FakePlaybackProgressClientError.notImplemented
+    }
+}
+
+private enum FakePlaybackProgressClientError: Error {
+    case notImplemented
 }

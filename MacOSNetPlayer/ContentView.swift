@@ -36,6 +36,11 @@ struct ContentView: View {
                 await autoConnectDiscoveredServerIfNeeded()
             }
         }
+        .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
+            Task {
+                await refreshPlaybackProgressStatus()
+            }
+        }
         .confirmationDialog(
             "Delete Cached Video?",
             isPresented: Binding(
@@ -602,12 +607,17 @@ struct ContentView: View {
             return
         }
 
+        let progressContext = playbackProgressContext(for: item, playbackURL: url)
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.clearPlaybackStatus()
         cacheModel.finishPreparedPlayback(for: item, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func deleteCachedItem(_ item: CacheLibraryItem) async {
@@ -685,11 +695,18 @@ struct ContentView: View {
         }
 
         cacheModel.clearPlaybackStatus()
+        let progressContext = bilibiliModel.playbackProgressContext(
+            serverAddressText: cacheModel.serverAddressText
+        )
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func playBilibiliTaskResult(_ result: BilibiliTaskResultPresentation) async {
@@ -699,11 +716,19 @@ struct ContentView: View {
         }
 
         cacheModel.clearPlaybackStatus()
+        let progressContext = bilibiliModel.playbackProgressContext(
+            for: result,
+            serverAddressText: cacheModel.serverAddressText
+        )
         let didStartPlayback = model.loadTransient(
             streamURLText: url.absoluteString,
+            progressContext: progressContext,
             ifManualInteractionSequenceMatches: manualInteractionSequence
         )
         bilibiliModel.finishPreparedPlayback(result: result, didStartPlayback: didStartPlayback)
+        if didStartPlayback {
+            await refreshPlaybackProgressStatus()
+        }
     }
 
     private func loadManualStream() {
@@ -737,6 +762,30 @@ struct ContentView: View {
         }
 
         selectedItemID = cacheModel.items.first?.id
+    }
+
+    private func playbackProgressContext(
+        for item: CacheLibraryItem,
+        playbackURL: URL
+    ) -> PlayerPlaybackProgressContext? {
+        guard item.isOfflineHLSCache else {
+            return nil
+        }
+        guard let endpoint = CacheServerEndpoint.normalized(from: cacheModel.serverAddressText) else {
+            return nil
+        }
+
+        return PlayerPlaybackProgressContext(
+            endpoint: endpoint,
+            playbackURI: playbackURL.absoluteString,
+            libraryItemID: item.id,
+            variantID: item.primaryVariantID ?? ""
+        )
+    }
+
+    private func refreshPlaybackProgressStatus() async {
+        await model.flushPlaybackProgressReports()
+        await cacheModel.refreshHLSCacheStatus()
     }
 }
 

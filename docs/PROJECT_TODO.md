@@ -4,7 +4,7 @@
 - [completed] PR 2：支持 remote/Cloudflare Tunnel style cache server endpoint，包括 `https://` gRPC transport、scheme-aware endpoint normalization 和 remote URL 输入提示。
 - [completed] PR 3：实现 LAN transcoding execution MVP，包括 ffmpeg/job runner、落盘恢复、取消和输出 HLS manifest。
 - [completed] PR 4：基于 fMP4 segment metadata 实现安全的 segment-index HLS playlist splitting。
-- [pending] PR 5：加入 playback-position-aware fill/prefetch 调度和更完整 weak/offline UX。
+- [completed] PR 5：加入 playback-position-aware control-plane 上报和 weak/offline cache status UX foundation。
 - [pending] PR 6：完善 multi-result batch cache finalization、sidecar controls 和 download options UX。
 - [completed] PR 9：推进 segment-level fill / prefetch。
 - [completed] PR 10：增加 adaptive weak-network policy 和对应 UX。
