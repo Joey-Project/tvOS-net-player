@@ -48,6 +48,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     private var deleteOperationSequence = 0
     private var deletingItemOperationIDs: [String: Int] = [:]
     private var playbackSequence = 0
+    private var hlsCacheStatusRefreshSequence = 0
     private var pendingPlaybackItemID: String?
     private var activePlaybackItemID: String?
     private var hlsCacheStatusRefreshTask: Task<Void, Never>?
@@ -173,7 +174,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         }
 
         refreshSequence += 1
-        cancelHLSCacheStatusRefresh()
+        invalidateHLSCacheStatusRefresh()
         loadMoreSequence += 1
         playbackSequence += 1
         pendingPlaybackItemID = nil
@@ -232,7 +233,6 @@ public final class CacheLibraryViewModel: ObservableObject {
             isLoading = false
             scheduleHLSCacheStatusRefresh(
                 client: client,
-                requestSequence: requestSequence,
                 endpoint: endpoint
             )
             return .succeeded
@@ -412,7 +412,6 @@ public final class CacheLibraryViewModel: ObservableObject {
         await refreshCacheRoots(client: client, requestSequence: requestSequence, endpoint: endpoint)
         scheduleHLSCacheStatusRefresh(
             client: client,
-            requestSequence: requestSequence,
             endpoint: endpoint
         )
         guard isCurrentRefresh(requestSequence, endpoint: endpoint) else {
@@ -489,7 +488,7 @@ public final class CacheLibraryViewModel: ObservableObject {
         endpoint: CacheServerEndpoint
     ) async {
         let status = await fetchHLSCacheStatus(client: client)
-        guard !Task.isCancelled, isCurrentRefresh(requestSequence, endpoint: endpoint) else {
+        guard !Task.isCancelled, isCurrentHLSCacheStatusRefresh(requestSequence, endpoint: endpoint) else {
             return
         }
 
@@ -497,38 +496,47 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     public func refreshHLSCacheStatus() async {
-        guard let endpoint = loadedEndpoint,
-            CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
-        else {
+        guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             return
         }
 
         cancelHLSCacheStatusRefresh()
+        let requestSequence = nextHLSCacheStatusRefreshSequence()
         await refreshHLSCacheStatus(
             client: clientFactory(endpoint),
-            requestSequence: refreshSequence,
+            requestSequence: requestSequence,
             endpoint: endpoint
         )
     }
 
     private func scheduleHLSCacheStatusRefresh(
         client: any CacheControlClient,
-        requestSequence: Int,
         endpoint: CacheServerEndpoint
     ) {
         cancelHLSCacheStatusRefresh()
+        let hlsCacheStatusRequestSequence = nextHLSCacheStatusRefreshSequence()
         hlsCacheStatusRefreshTask = Task { [weak self] in
             await self?.refreshHLSCacheStatus(
                 client: client,
-                requestSequence: requestSequence,
+                requestSequence: hlsCacheStatusRequestSequence,
                 endpoint: endpoint
             )
         }
     }
 
+    private func invalidateHLSCacheStatusRefresh() {
+        cancelHLSCacheStatusRefresh()
+        hlsCacheStatusRefreshSequence += 1
+    }
+
     private func cancelHLSCacheStatusRefresh() {
         hlsCacheStatusRefreshTask?.cancel()
         hlsCacheStatusRefreshTask = nil
+    }
+
+    private func nextHLSCacheStatusRefreshSequence() -> Int {
+        hlsCacheStatusRefreshSequence += 1
+        return hlsCacheStatusRefreshSequence
     }
 
     private func fetchHLSCacheStatus(client: any CacheControlClient) async -> HLSCacheStatus? {
@@ -736,7 +744,7 @@ public final class CacheLibraryViewModel: ObservableObject {
     }
 
     private func clearLoadedLibrary(statusMessage: String, errorMessage: String?) {
-        cancelHLSCacheStatusRefresh()
+        invalidateHLSCacheStatusRefresh()
         loadedEndpoint = nil
         loadMoreSequence += 1
         pendingPlaybackItemID = nil
@@ -768,7 +776,7 @@ public final class CacheLibraryViewModel: ObservableObject {
 
         playbackSequence += 1
         refreshSequence += 1
-        cancelHLSCacheStatusRefresh()
+        invalidateHLSCacheStatusRefresh()
         loadMoreSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil
@@ -797,6 +805,11 @@ public final class CacheLibraryViewModel: ObservableObject {
 
     private func isCurrentRefresh(_ requestSequence: Int, endpoint: CacheServerEndpoint) -> Bool {
         requestSequence == refreshSequence
+            && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
+    }
+
+    private func isCurrentHLSCacheStatusRefresh(_ requestSequence: Int, endpoint: CacheServerEndpoint) -> Bool {
+        requestSequence == hlsCacheStatusRefreshSequence
             && CacheServerEndpoint.normalized(from: serverAddressText) == endpoint
     }
 
