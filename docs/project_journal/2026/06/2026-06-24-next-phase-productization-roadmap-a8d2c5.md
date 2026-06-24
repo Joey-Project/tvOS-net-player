@@ -90,6 +90,7 @@ superseded_by:
 
 ## Validation Contract
 
+- The repository default branch is currently `master`; branch/update steps intentionally target `origin/master`.
 - Each implementation PR starts from updated `master` and lands on a focused `wip/<topic>` branch.
 - Each PR must pass the full local gate, including `just ci`, plus relevant focused tests or live/macOS validation called out by that PR.
 - Each PR must pass GitHub CI and required repository checks.
