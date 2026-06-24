@@ -290,6 +290,25 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func createBilibiliTask(
+        urlOrID: String,
+        options: BilibiliDownloadTaskOptions = BilibiliDownloadTaskOptions()
+    ) async throws -> CacheTask {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                target: endpoint.grpcTarget,
+                transportSecurity: endpoint.grpcTransportSecurity
+            )
+        ) { client in
+            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+            var request = TvosNetPlayer_V1_CreateBilibiliTaskRequest()
+            request.urlOrID = urlOrID
+            request.options = TvosNetPlayer_V1_BilibiliDownloadOptions(options)
+            let response = try await service.createBilibiliTask(request, options: callOptions)
+            return CacheTask(response)
+        }
+    }
+
     static func requiredCapabilityForBilibiliPlaybackTask(
         selectionID: String,
         selection: BilibiliTaskSelection?
@@ -846,6 +865,49 @@ extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
         encodingPreference = options.encodingPreference
         audioLanguage = options.audioLanguagePreference
         preferTvApi = options.preferTVAPI
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliDownloadOptions {
+    init(_ options: BilibiliDownloadTaskOptions) {
+        self.init()
+        qualityPreference = options.qualityPreference
+        encodingPreference = options.encodingPreference
+        audioLanguage = options.audioLanguagePreference
+        preferTvApi = options.preferTVAPI
+        downloadSubtitles = options.downloadSubtitles
+        downloadDanmaku = options.downloadDanmaku
+        downloadCover = options.downloadCover
+        subtitleAiPolicy = TvosNetPlayer_V1_BilibiliSubtitleAiPolicy(options.subtitleAIPolicy)
+        danmakuFormats = options.danmakuFormats.map(TvosNetPlayer_V1_BilibiliDanmakuFormat.init)
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliSubtitleAiPolicy {
+    init(_ policy: BilibiliSubtitleAIPolicy) {
+        switch policy {
+        case .unspecified:
+            self = .unspecified
+        case .include:
+            self = .include
+        case .preferNonAI:
+            self = .preferNonAi
+        case .excludeAI:
+            self = .excludeAi
+        case .onlyAI:
+            self = .onlyAi
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliDanmakuFormat {
+    init(_ format: BilibiliDanmakuFormat) {
+        switch format {
+        case .xml:
+            self = .xml
+        case .ass:
+            self = .ass
+        }
     }
 }
 

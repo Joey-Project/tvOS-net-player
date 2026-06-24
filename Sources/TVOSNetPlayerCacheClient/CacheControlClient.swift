@@ -32,6 +32,10 @@ public protocol CacheControlClient: Sendable {
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult
+    func createBilibiliTask(
+        urlOrID: String,
+        options: BilibiliDownloadTaskOptions
+    ) async throws -> CacheTask
     func createBilibiliPlaybackTask(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
@@ -52,6 +56,7 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case hlsCacheStatus
     case bilibiliCredentialStatus
     case bilibiliResolve
+    case bilibiliDownloadTask
     case bilibiliTaskSelection
     case playbackProgressReporting
 }
@@ -74,6 +79,13 @@ public extension CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult {
         throw CacheControlClientUnsupportedFeature.bilibiliResolve
+    }
+
+    func createBilibiliTask(
+        urlOrID: String,
+        options: BilibiliDownloadTaskOptions
+    ) async throws -> CacheTask {
+        throw CacheControlClientUnsupportedFeature.bilibiliDownloadTask
     }
 
     func listLibraryItemsPage(

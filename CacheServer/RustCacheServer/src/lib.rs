@@ -182,13 +182,17 @@ impl AppState {
             restored_hls_sessions
                 .iter()
                 .filter(|session| {
+                    let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
                     session.transcoding.state == HlsTranscodingPlanState::Ready
                         && hls_cache.source_resources_are_complete(session)
                         && tasks
-                            .completed_playback_task_for_hls_session(&session.id)
+                            .playback_task_for_any_hls_session(&session.id)
                             .is_some_and(|task| {
-                                task.library_item_id
-                                    == HlsCacheStore::completed_library_item_id(&session.id)
+                                tasks.playback_task_has_completed_hls_cache_item(
+                                    &task,
+                                    &session.id,
+                                    &library_item_id,
+                                )
                             })
                 })
                 .map(|session| session.id.clone())
@@ -218,10 +222,15 @@ impl AppState {
         let restorable_completed_session_ids = completed_cache_session_ids
             .iter()
             .filter(|session_id| {
+                let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
                 tasks
-                    .completed_playback_task_for_hls_session(session_id)
+                    .playback_task_for_any_hls_session(session_id)
                     .is_some_and(|task| {
-                        task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
+                        tasks.playback_task_has_completed_hls_cache_item(
+                            &task,
+                            session_id,
+                            &library_item_id,
+                        )
                     })
             })
             .cloned()
@@ -330,14 +339,17 @@ impl AppState {
         }
 
         for session in restored_sessions {
-            let Some(task_id) = self
-                .tasks
-                .playable_task_id_for_primary_hls_session(&session.id)
-            else {
+            let Some(task_id) = self.tasks.playable_task_id_for_hls_session(&session.id) else {
                 continue;
             };
             if session.transcoding.state == HlsTranscodingPlanState::Ready
                 && self.hls_transcoding_execution_config().is_none()
+            {
+                continue;
+            }
+            if self
+                .tasks
+                .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session.id)
             {
                 continue;
             }
@@ -348,15 +360,22 @@ impl AppState {
                     Ok(()) => {
                         let completed_playback_session =
                             playback_session_from_hls_cache_session(session);
+                        let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
                         match self
                             .tasks
                             .complete_playback_hls_session_cached_with_metadata(
                                 &task_id,
                                 &session.id,
-                                HlsCacheStore::completed_library_item_id(&session.id),
+                                library_item_id.clone(),
                                 completed_playback_session,
                             ) {
-                            Ok(task) if task.state() == TaskState::Completed => {
+                            Ok(task)
+                                if self.tasks.playback_task_has_completed_hls_cache_item(
+                                    &task,
+                                    &session.id,
+                                    &library_item_id,
+                                ) =>
+                            {
                                 if let Err(error) = self.enforce_hls_cache_quota(
                                     "after_hls_finalization",
                                     [session.id.clone()],
@@ -554,7 +573,7 @@ impl AppState {
         match task.state() {
             TaskState::Playable => self
                 .tasks
-                .is_primary_hls_session_playable(&task.id, session_id),
+                .is_hls_session_playable_for_task(&task.id, session_id),
             TaskState::Completed => false,
             _ => false,
         }
@@ -573,35 +592,88 @@ impl AppState {
         if self.get_completed_hls_library_item(item_id).is_none() {
             return Ok(Some(false));
         }
-        let session_ids = self.completed_hls_task_session_ids(&session_id);
-        let task_removal_cache_item = self.completed_hls_task_removal_cache_item(&session_id);
+        let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
+        let (task_cleanup_session_id, task_cleanup_library_item_id) = self
+            .completed_hls_task_cleanup_item(&session_id, item_id)
+            .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
 
         self.remove_hls_sessions(&session_ids).map_err(|error| {
             Status::internal(format!(
                 "Failed to delete completed HLS cache item: {error}"
             ))
         })?;
-        if let Some((removal_session_id, removal_library_item_id)) = task_removal_cache_item {
-            self.tasks
-                .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)?;
-        } else {
-            self.tasks
-                .remove_completed_playback_task(&session_id, item_id)?;
-        }
+        self.tasks.remove_completed_playback_task(
+            &task_cleanup_session_id,
+            &task_cleanup_library_item_id,
+        )?;
         Ok(Some(true))
     }
 
-    fn completed_hls_task_session_ids(&self, session_id: &str) -> Vec<String> {
+    fn completed_hls_delete_session_ids(
+        &self,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> Vec<String> {
         self.tasks
             .completed_playback_task_for_any_hls_session(session_id)
             .filter(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
                     && task.state() == TaskState::Completed
                     && self.completed_hls_cache_entry_belongs_to_task(task, session_id)
+                    && !self.completed_hls_cache_entry_is_completed_secondary_result_item(
+                        task,
+                        session_id,
+                        library_item_id,
+                    )
             })
             .map(|task| self.tasks.playback_hls_session_ids(&task.id))
             .filter(|session_ids| !session_ids.is_empty())
             .unwrap_or_else(|| vec![session_id.to_owned()])
+    }
+
+    fn completed_hls_task_cleanup_item(
+        &self,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> Option<(String, String)> {
+        let task = self.tasks.playback_task_for_any_hls_session(session_id)?;
+        if task.kind() != TaskKind::BilibiliProgressivePlayback
+            || !matches!(task.state(), TaskState::Playable | TaskState::Completed)
+            || !self.completed_hls_cache_entry_belongs_to_task(&task, session_id)
+        {
+            return None;
+        }
+        if self.completed_hls_cache_entry_is_completed_secondary_result_item(
+            &task,
+            session_id,
+            library_item_id,
+        ) {
+            return Some((session_id.to_owned(), library_item_id.to_owned()));
+        }
+        if task.state() != TaskState::Completed {
+            return None;
+        }
+        if task.library_item_id.is_empty() {
+            return None;
+        }
+        let removal_session_id =
+            HlsCacheStore::session_id_from_library_item_id(&task.library_item_id)
+                .or_else(|| {
+                    task.playback_session
+                        .as_ref()
+                        .map(|session| session.id.clone())
+                })
+                .unwrap_or_else(|| task.id.clone());
+        Some((removal_session_id, task.library_item_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_hls_task_cleanup_item_for_tests(
+        &self,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> Option<(String, String)> {
+        self.completed_hls_task_cleanup_item(session_id, library_item_id)
     }
 
     fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
@@ -626,20 +698,19 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return false;
         }
-        let Some(task) = self
-            .tasks
-            .completed_playback_task_for_hls_session(session_id)
-        else {
+        let Some(task) = self.tasks.playback_task_for_any_hls_session(session_id) else {
             return false;
         };
 
-        if task.kind() != TaskKind::BilibiliProgressivePlayback
-            || task.state() != TaskState::Completed
-        {
+        if task.kind() != TaskKind::BilibiliProgressivePlayback {
             return false;
         }
-        if task.library_item_id != HlsCacheStore::completed_library_item_id(session_id) {
-            self.fail_completed_hls_task_after_cache_restore(session_id);
+        let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
+        if !self.tasks.playback_task_has_completed_hls_cache_item(
+            &task,
+            session_id,
+            &library_item_id,
+        ) {
             return false;
         }
         self.ensure_completed_hls_session_registered(session_id)
@@ -859,7 +930,8 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            let session_ids = self.completed_hls_task_session_ids(&entry.session_id);
+            let session_ids =
+                self.completed_hls_delete_session_ids(&entry.session_id, &entry.library_item_id);
             if session_ids
                 .iter()
                 .any(|session_id| evicted_session_id_set.contains(session_id))
@@ -1050,31 +1122,49 @@ impl AppState {
             .any(|task_session_id| task_session_id == session_id)
     }
 
-    fn completed_hls_task_removal_cache_item(&self, session_id: &str) -> Option<(String, String)> {
-        let task = self
-            .tasks
-            .completed_playback_task_for_any_hls_session(session_id)?;
-        if task.kind() != TaskKind::BilibiliProgressivePlayback
-            || task.state() != TaskState::Completed
-            || !self.completed_hls_cache_entry_belongs_to_task(&task, session_id)
-            || task.library_item_id.is_empty()
-        {
-            return None;
+    fn completed_hls_cache_entry_is_primary_task_item(
+        &self,
+        task: &Task,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> bool {
+        if task.library_item_id != library_item_id {
+            return false;
         }
-        let removal_session_id =
-            HlsCacheStore::session_id_from_library_item_id(&task.library_item_id)
-                .or_else(|| {
-                    task.playback_session
-                        .as_ref()
-                        .map(|session| session.id.clone())
-                })
-                .unwrap_or_else(|| task.id.clone());
-        Some((removal_session_id, task.library_item_id))
+        HlsCacheStore::session_id_from_library_item_id(&task.library_item_id)
+            .is_some_and(|task_session_id| task_session_id == session_id)
+            || task
+                .playback_session
+                .as_ref()
+                .is_some_and(|session| session.id == session_id)
+            || task.id == session_id
+    }
+
+    fn completed_hls_cache_entry_is_completed_secondary_result_item(
+        &self,
+        task: &Task,
+        session_id: &str,
+        library_item_id: &str,
+    ) -> bool {
+        !self.completed_hls_cache_entry_is_primary_task_item(task, session_id, library_item_id)
+            && task.result_items.iter().any(|item| {
+                item.library_item_id == library_item_id
+                    && item.state == i32::from(TaskState::Completed)
+                    && (item.id == session_id
+                        || item
+                            .playback_source
+                            .as_ref()
+                            .is_some_and(|source| source.item_id == session_id)
+                        || item
+                            .playback_session
+                            .as_ref()
+                            .is_some_and(|session| session.id == session_id))
+            })
     }
 
     fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
         let Some((removal_session_id, removal_library_item_id)) =
-            self.completed_hls_task_removal_cache_item(&entry.session_id)
+            self.completed_hls_task_cleanup_item(&entry.session_id, &entry.library_item_id)
         else {
             return;
         };
@@ -1145,7 +1235,7 @@ impl AppState {
             TaskState::Playable => {
                 if !self
                     .tasks
-                    .is_primary_hls_session_playable(&task.id, session_id)
+                    .is_hls_session_playable_for_task(&task.id, session_id)
                 {
                     return false;
                 }
@@ -1159,7 +1249,12 @@ impl AppState {
                 if !self.supports_completed_hls_cache_playback() {
                     return false;
                 }
-                if task.library_item_id != HlsCacheStore::completed_library_item_id(session_id) {
+                let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
+                if !self.tasks.playback_task_has_completed_hls_cache_item(
+                    &task,
+                    session_id,
+                    &library_item_id,
+                ) {
                     self.fail_completed_hls_task_after_cache_restore(session_id);
                     return false;
                 }
@@ -1191,11 +1286,14 @@ impl AppState {
 
     fn fail_completed_hls_task_after_cache_restore(&self, session_id: &str) {
         self.remove_hls_playback_session(session_id);
-        if let Err(status) = self.tasks.fail_completed_playback_task_after_cache_restore(
-            session_id,
-            "Restored completed HLS cache item did not match the persisted playback task."
-                .to_owned(),
-        ) {
+        if let Err(status) = self
+            .tasks
+            .fail_unrestorable_playback_session_after_cache_restore(
+                session_id,
+                "Restored completed HLS cache item did not match the persisted playback task."
+                    .to_owned(),
+            )
+        {
             eprintln!(
                 "Failed to mark completed HLS playback task {session_id} failed after cache restore validation: {status}"
             );
@@ -1287,7 +1385,7 @@ fn restored_hls_session_is_authorized(
     }
 
     match task.state() {
-        TaskState::Playable => tasks.is_primary_hls_session_playable(&task.id, session_id),
+        TaskState::Playable => tasks.is_hls_session_playable_for_task(&task.id, session_id),
         TaskState::Completed => {
             completed_session_ids.contains(session_id)
                 && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)

@@ -94,6 +94,46 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(task.playbackSession?.transcodingPlan?.outputProtocol, expectedPlaybackProtocol)
     }
 
+    func testBilibiliDownloadTaskOptionsMapToGeneratedSchema() {
+        let options = BilibiliDownloadTaskOptions(
+            qualityPreference: "1080p",
+            encodingPreference: "h264",
+            audioLanguagePreference: "ja-jp",
+            preferTVAPI: true,
+            downloadSubtitles: true,
+            downloadDanmaku: true,
+            downloadCover: true,
+            subtitleAIPolicy: .excludeAI,
+            danmakuFormats: [.xml, .ass]
+        )
+
+        let proto = TvosNetPlayer_V1_BilibiliDownloadOptions(options)
+
+        XCTAssertEqual(proto.qualityPreference, "1080p")
+        XCTAssertEqual(proto.encodingPreference, "h264")
+        XCTAssertEqual(proto.audioLanguage, "ja-jp")
+        XCTAssertTrue(proto.preferTvApi)
+        XCTAssertTrue(proto.downloadSubtitles)
+        XCTAssertTrue(proto.downloadDanmaku)
+        XCTAssertTrue(proto.downloadCover)
+        XCTAssertEqual(proto.subtitleAiPolicy, .excludeAi)
+        XCTAssertEqual(proto.danmakuFormats, [.xml, .ass])
+    }
+
+    func testBilibiliDownloadTaskOptionsDefaultsPreserveWireDefaults() {
+        let proto = TvosNetPlayer_V1_BilibiliDownloadOptions(BilibiliDownloadTaskOptions())
+
+        XCTAssertTrue(proto.qualityPreference.isEmpty)
+        XCTAssertTrue(proto.encodingPreference.isEmpty)
+        XCTAssertTrue(proto.audioLanguage.isEmpty)
+        XCTAssertFalse(proto.preferTvApi)
+        XCTAssertFalse(proto.downloadSubtitles)
+        XCTAssertFalse(proto.downloadDanmaku)
+        XCTAssertFalse(proto.downloadCover)
+        XCTAssertEqual(proto.subtitleAiPolicy, .unspecified)
+        XCTAssertTrue(proto.danmakuFormats.isEmpty)
+    }
+
     func testCacheServerSummaryExposesBilibiliSupport() {
         let supported = CacheServerSummary(
             id: "server-1",
