@@ -134,6 +134,45 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testLiveValidationDoesNotTreatAccessKeyOnlyAsAuthenticatedReady() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                ]
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: false,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 1,
+                restrictedAPIProxyCount: 1,
+                checkedAt: nil
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "liveValidation")?.value, "Public only")
+        XCTAssertEqual(model.row(id: "liveValidation")?.severity, .info)
+        XCTAssertTrue(model.row(id: "liveValidation")?.detail?.contains("web cookie") == true)
+    }
+
     func testTranscodingUnspecifiedRuntimeStateIsNotReady() async {
         let client = DiagnosticsFakeCacheControlClient(
             serverInfo: CacheServerSummary(

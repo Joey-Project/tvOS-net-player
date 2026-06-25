@@ -380,7 +380,8 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
             )
         }
 
-        let hasAuthenticatedCredential = credentialStatus.hasWebCookie || credentialStatus.hasAccessKey
+        let hasAuthenticatedCredential =
+            credentialStatus.credentialFileLoaded && credentialStatus.hasWebCookie
         let hasRestrictedProxy =
             credentialStatus.restrictedPlayURLProxyCount > 0
             || credentialStatus.restrictedAPIProxyCount > 0
@@ -410,7 +411,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
             id: "liveValidation",
             title: "Live Validation",
             value: "Public only",
-            detail: "Authenticated and restricted live cases need web cookie/access key readiness.",
+            detail: "Authenticated and restricted live cases need a loaded web cookie.",
             systemImage: "checklist",
             severity: .info
         )
