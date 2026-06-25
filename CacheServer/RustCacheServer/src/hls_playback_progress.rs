@@ -34,6 +34,10 @@ impl PlaybackProgressIntent {
     pub(crate) fn is_stopped(self) -> bool {
         matches!(self, Self::Stopped)
     }
+
+    pub(crate) fn promotes_hls_cache_fill(self) -> bool {
+        matches!(self, Self::Started | Self::Playing | Self::Seek)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +136,26 @@ impl HlsPlaybackProgressTracker {
             .latest_snapshot()
             .cloned()
             .unwrap_or_else(empty_snapshot)
+    }
+
+    pub(crate) fn snapshot_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<HlsPlaybackProgressSnapshot> {
+        self.snapshot_for_session_at(session_id, SystemTime::now())
+    }
+
+    pub(crate) fn snapshot_for_session_at(
+        &self,
+        session_id: &str,
+        now: SystemTime,
+    ) -> Option<HlsPlaybackProgressSnapshot> {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("HLS playback progress lock poisoned");
+        state.prune_expired(now);
+        state.reports_by_session_id.get(session_id).cloned()
     }
 
     pub(crate) fn remove_session(&self, session_id: &str) {
@@ -385,6 +409,41 @@ mod tests {
         assert_eq!(HlsPlaybackActivityState::Active, snapshot.state);
         assert_eq!("session-1", snapshot.session_id);
         assert_eq!(42.0, snapshot.position_seconds);
+    }
+
+    #[test]
+    fn snapshots_matching_session_without_changing_global_priority() {
+        let tracker = HlsPlaybackProgressTracker::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/session-1/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 12.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now,
+        });
+        tracker.record(PlaybackProgressReport {
+            playback_uri: "https://cache.example.test/hls/session-2/master.m3u8".to_owned(),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 48.0,
+            duration_seconds: None,
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: now + Duration::from_secs(1),
+        });
+
+        let session_snapshot = tracker
+            .snapshot_for_session_at("session-1", now + Duration::from_secs(1))
+            .expect("matching session snapshot should exist");
+        assert_eq!("session-1", session_snapshot.session_id);
+        assert_eq!(12.0, session_snapshot.position_seconds);
+        assert_eq!(
+            "session-2",
+            tracker.snapshot_at(now + Duration::from_secs(1)).session_id
+        );
     }
 
     #[test]

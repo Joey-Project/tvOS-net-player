@@ -32,6 +32,9 @@ use crate::{
         HlsMediaResourceMetadata, HlsMediaSegment, HlsPlaybackSession, HlsVariant,
         HlsVariantMetadata, mp4_initialization_length, should_forward_media_request_header,
     },
+    hls_playback_progress::{
+        HlsPlaybackActivityState, HlsPlaybackProgressSnapshot, PlaybackProgressIntent,
+    },
     library::{OpenedMediaFile, open_read_no_follow},
     mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
     transcoding::{
@@ -51,6 +54,7 @@ const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
 const HLS_PREWARM_HEAD_BYTES: u64 = HLS_INITIALIZATION_SCAN_BYTES;
 const HLS_FIRST_WINDOW_PREFETCH_SECONDS: u64 = 30;
 const HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const HLS_PLAYBACK_POSITION_PREFETCH_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const HLS_TRANSCODED_RESOURCE_ID: &str = "transcoded.m4s";
 const HLS_TRANSCODED_VIDEO_CODEC: &str = LAN_TRANSCODING_VIDEO_CODEC;
 const HLS_TRANSCODED_AUDIO_CODEC: &str = LAN_TRANSCODING_AUDIO_CODEC;
@@ -583,6 +587,7 @@ impl HlsCacheStore {
         result
     }
 
+    #[cfg(test)]
     pub(crate) async fn prewarm_session_first_frame_with_control<F>(
         &self,
         client: &reqwest::Client,
@@ -592,13 +597,40 @@ impl HlsCacheStore {
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
+        self.prewarm_session_first_frame_with_playback_progress(client, session, None, control)
+            .await
+    }
+
+    pub(crate) async fn prewarm_session_first_frame_with_playback_progress<F>(
+        &self,
+        client: &reqwest::Client,
+        session: &HlsPlaybackSession,
+        playback_progress: Option<&HlsPlaybackProgressSnapshot>,
+        control: F,
+    ) -> Result<(), HlsCacheError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
         check_fill_control(&control)?;
         self.save_session(session)?;
-        self.prewarm_resource(client, &session.id, &session.variant.video, &control)
-            .await?;
+        let prefetch_context = hls_playback_prefetch_context(session, playback_progress);
+        self.prewarm_resource(
+            client,
+            &session.id,
+            &session.variant.video,
+            prefetch_context.as_ref(),
+            &control,
+        )
+        .await?;
         if let Some(audio) = &session.variant.audio {
-            self.prewarm_resource(client, &session.id, audio, &control)
-                .await?;
+            self.prewarm_resource(
+                client,
+                &session.id,
+                audio,
+                prefetch_context.as_ref(),
+                &control,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -898,6 +930,7 @@ impl HlsCacheStore {
         client: &reqwest::Client,
         session_id: &str,
         resource: &HlsMediaResource,
+        prefetch_context: Option<&HlsPlaybackPrefetchContext>,
         control: &F,
     ) -> Result<(), HlsCacheError>
     where
@@ -907,9 +940,9 @@ impl HlsCacheStore {
         if self.cached_resource(session_id, &resource.id).is_some() {
             return Ok(());
         }
+        let target = hls_prefetch_prefix_target(resource, prefetch_context);
         if let Some(prewarmed) = self.prewarmed_resource(session_id, &resource.id) {
-            let target_prefix_length =
-                hls_first_window_prefetch_prefix_bytes(resource).min(prewarmed.total_length);
+            let target_prefix_length = target.prefix_bytes.min(prewarmed.total_length);
             if prewarmed.prefix_length >= target_prefix_length {
                 return Ok(());
             }
@@ -923,7 +956,9 @@ impl HlsCacheStore {
         for url in resource_urls(resource) {
             check_fill_control(control)?;
             self.prepare_temp_path(&temp_path)?;
-            match download_resource_prefix(client, resource, &url, &temp_path, control).await {
+            match download_resource_prefix(client, resource, &url, &temp_path, target, control)
+                .await
+            {
                 Ok(prefix) => {
                     if prefix.initialization_length == 0
                         || prefix.initialization_length >= prefix.total_length
@@ -950,7 +985,7 @@ impl HlsCacheStore {
                         content_type: resource.content_type().to_owned(),
                         prefix_length: prefix.prefix_length,
                         target_prefix_length: Some(prefix.target_prefix_length),
-                        target_window_seconds: Some(HLS_FIRST_WINDOW_PREFETCH_SECONDS),
+                        target_window_seconds: Some(prefix.target_window_seconds),
                         total_length: prefix.total_length,
                         initialization_length: prefix.initialization_length,
                         cache_key: PersistedBilibiliMediaCacheKey::from(
@@ -1995,8 +2030,29 @@ async fn download_resource(
 struct DownloadedResourcePrefix {
     prefix_length: u64,
     target_prefix_length: u64,
+    target_window_seconds: u64,
     total_length: u64,
     initialization_length: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HlsPlaybackPrefetchContext {
+    position_seconds: f64,
+    duration_seconds: Option<f64>,
+    last_intent: PlaybackProgressIntent,
+}
+
+impl HlsPlaybackPrefetchContext {
+    fn should_extend_prefetch_window(self) -> bool {
+        matches!(self.last_intent, PlaybackProgressIntent::Seek)
+            || self.position_seconds >= HLS_FIRST_WINDOW_PREFETCH_SECONDS as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HlsPrefetchPrefixTarget {
+    prefix_bytes: u64,
+    window_seconds: u64,
 }
 
 async fn download_resource_prefix(
@@ -2004,10 +2060,11 @@ async fn download_resource_prefix(
     resource: &HlsMediaResource,
     url: &str,
     temp_path: &Path,
+    target: HlsPrefetchPrefixTarget,
     control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
 ) -> Result<DownloadedResourcePrefix, HlsCacheError> {
     check_fill_control(control)?;
-    let target_prefix_length = hls_first_window_prefetch_prefix_bytes(resource);
+    let target_prefix_length = target.prefix_bytes;
     let mut request = client.get(url).header(
         reqwest::header::RANGE,
         format!("bytes=0-{}", target_prefix_length - 1),
@@ -2107,33 +2164,118 @@ async fn download_resource_prefix(
     Ok(DownloadedResourcePrefix {
         prefix_length,
         target_prefix_length,
+        target_window_seconds: target.window_seconds,
         total_length,
         initialization_length,
     })
 }
 
+#[cfg(test)]
 fn hls_first_window_prefetch_prefix_bytes(resource: &HlsMediaResource) -> u64 {
+    hls_prefetch_prefix_target(resource, None).prefix_bytes
+}
+
+fn hls_prefetch_prefix_target(
+    resource: &HlsMediaResource,
+    playback: Option<&HlsPlaybackPrefetchContext>,
+) -> HlsPrefetchPrefixTarget {
+    let window_seconds = hls_prefetch_window_seconds(resource, playback);
+    let max_bytes = if window_seconds > HLS_FIRST_WINDOW_PREFETCH_SECONDS {
+        HLS_PLAYBACK_POSITION_PREFETCH_MAX_BYTES
+    } else {
+        HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES
+    };
     let bitrate_window_bytes = resource
         .request
         .bandwidth
         .map(|bandwidth_bits_per_second| {
             bandwidth_bits_per_second
-                .saturating_mul(HLS_FIRST_WINDOW_PREFETCH_SECONDS)
+                .saturating_mul(window_seconds)
                 .saturating_add(7)
                 / 8
         })
         .unwrap_or_default();
     let target = HLS_PREWARM_HEAD_BYTES
         .saturating_add(bitrate_window_bytes)
-        .clamp(HLS_PREWARM_HEAD_BYTES, HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES);
+        .clamp(HLS_PREWARM_HEAD_BYTES, max_bytes);
 
-    resource
+    let prefix_bytes = resource
         .request
         .size
         .filter(|size| *size > 0)
         .map(|size| target.min(size))
         .unwrap_or(target)
-        .max(1)
+        .max(1);
+
+    HlsPrefetchPrefixTarget {
+        prefix_bytes,
+        window_seconds,
+    }
+}
+
+fn hls_prefetch_window_seconds(
+    resource: &HlsMediaResource,
+    playback: Option<&HlsPlaybackPrefetchContext>,
+) -> u64 {
+    let Some(playback) = playback else {
+        return HLS_FIRST_WINDOW_PREFETCH_SECONDS;
+    };
+    let Some(position_seconds) = ceil_seconds(playback.position_seconds) else {
+        return HLS_FIRST_WINDOW_PREFETCH_SECONDS;
+    };
+    if !playback.should_extend_prefetch_window() {
+        return HLS_FIRST_WINDOW_PREFETCH_SECONDS;
+    }
+    let playback_window_end = position_seconds.saturating_add(HLS_FIRST_WINDOW_PREFETCH_SECONDS);
+    let duration_seconds = playback
+        .duration_seconds
+        .and_then(ceil_positive_seconds)
+        .or_else(|| resource.request.duration_seconds.map(u64::from));
+    let window_end = duration_seconds
+        .filter(|duration_seconds| *duration_seconds > 0)
+        .map(|duration_seconds| playback_window_end.min(duration_seconds))
+        .unwrap_or(playback_window_end);
+    window_end.max(HLS_FIRST_WINDOW_PREFETCH_SECONDS)
+}
+
+fn hls_playback_prefetch_context(
+    session: &HlsPlaybackSession,
+    snapshot: Option<&HlsPlaybackProgressSnapshot>,
+) -> Option<HlsPlaybackPrefetchContext> {
+    let snapshot = snapshot?;
+    if snapshot.state != HlsPlaybackActivityState::Active || snapshot.session_id != session.id {
+        return None;
+    }
+    let variant_id = snapshot.variant_id.trim();
+    if !variant_id.is_empty() && variant_id != session.variant.id {
+        return None;
+    }
+    if !snapshot.position_seconds.is_finite() || snapshot.position_seconds < 0.0 {
+        return None;
+    }
+
+    Some(HlsPlaybackPrefetchContext {
+        position_seconds: snapshot.position_seconds,
+        duration_seconds: snapshot
+            .duration_seconds
+            .filter(|duration_seconds| duration_seconds.is_finite() && *duration_seconds > 0.0),
+        last_intent: snapshot.last_intent,
+    })
+}
+
+fn ceil_seconds(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    if value >= u64::MAX as f64 {
+        return Some(u64::MAX);
+    }
+    Some(value.ceil() as u64)
+}
+
+fn ceil_positive_seconds(value: f64) -> Option<u64> {
+    let seconds = ceil_seconds(value)?;
+    (seconds > 0).then_some(seconds)
 }
 
 fn parse_content_range_header(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, u64)> {
@@ -3306,6 +3448,8 @@ mod tests {
         routing::get,
     };
     use tempfile::TempDir;
+
+    use crate::hls_playback_progress::PlaybackProgressIntent;
 
     use super::*;
 
@@ -4698,6 +4842,193 @@ mod tests {
         assert_eq!(
             HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES,
             hls_first_window_prefetch_prefix_bytes(&session.variant.video)
+        );
+    }
+
+    #[test]
+    fn playback_position_prefetch_target_extends_from_reported_position() {
+        let mut session = sample_session(
+            "session-position-prefetch",
+            "https://example.test/video.m4s",
+        );
+        session.variant.video.request.size = Some(64 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(800_000);
+        let context = HlsPlaybackPrefetchContext {
+            position_seconds: 90.0,
+            duration_seconds: Some(180.0),
+            last_intent: PlaybackProgressIntent::Seek,
+        };
+
+        let target = hls_prefetch_prefix_target(&session.variant.video, Some(&context));
+
+        assert_eq!(120, target.window_seconds);
+        assert_eq!(HLS_PREWARM_HEAD_BYTES + 12_000_000, target.prefix_bytes);
+        assert!(target.prefix_bytes > HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES);
+    }
+
+    #[test]
+    fn playback_position_prefetch_target_keeps_first_window_maximum_at_start() {
+        let mut session = sample_session(
+            "session-position-prefetch-start",
+            "https://example.test/video.m4s",
+        );
+        session.variant.video.request.size = Some(64 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(20_000_000);
+        let context = HlsPlaybackPrefetchContext {
+            position_seconds: 0.0,
+            duration_seconds: Some(180.0),
+            last_intent: PlaybackProgressIntent::Playing,
+        };
+
+        let target = hls_prefetch_prefix_target(&session.variant.video, Some(&context));
+
+        assert_eq!(HLS_FIRST_WINDOW_PREFETCH_SECONDS, target.window_seconds);
+        assert_eq!(HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES, target.prefix_bytes);
+    }
+
+    #[test]
+    fn playback_position_prefetch_target_keeps_first_window_maximum_near_start() {
+        let mut session = sample_session(
+            "session-position-prefetch-near-start",
+            "https://example.test/video.m4s",
+        );
+        session.variant.video.request.size = Some(64 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(20_000_000);
+        let context = HlsPlaybackPrefetchContext {
+            position_seconds: 0.1,
+            duration_seconds: Some(180.0),
+            last_intent: PlaybackProgressIntent::Playing,
+        };
+
+        let target = hls_prefetch_prefix_target(&session.variant.video, Some(&context));
+
+        assert_eq!(HLS_FIRST_WINDOW_PREFETCH_SECONDS, target.window_seconds);
+        assert_eq!(HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES, target.prefix_bytes);
+    }
+
+    #[test]
+    fn playback_position_prefetch_target_clamps_to_duration_and_position_maximum() {
+        let mut session = sample_session(
+            "session-position-prefetch-clamp",
+            "https://example.test/video.m4s",
+        );
+        session.variant.video.request.size = Some(64 * 1024 * 1024);
+        session.variant.video.request.bandwidth = Some(20_000_000);
+        let context = HlsPlaybackPrefetchContext {
+            position_seconds: 150.0,
+            duration_seconds: Some(160.0),
+            last_intent: PlaybackProgressIntent::Seek,
+        };
+
+        let target = hls_prefetch_prefix_target(&session.variant.video, Some(&context));
+
+        assert_eq!(160, target.window_seconds);
+        assert_eq!(
+            HLS_PLAYBACK_POSITION_PREFETCH_MAX_BYTES,
+            target.prefix_bytes
+        );
+    }
+
+    #[test]
+    fn playback_position_prefetch_context_requires_active_matching_session_and_variant() {
+        let session = sample_session("session-position-context", "https://example.test/video.m4s");
+        let matching = HlsPlaybackProgressSnapshot {
+            state: HlsPlaybackActivityState::Active,
+            message: String::new(),
+            session_id: session.id.clone(),
+            library_item_id: String::new(),
+            variant_id: session.variant.id.clone(),
+            playback_uri: String::new(),
+            position_seconds: 42.0,
+            duration_seconds: Some(120.0),
+            last_intent: PlaybackProgressIntent::Playing,
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        let stopped = HlsPlaybackProgressSnapshot {
+            state: HlsPlaybackActivityState::RecentlyStopped,
+            ..matching.clone()
+        };
+        let other_variant = HlsPlaybackProgressSnapshot {
+            variant_id: "hevc".to_owned(),
+            ..matching.clone()
+        };
+
+        assert_eq!(
+            Some(HlsPlaybackPrefetchContext {
+                position_seconds: 42.0,
+                duration_seconds: Some(120.0),
+                last_intent: PlaybackProgressIntent::Playing,
+            }),
+            hls_playback_prefetch_context(&session, Some(&matching))
+        );
+        assert_eq!(
+            None,
+            hls_playback_prefetch_context(&session, Some(&stopped))
+        );
+        assert_eq!(
+            None,
+            hls_playback_prefetch_context(&session, Some(&other_variant))
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_upgrades_first_window_prefix_after_playback_position_report() {
+        let (upstream_url, _task) = start_position_prewarm_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-position-window-upgrade", &upstream_url);
+        session.variant.video.request.size = Some(position_prefetch_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(800_000);
+        let client = reqwest::Client::new();
+
+        store
+            .prewarm_session_first_frame_with_control(&client, &session, || {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm first window");
+        let first_window = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("first prewarm metadata should load");
+
+        let playback_progress = HlsPlaybackProgressSnapshot {
+            state: HlsPlaybackActivityState::Active,
+            message: String::new(),
+            session_id: session.id.clone(),
+            library_item_id: String::new(),
+            variant_id: session.variant.id.clone(),
+            playback_uri: String::new(),
+            position_seconds: 90.0,
+            duration_seconds: Some(180.0),
+            last_intent: PlaybackProgressIntent::Seek,
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        store
+            .prewarm_session_first_frame_with_playback_progress(
+                &client,
+                &session,
+                Some(&playback_progress),
+                || HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("session should upgrade prewarm around playback position");
+        let positioned = store
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("position prewarm metadata should load");
+
+        assert_eq!(
+            HLS_FIRST_WINDOW_PREFETCH_SECONDS,
+            first_window.target_window_seconds
+        );
+        assert_eq!(120, positioned.target_window_seconds);
+        assert!(positioned.prefix_length > first_window.prefix_length);
+        assert_eq!(
+            hls_prefetch_prefix_target(
+                &session.variant.video,
+                hls_playback_prefetch_context(&session, Some(&playback_progress)).as_ref(),
+            )
+            .prefix_bytes,
+            positioned.prefix_length
         );
     }
 
@@ -6145,6 +6476,13 @@ mod tests {
             .await
     }
 
+    async fn start_position_prewarm_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_position_prewarm_mp4)),
+        )
+        .await
+    }
+
     async fn start_headers_stalled_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
         start_hls_cache_upstream(
             Router::new().route("/video.m4s", get(upstream_headers_stalled_mp4)),
@@ -6220,6 +6558,10 @@ mod tests {
 
     async fn upstream_large_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
         upstream_prewarm_mp4_bytes(headers, large_prefetch_fake_mp4())
+    }
+
+    async fn upstream_position_prewarm_mp4(headers: HeaderMap) -> Response<Body> {
+        upstream_prewarm_mp4_bytes(headers, position_prefetch_fake_mp4())
     }
 
     fn upstream_prewarm_mp4_bytes(headers: HeaderMap, body: Vec<u8>) -> Response<Body> {
@@ -6659,6 +7001,18 @@ mod tests {
         bytes.extend(mp4_box(
             *b"mdat",
             &vec![0x55; usize::try_from(HLS_FIRST_WINDOW_PREFETCH_MAX_BYTES).unwrap()],
+        ));
+        bytes
+    }
+
+    fn position_prefetch_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(
+            *b"mdat",
+            &vec![0x55; usize::try_from(16 * 1024 * 1024).unwrap()],
         ));
         bytes
     }
