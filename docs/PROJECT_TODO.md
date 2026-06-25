@@ -5,7 +5,15 @@
 - [completed] PR 3：实现 LAN transcoding execution MVP，包括 ffmpeg/job runner、落盘恢复、取消和输出 HLS manifest。
 - [completed] PR 4：基于 fMP4 segment metadata 实现安全的 segment-index HLS playlist splitting。
 - [completed] PR 5：加入 playback-position-aware control-plane 上报和 weak/offline cache status UX foundation。
-- [pending] PR 6：完善 multi-result batch cache finalization、sidecar controls 和 download options UX。
+- [completed] PR 6：完善 multi-result batch cache finalization、sidecar controls 和 download options UX。
+- [completed] Next PR 0：清理 tracker 并记录下一阶段 productization roadmap。
+- [pending] Next PR 1：增加 macOS validation/operator UX，用 macOS 作为真实 Bilibili/credential/proxy/HLS 验证前端。
+- [pending] Next PR 2：基于已上报的 playback position 调整 segment fill/prefetch scheduling。
+- [pending] Next PR 3：补齐 weak/offline playback UX，包括 cache-only、partially cached、quota-blocked、upstream-failed、retrying 和 variant downgrade/recovery 状态。
+- [pending] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。
+- [pending] Next PR 5：扩展 authenticated/restricted live validation，覆盖 history、watch-later、following/dynamic、restricted Bangumi 和 collection/list cases。
+- [pending] Next PR 7：增加 transcoding/ABR policy controls；这是用户批准的非线性执行顺序，先于 deferred schema PR 6 推进播放策略产品化。
+- [pending] Deferred/non-sequential Next PR 6：Bilibili task options/result schema v2；开始实现前先暂停讨论 schema。
 - [completed] PR 9：推进 segment-level fill / prefetch。
 - [completed] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [completed] PR 11：增加 LAN transcoding foundation。

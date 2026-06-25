@@ -1,9 +1,9 @@
 ---
 id: 20260621-c9f0a2
 title: BBDown 0.5 And Progressive HLS Roadmap
-status: active
+status: completed
 created: 2026-06-21
-updated: 2026-06-22
+updated: 2026-06-24
 branch: wip/bbdown-050-roadmap-upgrade
 pr:
 supersedes:
@@ -11,7 +11,7 @@ supersedes:
   - 20260614-f3a9d1
   - 20260616-a9d4c1
   - 20260619-b7e3f1
-superseded_by:
+superseded_by: 20260622-f4a7b2
 ---
 
 # BBDown 0.5 And Progressive HLS Roadmap

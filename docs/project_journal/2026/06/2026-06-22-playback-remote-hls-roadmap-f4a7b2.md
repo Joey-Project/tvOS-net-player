@@ -1,14 +1,14 @@
 ---
 id: 20260622-f4a7b2
 title: Playback Controls Remote Endpoint And HLS Execution Roadmap
-status: active
+status: completed
 created: 2026-06-22
 updated: 2026-06-24
 branch:
 pr:
 supersedes:
   - 20260621-c9f0a2
-superseded_by:
+superseded_by: 20260624-a8d2c5
 ---
 
 # Playback Controls Remote Endpoint And HLS Execution Roadmap
@@ -78,7 +78,7 @@ superseded_by:
 
 ### PR 6: Batch Cache Finalization And Sidecar Options UX
 
-- Status: in progress.
+- Status: completed by the batch-cache/download-options slice.
 - Extend server-side HLS cache finalization so every playable selected result can be finalized, restored, and authorized as a completed cache item, not only the task's primary playback session.
 - Keep primary playback completion behavior unchanged: the task-level playback source and library item still represent the primary playback session, while secondary completed results retain their own result-level library item metadata.
 - Add Swift cache-client model and gRPC mapping for complete-download `BilibiliDownloadOptions`, including subtitle, danmaku, cover, danmaku format, subtitle AI policy, and audio-language fields.
