@@ -8,6 +8,7 @@ struct ContentView: View {
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
+    @ObservedObject var diagnosticsModel: CacheServerDiagnosticsViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
     @State private var isAutoDiscoveryConnecting = false
@@ -24,9 +25,16 @@ struct ContentView: View {
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onAppear {
             discoveryModel.start()
+            diagnosticsModel.useServerAddressText(cacheModel.serverAddressText)
             Task {
+                if cacheModel.hasServerAddress {
+                    await diagnosticsModel.refresh()
+                }
                 await autoConnectDiscoveredServerIfNeeded()
             }
+        }
+        .onChange(of: cacheModel.serverAddressText) { _, newValue in
+            diagnosticsModel.useServerAddressText(newValue)
         }
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
@@ -85,13 +93,13 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder)
                 .onSubmit {
                     Task {
-                        await cacheModel.refresh()
+                        await refreshCacheAndDiagnostics()
                     }
                 }
 
                 Button {
                     Task {
-                        await cacheModel.refresh()
+                        await refreshCacheAndDiagnostics()
                     }
                 } label: {
                     Label(cacheModel.isLoading ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
@@ -106,13 +114,13 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit {
                         Task {
-                            await cacheModel.refresh()
+                            await refreshCacheAndDiagnostics()
                         }
                     }
 
                 Button {
                     Task {
-                        await cacheModel.refresh()
+                        await refreshCacheAndDiagnostics()
                     }
                 } label: {
                     Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
@@ -231,6 +239,7 @@ struct ContentView: View {
             }
 
             manualStreamControls
+            operatorDiagnostics
             bilibiliControls
             selectedCacheItemControls
             playbackArea
@@ -271,6 +280,64 @@ struct ContentView: View {
             .padding(.top, 4)
         } label: {
             Label("Stream URL", systemImage: "link")
+        }
+    }
+
+    private var operatorDiagnostics: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(diagnosticsModel.statusMessage)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+
+                        if let errorMessage = diagnosticsModel.errorMessage {
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .lineLimit(2)
+                        }
+                    }
+
+                    Spacer()
+
+                    if diagnosticsModel.isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Button {
+                        Task {
+                            await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
+                        }
+                    } label: {
+                        Label("Refresh Diagnostics", systemImage: "stethoscope")
+                    }
+                    .disabled(!diagnosticsModel.canRefresh)
+                }
+
+                if diagnosticsModel.rows.isEmpty {
+                    ContentUnavailableView("No Diagnostics Loaded", systemImage: "stethoscope")
+                        .frame(maxWidth: .infinity, minHeight: 96)
+                } else {
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.adaptive(minimum: 240), alignment: .top)
+                        ],
+                        alignment: .leading,
+                        spacing: 10
+                    ) {
+                        ForEach(diagnosticsModel.rows) { row in
+                            CacheServerDiagnosticTile(row: row)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Cache Server Diagnostics", systemImage: "wrench.and.screwdriver")
         }
     }
 
@@ -692,7 +759,20 @@ struct ContentView: View {
     private func selectDiscoveredServer(_ server: DiscoveredCacheServer) async -> CacheLibraryRefreshResult {
         discoveryModel.select(server)
         cacheModel.useDiscoveredServer(server)
-        return await cacheModel.refresh()
+        let result = await cacheModel.refresh()
+        if result != .superseded {
+            await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
+        }
+        return result
+    }
+
+    @discardableResult
+    private func refreshCacheAndDiagnostics() async -> CacheLibraryRefreshResult {
+        let result = await cacheModel.refresh()
+        if result != .superseded {
+            await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
+        }
+        return result
     }
 
     private func autoConnectDiscoveredServerIfNeeded() async {
@@ -832,6 +912,9 @@ struct ContentView: View {
     private func refreshPlaybackProgressStatus() async {
         await model.flushPlaybackProgressReports()
         await cacheModel.refreshHLSCacheStatus()
+        if cacheModel.hasServerAddress {
+            await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
+        }
     }
 }
 
@@ -955,6 +1038,53 @@ private struct BilibiliFetchNoticeRow: View {
             Image(systemName: notice.systemImage)
         }
         .foregroundStyle(color)
+    }
+}
+
+private struct CacheServerDiagnosticTile: View {
+    let row: CacheServerDiagnosticRow
+
+    private var color: Color {
+        switch row.severity {
+        case .ready:
+            return .green
+        case .info:
+            return .blue
+        case .warning:
+            return .orange
+        case .error:
+            return .red
+        case .unknown:
+            return .secondary
+        }
+    }
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(row.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Text(row.value)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+
+                if let detail = row.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        } icon: {
+            Image(systemName: row.systemImage)
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

@@ -1,3 +1,5 @@
+import Foundation
+
 public struct CacheLibraryItemsPage: Equatable, Sendable {
     public let items: [CacheLibraryItem]
     public let nextPageToken: String
@@ -14,6 +16,7 @@ public struct CacheLibraryItemsPage: Equatable, Sendable {
 
 public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
+    func checkHealth() async throws -> CacheHealthStatus
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
@@ -53,6 +56,7 @@ public protocol CacheControlClient: Sendable {
 }
 
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
+    case healthCheck
     case hlsCacheStatus
     case bilibiliCredentialStatus
     case bilibiliResolve
@@ -62,6 +66,10 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
 }
 
 public extension CacheControlClient {
+    func checkHealth() async throws -> CacheHealthStatus {
+        throw CacheControlClientUnsupportedFeature.healthCheck
+    }
+
     func getHLSCacheStatus() async throws -> HLSCacheStatus {
         throw CacheControlClientUnsupportedFeature.hlsCacheStatus
     }
@@ -135,5 +143,26 @@ public extension CacheControlClient {
 
     func watchTask(id: String) async -> AsyncThrowingStream<CacheTask, Error> {
         await watchTasks(ids: [id])
+    }
+}
+
+extension CacheControlClientUnsupportedFeature: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .healthCheck:
+            return "Health check is not supported by this cache server."
+        case .hlsCacheStatus:
+            return "HLS cache status is not supported by this cache server."
+        case .bilibiliCredentialStatus:
+            return "Bilibili credential status is not supported by this cache server."
+        case .bilibiliResolve:
+            return "Bilibili resolve is not supported by this cache server."
+        case .bilibiliDownloadTask:
+            return "Bilibili download tasks are not supported by this cache server."
+        case .bilibiliTaskSelection:
+            return "Bilibili task selection is not supported by this cache server."
+        case .playbackProgressReporting:
+            return "Playback progress reporting is not supported by this cache server."
+        }
     }
 }

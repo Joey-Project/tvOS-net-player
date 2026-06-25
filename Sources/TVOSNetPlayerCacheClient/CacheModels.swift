@@ -244,6 +244,30 @@ public struct CacheServerSummary: Equatable, Sendable {
     }
 }
 
+public struct CacheHealthStatus: Equatable, Sendable {
+    public let state: String
+    public let message: String
+    public let checkedAt: Date?
+
+    public init(state: String, message: String, checkedAt: Date?) {
+        self.state = state
+        self.message = message
+        self.checkedAt = checkedAt
+    }
+
+    public var isServing: Bool {
+        state.normalizedCacheProtocolName.removingHealthStatePrefix == "serving"
+    }
+
+    public var isDegraded: Bool {
+        state.normalizedCacheProtocolName.removingHealthStatePrefix == "degraded"
+    }
+
+    public var isNotServing: Bool {
+        state.normalizedCacheProtocolName.removingHealthStatePrefix == "notserving"
+    }
+}
+
 public enum CacheServerCapability {
     public static let bilibiliCredentialStatus = "bilibiliCredentialStatus"
     public static let bilibiliResolve = "bilibiliResolve"
@@ -1186,6 +1210,15 @@ extension String {
 
     fileprivate var removingPlaybackActivityStatePrefix: String {
         let prefix = "hlsplaybackactivitystate"
+        guard hasPrefix(prefix) else {
+            return self
+        }
+
+        return String(dropFirst(prefix.count))
+    }
+
+    fileprivate var removingHealthStatePrefix: String {
+        let prefix = "healthstate"
         guard hasPrefix(prefix) else {
             return self
         }

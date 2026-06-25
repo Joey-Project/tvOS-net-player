@@ -7,7 +7,7 @@
 - [completed] PR 5：加入 playback-position-aware control-plane 上报和 weak/offline cache status UX foundation。
 - [completed] PR 6：完善 multi-result batch cache finalization、sidecar controls 和 download options UX。
 - [completed] Next PR 0：清理 tracker 并记录下一阶段 productization roadmap。
-- [pending] Next PR 1：增加 macOS validation/operator UX，用 macOS 作为真实 Bilibili/credential/proxy/HLS 验证前端。
+- [completed] Next PR 1：增加 macOS validation/operator UX，用 macOS 作为真实 Bilibili/credential/proxy/HLS 验证前端。
 - [pending] Next PR 2：基于已上报的 playback position 调整 segment fill/prefetch scheduling。
 - [pending] Next PR 3：补齐 weak/offline playback UX，包括 cache-only、partially cached、quota-blocked、upstream-failed、retrying 和 variant downgrade/recovery 状态。
 - [pending] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。

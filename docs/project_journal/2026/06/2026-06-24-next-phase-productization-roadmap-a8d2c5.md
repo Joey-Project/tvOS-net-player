@@ -3,7 +3,7 @@ id: 20260624-a8d2c5
 title: Next Phase Productization Roadmap
 status: active
 created: 2026-06-24
-updated: 2026-06-24
+updated: 2026-06-25
 branch: wip/next-phase-roadmap
 pr:
 supersedes:
@@ -24,7 +24,7 @@ superseded_by:
 ## Current State
 
 - PRs through `Batch Cache Finalization And Sidecar Options UX` are complete on the repository default branch advertised by `origin/HEAD`.
-- The app supports Bonjour/manual/remote HTTPS cache endpoints, shared tvOS/macOS player controls, progressive Bilibili HLS playback, completed-HLS offline cache, quota/watermark eviction, adaptive weak-network policy, playback-position reporting, LAN transcoding execution MVP, segment-index playlist splitting, multi-result Bilibili selection, and complete-download sidecar/options controls.
+- The app supports Bonjour/manual/remote HTTPS cache endpoints, shared tvOS/macOS player controls, macOS validation/operator diagnostics, progressive Bilibili HLS playback, completed-HLS offline cache, quota/watermark eviction, adaptive weak-network policy, playback-position reporting, LAN transcoding execution MVP, segment-index playlist splitting, multi-result Bilibili selection, and complete-download sidecar/options controls.
 - The live e2e skill has canonical ordinary video, multi-part video, Bangumi media, Bangumi episode, authenticated page-fetch, and collection/list fixture definitions. Restricted and authenticated cases remain opt-in because they depend on local credentials, proxy availability, and account state.
 - `docs/PROJECT_TODO.md` is the cross-workstream backlog entrypoint. This journal is the durable plan for the next PR sequence.
 
@@ -39,10 +39,10 @@ superseded_by:
 
 ### PR 1: macOS Validation Operator UX
 
-- Add a macOS-first validation/operator surface for LAN cache server diagnostics.
-- Surface server connection state, capabilities, credential readiness, restricted-area proxy readiness, cache root/quota summary, and live e2e readiness without exposing secret paths or secret values.
-- Prefer actionable states and retry/recheck actions over raw logs.
-- Preserve tvOS functional parity where user-facing status matters, but keep macOS as the richer validation surface.
+- Status: completed by the `wip/macos-validation-operator-ux` slice.
+- Added shared AppCore diagnostics state for server info, health, capabilities, credential readiness, restricted-area proxy readiness, cache root/quota summary, HLS cache status, weak-network state, transcoding runtime state, playback signal, and live validation readiness without exposing secret paths or secret values.
+- Added a macOS diagnostics panel with explicit refresh/recheck controls.
+- Preserved tvOS behavior; macOS is the richer validation surface for this slice.
 
 ### PR 2: Playback-Position-Aware Segment Scheduling
 
@@ -109,6 +109,7 @@ superseded_by:
 
 ## Evidence
 
+- PR 1 focused validation: `swift test --filter CacheServerDiagnosticsViewModelTests`, `scripts/build-macos.sh`, `scripts/test-macos.sh`.
 - Previous roadmap: `docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - Current architecture note: `docs/architecture/cache-server.md`
 - Current repo state entrypoint: `docs/PROJECT_STATE.md`

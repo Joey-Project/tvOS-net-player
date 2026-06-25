@@ -16,11 +16,13 @@ final class AppShellIntegrationTests: XCTestCase {
         let cacheModel = CacheLibraryViewModel(defaults: defaults)
         let bilibiliModel = BilibiliTaskViewModel()
         let discoveryModel = CacheServerDiscoveryViewModel()
+        let diagnosticsModel = CacheServerDiagnosticsViewModel()
         let view = ContentView(
             model: playerModel,
             cacheModel: cacheModel,
             discoveryModel: discoveryModel,
-            bilibiliModel: bilibiliModel
+            bilibiliModel: bilibiliModel,
+            diagnosticsModel: diagnosticsModel
         )
 
         _ = view.body
@@ -28,5 +30,6 @@ final class AppShellIntegrationTests: XCTestCase {
         XCTAssertEqual(playerModel.streamURLText, "")
         XCTAssertEqual(cacheModel.serverAddressText, "")
         XCTAssertEqual(bilibiliModel.sourceText, "")
+        XCTAssertEqual(diagnosticsModel.statusMessage, "Diagnostics not loaded.")
     }
 }
