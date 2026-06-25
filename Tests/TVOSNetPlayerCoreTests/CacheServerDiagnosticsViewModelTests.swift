@@ -143,6 +143,7 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
                 mediaBaseURIs: [],
                 capabilities: [
                     CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliTaskSelection,
                     CacheServerCapability.bilibiliCredentialStatus,
                 ]
             ),
@@ -171,6 +172,85 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.row(id: "liveValidation")?.value, "Public only")
         XCTAssertEqual(model.row(id: "liveValidation")?.severity, .info)
         XCTAssertTrue(model.row(id: "liveValidation")?.detail?.contains("web cookie") == true)
+    }
+
+    func testLiveValidationRequiresTaskSelectionCapability() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                ]
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: true,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 1,
+                restrictedAPIProxyCount: 1,
+                checkedAt: nil
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "liveValidation")?.value, "Selection unavailable")
+        XCTAssertEqual(model.row(id: "liveValidation")?.severity, .unknown)
+        XCTAssertTrue(model.row(id: "liveValidation")?.detail?.contains("task selection") == true)
+    }
+
+    func testLiveValidationRequiresRestrictedAPIProxyForRestrictedReady() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliTaskSelection,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                ]
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: true,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 2,
+                restrictedAPIProxyCount: 0,
+                checkedAt: nil
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "liveValidation")?.value, "Authenticated-ready")
+        XCTAssertEqual(model.row(id: "liveValidation")?.severity, .warning)
+        XCTAssertTrue(model.row(id: "liveValidation")?.detail?.contains("API proxy") == true)
     }
 
     func testTranscodingUnspecifiedRuntimeStateIsNotReady() async {
@@ -217,6 +297,95 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.row(id: "transcoding")?.value, "Unknown")
         XCTAssertEqual(model.row(id: "transcoding")?.severity, .unknown)
         XCTAssertTrue(model.row(id: "transcoding")?.detail?.contains("UNSPECIFIED") == true)
+    }
+
+    func testDisabledTranscodingWithoutCapabilityDoesNotAddRow() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: []
+            ),
+            hlsCacheStatus: HLSCacheStatus(
+                evictionEnabled: true,
+                maxBytes: 100_000_000,
+                highWatermarkPercent: 90,
+                lowWatermarkPercent: 70,
+                highWatermarkBytes: 90_000_000,
+                lowWatermarkBytes: 70_000_000,
+                usedBytes: 42_000_000,
+                completedSessionCount: 3,
+                lastEviction: nil,
+                weakNetwork: nil,
+                transcoding: LanTranscodingStatus(
+                    enabled: false,
+                    state: "LAN_TRANSCODING_RUNTIME_STATE_DISABLED",
+                    message: "",
+                    profileID: "apple-tv-h264",
+                    targetContainer: "fmp4",
+                    targetVideoCodec: "h264",
+                    targetAudioCodec: "aac",
+                    maxConcurrentJobs: 1,
+                    activeJobCount: 0
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertNil(model.row(id: "transcoding"))
+    }
+
+    func testDisabledTranscodingCapabilityIsInformational() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [CacheServerCapability.lanTranscoding]
+            ),
+            hlsCacheStatus: HLSCacheStatus(
+                evictionEnabled: true,
+                maxBytes: 100_000_000,
+                highWatermarkPercent: 90,
+                lowWatermarkPercent: 70,
+                highWatermarkBytes: 90_000_000,
+                lowWatermarkBytes: 70_000_000,
+                usedBytes: 42_000_000,
+                completedSessionCount: 3,
+                lastEviction: nil,
+                weakNetwork: nil,
+                transcoding: LanTranscodingStatus(
+                    enabled: false,
+                    state: "LAN_TRANSCODING_RUNTIME_STATE_DISABLED",
+                    message: "",
+                    profileID: "apple-tv-h264",
+                    targetContainer: "fmp4",
+                    targetVideoCodec: "h264",
+                    targetAudioCodec: "aac",
+                    maxConcurrentJobs: 1,
+                    activeJobCount: 0
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "transcoding")?.value, "Disabled")
+        XCTAssertEqual(model.row(id: "transcoding")?.severity, .info)
     }
 
     func testRefreshRejectsInvalidAddress() async {

@@ -128,7 +128,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
         if let weakNetwork = hlsCacheStatus?.weakNetwork {
             rows.append(weakNetworkRow(weakNetwork))
         }
-        if serverInfo.supportsLanTranscoding || hlsCacheStatus?.transcoding != nil {
+        if serverInfo.supportsLanTranscoding {
             rows.append(transcodingRow(hlsCacheStatus?.transcoding))
         }
         if let playback = hlsCacheStatus?.playback, playback.isActive || playback.isRecentlyStopped {
@@ -369,6 +369,17 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
             )
         }
 
+        guard serverInfo.supportsBilibiliTaskSelection else {
+            return CacheServerDiagnosticRow(
+                id: "liveValidation",
+                title: "Live Validation",
+                value: "Selection unavailable",
+                detail: "Live validation needs Bilibili task selection capability.",
+                systemImage: "checklist",
+                severity: .unknown
+            )
+        }
+
         guard let credentialStatus else {
             return CacheServerDiagnosticRow(
                 id: "liveValidation",
@@ -382,9 +393,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
 
         let hasAuthenticatedCredential =
             credentialStatus.credentialFileLoaded && credentialStatus.hasWebCookie
-        let hasRestrictedProxy =
-            credentialStatus.restrictedPlayURLProxyCount > 0
-            || credentialStatus.restrictedAPIProxyCount > 0
+        let hasRestrictedProxy = credentialStatus.restrictedAPIProxyCount > 0
 
         if hasAuthenticatedCredential && hasRestrictedProxy {
             return CacheServerDiagnosticRow(
@@ -401,7 +410,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
                 id: "liveValidation",
                 title: "Live Validation",
                 value: "Authenticated-ready",
-                detail: "Restricted Bangumi validation still needs a restricted-area proxy.",
+                detail: "Restricted Bangumi validation still needs a restricted API proxy.",
                 systemImage: "checklist",
                 severity: .warning
             )
@@ -506,7 +515,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
         let severity: CacheServerDiagnosticSeverity
         if !status.enabled || normalizedState == "disabled" {
             value = "Disabled"
-            severity = .unknown
+            severity = .info
         } else if normalizedState == "idle" {
             value = "Ready"
             severity = .ready

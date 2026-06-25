@@ -760,7 +760,7 @@ struct ContentView: View {
         discoveryModel.select(server)
         cacheModel.useDiscoveredServer(server)
         let result = await cacheModel.refresh()
-        if result == .succeeded {
+        if result != .superseded {
             await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
         }
         return result
@@ -769,7 +769,7 @@ struct ContentView: View {
     @discardableResult
     private func refreshCacheAndDiagnostics() async -> CacheLibraryRefreshResult {
         let result = await cacheModel.refresh()
-        if result == .succeeded {
+        if result != .superseded {
             await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
         }
         return result
@@ -912,6 +912,9 @@ struct ContentView: View {
     private func refreshPlaybackProgressStatus() async {
         await model.flushPlaybackProgressReports()
         await cacheModel.refreshHLSCacheStatus()
+        if cacheModel.hasServerAddress {
+            await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
+        }
     }
 }
 
