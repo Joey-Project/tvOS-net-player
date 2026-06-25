@@ -64,7 +64,7 @@ superseded_by:
 
 - Status: completed by the `wip/weak-offline-playback-ux` slice.
 - Added shared AppCore cache status badges for global HLS quota and weak-network states.
-- Surfaced cache-only playback, quota-blocked cleanup, upstream-failed, retrying upstream, variant-downgraded, network-recovered, and playback-position-protected states through tvOS/macOS cache panels.
+- Surfaced cache-only playback, quota-blocked cleanup, upstream-failed, retrying upstream, variant-downgraded, unknown active fallback, and playback-position-protected states through tvOS/macOS cache panels.
 - Reused the same shared presentation in macOS operator diagnostics so weak-network rows show concrete values instead of a generic active/normal label.
 - Tightened progressive Bilibili task badges for partially cached, quota-blocked, upstream-failed, and retrying offline-cache states.
 - Kept this PR focused on UX/state semantics; no protobuf, media-plane, or scheduler changes.
