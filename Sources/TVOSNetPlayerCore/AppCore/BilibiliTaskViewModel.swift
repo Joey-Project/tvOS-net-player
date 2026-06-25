@@ -1789,6 +1789,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     label: "Offline ready", systemImage: "externaldrive.fill.badge.checkmark")
             }
 
+            if let failureBadge = multiResultOfflineCacheFailureBadge(for: task, summary: summary) {
+                return failureBadge
+            }
+
             if summary.cachedCount > 0 {
                 return ProgressiveCacheStatusBadge(
                     label: "\(summary.cachedCount) of \(summary.totalCount) offline ready",
@@ -1813,16 +1817,39 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if task.isFailedBilibiliTaskState {
+            if task.message.isQuotaOrStorageFailureMessage {
+                return ProgressiveCacheStatusBadge(label: "Quota blocked", systemImage: "externaldrive.badge.xmark")
+            }
+            if task.message.isUpstreamOrNetworkFailureMessage {
+                return ProgressiveCacheStatusBadge(label: "Upstream failed", systemImage: "wifi.slash")
+            }
             return ProgressiveCacheStatusBadge(
-                label: task.message.isQuotaOrStorageFailureMessage ? "Quota blocked" : "Cache failed",
+                label: "Cache failed",
                 systemImage: "exclamationmark.triangle"
             )
         }
 
         if task.isPlayableBilibiliTaskState {
             let normalizedMessage = task.message.lowercased()
-            if normalizedMessage.contains("failed") {
-                return ProgressiveCacheStatusBadge(label: "Cache failed; playable online", systemImage: "wifi")
+            if task.message.isQuotaOrStorageFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Quota blocked; playable online",
+                    systemImage: "externaldrive.badge.xmark"
+                )
+            }
+            if task.message.isOfflineCacheRetryMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Retrying offline cache", systemImage: "arrow.clockwise.circle")
+            }
+            if task.message.isUpstreamOrNetworkFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Upstream failed; cache may be partial", systemImage: "wifi.slash")
+            }
+            if task.message.isGenericFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Cache failed; playable online",
+                    systemImage: "exclamationmark.triangle"
+                )
             }
             if normalizedMessage.contains("paused") || normalizedMessage.contains("queued") {
                 return ProgressiveCacheStatusBadge(label: "Offline fill queued", systemImage: "clock")
@@ -1832,7 +1859,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
             if let percent = task.offlineCachePercentLabel {
                 return ProgressiveCacheStatusBadge(
-                    label: "Filling offline cache \(percent)", systemImage: "arrow.down.circle")
+                    label: "Partially cached \(percent)", systemImage: "arrow.down.circle")
             }
 
             return ProgressiveCacheStatusBadge(label: "Playable online; caching", systemImage: "wifi")
@@ -1844,6 +1871,60 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         return nil
+    }
+
+    private static func multiResultOfflineCacheFailureBadge(
+        for task: CacheTask,
+        summary: BilibiliTaskResultSummary
+    ) -> ProgressiveCacheStatusBadge? {
+        guard summary.failedCount > 0 else {
+            return nil
+        }
+
+        let failedCacheMessages = task.resultItems
+            .filter(\.isFailedBilibiliResultState)
+            .map(\.message)
+            .filter(\.isOfflineCacheFailureMessage)
+        guard !failedCacheMessages.isEmpty else {
+            return nil
+        }
+
+        let suffix = multiResultFailureBadgeSuffix(summary)
+        if failedCacheMessages.contains(where: \.isQuotaOrStorageFailureMessage) {
+            return ProgressiveCacheStatusBadge(
+                label: "Quota blocked\(suffix)",
+                systemImage: "externaldrive.badge.xmark"
+            )
+        }
+        if failedCacheMessages.contains(where: \.isOfflineCacheRetryMessage) {
+            return ProgressiveCacheStatusBadge(
+                label: "Retrying offline cache\(suffix)",
+                systemImage: "arrow.clockwise.circle"
+            )
+        }
+        if failedCacheMessages.contains(where: \.isUpstreamOrNetworkFailureMessage) {
+            return ProgressiveCacheStatusBadge(
+                label: "Upstream failed\(suffix)",
+                systemImage: "wifi.slash"
+            )
+        }
+        if failedCacheMessages.contains(where: \.isGenericFailureMessage) {
+            return ProgressiveCacheStatusBadge(
+                label: "Cache failed\(suffix)",
+                systemImage: "exclamationmark.triangle"
+            )
+        }
+        return nil
+    }
+
+    private static func multiResultFailureBadgeSuffix(_ summary: BilibiliTaskResultSummary) -> String {
+        if summary.cachedCount > 0 {
+            return "; \(summary.cachedCount) of \(summary.totalCount) offline ready"
+        }
+        if summary.readyCount > 0 {
+            return "; partial result success"
+        }
+        return ""
     }
 
     private static func singleSelection(for selectionID: String) -> BilibiliTaskSelection {
@@ -2371,6 +2452,46 @@ private extension String {
             || normalized.contains("storage")
             || normalized.contains("disk")
             || normalized.contains("no space")
+    }
+
+    var isUpstreamOrNetworkFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("upstream")
+            || normalized.contains("network")
+            || normalized.contains("timed out")
+            || normalized.contains("timeout")
+            || normalized.contains("connection")
+    }
+
+    var isOfflineCacheFailureMessage: Bool {
+        return isQuotaOrStorageFailureMessage
+            || isUpstreamOrNetworkFailureMessage
+            || isOfflineCacheContextMessage
+    }
+
+    var isOfflineCacheRetryMessage: Bool {
+        isRetryingFailureMessage && isOfflineCacheContextMessage
+    }
+
+    var isOfflineCacheContextMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("offline cache")
+            || normalized.contains("cache fill")
+            || normalized.contains("cache-fill")
+            || normalized.contains("cache offline")
+    }
+
+    var isRetryingFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("retry")
+            || normalized.contains("backup url")
+            || normalized.contains("backup urls")
+    }
+
+    var isGenericFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("failed")
+            || normalized.contains("failure")
     }
 }
 

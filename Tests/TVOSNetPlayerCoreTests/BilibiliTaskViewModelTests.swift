@@ -1496,7 +1496,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         XCTAssertTrue(model.canPlay)
-        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Filling offline cache 25%")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Partially cached 25%")
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "arrow.down.circle")
 
         model.clearTask()
@@ -1514,8 +1514,81 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         XCTAssertTrue(model.canPlay)
-        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Filling offline cache 45%")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Partially cached 45%")
         XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "arrow.down.circle")
+
+        model.clearTask()
+    }
+
+    func testPlayableTaskShowsQuotaBlockedBadgeWhenOfflineFillHitsWatermark() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(message: "Offline cache fill paused because HLS quota watermark was reached."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1quota",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Quota blocked; playable online")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.xmark")
+
+        model.clearTask()
+    }
+
+    func testPlayableTaskShowsRetryingOfflineCacheBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(message: "Retrying offline cache fill with backup URLs."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1retry",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Retrying offline cache")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "arrow.clockwise.circle")
+
+        model.clearTask()
+    }
+
+    func testPlayableTaskShowsUpstreamFailedPartialCacheBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.playableFixture(message: "Playable online; offline cache fill failed: upstream failed."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1upstream",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Upstream failed; cache may be partial")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "wifi.slash")
+
+        model.clearTask()
+    }
+
+    func testPlayableTaskShowsGenericCacheFailedBadgeWhenOfflineFillFails() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(message: "Playable online; some Bilibili playback results failed to cache offline."))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1failed",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Cache failed; playable online")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "exclamationmark.triangle")
 
         model.clearTask()
     }
@@ -2016,7 +2089,52 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
         XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
         XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Upstream failed; 1 of 2 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "wifi.slash")
         XCTAssertFalse(model.isWatching)
+    }
+
+    func testCompletedMultiResultTaskDoesNotTreatPlanningRetryAsOfflineCacheRetry() async {
+        let primaryLibraryItemID = "bilibili.hls.bilibili-playback-1"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: primaryLibraryItemID
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_FAILED",
+                message:
+                    "Selected Bilibili item no longer matches the resolved candidate. Resolve the input again and retry."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    message: "Completed offline; some Bilibili playback results failed.",
+                    libraryItemID: primaryLibraryItemID,
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1planning-retry",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "1 of 2 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
     }
 
     func testMultiResultTaskShowsFailureStatusBeforeAnyResultIsReady() async {
@@ -2116,8 +2234,29 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Quota blocked")
-        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "exclamationmark.triangle")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.xmark")
         XCTAssertNil(model.fetchNotice)
+    }
+
+    func testFailedTaskWithUpstreamFailureShowsUpstreamFailedBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    source: "BV1upstream",
+                    state: "TASK_STATE_FAILED",
+                    message: "Offline cache fill failed: upstream failed."
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1upstream",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Upstream failed")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "wifi.slash")
+        XCTAssertEqual(model.fetchNotice?.title, "Retry available")
     }
 
     func testDuplicateSubmitWhileSubmittingDoesNotInvalidateInFlightSubmission() async {

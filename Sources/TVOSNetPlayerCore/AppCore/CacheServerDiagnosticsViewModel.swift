@@ -463,39 +463,26 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
             let evicted = ByteCountFormatter.string(fromByteCount: eviction.evictedBytes, countStyle: .file)
             detailParts.append("Last cleanup freed \(evicted)")
         }
+        let storagePressureBadge = HLSCacheStatusPresentation.storagePressureBadge(for: status)
+        if let detail = storagePressureBadge?.detail {
+            detailParts.append(detail)
+        }
 
-        let severity: CacheServerDiagnosticSeverity =
-            status.evictionEnabled
-                && status.highWatermarkBytes > 0
-                && status.usedBytes >= status.highWatermarkBytes
-            ? .warning
-            : .ready
+        let severity =
+            storagePressureBadge.map { HLSCacheStatusPresentation.diagnosticSeverity(for: $0.tone) } ?? .ready
 
         return CacheServerDiagnosticRow(
             id: "hlsCache",
             title: "HLS Cache",
             value: value,
             detail: detailParts.joined(separator: " · "),
-            systemImage: severity == .warning ? "externaldrive.badge.exclamationmark" : "film.stack",
+            systemImage: storagePressureBadge?.systemImage ?? "film.stack",
             severity: severity
         )
     }
 
     private static func weakNetworkRow(_ status: HLSWeakNetworkStatus) -> CacheServerDiagnosticRow {
-        let detailParts = [
-            "\(status.degradedSessionCount) degraded sessions",
-            "\(status.retryingVariantCount) retrying variants",
-            "\(status.cacheOnlySessionCount) cache-only sessions",
-        ]
-        let value = status.isActive ? "Active" : "Normal"
-        return CacheServerDiagnosticRow(
-            id: "weakNetwork",
-            title: "Weak Network",
-            value: value,
-            detail: trimmed(status.message) ?? detailParts.joined(separator: " · "),
-            systemImage: status.isActive ? "wifi.exclamationmark" : "wifi",
-            severity: status.isActive ? .warning : .ready
-        )
+        HLSCacheStatusPresentation.weakNetworkDiagnosticRow(status)
     }
 
     private static func transcodingRow(_ status: LanTranscodingStatus?) -> CacheServerDiagnosticRow {

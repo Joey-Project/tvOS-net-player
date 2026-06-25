@@ -594,12 +594,32 @@ public struct HLSWeakNetworkStatus: Equatable, Sendable {
     }
 
     public var isActive: Bool {
-        switch state.normalizedCacheProtocolName.removingWeakNetworkStatePrefix {
+        switch stateKind {
         case "", "unspecified", "normal":
             false
         default:
             true
         }
+    }
+
+    public var stateKind: String {
+        state.normalizedCacheProtocolName.removingWeakNetworkStatePrefix
+    }
+
+    public var isRetrying: Bool {
+        stateKind == "retrying"
+    }
+
+    public var isVariantDowngraded: Bool {
+        stateKind == "degraded"
+    }
+
+    public var isCacheOnly: Bool {
+        stateKind == "cacheonly"
+    }
+
+    public var isUpstreamFailed: Bool {
+        stateKind == "upstreamfailed"
     }
 }
 
