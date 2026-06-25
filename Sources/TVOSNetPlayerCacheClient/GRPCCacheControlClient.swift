@@ -40,6 +40,26 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func checkHealth() async throws -> CacheHealthStatus {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                let response = try await service.checkHealth(
+                    TvosNetPlayer_V1_CheckHealthRequest(),
+                    options: callOptions
+                )
+                return CacheHealthStatus(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.healthCheck
+        }
+    }
+
     public func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus {
         do {
             return try await withGRPCClient(
@@ -507,6 +527,16 @@ extension CacheServerSummary {
             version: proto.version,
             mediaBaseURIs: proto.mediaBaseUris,
             capabilities: proto.capabilities.map { String(describing: $0) }
+        )
+    }
+}
+
+extension CacheHealthStatus {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HealthStatus) {
+        self.init(
+            state: String(describing: proto.state),
+            message: proto.message,
+            checkedAt: proto.hasCheckedAt ? Date(proto.checkedAt) : nil
         )
     }
 }
