@@ -627,10 +627,14 @@ public final class CacheServerDiagnosticsViewModel: ObservableObject {
     }
 
     public func useServerAddressText(_ text: String) {
+        let previousAddressText = serverAddressText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextAddressText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let previousEndpoint = CacheServerEndpoint.normalized(from: serverAddressText)
         let nextEndpoint = CacheServerEndpoint.normalized(from: text)
         serverAddressText = text
-        guard previousEndpoint != nextEndpoint else {
+        if previousEndpoint == nextEndpoint,
+            nextEndpoint != nil || previousAddressText == nextAddressText
+        {
             return
         }
 

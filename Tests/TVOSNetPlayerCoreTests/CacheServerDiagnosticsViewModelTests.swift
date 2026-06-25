@@ -230,6 +230,19 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertNil(model.snapshot)
     }
 
+    func testClearingAddressAfterInvalidRefreshClearsDiagnosticError() async {
+        let model = CacheServerDiagnosticsViewModel(defaultServerAddressText: "https://192.168.1.10:50051")
+
+        let result = await model.refresh()
+        model.useServerAddressText("")
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertEqual(model.statusMessage, "Set a cache server address to run diagnostics.")
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isRefreshing)
+        XCTAssertNil(model.snapshot)
+    }
+
     func testRefreshDoesNotPublishSupersededServerResultAfterAddressChanges() async {
         let client = DiagnosticsFakeCacheControlClient(
             serverInfo: CacheServerSummary(
