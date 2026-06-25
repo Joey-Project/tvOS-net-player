@@ -37,8 +37,8 @@ public enum HLSCacheStatusPresentation {
         }
 
         var badges: [CacheStatusBadge] = []
-        if let quotaBadge = quotaBadge(for: status) {
-            badges.append(quotaBadge)
+        if let storagePressureBadge = storagePressureBadge(for: status) {
+            badges.append(storagePressureBadge)
         }
         if let weakNetwork = status.weakNetwork,
             let weakNetworkBadge = weakNetworkBadge(for: weakNetwork)
@@ -72,7 +72,7 @@ public enum HLSCacheStatusPresentation {
         )
     }
 
-    private static func quotaBadge(for status: HLSCacheStatus) -> CacheStatusBadge? {
+    static func storagePressureBadge(for status: HLSCacheStatus) -> CacheStatusBadge? {
         if let eviction = status.lastEviction,
             isQuotaCurrentlyBlocked(status, eviction: eviction)
         {
@@ -221,7 +221,7 @@ public enum HLSCacheStatusPresentation {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private static func diagnosticSeverity(for tone: CacheStatusBadgeTone) -> CacheServerDiagnosticSeverity {
+    static func diagnosticSeverity(for tone: CacheStatusBadgeTone) -> CacheServerDiagnosticSeverity {
         switch tone {
         case .ready:
             return .ready

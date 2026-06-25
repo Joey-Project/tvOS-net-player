@@ -2089,6 +2089,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
         XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
         XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Upstream failed; 1 of 2 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "wifi.slash")
         XCTAssertFalse(model.isWatching)
     }
 
