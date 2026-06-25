@@ -2094,6 +2094,49 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertFalse(model.isWatching)
     }
 
+    func testCompletedMultiResultTaskDoesNotTreatPlanningRetryAsOfflineCacheRetry() async {
+        let primaryLibraryItemID = "bilibili.hls.bilibili-playback-1"
+        let resultItems: [BilibiliTaskResultItem] = [
+            .fixture(
+                id: "bilibili-playback-1",
+                selectionID: "page:1",
+                title: "Part 1",
+                state: "TASK_STATE_COMPLETED",
+                libraryItemID: primaryLibraryItemID
+            ),
+            .fixture(
+                id: "bilibili-playback-1-result-2",
+                selectionID: "page:2",
+                title: "Part 2",
+                index: 2,
+                state: "TASK_STATE_FAILED",
+                message:
+                    "Selected Bilibili item no longer matches the resolved candidate. Resolve the input again and retry."
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_COMPLETED",
+                    progress: 1,
+                    message: "Completed offline; some Bilibili playback results failed.",
+                    libraryItemID: primaryLibraryItemID,
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1planning-retry",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResultSummary?.cachedCount, 1)
+        XCTAssertEqual(model.taskResultSummary?.failedCount, 1)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "1 of 2 offline ready")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "externaldrive.badge.checkmark")
+    }
+
     func testMultiResultTaskShowsFailureStatusBeforeAnyResultIsReady() async {
         let resultItems: [BilibiliTaskResultItem] = [
             .fixture(

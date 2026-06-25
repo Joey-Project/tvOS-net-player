@@ -1837,7 +1837,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     systemImage: "externaldrive.badge.xmark"
                 )
             }
-            if task.message.isRetryingFailureMessage {
+            if task.message.isOfflineCacheRetryMessage {
                 return ProgressiveCacheStatusBadge(
                     label: "Retrying offline cache", systemImage: "arrow.clockwise.circle")
             }
@@ -1896,7 +1896,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 systemImage: "externaldrive.badge.xmark"
             )
         }
-        if failedCacheMessages.contains(where: \.isRetryingFailureMessage) {
+        if failedCacheMessages.contains(where: \.isOfflineCacheRetryMessage) {
             return ProgressiveCacheStatusBadge(
                 label: "Retrying offline cache\(suffix)",
                 systemImage: "arrow.clockwise.circle"
@@ -2464,12 +2464,20 @@ private extension String {
     }
 
     var isOfflineCacheFailureMessage: Bool {
-        let normalized = lowercased()
         return isQuotaOrStorageFailureMessage
-            || isRetryingFailureMessage
             || isUpstreamOrNetworkFailureMessage
-            || normalized.contains("offline cache")
+            || isOfflineCacheContextMessage
+    }
+
+    var isOfflineCacheRetryMessage: Bool {
+        isRetryingFailureMessage && isOfflineCacheContextMessage
+    }
+
+    var isOfflineCacheContextMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("offline cache")
             || normalized.contains("cache fill")
+            || normalized.contains("cache-fill")
             || normalized.contains("cache offline")
     }
 
