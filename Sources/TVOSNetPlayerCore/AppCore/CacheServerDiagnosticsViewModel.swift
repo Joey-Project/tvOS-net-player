@@ -100,7 +100,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
     }
 
     public var issueCount: Int {
-        rows.filter { $0.severity == .warning || $0.severity == .error }.count
+        rows.filter(\.countsAsIssue).count
     }
 
     private static func buildRows(
@@ -506,16 +506,22 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
         if !status.enabled || normalizedState == "disabled" {
             value = "Disabled"
             severity = .unknown
+        } else if normalizedState == "idle" {
+            value = "Ready"
+            severity = .ready
         } else if normalizedState == "busy" {
             value = "Busy"
             severity = .info
         } else {
-            value = "Ready"
-            severity = .ready
+            value = "Unknown"
+            severity = .unknown
         }
 
         let detail = [
             status.profileID.isEmpty ? nil : "Profile \(status.profileID)",
+            !normalizedState.isEmpty && normalizedState != "idle" && normalizedState != "busy"
+                && normalizedState != "disabled"
+                ? "State \(status.state)" : nil,
             "\(status.activeJobCount)/\(status.maxConcurrentJobs) jobs",
             status.targetVideoCodec.isEmpty ? nil : "\(status.targetVideoCodec)/\(status.targetAudioCodec)",
         ].compactMap(\.self).joined(separator: " · ")
@@ -568,6 +574,19 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
     private static func trimmed(_ text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private extension CacheServerDiagnosticRow {
+    var countsAsIssue: Bool {
+        switch severity {
+        case .warning, .error:
+            return true
+        case .unknown:
+            return detail?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        case .ready, .info:
+            return false
+        }
     }
 }
 

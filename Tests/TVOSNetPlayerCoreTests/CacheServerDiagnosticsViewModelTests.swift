@@ -129,7 +129,55 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.row(id: "liveValidation")?.value, "Unavailable")
         XCTAssertEqual(model.row(id: "cacheRoots")?.value, "Unavailable")
         XCTAssertEqual(model.row(id: "hlsCache")?.severity, .unknown)
+        XCTAssertEqual(model.snapshot?.issueCount, 5)
+        XCTAssertEqual(model.statusMessage, "Diagnostics checked for Legacy cache with 5 issue(s).")
         XCTAssertNil(model.errorMessage)
+    }
+
+    func testTranscodingUnspecifiedRuntimeStateIsNotReady() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [CacheServerCapability.lanTranscoding]
+            ),
+            hlsCacheStatus: HLSCacheStatus(
+                evictionEnabled: true,
+                maxBytes: 100_000_000,
+                highWatermarkPercent: 90,
+                lowWatermarkPercent: 70,
+                highWatermarkBytes: 90_000_000,
+                lowWatermarkBytes: 70_000_000,
+                usedBytes: 42_000_000,
+                completedSessionCount: 3,
+                lastEviction: nil,
+                weakNetwork: nil,
+                transcoding: LanTranscodingStatus(
+                    enabled: true,
+                    state: "LAN_TRANSCODING_RUNTIME_STATE_UNSPECIFIED",
+                    message: "",
+                    profileID: "",
+                    targetContainer: "",
+                    targetVideoCodec: "",
+                    targetAudioCodec: "",
+                    maxConcurrentJobs: 0,
+                    activeJobCount: 0
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "transcoding")?.value, "Unknown")
+        XCTAssertEqual(model.row(id: "transcoding")?.severity, .unknown)
+        XCTAssertTrue(model.row(id: "transcoding")?.detail?.contains("UNSPECIFIED") == true)
     }
 
     func testRefreshRejectsInvalidAddress() async {
