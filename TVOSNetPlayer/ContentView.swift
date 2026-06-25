@@ -152,6 +152,14 @@ struct ContentView: View {
                     .lineLimit(3)
             }
 
+            if !cacheModel.hlsCacheStatusBadges.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(cacheModel.hlsCacheStatusBadges) { badge in
+                        CacheStatusBadgeRow(badge: badge)
+                    }
+                }
+            }
+
             HStack(spacing: 12) {
                 TextField("Search cached videos", text: $cacheModel.searchText)
                     .textContentType(.none)
@@ -915,6 +923,41 @@ private struct BilibiliFetchNoticeRow: View {
             }
         } icon: {
             Image(systemName: notice.systemImage)
+        }
+        .foregroundStyle(color)
+    }
+}
+
+private struct CacheStatusBadgeRow: View {
+    let badge: CacheStatusBadge
+
+    private var color: Color {
+        switch badge.tone {
+        case .ready:
+            return .green
+        case .info:
+            return .secondary
+        case .warning:
+            return .yellow
+        case .error:
+            return .red
+        }
+    }
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(badge.label)
+                    .font(.caption.weight(.semibold))
+                if let detail = badge.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        } icon: {
+            Image(systemName: badge.systemImage)
         }
         .foregroundStyle(color)
     }

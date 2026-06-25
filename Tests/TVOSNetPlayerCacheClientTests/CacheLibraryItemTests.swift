@@ -95,6 +95,27 @@ final class CacheLibraryItemTests: XCTestCase {
         XCTAssertEqual(status.positionLabel, "0:42")
     }
 
+    func testWeakNetworkStatusClassifiesConcreteStates() {
+        let cacheOnly = HLSWeakNetworkStatus.fixture(state: "HLS_WEAK_NETWORK_STATE_CACHE_ONLY")
+        XCTAssertTrue(cacheOnly.isActive)
+        XCTAssertTrue(cacheOnly.isCacheOnly)
+
+        let upstreamFailed = HLSWeakNetworkStatus.fixture(state: "HLS_WEAK_NETWORK_STATE_UPSTREAM_FAILED")
+        XCTAssertTrue(upstreamFailed.isUpstreamFailed)
+
+        let degraded = HLSWeakNetworkStatus.fixture(state: "HLS_WEAK_NETWORK_STATE_DEGRADED")
+        XCTAssertTrue(degraded.isVariantDowngraded)
+
+        let retrying = HLSWeakNetworkStatus.fixture(state: "HLS_WEAK_NETWORK_STATE_RETRYING")
+        XCTAssertTrue(retrying.isRetrying)
+
+        let recovered = HLSWeakNetworkStatus.fixture(
+            state: "HLS_WEAK_NETWORK_STATE_NORMAL",
+            lastChangedAt: Date(timeIntervalSince1970: 100)
+        )
+        XCTAssertFalse(recovered.isActive)
+    }
+
     func testPlaybackSourceSupportsHTTPFileAndHLSProtocols() {
         let protocolNames = ["httpFile", "PLAYBACK_PROTOCOL_HTTP_FILE", "hls", "PLAYBACK_PROTOCOL_HLS"]
 
@@ -215,6 +236,23 @@ extension CacheMediaVariant {
             height: 1080,
             bitrate: 0,
             sizeBytes: 0
+        )
+    }
+}
+
+extension HLSWeakNetworkStatus {
+    fileprivate static func fixture(
+        state: String,
+        lastChangedAt: Date? = nil
+    ) -> Self {
+        Self(
+            state: state,
+            message: "",
+            degradedSessionCount: 0,
+            unhealthyVariantCount: 0,
+            retryingVariantCount: 0,
+            cacheOnlySessionCount: 0,
+            lastChangedAt: lastChangedAt
         )
     }
 }

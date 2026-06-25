@@ -388,6 +388,106 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.row(id: "transcoding")?.severity, .info)
     }
 
+    func testWeakNetworkDiagnosticsClassifiesUpstreamFailure() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: []
+            ),
+            hlsCacheStatus: .diagnosticsFixture(
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_UPSTREAM_FAILED",
+                    message: "HLS upstream failed; playback may continue from cache when available.",
+                    degradedSessionCount: 1,
+                    unhealthyVariantCount: 1,
+                    retryingVariantCount: 1,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "weakNetwork")?.value, "Upstream failed")
+        XCTAssertEqual(model.row(id: "weakNetwork")?.severity, .error)
+        XCTAssertTrue(model.row(id: "weakNetwork")?.detail?.contains("1 retrying variant") == true)
+    }
+
+    func testWeakNetworkDiagnosticsKeepsNormalStateReadyWhenLastChangedAtIsPresent() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: []
+            ),
+            hlsCacheStatus: .diagnosticsFixture(
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_NORMAL",
+                    message: "",
+                    degradedSessionCount: 0,
+                    unhealthyVariantCount: 0,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: Date(timeIntervalSince1970: 100)
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "weakNetwork")?.value, "Normal")
+        XCTAssertEqual(model.row(id: "weakNetwork")?.severity, .ready)
+    }
+
+    func testWeakNetworkDiagnosticsKeepsUnknownActiveStateVisible() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: []
+            ),
+            hlsCacheStatus: .diagnosticsFixture(
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_CAPTIVE_PORTAL",
+                    message: "",
+                    degradedSessionCount: 0,
+                    unhealthyVariantCount: 0,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "weakNetwork")?.value, "Weak network active")
+        XCTAssertEqual(model.row(id: "weakNetwork")?.severity, .warning)
+    }
+
     func testRefreshRejectsInvalidAddress() async {
         let model = CacheServerDiagnosticsViewModel(defaultServerAddressText: "https://192.168.1.10:50051")
 
@@ -462,6 +562,27 @@ private enum DiagnosticsFakeCacheError: LocalizedError {
         case .unexpected:
             return "Unexpected diagnostics fixture call."
         }
+    }
+}
+
+private extension HLSCacheStatus {
+    static func diagnosticsFixture(
+        weakNetwork: HLSWeakNetworkStatus? = nil,
+        transcoding: LanTranscodingStatus? = nil
+    ) -> Self {
+        Self(
+            evictionEnabled: true,
+            maxBytes: 100_000_000,
+            highWatermarkPercent: 90,
+            lowWatermarkPercent: 70,
+            highWatermarkBytes: 90_000_000,
+            lowWatermarkBytes: 70_000_000,
+            usedBytes: 42_000_000,
+            completedSessionCount: 3,
+            lastEviction: nil,
+            weakNetwork: weakNetwork,
+            transcoding: transcoding
+        )
     }
 }
 

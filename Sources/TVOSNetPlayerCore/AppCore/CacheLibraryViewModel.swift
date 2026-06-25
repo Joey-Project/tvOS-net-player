@@ -125,6 +125,10 @@ public final class CacheLibraryViewModel: ObservableObject {
         return summary
     }
 
+    public var hlsCacheStatusBadges: [CacheStatusBadge] {
+        HLSCacheStatusPresentation.badges(for: hlsCacheStatus)
+    }
+
     private func appendWeakNetworkSummary(to summary: inout String, from hlsCacheStatus: HLSCacheStatus) {
         if let weakNetwork = hlsCacheStatus.weakNetwork,
             weakNetwork.isActive,

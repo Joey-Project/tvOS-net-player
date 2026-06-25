@@ -482,20 +482,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
     }
 
     private static func weakNetworkRow(_ status: HLSWeakNetworkStatus) -> CacheServerDiagnosticRow {
-        let detailParts = [
-            "\(status.degradedSessionCount) degraded sessions",
-            "\(status.retryingVariantCount) retrying variants",
-            "\(status.cacheOnlySessionCount) cache-only sessions",
-        ]
-        let value = status.isActive ? "Active" : "Normal"
-        return CacheServerDiagnosticRow(
-            id: "weakNetwork",
-            title: "Weak Network",
-            value: value,
-            detail: trimmed(status.message) ?? detailParts.joined(separator: " · "),
-            systemImage: status.isActive ? "wifi.exclamationmark" : "wifi",
-            severity: status.isActive ? .warning : .ready
-        )
+        HLSCacheStatusPresentation.weakNetworkDiagnosticRow(status)
     }
 
     private static func transcodingRow(_ status: LanTranscodingStatus?) -> CacheServerDiagnosticRow {

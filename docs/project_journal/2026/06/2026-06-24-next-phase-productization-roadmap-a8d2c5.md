@@ -62,10 +62,12 @@ superseded_by:
 
 ### PR 3: Weak/Offline UX Completion
 
-- Complete shared tvOS/macOS presentation for weak/offline playback states.
-- Surface cache-only, partially cached, quota-blocked, upstream-failed, retrying, variant downgraded, and recovery states consistently.
-- Make per-item and global cache status understandable from the app without requiring CLI logs.
-- Keep this PR focused on UX/state semantics, not scheduler internals.
+- Status: completed by the `wip/weak-offline-playback-ux` slice.
+- Added shared AppCore cache status badges for global HLS quota and weak-network states.
+- Surfaced cache-only playback, quota-blocked cleanup, upstream-failed, retrying upstream, variant-downgraded, network-recovered, and playback-position-protected states through tvOS/macOS cache panels.
+- Reused the same shared presentation in macOS operator diagnostics so weak-network rows show concrete values instead of a generic active/normal label.
+- Tightened progressive Bilibili task badges for partially cached, quota-blocked, upstream-failed, and retrying offline-cache states.
+- Kept this PR focused on UX/state semantics; no protobuf, media-plane, or scheduler changes.
 
 ### PR 4: Credential Profile And Login Foundation
 
@@ -121,6 +123,7 @@ superseded_by:
 - PR 2 focused validation: `cargo test hls_playback_progress`, `cargo test hls_fill_scheduler`, `cargo test playback_position_prefetch`, `cargo test prewarm_upgrades_first_window`, `cargo test report_playback_progress_promotes`.
 - PR 2 review-fix validation: `cargo test hls_fill_scheduler -- --nocapture`.
 - PR 2 quota-lock/progress-visibility review-fix validation: `cargo test playback_progress_promotes_before_waiting_for_quota_lock -- --nocapture`, `cargo test prewarm -- --nocapture`, `cargo test playback_progress -- --nocapture`.
+- PR 3 focused validation: `swift test --filter CacheLibraryItemTests/testWeakNetworkStatusClassifiesConcreteStates --disable-automatic-resolution`, `swift test --filter CacheLibraryViewModelTests/testHLSCacheStatusBadges --disable-automatic-resolution`, `swift test --filter CacheServerDiagnosticsViewModelTests/testWeakNetworkDiagnostics --disable-automatic-resolution`, `swift test --filter BilibiliTaskViewModelTests/testPlayable --disable-automatic-resolution`.
 - Previous roadmap: `docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - Current architecture note: `docs/architecture/cache-server.md`
 - Current repo state entrypoint: `docs/PROJECT_STATE.md`

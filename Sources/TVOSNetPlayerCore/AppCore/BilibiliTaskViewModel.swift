@@ -1813,16 +1813,39 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if task.isFailedBilibiliTaskState {
+            if task.message.isQuotaOrStorageFailureMessage {
+                return ProgressiveCacheStatusBadge(label: "Quota blocked", systemImage: "externaldrive.badge.xmark")
+            }
+            if task.message.isUpstreamOrNetworkFailureMessage {
+                return ProgressiveCacheStatusBadge(label: "Upstream failed", systemImage: "wifi.slash")
+            }
             return ProgressiveCacheStatusBadge(
-                label: task.message.isQuotaOrStorageFailureMessage ? "Quota blocked" : "Cache failed",
+                label: "Cache failed",
                 systemImage: "exclamationmark.triangle"
             )
         }
 
         if task.isPlayableBilibiliTaskState {
             let normalizedMessage = task.message.lowercased()
-            if normalizedMessage.contains("failed") {
-                return ProgressiveCacheStatusBadge(label: "Cache failed; playable online", systemImage: "wifi")
+            if task.message.isQuotaOrStorageFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Quota blocked; playable online",
+                    systemImage: "externaldrive.badge.xmark"
+                )
+            }
+            if task.message.isRetryingFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Retrying offline cache", systemImage: "arrow.clockwise.circle")
+            }
+            if task.message.isUpstreamOrNetworkFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Upstream failed; cache may be partial", systemImage: "wifi.slash")
+            }
+            if task.message.isGenericFailureMessage {
+                return ProgressiveCacheStatusBadge(
+                    label: "Cache failed; playable online",
+                    systemImage: "exclamationmark.triangle"
+                )
             }
             if normalizedMessage.contains("paused") || normalizedMessage.contains("queued") {
                 return ProgressiveCacheStatusBadge(label: "Offline fill queued", systemImage: "clock")
@@ -1832,7 +1855,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
             if let percent = task.offlineCachePercentLabel {
                 return ProgressiveCacheStatusBadge(
-                    label: "Filling offline cache \(percent)", systemImage: "arrow.down.circle")
+                    label: "Partially cached \(percent)", systemImage: "arrow.down.circle")
             }
 
             return ProgressiveCacheStatusBadge(label: "Playable online; caching", systemImage: "wifi")
@@ -2371,6 +2394,28 @@ private extension String {
             || normalized.contains("storage")
             || normalized.contains("disk")
             || normalized.contains("no space")
+    }
+
+    var isUpstreamOrNetworkFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("upstream")
+            || normalized.contains("network")
+            || normalized.contains("timed out")
+            || normalized.contains("timeout")
+            || normalized.contains("connection")
+    }
+
+    var isRetryingFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("retry")
+            || normalized.contains("backup url")
+            || normalized.contains("backup urls")
+    }
+
+    var isGenericFailureMessage: Bool {
+        let normalized = lowercased()
+        return normalized.contains("failed")
+            || normalized.contains("failure")
     }
 }
 

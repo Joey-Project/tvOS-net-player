@@ -150,6 +150,14 @@ struct ContentView: View {
                     .lineLimit(3)
             }
 
+            if !cacheModel.hlsCacheStatusBadges.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(cacheModel.hlsCacheStatusBadges) { badge in
+                        CacheStatusBadgeRow(badge: badge)
+                    }
+                }
+            }
+
             Divider()
 
             if cacheModel.items.isEmpty {
@@ -1036,6 +1044,43 @@ private struct BilibiliFetchNoticeRow: View {
             }
         } icon: {
             Image(systemName: notice.systemImage)
+        }
+        .foregroundStyle(color)
+    }
+}
+
+private struct CacheStatusBadgeRow: View {
+    let badge: CacheStatusBadge
+
+    private var color: Color {
+        switch badge.tone {
+        case .ready:
+            return .green
+        case .info:
+            return .blue
+        case .warning:
+            return .orange
+        case .error:
+            return .red
+        }
+    }
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(badge.label)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+
+                if let detail = badge.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        } icon: {
+            Image(systemName: badge.systemImage)
         }
         .foregroundStyle(color)
     }

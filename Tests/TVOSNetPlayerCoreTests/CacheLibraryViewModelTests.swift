@@ -213,6 +213,129 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheStatusBadgesExposeCacheOnlyWeakNetworkState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                usedBytes: 42,
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_CACHE_ONLY",
+                    message: "Serving HLS from local cache while upstream is degraded.",
+                    degradedSessionCount: 1,
+                    unhealthyVariantCount: 2,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 1,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.label), ["Cache-only playback"])
+        XCTAssertEqual(model.hlsCacheStatusBadges.first?.tone, .warning)
+        XCTAssertTrue(model.hlsCacheStatusBadges.first?.detail?.contains("2 unhealthy variants") == true)
+    }
+
+    @MainActor
+    func testHLSCacheStatusBadgesExposeUnknownActiveWeakNetworkState() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                usedBytes: 42,
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_CAPTIVE_PORTAL",
+                    message: "",
+                    degradedSessionCount: 0,
+                    unhealthyVariantCount: 0,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 42)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.label), ["Weak network active"])
+        XCTAssertEqual(model.hlsCacheStatusBadges.first?.tone, .warning)
+    }
+
+    @MainActor
+    func testHLSCacheStatusBadgesExposeQuotaBlockedWithoutTreatingNormalLastChangeAsRecovered() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: 100,
+                usedBytes: 95,
+                lastEviction: .fixture(targetReached: false, targetUsedBytes: 80),
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_NORMAL",
+                    message: "",
+                    degradedSessionCount: 0,
+                    unhealthyVariantCount: 0,
+                    retryingVariantCount: 0,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: Date(timeIntervalSince1970: 100)
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 95)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.label), ["Quota blocked"])
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.tone), [.error])
+    }
+
+    @MainActor
+    func testHLSCacheStatusBadgesHandleVeryLargeWatermarksWithoutOverflow() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: .max,
+                highWatermarkBytes: .max,
+                usedBytes: .max - 1
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: .max - 1)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map { $0.label }, ["Near cleanup watermark"])
+    }
+
+    @MainActor
     func testHLSCacheSummaryIncludesPlaybackPositionStatus() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -2828,6 +2951,8 @@ extension HLSCacheStatus {
         maxBytes: Int64 = 50 * 1_024 * 1_024 * 1_024,
         highWatermarkPercent: Int = 90,
         lowWatermarkPercent: Int = 80,
+        highWatermarkBytes: Int64? = nil,
+        lowWatermarkBytes: Int64? = nil,
         usedBytes: Int64 = 0,
         completedSessionCount: Int = 0,
         lastEviction: HLSCacheEvictionSummary? = nil,
@@ -2839,13 +2964,40 @@ extension HLSCacheStatus {
             maxBytes: maxBytes,
             highWatermarkPercent: highWatermarkPercent,
             lowWatermarkPercent: lowWatermarkPercent,
-            highWatermarkBytes: maxBytes * Int64(highWatermarkPercent) / 100,
-            lowWatermarkBytes: maxBytes * Int64(lowWatermarkPercent) / 100,
+            highWatermarkBytes: highWatermarkBytes ?? watermarkBytes(maxBytes: maxBytes, percent: highWatermarkPercent),
+            lowWatermarkBytes: lowWatermarkBytes ?? watermarkBytes(maxBytes: maxBytes, percent: lowWatermarkPercent),
             usedBytes: usedBytes,
             completedSessionCount: completedSessionCount,
             lastEviction: lastEviction,
             weakNetwork: weakNetwork,
             playback: playback
+        )
+    }
+
+    private static func watermarkBytes(maxBytes: Int64, percent: Int) -> Int64 {
+        let quotient = maxBytes / 100
+        let remainder = maxBytes % 100
+        let percent = Int64(percent)
+        return quotient * percent + remainder * percent / 100
+    }
+}
+
+extension HLSCacheEvictionSummary {
+    fileprivate static func fixture(
+        targetReached: Bool = true,
+        targetUsedBytes: Int64 = 0,
+        evictedBytes: Int64 = 0
+    ) -> Self {
+        Self(
+            reason: "highWatermark",
+            startedUsedBytes: 100,
+            finishedUsedBytes: max(0, 100 - evictedBytes),
+            targetUsedBytes: targetUsedBytes,
+            projectedAddedBytes: 0,
+            evictedBytes: evictedBytes,
+            evictedSessionIDs: [],
+            targetReached: targetReached,
+            completedAt: nil
         )
     }
 }
