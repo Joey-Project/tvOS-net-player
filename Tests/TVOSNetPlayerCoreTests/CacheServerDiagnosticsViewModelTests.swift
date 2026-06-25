@@ -422,6 +422,76 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertTrue(model.row(id: "weakNetwork")?.detail?.contains("1 retrying variant") == true)
     }
 
+    func testWeakNetworkDiagnosticsCountsRetryingUpstreamAsIssue() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliTaskSelection,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                    CacheServerCapability.libraryItemDelete,
+                ]
+            ),
+            healthStatus: CacheHealthStatus(
+                state: "HEALTH_STATE_SERVING",
+                message: "Ready",
+                checkedAt: nil
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: true,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 2,
+                restrictedAPIProxyCount: 1,
+                checkedAt: nil
+            ),
+            cacheRoots: [
+                CacheRoot(
+                    id: "default",
+                    label: "Local Cache",
+                    kind: "CACHE_ROOT_KIND_LOCAL_DIRECTORY",
+                    path: "/Users/joey/.cache/tvos-net-player",
+                    writable: true,
+                    freeBytes: 64_000_000,
+                    totalBytes: 128_000_000
+                )
+            ],
+            hlsCacheStatus: .diagnosticsFixture(
+                weakNetwork: HLSWeakNetworkStatus(
+                    state: "HLS_WEAK_NETWORK_STATE_RETRYING",
+                    message: "Retrying HLS upstream requests via backup URLs.",
+                    degradedSessionCount: 0,
+                    unhealthyVariantCount: 0,
+                    retryingVariantCount: 1,
+                    cacheOnlySessionCount: 0,
+                    lastChangedAt: nil
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "weakNetwork")?.value, "Retrying upstream")
+        XCTAssertEqual(model.row(id: "weakNetwork")?.severity, .warning)
+        XCTAssertTrue(model.row(id: "weakNetwork")?.detail?.contains("1 retrying variant") == true)
+        XCTAssertEqual(model.snapshot?.issueCount, 1)
+        XCTAssertEqual(model.statusMessage, "Diagnostics checked for Mac mini cache with 1 issue(s).")
+    }
+
     func testWeakNetworkDiagnosticsKeepsNormalStateReadyWhenLastChangedAtIsPresent() async {
         let client = DiagnosticsFakeCacheControlClient(
             serverInfo: CacheServerSummary(

@@ -165,7 +165,7 @@ public enum HLSCacheStatusPresentation {
                 label: "Retrying upstream",
                 detail: detail ?? "Trying backup URLs before declaring the variant unhealthy.",
                 systemImage: "arrow.clockwise.circle",
-                tone: .info
+                tone: .warning
             )
         }
         if status.isActive {
