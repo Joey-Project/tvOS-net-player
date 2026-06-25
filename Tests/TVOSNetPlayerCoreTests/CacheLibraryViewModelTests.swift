@@ -312,6 +312,31 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheStatusBadgesIgnoreStaleQuotaBlockedEvictionAfterUsageDrops() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: 100,
+                usedBytes: 85,
+                lastEviction: .fixture(targetReached: false, targetUsedBytes: 80)
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 85)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.label), ["Near cleanup watermark"])
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.tone), [.info])
+    }
+
+    @MainActor
     func testHLSCacheStatusBadgesHandleVeryLargeWatermarksWithoutOverflow() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),

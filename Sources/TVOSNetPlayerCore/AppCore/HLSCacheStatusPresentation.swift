@@ -73,7 +73,9 @@ public enum HLSCacheStatusPresentation {
     }
 
     private static func quotaBadge(for status: HLSCacheStatus) -> CacheStatusBadge? {
-        if let eviction = status.lastEviction, !eviction.targetReached {
+        if let eviction = status.lastEviction,
+            isQuotaCurrentlyBlocked(status, eviction: eviction)
+        {
             let target = ByteCountFormatter.string(fromByteCount: eviction.targetUsedBytes, countStyle: .file)
             return CacheStatusBadge(
                 id: "quotaBlocked",
@@ -111,6 +113,21 @@ public enum HLSCacheStatusPresentation {
             systemImage: "externaldrive.badge.timemachine",
             tone: .info
         )
+    }
+
+    private static func isQuotaCurrentlyBlocked(
+        _ status: HLSCacheStatus,
+        eviction: HLSCacheEvictionSummary
+    ) -> Bool {
+        guard !eviction.targetReached, status.evictionEnabled else {
+            return false
+        }
+
+        if status.highWatermarkBytes > 0 {
+            return status.usedBytes >= status.highWatermarkBytes
+        }
+
+        return status.usedBytes > eviction.targetUsedBytes
     }
 
     private static func weakNetworkBadge(for status: HLSWeakNetworkStatus) -> CacheStatusBadge? {
