@@ -2193,6 +2193,27 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertNil(model.fetchNotice)
     }
 
+    func testFailedTaskWithUpstreamFailureShowsUpstreamFailedBadge() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    source: "BV1upstream",
+                    state: "TASK_STATE_FAILED",
+                    message: "Offline cache fill failed: upstream failed."
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1upstream",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Upstream failed")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.systemImage, "wifi.slash")
+        XCTAssertEqual(model.fetchNotice?.title, "Retry available")
+    }
+
     func testDuplicateSubmitWhileSubmittingDoesNotInvalidateInFlightSubmission() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [],
