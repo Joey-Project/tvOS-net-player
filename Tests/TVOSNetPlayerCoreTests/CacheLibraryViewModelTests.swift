@@ -337,6 +337,35 @@ final class CacheLibraryViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testHLSCacheStatusBadgesIncludeProjectedBytesForQuotaBlockedEviction() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(name: "Server A"),
+            items: [],
+            playbackSource: .fixture(),
+            hlsCacheStatus: .fixture(
+                maxBytes: 100,
+                usedBytes: 20,
+                lastEviction: .fixture(
+                    targetReached: false,
+                    targetUsedBytes: 80,
+                    projectedAddedBytes: 75
+                )
+            )
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "server-a.local:50051",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        _ = await model.refresh()
+        await waitForHLSCacheStatus(on: model, usedBytes: 20)
+
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.label), ["Quota blocked"])
+        XCTAssertEqual(model.hlsCacheStatusBadges.map(\.tone), [.error])
+    }
+
+    @MainActor
     func testHLSCacheStatusBadgesHandleVeryLargeWatermarksWithoutOverflow() async {
         let client = FakeCacheControlClient(
             serverInfo: .fixture(name: "Server A"),
@@ -3011,6 +3040,7 @@ extension HLSCacheEvictionSummary {
     fileprivate static func fixture(
         targetReached: Bool = true,
         targetUsedBytes: Int64 = 0,
+        projectedAddedBytes: Int64 = 0,
         evictedBytes: Int64 = 0
     ) -> Self {
         Self(
@@ -3018,7 +3048,7 @@ extension HLSCacheEvictionSummary {
             startedUsedBytes: 100,
             finishedUsedBytes: max(0, 100 - evictedBytes),
             targetUsedBytes: targetUsedBytes,
-            projectedAddedBytes: 0,
+            projectedAddedBytes: projectedAddedBytes,
             evictedBytes: evictedBytes,
             evictedSessionIDs: [],
             targetReached: targetReached,

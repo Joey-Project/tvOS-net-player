@@ -562,6 +562,76 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.statusMessage, "Diagnostics checked for Mac mini cache with 1 issue(s).")
     }
 
+    func testHLSCacheDiagnosticsIncludesProjectedBytesForQuotaBlockedEviction() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliTaskSelection,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                    CacheServerCapability.libraryItemDelete,
+                ]
+            ),
+            healthStatus: CacheHealthStatus(
+                state: "HEALTH_STATE_SERVING",
+                message: "Ready",
+                checkedAt: nil
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: true,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 2,
+                restrictedAPIProxyCount: 1,
+                checkedAt: nil
+            ),
+            cacheRoots: [
+                CacheRoot(
+                    id: "default",
+                    label: "Local Cache",
+                    kind: "CACHE_ROOT_KIND_LOCAL_DIRECTORY",
+                    path: "/Users/joey/.cache/tvos-net-player",
+                    writable: true,
+                    freeBytes: 64_000_000,
+                    totalBytes: 128_000_000
+                )
+            ],
+            hlsCacheStatus: .diagnosticsFixture(
+                maxBytes: 100_000_000,
+                highWatermarkBytes: 90_000_000,
+                lowWatermarkBytes: 70_000_000,
+                usedBytes: 20_000_000,
+                lastEviction: .diagnosticsFixture(
+                    targetReached: false,
+                    targetUsedBytes: 80_000_000,
+                    projectedAddedBytes: 75_000_000,
+                    evictedBytes: 0
+                )
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertEqual(model.row(id: "hlsCache")?.severity, .error)
+        XCTAssertEqual(model.row(id: "hlsCache")?.systemImage, "externaldrive.badge.xmark")
+        XCTAssertTrue(model.row(id: "hlsCache")?.detail?.contains("Cleanup could not trim HLS cache") == true)
+        XCTAssertEqual(model.snapshot?.issueCount, 1)
+    }
+
     func testWeakNetworkDiagnosticsKeepsNormalStateReadyWhenLastChangedAtIsPresent() async {
         let client = DiagnosticsFakeCacheControlClient(
             serverInfo: CacheServerSummary(
@@ -735,6 +805,7 @@ private extension HLSCacheEvictionSummary {
     static func diagnosticsFixture(
         targetReached: Bool = true,
         targetUsedBytes: Int64 = 0,
+        projectedAddedBytes: Int64 = 0,
         evictedBytes: Int64 = 0
     ) -> Self {
         Self(
@@ -742,7 +813,7 @@ private extension HLSCacheEvictionSummary {
             startedUsedBytes: targetUsedBytes + evictedBytes,
             finishedUsedBytes: targetUsedBytes + max(0, evictedBytes / 2),
             targetUsedBytes: targetUsedBytes,
-            projectedAddedBytes: 0,
+            projectedAddedBytes: projectedAddedBytes,
             evictedBytes: evictedBytes,
             evictedSessionIDs: [],
             targetReached: targetReached,

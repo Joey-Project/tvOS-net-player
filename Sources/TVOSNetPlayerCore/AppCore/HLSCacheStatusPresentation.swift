@@ -123,11 +123,27 @@ public enum HLSCacheStatusPresentation {
             return false
         }
 
+        let projectedUsedBytes = projectedUsedBytes(status, eviction: eviction)
         if status.highWatermarkBytes > 0 {
             return status.usedBytes >= status.highWatermarkBytes
+                || projectedUsedBytes >= status.highWatermarkBytes
         }
 
         return status.usedBytes > eviction.targetUsedBytes
+            || projectedUsedBytes > eviction.targetUsedBytes
+    }
+
+    private static func projectedUsedBytes(
+        _ status: HLSCacheStatus,
+        eviction: HLSCacheEvictionSummary
+    ) -> Int64 {
+        guard eviction.projectedAddedBytes > 0 else {
+            return status.usedBytes
+        }
+        guard status.usedBytes <= Int64.max - eviction.projectedAddedBytes else {
+            return Int64.max
+        }
+        return status.usedBytes + eviction.projectedAddedBytes
     }
 
     private static func weakNetworkBadge(for status: HLSWeakNetworkStatus) -> CacheStatusBadge? {
