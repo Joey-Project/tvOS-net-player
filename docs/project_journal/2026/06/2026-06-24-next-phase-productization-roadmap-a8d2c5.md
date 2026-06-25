@@ -46,11 +46,19 @@ superseded_by:
 
 ### PR 2: Playback-Position-Aware Segment Scheduling
 
-- Use the existing app-to-server playback progress signal to influence HLS segment fill and prefetch order.
-- Prioritize init data and the playable window around active/recent playback position.
-- Demote distant segments and stale playback windows under cache pressure.
-- Re-prioritize cleanly after seek, playback stop, and playback-source changes.
-- Keep protocol changes minimal; consume the existing `ReportPlaybackProgress` and `GetHlsCacheStatus` foundation where possible.
+- Status: completed by the `wip/playback-position-segment-scheduling` slice.
+- Used the existing app-to-server playback progress signal to influence HLS fill and prefetch order without changing protobuf schema.
+- Added per-session playback progress lookup, active-session fill promotion, and current-fill preemption when a queued session becomes the active playback target.
+- Fixed the review-found repromotion edge case where playback progress for a still-current but already preempted session could otherwise leave that session demoted behind unrelated foreground work.
+- Fixed the review-found quota-lock edge case so active playback reports can preempt queued HLS fill work before waiting for cache quota enforcement.
+- Fixed the review-found progress-visibility race by recording the active playback position before waking the promoted fill worker.
+- Fixed the review-found same-session seek edge case so an already-running fill restarts prewarm with the newest playback position instead of keeping the old first-window target.
+- Fixed the review-found same-session heartbeat edge case so periodic playing reports keep an already-running fill alive instead of restarting it every heartbeat.
+- Fixed the review-found paused heartbeat edge case so paused reports keep the HLS cache session recent without promoting or preempting fill work.
+- Fixed the review-found prewarmed playlist/range edge case so partial prewarm keeps advertising the full media range while cross-prefix requests stream the local prefix first and proxy the uncached tail.
+- Fixed the frozen-review prefetch cap edge cases so active playback snapshots at 0s or near the start keep the first-window 8 MiB cap unless the report is a seek or has reached the first playback window.
+- Extended HLS prewarm from the first playback window to a bounded `position + first-window` prefix for active matching session/variant reports, while preserving first-window behavior for stale, stopped, or mismatched reports.
+- Kept the media plane unchanged: AVPlayer still receives server-owned HLS/Range URLs and the LAN server continues to proxy uncached bytes.
 
 ### PR 3: Weak/Offline UX Completion
 
@@ -110,6 +118,9 @@ superseded_by:
 ## Evidence
 
 - PR 1 focused validation: `swift test --filter CacheServerDiagnosticsViewModelTests`, `scripts/build-macos.sh`, `scripts/test-macos.sh`.
+- PR 2 focused validation: `cargo test hls_playback_progress`, `cargo test hls_fill_scheduler`, `cargo test playback_position_prefetch`, `cargo test prewarm_upgrades_first_window`, `cargo test report_playback_progress_promotes`.
+- PR 2 review-fix validation: `cargo test hls_fill_scheduler -- --nocapture`.
+- PR 2 quota-lock/progress-visibility review-fix validation: `cargo test playback_progress_promotes_before_waiting_for_quota_lock -- --nocapture`, `cargo test prewarm -- --nocapture`, `cargo test playback_progress -- --nocapture`.
 - Previous roadmap: `docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - Current architecture note: `docs/architecture/cache-server.md`
 - Current repo state entrypoint: `docs/PROJECT_STATE.md`

@@ -1,7 +1,8 @@
 use std::{io::SeekFrom, sync::Arc, time::Duration};
 
 use axum::{
-    body::Body,
+    BoxError,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, Method, Response, StatusCode,
@@ -11,7 +12,7 @@ use axum::{
         },
     },
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
     time::Instant,
@@ -293,6 +294,21 @@ async fn hls_segment_response(
                 state.state.hls_network_policy.record_cache_hit(&session_id);
                 range
             }
+            Ok(Some(range)) if range.start < opened_file.prefix_length => {
+                return build_prewarmed_spliced_file_response(
+                    HlsMediaProxyContext {
+                        state: &state,
+                        session_id: &session_id,
+                        variant_id: &variant_id,
+                        resource: &resource,
+                    },
+                    opened_file,
+                    range,
+                    &headers,
+                    head_only,
+                )
+                .await;
+            }
             Ok(_) => {
                 return proxy_hls_media_resource(
                     &state,
@@ -466,8 +482,24 @@ fn hls_policy_recording_body(
     variant_id: String,
     response_time: Duration,
 ) -> Body {
+    Body::from_stream(hls_policy_recording_stream(
+        upstream,
+        policy,
+        session_id,
+        variant_id,
+        response_time,
+    ))
+}
+
+fn hls_policy_recording_stream(
+    upstream: reqwest::Response,
+    policy: crate::hls_network_policy::HlsNetworkPolicy,
+    session_id: String,
+    variant_id: String,
+    response_time: Duration,
+) -> impl futures_core::Stream<Item = Result<Bytes, reqwest::Error>> {
     let stream = Box::pin(upstream.bytes_stream());
-    let stream = futures_util::stream::unfold(
+    futures_util::stream::unfold(
         (stream, policy, session_id, variant_id, response_time, false),
         |(mut stream, policy, session_id, variant_id, response_time, failed)| async move {
             match stream.next().await {
@@ -499,8 +531,7 @@ fn hls_policy_recording_body(
                 }
             }
         },
-    );
-    Body::from_stream(stream)
+    )
 }
 
 fn hls_upstream_request_builder(
@@ -805,6 +836,179 @@ async fn build_prewarmed_file_response(
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[derive(Clone, Copy)]
+struct HlsMediaProxyContext<'a> {
+    state: &'a MediaState,
+    session_id: &'a str,
+    variant_id: &'a str,
+    resource: &'a HlsMediaResource,
+}
+
+async fn build_prewarmed_spliced_file_response(
+    context: HlsMediaProxyContext<'_>,
+    opened_file: OpenedPrewarmedHlsResource,
+    range: ByteRange,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> Response<Body> {
+    if head_only {
+        return proxy_hls_media_resource(
+            context.state,
+            context.session_id,
+            context.variant_id,
+            context.resource.clone(),
+            headers,
+            true,
+        )
+        .await;
+    }
+
+    let tail = match open_hls_upstream_tail_response(
+        context.state,
+        context.session_id,
+        context.variant_id,
+        context.resource,
+        opened_file.prefix_length,
+        range.end,
+        opened_file.total_length,
+    )
+    .await
+    {
+        Ok(tail) => tail,
+        Err(()) => {
+            return proxy_hls_media_resource(
+                context.state,
+                context.session_id,
+                context.variant_id,
+                context.resource.clone(),
+                headers,
+                false,
+            )
+            .await;
+        }
+    };
+
+    let local_length = opened_file.prefix_length - range.start;
+    let body = {
+        let mut file = tokio::fs::File::from_std(opened_file.file);
+        if file.seek(SeekFrom::Start(range.start)).await.is_err() {
+            return empty_response(StatusCode::NOT_FOUND);
+        }
+        let local_stream = ReaderStream::new(file.take(local_length))
+            .map_err(|error| -> BoxError { Box::new(error) });
+        let upstream_stream = hls_policy_recording_stream(
+            tail.upstream,
+            context.state.state.hls_network_policy.clone(),
+            context.session_id.to_owned(),
+            context.variant_id.to_owned(),
+            tail.response_time,
+        )
+        .map_err(|error| -> BoxError { Box::new(error) });
+        Body::from_stream(local_stream.chain(upstream_stream))
+    };
+
+    let mut response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(
+            CONTENT_TYPE,
+            content_type_header_value(&opened_file.content_type),
+        )
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_LENGTH, range.length().to_string())
+        .header(
+            CONTENT_RANGE,
+            format!(
+                "bytes {}-{}/{}",
+                range.start, range.end, opened_file.total_length
+            ),
+        )
+        .header(
+            LAST_MODIFIED,
+            httpdate::fmt_http_date(opened_file.last_modified),
+        )
+        .body(body)
+        .expect("spliced prewarmed media response should build");
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+struct HlsUpstreamTailResponse {
+    upstream: reqwest::Response,
+    response_time: Duration,
+}
+
+async fn open_hls_upstream_tail_response(
+    state: &MediaState,
+    session_id: &str,
+    variant_id: &str,
+    resource: &HlsMediaResource,
+    start: u64,
+    end: u64,
+    total_length: u64,
+) -> Result<HlsUpstreamTailResponse, ()> {
+    let tail_range = HeaderValue::from_str(&format!("bytes={start}-{end}")).map_err(|_| ())?;
+    let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
+    urls.push(resource.request.url.clone());
+    urls.extend(resource.request.backup_urls.clone());
+
+    for url in urls {
+        let started_at = Instant::now();
+        let upstream = match hls_upstream_request_builder(state, resource, Method::GET, &url)
+            .header(RANGE.as_str(), tail_range.to_str().map_err(|_| ())?)
+            .send()
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                state
+                    .state
+                    .hls_network_policy
+                    .record_upstream_retry(session_id, variant_id);
+                continue;
+            }
+        };
+        let response_time = started_at.elapsed();
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        if should_retry_hls_upstream_status(status) || !status.is_success() {
+            state
+                .state
+                .hls_network_policy
+                .record_upstream_retry(session_id, variant_id);
+            continue;
+        }
+        let headers = upstream.headers();
+        let Some((returned_range, returned_total_length)) = content_range_byte_range(headers)
+        else {
+            state
+                .state
+                .hls_network_policy
+                .record_upstream_retry(session_id, variant_id);
+            continue;
+        };
+        let expected_range = ByteRange { start, end };
+        if status != StatusCode::PARTIAL_CONTENT
+            || returned_range != expected_range
+            || returned_total_length != total_length
+        {
+            state
+                .state
+                .hls_network_policy
+                .record_upstream_retry(session_id, variant_id);
+            continue;
+        }
+
+        return Ok(HlsUpstreamTailResponse {
+            upstream,
+            response_time,
+        });
+    }
+
+    Err(())
 }
 
 fn empty_response(status: StatusCode) -> Response<Body> {
@@ -1150,7 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_media_playlist_keeps_single_media_range_for_prewarmed_prefix() {
+    async fn hls_media_playlist_keeps_full_media_range_for_prewarmed_prefix() {
         let (upstream_url, _upstream_task) = start_hls_large_mp4_upstream().await;
         let temp = TempDir::new().expect("temp dir should be created");
         let root_path = temp.path().canonicalize().unwrap();
@@ -1168,13 +1372,18 @@ mod tests {
             })
             .await
             .expect("session should prewarm");
+        let prewarmed = state
+            .hls_cache
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+        assert!(prewarmed.prefix_length < prewarmed.total_length);
         insert_authorized_hls_session(
             &state,
             hls_session("session-1", "http://127.0.0.1:9/unreachable.m4s"),
         );
 
         let response = hls_segment_get(
-            State(MediaState::new(state)),
+            State(MediaState::new(state.clone())),
             Path(("session-1".to_owned(), "video.m3u8".to_owned())),
             HeaderMap::new(),
         )
@@ -1183,13 +1392,100 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let playlist = String::from_utf8(body.to_vec()).unwrap();
-        let mp4 = large_fake_mp4();
-        let initialization_length = mp4_initialization_length(&mp4).unwrap();
-        let media_length = u64::try_from(mp4.len()).unwrap() - initialization_length;
+        let initialization_length = prewarmed.initialization_length;
+        let prefix_media_length = prewarmed.prefix_length - initialization_length;
+        let full_media_length = prewarmed.total_length - initialization_length;
         assert!(playlist.contains(&format!(
-            "#EXT-X-BYTERANGE:{media_length}@{initialization_length}"
+            "#EXT-X-BYTERANGE:{full_media_length}@{initialization_length}"
         )));
         assert!(!playlist.contains(&format!("@{HLS_INITIALIZATION_SCAN_BYTES}")));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes={initialization_length}-{}",
+                prewarmed.prefix_length - 1
+            ))
+            .expect("range header should be valid"),
+        );
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            format!(
+                "bytes {initialization_length}-{}/{}",
+                prewarmed.prefix_length - 1,
+                prewarmed.total_length
+            ),
+            response.headers()[CONTENT_RANGE]
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(usize::try_from(prefix_media_length).unwrap(), body.len());
+    }
+
+    #[tokio::test]
+    async fn hls_segment_splices_prewarmed_prefix_with_upstream_tail() {
+        let (upstream_url, _upstream_task) = start_hls_large_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-1", &upstream_url);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("session should prewarm");
+        let prewarmed = state
+            .hls_cache
+            .prewarmed_resource(&session.id, "video.m4s")
+            .expect("prewarm metadata should load");
+        assert!(prewarmed.prefix_length < prewarmed.total_length);
+        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
+
+        let initialization_length = prewarmed.initialization_length;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes={initialization_length}-{}",
+                prewarmed.total_length - 1
+            ))
+            .expect("range header should be valid"),
+        );
+        let response = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            format!(
+                "bytes {initialization_length}-{}/{}",
+                prewarmed.total_length - 1,
+                prewarmed.total_length
+            ),
+            response.headers()[CONTENT_RANGE]
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &large_fake_mp4()[usize::try_from(initialization_length).unwrap()..],
+            &body[..]
+        );
     }
 
     #[tokio::test]

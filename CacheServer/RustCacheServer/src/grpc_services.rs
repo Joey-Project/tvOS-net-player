@@ -1640,6 +1640,7 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
+    let playback_progress = state.hls_playback_progress_for_session(&session_id);
     let _ = state.tasks.update_playback_cache_progress(
         &task_id,
         BilibiliTaskProgress {
@@ -1647,12 +1648,19 @@ async fn run_hls_cache_finalization_inner(
             downloaded_bytes: Some(0),
             total_bytes: hls_session_declared_size_bytes(&session)
                 .map(|value| value.try_into().unwrap_or(i64::MAX)),
-            message: Some("Playable online; prefetching first playback window.".to_owned()),
+            message: Some(hls_cache_prewarm_progress_message(
+                playback_progress.as_ref(),
+            )),
         },
     );
     match state
         .hls_cache
-        .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, &control)
+        .prewarm_session_first_frame_with_playback_progress(
+            &state.hls_upstream_client,
+            &session,
+            playback_progress.as_ref(),
+            &control,
+        )
         .await
     {
         Ok(()) => {}
@@ -1795,6 +1803,23 @@ async fn run_hls_cache_finalization_inner(
         }
     }
     HlsCacheFinalizationOutcome::Finished
+}
+
+fn hls_cache_prewarm_progress_message(
+    playback_progress: Option<&HlsPlaybackProgressSnapshot>,
+) -> String {
+    if let Some(snapshot) = playback_progress
+        && snapshot.state == HlsPlaybackActivityState::Active
+        && snapshot.position_seconds.is_finite()
+        && snapshot.position_seconds > 0.0
+    {
+        return format!(
+            "Playable online; prefetching HLS cache near {:.0}s playback position.",
+            snapshot.position_seconds
+        );
+    }
+
+    "Playable online; prefetching first playback window.".to_owned()
 }
 
 fn hls_cache_progress_reporter(
@@ -5130,6 +5155,66 @@ mod tests {
         assert_eq!(
             ProtoPlaybackProgressIntent::Seek as i32,
             playback.last_intent
+        );
+    }
+
+    #[tokio::test]
+    async fn report_playback_progress_promotes_demoted_hls_cache_fill() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (active_task_id, active_hls_session, _active_library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1active-fill", &upstream_url);
+        let (demoted_task_id, demoted_hls_session, _demoted_library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1demoted-fill", &upstream_url);
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            active_task_id.clone(),
+            active_hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_job = state.hls_fill_scheduler.next_job().await;
+        assert!(!state.hls_fill_scheduler.enqueue_demoted(
+            demoted_task_id.clone(),
+            demoted_hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let service = CacheGrpcService::new(state.clone());
+
+        let report = service
+            .report_playback_progress(Request::new(ReportPlaybackProgressRequest {
+                playback_uri: format!(
+                    "http://media.example.test:8080/hls/{demoted_task_id}/master.m3u8"
+                ),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 90.0,
+                duration_seconds: 180.0,
+                intent: ProtoPlaybackProgressIntent::Seek.into(),
+            }))
+            .await
+            .expect("playback progress should be accepted")
+            .into_inner();
+
+        assert!(report.accepted);
+        assert!(active_job.token.is_preempted());
+        state.hls_fill_scheduler.finish_current(&active_job);
+        let promoted = state.hls_fill_scheduler.next_job().await;
+        assert_eq!(demoted_task_id, promoted.task_id);
+        assert_eq!(
+            crate::hls_fill_scheduler::HlsFillPriority::Foreground,
+            promoted.priority
         );
     }
 

@@ -61,8 +61,8 @@ use crate::{
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
     hls_playback_progress::{
-        HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressRecordOutcome,
-        PlaybackProgressReport, session_id_from_report,
+        HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressIntent,
+        PlaybackProgressRecordOutcome, PlaybackProgressReport, session_id_from_report,
     },
     library::LocalMediaLibrary,
     media::{
@@ -772,10 +772,9 @@ impl AppState {
             };
         };
 
-        let _quota_lock = self
-            .hls_cache_quota_enforcement_lock
-            .lock()
-            .expect("HLS cache quota enforcement lock poisoned");
+        let intent = report.intent;
+        let should_promote = intent.promotes_hls_cache_fill();
+        let restart_current = matches!(intent, PlaybackProgressIntent::Seek);
         if !self.registered_hls_session_is_authorized_for_serving(&session_id) {
             return PlaybackProgressRecordOutcome {
                 accepted: false,
@@ -785,14 +784,53 @@ impl AppState {
         }
 
         let outcome = self.hls_playback_progress.record(report);
-        if outcome.accepted {
-            self.note_hls_cache_playback_use(&outcome.session_id);
+        let promoted_before_quota_lock = outcome.accepted
+            && should_promote
+            && self.promote_hls_cache_fill_for_playback(&session_id, restart_current);
+
+        {
+            let _quota_lock = self
+                .hls_cache_quota_enforcement_lock
+                .lock()
+                .expect("HLS cache quota enforcement lock poisoned");
+            if !self.registered_hls_session_is_authorized_for_serving(&session_id) {
+                self.hls_playback_progress.remove_session(&session_id);
+                return PlaybackProgressRecordOutcome {
+                    accepted: false,
+                    session_id,
+                    message: "Playback URI does not identify a known HLS cache session.".to_owned(),
+                };
+            }
+
+            if outcome.accepted {
+                self.note_hls_cache_playback_use(&outcome.session_id);
+            }
+        }
+        if outcome.accepted && should_promote && !promoted_before_quota_lock {
+            self.promote_hls_cache_fill_for_playback(&outcome.session_id, restart_current);
         }
         outcome
     }
 
     pub(crate) fn hls_playback_progress_status(&self) -> HlsPlaybackProgressSnapshot {
         self.hls_playback_progress.snapshot()
+    }
+
+    pub(crate) fn hls_playback_progress_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<HlsPlaybackProgressSnapshot> {
+        self.hls_playback_progress.snapshot_for_session(session_id)
+    }
+
+    fn promote_hls_cache_fill_for_playback(&self, session_id: &str, restart_current: bool) -> bool {
+        let promoted = self
+            .hls_fill_scheduler
+            .promote_session_to_foreground(session_id, restart_current);
+        if promoted {
+            eprintln!("Promoted HLS cache fill for active playback session {session_id}.");
+        }
+        promoted
     }
 
     pub(crate) fn protect_hls_cache_session_from_eviction(
@@ -1645,11 +1683,26 @@ fn is_optional_address_family_unavailable(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+        pin::Pin,
+        thread,
+        time::Instant,
     };
 
     use super::*;
+    use crate::{
+        bbdown_adapter::{
+            BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
+            BilibiliMediaRequestKind,
+        },
+        bilibili_playback::{BilibiliPlaybackPlanner, BilibiliPlaybackPlanningRequest},
+        bilibili_worker::BilibiliDownloadError,
+        generated::tvos_net_player::v1::{BilibiliPlaybackSession, BilibiliPlaybackVariant},
+        hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
+        transcoding::HlsTranscodingPlan,
+    };
 
     #[tokio::test]
     async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
@@ -1676,6 +1729,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playback_progress_promotes_before_waiting_for_quota_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (current_task_id, current_session) =
+            create_playable_hls_task(&state, "BV1quota-current");
+        let (active_task_id, active_session) = create_playable_hls_task(&state, "BV1quota-active");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            current_task_id,
+            current_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current_job = state.hls_fill_scheduler.next_job().await;
+        assert!(!state.hls_fill_scheduler.enqueue_demoted(
+            active_task_id.clone(),
+            active_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+
+        let quota_lock = state
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("quota lock should be acquired for test");
+        let report_state = state.clone();
+        let report_task_id = active_task_id.clone();
+        let report_handle = thread::spawn(move || {
+            report_state.record_hls_playback_progress(PlaybackProgressReport {
+                playback_uri: format!(
+                    "http://media.example.test:8080/hls/{report_task_id}/master.m3u8"
+                ),
+                library_item_id: String::new(),
+                variant_id: "h264".to_owned(),
+                position_seconds: 42.0,
+                duration_seconds: Some(120.0),
+                intent: crate::hls_playback_progress::PlaybackProgressIntent::Seek,
+                reported_at: SystemTime::now(),
+            })
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut preempted_before_quota_unlock = current_job.token.is_preempted();
+        while !preempted_before_quota_unlock && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            preempted_before_quota_unlock = current_job.token.is_preempted();
+        }
+        assert!(
+            preempted_before_quota_unlock,
+            "playback progress should preempt before waiting for quota lock"
+        );
+        let snapshot = state
+            .hls_playback_progress_for_session(&active_task_id)
+            .expect("reported playback progress should be visible before quota unlock");
+        assert_eq!(42.0, snapshot.position_seconds);
+        drop(quota_lock);
+        let outcome = report_handle
+            .join()
+            .expect("playback progress thread should not panic");
+
+        assert!(outcome.accepted);
+        assert_eq!(active_task_id, outcome.session_id);
+    }
+
+    #[tokio::test]
+    async fn playback_progress_heartbeat_keeps_current_hls_fill_running() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (task_id, session) = create_playable_hls_task(&state, "BV1heartbeat");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current_job = state.hls_fill_scheduler.next_job().await;
+
+        let outcome = state.record_hls_playback_progress(PlaybackProgressReport {
+            playback_uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 42.0,
+            duration_seconds: Some(120.0),
+            intent: PlaybackProgressIntent::Playing,
+            reported_at: SystemTime::now(),
+        });
+
+        assert!(outcome.accepted);
+        assert_eq!(task_id, outcome.session_id);
+        assert!(!current_job.token.is_preempted());
+        assert_eq!(
+            0,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&outcome.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_playback_progress_keeps_cache_recent_without_promoting_fill() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (current_task_id, current_session) =
+            create_playable_hls_task(&state, "BV1paused-current");
+        let (paused_task_id, paused_session) =
+            create_playable_hls_task(&state, "BV1paused-session");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            current_task_id,
+            current_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current_job = state.hls_fill_scheduler.next_job().await;
+        assert!(!state.hls_fill_scheduler.enqueue_demoted(
+            paused_task_id.clone(),
+            paused_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+
+        let outcome = state.record_hls_playback_progress(PlaybackProgressReport {
+            playback_uri: format!(
+                "http://media.example.test:8080/hls/{paused_task_id}/master.m3u8"
+            ),
+            library_item_id: String::new(),
+            variant_id: "h264".to_owned(),
+            position_seconds: 42.0,
+            duration_seconds: Some(120.0),
+            intent: PlaybackProgressIntent::Paused,
+            reported_at: SystemTime::now(),
+        });
+
+        assert!(outcome.accepted);
+        assert_eq!(paused_task_id, outcome.session_id);
+        assert!(!current_job.token.is_preempted());
+        assert_eq!(
+            1,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&outcome.session_id)
+        );
+        assert!(
+            state
+                .recently_used_hls_cache_session_ids()
+                .contains(&outcome.session_id)
+        );
+    }
+
+    #[tokio::test]
     async fn listener_group_keeps_available_family_when_other_family_is_unavailable() {
         let port = match free_port() {
             Ok(port) => port,
@@ -1694,6 +1890,148 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
             listeners[0].local_addr().unwrap()
         );
+    }
+
+    type TestPlanningFuture<'a> = Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        crate::bbdown_adapter::BilibiliPlaybackPlan,
+                        BilibiliDownloadError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    struct NoopPlaybackPlanner;
+
+    impl BilibiliPlaybackPlanner for NoopPlaybackPlanner {
+        fn plan<'a>(&'a self, _request: BilibiliPlaybackPlanningRequest) -> TestPlanningFuture<'a> {
+            Box::pin(async {
+                Err(BilibiliDownloadError::Failed(
+                    "test planner is not configured".to_owned(),
+                ))
+            })
+        }
+    }
+
+    fn test_app_state(temp: &tempfile::TempDir) -> AppState {
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        )
+    }
+
+    fn create_playable_hls_task(state: &AppState, source: &str) -> (String, HlsPlaybackSession) {
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task(source, None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let session = sample_hls_session(&task_id);
+        state
+            .hls_cache
+            .save_session(&session)
+            .expect("HLS session should persist");
+        state.hls_sessions.insert(session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &task_id,
+                session.title.clone(),
+                PlaybackSource {
+                    item_id: task_id.clone(),
+                    variant_id: session.variant.id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                    expires_at: None,
+                },
+                sample_playback_session(&task_id),
+            )
+            .expect("task should become playable");
+        (task_id, session)
+    }
+
+    fn sample_playback_session(session_id: &str) -> BilibiliPlaybackSession {
+        BilibiliPlaybackSession {
+            id: session_id.to_owned(),
+            title: "Episode".to_owned(),
+            content_id: "cid-1".to_owned(),
+            selected_variant_id: "h264".to_owned(),
+            selected_variant: Some(BilibiliPlaybackVariant {
+                id: "h264".to_owned(),
+                label: "1920x1080".to_owned(),
+                source_kind: "dash".to_owned(),
+                container: "mp4".to_owned(),
+                video_codec: "avc1.640028".to_owned(),
+                audio_codec: String::new(),
+                width: 1920,
+                height: 1080,
+                bitrate: 1_000_000,
+                size_bytes: 1024,
+            }),
+            variants: Vec::new(),
+            transcoding_plan: None,
+        }
+    }
+
+    fn sample_hls_session(session_id: &str) -> HlsPlaybackSession {
+        HlsPlaybackSession {
+            id: session_id.to_owned(),
+            title: "Episode".to_owned(),
+            variant: HlsVariant {
+                id: "h264".to_owned(),
+                bandwidth: 1_000_000,
+                codecs: vec!["avc1.640028".to_owned()],
+                width: Some(1920),
+                height: Some(1080),
+                duration_seconds: 120,
+                video: HlsMediaResource {
+                    id: "video.m4s".to_owned(),
+                    request: BilibiliMediaRequest {
+                        kind: BilibiliMediaRequestKind::Video,
+                        stream_id: None,
+                        url: "https://example.test/video.m4s".to_owned(),
+                        backup_urls: Vec::new(),
+                        headers: vec![BilibiliHttpHeader {
+                            name: "referer".to_owned(),
+                            value: "https://www.bilibili.com".to_owned(),
+                        }],
+                        mime_type: Some("video/mp4".to_owned()),
+                        codecs: Some("avc1.640028".to_owned()),
+                        bandwidth: Some(1_000_000),
+                        width: Some(1920),
+                        height: Some(1080),
+                        frame_rate: Some("60".to_owned()),
+                        size: Some(1024),
+                        duration_seconds: Some(120),
+                        cache_key: BilibiliMediaCacheKey {
+                            content_id: "cid-1".to_owned(),
+                            media_kind: BilibiliMediaRequestKind::Video,
+                            stream_id: None,
+                            codecs: Some("avc1.640028".to_owned()),
+                            source_hash: session_id.to_owned(),
+                        },
+                    },
+                },
+                audio: None,
+            },
+            alternate_variants: Vec::new(),
+            advertise_alternate_variants: true,
+            abr: HlsAbrMetadata::default(),
+            variants: Vec::new(),
+            transcoding: HlsTranscodingPlan::default(),
+        }
     }
 
     fn free_port() -> io::Result<u16> {
