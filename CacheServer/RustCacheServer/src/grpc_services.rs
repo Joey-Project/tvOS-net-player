@@ -100,9 +100,10 @@ const MAX_BILIBILI_LOGIN_SESSIONS: usize = 64;
 
 impl ServerGrpcService {
     pub fn new(state: AppState) -> Self {
+        let login_sessions = Arc::clone(&state.bilibili_login_sessions);
         Self {
             state,
-            login_sessions: Arc::new(StdMutex::new(VecDeque::new())),
+            login_sessions,
         }
     }
 }
@@ -2990,7 +2991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bilibili_login_session_foundation_returns_unsupported_session() {
+    async fn bilibili_login_session_foundation_shares_unsupported_session_across_services() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -3016,9 +3017,10 @@ mod tests {
             bbdown_credential_path: Some(credentials_path),
             ..CacheServerOptions::default()
         });
-        let service = ServerGrpcService::new(state);
+        let creator = ServerGrpcService::new(state.clone());
+        let reader = ServerGrpcService::new(state);
 
-        let session = service
+        let session = creator
             .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
                 profile_id: String::new(),
                 method: BilibiliLoginMethod::WebQr.into(),
@@ -3034,7 +3036,7 @@ mod tests {
         assert!(session.verification_uri.is_empty());
         assert!(!session.message.contains("cookie"));
 
-        let fetched = service
+        let fetched = reader
             .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
                 session_id: session.id.clone(),
             }))
