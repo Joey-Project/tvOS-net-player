@@ -133,6 +133,7 @@ BBDown adapter 相关配置：
 - `Cache:BBDownArchivePath`: BBDown 下载 archive JSON。默认和 `Cache:TaskStatePath` 同目录，文件名为 `bbdown-archive.json`。
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。
 - `Cache:BBDownCredentialPath`: BBDown credential JSON 文件路径，字段兼容 `bbdown-core` 的 `cookie`、`access_key` 和 `tv_access_key`。不要把这个文件提交到仓库。
+- `Cache:BBDownCredentialProfile`: 可选 BBDown credential profile 名称；设置后 server 会从 `Cache:BBDownCredentialPath` 指向的 profile store 读取该 profile。未设置时继续使用 credential store 的默认 profile。
 - `Cache:BBDownRestrictedArea`: restricted-area 优先区域，可选 `cn`、`th`、`hk` 或 `tw`。
 - `Cache:BBDownRestrictedAreaProxy`: restricted-area playurl proxy 列表，格式为逗号分隔的 `[area=]URL`，例如 `hk=https://proxy.example/playurl,https://fallback.example/playurl`。
 - `Cache:BBDownRestrictedApiProxy`: restricted-area Bilibili API proxy 列表，格式同上。

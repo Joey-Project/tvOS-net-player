@@ -80,6 +80,68 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func listBilibiliCredentialProfiles() async throws -> BilibiliCredentialProfilesSummary {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                let response = try await service.listBilibiliCredentialProfiles(
+                    TvosNetPlayer_V1_ListBilibiliCredentialProfilesRequest(),
+                    options: callOptions
+                )
+                return BilibiliCredentialProfilesSummary(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliCredentialProfiles
+        }
+    }
+
+    public func startBilibiliLoginSession(
+        profileID: String,
+        method: BilibiliLoginMethod = .webQR
+    ) async throws -> BilibiliLoginSession {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_StartBilibiliLoginSessionRequest()
+                request.profileID = profileID
+                request.method = TvosNetPlayer_V1_BilibiliLoginMethod(method)
+                let response = try await service.startBilibiliLoginSession(request, options: callOptions)
+                return BilibiliLoginSession(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliLoginSessions
+        }
+    }
+
+    public func getBilibiliLoginSession(id: String) async throws -> BilibiliLoginSession {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_GetBilibiliLoginSessionRequest()
+                request.sessionID = id
+                let response = try await service.getBilibiliLoginSession(request, options: callOptions)
+                return BilibiliLoginSession(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliLoginSessions
+        }
+    }
+
     public func listCacheRoots() async throws -> [CacheRoot] {
         try await withGRPCClient(
             transport: .http2NIOTS(
@@ -554,8 +616,60 @@ extension BilibiliCredentialStatus {
             restrictedArea: proto.restrictedArea,
             restrictedPlayURLProxyCount: proto.restrictedPlayurlProxyCount,
             restrictedAPIProxyCount: proto.restrictedApiProxyCount,
+            checkedAt: proto.hasCheckedAt ? Date(proto.checkedAt) : nil,
+            activeProfileID: proto.activeProfileID,
+            defaultProfileID: proto.defaultProfileID,
+            profileCount: proto.profileCount,
+            profiles: proto.profiles.map(BilibiliCredentialProfile.init)
+        )
+    }
+}
+
+extension BilibiliCredentialProfile {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliCredentialProfile) {
+        self.init(
+            id: proto.id,
+            isDefault: proto.isDefault,
+            isActive: proto.isActive,
+            hasWebCookie: proto.webCookiePresent,
+            hasAccessKey: proto.accessKeyPresent,
+            hasTVAccessKey: proto.tvAccessKeyPresent
+        )
+    }
+}
+
+extension BilibiliCredentialProfilesSummary {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ListBilibiliCredentialProfilesResponse) {
+        self.init(
+            profiles: proto.profiles.map(BilibiliCredentialProfile.init),
+            activeProfileID: proto.activeProfileID,
+            defaultProfileID: proto.defaultProfileID,
             checkedAt: proto.hasCheckedAt ? Date(proto.checkedAt) : nil
         )
+    }
+}
+
+extension BilibiliLoginSession {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliLoginSession) {
+        self.init(
+            id: proto.id,
+            profileID: proto.profileID,
+            method: String(describing: proto.method),
+            state: String(describing: proto.state),
+            message: proto.message,
+            verificationURI: proto.verificationUri,
+            createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
+            expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil
+        )
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliLoginMethod {
+    fileprivate init(_ method: BilibiliLoginMethod) {
+        switch method {
+        case .webQR:
+            self = .webQr
+        }
     }
 }
 

@@ -71,10 +71,12 @@ superseded_by:
 
 ### PR 4: Credential Profile And Login Foundation
 
-- Add server-owned credential profile/login foundation while keeping secrets local to the Mac mini/server.
-- Continue exposing only redacted readiness/status to clients.
-- Prefer a control-plane shape that can later support QR/web login sessions, profile selection, and credential refresh without changing media playback.
-- If a full QR login flow is not safe or stable in this slice, land the profile/status/session foundation first and document the remaining login handoff.
+- Status: completed by the `wip/credential-profile-login-foundation` slice.
+- Added `--Cache:BBDownCredentialProfile` so the Rust LAN cache server can select a named BBDown credential profile while keeping the default-profile behavior unchanged when unset.
+- Extended the server control plane with redacted credential profile summaries, active/default profile IDs, and profile-list RPCs. Clients still see only presence/status booleans and profile IDs, never credential paths or secret values.
+- Added login-session control-plane RPCs and Swift client models with an explicit server-side `unsupported` session state. This lands the future QR/web login API shape without writing credential files or exposing refresh secrets in this slice.
+- Surfaced active profile/profile-count context in shared AppCore diagnostics for macOS/tvOS operator visibility.
+- Full QR/web login implementation, credential refresh lifecycle, and any secret-writing flow remain deferred to a later focused PR.
 
 ### PR 5: Authenticated And Restricted Live Validation Expansion
 
@@ -124,6 +126,8 @@ superseded_by:
 - PR 2 review-fix validation: `cargo test hls_fill_scheduler -- --nocapture`.
 - PR 2 quota-lock/progress-visibility review-fix validation: `cargo test playback_progress_promotes_before_waiting_for_quota_lock -- --nocapture`, `cargo test prewarm -- --nocapture`, `cargo test playback_progress -- --nocapture`.
 - PR 3 focused validation: `swift test --filter CacheLibraryItemTests/testWeakNetworkStatusClassifiesConcreteStates --disable-automatic-resolution`, `swift test --filter CacheLibraryViewModelTests/testHLSCacheStatusBadges --disable-automatic-resolution`, `swift test --filter CacheServerDiagnosticsViewModelTests/testWeakNetworkDiagnostics --disable-automatic-resolution`, `swift test --filter BilibiliTaskViewModelTests/testPlayable --disable-automatic-resolution`.
+- PR 4 focused validation: `cargo test -p tvos-net-player-cache-server credential_profile`, `cargo test -p tvos-net-player-cache-server get_bilibili_credential_status_reports_selected_profile`, `cargo test -p tvos-net-player-cache-server bilibili_login_session_foundation_returns_unsupported_session`, `swift test --filter CacheLibraryPaginationTests/testGeneratedBilibiliCredentialProfilesCapabilityMatchesPublicConstant --filter CacheLibraryPaginationTests/testGeneratedBilibiliLoginSessionsCapabilityMatchesPublicConstant --filter CacheServerDiagnosticsViewModelTests/testCredentialDiagnosticsIncludesActiveProfileSummary`.
+- PR 4 full validation: `just ci`.
 - Previous roadmap: `docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - Current architecture note: `docs/architecture/cache-server.md`
 - Current repo state entrypoint: `docs/PROJECT_STATE.md`

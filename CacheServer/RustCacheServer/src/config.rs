@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use bbdown_core::CredentialStore;
+use bbdown_core::{CredentialProfileSelection, CredentialStore};
 use url::Url;
 
 use crate::task_registry::TaskRetentionPolicy;
@@ -39,6 +39,7 @@ pub struct CacheServerOptions {
     pub bbdown_archive_path: Option<PathBuf>,
     pub bbdown_ffmpeg_path: PathBuf,
     pub bbdown_credential_path: Option<PathBuf>,
+    pub bbdown_credential_profile: Option<String>,
     pub bbdown_restricted_area: Option<BbdownRestrictedArea>,
     pub bbdown_restricted_area_proxies: Vec<BbdownRestrictedProxy>,
     pub bbdown_restricted_api_proxies: Vec<BbdownRestrictedProxy>,
@@ -97,6 +98,7 @@ impl Default for CacheServerOptions {
             bbdown_archive_path: None,
             bbdown_ffmpeg_path: PathBuf::from("ffmpeg"),
             bbdown_credential_path: None,
+            bbdown_credential_profile: None,
             bbdown_restricted_area: None,
             bbdown_restricted_area_proxies: Vec::new(),
             bbdown_restricted_api_proxies: Vec::new(),
@@ -187,8 +189,13 @@ impl CacheServerOptions {
                 ));
             }
         }
+        if self.bbdown_credential_profile.is_some() && self.bbdown_credential_path.is_none() {
+            return Err(ConfigError::new(
+                "BBDown credential profile requires --Cache:BBDownCredentialPath.",
+            ));
+        }
         if let Some(path) = self.bbdown_credential_path.as_deref() {
-            validate_bbdown_credential_path(path)?;
+            validate_bbdown_credential_path(path, self.bbdown_credential_profile.as_deref())?;
         }
 
         Ok(())
@@ -347,6 +354,9 @@ impl CacheServerOptions {
             "Cache:BBDownCredentialPath" => {
                 self.bbdown_credential_path = Some(PathBuf::from(value));
             }
+            "Cache:BBDownCredentialProfile" => {
+                self.bbdown_credential_profile = Some(parse_bbdown_credential_profile(&value)?);
+            }
             "Cache:BBDownRestrictedArea" => {
                 self.bbdown_restricted_area = Some(parse_bbdown_restricted_area(&value)?);
             }
@@ -420,6 +430,18 @@ fn parse_bool(value: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" | "n" | "off" => Ok(false),
         _ => Err(ConfigError::new(format!("invalid boolean value: {value}"))),
     }
+}
+
+fn parse_bbdown_credential_profile(value: &str) -> Result<String, ConfigError> {
+    let selection = CredentialProfileSelection::named(value).map_err(|error| {
+        ConfigError::new(format!(
+            "invalid BBDown credential profile `{value}`: {error}"
+        ))
+    })?;
+    selection
+        .profile_name()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ConfigError::new("BBDown credential profile must be a named profile."))
 }
 
 fn parse_bbdown_restricted_area(value: &str) -> Result<BbdownRestrictedArea, ConfigError> {
@@ -518,16 +540,29 @@ fn redact_config_url_for_error(raw: &str) -> String {
     )
 }
 
-fn validate_bbdown_credential_path(path: &Path) -> Result<(), ConfigError> {
-    CredentialStore::new(path.to_path_buf())
-        .load()
-        .map(|_| ())
+fn validate_bbdown_credential_path(
+    path: &Path,
+    selected_profile: Option<&str>,
+) -> Result<(), ConfigError> {
+    let profiles = CredentialStore::new(path.to_path_buf())
+        .load_profiles()
         .map_err(|error| {
             ConfigError::new(format!(
                 "failed to load BBDown credential file {}: {error}",
                 path.display()
             ))
-        })
+        })?;
+    if let Some(profile) = selected_profile {
+        let profile_exists = profiles.profile_names().any(|name| name == profile);
+        if !profile_exists {
+            return Err(ConfigError::new(format!(
+                "configured BBDown credential profile `{profile}` does not exist in {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn normalized_absolute_path(path: &Path) -> PathBuf {
@@ -836,6 +871,86 @@ mod tests {
         .expect("profile store credentials should parse");
 
         assert_eq!(Some(credentials_path), options.bbdown_credential_path);
+    }
+
+    #[test]
+    fn parses_bbdown_credential_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    },
+                    "living-room": {
+                        "cookie": "SESSDATA=living-room"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+            "--Cache:BBDownCredentialProfile".to_owned(),
+            "living-room".to_owned(),
+        ])
+        .expect("profile store credentials should parse");
+
+        assert_eq!(Some(credentials_path), options.bbdown_credential_path);
+        assert_eq!(
+            Some("living-room"),
+            options.bbdown_credential_profile.as_deref()
+        );
+    }
+
+    #[test]
+    fn rejects_bbdown_credential_profile_without_credential_path() {
+        let result = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialProfile".to_owned(),
+            "living-room".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("requires --Cache:BBDownCredentialPath")
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_bbdown_credential_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+            "--Cache:BBDownCredentialProfile".to_owned(),
+            "living-room".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError { message }) if message.contains("does not exist")
+        ));
     }
 
     #[test]

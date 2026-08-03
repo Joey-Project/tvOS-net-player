@@ -102,6 +102,68 @@ final class CacheServerDiagnosticsViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testCredentialDiagnosticsIncludesActiveProfileSummary() async {
+        let client = DiagnosticsFakeCacheControlClient(
+            serverInfo: CacheServerSummary(
+                id: "server-1",
+                name: "Mac mini cache",
+                version: "0.5.0",
+                mediaBaseURIs: [],
+                capabilities: [
+                    CacheServerCapability.bilibiliResolve,
+                    CacheServerCapability.bilibiliTaskSelection,
+                    CacheServerCapability.bilibiliCredentialStatus,
+                    CacheServerCapability.bilibiliCredentialProfiles,
+                ]
+            ),
+            credentialStatus: BilibiliCredentialStatus(
+                state: "BILIBILI_CREDENTIAL_STATE_READY",
+                message: "Credentials loaded.",
+                credentialPathConfigured: true,
+                credentialFileLoaded: true,
+                hasWebCookie: true,
+                hasAccessKey: true,
+                hasTVAccessKey: false,
+                restrictedArea: "th",
+                restrictedPlayURLProxyCount: 1,
+                restrictedAPIProxyCount: 1,
+                checkedAt: nil,
+                activeProfileID: "living-room",
+                defaultProfileID: "default",
+                profileCount: 2,
+                profiles: [
+                    BilibiliCredentialProfile(
+                        id: "default",
+                        isDefault: true,
+                        isActive: false,
+                        hasWebCookie: true,
+                        hasAccessKey: false,
+                        hasTVAccessKey: false
+                    ),
+                    BilibiliCredentialProfile(
+                        id: "living-room",
+                        isDefault: false,
+                        isActive: true,
+                        hasWebCookie: true,
+                        hasAccessKey: true,
+                        hasTVAccessKey: false
+                    ),
+                ]
+            )
+        )
+        let model = CacheServerDiagnosticsViewModel(
+            defaultServerAddressText: "mac-mini.local",
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+
+        XCTAssertEqual(result, .succeeded)
+        let detail = model.row(id: "credentials")?.detail
+        XCTAssertTrue(detail?.contains("Profile living-room") == true)
+        XCTAssertTrue(detail?.contains("2 profiles") == true)
+    }
+
     func testRefreshKeepsOptionalDiagnosticFailuresLocalToRows() async {
         let client = DiagnosticsFakeCacheControlClient(
             serverInfo: CacheServerSummary(

@@ -222,6 +222,7 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
             capabilityLabel("Bilibili", isReady: serverInfo.supportsBilibiliResolve),
             capabilityLabel("Selection", isReady: serverInfo.supportsBilibiliTaskSelection),
             capabilityLabel("Credentials", isReady: serverInfo.supportsBilibiliCredentialStatus),
+            capabilityLabel("Profiles", isReady: serverInfo.supportsBilibiliCredentialProfiles),
             capabilityLabel("Transcoding", isReady: serverInfo.supportsLanTranscoding),
             capabilityLabel("Delete", isReady: serverInfo.supportsLibraryItemDelete),
         ]
@@ -546,6 +547,12 @@ public struct CacheServerDiagnosticsSnapshot: Equatable, Sendable {
 
     private static func credentialDetail(_ status: BilibiliCredentialStatus) -> String {
         var parts: [String] = []
+        if !status.activeProfileID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("Profile \(status.activeProfileID)")
+        }
+        if status.profileCount > 1 {
+            parts.append("\(status.profileCount) profiles")
+        }
         parts.append(status.credentialFileLoaded ? "Credential file loaded" : "Credential file not loaded")
         parts.append(status.hasWebCookie ? "Web cookie ready" : "Web cookie missing")
         parts.append(status.hasAccessKey ? "Access key ready" : "Access key missing")

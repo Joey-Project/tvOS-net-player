@@ -239,6 +239,14 @@ public struct CacheServerSummary: Equatable, Sendable {
         capabilities.contains(CacheServerCapability.bilibiliCredentialStatus)
     }
 
+    public var supportsBilibiliCredentialProfiles: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliCredentialProfiles)
+    }
+
+    public var supportsBilibiliLoginSessions: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliLoginSessions)
+    }
+
     public var supportsLanTranscoding: Bool {
         capabilities.contains(CacheServerCapability.lanTranscoding)
     }
@@ -270,10 +278,56 @@ public struct CacheHealthStatus: Equatable, Sendable {
 
 public enum CacheServerCapability {
     public static let bilibiliCredentialStatus = "bilibiliCredentialStatus"
+    public static let bilibiliCredentialProfiles = "bilibiliCredentialProfiles"
+    public static let bilibiliLoginSessions = "bilibiliLoginSessions"
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
+}
+
+public struct BilibiliCredentialProfile: Equatable, Sendable {
+    public let id: String
+    public let isDefault: Bool
+    public let isActive: Bool
+    public let hasWebCookie: Bool
+    public let hasAccessKey: Bool
+    public let hasTVAccessKey: Bool
+
+    public init(
+        id: String,
+        isDefault: Bool,
+        isActive: Bool,
+        hasWebCookie: Bool,
+        hasAccessKey: Bool,
+        hasTVAccessKey: Bool
+    ) {
+        self.id = id
+        self.isDefault = isDefault
+        self.isActive = isActive
+        self.hasWebCookie = hasWebCookie
+        self.hasAccessKey = hasAccessKey
+        self.hasTVAccessKey = hasTVAccessKey
+    }
+}
+
+public struct BilibiliCredentialProfilesSummary: Equatable, Sendable {
+    public let profiles: [BilibiliCredentialProfile]
+    public let activeProfileID: String
+    public let defaultProfileID: String
+    public let checkedAt: Date?
+
+    public init(
+        profiles: [BilibiliCredentialProfile],
+        activeProfileID: String,
+        defaultProfileID: String,
+        checkedAt: Date?
+    ) {
+        self.profiles = profiles
+        self.activeProfileID = activeProfileID
+        self.defaultProfileID = defaultProfileID
+        self.checkedAt = checkedAt
+    }
 }
 
 public struct BilibiliCredentialStatus: Equatable, Sendable {
@@ -288,6 +342,10 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
     public let restrictedPlayURLProxyCount: UInt32
     public let restrictedAPIProxyCount: UInt32
     public let checkedAt: Date?
+    public let activeProfileID: String
+    public let defaultProfileID: String
+    public let profileCount: UInt32
+    public let profiles: [BilibiliCredentialProfile]
 
     public init(
         state: String,
@@ -300,7 +358,11 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
         restrictedArea: String,
         restrictedPlayURLProxyCount: UInt32,
         restrictedAPIProxyCount: UInt32,
-        checkedAt: Date?
+        checkedAt: Date?,
+        activeProfileID: String = "",
+        defaultProfileID: String = "",
+        profileCount: UInt32 = 0,
+        profiles: [BilibiliCredentialProfile] = []
     ) {
         self.state = state
         self.message = message
@@ -313,6 +375,45 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
         self.restrictedPlayURLProxyCount = restrictedPlayURLProxyCount
         self.restrictedAPIProxyCount = restrictedAPIProxyCount
         self.checkedAt = checkedAt
+        self.activeProfileID = activeProfileID
+        self.defaultProfileID = defaultProfileID
+        self.profileCount = profileCount
+        self.profiles = profiles
+    }
+}
+
+public enum BilibiliLoginMethod: String, Equatable, Sendable {
+    case webQR
+}
+
+public struct BilibiliLoginSession: Equatable, Sendable {
+    public let id: String
+    public let profileID: String
+    public let method: String
+    public let state: String
+    public let message: String
+    public let verificationURI: String
+    public let createdAt: Date?
+    public let expiresAt: Date?
+
+    public init(
+        id: String,
+        profileID: String,
+        method: String,
+        state: String,
+        message: String,
+        verificationURI: String,
+        createdAt: Date?,
+        expiresAt: Date?
+    ) {
+        self.id = id
+        self.profileID = profileID
+        self.method = method
+        self.state = state
+        self.message = message
+        self.verificationURI = verificationURI
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
     }
 }
 

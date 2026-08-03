@@ -23,6 +23,20 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedBilibiliCredentialProfilesCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliCredentialProfiles),
+            CacheServerCapability.bilibiliCredentialProfiles
+        )
+    }
+
+    func testGeneratedBilibiliLoginSessionsCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliLoginSessions),
+            CacheServerCapability.bilibiliLoginSessions
+        )
+    }
+
     func testGeneratedLanTranscodingCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.lanTranscoding),
@@ -142,6 +156,8 @@ final class CacheLibraryPaginationTests: XCTestCase {
             mediaBaseURIs: [],
             capabilities: [
                 CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliCredentialProfiles,
+                CacheServerCapability.bilibiliLoginSessions,
                 CacheServerCapability.bilibiliResolve,
                 CacheServerCapability.bilibiliTaskSelection,
                 CacheServerCapability.lanTranscoding,
@@ -156,10 +172,14 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
 
         XCTAssertTrue(supported.supportsBilibiliCredentialStatus)
+        XCTAssertTrue(supported.supportsBilibiliCredentialProfiles)
+        XCTAssertTrue(supported.supportsBilibiliLoginSessions)
         XCTAssertTrue(supported.supportsBilibiliResolve)
         XCTAssertTrue(supported.supportsBilibiliTaskSelection)
         XCTAssertTrue(supported.supportsLanTranscoding)
         XCTAssertFalse(unsupported.supportsBilibiliCredentialStatus)
+        XCTAssertFalse(unsupported.supportsBilibiliCredentialProfiles)
+        XCTAssertFalse(unsupported.supportsBilibiliLoginSessions)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
         XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
         XCTAssertFalse(unsupported.supportsLanTranscoding)
