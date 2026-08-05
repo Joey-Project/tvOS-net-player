@@ -44,6 +44,16 @@ const WATCHER_EVENT_BUFFER_CAPACITY: usize = 128;
 const DEFAULT_MAX_TERMINAL_TASKS: usize = 200;
 const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+pub(crate) fn is_known_safe_cancellation_message(message: &str) -> bool {
+    matches!(
+        message,
+        CANCEL_REQUESTED_MESSAGE
+            | CANCELLED_BY_REQUEST_MESSAGE
+            | CANCELLED_AFTER_RESTART_MESSAGE
+            | CANCELLED_MESSAGE
+    )
+}
+
 pub struct BilibiliTaskRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     queue_notify: Arc<Notify>,

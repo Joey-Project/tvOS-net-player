@@ -64,7 +64,10 @@ use crate::{
         PlaybackProgressReport,
     },
     library::ROOT_ID,
-    task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
+    task_registry::{
+        BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp,
+        is_known_safe_cancellation_message,
+    },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
         LanTranscodingStatusSnapshot,
@@ -849,20 +852,35 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
     if !redact_error_details {
         return task;
     }
-    if task.kind() == TaskKind::BilibiliDownload
-        && matches!(
-            task.state(),
-            TaskState::Running | TaskState::CancelRequested
-        )
-    {
-        task.message = crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL.to_owned();
-    }
-    if matches!(task.state(), TaskState::Failed | TaskState::Cancelled) {
-        task.message = crate::credential_safe_client_error(true, &task.message);
+    match task.state() {
+        TaskState::Running | TaskState::CancelRequested
+            if task.kind() == TaskKind::BilibiliDownload =>
+        {
+            task.message = crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL.to_owned();
+        }
+        TaskState::Failed => {
+            task.message = crate::credential_safe_client_error(true, &task.message);
+        }
+        TaskState::Cancelled if !is_known_safe_cancellation_message(&task.message) => {
+            task.message = crate::credential_safe_client_error(true, &task.message);
+        }
+        TaskState::Playable | TaskState::Completed
+            if task.kind() == TaskKind::BilibiliProgressivePlayback
+                && task.message.contains("offline cache fill failed") =>
+        {
+            task.message = crate::credential_safe_client_error(true, &task.message);
+        }
+        _ => {}
     }
     for item in &mut task.result_items {
-        if matches!(item.state(), TaskState::Failed | TaskState::Cancelled) {
-            item.message = crate::credential_safe_client_error(true, &item.message);
+        match item.state() {
+            TaskState::Failed => {
+                item.message = crate::credential_safe_client_error(true, &item.message);
+            }
+            TaskState::Cancelled if !is_known_safe_cancellation_message(&item.message) => {
+                item.message = crate::credential_safe_client_error(true, &item.message);
+            }
+            _ => {}
         }
     }
     task
@@ -3985,6 +4003,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_configured_rpc_omits_persisted_playable_cache_fill_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let created = tasks
+            .create_bilibili_playback_task("BV1playable-credential-error", None, None)
+            .expect("playback task should be created");
+        tasks
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                PlaybackSource {
+                    item_id: created.task.id.clone(),
+                    variant_id: "source".to_owned(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        created.task.id
+                    ),
+                    expires_at: None,
+                },
+                BilibiliPlaybackSession {
+                    id: created.task.id.clone(),
+                    selected_variant_id: "source".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("playback task should become playable");
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        let sensitive_detail = format!(
+            "Playable online; offline cache fill failed: upstream request https://example.test/media?access_key={synthetic_access_token}"
+        );
+        let degraded = tasks
+            .fail_hls_cache_fill_for_playback_session(
+                &created.task.id,
+                &created.task.id,
+                sensitive_detail.clone(),
+            )
+            .expect("cache fill failure should be accepted")
+            .expect("cache fill failure should update the playable task");
+        assert_eq!(TaskState::Playable, degraded.state());
+        assert!(
+            fs::read_to_string(&task_state_path)
+                .expect("persisted task state should remain readable")
+                .contains(synthetic_access_token)
+        );
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: created.task.id.clone(),
+            }))
+            .await
+            .expect("persisted playable task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Playable, snapshot.state());
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            snapshot.message
+        );
+        assert!(!snapshot.message.contains(synthetic_access_token));
+
+        let mut stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![created.task.id],
+            }))
+            .await
+            .expect("playable task watch should start")
+            .into_inner();
+        let watched_snapshot = stream
+            .next()
+            .await
+            .expect("watch should include its initial snapshot")
+            .expect("initial task event should succeed")
+            .task
+            .expect("initial event should include a task");
+        assert_eq!(TaskState::Playable, watched_snapshot.state());
+        assert_eq!(snapshot.message, watched_snapshot.message);
+        assert!(!watched_snapshot.message.contains(synthetic_access_token));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_preserves_internal_cancellation_messages() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let queued = tasks
+            .create_bilibili_task("BV1queued-cancel", None)
+            .expect("queued task should be created");
+        let queued_cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest { id: queued.id }))
+            .await
+            .expect("queued task cancellation should succeed")
+            .into_inner();
+        assert_eq!(TaskState::Cancelled, queued_cancelled.state());
+        assert_eq!(
+            "Cancelled before the download adapter started.",
+            queued_cancelled.message
+        );
+        assert!(!queued_cancelled.message.contains("server_bug"));
+
+        let running = tasks
+            .create_bilibili_task("BV1running-cancel", None)
+            .expect("running task should be created");
+        let work_item = tasks
+            .try_claim_next_bilibili_task()
+            .expect("download task should become running");
+        assert_eq!(running.id, work_item.task_id);
+        service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: running.id.clone(),
+            }))
+            .await
+            .expect("running task cancellation should be requested");
+        tasks
+            .complete_task_cancelled(&running.id, "Cancelled by request.".to_owned())
+            .expect("running task should finish cancellation");
+
+        let running_cancelled = service
+            .get_task(Request::new(GetTaskRequest { id: running.id }))
+            .await
+            .expect("cancelled task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Cancelled, running_cancelled.state());
+        assert_eq!("Cancelled by request.", running_cancelled.message);
+        assert!(!running_cancelled.message.contains("server_bug"));
+    }
+
+    #[tokio::test]
     async fn credential_configured_result_item_omits_upstream_detail() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -4079,6 +4253,30 @@ mod tests {
                 .message
                 .contains("result-sensitive-marker")
         );
+    }
+
+    #[test]
+    fn task_client_boundary_redacts_cache_fill_failure_from_playable_parent_states() {
+        let sensitive_detail =
+            "Playable online; offline cache fill failed: upstream response-sensitive-marker";
+
+        for state in [TaskState::Playable, TaskState::Completed] {
+            let task = Task {
+                kind: TaskKind::BilibiliProgressivePlayback.into(),
+                state: state.into(),
+                message: sensitive_detail.to_owned(),
+                ..Default::default()
+            };
+
+            let sanitized = task_for_client(task, true);
+
+            assert_eq!(state, sanitized.state());
+            assert_eq!(
+                crate::credential_safe_client_error(true, &sensitive_detail),
+                sanitized.message
+            );
+            assert!(!sanitized.message.contains("response-sensitive-marker"));
+        }
     }
 
     #[tokio::test]
