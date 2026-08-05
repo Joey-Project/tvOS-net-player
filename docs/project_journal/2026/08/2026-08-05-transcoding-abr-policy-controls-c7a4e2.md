@@ -28,7 +28,7 @@ superseded_by:
 - Unspecified wire values normalize to automatic transcoding, compatible-first selection, and adaptive weak-network recovery. The playback session reports normalized effective values.
 - Explicit codec input retains precedence over compatible-first selection. The compatible-first path, HLS alternate filtering, and transcoding planning share one conservative H.264/AAC HLS compatibility predicate.
 - Requested options remain part of persisted task state, and effective policy remains part of persisted HLS session state. Legacy snapshots and manifests recover through safe defaults without a schema-version bump.
-- Every client playback-policy request requires the new server capability because even the default compatible-first behavior has semantics that an older server would silently ignore.
+- Explicit non-default client policies require the new server capability. Default requests remain usable with legacy servers through a documented fallback to their older planner and weak-network behavior.
 
 ## Client UX
 

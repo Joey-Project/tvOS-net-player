@@ -435,9 +435,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
     }
 
     static func requiredCapabilityForBilibiliPlaybackPolicy(
-        options _: BilibiliPlaybackTaskOptions
+        options: BilibiliPlaybackTaskOptions
     ) -> String? {
-        CacheServerCapability.bilibiliPlaybackPolicy
+        options.playbackPolicy.isDefault ? nil : CacheServerCapability.bilibiliPlaybackPolicy
     }
 
     private static func unsupportedFeature(forMissingCapability capability: String)
