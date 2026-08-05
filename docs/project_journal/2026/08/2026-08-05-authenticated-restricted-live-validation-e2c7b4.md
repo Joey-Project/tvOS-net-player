@@ -21,8 +21,8 @@ superseded_by:
 ## Delivered
 
 - Added `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` and mapped it to the server's `Cache:BBDownCredentialProfile` setting.
-- Added per-case server isolation, aggregate failure reporting, credential-safe details, and failure classes for credential, empty account state, upstream schema/availability, restricted proxy, and server defects. Teardown now tracks the created task, cancels it, explicitly cancels its queued/current scheduler fills, and proves the task and registered planning/finalization/transcoding/HLS-fill work are idle before dropping that case's cache root. This also covers terminal multi-result parents whose secondary cache fill remains active after the primary cache completes.
-- Preserved stable Bilibili collection-item identity when recommendations or other dynamic feeds reorder between selection and task execution, including exact page selection by embedded CID.
+- Added per-case server isolation, aggregate failure reporting, credential-safe details, and failure classes for credential, empty account state, upstream schema/availability, restricted proxy, and server defects. Credential-backed background logs use a fixed omitted-detail marker instead of formatting upstream errors. Teardown tracks the created task, cancels it, explicitly cancels its queued/current scheduler fills, proves the task and registered planning/finalization/transcoding/HLS-fill work are idle, then closes and awaits the per-state HLS worker before dropping that case's cache root and clients. Current completion plus optional requeue is atomic with scheduler cancellation, covering terminal multi-result parents whose secondary cache fill remains active after the primary cache completes.
+- Preserved stable Bilibili collection-item identity when recommendations or other dynamic feeds reorder between selection and task execution, including exact page selection by embedded CID. Stable `item:` ids now bind a canonical parsed collection-source token and reject reuse against another list/feed endpoint.
 - Kept completed HLS playlists and persisted manifests upstream-free while allowing already-issued alternate playlist and range URLs to finish from in-memory runtime metadata during one fixed 60-second absolute grace period. An atomic generation-bound scrub prevents a delayed timer from overwriting even a byte-for-byte identical newer same-id session.
 - Refreshed the restricted proxy inventory with separately recorded availability timestamps; restricted playback remains web API mode only.
 
@@ -44,6 +44,9 @@ superseded_by:
 - `cargo test -p tvos-net-player-cache-server completed_runtime --locked`
 - `cargo test -p tvos-net-player-cache-server background_work --locked`
 - `cargo test -p tvos-net-player-cache-server cancelling_task_removes_queued_jobs_and_cancels_current_without_requeue --locked`
+- `cargo test -p tvos-net-player-cache-server collection_item_selection_bound --locked`
+- `cargo test -p tvos-net-player-cache-server shutdown --locked`
+- `cargo test -p tvos-net-player-cache-server credential_safe_log_detail_omits_raw_upstream_error --locked`
 - `cargo test -p tvos-net-player-cache-server --test bilibili_live_e2e --locked`
 - Opt-in real live e2e: ordinary video, multi-part video, space collection/videos, homepage recommendations, authenticated history/watch-later, and both restricted Bangumi fixtures.
 - `just test`

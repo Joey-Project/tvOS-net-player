@@ -1393,7 +1393,7 @@ fn playback_selection_from_id(
         if !playback_input_accepts_collection_item_selection(input) {
             return Err(invalid_selection_id(selection_id));
         }
-        return playback_collection_item_selection_from_id(item, selection_id);
+        return playback_collection_item_selection_from_id(input, item, selection_id);
     }
     if let Some(episode) = selection_id.strip_prefix("episode:") {
         if !playback_input_accepts_episode_selection(input) {
@@ -1452,7 +1452,11 @@ fn playback_page_selection_from_id(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_index(index_text, selection_id)?;
-    let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    let parsed = playback_selection_parts_from_parts(parts, selection_id)?;
+    if parsed.source_token.is_some() {
+        return Err(invalid_selection_id(selection_id));
+    }
+    let expected_identity = parsed.expected_identity;
     if !expected_identity
         .as_ref()
         .is_some_and(PlaybackExpectedIdentity::is_valid_page_identity)
@@ -1468,10 +1472,16 @@ fn playback_page_selection_from_id(
 }
 
 fn playback_collection_item_selection_from_id(
+    input: &Input,
     item: &str,
     selection_id: &str,
 ) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
     let parsed = parse_collection_item_selection(item, selection_id)?;
+    let expected_source_token =
+        collection_source_token(input).ok_or_else(|| invalid_selection_id(selection_id))?;
+    if parsed.source_token.as_deref() != Some(expected_source_token.as_str()) {
+        return Err(invalid_selection_id(selection_id));
+    }
 
     Ok(PlaybackInputSelection {
         input_override: parsed.expected_identity.direct_video_input(),
@@ -1483,6 +1493,7 @@ fn playback_collection_item_selection_from_id(
 #[derive(Debug, Eq, PartialEq)]
 struct ParsedCollectionItemSelection {
     index: u32,
+    source_token: Option<String>,
     expected_identity: PlaybackExpectedIdentity,
 }
 
@@ -1496,7 +1507,8 @@ fn parse_collection_item_selection(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_index(index_text, selection_id)?;
-    let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    let parsed = playback_selection_parts_from_parts(parts, selection_id)?;
+    let expected_identity = parsed.expected_identity;
     if !expected_identity
         .as_ref()
         .is_some_and(PlaybackExpectedIdentity::is_valid_collection_item_identity)
@@ -1505,17 +1517,24 @@ fn parse_collection_item_selection(
     }
     Ok(ParsedCollectionItemSelection {
         index,
+        source_token: parsed.source_token,
         expected_identity: expected_identity.expect("validated collection identity should exist"),
     })
 }
 
 pub(crate) fn recover_stable_collection_candidate(
     selection_id: &str,
+    source: &str,
     source_kind: &str,
     current_candidates: &[BilibiliResolvedCandidate],
 ) -> Option<BilibiliResolvedCandidate> {
     let item = selection_id.strip_prefix("item:")?;
     let parsed = parse_collection_item_selection(item, selection_id).ok()?;
+    let input = playback_input_for_planning(source).ok()?;
+    let expected_source_token = collection_source_token(&input)?;
+    if parsed.source_token.as_deref() != Some(expected_source_token.as_str()) {
+        return None;
+    }
     let mut candidate = current_candidates
         .iter()
         .find(|candidate| {
@@ -1526,9 +1545,10 @@ pub(crate) fn recover_stable_collection_candidate(
                     parse_collection_item_selection(item, &candidate.selection_id).ok()
                 })
                 .is_some_and(|current| {
-                    parsed
-                        .expected_identity
-                        .same_collection_item(&current.expected_identity)
+                    current.source_token.as_deref() == Some(expected_source_token.as_str())
+                        && parsed
+                            .expected_identity
+                            .same_collection_item(&current.expected_identity)
                 })
         })
         .cloned()
@@ -1558,10 +1578,16 @@ pub(crate) fn recover_stable_collection_candidate(
     Some(candidate)
 }
 
-fn playback_expected_identity_from_parts<'a>(
+struct ParsedSelectionParts {
+    source_token: Option<String>,
+    expected_identity: Option<PlaybackExpectedIdentity>,
+}
+
+fn playback_selection_parts_from_parts<'a>(
     mut parts: impl Iterator<Item = &'a str>,
     selection_id: &str,
-) -> Result<Option<PlaybackExpectedIdentity>, BilibiliDownloadError> {
+) -> Result<ParsedSelectionParts, BilibiliDownloadError> {
+    let mut source_token = None;
     let mut bvid = None;
     let mut aid = None;
     let mut cid = None;
@@ -1570,6 +1596,9 @@ fn playback_expected_identity_from_parts<'a>(
             return Err(invalid_selection_id(selection_id));
         };
         match kind {
+            "source" if source_token.is_none() && !value.trim().is_empty() => {
+                source_token = Some(value.trim().to_owned());
+            }
             "bvid" if bvid.is_none() && !value.trim().is_empty() => {
                 bvid = Some(value.trim().to_owned());
             }
@@ -1584,9 +1613,15 @@ fn playback_expected_identity_from_parts<'a>(
     }
 
     if bvid.is_none() && aid.is_none() && cid.is_none() {
-        return Ok(None);
+        return Ok(ParsedSelectionParts {
+            source_token,
+            expected_identity: None,
+        });
     }
-    Ok(Some(PlaybackExpectedIdentity { bvid, aid, cid }))
+    Ok(ParsedSelectionParts {
+        source_token,
+        expected_identity: Some(PlaybackExpectedIdentity { bvid, aid, cid }),
+    })
 }
 
 fn parse_selection_index(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
@@ -1727,7 +1762,7 @@ impl BilibiliInputResolution {
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|item| BilibiliResolvedCandidate {
-                        selection_id: collection_item_selection_id(item),
+                        selection_id: collection_item_selection_id(input, item),
                         title: item.title.clone(),
                         subtitle: collection_item_subtitle(source_kind, item.index, &item.owner),
                         source_kind: source_kind.to_owned(),
@@ -1799,20 +1834,59 @@ fn page_selection_id(page: &bbdown_core::PageMetadata, video_bvid: Option<&str>)
         )
 }
 
-fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> String {
+fn collection_item_selection_id(input: &Input, item: &bbdown_core::VideoCollectionItem) -> String {
+    let source_token = collection_source_token(input)
+        .expect("resolved Bilibili collection should have a stable source token");
     item.bvid
         .as_deref()
         .map(str::trim)
         .filter(|bvid| !bvid.is_empty())
         .map_or_else(
-            || format!("item:{}:cid:{}:aid:{}", item.index, item.cid, item.aid),
+            || {
+                format!(
+                    "item:{}:source:{}:cid:{}:aid:{}",
+                    item.index, source_token, item.cid, item.aid
+                )
+            },
             |bvid| {
                 format!(
-                    "item:{}:cid:{}:bvid:{}:aid:{}",
-                    item.index, item.cid, bvid, item.aid
+                    "item:{}:source:{}:cid:{}:bvid:{}:aid:{}",
+                    item.index, source_token, item.cid, bvid, item.aid
                 )
             },
         )
+}
+
+fn collection_source_token(input: &Input) -> Option<String> {
+    match input {
+        Input::SpaceVideos(owner_mid) => Some(format!("space-videos-{owner_mid}")),
+        Input::FavoriteList {
+            media_id,
+            owner_mid,
+        } => Some(format!(
+            "favorite-{}-{}",
+            optional_u64_source_component(*media_id),
+            optional_u64_source_component(*owner_mid)
+        )),
+        Input::CollectionList(list_id) => Some(format!("collection-{list_id}")),
+        Input::SeriesList(list_id) => Some(format!("series-{list_id}")),
+        Input::SpaceCollectionList { list_id, owner_mid } => {
+            Some(format!("space-collection-{owner_mid}-{list_id}"))
+        }
+        Input::SpaceSeriesList { list_id, owner_mid } => {
+            Some(format!("space-series-{owner_mid}-{list_id}"))
+        }
+        Input::RecommendationFeed => Some("recommendation".to_owned()),
+        Input::FollowingFeed => Some("following".to_owned()),
+        Input::SpaceDynamic(owner_mid) => Some(format!("space-dynamic-{owner_mid}")),
+        Input::History => Some("history".to_owned()),
+        Input::WatchLater => Some("watch-later".to_owned()),
+        _ => None,
+    }
+}
+
+fn optional_u64_source_component(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 fn episode_selection_id(epid: u64) -> String {
@@ -3392,7 +3466,7 @@ mod tests {
     fn parses_collection_item_bvid_selection_id_as_direct_video_selection() {
         let input_selection = playback_selection_from_id(
             &Input::History,
-            Some("item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
+            Some("item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
         )
         .unwrap();
 
@@ -3413,9 +3487,11 @@ mod tests {
 
     #[test]
     fn parses_collection_item_aid_selection_id_as_direct_video_selection() {
-        let input_selection =
-            playback_selection_from_id(&Input::History, Some("item:7:cid:270001:aid:170001"))
-                .unwrap();
+        let input_selection = playback_selection_from_id(
+            &Input::History,
+            Some("item:7:source:history:cid:270001:aid:170001"),
+        )
+        .unwrap();
 
         assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
         assert_eq!(input_selection.selection, None);
@@ -3431,9 +3507,10 @@ mod tests {
 
     #[test]
     fn recovers_reordered_collection_candidate_by_stable_identity() {
-        let selection_id = "item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
         let current = BilibiliResolvedCandidate {
-            selection_id: "item:1:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+            selection_id: "item:1:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+                .to_owned(),
             title: "Current recommendation title".to_owned(),
             subtitle: "Current owner".to_owned(),
             source_kind: "recommendation".to_owned(),
@@ -3443,9 +3520,13 @@ mod tests {
             cover_uri: "https://example.invalid/cover.jpg".to_owned(),
         };
 
-        let recovered =
-            recover_stable_collection_candidate(selection_id, "recommendation", &[current])
-                .expect("stable identity should recover a reordered candidate");
+        let recovered = recover_stable_collection_candidate(
+            selection_id,
+            "https://www.bilibili.com/",
+            "recommendation",
+            &[current],
+        )
+        .expect("stable identity should recover a reordered candidate");
 
         assert_eq!(recovered.selection_id, selection_id);
         assert_eq!(recovered.index, 7);
@@ -3455,16 +3536,37 @@ mod tests {
 
     #[test]
     fn recovers_missing_collection_candidate_from_server_owned_selection_id() {
-        let selection_id = "item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
 
-        let recovered = recover_stable_collection_candidate(selection_id, "recommendation", &[])
-            .expect("valid stable identity should recover without a refreshed feed match");
+        let recovered = recover_stable_collection_candidate(
+            selection_id,
+            "https://www.bilibili.com/",
+            "recommendation",
+            &[],
+        )
+        .expect("valid stable identity should recover without a refreshed feed match");
 
         assert_eq!(recovered.selection_id, selection_id);
         assert_eq!(recovered.index, 7);
         assert_eq!(recovered.title, "BV1xx411c7mD");
         assert_eq!(recovered.content_id, "BV1xx411c7mD");
         assert_eq!(recovered.source_kind, "recommendation");
+    }
+
+    #[test]
+    fn rejects_collection_item_selection_bound_to_another_source() {
+        let history_selection = "item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+
+        assert!(playback_selection_from_id(&Input::WatchLater, Some(history_selection)).is_err());
+        assert!(
+            recover_stable_collection_candidate(
+                history_selection,
+                "https://www.bilibili.com/",
+                "recommendation",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3784,13 +3886,19 @@ mod tests {
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
-            "item:3:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+            "item:3:source:favorite-456-none:cid:270001:bvid:BV1xx411c7mD:aid:170001"
         );
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
 
-        let input_selection =
-            playback_selection_from_id(&Input::History, Some(&candidate.selection_id)).unwrap();
+        let input_selection = playback_selection_from_id(
+            &Input::FavoriteList {
+                media_id: Some(456),
+                owner_mid: None,
+            },
+            Some(&candidate.selection_id),
+        )
+        .unwrap();
         assert_eq!(
             input_selection.input_override,
             Some(Input::Bvid("BV1xx411c7mD".to_owned()))

@@ -1315,7 +1315,8 @@ async fn run_single_bilibili_playback_planning(
             } else {
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
-                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"
+                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                 }
                 state.enqueue_hls_cache_fill_foreground(
@@ -1455,7 +1456,8 @@ async fn run_explicit_bilibili_playback_planning(
                 planned_sessions.push(metadata.hls_session.clone());
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
-                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {error}"
+                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                 }
                 if primary.is_none() {
@@ -1473,7 +1475,7 @@ async fn run_explicit_bilibili_playback_planning(
             Err(error) if cancellation.is_cancel_requested() => {
                 eprintln!(
                     "Bilibili playback planning for task {task_id} observed cancellation after planner error: {}",
-                    playback_error_message(error)
+                    state.error_detail_for_log(&playback_error_message(error))
                 );
                 return complete_cancelled_explicit_bilibili_playback(
                     &state,
@@ -1614,6 +1616,7 @@ fn selected_bilibili_candidates(
                     .or_else(|| {
                         recover_stable_collection_candidate(
                             selection_id,
+                            &resolution.source,
                             &resolution.source_kind,
                             &resolution.candidates,
                         )
@@ -1771,8 +1774,8 @@ pub(crate) async fn run_hls_cache_finalization(
 }
 
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
-    loop {
-        let job = state.hls_fill_scheduler.next_job().await;
+    let _worker_guard = state.hls_fill_scheduler.worker_guard();
+    while let Some(job) = state.hls_fill_scheduler.next_job_until_shutdown().await {
         let session_id = job.session.id.clone();
         let outcome = run_hls_cache_finalization_inner(
             state.clone(),
@@ -1782,12 +1785,11 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
             job.token.clone(),
         )
         .await;
-        state.hls_fill_scheduler.finish_current(&job);
-        if outcome == HlsCacheFinalizationOutcome::Preempted
+        let should_requeue = outcome == HlsCacheFinalizationOutcome::Preempted
             && state
                 .tasks
-                .is_hls_session_playable_for_task(&job.task_id, &session_id)
-        {
+                .is_hls_session_playable_for_task(&job.task_id, &session_id);
+        if should_requeue {
             let message = match job.priority {
                 crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
                     "Playable online; offline cache fill paused behind newer playback."
@@ -1805,8 +1807,10 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                     message: Some(message.to_owned()),
                 },
             );
-            state.hls_fill_scheduler.requeue_preempted(job);
         }
+        state
+            .hls_fill_scheduler
+            .finish_current(&job, should_requeue);
     }
 }
 
@@ -1911,7 +1915,8 @@ async fn run_hls_cache_finalization_inner(
         }
         Err(error) => {
             eprintln!(
-                "Failed to prewarm HLS playback cache for task {task_id}; continuing full cache fill: {error}"
+                "Failed to prewarm HLS playback cache for task {task_id}; continuing full cache fill: {}",
+                state.error_detail_for_log(&error)
             );
         }
     }
@@ -1932,7 +1937,8 @@ async fn run_hls_cache_finalization_inner(
         || control() != HlsCacheFillControl::Continue,
     ) {
         eprintln!(
-            "Failed to run HLS cache eviction before finalization for task {task_id}: {error}"
+            "Failed to run HLS cache eviction before finalization for task {task_id}: {}",
+            state.error_detail_for_log(&error)
         );
     }
     if control() == HlsCacheFillControl::Preempt {
@@ -1980,7 +1986,8 @@ async fn run_hls_cache_finalization_inner(
                         0,
                     ) {
                         eprintln!(
-                            "Failed to run HLS cache eviction after finalization for task {task_id}: {error}"
+                            "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
+                            state.error_detail_for_log(&error)
                         );
                     }
                 }
@@ -2007,7 +2014,8 @@ async fn run_hls_cache_finalization_inner(
             match failure_mode {
                 HlsCacheFinalizationFailureMode::KeepPlayable => {
                     eprintln!(
-                        "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {error}"
+                        "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                     if let Err(status) = state.tasks.fail_hls_cache_fill_for_playback_session(
                         &task_id,
@@ -2015,7 +2023,8 @@ async fn run_hls_cache_finalization_inner(
                         format!("Playable online; offline cache fill failed: {error}"),
                     ) {
                         eprintln!(
-                            "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {status}"
+                            "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
+                            state.error_detail_for_log(&status)
                         );
                     }
                 }
@@ -2030,7 +2039,8 @@ async fn run_hls_cache_finalization_inner(
                         )
                     {
                         eprintln!(
-                            "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {status}"
+                            "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {}",
+                            state.error_detail_for_log(&status)
                         );
                     }
                 }
@@ -4393,13 +4403,15 @@ mod tests {
 
     #[test]
     fn explicit_item_ids_recover_when_a_refreshed_feed_no_longer_contains_the_item() {
-        let selection_id = "item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
         let resolution = BilibiliInputResolution {
             source: "https://www.bilibili.com/".to_owned(),
             title: "Refreshed recommendations".to_owned(),
             source_kind: "recommendation".to_owned(),
             candidates: vec![AdapterBilibiliResolvedCandidate {
-                selection_id: "item:1:cid:270002:bvid:BV1yy411c7mD:aid:170002".to_owned(),
+                selection_id:
+                    "item:1:source:recommendation:cid:270002:bvid:BV1yy411c7mD:aid:170002"
+                        .to_owned(),
                 title: "Different recommendation".to_owned(),
                 subtitle: String::new(),
                 source_kind: "recommendation".to_owned(),
@@ -4424,6 +4436,30 @@ mod tests {
         assert_eq!(selected[0].selection_id, selection_id);
         assert_eq!(selected[0].content_id, "BV1xx411c7mD");
         assert_eq!(selected[0].index, 7);
+    }
+
+    #[test]
+    fn explicit_item_ids_reject_selection_bound_to_another_source() {
+        let resolution = BilibiliInputResolution {
+            source: "https://www.bilibili.com/".to_owned(),
+            title: "Refreshed recommendations".to_owned(),
+            source_kind: "recommendation".to_owned(),
+            candidates: Vec::new(),
+            default_selection_id: String::new(),
+            candidates_truncated: false,
+        };
+
+        let error = selected_bilibili_candidates(
+            &resolution,
+            &BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                selection_ids: vec![
+                    "item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+                ],
+            },
+        )
+        .expect_err("cross-source stable selection should be rejected");
+
+        assert!(error.contains("was not found"));
     }
 
     #[tokio::test]
@@ -5837,7 +5873,7 @@ mod tests {
 
         assert!(report.accepted);
         assert!(active_job.token.is_preempted());
-        state.hls_fill_scheduler.finish_current(&active_job);
+        state.hls_fill_scheduler.finish_current(&active_job, false);
         let promoted = state.hls_fill_scheduler.next_job().await;
         assert_eq!(demoted_task_id, promoted.task_id);
         assert_eq!(

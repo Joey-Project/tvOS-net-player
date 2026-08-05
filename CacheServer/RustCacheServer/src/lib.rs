@@ -21,6 +21,7 @@ mod transcoding;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Display,
     io,
     net::SocketAddr,
     sync::{
@@ -83,6 +84,8 @@ const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
 const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const CREDENTIAL_SAFE_LOG_DETAIL: &str =
+    "detail omitted because Bilibili credential material is configured";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -743,6 +746,10 @@ impl AppState {
         }
     }
 
+    pub(crate) fn error_detail_for_log(&self, detail: &dyn Display) -> String {
+        error_detail_for_log(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
     #[doc(hidden)]
     pub fn background_work_is_idle(&self) -> bool {
         self.playback_planning_active_jobs.load(Ordering::SeqCst) == 0
@@ -759,6 +766,11 @@ impl AppState {
     #[doc(hidden)]
     pub fn cancel_hls_fill_work_for_task(&self, task_id: &str) {
         self.hls_fill_scheduler.cancel_task(task_id);
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_hls_fill_worker(&self) {
+        self.hls_fill_scheduler.shutdown_and_wait_for_worker().await;
     }
 
     #[doc(hidden)]
@@ -1444,6 +1456,14 @@ impl AppState {
     }
 }
 
+fn error_detail_for_log(credentials_configured: bool, detail: &dyn Display) -> String {
+    if credentials_configured {
+        CREDENTIAL_SAFE_LOG_DETAIL.to_owned()
+    } else {
+        detail.to_string()
+    }
+}
+
 fn refresh_restored_hls_playback_source(
     tasks: &BilibiliTaskRegistry,
     playback_uri_factory: &PlaybackUriFactory,
@@ -1791,6 +1811,16 @@ mod tests {
         transcoding::HlsTranscodingPlan,
     };
 
+    #[test]
+    fn credential_safe_log_detail_omits_raw_upstream_error() {
+        let detail = "https://example.test/video.m4s?access_key=credential-sensitive-marker";
+
+        assert_eq!(detail, error_detail_for_log(false, &detail));
+        let safe = error_detail_for_log(true, &detail);
+        assert_eq!(CREDENTIAL_SAFE_LOG_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
     #[tokio::test]
     async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
         let port = match free_port() {
@@ -1927,8 +1957,33 @@ mod tests {
         assert!(!state.background_work_is_idle());
         state.cancel_hls_fill_work_for_task(&task_id);
         assert!(current_job.token.is_cancelled());
-        state.hls_fill_scheduler.finish_current(&current_job);
+        state.hls_fill_scheduler.finish_current(&current_job, false);
         assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn app_state_shutdown_stops_idle_hls_fill_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        state.enqueue_hls_cache_fill_foreground(
+            "missing-task".to_owned(),
+            sample_hls_session("shutdown-worker"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.hls_fill_scheduler.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HLS fill worker should finish the rejected job");
+        assert!(state.hls_fill_scheduler.worker_started_for_tests());
+
+        tokio::time::timeout(Duration::from_secs(1), state.shutdown_hls_fill_worker())
+            .await
+            .expect("idle HLS fill worker should stop after shutdown");
+        assert!(!state.hls_fill_scheduler.worker_started_for_tests());
     }
 
     #[tokio::test]

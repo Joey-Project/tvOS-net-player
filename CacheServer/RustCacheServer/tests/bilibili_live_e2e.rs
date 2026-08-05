@@ -748,6 +748,12 @@ fn assert_stable_item_candidate(case: &LiveCase, candidate: &BilibiliResolvedCan
         selection_id
     );
     assert!(
+        selection_id.contains(":source:"),
+        "{}: stable collection item selection lacks source binding: {}",
+        case.id,
+        selection_id
+    );
+    assert!(
         selection_id.contains(":cid:"),
         "{}: stable collection item id is missing cid: {}",
         case.id,
@@ -1164,6 +1170,7 @@ impl LiveTestServer {
             if task_is_terminal && self.state.background_work_is_idle() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 if self.state.background_work_is_idle() {
+                    self.state.shutdown_hls_fill_worker().await;
                     return Ok(());
                 }
             }
@@ -1393,7 +1400,8 @@ mod tests {
     fn stable_item_candidate_contract_accepts_complete_identity() {
         let case = test_case("space-videos", false, false);
         let valid = BilibiliResolvedCandidate {
-            selection_id: "item:1:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+            selection_id: "item:1:source:space-videos-123:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+                .to_owned(),
             source_kind: "space".to_owned(),
             content_id: "BV1xx411c7mD".to_owned(),
             index: 1,
