@@ -130,7 +130,7 @@ async fn run_one_bilibili_task(
     if work_item.cancellation.is_cancel_requested() {
         let message = match result {
             Err(BilibiliDownloadError::Cancelled(message)) => {
-                crate::credential_safe_client_error(credentials_configured, &message)
+                crate::credential_safe_client_cancellation(credentials_configured, &message)
             }
             _ => "Cancelled by request.".to_owned(),
         };
@@ -147,7 +147,8 @@ async fn run_one_bilibili_task(
             );
         }
         Err(BilibiliDownloadError::Cancelled(message)) => {
-            let message = crate::credential_safe_client_error(credentials_configured, &message);
+            let message =
+                crate::credential_safe_client_cancellation(credentials_configured, &message);
             let _ = registry.complete_task_cancelled(&work_item.task_id, message);
         }
         Err(error @ BilibiliDownloadError::Failed(_)) => {

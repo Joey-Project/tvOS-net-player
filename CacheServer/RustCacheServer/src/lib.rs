@@ -90,6 +90,8 @@ pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
     "Bilibili error detail omitted because credential material is configured.";
 pub(crate) const CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL: &str =
     "Bilibili download progress detail omitted because credential material is configured.";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL: &str =
+    "Bilibili cancellation detail omitted because credential material is configured.";
 const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 
 #[derive(Clone)]
@@ -765,6 +767,22 @@ impl AppState {
 
     pub(crate) fn error_detail_for_client(&self, detail: &dyn Display) -> String {
         credential_safe_client_error(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn cancellation_detail_for_client(&self, detail: &str) -> String {
+        credential_safe_client_cancellation(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn error_with_context_for_client(
+        &self,
+        context: &'static str,
+        detail: &dyn Display,
+    ) -> String {
+        credential_safe_client_error_with_context(
+            self.options.bbdown_credential_path.is_some(),
+            context,
+            detail,
+        )
     }
 
     pub(crate) fn bilibili_error_details_are_sensitive(&self) -> bool {
@@ -1502,6 +1520,33 @@ pub(crate) fn credential_safe_client_error(
     )
 }
 
+pub(crate) fn credential_safe_client_cancellation(
+    credentials_configured: bool,
+    detail: &str,
+) -> String {
+    if !credentials_configured
+        || detail == CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL
+        || task_registry::is_known_safe_cancellation_message(detail)
+    {
+        return detail.to_owned();
+    }
+
+    CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL.to_owned()
+}
+
+fn credential_safe_client_error_with_context(
+    credentials_configured: bool,
+    context: &'static str,
+    detail: &dyn Display,
+) -> String {
+    let detail = credential_safe_client_error(credentials_configured, detail);
+    if credentials_configured {
+        format!("{detail} {context}.")
+    } else {
+        format!("{context}: {detail}")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BilibiliFailureClass {
     Credential,
@@ -2031,6 +2076,65 @@ mod tests {
 
         assert!(safe.contains("[bilibili_failure_class=upstream_schema_or_availability]"));
         assert!(!safe.contains("raw-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_cancellation_preserves_only_server_owned_detail() {
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        assert_eq!(
+            "Cancelled before playback planning started.",
+            credential_safe_client_cancellation(
+                true,
+                "Cancelled before playback planning started."
+            )
+        );
+        assert_eq!(
+            CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL,
+            credential_safe_client_cancellation(
+                true,
+                &format!(
+                    "Cancelled after upstream request https://example.test/media?access_key={synthetic_access_token}"
+                )
+            )
+        );
+        assert_eq!(
+            "adapter cancellation detail",
+            credential_safe_client_cancellation(false, "adapter cancellation detail")
+        );
+    }
+
+    #[test]
+    fn credential_safe_client_error_context_survives_boundary_redaction() {
+        assert_eq!(
+            "Playable online; offline cache fill failed: upstream request failed",
+            credential_safe_client_error_with_context(
+                false,
+                "Playable online; offline cache fill failed",
+                &"upstream request failed",
+            )
+        );
+        for context in [
+            "Playable online; offline cache fill failed",
+            "Failed to restore offline HLS cache after restart",
+        ] {
+            let wrapped = credential_safe_client_error_with_context(
+                true,
+                context,
+                &"restricted proxy response-sensitive-marker",
+            );
+
+            assert!(wrapped.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL));
+            assert!(wrapped.contains("[bilibili_failure_class=restricted_proxy]"));
+            assert!(wrapped.contains(context));
+            assert!(!wrapped.contains("response-sensitive-marker"));
+            assert_eq!(
+                format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"
+                ),
+                credential_safe_client_error(true, &wrapped)
+            );
+        }
     }
 
     #[tokio::test]

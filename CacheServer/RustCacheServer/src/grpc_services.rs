@@ -65,8 +65,8 @@ use crate::{
     },
     library::ROOT_ID,
     task_registry::{
-        BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp,
-        is_known_safe_cancellation_message,
+        BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
     },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
@@ -861,8 +861,8 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
         TaskState::Failed => {
             task.message = crate::credential_safe_client_error(true, &task.message);
         }
-        TaskState::Cancelled if !is_known_safe_cancellation_message(&task.message) => {
-            task.message = crate::credential_safe_client_error(true, &task.message);
+        TaskState::Cancelled => {
+            task.message = crate::credential_safe_client_cancellation(true, &task.message);
         }
         TaskState::Playable | TaskState::Completed
             if task.kind() == TaskKind::BilibiliProgressivePlayback
@@ -877,8 +877,8 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
             TaskState::Failed => {
                 item.message = crate::credential_safe_client_error(true, &item.message);
             }
-            TaskState::Cancelled if !is_known_safe_cancellation_message(&item.message) => {
-                item.message = crate::credential_safe_client_error(true, &item.message);
+            TaskState::Cancelled => {
+                item.message = crate::credential_safe_client_cancellation(true, &item.message);
             }
             _ => {}
         }
@@ -1244,10 +1244,7 @@ async fn run_bilibili_playback_planning(
         if cancellation.is_cancel_requested() {
             if state
                 .tasks
-                .complete_task_cancelled(
-                    &task_id,
-                    "Cancelled before playback planning started.".to_owned(),
-                )
+                .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
                 .is_ok()
             {
                 cleanup.disarm();
@@ -1280,10 +1277,7 @@ async fn run_bilibili_playback_planning(
     if cancellation.is_cancel_requested() {
         if state
             .tasks
-            .complete_task_cancelled(
-                &task_id,
-                "Cancelled before playback planning started.".to_owned(),
-            )
+            .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
             .is_ok()
         {
             cleanup.disarm();
@@ -1420,7 +1414,7 @@ async fn run_explicit_bilibili_playback_planning(
             let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_cancelled(&task_id, state.error_detail_for_client(&message))
+                .complete_task_cancelled(&task_id, state.cancellation_detail_for_client(&message))
                 .is_ok();
         }
         Err(error) => {
@@ -1652,7 +1646,7 @@ fn complete_cancelled_explicit_bilibili_playback(
     let _ = state.tasks.update_playback_results(
         task_id,
         Some(title.to_owned()),
-        "Cancelled while planning Bilibili playback results.".to_owned(),
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
         result_items_progress(result_items),
         result_items.to_vec(),
     );
@@ -1660,7 +1654,7 @@ fn complete_cancelled_explicit_bilibili_playback(
         .tasks
         .complete_task_cancelled(
             task_id,
-            "Cancelled while planning Bilibili playback results.".to_owned(),
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
         )
         .is_ok()
 }
@@ -1776,7 +1770,7 @@ fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
 fn mark_results_cancelled(items: &mut [BilibiliTaskResultItem]) {
     for item in items {
         item.state = TaskState::Cancelled.into();
-        item.message = "Cancelled while planning Bilibili playback results.".to_owned();
+        item.message = PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned();
         item.library_item_id.clear();
         item.playback_source = None;
         item.playback_session = None;
@@ -2085,9 +2079,9 @@ async fn run_hls_cache_finalization_inner(
                     if let Err(status) = state.tasks.fail_hls_cache_fill_for_playback_session(
                         &task_id,
                         &session_id,
-                        format!(
-                            "Playable online; offline cache fill failed: {}",
-                            state.error_detail_for_client(&error)
+                        state.error_with_context_for_client(
+                            "Playable online; offline cache fill failed",
+                            &error,
                         ),
                     ) {
                         eprintln!(
@@ -2103,9 +2097,9 @@ async fn run_hls_cache_finalization_inner(
                         .tasks
                         .fail_unrestorable_playback_session_after_cache_restore(
                             &session_id,
-                            format!(
-                                "Failed to restore offline HLS cache after restart: {}",
-                                state.error_detail_for_client(&error)
+                            state.error_with_context_for_client(
+                                "Failed to restore offline HLS cache after restart",
+                                &error,
                             ),
                         )
                     {
@@ -2528,7 +2522,7 @@ fn playback_status_from_error(state: &AppState, error: BilibiliDownloadError) ->
             Status::failed_precondition(state.error_detail_for_client(&message))
         }
         BilibiliDownloadError::Cancelled(message) => {
-            Status::cancelled(state.error_detail_for_client(&message))
+            Status::cancelled(state.cancellation_detail_for_client(&message))
         }
     }
 }
@@ -4156,6 +4150,103 @@ mod tests {
         assert_eq!(TaskState::Cancelled, running_cancelled.state());
         assert_eq!("Cancelled by request.", running_cancelled.message);
         assert!(!running_cancelled.message.contains("server_bug"));
+
+        let planning = tasks
+            .create_bilibili_playback_task("BV1planning-cancel", None, None)
+            .expect("playback planning task should be created");
+        tasks
+            .complete_task_cancelled(
+                &planning.task.id,
+                PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            )
+            .expect("playback planning task should finish cancellation");
+        let planning_snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: planning.task.id.clone(),
+            }))
+            .await
+            .expect("cancelled playback planning task should remain readable")
+            .into_inner();
+        assert_eq!(
+            PLAYBACK_PLANNING_CANCELLED_MESSAGE,
+            planning_snapshot.message
+        );
+        assert!(!planning_snapshot.message.contains("server_bug"));
+        let mut planning_stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![planning.task.id],
+            }))
+            .await
+            .expect("cancelled playback planning watch should start")
+            .into_inner();
+        let watched_planning = planning_stream
+            .next()
+            .await
+            .expect("watch should include its initial planning snapshot")
+            .expect("initial planning event should succeed")
+            .task
+            .expect("initial planning event should include a task");
+        assert_eq!(planning_snapshot.message, watched_planning.message);
+
+        let explicit = tasks
+            .create_bilibili_playback_task("BV1result-planning-cancel", None, None)
+            .expect("explicit playback task should be created");
+        tasks
+            .update_playback_results(
+                &explicit.task.id,
+                None,
+                PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: format!("{}-result-1", explicit.task.id),
+                    state: TaskState::Cancelled.into(),
+                    message: PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("explicit playback result should record cancellation");
+        tasks
+            .complete_task_cancelled(
+                &explicit.task.id,
+                PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            )
+            .expect("explicit playback task should finish cancellation");
+        let explicit_snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: explicit.task.id.clone(),
+            }))
+            .await
+            .expect("cancelled explicit playback task should remain readable")
+            .into_inner();
+        assert_eq!(
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+            explicit_snapshot.message
+        );
+        assert_eq!(1, explicit_snapshot.result_items.len());
+        assert_eq!(
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+            explicit_snapshot.result_items[0].message
+        );
+        assert!(!explicit_snapshot.message.contains("server_bug"));
+        let mut explicit_stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![explicit.task.id],
+            }))
+            .await
+            .expect("cancelled explicit playback watch should start")
+            .into_inner();
+        let watched_explicit = explicit_stream
+            .next()
+            .await
+            .expect("watch should include its initial explicit snapshot")
+            .expect("initial explicit event should succeed")
+            .task
+            .expect("initial explicit event should include a task");
+        assert_eq!(explicit_snapshot.message, watched_explicit.message);
+        assert_eq!(
+            explicit_snapshot.result_items[0].message,
+            watched_explicit.result_items[0].message
+        );
     }
 
     #[tokio::test]
@@ -4277,6 +4368,27 @@ mod tests {
             );
             assert!(!sanitized.message.contains("response-sensitive-marker"));
         }
+
+        let wrapped = format!(
+            "{} [bilibili_failure_class=restricted_proxy] Playable online; offline cache fill failed.",
+            crate::CREDENTIAL_SAFE_CLIENT_DETAIL
+        );
+        let sanitized = task_for_client(
+            Task {
+                kind: TaskKind::BilibiliProgressivePlayback.into(),
+                state: TaskState::Playable.into(),
+                message: wrapped,
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(
+            format!(
+                "{} [bilibili_failure_class=restricted_proxy]",
+                crate::CREDENTIAL_SAFE_CLIENT_DETAIL
+            ),
+            sanitized.message
+        );
     }
 
     #[tokio::test]

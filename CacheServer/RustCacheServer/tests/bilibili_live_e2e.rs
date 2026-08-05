@@ -349,20 +349,26 @@ async fn assert_hls_master(
 
     let source_url = assert_lan_media_url(case, &source.uri, media_url, label);
 
-    let response =
-        http.get(&source.uri).send().await.unwrap_or_else(|error| {
-            panic!("{}: {label} HLS master request failed: {error}", case.id)
-        });
+    let response = http.get(&source.uri).send().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: {label} HLS master request failed: {}",
+            case.id,
+            error.without_url()
+        )
+    });
     assert_eq!(
         StatusCode::OK,
         response.status(),
         "{}: {label} HLS master returned unexpected status",
         case.id
     );
-    let playlist = response
-        .text()
-        .await
-        .unwrap_or_else(|error| panic!("{}: {label} HLS master body failed: {error}", case.id));
+    let playlist = response.text().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: {label} HLS master body failed: {}",
+            case.id,
+            error.without_url()
+        )
+    });
     assert!(
         playlist.contains("#EXTM3U"),
         "{}: {label} HLS master is not an m3u8 playlist",
@@ -372,31 +378,34 @@ async fn assert_hls_master(
         assert_playlist_stays_on_lan(case, &source_url, &playlist, media_url, label);
     for media_playlist_url in media_playlist_urls {
         let nested_label = format!("{label} media playlist");
+        let media_playlist_origin = lan_media_origin_for_diagnostic(&media_playlist_url);
         let response = http
             .get(media_playlist_url.clone())
             .send()
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "{}: {nested_label} request failed for {media_playlist_url}: {error}",
-                    case.id
+                    "{}: {nested_label} request failed for origin={media_playlist_origin}: {}",
+                    case.id,
+                    error.without_url()
                 )
             });
         assert_eq!(
             StatusCode::OK,
             response.status(),
-            "{}: {nested_label} returned non-OK status for {media_playlist_url}",
+            "{}: {nested_label} returned non-OK status for origin={media_playlist_origin}",
             case.id
         );
         let media_playlist = response.text().await.unwrap_or_else(|error| {
             panic!(
-                "{}: {nested_label} response body failed for {media_playlist_url}: {error}",
-                case.id
+                "{}: {nested_label} response body failed for origin={media_playlist_origin}: {}",
+                case.id,
+                error.without_url()
             )
         });
         assert!(
             media_playlist.starts_with("#EXTM3U"),
-            "{}: {nested_label} is not an m3u8 playlist for {media_playlist_url}",
+            "{}: {nested_label} is not an m3u8 playlist for origin={media_playlist_origin}",
             case.id
         );
         assert_playlist_stays_on_lan(
@@ -420,7 +429,7 @@ fn assert_playlist_stays_on_lan(
     for uri in playlist_referenced_uris(playlist) {
         let resolved = base_url.join(&uri).unwrap_or_else(|error| {
             panic!(
-                "{}: {label} playlist URI is not resolvable against {base_url}: {uri}: {error}",
+                "{}: {label} playlist contains an unresolvable URI: {error}",
                 case.id
             )
         });
@@ -473,10 +482,15 @@ fn assert_lan_media_url(case: &LiveCase, uri: &str, media_url: &str, label: &str
             parsed.host_str(),
             parsed.port_or_known_default()
         ),
-        "{}: {label} escaped the LAN media listener: {uri}",
-        case.id
+        "{}: {label} escaped the LAN media listener: origin={}",
+        case.id,
+        lan_media_origin_for_diagnostic(&parsed)
     );
     parsed
+}
+
+fn lan_media_origin_for_diagnostic(url: &Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1434,6 +1448,22 @@ async fn wait_for_grpc(grpc_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_media_origin_diagnostic_omits_credential_query() {
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        let url = Url::parse(&format!(
+            "https://upstream.example.test/media/video.m4s?access_key={synthetic_access_token}"
+        ))
+        .expect("synthetic upstream URL should parse");
+
+        let diagnostic = lan_media_origin_for_diagnostic(&url);
+
+        assert_eq!("https://upstream.example.test", diagnostic);
+        assert!(!diagnostic.contains(synthetic_access_token));
+        assert!(!diagnostic.contains("access_key"));
+    }
 
     #[tokio::test]
     async fn shutdown_cancels_untracked_registry_task_before_removing_case_root() {
