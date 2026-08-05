@@ -15,6 +15,7 @@ pub mod library;
 pub mod media;
 mod mp4_segments;
 pub mod playback;
+mod playback_policy;
 pub mod task_registry;
 mod task_store;
 mod transcoding;
@@ -53,7 +54,7 @@ use crate::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
         TaskGrpcService, playback_session_from_hls_cache_session,
     },
-    hls::{HlsPlaybackRegistry, HlsPlaybackSession},
+    hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
@@ -557,7 +558,7 @@ impl AppState {
     pub(crate) fn hls_playback_session_for_serving(
         &self,
         session_id: &str,
-    ) -> Option<HlsPlaybackSession> {
+    ) -> Option<HlsPlaybackSessionHandle> {
         let _quota_lock = self
             .hls_cache_quota_enforcement_lock
             .lock()
@@ -567,20 +568,21 @@ impl AppState {
             self.remove_hls_playback_session(session_id);
             return None;
         }
-        let Some(session) = self.hls_playback_session(session_id) else {
+        if self.hls_playback_session(session_id).is_none() {
             self.fail_unrestorable_hls_playback_session_if_cache_is_accessible(session_id);
             return None;
-        };
-        if !was_registered || self.restored_hls_playback_source_needs_refresh(&session) {
+        }
+        let handle = self.hls_sessions.get_with_generation(session_id)?;
+        if !was_registered || self.restored_hls_playback_source_needs_refresh(&handle.session) {
             refresh_restored_hls_playback_source_for_session(
                 &self.tasks,
                 &self.playback_uri_factory,
-                &session,
+                &handle.session,
                 self.completed_hls_task_is_authorized(session_id),
             );
         }
         self.note_hls_cache_playback_use(session_id);
-        Some(session)
+        Some(handle)
     }
 
     fn registered_hls_session_is_authorized_for_serving(&self, session_id: &str) -> bool {
@@ -734,6 +736,7 @@ impl AppState {
         session: &HlsPlaybackSession,
         grace_period: Duration,
     ) {
+        self.hls_network_policy.remove_session(&session.id);
         let runtime_session = completed_runtime_session(session);
         let sanitized_session = sanitized_completed_session(session);
         let session_id = runtime_session.id.clone();
@@ -2623,6 +2626,7 @@ mod tests {
             }),
             variants: Vec::new(),
             transcoding_plan: None,
+            effective_policy: Some(crate::playback_policy::PlaybackPolicy::default().to_proto()),
         }
     }
 
@@ -2672,6 +2676,7 @@ mod tests {
             abr: HlsAbrMetadata::default(),
             variants: Vec::new(),
             transcoding: HlsTranscodingPlan::default(),
+            effective_policy: crate::playback_policy::PlaybackPolicy::default(),
         }
     }
 

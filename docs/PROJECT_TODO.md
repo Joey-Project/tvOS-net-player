@@ -12,7 +12,7 @@
 - [completed] Next PR 3：补齐 weak/offline playback UX，包括 cache-only、partially cached、quota-blocked、upstream-failed、retrying、variant downgrade 和 unknown active fallback 状态。
 - [completed] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。
 - [completed] Next PR 5：扩展 authenticated/restricted live validation，覆盖 history、watch-later、recommendations、space videos、restricted Bangumi 和 collection/list cases，并安全识别 following/dynamic 的外部 schema compatibility failure。
-- [pending] Next PR 7：增加 transcoding/ABR policy controls；这是用户批准的非线性执行顺序，先于 deferred schema PR 6 推进播放策略产品化。
+- [completed] Next PR 7：增加 per-request transcoding/ABR policy controls、兼容变体选择、弱网降级/恢复模式，以及 tvOS/macOS 共享设置。
 - [pending] Deferred/non-sequential Next PR 6：Bilibili task options/result schema v2；开始实现前先暂停讨论 schema。
 - [pending] 跟进 `bbdown-core` dynamic feed timestamp compatibility：接受整数或 numeric-string `module_author.pub_ts`，升级依赖后重跑 following/dynamic live cases。
 - [completed] PR 9：推进 segment-level fill / prefetch。

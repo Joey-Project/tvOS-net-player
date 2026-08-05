@@ -4,6 +4,48 @@ import XCTest
 
 @MainActor
 final class BilibiliTaskViewModelTests: XCTestCase {
+    func testPlaybackPolicyDefaultsLoadAndSave() throws {
+        let suiteName = "BilibiliTaskViewModelTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = BilibiliTaskViewModel(defaults: defaults)
+
+        XCTAssertEqual(model.playbackTranscodingPreference, .auto)
+        XCTAssertEqual(model.playbackCompatibleVariantPreference, .preferCompatible)
+        XCTAssertEqual(model.playbackWeakNetworkPreference, .adaptive)
+
+        model.playbackTranscodingPreference = .force
+        model.playbackCompatibleVariantPreference = .preferRequested
+        model.playbackWeakNetworkPreference = .holdDowngrade
+
+        XCTAssertEqual(
+            defaults.string(forKey: BilibiliTaskViewModel.playbackTranscodingPreferenceDefaultsKey),
+            "force"
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: BilibiliTaskViewModel.playbackCompatibleVariantPreferenceDefaultsKey),
+            "preferRequested"
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: BilibiliTaskViewModel.playbackWeakNetworkPreferenceDefaultsKey),
+            "holdDowngrade"
+        )
+
+        let restored = BilibiliTaskViewModel(defaults: defaults)
+        XCTAssertEqual(restored.playbackTranscodingPreference, .force)
+        XCTAssertEqual(restored.playbackCompatibleVariantPreference, .preferRequested)
+        XCTAssertEqual(restored.playbackWeakNetworkPreference, .holdDowngrade)
+
+        restored.playbackTranscodingPreference = .auto
+        restored.playbackCompatibleVariantPreference = .preferCompatible
+        restored.playbackWeakNetworkPreference = .adaptive
+
+        XCTAssertNil(defaults.string(forKey: BilibiliTaskViewModel.playbackTranscodingPreferenceDefaultsKey))
+        XCTAssertNil(defaults.string(forKey: BilibiliTaskViewModel.playbackCompatibleVariantPreferenceDefaultsKey))
+        XCTAssertNil(defaults.string(forKey: BilibiliTaskViewModel.playbackWeakNetworkPreferenceDefaultsKey))
+    }
+
     func testSubmitCreatesPlaybackTaskWithOptionsAndStartsWatching() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.fixture(state: "TASK_STATE_PREPARING", message: "Preparing playback."))
@@ -37,6 +79,78 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await client.waitForWatchSubscription()
         model.clearTask()
         await client.waitForWatchTermination()
+    }
+
+    func testSubmitPassesPlaybackPolicyToResolveAndCreate() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(state: "TASK_STATE_PREPARING", message: "Preparing playback."))
+        ])
+        let policy = BilibiliPlaybackPolicy(
+            transcodingPreference: .force,
+            compatibleVariantPreference: .preferRequested,
+            weakNetworkPreference: .avPlayerManaged
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1policy",
+            playbackPolicy: policy,
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.first?.options.playbackPolicy, policy)
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.first?.options.playbackPolicy, policy)
+
+        await client.waitForWatchSubscription()
+        model.clearTask()
+        await client.waitForWatchTermination()
+    }
+
+    func testActivePlaybackPolicySummaryUsesEffectivePolicyAndTranscodingPlan() async {
+        let policy = BilibiliPlaybackPolicy(
+            transcodingPreference: .never,
+            compatibleVariantPreference: .preferRequested,
+            weakNetworkPreference: .holdDowngrade
+        )
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    state: "TASK_STATE_PLAYABLE",
+                    playbackSession: CacheBilibiliPlaybackSession(
+                        id: "bilibili-playback-1",
+                        title: "Ready video",
+                        contentID: "BV1ready-cid1",
+                        selectedVariantID: "h264",
+                        selectedVariant: nil,
+                        variants: [],
+                        transcodingPlan: LanTranscodingPlan(
+                            state: "LAN_TRANSCODING_PLAN_STATE_REQUIRED",
+                            profileID: "avplayer-h264-aac-hls-v1",
+                            reason: "Requested policy requires transcoding.",
+                            sourceVariantID: "dolby",
+                            targetContainer: "hls/fmp4",
+                            targetVideoCodec: "h264",
+                            targetAudioCodec: "aac",
+                            outputProtocol: "PLAYBACK_PROTOCOL_HLS"
+                        ),
+                        effectivePolicy: policy
+                    )
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1summary",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(
+            model.activePlaybackPolicySummary,
+            "Policy: never transcode, prefer requested, hold downgrade · Transcoding: Requested policy requires transcoding."
+        )
+        model.clearTask()
     }
 
     func testSubmitCreatesDownloadTaskWithSidecarOptions() async {

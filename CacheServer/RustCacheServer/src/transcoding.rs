@@ -12,9 +12,11 @@ use tokio::{
 };
 
 use crate::{
-    bbdown_adapter::{BilibiliMediaRequest, BilibiliPlaybackVariant},
-    codecs::{codec_list_matches, is_aac_codec, is_h264_codec},
+    bbdown_adapter::BilibiliPlaybackVariant,
     config::CacheServerOptions,
+    playback_policy::{
+        PlaybackPolicy, TranscodingPreference, variant_is_avplayer_h264_aac_hls_compatible,
+    },
 };
 
 pub(crate) const LAN_TRANSCODING_PROFILE_ID: &str = "avplayer-h264-aac-hls-v1";
@@ -185,9 +187,18 @@ impl Default for HlsTranscodingPlan {
 }
 
 impl HlsTranscodingPlan {
+    #[cfg(test)]
     pub(crate) fn for_variant(
         options: &CacheServerOptions,
         variant: &BilibiliPlaybackVariant,
+    ) -> Self {
+        Self::for_variant_with_policy(options, variant, PlaybackPolicy::default())
+    }
+
+    pub(crate) fn for_variant_with_policy(
+        options: &CacheServerOptions,
+        variant: &BilibiliPlaybackVariant,
+        policy: PlaybackPolicy,
     ) -> Self {
         if variant.video.is_none() {
             return Self::with_state(
@@ -197,27 +208,43 @@ impl HlsTranscodingPlan {
             );
         }
 
-        if variant_is_avplayer_h264_aac_hls_compatible(variant) {
-            return Self::with_state(
+        let compatible = variant_is_avplayer_h264_aac_hls_compatible(variant);
+        match policy.transcoding_preference {
+            TranscodingPreference::Auto if compatible => Self::with_state(
                 HlsTranscodingPlanState::NotRequired,
                 variant.id.clone(),
                 "Selected variant is already compatible with the conservative AVPlayer H.264/AAC HLS profile.",
-            );
-        }
-
-        if !options.lan_transcoding_enabled {
-            return Self::with_state(
+            ),
+            TranscodingPreference::Never if compatible => Self::with_state(
+                HlsTranscodingPlanState::NotRequired,
+                variant.id.clone(),
+                "Selected variant is already compatible with the conservative AVPlayer H.264/AAC HLS profile.",
+            ),
+            TranscodingPreference::Never => Self::with_state(
+                HlsTranscodingPlanState::Disabled,
+                variant.id.clone(),
+                "LAN transcoding was disabled by playback policy; selected variant will be served through the existing HLS passthrough path.",
+            ),
+            TranscodingPreference::Force if !options.lan_transcoding_enabled => Self::with_state(
+                HlsTranscodingPlanState::Disabled,
+                variant.id.clone(),
+                "LAN transcoding is disabled by server configuration; playback policy cannot force transcoding.",
+            ),
+            TranscodingPreference::Auto if !options.lan_transcoding_enabled => Self::with_state(
                 HlsTranscodingPlanState::Disabled,
                 variant.id.clone(),
                 "LAN transcoding is disabled; selected variant will be served through the existing HLS passthrough path.",
-            );
+            ),
+            TranscodingPreference::Auto | TranscodingPreference::Force => Self::with_state(
+                HlsTranscodingPlanState::Ready,
+                variant.id.clone(),
+                if compatible {
+                    "Playback policy forces LAN transcoding into the conservative AVPlayer H.264/AAC HLS profile."
+                } else {
+                    "Selected variant can be converted by the LAN server into the conservative AVPlayer H.264/AAC HLS profile when execution is enabled."
+                },
+            ),
         }
-
-        Self::with_state(
-            HlsTranscodingPlanState::Ready,
-            variant.id.clone(),
-            "Selected variant can be converted by the LAN server into the conservative AVPlayer H.264/AAC HLS profile when execution is enabled.",
-        )
     }
 
     pub(crate) fn with_state(
@@ -417,149 +444,12 @@ fn stderr_tail(stderr: &[u8]) -> String {
     format!("...{tail}")
 }
 
-fn variant_is_avplayer_h264_aac_hls_compatible(variant: &BilibiliPlaybackVariant) -> bool {
-    let Some(video) = variant.video.as_ref() else {
-        return false;
-    };
-    variant_has_codec(variant, Some(video), is_h264_codec)
-        && variant
-            .audio
-            .as_ref()
-            .is_none_or(|audio| variant_has_codec(variant, Some(audio), is_aac_codec))
-        && variant_is_within_transcoding_profile_envelope(variant, video)
-        && variant_h264_level_is_within_transcoding_profile(variant, video)
-}
-
-fn variant_is_within_transcoding_profile_envelope(
-    variant: &BilibiliPlaybackVariant,
-    video: &BilibiliMediaRequest,
-) -> bool {
-    bounded_u32(variant.width, LAN_TRANSCODING_MAX_WIDTH)
-        && bounded_u32(video.width, LAN_TRANSCODING_MAX_WIDTH)
-        && bounded_u32(variant.height, LAN_TRANSCODING_MAX_HEIGHT)
-        && bounded_u32(video.height, LAN_TRANSCODING_MAX_HEIGHT)
-        && bounded_frame_rate(variant.frame_rate.as_deref())
-        && bounded_frame_rate(video.frame_rate.as_deref())
-        && bounded_u64(
-            variant.bandwidth,
-            transcoding_profile_total_bandwidth(variant.audio.is_some()),
-        )
-        && bounded_u64(video.bandwidth, LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS)
-        && variant
-            .audio
-            .as_ref()
-            .is_none_or(|audio| bounded_u64(audio.bandwidth, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS))
-}
-
-fn transcoding_profile_total_bandwidth(has_audio: bool) -> u64 {
-    LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS
-        + if has_audio {
-            LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS
-        } else {
-            0
-        }
-}
-
-fn bounded_u32(value: Option<u32>, max: u32) -> bool {
-    value.is_none_or(|value| value <= max)
-}
-
-fn bounded_u64(value: Option<u64>, max: u64) -> bool {
-    value.is_none_or(|value| value <= max)
-}
-
-fn bounded_frame_rate(frame_rate: Option<&str>) -> bool {
-    let Some(frame_rate) = frame_rate.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
-
-    parse_frame_rate(frame_rate).is_none_or(|rate| rate <= LAN_TRANSCODING_MAX_FRAME_RATE)
-}
-
-fn parse_frame_rate(frame_rate: &str) -> Option<f64> {
-    if let Some((numerator, denominator)) = frame_rate.split_once('/') {
-        let numerator = numerator.trim().parse::<f64>().ok()?;
-        let denominator = denominator.trim().parse::<f64>().ok()?;
-        if denominator <= 0.0 {
-            return None;
-        }
-        let parsed = numerator / denominator;
-        return parsed.is_finite().then_some(parsed);
-    }
-    frame_rate
-        .parse::<f64>()
-        .ok()
-        .filter(|rate| rate.is_finite())
-}
-
-fn variant_h264_level_is_within_transcoding_profile(
-    variant: &BilibiliPlaybackVariant,
-    video: &BilibiliMediaRequest,
-) -> bool {
-    if let Some(codecs) = video.codecs.as_deref() {
-        return codec_list_h264_is_within_transcoding_profile(codecs);
-    }
-
-    variant
-        .codecs
-        .iter()
-        .all(|codecs| codec_list_h264_is_within_transcoding_profile(codecs))
-}
-
-fn codec_list_h264_is_within_transcoding_profile(codecs: &str) -> bool {
-    codecs
-        .split(',')
-        .filter(|codec| is_h264_codec(codec))
-        .all(h264_codec_is_within_transcoding_profile)
-}
-
-fn h264_codec_is_within_transcoding_profile(codec: &str) -> bool {
-    let codec = codec.trim().to_ascii_lowercase();
-    let Some(profile_level_id) = codec
-        .strip_prefix("avc1.")
-        .or_else(|| codec.strip_prefix("avc3."))
-        .and_then(|value| value.split('.').next())
-    else {
-        return true;
-    };
-    if profile_level_id.len() != 6
-        || !profile_level_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return true;
-    }
-
-    let profile_idc = u8::from_str_radix(&profile_level_id[0..2], 16).ok();
-    let level_idc = u8::from_str_radix(&profile_level_id[4..6], 16).ok();
-    profile_idc.is_some_and(h264_profile_is_within_transcoding_profile)
-        && level_idc.is_some_and(|level| level <= 0x2A)
-}
-
-fn h264_profile_is_within_transcoding_profile(profile_idc: u8) -> bool {
-    matches!(profile_idc, 0x42 | 0x4D | 0x64)
-}
-
-fn variant_has_codec(
-    variant: &BilibiliPlaybackVariant,
-    request: Option<&BilibiliMediaRequest>,
-    predicate: fn(&str) -> bool,
-) -> bool {
-    if let Some(codecs) = request.and_then(|request| request.codecs.as_deref()) {
-        return codec_list_matches(codecs, predicate);
-    }
-
-    variant
-        .codecs
-        .iter()
-        .any(|codecs| codec_list_matches(codecs, predicate))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bbdown_adapter::{
-        BilibiliMediaCacheKey, BilibiliMediaRequestKind, BilibiliPlaybackVariantKind,
+        BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
+        BilibiliPlaybackVariantKind,
     };
 
     #[test]
@@ -729,6 +619,57 @@ mod tests {
         );
         assert_eq!(HlsTranscodingPlanState::Ready, enabled.state);
         assert_eq!("hevc", enabled.source_variant_id);
+    }
+
+    #[test]
+    fn never_policy_disables_transcoding_for_incompatible_variant() {
+        let plan = HlsTranscodingPlan::for_variant_with_policy(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant("hevc", "hvc1.1.6.L120.90", Some("mp4a.40.2")),
+            PlaybackPolicy {
+                transcoding_preference: TranscodingPreference::Never,
+                ..PlaybackPolicy::default()
+            },
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Disabled, plan.state);
+        assert!(plan.reason.contains("disabled by playback policy"));
+    }
+
+    #[test]
+    fn force_policy_transcodes_compatible_variant_when_server_allows_it() {
+        let plan = HlsTranscodingPlan::for_variant_with_policy(
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            &variant("h264", "avc1.640028", Some("mp4a.40.2")),
+            PlaybackPolicy {
+                transcoding_preference: TranscodingPreference::Force,
+                ..PlaybackPolicy::default()
+            },
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Ready, plan.state);
+        assert!(plan.reason.contains("forces LAN transcoding"));
+    }
+
+    #[test]
+    fn server_configuration_remains_hard_bound_for_force_policy() {
+        let plan = HlsTranscodingPlan::for_variant_with_policy(
+            &CacheServerOptions::default(),
+            &variant("h264", "avc1.640028", Some("mp4a.40.2")),
+            PlaybackPolicy {
+                transcoding_preference: TranscodingPreference::Force,
+                ..PlaybackPolicy::default()
+            },
+        );
+
+        assert_eq!(HlsTranscodingPlanState::Disabled, plan.state);
+        assert!(plan.reason.contains("server configuration"));
     }
 
     #[test]

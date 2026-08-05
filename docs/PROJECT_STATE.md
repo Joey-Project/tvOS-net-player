@@ -2,8 +2,8 @@
 
 ## Current State
 
-- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS/macOS gRPC cache client with LAN plaintext and remote HTTPS endpoint support、macOS validation/operator diagnostics surface、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、runtime multi-variant HLS master playlist、durable HLS offline cache manifests/recovery、completed cached-resource fMP4 segment-index HLS playlist splitting、playback-position-aware HLS progress reporting/status foundation、progressive HLS ABR metadata manifests、completed-HLS quota/watermark eviction、LAN transcoding execution MVP、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status/profile/login-session foundation control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
-- 下一阶段 productization roadmap 记录在 `docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`；PR1 到 PR5 已完成，下一步执行 PR7 transcoding/ABR policy controls，然后在 Bilibili task options/result schema v2 前暂停讨论。
+- 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS/macOS gRPC cache client with LAN plaintext and remote HTTPS endpoint support、macOS validation/operator diagnostics surface、Bilibili task intake/progressive playback control plane、per-request transcoding/compatible-variant/weak-network policy、runtime passthrough HLS media pipeline、runtime multi-variant HLS master playlist、durable HLS offline cache manifests/recovery、completed cached-resource fMP4 segment-index HLS playlist splitting、playback-position-aware HLS progress reporting/status foundation、progressive HLS ABR metadata manifests、completed-HLS quota/watermark eviction、LAN transcoding execution MVP、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status/profile/login-session foundation control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
+- 下一阶段 productization roadmap 记录在 `docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`；PR1 到 PR5 以及非线性提前执行的 PR7 已完成，下一步在 Bilibili task options/result schema v2 前暂停并讨论 schema。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -38,6 +38,7 @@
 - Next phase productization roadmap：`docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`
 - macOS validation/operator UX workstream：`docs/project_journal/2026/06/2026-06-25-macos-validation-operator-ux-c3e9a1.md`
 - Authenticated/restricted live validation workstream：`docs/project_journal/2026/08/2026-08-05-authenticated-restricted-live-validation-e2c7b4.md`
+- Transcoding/ABR policy controls workstream：`docs/project_journal/2026/08/2026-08-05-transcoding-abr-policy-controls-c7a4e2.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers

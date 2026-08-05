@@ -70,6 +70,7 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case bilibiliResolve
     case bilibiliDownloadTask
     case bilibiliTaskSelection
+    case bilibiliPlaybackPolicy
     case playbackProgressReporting
 }
 
@@ -188,6 +189,8 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "Bilibili download tasks are not supported by this cache server."
         case .bilibiliTaskSelection:
             return "Bilibili task selection is not supported by this cache server."
+        case .bilibiliPlaybackPolicy:
+            return "Bilibili playback policy controls are not supported by this cache server."
         case .playbackProgressReporting:
             return "Playback progress reporting is not supported by this cache server."
         }

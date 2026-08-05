@@ -250,6 +250,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsLanTranscoding: Bool {
         capabilities.contains(CacheServerCapability.lanTranscoding)
     }
+
+    public var supportsBilibiliPlaybackPolicy: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliPlaybackPolicy)
+    }
 }
 
 public struct CacheHealthStatus: Equatable, Sendable {
@@ -282,6 +286,7 @@ public enum CacheServerCapability {
     public static let bilibiliLoginSessions = "bilibiliLoginSessions"
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
+    public static let bilibiliPlaybackPolicy = "bilibiliPlaybackPolicy"
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
 }
@@ -939,22 +944,64 @@ public struct CachePlaybackSource: Equatable, Sendable {
     }
 }
 
+public enum BilibiliTranscodingPreference: String, CaseIterable, Equatable, Hashable, Sendable {
+    case auto
+    case never
+    case force
+}
+
+public enum BilibiliCompatibleVariantPreference: String, CaseIterable, Equatable, Hashable, Sendable {
+    case preferCompatible
+    case preferRequested
+}
+
+public enum BilibiliWeakNetworkPreference: String, CaseIterable, Equatable, Hashable, Sendable {
+    case adaptive
+    case holdDowngrade
+    case avPlayerManaged
+}
+
+public struct BilibiliPlaybackPolicy: Equatable, Sendable {
+    public static let `default` = Self()
+
+    public let transcodingPreference: BilibiliTranscodingPreference
+    public let compatibleVariantPreference: BilibiliCompatibleVariantPreference
+    public let weakNetworkPreference: BilibiliWeakNetworkPreference
+
+    public init(
+        transcodingPreference: BilibiliTranscodingPreference = .auto,
+        compatibleVariantPreference: BilibiliCompatibleVariantPreference = .preferCompatible,
+        weakNetworkPreference: BilibiliWeakNetworkPreference = .adaptive
+    ) {
+        self.transcodingPreference = transcodingPreference
+        self.compatibleVariantPreference = compatibleVariantPreference
+        self.weakNetworkPreference = weakNetworkPreference
+    }
+
+    public var isDefault: Bool {
+        self == Self.default
+    }
+}
+
 public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
     public let qualityPreference: String
     public let encodingPreference: String
     public let audioLanguagePreference: String
     public let preferTVAPI: Bool
+    public let playbackPolicy: BilibiliPlaybackPolicy
 
     public init(
         qualityPreference: String = "",
         encodingPreference: String = "",
         audioLanguagePreference: String = "",
-        preferTVAPI: Bool = false
+        preferTVAPI: Bool = false,
+        playbackPolicy: BilibiliPlaybackPolicy = .default
     ) {
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
         self.audioLanguagePreference = audioLanguagePreference
         self.preferTVAPI = preferTVAPI
+        self.playbackPolicy = playbackPolicy
     }
 }
 
@@ -1207,6 +1254,7 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
     public let selectedVariant: CacheBilibiliPlaybackVariant?
     public let variants: [CacheBilibiliPlaybackVariant]
     public let transcodingPlan: LanTranscodingPlan?
+    public let effectivePolicy: BilibiliPlaybackPolicy?
 
     public init(
         id: String,
@@ -1215,7 +1263,8 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
         selectedVariantID: String,
         selectedVariant: CacheBilibiliPlaybackVariant?,
         variants: [CacheBilibiliPlaybackVariant],
-        transcodingPlan: LanTranscodingPlan? = nil
+        transcodingPlan: LanTranscodingPlan? = nil,
+        effectivePolicy: BilibiliPlaybackPolicy? = nil
     ) {
         self.id = id
         self.title = title
@@ -1224,6 +1273,7 @@ public struct CacheBilibiliPlaybackSession: Equatable, Sendable {
         self.selectedVariant = selectedVariant
         self.variants = variants
         self.transcodingPlan = transcodingPlan
+        self.effectivePolicy = effectivePolicy
     }
 }
 

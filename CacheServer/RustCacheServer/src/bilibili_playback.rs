@@ -6,6 +6,7 @@ use crate::{
     generated::tvos_net_player::v1::{
         BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliSubtitleAiPolicy,
     },
+    playback_policy::PlaybackPolicy,
     task_registry::BilibiliTaskCancellation,
 };
 
@@ -90,10 +91,12 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
     ) -> BilibiliPlaybackPlanningFuture<'a> {
         Box::pin(async move {
             let download_options = request.options.as_ref().map(playback_to_download_options);
+            let playback_policy = PlaybackPolicy::from_playback_options(request.options.as_ref());
             self.plan_playback(
                 &request.source,
                 request.selection_id.as_deref(),
                 download_options.as_ref(),
+                playback_policy,
                 || request.cancellation.is_cancel_requested(),
             )
             .await

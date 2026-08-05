@@ -11,7 +11,8 @@ use crate::bbdown_adapter::{
     BilibiliPlaybackAbrLevel as AdapterAbrLevel, BilibiliPlaybackAbrMetadata as AdapterAbrMetadata,
     BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
-use crate::codecs::{codec_list_matches, is_aac_codec, is_h264_codec};
+use crate::codecs::is_aac_codec;
+use crate::playback_policy::{PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible};
 use crate::transcoding::HlsTranscodingPlan;
 use url::Url;
 
@@ -38,6 +39,12 @@ struct HlsPlaybackPendingScrub {
     generation: u64,
     deadline: Instant,
     replacement: HlsPlaybackSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HlsPlaybackSessionHandle {
+    pub(crate) session: HlsPlaybackSession,
+    pub(crate) generation: u64,
 }
 
 impl HlsPlaybackRegistry {
@@ -98,6 +105,11 @@ impl HlsPlaybackRegistry {
     }
 
     pub(crate) fn get(&self, session_id: &str) -> Option<HlsPlaybackSession> {
+        self.get_with_generation(session_id)
+            .map(|handle| handle.session)
+    }
+
+    pub(crate) fn get_with_generation(&self, session_id: &str) -> Option<HlsPlaybackSessionHandle> {
         {
             let inner = self
                 .inner
@@ -108,7 +120,7 @@ impl HlsPlaybackRegistry {
                 .get(session_id)
                 .is_some_and(|scrub| scrub.deadline <= Instant::now());
             if !scrub_is_due {
-                return inner.sessions.get(session_id).cloned();
+                return session_handle(&inner, session_id);
             }
         }
 
@@ -117,7 +129,23 @@ impl HlsPlaybackRegistry {
             .write()
             .expect("HLS playback registry lock poisoned");
         scrub_expired_session(&mut inner, session_id, Instant::now());
-        inner.sessions.get(session_id).cloned()
+        session_handle(&inner, session_id)
+    }
+
+    pub(crate) fn accepts_network_policy_update(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+    ) -> bool {
+        let inner = self
+            .inner
+            .read()
+            .expect("HLS playback registry lock poisoned");
+        inner.generations.get(session_id) == Some(&expected_generation)
+            && inner
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.advertise_alternate_variants)
     }
 
     pub(crate) fn scrub_generation(&self, session_id: &str, expected_generation: u64) -> bool {
@@ -127,6 +155,16 @@ impl HlsPlaybackRegistry {
             .expect("HLS playback registry lock poisoned");
         apply_pending_scrub(&mut inner, session_id, Some(expected_generation))
     }
+}
+
+fn session_handle(
+    inner: &HlsPlaybackRegistryInner,
+    session_id: &str,
+) -> Option<HlsPlaybackSessionHandle> {
+    Some(HlsPlaybackSessionHandle {
+        session: inner.sessions.get(session_id)?.clone(),
+        generation: *inner.generations.get(session_id)?,
+    })
 }
 
 fn scrub_expired_session(
@@ -173,6 +211,7 @@ pub(crate) struct HlsPlaybackSession {
     pub(crate) abr: HlsAbrMetadata,
     pub(crate) variants: Vec<HlsVariantMetadata>,
     pub(crate) transcoding: HlsTranscodingPlan,
+    pub(crate) effective_policy: PlaybackPolicy,
 }
 
 impl HlsPlaybackSession {
@@ -197,9 +236,11 @@ impl HlsPlaybackSession {
             abr: HlsAbrMetadata::default(),
             variants: vec![HlsVariantMetadata::from_adapter(variant)],
             transcoding: HlsTranscodingPlan::default(),
+            effective_policy: PlaybackPolicy::default(),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_playback_entry(
         session_id: &str,
         title: &str,
@@ -207,7 +248,26 @@ impl HlsPlaybackSession {
         abr: &AdapterAbrMetadata,
         variants: &[AdapterPlaybackVariant],
     ) -> Result<Self, HlsSessionError> {
+        Self::from_playback_entry_with_policy(
+            session_id,
+            title,
+            selected_variant,
+            abr,
+            variants,
+            PlaybackPolicy::default(),
+        )
+    }
+
+    pub(crate) fn from_playback_entry_with_policy(
+        session_id: &str,
+        title: &str,
+        selected_variant: &AdapterPlaybackVariant,
+        abr: &AdapterAbrMetadata,
+        variants: &[AdapterPlaybackVariant],
+        effective_policy: PlaybackPolicy,
+    ) -> Result<Self, HlsSessionError> {
         let mut session = Self::from_selected_variant(session_id, title, selected_variant)?;
+        session.effective_policy = effective_policy;
         session.abr = HlsAbrMetadata::from_adapter(abr);
         session.variants = variants
             .iter()
@@ -1034,33 +1094,8 @@ fn is_switchable_alternate_variant(
 }
 
 fn is_avplayer_safe_alternate_variant(variant: &AdapterPlaybackVariant) -> bool {
-    if variant.kind != BilibiliPlaybackVariantKind::Dash {
-        return false;
-    }
-    let Some(video) = &variant.video else {
-        return false;
-    };
-    if !variant_has_codec(variant, video.codecs.as_deref(), is_h264_codec) {
-        return false;
-    }
-    variant
-        .audio
-        .as_ref()
-        .is_none_or(|audio| variant_has_codec(variant, audio.codecs.as_deref(), is_aac_codec))
-}
-
-fn variant_has_codec(
-    variant: &AdapterPlaybackVariant,
-    request_codecs: Option<&str>,
-    predicate: fn(&str) -> bool,
-) -> bool {
-    if let Some(codecs) = request_codecs {
-        return codec_list_matches(codecs, predicate);
-    }
-    variant
-        .codecs
-        .iter()
-        .any(|codecs| codec_list_matches(codecs, predicate))
+    variant.kind == BilibiliPlaybackVariantKind::Dash
+        && variant_is_avplayer_h264_aac_hls_compatible(variant)
 }
 
 #[cfg(test)]

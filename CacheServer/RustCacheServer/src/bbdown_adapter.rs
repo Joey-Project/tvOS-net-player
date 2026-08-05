@@ -42,6 +42,9 @@ use crate::{
         BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliSubtitleAiPolicy,
     },
     library::LocalMediaLibrary,
+    playback_policy::{
+        CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
+    },
     task_registry::BilibiliTaskProgress,
 };
 
@@ -225,6 +228,7 @@ struct PlaybackVariantPreferences {
     quality_preference: Option<u32>,
     allow_avplayer_hint_fallback: bool,
     encoding_preference: Option<String>,
+    prefer_conservative_compatible: bool,
 }
 
 #[allow(dead_code)]
@@ -467,9 +471,10 @@ impl BbdownBilibiliAdapter {
         source: &str,
         selection_id: Option<&str>,
         options: Option<&BilibiliDownloadOptions>,
+        policy: PlaybackPolicy,
         is_cancel_requested: impl Fn() -> bool,
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
-        let preferences = playback_variant_preferences_from_options(options)?;
+        let preferences = playback_variant_preferences_from_options_with_policy(options, policy)?;
         let input = playback_input_for_planning(source)?;
         let PlaybackInputSelection {
             input_override,
@@ -2106,11 +2111,21 @@ impl From<MediaRequestKind> for BilibiliMediaRequestKind {
 fn playback_variant_preferences_from_options(
     options: Option<&BilibiliDownloadOptions>,
 ) -> Result<PlaybackVariantPreferences, BilibiliDownloadError> {
+    playback_variant_preferences_from_options_with_policy(options, PlaybackPolicy::default())
+}
+
+fn playback_variant_preferences_from_options_with_policy(
+    options: Option<&BilibiliDownloadOptions>,
+    policy: PlaybackPolicy,
+) -> Result<PlaybackVariantPreferences, BilibiliDownloadError> {
     let encoding_preference = playback_explicit_encoding_preference(options).map(str::to_owned);
     Ok(PlaybackVariantPreferences {
         codec_candidates: playback_codec_preferences_from_options(options)?,
         quality_preference: playback_quality_preference_from_options(options)?,
         allow_avplayer_hint_fallback: encoding_preference.is_none(),
+        prefer_conservative_compatible: encoding_preference.is_none()
+            && policy.compatible_variant_preference
+                == CompatibleVariantPreference::PreferCompatible,
         encoding_preference,
     })
 }
@@ -2209,6 +2224,30 @@ fn select_playback_variant<'a>(
 ) -> Result<Option<SelectedCorePlaybackVariant<'a>>, BilibiliDownloadError> {
     let candidate_variants =
         playback_variants_matching_quality(variants, preferences.quality_preference)?;
+    let compatible_variant = preferences
+        .prefer_conservative_compatible
+        .then(|| {
+            candidate_variants
+                .iter()
+                .copied()
+                .filter(|variant| variant.selection_hints.avplayer.playable)
+                .filter(|variant| core_variant_is_avplayer_h264_aac_hls_compatible(variant))
+                .min_by(|left, right| compare_playback_variants(left, 0, right, 0))
+                .or_else(|| {
+                    variants
+                        .iter()
+                        .filter(|variant| variant.selection_hints.avplayer.playable)
+                        .filter(|variant| {
+                            playback_variant_does_not_exceed_requested_quality(
+                                variant,
+                                preferences.quality_preference,
+                            )
+                        })
+                        .filter(|variant| core_variant_is_avplayer_h264_aac_hls_compatible(variant))
+                        .min_by(|left, right| compare_playback_variants(left, 0, right, 0))
+                })
+        })
+        .flatten();
 
     for candidate in &preferences.codec_candidates {
         if let Some((variant, codec_rank)) = candidate_variants
@@ -2224,14 +2263,18 @@ fn select_playback_variant<'a>(
                 compare_playback_variants(left, *left_rank, right, *right_rank)
             })
         {
-            return Ok(Some(SelectedCorePlaybackVariant {
+            let selected = SelectedCorePlaybackVariant {
                 variant,
                 selection: BilibiliPlaybackVariantSelection {
                     policy: candidate.policy,
                     codec_rank: Some(codec_rank),
                     score: variant.selection_hints.avplayer.score,
                 },
-            }));
+            };
+            return Ok(Some(prefer_compatible_variant(
+                selected,
+                compatible_variant,
+            )));
         }
     }
 
@@ -2245,7 +2288,7 @@ fn select_playback_variant<'a>(
         )));
     }
 
-    Ok(candidate_variants
+    let selected = candidate_variants
         .iter()
         .copied()
         .filter(|variant| variant.selection_hints.avplayer.playable)
@@ -2257,7 +2300,50 @@ fn select_playback_variant<'a>(
                 codec_rank: None,
                 score: variant.selection_hints.avplayer.score,
             },
-        }))
+        });
+    Ok(selected
+        .map(|selected| prefer_compatible_variant(selected, compatible_variant))
+        .or_else(|| compatible_variant.map(conservative_compatible_selection)))
+}
+
+#[allow(dead_code)]
+fn prefer_compatible_variant<'a>(
+    selected: SelectedCorePlaybackVariant<'a>,
+    compatible_variant: Option<&'a PlaybackVariant>,
+) -> SelectedCorePlaybackVariant<'a> {
+    if core_variant_is_avplayer_h264_aac_hls_compatible(selected.variant) {
+        return selected;
+    }
+    compatible_variant
+        .map(conservative_compatible_selection)
+        .unwrap_or(selected)
+}
+
+#[allow(dead_code)]
+fn conservative_compatible_selection(variant: &PlaybackVariant) -> SelectedCorePlaybackVariant<'_> {
+    SelectedCorePlaybackVariant {
+        variant,
+        selection: BilibiliPlaybackVariantSelection {
+            policy: BilibiliPlaybackVariantSelectionPolicy::H264AacFallback,
+            codec_rank: None,
+            score: variant.selection_hints.avplayer.score,
+        },
+    }
+}
+
+#[allow(dead_code)]
+fn core_variant_is_avplayer_h264_aac_hls_compatible(variant: &PlaybackVariant) -> bool {
+    variant_is_avplayer_h264_aac_hls_compatible(&BilibiliPlaybackVariant::from_core(variant))
+}
+
+#[allow(dead_code)]
+fn playback_variant_does_not_exceed_requested_quality(
+    variant: &PlaybackVariant,
+    quality_preference: Option<u32>,
+) -> bool {
+    quality_preference.is_none_or(|requested| {
+        playback_variant_stream_id(variant).is_some_and(|quality| quality <= requested)
+    })
 }
 
 #[allow(dead_code)]
@@ -4219,6 +4305,118 @@ mod tests {
     }
 
     #[test]
+    fn compatible_policy_can_downgrade_requested_quality_to_safe_variant() {
+        let options = bilibili_options_with_quality("4k");
+        let requested_preferences = playback_variant_preferences_from_options_with_policy(
+            Some(&options),
+            PlaybackPolicy {
+                compatible_variant_preference: CompatibleVariantPreference::PreferRequested,
+                ..PlaybackPolicy::default()
+            },
+        )
+        .unwrap();
+        let requested = BilibiliPlaybackPlan::from_core_with_preferences(
+            sample_playback_plan(),
+            &requested_preferences,
+        )
+        .unwrap();
+        assert_eq!(
+            "av1",
+            requested.entries[0]
+                .selected_variant
+                .as_ref()
+                .unwrap()
+                .variant
+                .id
+        );
+
+        let compatible_preferences = playback_variant_preferences_from_options_with_policy(
+            Some(&options),
+            PlaybackPolicy::default(),
+        )
+        .unwrap();
+        let compatible = BilibiliPlaybackPlan::from_core_with_preferences(
+            sample_playback_plan(),
+            &compatible_preferences,
+        )
+        .unwrap();
+        assert_eq!(
+            "h264",
+            compatible.entries[0]
+                .selected_variant
+                .as_ref()
+                .unwrap()
+                .variant
+                .id
+        );
+    }
+
+    #[test]
+    fn compatible_policy_does_not_upgrade_above_requested_quality() {
+        let mut plan = sample_playback_plan();
+        let entry = &mut plan.entries[0];
+        entry
+            .variants
+            .iter_mut()
+            .find(|variant| variant.id == "h264")
+            .and_then(|variant| variant.video.as_mut())
+            .expect("H.264 video should exist")
+            .stream_id = Some(80);
+        entry
+            .variants
+            .iter_mut()
+            .find(|variant| variant.id == "hevc")
+            .and_then(|variant| variant.video.as_mut())
+            .expect("HEVC video should exist")
+            .stream_id = Some(64);
+
+        let options = bilibili_options_with_quality("720p");
+        let mapped = BilibiliPlaybackPlan::from_core(plan, Some(&options)).unwrap();
+
+        assert_eq!(
+            "hevc",
+            mapped.entries[0]
+                .selected_variant
+                .as_ref()
+                .unwrap()
+                .variant
+                .id
+        );
+    }
+
+    #[test]
+    fn compatible_policy_ignores_non_dash_h264_candidate() {
+        let mut plan = sample_playback_plan();
+        let entry = &mut plan.entries[0];
+        let mut dash_h264 = entry
+            .variants
+            .iter()
+            .find(|variant| variant.id == "h264")
+            .expect("H.264 variant should exist")
+            .clone();
+        dash_h264.id = "h264-dash".to_owned();
+        entry
+            .variants
+            .iter_mut()
+            .find(|variant| variant.id == "h264")
+            .expect("H.264 variant should exist")
+            .kind = PlaybackVariantKind::Flv;
+        entry.variants.push(dash_h264);
+
+        let mapped = BilibiliPlaybackPlan::from_core(plan, None).unwrap();
+
+        assert_eq!(
+            "h264-dash",
+            mapped.entries[0]
+                .selected_variant
+                .as_ref()
+                .unwrap()
+                .variant
+                .id
+        );
+    }
+
+    #[test]
     fn playback_selection_falls_back_to_h264_for_unsupported_explicit_preference() {
         let mut plan = sample_playback_plan();
         plan.entries[0]
@@ -4290,9 +4488,17 @@ mod tests {
     #[test]
     fn playback_selection_honors_quality_preference() {
         let options = bilibili_options_with_quality("4k");
-
+        let preferences = playback_variant_preferences_from_options_with_policy(
+            Some(&options),
+            PlaybackPolicy {
+                compatible_variant_preference: CompatibleVariantPreference::PreferRequested,
+                ..PlaybackPolicy::default()
+            },
+        )
+        .unwrap();
         let mapped =
-            BilibiliPlaybackPlan::from_core(sample_playback_plan(), Some(&options)).unwrap();
+            BilibiliPlaybackPlan::from_core_with_preferences(sample_playback_plan(), &preferences)
+                .unwrap();
 
         let selected = mapped.entries[0].selected_variant.as_ref().unwrap();
         assert_eq!(selected.variant.id, "av1");
