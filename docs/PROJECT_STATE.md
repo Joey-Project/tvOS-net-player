@@ -3,7 +3,7 @@
 ## Current State
 
 - 仓库现在包含初始 SwiftUI tvOS app、Rust LAN cache server、tvOS/macOS gRPC cache client with LAN plaintext and remote HTTPS endpoint support、macOS validation/operator diagnostics surface、Bilibili task intake/progressive playback control plane、runtime passthrough HLS media pipeline、runtime multi-variant HLS master playlist、durable HLS offline cache manifests/recovery、completed cached-resource fMP4 segment-index HLS playlist splitting、playback-position-aware HLS progress reporting/status foundation、progressive HLS ABR metadata manifests、completed-HLS quota/watermark eviction、LAN transcoding execution MVP、可落盘恢复的 server-side task worker、基于 `BBDown-rust` `v0.5.0` 的真实 BBDown Rust crate adapter、BBDown native download progress/cancellation 映射、Bilibili download options schema 扩展、server-owned BBDown credential status/profile/login-session foundation control plane、Bilibili fetch UX notices/re-resolve/clear-selection actions、repo-local Bilibili live e2e skill with authenticated page-fetch and collection/list fixtures、Xcode project、Swift package core tests、Xcode XCTest compile gate、CI workflow、`Justfile` 本机 task runner、本机 build/test/deploy 脚本、Swift/Rust formatter/linter 和 pre-commit hook installer，以及 Codex review gate。
-- 下一阶段 productization roadmap 记录在 `docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`；PR1 macOS validation/operator UX、PR2 playback-position segment scheduling、PR3 weak/offline UX completion 和 PR4 credential profile/login foundation 已完成，后续执行顺序是 authenticated/restricted live validation、transcoding/ABR policy controls，然后在 Bilibili task options/result schema v2 前暂停讨论。
+- 下一阶段 productization roadmap 记录在 `docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`；PR1 到 PR5 已完成，下一步执行 PR7 transcoding/ABR policy controls，然后在 Bilibili task options/result schema v2 前暂停讨论。
 - 普通 workstream 状态放在 `docs/project_journal/`，顶层文件只保留 repo-wide 入口。
 
 ## Recovery Pointers
@@ -37,6 +37,7 @@
 - Playback-position weak/offline UX workstream：`docs/project_journal/2026/06/2026-06-23-playback-position-weak-offline-ux-d5b7e2.md`
 - Next phase productization roadmap：`docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`
 - macOS validation/operator UX workstream：`docs/project_journal/2026/06/2026-06-25-macos-validation-operator-ux-c3e9a1.md`
+- Authenticated/restricted live validation workstream：`docs/project_journal/2026/08/2026-08-05-authenticated-restricted-live-validation-e2c7b4.md`
 - 本地 journal index 可用 project-journal helper 生成到 `docs/project_journal/INDEX.md`，该文件不提交。
 
 ## Global Blockers
@@ -48,4 +49,4 @@
 - 架构决策：gRPC 只做控制面；媒体面继续使用 `AVPlayer` 可直接播放的 HTTP/HLS/Range URL。
 - CI 不保存 Apple Developer secrets；设备刷新只在本机通过 `scripts/deploy-lan.sh` 执行。
 - 本地 hook 用 `just install-hooks` 安装；CI 运行同一个 `scripts/pre-commit.sh` 快速检查入口。
-- 真实 Bilibili smoke suite 由 `.agents/skills/bilibili-live-e2e/` 维护；默认跑稳定的非区域限制、非登录、非 collection/list case。Rust LAN cache server 已支持 BBDown credential file 和 restricted-area proxy runtime 配置，番剧区域限制 case 已用本机私有 credential 和 web-mode restricted API proxy 验证通过；authenticated history、watch-later、following 和 space dynamic cases 需要本机 web cookie 后 opt-in 运行；favorite、space videos、collection、series 和 recommendations collection/list cases 需要显式 opt-in，其中认证型 list/feed 仍需要 web cookie，标记为 `requires_live_sample_override` 的 favorite/series 样例需要 env override 后才进入未过滤 smoke；客户端只能读取 server-owned credential readiness/status，不读取 credential 路径或 secret 值。
+- 真实 Bilibili smoke suite 由 `.agents/skills/bilibili-live-e2e/` 维护；默认跑稳定的非区域限制、非登录、非 collection/list case。Rust LAN cache server 已支持 named BBDown credential profile 和 web-mode restricted-area proxy；authenticated history、watch-later、recommendations、space videos 以及 restricted Bangumi media/episode 已通过真实 LAN cache/HLS 链路。following/dynamic 暂受 `bbdown-core v0.5.0` 对 numeric-string `pub_ts` 不兼容影响；客户端与测试输出只暴露 server-owned credential readiness/status 和脱敏失败分类，不读取或输出 credential 路径、secret 值或原始认证错误。

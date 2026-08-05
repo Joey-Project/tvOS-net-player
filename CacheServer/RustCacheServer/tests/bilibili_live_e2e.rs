@@ -1,5 +1,6 @@
-use std::{collections::HashSet, env, fs, path::PathBuf, time::Duration};
+use std::{collections::HashSet, env, fs, panic::AssertUnwindSafe, path::PathBuf, time::Duration};
 
+use futures_util::FutureExt;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -30,10 +31,10 @@ const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     let fixture_set = LiveFixtureSet::load();
     let run_policy = LiveRunPolicy::from_env();
-    let server = LiveTestServer::start().await;
     let http = reqwest::Client::new();
     let mut ran_cases = 0usize;
-    let mut credential_status: Option<BilibiliCredentialStatus> = None;
+    let mut failed_cases = Vec::new();
+    let mut retired_servers = Vec::new();
 
     for case in fixture_set.cases.iter().filter(|case| {
         run_policy
@@ -49,26 +50,41 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
             }
         }
 
-        if case.requires_authentication && credential_status.is_none() {
-            credential_status =
-                Some(fetch_bilibili_credential_status(server.channel().await).await);
-        }
-
         ran_cases += 1;
         println!("running {}", case.id);
-        run_live_case(
-            case,
-            server.channel().await,
-            &http,
-            &server.media_url,
-            credential_status.as_ref(),
-        )
+        let server = LiveTestServer::start().await;
+        let outcome = AssertUnwindSafe(async {
+            let credential_status = fetch_bilibili_credential_status(server.channel().await).await;
+            run_live_case(
+                case,
+                server.channel().await,
+                &http,
+                &server.media_url,
+                Some(&credential_status),
+            )
+            .await;
+        })
+        .catch_unwind()
         .await;
+        if outcome.is_err() {
+            failed_cases.push(case.id.clone());
+        }
+        server.stop_listeners();
+        retired_servers.push(server);
     }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(retired_servers);
 
     assert!(
         ran_cases > 0,
         "no live Bilibili e2e cases matched the filter"
+    );
+    assert!(
+        failed_cases.is_empty(),
+        "{} live Bilibili e2e case(s) failed: {}",
+        failed_cases.len(),
+        failed_cases.join(", ")
     );
 }
 
@@ -220,10 +236,10 @@ async fn wait_for_playable_task(
             TaskState::Failed | TaskState::Cancelled => {
                 panic!(
                     "{}",
-                    live_failure_message(
+                    live_task_failure_message(
                         case,
                         &format!("task ended in {:?}", task.state()),
-                        &task.message,
+                        &task,
                         credential_status,
                     )
                 );
@@ -231,14 +247,14 @@ async fn wait_for_playable_task(
             _ if tokio::time::Instant::now() >= deadline => {
                 panic!(
                     "{}",
-                    live_failure_message(
+                    live_task_failure_message(
                         case,
                         &format!(
                             "task did not become playable within {:?}; last state {:?}",
                             timeout,
                             task.state()
                         ),
-                        &task.message,
+                        &task,
                         credential_status,
                     )
                 );
@@ -829,9 +845,7 @@ async fn fetch_bilibili_credential_status(
     ServerServiceClient::new(channel)
         .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
         .await
-        .unwrap_or_else(|error| {
-            panic!("failed to read Bilibili credential status from live server: {error}")
-        })
+        .unwrap_or_else(|_| panic!("failed to read Bilibili credential status from live server"))
         .into_inner()
 }
 
@@ -874,7 +888,52 @@ fn live_failure_message(
     credential_status: Option<&BilibiliCredentialStatus>,
 ) -> String {
     let class = classify_live_failure(case, phase, detail, credential_status);
+    let detail = safe_live_failure_detail(detail, credential_status);
     format!("{}: {phase} failed [{}]: {detail}", case.id, class.as_str())
+}
+
+fn live_task_failure_message(
+    case: &LiveCase,
+    phase: &str,
+    task: &Task,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> String {
+    let classification_detail = task_failure_classification_detail(task);
+    let class = classify_live_failure(case, phase, &classification_detail, credential_status);
+    let failed_result_count = task
+        .result_items
+        .iter()
+        .filter(|item| item.state() == TaskState::Failed)
+        .count();
+    let detail = safe_live_failure_detail(&task.message, credential_status);
+    format!(
+        "{}: {phase} failed [{}]: {detail}; failed_result_count={failed_result_count}",
+        case.id,
+        class.as_str(),
+    )
+}
+
+fn safe_live_failure_detail<'a>(
+    detail: &'a str,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> &'a str {
+    if credential_status.is_some_and(|status| status.credential_file_loaded) {
+        "upstream detail omitted because credential material is configured"
+    } else {
+        detail
+    }
+}
+
+fn task_failure_classification_detail(task: &Task) -> String {
+    let mut details = Vec::with_capacity(task.result_items.len() + 1);
+    details.push(task.message.as_str());
+    details.extend(
+        task.result_items
+            .iter()
+            .map(|item| item.message.as_str())
+            .filter(|message| !message.trim().is_empty()),
+    );
+    details.join("; ")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1048,6 +1107,18 @@ impl LiveTestServer {
             .await
             .unwrap()
     }
+
+    fn stop_listeners(&self) {
+        self._grpc_task.abort();
+        self._media_task.abort();
+    }
+}
+
+impl Drop for LiveTestServer {
+    fn drop(&mut self) {
+        self._grpc_task.abort();
+        self._media_task.abort();
+    }
 }
 
 fn live_server_options(
@@ -1077,35 +1148,44 @@ fn live_server_options(
         "--Cache:HlsCacheMaxBytes".to_owned(),
         "0".to_owned(),
     ];
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH",
-        "Cache:BBDownCredentialPath",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_AREA",
-        "Cache:BBDownRestrictedArea",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY",
-        "Cache:BBDownRestrictedAreaProxy",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY",
-        "Cache:BBDownRestrictedApiProxy",
-    );
+    args.extend(live_server_environment_args(|key| env::var(key).ok()));
 
     CacheServerOptions::from_args(args)
         .expect("live e2e cache server options should parse")
         .normalized_for_runtime()
 }
 
-fn push_arg_from_env(args: &mut Vec<String>, env_key: &str, config_key: &str) {
-    let Some(value) = env::var(env_key)
-        .ok()
+fn live_server_environment_args(get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (env_key, config_key) in [
+        (
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH",
+            "Cache:BBDownCredentialPath",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE",
+            "Cache:BBDownCredentialProfile",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_AREA",
+            "Cache:BBDownRestrictedArea",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY",
+            "Cache:BBDownRestrictedAreaProxy",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY",
+            "Cache:BBDownRestrictedApiProxy",
+        ),
+    ] {
+        push_arg_from_value(&mut args, get_env(env_key), config_key);
+    }
+    args
+}
+
+fn push_arg_from_value(args: &mut Vec<String>, value: Option<String>, config_key: &str) {
+    let Some(value) = value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
@@ -1134,6 +1214,22 @@ async fn wait_for_grpc(grpc_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_server_environment_args_maps_named_credential_profile() {
+        let args = live_server_environment_args(|key| match key {
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE" => Some("family-room".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(
+            vec![
+                "--Cache:BBDownCredentialProfile".to_owned(),
+                "family-room".to_owned(),
+            ],
+            args
+        );
+    }
 
     #[test]
     fn fixture_set_includes_authenticated_page_fetch_cases() {
@@ -1526,6 +1622,55 @@ mod tests {
                 "{detail}"
             );
         }
+    }
+
+    #[test]
+    fn task_failure_message_classifies_child_result_without_exposing_raw_detail() {
+        let case = test_case("bangumi-media-series", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            access_key_present: true,
+            ..Default::default()
+        };
+        let task = Task {
+            message: "request failed with parent-sensitive-marker".to_owned(),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: "restricted proxy rejected child-sensitive-marker".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let message =
+            live_task_failure_message(&case, "task ended in Failed", &task, Some(&status));
+
+        assert!(message.contains("[restricted_proxy]"));
+        assert!(message.contains("failed_result_count=1"));
+        assert!(!message.contains("parent-sensitive-marker"));
+        assert!(!message.contains("child-sensitive-marker"));
+    }
+
+    #[test]
+    fn live_failure_message_omits_raw_detail_when_credentials_are_loaded() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        let message = live_failure_message(
+            &case,
+            "resolve",
+            "login cookie rejected credential-sensitive-marker",
+            Some(&status),
+        );
+
+        assert!(message.contains("[credential]"));
+        assert!(message.contains("upstream detail omitted"));
+        assert!(!message.contains("credential-sensitive-marker"));
+        assert!(!message.contains("cookie"));
     }
 
     #[test]

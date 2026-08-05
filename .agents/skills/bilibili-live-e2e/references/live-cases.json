@@ -86,6 +86,7 @@
       "requires_collection_list_validation": true,
       "requires_authentication": true,
       "requires_stable_item_selection": true,
+      "timeout_seconds": 180,
       "playback_options": {
         "quality_preference": "360p",
         "encoding_preference": "h264",

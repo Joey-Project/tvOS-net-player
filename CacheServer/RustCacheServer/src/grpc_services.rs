@@ -18,7 +18,7 @@ use crate::{
     AppState,
     bbdown_adapter::{
         BilibiliPlaybackPlan, BilibiliPlaybackVariant as AdapterPlaybackVariant,
-        BilibiliPlaybackVariantKind,
+        BilibiliPlaybackVariantKind, recover_stable_collection_candidate,
     },
     bilibili_playback::{
         BilibiliInputResolution, BilibiliInputResolveRequest, BilibiliPlaybackPlanningRequest,
@@ -1439,6 +1439,7 @@ async fn run_explicit_bilibili_playback_planning(
                     uri: playback_source_uri,
                     expires_at: None,
                 };
+                result_items[index].title = metadata.title.clone();
                 result_items[index].state = TaskState::Playable.into();
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
@@ -1604,6 +1605,13 @@ fn selected_bilibili_candidates(
                     .iter()
                     .find(|candidate| candidate.selection_id == *selection_id)
                     .cloned()
+                    .or_else(|| {
+                        recover_stable_collection_candidate(
+                            selection_id,
+                            &resolution.source_kind,
+                            &resolution.candidates,
+                        )
+                    })
                     .ok_or_else(|| {
                         format!(
                             "Selected Bilibili item {selection_id:?} was not found. Resolve the input again and retry."
@@ -4222,7 +4230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_playback_task_scrubs_runtime_hls_alternates_after_finalization() {
+    async fn completed_playback_task_keeps_runtime_hls_alternates_for_stale_clients() {
         let (selected_upstream_url, _selected_upstream_task) = start_mp4_upstream().await;
         let (alternate_upstream_url, _alternate_upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -4290,9 +4298,9 @@ mod tests {
         let runtime_alternate = runtime_session
             .media_resource("v1-video.m4s")
             .expect("runtime alternate media resource should remain serveable");
-        assert!(runtime_alternate.request.url.is_empty());
+        assert_eq!(alternate_upstream_url, runtime_alternate.request.url);
         assert!(runtime_alternate.request.backup_urls.is_empty());
-        assert!(runtime_alternate.request.headers.is_empty());
+        assert!(!runtime_alternate.request.headers.is_empty());
 
         let persisted_session = state
             .hls_cache
@@ -4373,6 +4381,41 @@ mod tests {
                 .expect("playback request log should not be poisoned")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_item_ids_recover_when_a_refreshed_feed_no_longer_contains_the_item() {
+        let selection_id = "item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let resolution = BilibiliInputResolution {
+            source: "https://www.bilibili.com/".to_owned(),
+            title: "Refreshed recommendations".to_owned(),
+            source_kind: "recommendation".to_owned(),
+            candidates: vec![AdapterBilibiliResolvedCandidate {
+                selection_id: "item:1:cid:270002:bvid:BV1yy411c7mD:aid:170002".to_owned(),
+                title: "Different recommendation".to_owned(),
+                subtitle: String::new(),
+                source_kind: "recommendation".to_owned(),
+                content_id: "BV1yy411c7mD".to_owned(),
+                index: 1,
+                duration_seconds: Some(60),
+                cover_uri: String::new(),
+            }],
+            default_selection_id: String::new(),
+            candidates_truncated: false,
+        };
+
+        let selected = selected_bilibili_candidates(
+            &resolution,
+            &BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                selection_ids: vec![selection_id.to_owned()],
+            },
+        )
+        .expect("server-owned stable item identity should survive feed refresh");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].selection_id, selection_id);
+        assert_eq!(selected[0].content_id, "BV1xx411c7mD");
+        assert_eq!(selected[0].index, 7);
     }
 
     #[tokio::test]
@@ -9858,9 +9901,9 @@ mod tests {
         let runtime_source_video = runtime_session
             .media_resource("video.m4s")
             .expect("runtime source video lookup should remain addressable");
-        assert!(runtime_source_video.request.url.is_empty());
+        assert_eq!(upstream_url, runtime_source_video.request.url);
         assert!(runtime_source_video.request.backup_urls.is_empty());
-        assert!(runtime_source_video.request.headers.is_empty());
+        assert!(!runtime_source_video.request.headers.is_empty());
         let restored_source_video = restored_session
             .media_resource("video.m4s")
             .expect("persisted source video lookup should remain addressable");

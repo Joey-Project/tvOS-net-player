@@ -21,13 +21,13 @@
       "source_area_label": "港澳台、中国大陆",
       "provider": "@M1saka10010",
       "url": "https://bili.lli.cx",
-      "last_checked_at": "2026-06-20T21:11:38Z",
-      "last_available_at": "2026-06-20T21:11:38Z",
+      "last_checked_at": "2026-08-05T09:40:18Z",
+      "last_available_at": "2026-08-05T09:40:18Z",
       "last_probe": {
         "status": "available",
-        "playurl_modes": ["web", "app"],
+        "playurl_modes": ["web"],
         "restricted_api_proxy": "hk=https://bili.lli.cx",
-        "notes": "Web and app playback planning succeeded for bangumi-media-series; TV mode returned Bilibili area restriction."
+        "notes": "Credential-backed bangumi-media-series and bangumi-episode live e2e cases both reached playable LAN HLS through the HK web API proxy. Access-key egress to this public host was explicitly authorized for validation; no credential values are stored in this fixture."
       }
     },
     {
@@ -107,13 +107,12 @@
       "source_area_label": "所有",
       "provider": "@atri828",
       "url": "https://atri.ink",
-      "last_checked_at": "2026-06-20T21:11:38Z",
+      "last_checked_at": "2026-08-05T09:40:48Z",
       "last_available_at": null,
       "last_probe": {
         "status": "unavailable",
-        "http_root_status": 502,
-        "http_playurl_status": 502,
-        "notes": "Host and PGC playurl paths returned 502 Bad Gateway."
+        "restricted_api_proxy": "hk=https://atri.ink",
+        "notes": "Credential-backed bangumi-episode live e2e failed through the HK web API proxy and was safely classified as restricted_proxy. Access-key egress to this public host was explicitly authorized for validation; no credential values are stored in this fixture."
       }
     },
     {

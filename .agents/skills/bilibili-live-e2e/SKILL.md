@@ -39,6 +39,7 @@ BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live
 BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1 just test-bilibili-live
 
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1 \
 BILIBILI_LIVE_E2E_FAVORITE_URL='https://www.bilibili.com/list/ml...' \
 BILIBILI_LIVE_E2E_SPACE_VIDEOS_URL='https://space.bilibili.com/<mid>' \
@@ -55,33 +56,36 @@ Explicit `BILIBILI_LIVE_E2E_CASES` filters bypass the default skip policy and ar
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_CASES=authenticated-history,authenticated-watch-later,authenticated-following-feed \
 just test-bilibili-live
 
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL='https://space.bilibili.com/<mid>/dynamic' \
 BILIBILI_LIVE_E2E_CASES=authenticated-space-dynamic \
 just test-bilibili-live
 ```
 
-Authenticated failure messages are classified as `credential`, `empty_account_state`, `upstream_schema_or_availability`, `restricted_proxy`, or `server_bug` to keep live validation actionable.
+Authenticated failure messages are classified as `credential`, `empty_account_state`, `upstream_schema_or_availability`, `restricted_proxy`, or `server_bug` to keep live validation actionable. When a credential file is loaded, raw upstream and task details are omitted from terminal output; classification still uses the complete in-process error, and the suite reports a final list of every failed case.
 
 8. Default runs skip `requires_restricted_area_path` cases. Run those cases explicitly when validating BBDown restricted-area support; without a configured restricted-area route they are expected to fail with Bilibili area restriction errors. Public BiliRoaming reverse proxies are web-mode API proxies, so use `BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY` and keep the fixture `prefer_tv_api` disabled for these cases. Proxy requests may include the configured `access_key`; use a self-hosted or otherwise trusted proxy for normal validation, and use public proxies only with a disposable/test credential or for explicit availability probing. Pass local restricted-area runtime settings through these environment variables:
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
 BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://trusted-proxy.example' \
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode \
 just test-bilibili-live
 ```
 
-The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `access_key`, and `tv_access_key` fields. Do not commit real credentials or real proxy tokens.
-9. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, task state/message, and whether the failure is local code, BBDown core, credentials, region restriction, account state, or upstream availability.
+The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `access_key`, and `tv_access_key` fields. Set `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` when the file is a multi-profile store and the live credential is not the default profile. Do not commit real credentials or real proxy tokens.
+9. Treat failures as product evidence, not flaky CI noise. Capture the case id, failing phase, safe task summary, and whether the failure is local code, BBDown core, credentials, region restriction, account state, or upstream availability. Never add raw credential-backed upstream errors to tracked artifacts.
 
 ## Scope
 
-- The live suite starts a local Rust cache server, resolves each Bilibili input, creates a progressive playback task, waits for a playable HLS source, and fetches the generated master playlist.
+- The live suite starts an isolated local Rust cache server for each selected case, resolves the Bilibili input, creates a progressive playback task, waits for a playable HLS source, and fetches the generated master playlist. A failing case does not prevent later selected cases from running.
 - The suite does not run in default `just ci` or GitHub Actions.
 - The suite is for macOS/local development first. Physical Apple TV validation is intentionally outside the current plan.
 - The media plane must remain HTTP/HLS through the LAN cache server. Do not make the Swift app fetch Bilibili media URLs directly to satisfy this test.

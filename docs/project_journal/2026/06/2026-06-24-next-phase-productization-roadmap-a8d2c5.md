@@ -3,7 +3,7 @@ id: 20260624-a8d2c5
 title: Next Phase Productization Roadmap
 status: active
 created: 2026-06-24
-updated: 2026-06-25
+updated: 2026-08-05
 branch: wip/next-phase-roadmap
 pr:
 supersedes:
@@ -26,6 +26,7 @@ superseded_by:
 - PRs through `Batch Cache Finalization And Sidecar Options UX` are complete on the repository default branch advertised by `origin/HEAD`.
 - The app supports Bonjour/manual/remote HTTPS cache endpoints, shared tvOS/macOS player controls, macOS validation/operator diagnostics, progressive Bilibili HLS playback, completed-HLS offline cache, quota/watermark eviction, adaptive weak-network policy, playback-position reporting, LAN transcoding execution MVP, segment-index playlist splitting, multi-result Bilibili selection, and complete-download sidecar/options controls.
 - The live e2e skill has canonical ordinary video, multi-part video, Bangumi media, Bangumi episode, authenticated page-fetch, and collection/list fixture definitions. Restricted and authenticated cases remain opt-in because they depend on local credentials, proxy availability, and account state.
+- PR 5 completed authenticated/restricted validation for history, watch-later, recommendations, space videos, and restricted Bangumi through server-owned playback URLs. Following/dynamic remains a documented `bbdown-core v0.5.0` upstream schema compatibility follow-up.
 - `docs/PROJECT_TODO.md` is the cross-workstream backlog entrypoint. This journal is the durable plan for the next PR sequence.
 
 ## PR Plan
@@ -80,10 +81,13 @@ superseded_by:
 
 ### PR 5: Authenticated And Restricted Live Validation Expansion
 
-- Expand opt-in live validation through the LAN cache server and macOS validation path.
-- Cover authenticated history, watch-later, following/dynamic feeds, restricted Bangumi media/episode, and collection/list cases.
-- Classify failures as credential, proxy, account-state, upstream availability/schema, or server bug.
-- Keep these cases outside default CI unless they become stable and credential-free.
+- Status: completed by the `wip/authenticated-restricted-live-validation` slice.
+- Added named credential-profile selection, per-case server isolation, aggregate failures, and credential-safe output for opt-in live validation.
+- Passed authenticated history, watch-later, recommendations, space videos, and restricted Bangumi media/episode through the LAN cache/HLS path.
+- Added stable dynamic collection-item recovery and exact page selection so feed reordering cannot silently play a different item.
+- Fixed completed-HLS alternate-playlist and range races without persisting upstream URLs or headers.
+- Classified following/dynamic as an upstream schema/availability failure because `bbdown-core v0.5.0` does not yet accept numeric-string `module_author.pub_ts`; keep this as an explicit dependency follow-up.
+- Kept every credential-dependent and restricted case outside default CI.
 
 ### PR 7: Transcoding And ABR Policy Controls
 
@@ -105,10 +109,10 @@ superseded_by:
 - Each implementation PR starts from the updated repository default branch advertised by `origin/HEAD` and lands on a focused `wip/<topic>` branch.
 - Each PR must pass the full local gate, including `just ci`, plus relevant focused tests or live/macOS validation called out by that PR.
 - Each PR must pass GitHub CI and required repository checks.
-- Each PR must complete the requested review gates before merge:
+- Per the explicit repository-specific override recorded on 2026-08-05, Claude review is not a required delivery gate for this roadmap.
+- Each PR must complete these review gates before merge:
   - GitHub `codex/review-gate` when present, required, or explicitly triggered for the PR.
-  - `independent-codex-pr-review`.
-  - `offline-frozen-diff-review`.
+  - An independent fresh-context local Codex review over the frozen whole-PR range.
 - All actionable PR comments and unresolved conversations must be addressed or resolved before merge.
 - After each merge, update the local branch that tracks `origin/HEAD` before branching the next PR.
 - Pause before PR 6 and discuss the schema before implementing it.
@@ -128,6 +132,9 @@ superseded_by:
 - PR 3 focused validation: `swift test --filter CacheLibraryItemTests/testWeakNetworkStatusClassifiesConcreteStates --disable-automatic-resolution`, `swift test --filter CacheLibraryViewModelTests/testHLSCacheStatusBadges --disable-automatic-resolution`, `swift test --filter CacheServerDiagnosticsViewModelTests/testWeakNetworkDiagnostics --disable-automatic-resolution`, `swift test --filter BilibiliTaskViewModelTests/testPlayable --disable-automatic-resolution`.
 - PR 4 focused validation: `cargo test -p tvos-net-player-cache-server credential_profile`, `cargo test -p tvos-net-player-cache-server get_bilibili_credential_status_reports_selected_profile`, `cargo test -p tvos-net-player-cache-server bilibili_login_session_foundation_shares_unsupported_session_across_services`, `swift test --filter CacheLibraryPaginationTests/testGeneratedBilibiliCredentialProfilesCapabilityMatchesPublicConstant --filter CacheLibraryPaginationTests/testGeneratedBilibiliLoginSessionsCapabilityMatchesPublicConstant --filter CacheServerDiagnosticsViewModelTests/testCredentialDiagnosticsIncludesActiveProfileSummary`.
 - PR 4 full validation: `just ci`.
+- PR 5 focused live validation: public ordinary/multi-part/space-collection; credential-backed recommendations/history/watch-later/space-videos; restricted Bangumi media/episode through an available web-mode proxy; unavailable proxy classification.
+- PR 5 local validation: `cargo fmt --all`, `just lint`, `just pre-commit`, `scripts/test-cache-server.sh`, `just test`, `just test-macos`, `just build-cache-server`, `just build`, `just build-macos`, `just build-for-testing`. Local simulator execution remains blocked by the host CoreSimulator/Xcode patch-version mismatch and is delegated to GitHub CI.
+- PR 5 workstream: `docs/project_journal/2026/08/2026-08-05-authenticated-restricted-live-validation-e2c7b4.md`
 - Previous roadmap: `docs/project_journal/2026/06/2026-06-22-playback-remote-hls-roadmap-f4a7b2.md`
 - Current architecture note: `docs/architecture/cache-server.md`
 - Current repo state entrypoint: `docs/PROJECT_STATE.md`
