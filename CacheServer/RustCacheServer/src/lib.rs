@@ -28,7 +28,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant as MonotonicInstant, SystemTime},
 };
 
 use axum::{Router, routing::get};
@@ -88,6 +88,9 @@ const CREDENTIAL_SAFE_LOG_DETAIL: &str =
     "detail omitted because Bilibili credential material is configured";
 pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
     "Bilibili error detail omitted because credential material is configured.";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL: &str =
+    "Bilibili download progress detail omitted because credential material is configured.";
+const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -732,9 +735,9 @@ impl AppState {
         let runtime_session = completed_runtime_session(session);
         let sanitized_session = sanitized_completed_session(session);
         let session_id = runtime_session.id.clone();
-        let deadline = SystemTime::now()
+        let deadline = MonotonicInstant::now()
             .checked_add(grace_period)
-            .expect("HLS completion grace deadline should fit in SystemTime");
+            .expect("HLS completion grace deadline should fit in Instant");
         let generation = self.hls_sessions.insert_with_scrub_deadline(
             runtime_session,
             sanitized_session,
@@ -744,7 +747,7 @@ impl AppState {
         let registry = self.hls_sessions.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace_period).await;
-            registry.scrub_if_generation(&session_id, generation);
+            registry.scrub_generation(&session_id, generation);
         });
     }
 
@@ -1486,11 +1489,154 @@ pub(crate) fn credential_safe_client_error(
     credentials_configured: bool,
     detail: &dyn Display,
 ) -> String {
-    if credentials_configured {
-        CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned()
-    } else {
-        detail.to_string()
+    let detail = detail.to_string();
+    if !credentials_configured {
+        return detail;
     }
+
+    let class = tagged_bilibili_failure_class(&detail)
+        .unwrap_or_else(|| classify_bilibili_failure(&detail));
+    format!(
+        "{CREDENTIAL_SAFE_CLIENT_DETAIL} [{BILIBILI_FAILURE_CLASS_TAG}={}]",
+        class.as_str()
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BilibiliFailureClass {
+    Credential,
+    EmptyAccountState,
+    UpstreamSchemaOrAvailability,
+    RestrictedProxy,
+    ServerBug,
+}
+
+impl BilibiliFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::EmptyAccountState => "empty_account_state",
+            Self::UpstreamSchemaOrAvailability => "upstream_schema_or_availability",
+            Self::RestrictedProxy => "restricted_proxy",
+            Self::ServerBug => "server_bug",
+        }
+    }
+}
+
+fn tagged_bilibili_failure_class(detail: &str) -> Option<BilibiliFailureClass> {
+    if !detail.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL) {
+        return None;
+    }
+    [
+        BilibiliFailureClass::Credential,
+        BilibiliFailureClass::EmptyAccountState,
+        BilibiliFailureClass::RestrictedProxy,
+        BilibiliFailureClass::UpstreamSchemaOrAvailability,
+        BilibiliFailureClass::ServerBug,
+    ]
+    .into_iter()
+    .find(|class| {
+        detail.contains(&format!(
+            "[{BILIBILI_FAILURE_CLASS_TAG}={}]",
+            class.as_str()
+        ))
+    })
+}
+
+fn classify_bilibili_failure(detail: &str) -> BilibiliFailureClass {
+    let detail = untagged_bilibili_failure_detail(detail);
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "area",
+            "region",
+            "restricted",
+            "proxy",
+            "\u{5730}\u{533a}",
+            "\u{7248}\u{6743}",
+            "\u{4e0d}\u{53ef}\u{89c2}\u{770b}",
+        ],
+    ) {
+        return BilibiliFailureClass::RestrictedProxy;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "empty account",
+            "watch later is empty",
+            "history is empty",
+            "\u{6ca1}\u{6709}\u{66f4}\u{591a}",
+        ],
+    ) {
+        return BilibiliFailureClass::EmptyAccountState;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "credential file",
+            "credential store",
+            "credential profile",
+            "cookie",
+            "login",
+            "not logged",
+            "sessdata",
+            "csrf",
+            "unauthorized",
+            "-101",
+            "\u{8d26}\u{53f7}\u{672a}\u{767b}\u{5f55}",
+            "\u{672a}\u{767b}\u{5f55}",
+        ],
+    ) {
+        return BilibiliFailureClass::Credential;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "upstream",
+            "schema",
+            "availability",
+            "playurl",
+            "resolve",
+            "selected bilibili item",
+            "selected collection item",
+            "was not found",
+            "no longer matches",
+            "failed to fetch",
+            "request failed",
+            "network",
+            "connection",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "http status",
+            "missing field",
+            "stream reset",
+        ],
+    ) {
+        return BilibiliFailureClass::UpstreamSchemaOrAvailability;
+    }
+    BilibiliFailureClass::ServerBug
+}
+
+fn untagged_bilibili_failure_detail(detail: &str) -> String {
+    let mut detail = detail.to_ascii_lowercase();
+    for class in [
+        BilibiliFailureClass::Credential,
+        BilibiliFailureClass::EmptyAccountState,
+        BilibiliFailureClass::RestrictedProxy,
+        BilibiliFailureClass::UpstreamSchemaOrAvailability,
+        BilibiliFailureClass::ServerBug,
+    ] {
+        detail = detail.replace(
+            &format!("[{BILIBILI_FAILURE_CLASS_TAG}={}]", class.as_str()),
+            "",
+        );
+    }
+    detail
+}
+
+fn contains_bilibili_failure_marker(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn refresh_restored_hls_playback_source(
@@ -1856,8 +2002,35 @@ mod tests {
 
         assert_eq!(detail, credential_safe_client_error(false, &detail));
         let safe = credential_safe_client_error(true, &detail);
-        assert_eq!(CREDENTIAL_SAFE_CLIENT_DETAIL, safe);
+        assert!(safe.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL));
+        assert!(safe.contains("[bilibili_failure_class=server_bug]"));
         assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_error_preserves_only_existing_failure_class() {
+        let detail = format!(
+            "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy] appended-sensitive-marker"
+        );
+
+        let safe = credential_safe_client_error(true, &detail);
+
+        assert_eq!(
+            format!("{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"),
+            safe
+        );
+        assert!(!safe.contains("appended-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_error_does_not_trust_raw_failure_class_tag() {
+        let detail =
+            "upstream request failed [bilibili_failure_class=credential] raw-sensitive-marker";
+
+        let safe = credential_safe_client_error(true, &detail);
+
+        assert!(safe.contains("[bilibili_failure_class=upstream_schema_or_availability]"));
+        assert!(!safe.contains("raw-sensitive-marker"));
     }
 
     #[tokio::test]
@@ -1946,7 +2119,9 @@ mod tests {
         state.hls_sessions.insert_with_scrub_deadline(
             completed_runtime_session(&session),
             sanitized_completed_session(&session),
-            SystemTime::UNIX_EPOCH,
+            MonotonicInstant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("expired monotonic deadline should fit"),
         );
 
         let served = state
@@ -1960,6 +2135,33 @@ mod tests {
                 .headers
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn completed_runtime_timer_scrub_does_not_recheck_deadline() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-timer-scrub");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        session.alternate_variants = vec![alternate];
+
+        let generation = state.hls_sessions.insert_with_scrub_deadline(
+            completed_runtime_session(&session),
+            sanitized_completed_session(&session),
+            MonotonicInstant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("future monotonic deadline should fit"),
+        );
+
+        assert!(state.hls_sessions.scrub_generation(&session.id, generation));
+        let scrubbed = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(scrubbed.alternate_variants[0].video.request.url.is_empty());
     }
 
     #[tokio::test]

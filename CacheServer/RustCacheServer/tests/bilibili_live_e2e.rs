@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env, fs,
     panic::AssertUnwindSafe,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -32,6 +32,9 @@ const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
 const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
+const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
+    "Bilibili error detail omitted because credential material is configured.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live Bilibili network access and is intentionally outside default CI"]
@@ -976,13 +979,17 @@ fn classify_live_failure(
     detail: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
 ) -> LiveFailureClass {
-    let detail = detail.to_ascii_lowercase();
     if case.requires_authentication
         && credential_status
             .is_some_and(|status| !status.credential_file_loaded || !status.web_cookie_present)
     {
         return LiveFailureClass::Credential;
     }
+    if let Some(class) = tagged_live_failure_class(detail) {
+        return class;
+    }
+
+    let detail = untagged_live_failure_detail(detail);
     if case.requires_authentication
         && contains_any(
             &detail,
@@ -1050,6 +1057,43 @@ fn classify_live_failure(
     LiveFailureClass::ServerBug
 }
 
+fn untagged_live_failure_detail(detail: &str) -> String {
+    let mut detail = detail.to_ascii_lowercase();
+    for class in [
+        LiveFailureClass::Credential,
+        LiveFailureClass::EmptyAccountState,
+        LiveFailureClass::RestrictedProxy,
+        LiveFailureClass::UpstreamSchemaOrAvailability,
+        LiveFailureClass::ServerBug,
+    ] {
+        detail = detail.replace(
+            &format!("[{BILIBILI_FAILURE_CLASS_TAG}={}]", class.as_str()),
+            "",
+        );
+    }
+    detail
+}
+
+fn tagged_live_failure_class(detail: &str) -> Option<LiveFailureClass> {
+    if !detail.contains(CREDENTIAL_SAFE_CLIENT_DETAIL) {
+        return None;
+    }
+    [
+        LiveFailureClass::Credential,
+        LiveFailureClass::EmptyAccountState,
+        LiveFailureClass::RestrictedProxy,
+        LiveFailureClass::UpstreamSchemaOrAvailability,
+        LiveFailureClass::ServerBug,
+    ]
+    .into_iter()
+    .find(|class| {
+        detail.contains(&format!(
+            "[{BILIBILI_FAILURE_CLASS_TAG}={}]",
+            class.as_str()
+        ))
+    })
+}
+
 fn looks_like_upstream_planning_failure(detail: &str) -> bool {
     contains_any(
         detail,
@@ -1103,7 +1147,7 @@ impl LiveTaskTracker {
 }
 
 struct LiveTestServer {
-    _temp_root: TempDir,
+    temp_root: Option<TempDir>,
     state: AppState,
     grpc_url: String,
     media_url: String,
@@ -1127,7 +1171,7 @@ impl LiveTestServer {
 
         wait_for_grpc(&grpc_url).await;
         Self {
-            _temp_root: temp_root,
+            temp_root: Some(temp_root),
             state,
             grpc_url,
             media_url,
@@ -1147,7 +1191,31 @@ impl LiveTestServer {
     async fn shutdown(mut self, task_tracker: &LiveTaskTracker) -> Result<(), String> {
         let listener_result = self.stop_listeners().await;
         let background_result = self.cancel_case_tasks_and_wait(task_tracker).await;
-        combine_teardown_results(listener_result, background_result)
+        self.finish_teardown(combine_teardown_results(listener_result, background_result))
+    }
+
+    fn temp_root_path(&self) -> &Path {
+        self.temp_root
+            .as_ref()
+            .expect("live e2e temp root should be present")
+            .path()
+    }
+
+    fn finish_teardown(mut self, result: Result<(), String>) -> Result<(), String> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let retained_root = self
+                    .temp_root
+                    .take()
+                    .expect("live e2e temp root should be present")
+                    .keep();
+                Err(format!(
+                    "{error}; retained live e2e root for recovery: {}",
+                    retained_root.display()
+                ))
+            }
+        }
     }
 
     async fn cancel_case_tasks_and_wait(
@@ -1370,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cancels_untracked_registry_task_before_removing_case_root() {
         let server = LiveTestServer::start().await;
-        let root_path = server._temp_root.path().to_owned();
+        let root_path = server.temp_root_path().to_owned();
         let tasks = Arc::clone(&server.state.tasks);
         let task = tasks
             .create_bilibili_task("BV1xx411c7mD", None)
@@ -1396,6 +1464,36 @@ mod tests {
             !root_path.exists(),
             "case root should be removed only after listeners and background work stop"
         );
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_retains_case_root_and_persisted_state_for_recovery() {
+        let mut server = LiveTestServer::start().await;
+        let root_path = server.temp_root_path().to_owned();
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        server
+            .state
+            .tasks
+            .create_bilibili_task("BV1retained-state", None)
+            .expect("diagnostic task state should be persisted");
+        assert!(task_state_path.exists());
+        server
+            .stop_listeners()
+            .await
+            .expect("test listeners should stop cleanly");
+
+        let error = server
+            .finish_teardown(Err("forced teardown failure".to_owned()))
+            .expect_err("forced teardown failure should be reported");
+
+        assert!(error.contains("forced teardown failure"));
+        assert!(error.contains(&root_path.display().to_string()));
+        assert!(
+            root_path.exists(),
+            "failed teardown should retain the isolated root and persisted state"
+        );
+        assert!(task_state_path.exists());
+        fs::remove_dir_all(&root_path).expect("retained test root should be removable");
     }
 
     #[test]
@@ -1833,6 +1931,75 @@ mod tests {
         assert!(message.contains("failed_result_count=1"));
         assert!(!message.contains("parent-sensitive-marker"));
         assert!(!message.contains("child-sensitive-marker"));
+    }
+
+    #[test]
+    fn task_failure_message_uses_typed_rpc_class_after_detail_redaction() {
+        let case = test_case("bangumi-media-series", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            access_key_present: true,
+            ..Default::default()
+        };
+        let task = Task {
+            message: format!("{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=server_bug]"),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let message =
+            live_task_failure_message(&case, "task ended in Failed", &task, Some(&status));
+
+        assert!(message.contains("[restricted_proxy]"));
+        assert!(message.contains("failed_result_count=1"));
+    }
+
+    #[test]
+    fn authenticated_failure_prefers_typed_upstream_class_over_safe_marker_wording() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            LiveFailureClass::UpstreamSchemaOrAvailability,
+            classify_live_failure(
+                &case,
+                "task ended in Failed",
+                &format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=upstream_schema_or_availability]"
+                ),
+                Some(&status),
+            )
+        );
+    }
+
+    #[test]
+    fn failure_classification_does_not_trust_raw_upstream_class_tag() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            LiveFailureClass::UpstreamSchemaOrAvailability,
+            classify_live_failure(
+                &case,
+                "task ended in Failed",
+                "upstream request failed [bilibili_failure_class=credential]",
+                Some(&status),
+            )
+        );
     }
 
     #[test]

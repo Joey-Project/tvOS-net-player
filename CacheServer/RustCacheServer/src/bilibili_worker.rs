@@ -225,7 +225,10 @@ mod tests {
         let completed = wait_for_state(&registry, &task.id, TaskState::Failed).await;
 
         worker.abort();
-        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, completed.message);
+        assert_eq!(
+            crate::credential_safe_client_error(true, &"adapter failed"),
+            completed.message
+        );
         assert!(!completed.message.contains("adapter failed"));
     }
 

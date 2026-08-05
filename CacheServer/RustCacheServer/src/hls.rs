@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Display},
     sync::{Arc, RwLock},
-    time::SystemTime,
+    time::Instant,
 };
 
 use crate::bbdown_adapter::{
@@ -36,7 +36,7 @@ struct HlsPlaybackRegistryInner {
 #[derive(Clone)]
 struct HlsPlaybackPendingScrub {
     generation: u64,
-    deadline: SystemTime,
+    deadline: Instant,
     replacement: HlsPlaybackSession,
 }
 
@@ -62,7 +62,7 @@ impl HlsPlaybackRegistry {
         &self,
         session: HlsPlaybackSession,
         replacement: HlsPlaybackSession,
-        deadline: SystemTime,
+        deadline: Instant,
     ) -> u64 {
         let mut inner = self
             .inner
@@ -106,7 +106,7 @@ impl HlsPlaybackRegistry {
             let scrub_is_due = inner
                 .pending_scrubs
                 .get(session_id)
-                .is_some_and(|scrub| scrub.deadline <= SystemTime::now());
+                .is_some_and(|scrub| scrub.deadline <= Instant::now());
             if !scrub_is_due {
                 return inner.sessions.get(session_id).cloned();
             }
@@ -116,28 +116,36 @@ impl HlsPlaybackRegistry {
             .inner
             .write()
             .expect("HLS playback registry lock poisoned");
-        scrub_expired_session(&mut inner, session_id, SystemTime::now(), None);
+        scrub_expired_session(&mut inner, session_id, Instant::now());
         inner.sessions.get(session_id).cloned()
     }
 
-    pub(crate) fn scrub_if_generation(&self, session_id: &str, expected_generation: u64) -> bool {
+    pub(crate) fn scrub_generation(&self, session_id: &str, expected_generation: u64) -> bool {
         let mut inner = self
             .inner
             .write()
             .expect("HLS playback registry lock poisoned");
-        scrub_expired_session(
-            &mut inner,
-            session_id,
-            SystemTime::now(),
-            Some(expected_generation),
-        )
+        apply_pending_scrub(&mut inner, session_id, Some(expected_generation))
     }
 }
 
 fn scrub_expired_session(
     inner: &mut HlsPlaybackRegistryInner,
     session_id: &str,
-    now: SystemTime,
+    now: Instant,
+) -> bool {
+    let Some(scrub) = inner.pending_scrubs.get(session_id).cloned() else {
+        return false;
+    };
+    if now < scrub.deadline {
+        return false;
+    }
+    apply_pending_scrub(inner, session_id, None)
+}
+
+fn apply_pending_scrub(
+    inner: &mut HlsPlaybackRegistryInner,
+    session_id: &str,
     expected_generation: Option<u64>,
 ) -> bool {
     let Some(scrub) = inner.pending_scrubs.get(session_id).cloned() else {
@@ -145,7 +153,6 @@ fn scrub_expired_session(
     };
     if inner.generations.get(session_id) != Some(&scrub.generation)
         || expected_generation.is_some_and(|generation| generation != scrub.generation)
-        || now < scrub.deadline
     {
         return false;
     }

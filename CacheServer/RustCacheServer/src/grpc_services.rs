@@ -849,12 +849,20 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
     if !redact_error_details {
         return task;
     }
+    if task.kind() == TaskKind::BilibiliDownload
+        && matches!(
+            task.state(),
+            TaskState::Running | TaskState::CancelRequested
+        )
+    {
+        task.message = crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL.to_owned();
+    }
     if matches!(task.state(), TaskState::Failed | TaskState::Cancelled) {
-        task.message = crate::CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned();
+        task.message = crate::credential_safe_client_error(true, &task.message);
     }
     for item in &mut task.result_items {
         if matches!(item.state(), TaskState::Failed | TaskState::Cancelled) {
-            item.message = crate::CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned();
+            item.message = crate::credential_safe_client_error(true, &item.message);
         }
     }
     task
@@ -2771,6 +2779,7 @@ mod tests {
         routing::get,
     };
     use tokio::sync::{mpsc, oneshot};
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -3839,7 +3848,10 @@ mod tests {
             .await
             .expect("failed task should remain readable")
             .into_inner();
-        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, snapshot.message);
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            snapshot.message
+        );
         assert!(!snapshot.message.contains("credential-sensitive-marker"));
 
         let legacy_task = tasks
@@ -3854,7 +3866,7 @@ mod tests {
             .expect("legacy failed task should remain readable")
             .into_inner();
         assert_eq!(
-            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            crate::credential_safe_client_error(true, &sensitive_detail),
             legacy_snapshot.message
         );
         assert!(
@@ -3871,8 +3883,105 @@ mod tests {
             .await
             .expect_err("resolve should return the planner error");
         assert_eq!(tonic::Code::FailedPrecondition, status.code());
-        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, status.message());
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            status.message()
+        );
         assert!(!status.message().contains("credential-sensitive-marker"));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_omits_running_download_detail_from_get_and_watch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let task = tasks
+            .create_bilibili_task("BV1running-credential-error", None)
+            .expect("download task should be created");
+        let _work_item = tasks
+            .try_claim_next_bilibili_task()
+            .expect("download task should become running");
+        assert!(
+            tasks.update_task_progress(
+                &task.id,
+                BilibiliTaskProgress {
+                    progress: Some(0.25),
+                    message: Some(
+                        "retrying https://example.test/media?access_key=running-sensitive-marker"
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                },
+            )
+        );
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: task.id.clone(),
+            }))
+            .await
+            .expect("running task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Running, snapshot.state());
+        assert_eq!(0.25, snapshot.progress);
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            snapshot.message
+        );
+        assert!(!snapshot.message.contains("running-sensitive-marker"));
+
+        let mut stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![task.id.clone()],
+            }))
+            .await
+            .expect("running task watch should start")
+            .into_inner();
+        let watched_snapshot = stream
+            .next()
+            .await
+            .expect("watch should include its initial snapshot")
+            .expect("initial task event should succeed")
+            .task
+            .expect("initial event should include a task");
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            watched_snapshot.message
+        );
+
+        assert!(tasks.update_task_progress(
+            &task.id,
+            BilibiliTaskProgress {
+                progress: Some(0.5),
+                message: Some("BBDown failed with watch-sensitive-marker".to_owned()),
+                ..Default::default()
+            },
+        ));
+        let watched_update = stream
+            .next()
+            .await
+            .expect("watch should include the progress update")
+            .expect("progress task event should succeed")
+            .task
+            .expect("progress event should include a task");
+        assert_eq!(0.5, watched_update.progress);
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            watched_update.message
+        );
+        assert!(!watched_update.message.contains("watch-sensitive-marker"));
     }
 
     #[tokio::test]
@@ -3884,8 +3993,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
-        let sensitive_detail =
-            "upstream failed at https://example.test/playurl?access_key=result-sensitive-marker";
+        let sensitive_detail = "restricted proxy rejected playurl at https://example.test/playurl?access_key=result-sensitive-marker";
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
@@ -3931,8 +4039,13 @@ mod tests {
             .into_inner();
         assert_eq!(1, snapshot.result_items.len());
         assert_eq!(
-            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            crate::credential_safe_client_error(true, &sensitive_detail),
             snapshot.result_items[0].message
+        );
+        assert!(
+            snapshot.result_items[0]
+                .message
+                .contains("[bilibili_failure_class=restricted_proxy]")
         );
         assert!(
             !snapshot.result_items[0]
@@ -3958,7 +4071,7 @@ mod tests {
 
         assert_eq!("Completed with one playable result.", sanitized.message);
         assert_eq!(
-            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            crate::credential_safe_client_error(true, &"upstream result-sensitive-marker"),
             sanitized.result_items[0].message
         );
         assert!(

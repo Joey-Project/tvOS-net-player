@@ -944,13 +944,12 @@ impl BilibiliBbdownProgressAccumulator {
                 entry_title,
                 kind,
                 path,
-                error,
                 ..
             } => {
                 self.active_entry_in_progress = true;
                 self.rollback_file_progress(path);
                 Some(self.published_rollback_bytes_progress(format!(
-                    "Retrying {} for {entry_title} after BBDown error: {error}",
+                    "Retrying {} for {entry_title} after a BBDown error.",
                     download_file_kind_label(kind),
                 )))
             }
@@ -975,15 +974,15 @@ impl BilibiliBbdownProgressAccumulator {
                     format!("Downloaded {entry_count} Bilibili entry(s)."),
                 )
             }
-            DownloadProgressEvent::PlanCancelled { error, .. } => {
+            DownloadProgressEvent::PlanCancelled { .. } => {
                 self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
-                self.message_progress(progress, format!("BBDown download cancelled: {error}"))
+                self.message_progress(progress, "BBDown download cancelled.".to_owned())
             }
-            DownloadProgressEvent::PlanFailed { error, .. } => {
+            DownloadProgressEvent::PlanFailed { .. } => {
                 self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
-                self.message_progress(progress, format!("BBDown download failed: {error}"))
+                self.message_progress(progress, "BBDown download failed.".to_owned())
             }
             DownloadProgressEvent::MuxStarted { .. }
             | DownloadProgressEvent::MuxCompleted { .. }
@@ -4782,6 +4781,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("Retrying video"))
         );
+        assert!(
+            failed_progress
+                .message
+                .as_deref()
+                .is_none_or(|message| !message.contains("stream reset"))
+        );
 
         let plan_cancelled = cancelled_accumulator
             .record(&DownloadProgressEvent::PlanCancelled {
@@ -4794,6 +4799,10 @@ mod tests {
         assert_progress_near(plan_cancelled.progress, DOWNLOAD_PROGRESS_START);
         assert_eq!(None, plan_cancelled.downloaded_bytes);
         assert_eq!(None, plan_cancelled.total_bytes);
+        assert_eq!(
+            Some("BBDown download cancelled."),
+            plan_cancelled.message.as_deref()
+        );
 
         let (mut failed_accumulator, _) = accumulator_after_failed_bbdown_file_attempt();
         let plan_failed = failed_accumulator
@@ -4807,6 +4816,10 @@ mod tests {
         assert_progress_near(plan_failed.progress, DOWNLOAD_PROGRESS_START);
         assert_eq!(None, plan_failed.downloaded_bytes);
         assert_eq!(None, plan_failed.total_bytes);
+        assert_eq!(
+            Some("BBDown download failed."),
+            plan_failed.message.as_deref()
+        );
     }
 
     #[tokio::test]
