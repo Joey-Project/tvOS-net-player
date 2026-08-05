@@ -35,6 +35,8 @@ superseded_by:
 - Shared AppCore owns the policy selection state and persists it through injected `UserDefaults`.
 - tvOS and macOS expose the same three playback-only Picker controls. Complete-download options remain unchanged.
 - Existing cache diagnostics continue to show runtime transcoding and weak-network state; current task metadata exposes the effective policy and transcoding decision.
+- HLS weak-network observations are generation-scoped and serialized with session removal, so a stale recorder cannot mutate a replacement session that reuses the same ID.
+- Playback-only policy changes preserve an already resolved multi-candidate selection and are applied when the task is created without repeating page resolution.
 
 ## Non-Goals
 
@@ -53,8 +55,8 @@ superseded_by:
 - Roadmap: `docs/project_journal/2026/06/2026-06-24-next-phase-productization-roadmap-a8d2c5.md`
 - Cache-server architecture: `docs/architecture/cache-server.md`
 - `just lint`: passed after the final Rust media-handler refactor and policy tests.
-- `scripts/test.sh`: 267 Swift package tests passed with no failures.
-- `scripts/test-cache-server.sh`: 496 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default.
+- `scripts/test.sh`: 268 Swift package tests passed with no failures, including policy changes after multi-candidate resolution.
+- `scripts/test-cache-server.sh`: 498 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation and session-removal serialization regressions.
 - `just build-cache-server`: the optimized Rust LAN cache server build passed.
 - `just build`: the generic tvOS Simulator app build passed.
 - `just build-for-testing`: the generic tvOS Simulator test bundle build passed.

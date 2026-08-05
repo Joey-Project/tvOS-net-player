@@ -1432,6 +1432,58 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testPlaybackPolicyChangePreservesResolvedCandidateSelection() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1multi",
+                        title: "Multi page video",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: ""
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1multi", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        model.selectedCandidateID = "page:2"
+        model.playbackTranscodingPreference = .force
+        model.playbackCompatibleVariantPreference = .preferRequested
+        model.playbackWeakNetworkPreference = .holdDowngrade
+
+        XCTAssertEqual(model.resolvedCandidates.map(\.selectionID), ["page:1", "page:2"])
+        XCTAssertEqual(model.selectedCandidateID, "page:2")
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.count, 1)
+        let requests = await client.createdRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selectionID, "page:2")
+        XCTAssertEqual(
+            requests.first?.options.playbackPolicy,
+            BilibiliPlaybackPolicy(
+                transcodingPreference: .force,
+                compatibleVariantPreference: .preferRequested,
+                weakNetworkPreference: .holdDowngrade
+            )
+        )
+
+        model.clearTask()
+    }
+
     func testSubmitIgnoresResolveResultWhenInputChangesBeforeCompletion() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [

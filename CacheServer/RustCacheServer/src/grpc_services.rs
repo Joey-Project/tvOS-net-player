@@ -1361,7 +1361,7 @@ async fn run_single_bilibili_playback_planning(
         uri: playback_source_uri,
         expires_at: None,
     };
-    state.hls_sessions.insert(metadata.hls_session.clone());
+    state.register_hls_playback_session(metadata.hls_session.clone());
     match state.tasks.complete_playback_playable(
         &task_id,
         metadata.title,
@@ -1519,7 +1519,7 @@ async fn run_explicit_bilibili_playback_planning(
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
                 result_items[index].playback_session = Some(metadata.playback_session.clone());
-                state.hls_sessions.insert(metadata.hls_session.clone());
+                state.register_hls_playback_session(metadata.hls_session.clone());
                 planned_session_ids.push(session_id.clone());
                 planned_sessions.push(metadata.hls_session.clone());
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
@@ -5934,9 +5934,17 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_some()
         );
-        state
-            .hls_network_policy
-            .record_upstream_failure(&completed.id, "h264");
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&completed.id)
+            .expect("completed HLS session should remain registered")
+            .generation;
+        state.hls_network_policy.record_upstream_failure_for_policy(
+            WeakNetworkPreference::Adaptive,
+            &completed.id,
+            generation,
+            "h264",
+        );
         assert_eq!(
             RuntimeTestHlsWeakNetworkState::UpstreamFailed,
             state.hls_weak_network_status().state

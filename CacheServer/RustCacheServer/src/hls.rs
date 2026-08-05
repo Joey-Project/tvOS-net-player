@@ -94,14 +94,15 @@ impl HlsPlaybackRegistry {
         generation
     }
 
-    pub(crate) fn remove(&self, session_id: &str) {
+    pub(crate) fn remove(&self, session_id: &str) -> Option<u64> {
         let mut inner = self
             .inner
             .write()
             .expect("HLS playback registry lock poisoned");
         inner.sessions.remove(session_id);
-        inner.generations.remove(session_id);
+        let generation = inner.generations.remove(session_id);
         inner.pending_scrubs.remove(session_id);
+        generation
     }
 
     pub(crate) fn get(&self, session_id: &str) -> Option<HlsPlaybackSession> {
@@ -132,20 +133,26 @@ impl HlsPlaybackRegistry {
         session_handle(&inner, session_id)
     }
 
-    pub(crate) fn accepts_network_policy_update(
+    pub(crate) fn with_network_policy_update(
         &self,
         session_id: &str,
         expected_generation: u64,
+        update: impl FnOnce(),
     ) -> bool {
         let inner = self
             .inner
             .read()
             .expect("HLS playback registry lock poisoned");
-        inner.generations.get(session_id) == Some(&expected_generation)
+        let accepts_update = inner.generations.get(session_id) == Some(&expected_generation)
             && inner
                 .sessions
                 .get(session_id)
-                .is_some_and(|session| session.advertise_alternate_variants)
+                .is_some_and(|session| session.advertise_alternate_variants);
+        if accepts_update {
+            update();
+        }
+        drop(inner);
+        accepts_update
     }
 
     pub(crate) fn scrub_generation(&self, session_id: &str, expected_generation: u64) -> bool {

@@ -178,7 +178,21 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
 private struct BilibiliResolvedInputContext: Equatable {
     let source: String
     let endpoint: CacheServerEndpoint
-    let options: BilibiliPlaybackTaskOptions
+    let options: BilibiliPlaybackResolutionOptions
+}
+
+private struct BilibiliPlaybackResolutionOptions: Equatable {
+    let qualityPreference: String
+    let encodingPreference: String
+    let audioLanguagePreference: String
+    let preferTVAPI: Bool
+
+    init(_ options: BilibiliPlaybackTaskOptions) {
+        qualityPreference = options.qualityPreference
+        encodingPreference = options.encodingPreference
+        audioLanguagePreference = options.audioLanguagePreference
+        preferTVAPI = options.preferTVAPI
+    }
 }
 
 private struct BilibiliCandidateSelectionRequest {
@@ -893,7 +907,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
                 endpoint: endpoint,
-                options: options
+                options: BilibiliPlaybackResolutionOptions(options)
             )
             applyResolvedCandidateDefaults(resolved)
             isResolving = false
@@ -918,7 +932,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 endpoint: endpoint,
                 sequence: sequence,
                 client: client,
-                options: options
+                options: currentPlaybackOptions
             )
         } catch {
             guard sequence == operationSequence else {
@@ -938,7 +952,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     endpoint: endpoint,
                     sequence: sequence,
                     client: client,
-                    options: options
+                    options: currentPlaybackOptions
                 )
                 return
             }
@@ -1026,7 +1040,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
                 endpoint: endpoint,
-                options: options
+                options: BilibiliPlaybackResolutionOptions(options)
             )
             applyResolvedCandidateDefaults(resolved)
             isResolving = false
@@ -2588,13 +2602,14 @@ private extension BilibiliTaskViewModel {
         }
 
         return resolvedInputContext.source == source
-            && resolvedInputContext.options == options
+            && resolvedInputContext.options == BilibiliPlaybackResolutionOptions(options)
             && Self.normalizedBilibiliSource(resolvedInput.source) == source
     }
 
     func currentSubmissionMatches(source: String, options: BilibiliPlaybackTaskOptions) -> Bool {
         Self.normalizedBilibiliSource(sourceText) == source
-            && currentPlaybackOptions == options
+            && BilibiliPlaybackResolutionOptions(currentPlaybackOptions)
+                == BilibiliPlaybackResolutionOptions(options)
     }
 
     func discardStaleResolveSubmission() {

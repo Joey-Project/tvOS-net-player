@@ -718,9 +718,19 @@ impl AppState {
         Ok(())
     }
 
+    pub(crate) fn register_hls_playback_session(&self, session: HlsPlaybackSession) -> u64 {
+        let session_id = session.id.clone();
+        let generation = self.hls_sessions.insert(session);
+        self.hls_network_policy
+            .advance_session_generation(&session_id, generation);
+        generation
+    }
+
     pub(crate) fn remove_hls_playback_session(&self, session_id: &str) {
-        self.hls_sessions.remove(session_id);
-        self.hls_network_policy.remove_session(session_id);
+        if let Some(generation) = self.hls_sessions.remove(session_id) {
+            self.hls_network_policy
+                .remove_session_generation(session_id, generation);
+        }
         self.hls_playback_progress.remove_session(session_id);
     }
 
@@ -736,7 +746,6 @@ impl AppState {
         session: &HlsPlaybackSession,
         grace_period: Duration,
     ) {
-        self.hls_network_policy.remove_session(&session.id);
         let runtime_session = completed_runtime_session(session);
         let sanitized_session = sanitized_completed_session(session);
         let session_id = runtime_session.id.clone();
@@ -748,6 +757,8 @@ impl AppState {
             sanitized_session,
             deadline,
         );
+        self.hls_network_policy
+            .advance_session_generation(&session.id, generation);
 
         let registry = self.hls_sessions.clone();
         tokio::spawn(async move {
@@ -1403,7 +1414,7 @@ impl AppState {
             let Some(session) = self.hls_cache.playback_session(session_id) else {
                 return false;
             };
-            self.hls_sessions.insert(session);
+            self.register_hls_playback_session(session);
             return true;
         };
         if task.kind() != TaskKind::BilibiliProgressivePlayback {
@@ -1421,7 +1432,7 @@ impl AppState {
                 let Some(session) = self.hls_cache.playback_session(session_id) else {
                     return false;
                 };
-                self.hls_sessions.insert(session);
+                self.register_hls_playback_session(session);
                 true
             }
             TaskState::Completed => {
@@ -1450,8 +1461,7 @@ impl AppState {
         let Some(session) = self.hls_cache.completed_session(session_id) else {
             return false;
         };
-        self.hls_sessions
-            .insert(sanitized_completed_session(&session));
+        self.register_hls_playback_session(sanitized_completed_session(&session));
         true
     }
 

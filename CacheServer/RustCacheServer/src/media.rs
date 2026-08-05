@@ -131,6 +131,7 @@ fn hls_master_playlist_response(
     let Some(handle) = state.state.hls_playback_session_for_serving(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+    let generation = handle.generation;
     let session = handle.session;
 
     let body = if head_only {
@@ -144,6 +145,7 @@ fn hls_master_playlist_response(
                 .variant_is_advertisable_for_policy(
                     weak_network_preference,
                     &session_id,
+                    generation,
                     &variant.id,
                 )
         }))
@@ -379,55 +381,70 @@ impl HlsNetworkPolicyRecorder {
         }
     }
 
-    fn is_current(&self) -> bool {
-        self.state
-            .hls_sessions
-            .accepts_network_policy_update(&self.session_id, self.generation)
-    }
-
     fn record_cache_hit(&self) {
-        if self.is_current() {
-            self.state
-                .hls_network_policy
-                .record_cache_hit_for_policy(self.weak_network_preference, &self.session_id);
-        }
+        self.state.hls_sessions.with_network_policy_update(
+            &self.session_id,
+            self.generation,
+            || {
+                self.state.hls_network_policy.record_cache_hit_for_policy(
+                    self.weak_network_preference,
+                    &self.session_id,
+                    self.generation,
+                );
+            },
+        );
     }
 
     fn record_upstream_retry(&self, variant_id: &str) {
-        if self.is_current() {
-            self.state
-                .hls_network_policy
-                .record_upstream_retry_for_policy(
-                    self.weak_network_preference,
-                    &self.session_id,
-                    variant_id,
-                );
-        }
+        self.state.hls_sessions.with_network_policy_update(
+            &self.session_id,
+            self.generation,
+            || {
+                self.state
+                    .hls_network_policy
+                    .record_upstream_retry_for_policy(
+                        self.weak_network_preference,
+                        &self.session_id,
+                        self.generation,
+                        variant_id,
+                    );
+            },
+        );
     }
 
     fn record_upstream_success(&self, variant_id: &str, response_time: Duration) {
-        if self.is_current() {
-            self.state
-                .hls_network_policy
-                .record_upstream_success_for_policy(
-                    self.weak_network_preference,
-                    &self.session_id,
-                    variant_id,
-                    response_time,
-                );
-        }
+        self.state.hls_sessions.with_network_policy_update(
+            &self.session_id,
+            self.generation,
+            || {
+                self.state
+                    .hls_network_policy
+                    .record_upstream_success_for_policy(
+                        self.weak_network_preference,
+                        &self.session_id,
+                        self.generation,
+                        variant_id,
+                        response_time,
+                    );
+            },
+        );
     }
 
     fn record_upstream_failure(&self, variant_id: &str) {
-        if self.is_current() {
-            self.state
-                .hls_network_policy
-                .record_upstream_failure_for_policy(
-                    self.weak_network_preference,
-                    &self.session_id,
-                    variant_id,
-                );
-        }
+        self.state.hls_sessions.with_network_policy_update(
+            &self.session_id,
+            self.generation,
+            || {
+                self.state
+                    .hls_network_policy
+                    .record_upstream_failure_for_policy(
+                        self.weak_network_preference,
+                        &self.session_id,
+                        self.generation,
+                        variant_id,
+                    );
+            },
+        );
     }
 }
 
@@ -1131,7 +1148,7 @@ fn parse_range(header: Option<&HeaderValue>, size: u64) -> Result<Option<ByteRan
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{convert::Infallible, sync::mpsc, thread};
 
     use super::*;
     use axum::{
@@ -1305,6 +1322,73 @@ mod tests {
         );
         state.remove_hls_playback_session(&removed_session.id);
         removed_recorder.record_upstream_failure("h264");
+        assert_eq!(
+            crate::hls_network_policy::HlsWeakNetworkState::Normal,
+            state.hls_weak_network_status().state
+        );
+    }
+
+    #[test]
+    fn network_policy_update_is_serialized_with_session_removal() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session("session-race", "https://example.test/video.m4s");
+        let generation = state.register_hls_playback_session(session.clone());
+        let (update_started_tx, update_started_rx) = mpsc::channel();
+        let (release_update_tx, release_update_rx) = mpsc::channel();
+        let update_state = state.clone();
+        let session_id = session.id.clone();
+        let updater = thread::spawn(move || {
+            let updated = update_state.hls_sessions.with_network_policy_update(
+                &session_id,
+                generation,
+                || {
+                    update_started_tx.send(()).unwrap();
+                    release_update_rx.recv().unwrap();
+                    update_state
+                        .hls_network_policy
+                        .record_upstream_failure_for_policy(
+                            WeakNetworkPreference::HoldDowngrade,
+                            &session_id,
+                            generation,
+                            "h264",
+                        );
+                },
+            );
+            assert!(updated);
+        });
+
+        update_started_rx.recv().unwrap();
+        let (removal_started_tx, removal_started_rx) = mpsc::channel();
+        let (removal_done_tx, removal_done_rx) = mpsc::channel();
+        let removal_state = state.clone();
+        let removal_session_id = session.id.clone();
+        let remover = thread::spawn(move || {
+            removal_started_tx.send(()).unwrap();
+            removal_state.remove_hls_playback_session(&removal_session_id);
+            removal_done_tx.send(()).unwrap();
+        });
+
+        removal_started_rx.recv().unwrap();
+        assert!(
+            removal_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "session removal must wait for the in-flight policy update"
+        );
+        release_update_tx.send(()).unwrap();
+        updater.join().unwrap();
+        removal_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("session removal should finish after the policy update");
+        remover.join().unwrap();
+
         assert_eq!(
             crate::hls_network_policy::HlsWeakNetworkState::Normal,
             state.hls_weak_network_status().state
