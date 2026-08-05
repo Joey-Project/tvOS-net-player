@@ -69,6 +69,7 @@ pub async fn run_bilibili_task_worker(
     registry: Arc<BilibiliTaskRegistry>,
     adapter: Arc<dyn BilibiliDownloadAdapter>,
     max_concurrent_tasks: usize,
+    credentials_configured: bool,
 ) {
     let max_concurrent_tasks = max_concurrent_tasks.max(1);
     let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
@@ -91,7 +92,7 @@ pub async fn run_bilibili_task_worker(
         let adapter = Arc::clone(&adapter);
         running_tasks.spawn(async move {
             let _permit = permit;
-            run_one_bilibili_task(registry, adapter, work_item).await;
+            run_one_bilibili_task(registry, adapter, work_item, credentials_configured).await;
         });
     }
 }
@@ -100,6 +101,7 @@ async fn run_one_bilibili_task(
     registry: Arc<BilibiliTaskRegistry>,
     adapter: Arc<dyn BilibiliDownloadAdapter>,
     work_item: BilibiliTaskWorkItem,
+    credentials_configured: bool,
 ) {
     let request = BilibiliDownloadRequest {
         task_id: work_item.task_id.clone(),
@@ -127,7 +129,9 @@ async fn run_one_bilibili_task(
 
     if work_item.cancellation.is_cancel_requested() {
         let message = match result {
-            Err(BilibiliDownloadError::Cancelled(message)) => message,
+            Err(BilibiliDownloadError::Cancelled(message)) => {
+                crate::credential_safe_client_error(credentials_configured, &message)
+            }
             _ => "Cancelled by request.".to_owned(),
         };
         let _ = registry.complete_task_cancelled(&work_item.task_id, message);
@@ -143,10 +147,13 @@ async fn run_one_bilibili_task(
             );
         }
         Err(BilibiliDownloadError::Cancelled(message)) => {
+            let message = crate::credential_safe_client_error(credentials_configured, &message);
             let _ = registry.complete_task_cancelled(&work_item.task_id, message);
         }
         Err(error @ BilibiliDownloadError::Failed(_)) => {
-            let _ = registry.complete_task_failed(&work_item.task_id, error.message());
+            let detail = error.message();
+            let message = crate::credential_safe_client_error(credentials_configured, &detail);
+            let _ = registry.complete_task_failed(&work_item.task_id, message);
         }
     }
 }
@@ -167,6 +174,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(SuccessAdapter),
             1,
+            false,
         ));
         let task = registry
             .create_bilibili_task("BV1success", None)
@@ -189,6 +197,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(FailureAdapter),
             1,
+            false,
         ));
         let task = registry
             .create_bilibili_task("BV1failure", None)
@@ -201,12 +210,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_omits_adapter_failure_detail_when_credentials_are_configured() {
+        let registry = Arc::new(BilibiliTaskRegistry::default());
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(FailureAdapter),
+            1,
+            true,
+        ));
+        let task = registry
+            .create_bilibili_task("BV1credential-failure", None)
+            .expect("task should be created");
+
+        let completed = wait_for_state(&registry, &task.id, TaskState::Failed).await;
+
+        worker.abort();
+        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, completed.message);
+        assert!(!completed.message.contains("adapter failed"));
+    }
+
+    #[tokio::test]
     async fn worker_marks_adapter_panic_as_failure_and_allows_requeue() {
         let registry = Arc::new(BilibiliTaskRegistry::default());
         let worker = tokio::spawn(run_bilibili_task_worker(
             Arc::clone(&registry),
             Arc::new(PanicAdapter),
             1,
+            false,
         ));
         let task = registry
             .create_bilibili_task("BV1panic", None)
@@ -231,6 +261,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::clone(&adapter) as Arc<dyn BilibiliDownloadAdapter>,
             1,
+            false,
         ));
         let task = registry
             .create_bilibili_task("BV1drop", None)
@@ -256,6 +287,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(CancellationAwareAdapter),
             1,
+            false,
         ));
         let task = registry
             .create_bilibili_task("BV1cancel", None)

@@ -928,7 +928,9 @@ fn safe_live_failure_detail<'a>(
     detail: &'a str,
     credential_status: Option<&BilibiliCredentialStatus>,
 ) -> &'a str {
-    if credential_status.is_some_and(|status| status.credential_file_loaded) {
+    if credential_status
+        .is_some_and(|status| status.credential_path_configured || status.credential_file_loaded)
+    {
         "upstream detail omitted because credential material is configured"
     } else {
         detail
@@ -1853,6 +1855,27 @@ mod tests {
         assert!(message.contains("upstream detail omitted"));
         assert!(!message.contains("credential-sensitive-marker"));
         assert!(!message.contains("cookie"));
+    }
+
+    #[test]
+    fn live_failure_message_omits_raw_detail_when_credential_path_fails_to_load() {
+        let case = test_case("bangumi-episode", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_path_configured: true,
+            credential_file_loaded: false,
+            ..Default::default()
+        };
+
+        let message = live_failure_message(
+            &case,
+            "resolve",
+            "failed to read /private/credential-sensitive-marker.json",
+            Some(&status),
+        );
+
+        assert!(message.contains("upstream detail omitted"));
+        assert!(!message.contains("credential-sensitive-marker"));
+        assert!(!message.contains("/private/"));
     }
 
     #[test]

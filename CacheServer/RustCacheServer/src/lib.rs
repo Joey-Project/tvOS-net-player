@@ -86,6 +86,8 @@ const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60)
 const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
 const CREDENTIAL_SAFE_LOG_DETAIL: &str =
     "detail omitted because Bilibili credential material is configured";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
+    "Bilibili error detail omitted because credential material is configured.";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -483,6 +485,7 @@ impl AppState {
             Arc::clone(&self.tasks),
             adapter,
             max_concurrent_tasks,
+            self.options.bbdown_credential_path.is_some(),
         ))
     }
 
@@ -729,12 +732,19 @@ impl AppState {
         let runtime_session = completed_runtime_session(session);
         let sanitized_session = sanitized_completed_session(session);
         let session_id = runtime_session.id.clone();
-        let generation = self.hls_sessions.insert(runtime_session);
+        let deadline = SystemTime::now()
+            .checked_add(grace_period)
+            .expect("HLS completion grace deadline should fit in SystemTime");
+        let generation = self.hls_sessions.insert_with_scrub_deadline(
+            runtime_session,
+            sanitized_session,
+            deadline,
+        );
 
         let registry = self.hls_sessions.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace_period).await;
-            registry.replace_if_generation(&session_id, generation, sanitized_session);
+            registry.scrub_if_generation(&session_id, generation);
         });
     }
 
@@ -748,6 +758,14 @@ impl AppState {
 
     pub(crate) fn error_detail_for_log(&self, detail: &dyn Display) -> String {
         error_detail_for_log(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn error_detail_for_client(&self, detail: &dyn Display) -> String {
+        credential_safe_client_error(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn bilibili_error_details_are_sensitive(&self) -> bool {
+        self.options.bbdown_credential_path.is_some()
     }
 
     #[doc(hidden)]
@@ -1464,6 +1482,17 @@ fn error_detail_for_log(credentials_configured: bool, detail: &dyn Display) -> S
     }
 }
 
+pub(crate) fn credential_safe_client_error(
+    credentials_configured: bool,
+    detail: &dyn Display,
+) -> String {
+    if credentials_configured {
+        CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned()
+    } else {
+        detail.to_string()
+    }
+}
+
 fn refresh_restored_hls_playback_source(
     tasks: &BilibiliTaskRegistry,
     playback_uri_factory: &PlaybackUriFactory,
@@ -1821,6 +1850,16 @@ mod tests {
         assert!(!safe.contains("credential-sensitive-marker"));
     }
 
+    #[test]
+    fn credential_safe_client_error_omits_raw_upstream_error() {
+        let detail = "https://example.test/video.m4s?access_key=credential-sensitive-marker";
+
+        assert_eq!(detail, credential_safe_client_error(false, &detail));
+        let safe = credential_safe_client_error(true, &detail);
+        assert_eq!(CREDENTIAL_SAFE_CLIENT_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
     #[tokio::test]
     async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
         let port = match free_port() {
@@ -1878,6 +1917,44 @@ mod tests {
         assert!(scrubbed.alternate_variants[0].video.request.url.is_empty());
         assert!(
             scrubbed.alternate_variants[0]
+                .video
+                .request
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completed_runtime_session_enforces_expired_grace_during_lookup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-expired-lookup");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        alternate
+            .video
+            .request
+            .headers
+            .push(crate::bbdown_adapter::BilibiliHttpHeader {
+                name: "Authorization".to_owned(),
+                value: "credential-sensitive-marker".to_owned(),
+            });
+        session.alternate_variants = vec![alternate];
+
+        state.hls_sessions.insert_with_scrub_deadline(
+            completed_runtime_session(&session),
+            sanitized_completed_session(&session),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let served = state
+            .hls_playback_session(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(served.alternate_variants[0].video.request.url.is_empty());
+        assert!(
+            served.alternate_variants[0]
                 .video
                 .request
                 .headers

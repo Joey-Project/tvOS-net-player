@@ -692,7 +692,7 @@ impl TaskService for TaskGrpcService {
                 cancellation: crate::task_registry::BilibiliTaskCancellation::default(),
             })
             .await
-            .map_err(playback_status_from_error)?;
+            .map_err(|error| playback_status_from_error(&self.state, error))?;
         Ok(Response::new(BilibiliResolveResult::from(resolution)))
     }
 
@@ -705,7 +705,10 @@ impl TaskService for TaskGrpcService {
             .state
             .tasks
             .create_bilibili_task(&request.url_or_id, request.options)?;
-        Ok(Response::new(task))
+        Ok(Response::new(task_for_client(
+            task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn create_bilibili_playback_task(
@@ -724,7 +727,10 @@ impl TaskService for TaskGrpcService {
             selection_plan.task_selection.clone(),
         )?;
         if !creation.created {
-            return Ok(Response::new(creation.task));
+            return Ok(Response::new(task_for_client(
+                creation.task,
+                self.state.bilibili_error_details_are_sensitive(),
+            )));
         }
 
         let task_id = creation.task.id.clone();
@@ -752,12 +758,18 @@ impl TaskService for TaskGrpcService {
             .await;
         });
 
-        Ok(Response::new(creation.task))
+        Ok(Response::new(task_for_client(
+            creation.task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn get_task(&self, request: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(self.state.tasks.get_task(&request.id)?))
+        Ok(Response::new(task_for_client(
+            self.state.tasks.get_task(&request.id)?,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn watch_tasks(
@@ -767,11 +779,14 @@ impl TaskService for TaskGrpcService {
         let request = request.into_inner();
         let mut subscription = self.state.tasks.subscribe(&request.ids)?;
         let snapshots = subscription.snapshots().to_vec();
+        let redact_error_details = self.state.bilibili_error_details_are_sensitive();
         let (sender, receiver) = mpsc::channel(128);
         tokio::spawn(async move {
             for task in snapshots {
                 if sender
-                    .send(Ok(TaskEvent { task: Some(task) }))
+                    .send(Ok(TaskEvent {
+                        task: Some(task_for_client(task, redact_error_details)),
+                    }))
                     .await
                     .is_err()
                 {
@@ -788,7 +803,9 @@ impl TaskService for TaskGrpcService {
                 match result {
                     Ok(task) => {
                         if sender
-                            .send(Ok(TaskEvent { task: Some(task) }))
+                            .send(Ok(TaskEvent {
+                                task: Some(task_for_client(task, redact_error_details)),
+                            }))
                             .await
                             .is_err()
                         {
@@ -821,8 +838,26 @@ impl TaskService for TaskGrpcService {
                 let _ = self.state.hls_cache.remove_session(&session_id);
             }
         }
-        Ok(Response::new(task))
+        Ok(Response::new(task_for_client(
+            task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
+}
+
+fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
+    if !redact_error_details {
+        return task;
+    }
+    if matches!(task.state(), TaskState::Failed | TaskState::Cancelled) {
+        task.message = crate::CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned();
+    }
+    for item in &mut task.result_items {
+        if matches!(item.state(), TaskState::Failed | TaskState::Cancelled) {
+            item.message = crate::CREDENTIAL_SAFE_CLIENT_DETAIL.to_owned();
+        }
+    }
+    task
 }
 
 #[derive(Clone)]
@@ -1278,9 +1313,10 @@ async fn run_single_bilibili_playback_planning(
     let plan = match state.playback_planner.plan(planning_request).await {
         Ok(plan) => plan,
         Err(error) => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_failed(&task_id, playback_error_message(error))
+                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
                 .is_ok();
         }
     };
@@ -1289,7 +1325,7 @@ async fn run_single_bilibili_playback_planning(
         Err(error) => {
             return state
                 .tasks
-                .complete_task_failed(&task_id, error.message().to_owned())
+                .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
                 .is_ok();
         }
     };
@@ -1355,15 +1391,17 @@ async fn run_explicit_bilibili_playback_planning(
     {
         Ok(resolution) => resolution,
         Err(error) if cancellation.is_cancel_requested() => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_cancelled(&task_id, playback_error_message(error))
+                .complete_task_cancelled(&task_id, state.error_detail_for_client(&message))
                 .is_ok();
         }
         Err(error) => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_failed(&task_id, playback_error_message(error))
+                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
                 .is_ok();
         }
     };
@@ -1487,7 +1525,8 @@ async fn run_explicit_bilibili_playback_planning(
             }
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
-                result_items[index].message = playback_error_message(error);
+                let message = playback_error_message(error);
+                result_items[index].message = state.error_detail_for_client(&message);
             }
         }
 
@@ -2020,7 +2059,10 @@ async fn run_hls_cache_finalization_inner(
                     if let Err(status) = state.tasks.fail_hls_cache_fill_for_playback_session(
                         &task_id,
                         &session_id,
-                        format!("Playable online; offline cache fill failed: {error}"),
+                        format!(
+                            "Playable online; offline cache fill failed: {}",
+                            state.error_detail_for_client(&error)
+                        ),
                     ) {
                         eprintln!(
                             "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
@@ -2035,7 +2077,10 @@ async fn run_hls_cache_finalization_inner(
                         .tasks
                         .fail_unrestorable_playback_session_after_cache_restore(
                             &session_id,
-                            format!("Failed to restore offline HLS cache after restart: {error}"),
+                            format!(
+                                "Failed to restore offline HLS cache after restart: {}",
+                                state.error_detail_for_client(&error)
+                            ),
                         )
                     {
                         eprintln!(
@@ -2451,10 +2496,14 @@ fn playback_error_message(error: BilibiliDownloadError) -> String {
     }
 }
 
-fn playback_status_from_error(error: BilibiliDownloadError) -> Status {
+fn playback_status_from_error(state: &AppState, error: BilibiliDownloadError) -> Status {
     match error {
-        BilibiliDownloadError::Failed(message) => Status::failed_precondition(message),
-        BilibiliDownloadError::Cancelled(message) => Status::cancelled(message),
+        BilibiliDownloadError::Failed(message) => {
+            Status::failed_precondition(state.error_detail_for_client(&message))
+        }
+        BilibiliDownloadError::Cancelled(message) => {
+            Status::cancelled(state.error_detail_for_client(&message))
+        }
     }
 }
 
@@ -3743,6 +3792,179 @@ mod tests {
                 .lock()
                 .expect("playback request log should not be poisoned")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_errors_omit_upstream_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let sensitive_detail = "upstream failed at https://example.test/playurl?access_key=credential-sensitive-marker";
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credential_path),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(FailingPlaybackPlanner {
+                detail: sensitive_detail.to_owned(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1credential-error".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: None,
+            }))
+            .await
+            .expect("playback task should be accepted before async planning")
+            .into_inner();
+        let _ = wait_for_task_state(&tasks, &created.id, TaskState::Failed).await;
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: created.id.clone(),
+            }))
+            .await
+            .expect("failed task should remain readable")
+            .into_inner();
+        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, snapshot.message);
+        assert!(!snapshot.message.contains("credential-sensitive-marker"));
+
+        let legacy_task = tasks
+            .create_bilibili_task("BV1stored-credential-error", None)
+            .expect("legacy task should be created");
+        tasks
+            .complete_task_failed(&legacy_task.id, sensitive_detail.to_owned())
+            .expect("legacy task should store its original failure");
+        let legacy_snapshot = service
+            .get_task(Request::new(GetTaskRequest { id: legacy_task.id }))
+            .await
+            .expect("legacy failed task should remain readable")
+            .into_inner();
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            legacy_snapshot.message
+        );
+        assert!(
+            !legacy_snapshot
+                .message
+                .contains("credential-sensitive-marker")
+        );
+
+        let status = service
+            .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+                url_or_id: "BV1credential-error".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect_err("resolve should return the planner error");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+        assert_eq!(crate::CREDENTIAL_SAFE_CLIENT_DETAIL, status.message());
+        assert!(!status.message().contains("credential-sensitive-marker"));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_result_item_omits_upstream_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let sensitive_detail =
+            "upstream failed at https://example.test/playurl?access_key=result-sensitive-marker";
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credential_path),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndScriptedPlaybackPlanner {
+                resolve_requests: Arc::new(Mutex::new(Vec::new())),
+                playback_requests: Arc::new(Mutex::new(Vec::new())),
+                resolution: sample_resolution_with_pages(),
+                results: Mutex::new(HashMap::from([(
+                    "page:1".to_owned(),
+                    Err(BilibiliDownloadError::Failed(sensitive_detail.to_owned())),
+                )])),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1credential-result-error".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_SINGLE,
+                    selection_ids: vec!["page:1".to_owned()],
+                    range_start_index: 0,
+                    range_end_index: 0,
+                }),
+            }))
+            .await
+            .expect("playback task should be accepted before async planning")
+            .into_inner();
+        let _ = wait_for_task_state(&tasks, &created.id, TaskState::Failed).await;
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest { id: created.id }))
+            .await
+            .expect("failed task should remain readable")
+            .into_inner();
+        assert_eq!(1, snapshot.result_items.len());
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            snapshot.result_items[0].message
+        );
+        assert!(
+            !snapshot.result_items[0]
+                .message
+                .contains("result-sensitive-marker")
+        );
+    }
+
+    #[test]
+    fn task_client_boundary_redacts_failed_child_of_completed_parent() {
+        let task = Task {
+            state: TaskState::Completed.into(),
+            message: "Completed with one playable result.".to_owned(),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: "upstream result-sensitive-marker".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let sanitized = task_for_client(task, true);
+
+        assert_eq!("Completed with one playable result.", sanitized.message);
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_DETAIL,
+            sanitized.result_items[0].message
+        );
+        assert!(
+            !sanitized.result_items[0]
+                .message
+                .contains("result-sensitive-marker")
         );
     }
 
@@ -11094,6 +11316,28 @@ mod tests {
                     entries: Vec::new(),
                 })
             })
+        }
+    }
+
+    struct FailingPlaybackPlanner {
+        detail: String,
+    }
+
+    impl BilibiliPlaybackPlanner for FailingPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            _request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            let detail = self.detail.clone();
+            Box::pin(async move { Err(BilibiliDownloadError::Failed(detail)) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let detail = self.detail.clone();
+            Box::pin(async move { Err(BilibiliDownloadError::Failed(detail)) })
         }
     }
 
