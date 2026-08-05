@@ -97,6 +97,7 @@ pub struct ServerGrpcService {
 }
 
 const MAX_BILIBILI_LOGIN_SESSIONS: usize = 64;
+const MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES: usize = 256;
 
 impl ServerGrpcService {
     pub fn new(state: AppState) -> Self {
@@ -440,25 +441,35 @@ fn normalize_login_profile_id(
     options: &CacheServerOptions,
 ) -> Result<String, Status> {
     let requested_profile_id = requested_profile_id.trim();
-    if requested_profile_id.is_empty() {
+    let profile_id = if requested_profile_id.is_empty() {
         if let Some(profile) = options.bbdown_credential_profile.as_ref() {
-            return Ok(profile.clone());
+            profile.clone()
+        } else if let Some(path) = options.bbdown_credential_path.as_ref() {
+            CredentialStore::new(path.clone())
+                .load_profiles()
+                .map(|profiles| profiles.default_profile)
+                .map_err(|_| {
+                    Status::failed_precondition("Failed to load BBDown credential file.")
+                })?
+        } else {
+            DEFAULT_CREDENTIAL_PROFILE.to_owned()
         }
-        let Some(path) = options.bbdown_credential_path.as_ref() else {
-            return Ok(DEFAULT_CREDENTIAL_PROFILE.to_owned());
-        };
-        return CredentialStore::new(path.clone())
-            .load_profiles()
-            .map(|profiles| profiles.default_profile)
-            .map_err(|_| Status::failed_precondition("Failed to load BBDown credential file."));
+    } else {
+        let selection =
+            CredentialProfileSelection::named(requested_profile_id).map_err(|error| {
+                Status::invalid_argument(format!("Invalid Bilibili profile ID: {error}"))
+            })?;
+        selection
+            .profile_name()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Status::invalid_argument("Invalid Bilibili profile ID."))?
+    };
+    if profile_id.len() > MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "Bilibili profile ID must not exceed {MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES} UTF-8 bytes."
+        )));
     }
-    let selection = CredentialProfileSelection::named(requested_profile_id).map_err(|error| {
-        Status::invalid_argument(format!("Invalid Bilibili profile ID: {error}"))
-    })?;
-    selection
-        .profile_name()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| Status::invalid_argument("Invalid Bilibili profile ID."))
+    Ok(profile_id)
 }
 
 fn restricted_area_label(area: BbdownRestrictedArea) -> &'static str {
@@ -3070,6 +3081,51 @@ mod tests {
             .expect_err("unknown login method should be rejected");
 
         assert_eq!(tonic::Code::InvalidArgument, error.code());
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_rejects_oversized_profile_without_mutating_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        service
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: "a".repeat(MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect("maximum-length profile ID should be accepted");
+        let sessions_before = service
+            .login_sessions
+            .lock()
+            .expect("session store should be available")
+            .clone();
+
+        let error = service
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: "a".repeat(MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES + 1),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect_err("oversized profile ID should be rejected");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert_eq!(
+            sessions_before,
+            *service
+                .login_sessions
+                .lock()
+                .expect("session store should be available")
+        );
     }
 
     #[tokio::test]
