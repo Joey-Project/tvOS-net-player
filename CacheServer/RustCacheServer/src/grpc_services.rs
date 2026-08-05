@@ -1,11 +1,14 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet, VecDeque},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime},
 };
 
-use bbdown_core::CredentialStore;
+use bbdown_core::{
+    CredentialProfileSelection, CredentialProfiles, CredentialStore, Credentials,
+    DEFAULT_CREDENTIAL_PROFILE,
+};
 use futures_core::Stream;
 use tokio::{sync::mpsc, time::sleep};
 use tokio_stream::wrappers::ReceiverStream;
@@ -24,25 +27,28 @@ use crate::{
     bilibili_worker::BilibiliDownloadError,
     config::{BbdownRestrictedArea, CacheServerOptions},
     generated::tvos_net_player::v1::{
-        BilibiliCredentialState, BilibiliCredentialStatus, BilibiliPlaybackOptions,
-        BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliResolveResult,
-        BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliTaskResultItem,
-        BilibiliTaskSelection, CacheRoot, CancelTaskRequest, CheckHealthRequest,
-        CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest, DeleteLibraryItemRequest,
-        DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest, GetHlsCacheStatusRequest,
-        GetLibraryItemRequest, GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest,
-        HealthState, HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
-        HlsCacheStatus, HlsPlaybackActivityState as ProtoHlsPlaybackActivityState,
-        HlsPlaybackProgressStatus, HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan,
-        LanTranscodingPlanState, LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState,
-        LanTranscodingStatus, LibraryItem, LibrarySource, ListCacheRootsRequest,
-        ListCacheRootsResponse, ListLibraryItemsRequest, ListLibraryItemsResponse,
+        BilibiliCredentialProfile, BilibiliCredentialState, BilibiliCredentialStatus,
+        BilibiliLoginMethod, BilibiliLoginSession, BilibiliLoginSessionState,
+        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackVariant,
+        BilibiliResolveResult, BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate,
+        BilibiliTaskResultItem, BilibiliTaskSelection, CacheRoot, CancelTaskRequest,
+        CheckHealthRequest, CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest,
+        DeleteLibraryItemRequest, DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest,
+        GetBilibiliLoginSessionRequest, GetHlsCacheStatusRequest, GetLibraryItemRequest,
+        GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
+        HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus,
+        HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackProgressStatus,
+        HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan, LanTranscodingPlanState,
+        LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
+        LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
+        ListBilibiliCredentialProfilesResponse, ListCacheRootsRequest, ListCacheRootsResponse,
+        ListLibraryItemsRequest, ListLibraryItemsResponse,
         PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
         ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
-        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo, Task,
-        TaskEvent, TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
-        library_service_server::LibraryService, server_service_server::ServerService,
-        task_service_server::TaskService,
+        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
+        StartBilibiliLoginSessionRequest, Task, TaskEvent, TaskKind, TaskState, WatchTasksRequest,
+        cache_service_server::CacheService, library_service_server::LibraryService,
+        server_service_server::ServerService, task_service_server::TaskService,
     },
     hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
@@ -87,11 +93,19 @@ pub(crate) enum HlsCacheFinalizationFailureMode {
 #[derive(Clone)]
 pub struct ServerGrpcService {
     state: AppState,
+    login_sessions: Arc<StdMutex<VecDeque<BilibiliLoginSession>>>,
 }
+
+const MAX_BILIBILI_LOGIN_SESSIONS: usize = 64;
+const MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES: usize = 256;
 
 impl ServerGrpcService {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        let login_sessions = Arc::clone(&state.bilibili_login_sessions);
+        Self {
+            state,
+            login_sessions,
+        }
     }
 }
 
@@ -111,6 +125,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliResolve.into(),
                 ServerCapability::BilibiliTaskSelection.into(),
                 ServerCapability::BilibiliCredentialStatus.into(),
+                ServerCapability::BilibiliCredentialProfiles.into(),
                 ServerCapability::Hls.into(),
             ],
         };
@@ -167,6 +182,64 @@ impl ServerService for ServerGrpcService {
             &self.state.options,
         )))
     }
+
+    async fn list_bilibili_credential_profiles(
+        &self,
+        _request: Request<ListBilibiliCredentialProfilesRequest>,
+    ) -> Result<Response<ListBilibiliCredentialProfilesResponse>, Status> {
+        Ok(Response::new(bilibili_credential_profiles(
+            &self.state.options,
+        )?))
+    }
+
+    async fn start_bilibili_login_session(
+        &self,
+        request: Request<StartBilibiliLoginSessionRequest>,
+    ) -> Result<Response<BilibiliLoginSession>, Status> {
+        let request = request.into_inner();
+        let method = match BilibiliLoginMethod::try_from(request.method)
+            .map_err(|_| Status::invalid_argument("Unsupported Bilibili login method."))?
+        {
+            BilibiliLoginMethod::Unspecified => BilibiliLoginMethod::WebQr,
+            method => method,
+        };
+        let profile_id = normalize_login_profile_id(&request.profile_id, &self.state.options)?;
+        let session = BilibiliLoginSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            profile_id,
+            method: method.into(),
+            state: BilibiliLoginSessionState::Unsupported.into(),
+            message: "Bilibili login session control-plane is available, but server-side QR login is not implemented in this slice.".to_owned(),
+            verification_uri: String::new(),
+            created_at: Some(current_timestamp()),
+            expires_at: None,
+        };
+        let mut login_sessions = self
+            .login_sessions
+            .lock()
+            .map_err(|_| Status::internal("Bilibili login session store is unavailable."))?;
+        if login_sessions.len() >= MAX_BILIBILI_LOGIN_SESSIONS {
+            login_sessions.pop_front();
+        }
+        login_sessions.push_back(session.clone());
+        Ok(Response::new(session))
+    }
+
+    async fn get_bilibili_login_session(
+        &self,
+        request: Request<GetBilibiliLoginSessionRequest>,
+    ) -> Result<Response<BilibiliLoginSession>, Status> {
+        let session_id = request.into_inner().session_id;
+        let session = self
+            .login_sessions
+            .lock()
+            .map_err(|_| Status::internal("Bilibili login session store is unavailable."))?
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("Bilibili login session not found."))?;
+        Ok(Response::new(session))
+    }
 }
 
 fn bilibili_credential_status(
@@ -192,6 +265,13 @@ fn bilibili_credential_status(
         restricted_playurl_proxy_count: options.bbdown_restricted_area_proxies.len() as u32,
         restricted_api_proxy_count: options.bbdown_restricted_api_proxies.len() as u32,
         checked_at: Some(current_timestamp()),
+        active_profile_id: options
+            .bbdown_credential_profile
+            .clone()
+            .unwrap_or_default(),
+        default_profile_id: String::new(),
+        profile_count: 0,
+        profiles: Vec::new(),
     };
 
     let Some(path) = options.bbdown_credential_path.as_ref() else {
@@ -215,10 +295,35 @@ fn bilibili_credential_status(
         return status;
     }
 
-    match CredentialStore::new(path.clone()).load() {
-        Ok(credentials) => {
+    match CredentialStore::new(path.clone()).load_profiles() {
+        Ok(profiles) => {
+            let active_profile_id = options
+                .bbdown_credential_profile
+                .clone()
+                .unwrap_or_else(|| profiles.default_profile.clone());
+            if options.bbdown_credential_profile.is_some()
+                && !profiles
+                    .profile_names()
+                    .any(|name| name == active_profile_id)
+            {
+                let mut status = base_status();
+                status.credential_file_loaded = true;
+                status.default_profile_id = profiles.default_profile;
+                status.active_profile_id = active_profile_id;
+                status.state = BilibiliCredentialState::Error.into();
+                status.message = "Configured BBDown credential profile was not found.".to_owned();
+                return status;
+            }
+            let credentials = profiles
+                .profile(&active_profile_id)
+                .unwrap_or_else(|_| Credentials::default());
+            let profile_summaries = credential_profile_summaries(&profiles, &active_profile_id);
             let mut status = base_status();
             status.credential_file_loaded = true;
+            status.default_profile_id = profiles.default_profile;
+            status.active_profile_id = active_profile_id;
+            status.profile_count = profile_summaries.len() as u32;
+            status.profiles = profile_summaries;
             status.web_cookie_present = credentials
                 .cookie
                 .as_deref()
@@ -251,6 +356,120 @@ fn bilibili_credential_status(
             status
         }
     }
+}
+
+fn bilibili_credential_profiles(
+    options: &crate::config::CacheServerOptions,
+) -> Result<ListBilibiliCredentialProfilesResponse, Status> {
+    let Some(path) = options.bbdown_credential_path.as_ref() else {
+        return Ok(ListBilibiliCredentialProfilesResponse {
+            profiles: Vec::new(),
+            active_profile_id: options
+                .bbdown_credential_profile
+                .clone()
+                .unwrap_or_default(),
+            default_profile_id: String::new(),
+            checked_at: Some(current_timestamp()),
+        });
+    };
+    if !path.is_file() {
+        return Err(Status::failed_precondition(
+            "Failed to load BBDown credential file.",
+        ));
+    }
+    let profiles = CredentialStore::new(path.clone())
+        .load_profiles()
+        .map_err(|_| Status::failed_precondition("Failed to load BBDown credential file."))?;
+    let active_profile_id = options
+        .bbdown_credential_profile
+        .clone()
+        .unwrap_or_else(|| profiles.default_profile.clone());
+    if options.bbdown_credential_profile.is_some()
+        && !profiles
+            .profile_names()
+            .any(|name| name == active_profile_id)
+    {
+        return Err(Status::failed_precondition(
+            "Configured BBDown credential profile was not found.",
+        ));
+    }
+    let profile_summaries = credential_profile_summaries(&profiles, &active_profile_id);
+    Ok(ListBilibiliCredentialProfilesResponse {
+        profiles: profile_summaries,
+        active_profile_id,
+        default_profile_id: profiles.default_profile,
+        checked_at: Some(current_timestamp()),
+    })
+}
+
+fn credential_profile_summaries(
+    profiles: &CredentialProfiles,
+    active_profile_id: &str,
+) -> Vec<BilibiliCredentialProfile> {
+    let mut names = BTreeSet::new();
+    names.insert(profiles.default_profile.clone());
+    names.extend(profiles.profile_names().map(ToOwned::to_owned));
+    names
+        .into_iter()
+        .map(|name| {
+            let credentials = profiles
+                .profile(&name)
+                .unwrap_or_else(|_| Credentials::default());
+            BilibiliCredentialProfile {
+                id: name.clone(),
+                is_default: name == profiles.default_profile,
+                is_active: name == active_profile_id,
+                web_cookie_present: credentials
+                    .cookie
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                access_key_present: credentials
+                    .access_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                tv_access_key_present: credentials
+                    .tv_access_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            }
+        })
+        .collect()
+}
+
+fn normalize_login_profile_id(
+    requested_profile_id: &str,
+    options: &CacheServerOptions,
+) -> Result<String, Status> {
+    let requested_profile_id = requested_profile_id.trim();
+    let profile_id = if requested_profile_id.is_empty() {
+        if let Some(profile) = options.bbdown_credential_profile.as_ref() {
+            profile.clone()
+        } else if let Some(path) = options.bbdown_credential_path.as_ref() {
+            CredentialStore::new(path.clone())
+                .load_profiles()
+                .map(|profiles| profiles.default_profile)
+                .map_err(|_| {
+                    Status::failed_precondition("Failed to load BBDown credential file.")
+                })?
+        } else {
+            DEFAULT_CREDENTIAL_PROFILE.to_owned()
+        }
+    } else {
+        let selection =
+            CredentialProfileSelection::named(requested_profile_id).map_err(|error| {
+                Status::invalid_argument(format!("Invalid Bilibili profile ID: {error}"))
+            })?;
+        selection
+            .profile_name()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Status::invalid_argument("Invalid Bilibili profile ID."))?
+    };
+    if profile_id.len() > MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "Bilibili profile ID must not exceed {MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES} UTF-8 bytes."
+        )));
+    }
+    Ok(profile_id)
 }
 
 fn restricted_area_label(area: BbdownRestrictedArea) -> &'static str {
@@ -2517,6 +2736,15 @@ mod tests {
                 .contains(&(ServerCapability::BilibiliCredentialStatus as i32))
         );
         assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliCredentialProfiles as i32))
+        );
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::BilibiliLoginSessions as i32))
+        );
+        assert!(
             !info
                 .capabilities
                 .contains(&(ServerCapability::LanTranscoding as i32))
@@ -2640,6 +2868,310 @@ mod tests {
                 .message
                 .contains(credentials_path.to_string_lossy().as_ref())
         );
+    }
+
+    #[tokio::test]
+    async fn get_bilibili_credential_status_reports_selected_profile() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .join("cache")
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().join("cache"));
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    },
+                    "living-room": {
+                        "access_key": "living-access",
+                        "tv_access_key": "living-tv"
+                    }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credentials_path),
+            bbdown_credential_profile: Some("living-room".to_owned()),
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let status = service
+            .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+            .await
+            .expect("credential status should succeed")
+            .into_inner();
+
+        assert_eq!(BilibiliCredentialState::Ready, status.state());
+        assert_eq!("living-room", status.active_profile_id);
+        assert_eq!("default", status.default_profile_id);
+        assert_eq!(2, status.profile_count);
+        assert!(!status.web_cookie_present);
+        assert!(status.access_key_present);
+        assert!(status.tv_access_key_present);
+        assert_eq!(2, status.profiles.len());
+        assert!(
+            status
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "living-room"
+                    && profile.is_active
+                    && !profile.is_default
+                    && profile.access_key_present
+                    && profile.tv_access_key_present
+                    && !profile.web_cookie_present)
+        );
+        assert!(!status.message.contains("living-access"));
+        assert!(!status.message.contains("living-tv"));
+    }
+
+    #[tokio::test]
+    async fn list_bilibili_credential_profiles_reports_redacted_profiles() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .join("cache")
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().join("cache"));
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    },
+                    "living-room": {
+                        "access_key": "living-access"
+                    }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credentials_path),
+            bbdown_credential_profile: Some("living-room".to_owned()),
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let profiles = service
+            .list_bilibili_credential_profiles(Request::new(
+                ListBilibiliCredentialProfilesRequest {},
+            ))
+            .await
+            .expect("profile list should succeed")
+            .into_inner();
+
+        assert_eq!("living-room", profiles.active_profile_id);
+        assert_eq!("default", profiles.default_profile_id);
+        assert_eq!(2, profiles.profiles.len());
+        assert!(
+            profiles
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "default"
+                    && profile.is_default
+                    && !profile.is_active
+                    && profile.web_cookie_present)
+        );
+        assert!(
+            profiles
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "living-room"
+                    && profile.is_active
+                    && !profile.is_default
+                    && profile.access_key_present)
+        );
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_foundation_shares_unsupported_session_across_services() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "living-room",
+                "profiles": {
+                    "living-room": {
+                        "cookie": "SESSDATA=living-room"
+                    }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        });
+        let creator = ServerGrpcService::new(state.clone());
+        let reader = ServerGrpcService::new(state);
+
+        let session = creator
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: String::new(),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect("login session start should succeed")
+            .into_inner();
+
+        assert!(!session.id.is_empty());
+        assert_eq!("living-room", session.profile_id);
+        assert_eq!(BilibiliLoginMethod::WebQr, session.method());
+        assert_eq!(BilibiliLoginSessionState::Unsupported, session.state());
+        assert!(session.verification_uri.is_empty());
+        assert!(!session.message.contains("cookie"));
+
+        let fetched = reader
+            .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
+                session_id: session.id.clone(),
+            }))
+            .await
+            .expect("login session get should succeed")
+            .into_inner();
+
+        assert_eq!(session, fetched);
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_rejects_unknown_method() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        let error = service
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: String::new(),
+                method: i32::MAX,
+            }))
+            .await
+            .expect_err("unknown login method should be rejected");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_rejects_oversized_profile_without_mutating_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+
+        service
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: "a".repeat(MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect("maximum-length profile ID should be accepted");
+        let sessions_before = service
+            .login_sessions
+            .lock()
+            .expect("session store should be available")
+            .clone();
+
+        let error = service
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: "a".repeat(MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES + 1),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect_err("oversized profile ID should be rejected");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert_eq!(
+            sessions_before,
+            *service
+                .login_sessions
+                .lock()
+                .expect("session store should be available")
+        );
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_store_evicts_oldest_session_at_capacity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+        let mut oldest_session_id = String::new();
+
+        for index in 0..=MAX_BILIBILI_LOGIN_SESSIONS {
+            let session = service
+                .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                    profile_id: format!("profile-{index}"),
+                    method: BilibiliLoginMethod::WebQr.into(),
+                }))
+                .await
+                .expect("login session start should succeed")
+                .into_inner();
+            if index == 0 {
+                oldest_session_id = session.id;
+            }
+        }
+
+        assert_eq!(
+            MAX_BILIBILI_LOGIN_SESSIONS,
+            service
+                .login_sessions
+                .lock()
+                .expect("session store should be available")
+                .len()
+        );
+        let error = service
+            .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
+                session_id: oldest_session_id,
+            }))
+            .await
+            .expect_err("oldest session should be evicted");
+        assert_eq!(tonic::Code::NotFound, error.code());
     }
 
     #[tokio::test]

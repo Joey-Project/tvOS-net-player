@@ -18,6 +18,12 @@ public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
     func checkHealth() async throws -> CacheHealthStatus
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus
+    func listBilibiliCredentialProfiles() async throws -> BilibiliCredentialProfilesSummary
+    func startBilibiliLoginSession(
+        profileID: String,
+        method: BilibiliLoginMethod
+    ) async throws -> BilibiliLoginSession
+    func getBilibiliLoginSession(id: String) async throws -> BilibiliLoginSession
     func listCacheRoots() async throws -> [CacheRoot]
     func getHLSCacheStatus() async throws -> HLSCacheStatus
     func reportPlaybackProgress(_ report: PlaybackProgressReport) async throws -> PlaybackProgressReportResult
@@ -59,6 +65,8 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case healthCheck
     case hlsCacheStatus
     case bilibiliCredentialStatus
+    case bilibiliCredentialProfiles
+    case bilibiliLoginSessions
     case bilibiliResolve
     case bilibiliDownloadTask
     case bilibiliTaskSelection
@@ -80,6 +88,21 @@ public extension CacheControlClient {
 
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus {
         throw CacheControlClientUnsupportedFeature.bilibiliCredentialStatus
+    }
+
+    func listBilibiliCredentialProfiles() async throws -> BilibiliCredentialProfilesSummary {
+        throw CacheControlClientUnsupportedFeature.bilibiliCredentialProfiles
+    }
+
+    func startBilibiliLoginSession(
+        profileID: String,
+        method: BilibiliLoginMethod = .webQR
+    ) async throws -> BilibiliLoginSession {
+        throw CacheControlClientUnsupportedFeature.bilibiliLoginSessions
+    }
+
+    func getBilibiliLoginSession(id: String) async throws -> BilibiliLoginSession {
+        throw CacheControlClientUnsupportedFeature.bilibiliLoginSessions
     }
 
     func resolveBilibiliInput(
@@ -155,6 +178,10 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "HLS cache status is not supported by this cache server."
         case .bilibiliCredentialStatus:
             return "Bilibili credential status is not supported by this cache server."
+        case .bilibiliCredentialProfiles:
+            return "Bilibili credential profiles are not supported by this cache server."
+        case .bilibiliLoginSessions:
+            return "Bilibili login sessions are not supported by this cache server."
         case .bilibiliResolve:
             return "Bilibili resolve is not supported by this cache server."
         case .bilibiliDownloadTask:

@@ -10,7 +10,7 @@
 - [completed] Next PR 1：增加 macOS validation/operator UX，用 macOS 作为真实 Bilibili/credential/proxy/HLS 验证前端。
 - [completed] Next PR 2：基于已上报的 playback position 调整 segment fill/prefetch scheduling。
 - [completed] Next PR 3：补齐 weak/offline playback UX，包括 cache-only、partially cached、quota-blocked、upstream-failed、retrying、variant downgrade 和 unknown active fallback 状态。
-- [pending] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。
+- [completed] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。
 - [pending] Next PR 5：扩展 authenticated/restricted live validation，覆盖 history、watch-later、following/dynamic、restricted Bangumi 和 collection/list cases。
 - [pending] Next PR 7：增加 transcoding/ABR policy controls；这是用户批准的非线性执行顺序，先于 deferred schema PR 6 推进播放策略产品化。
 - [pending] Deferred/non-sequential Next PR 6：Bilibili task options/result schema v2；开始实现前先暂停讨论 schema。

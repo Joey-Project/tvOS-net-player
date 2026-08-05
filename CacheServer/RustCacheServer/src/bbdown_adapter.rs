@@ -10,14 +10,15 @@ use std::{
 };
 
 use bbdown_core::{
-    BiliClient, ClientConfig, CredentialStore, Credentials, DanmakuFormat, DownloadArchive,
-    DownloadCancellationToken, DownloadFileKind, DownloadOptions, DownloadProgressEvent,
-    DownloadProgressSink, DownloadReport, DuplicateDecision, EntryDownloadReport,
-    Error as BbdownError, HttpHeaderSpec, IndexSelection, Input, MediaRequestKind,
-    MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup, PlaybackAbrGroupKind,
-    PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference, PlaybackPlan, PlaybackVariant,
-    PlaybackVariantKind, PlayurlMode, ResolvedContent, RestrictedArea, RestrictedAreaConfig,
-    RestrictedAreaProxy, Selection, StreamSelection, SubtitleAiPolicy, VideoCollectionKind,
+    BiliClient, ClientConfig, CredentialProfileSelection, CredentialStore, Credentials,
+    DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadOptions,
+    DownloadProgressEvent, DownloadProgressSink, DownloadReport, DuplicateDecision,
+    EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection, Input,
+    MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
+    PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
+    PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode, ResolvedContent,
+    RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection, StreamSelection,
+    SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
     fs,
@@ -497,18 +498,34 @@ fn bbdown_client_config(
     Ok(ClientConfig::default()
         .with_credentials(bbdown_credentials(
             options.bbdown_credential_path.as_deref(),
+            options.bbdown_credential_profile.as_deref(),
         )?)
         .with_restricted_area(bbdown_restricted_area_config(options))
         .with_playurl_mode(playurl_mode))
 }
 
-fn bbdown_credentials(path: Option<&Path>) -> Result<Credentials, BilibiliDownloadError> {
+fn bbdown_credentials(
+    path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<Credentials, BilibiliDownloadError> {
     let Some(path) = path else {
         return Ok(Credentials::default());
     };
-    CredentialStore::new(path.to_path_buf())
-        .load()
-        .map_err(failed)
+    let selection = match profile {
+        Some(profile) => CredentialProfileSelection::named(profile).map_err(failed)?,
+        None => CredentialProfileSelection::default_profile(),
+    };
+    let store = CredentialStore::new(path.to_path_buf());
+    let Some(profile) = selection.profile_name() else {
+        return store.load().map_err(failed);
+    };
+    let profiles = store.load_profiles().map_err(failed)?;
+    if !profiles.profile_names().any(|name| name == profile) {
+        return Err(failed(format!(
+            "configured credential profile `{profile}` does not exist"
+        )));
+    }
+    profiles.profile(profile).map_err(failed)
 }
 
 fn bbdown_restricted_area_config(options: &CacheServerOptions) -> RestrictedAreaConfig {
@@ -2918,6 +2935,86 @@ mod tests {
             "https://api.example/proxy",
             config.restricted_area.proxies[1].base_url
         );
+    }
+
+    #[test]
+    fn builds_bbdown_client_config_from_selected_credential_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default",
+                        "access_key": "default-access"
+                    },
+                    "living-room": {
+                        "cookie": "SESSDATA=living-room",
+                        "access_key": "living-access",
+                        "tv_access_key": "living-tv"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCredentialPath".to_owned(),
+            credentials_path.display().to_string(),
+            "--Cache:BBDownCredentialProfile".to_owned(),
+            "living-room".to_owned(),
+        ])
+        .expect("options should parse");
+
+        let config =
+            bbdown_client_config(&options, PlayurlMode::Web).expect("client config should build");
+
+        assert_eq!(
+            Some("SESSDATA=living-room"),
+            config.credentials.cookie.as_deref()
+        );
+        assert_eq!(
+            Some("living-access"),
+            config.credentials.access_key.as_deref()
+        );
+        assert_eq!(
+            Some("living-tv"),
+            config.credentials.tv_access_key.as_deref()
+        );
+    }
+
+    #[test]
+    fn rejects_selected_credential_profile_removed_after_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            bbdown_credential_profile: Some("living-room".to_owned()),
+            ..CacheServerOptions::default()
+        };
+
+        let result = bbdown_client_config(&options, PlayurlMode::Web);
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("living-room") && message.contains("does not exist")
+        ));
     }
 
     #[test]

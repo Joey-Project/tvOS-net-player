@@ -14,6 +14,9 @@ service ServerService {
   rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfo);
   rpc CheckHealth(CheckHealthRequest) returns (HealthStatus);
   rpc GetBilibiliCredentialStatus(GetBilibiliCredentialStatusRequest) returns (BilibiliCredentialStatus);
+  rpc ListBilibiliCredentialProfiles(ListBilibiliCredentialProfilesRequest) returns (ListBilibiliCredentialProfilesResponse);
+  rpc StartBilibiliLoginSession(StartBilibiliLoginSessionRequest) returns (BilibiliLoginSession);
+  rpc GetBilibiliLoginSession(GetBilibiliLoginSessionRequest) returns (BilibiliLoginSession);
 }
 
 service LibraryService {
@@ -60,6 +63,8 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_TASK_SELECTION = 7;
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_STATUS = 8;
   SERVER_CAPABILITY_LAN_TRANSCODING = 9;
+  SERVER_CAPABILITY_BILIBILI_CREDENTIAL_PROFILES = 10;
+  SERVER_CAPABILITY_BILIBILI_LOGIN_SESSIONS = 11;
 }
 
 message CheckHealthRequest {}
@@ -91,6 +96,62 @@ message BilibiliCredentialStatus {
   uint32 restricted_playurl_proxy_count = 9;
   uint32 restricted_api_proxy_count = 10;
   google.protobuf.Timestamp checked_at = 11;
+  string active_profile_id = 12;
+  string default_profile_id = 13;
+  uint32 profile_count = 14;
+  repeated BilibiliCredentialProfile profiles = 15;
+}
+
+message ListBilibiliCredentialProfilesRequest {}
+
+message ListBilibiliCredentialProfilesResponse {
+  repeated BilibiliCredentialProfile profiles = 1;
+  string active_profile_id = 2;
+  string default_profile_id = 3;
+  google.protobuf.Timestamp checked_at = 4;
+}
+
+message BilibiliCredentialProfile {
+  string id = 1;
+  bool is_default = 2;
+  bool is_active = 3;
+  bool web_cookie_present = 4;
+  bool access_key_present = 5;
+  bool tv_access_key_present = 6;
+}
+
+message StartBilibiliLoginSessionRequest {
+  string profile_id = 1;
+  BilibiliLoginMethod method = 2;
+}
+
+message GetBilibiliLoginSessionRequest {
+  string session_id = 1;
+}
+
+message BilibiliLoginSession {
+  string id = 1;
+  string profile_id = 2;
+  BilibiliLoginMethod method = 3;
+  BilibiliLoginSessionState state = 4;
+  string message = 5;
+  string verification_uri = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+}
+
+enum BilibiliLoginMethod {
+  BILIBILI_LOGIN_METHOD_UNSPECIFIED = 0;
+  BILIBILI_LOGIN_METHOD_WEB_QR = 1;
+}
+
+enum BilibiliLoginSessionState {
+  BILIBILI_LOGIN_SESSION_STATE_UNSPECIFIED = 0;
+  BILIBILI_LOGIN_SESSION_STATE_UNSUPPORTED = 1;
+  BILIBILI_LOGIN_SESSION_STATE_PENDING = 2;
+  BILIBILI_LOGIN_SESSION_STATE_READY = 3;
+  BILIBILI_LOGIN_SESSION_STATE_EXPIRED = 4;
+  BILIBILI_LOGIN_SESSION_STATE_ERROR = 5;
 }
 
 enum BilibiliCredentialState {

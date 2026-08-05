@@ -20,7 +20,7 @@ mod task_store;
 mod transcoding;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     net::SocketAddr,
     sync::{
@@ -34,7 +34,7 @@ use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
 use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
-    LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
+    BilibiliLoginSession, LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
@@ -99,6 +99,7 @@ pub struct AppState {
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
+    pub(crate) bilibili_login_sessions: Arc<Mutex<VecDeque<BilibiliLoginSession>>>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
@@ -313,6 +314,7 @@ impl AppState {
             hls_fill_scheduler,
             hls_network_policy,
             hls_playback_progress,
+            bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
