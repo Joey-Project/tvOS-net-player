@@ -471,12 +471,29 @@ impl BbdownBilibiliAdapter {
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
         let preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
-        let input_selection = playback_selection_from_id(&input, selection_id)?;
-        let input = input_selection.input_override.unwrap_or(input);
+        let PlaybackInputSelection {
+            input_override,
+            selection,
+            expected_identity,
+        } = playback_selection_from_id(&input, selection_id)?;
+        let direct_collection_item = input_override.is_some();
+        let input = input_override.unwrap_or(input);
         let client = self.client_for_options(options);
-        let selection = input_selection
-            .selection
-            .or_else(|| default_selection_for_input(&input));
+        let selection = if direct_collection_item {
+            Some(
+                resolve_direct_collection_item_page(
+                    &client,
+                    &input,
+                    expected_identity
+                        .as_ref()
+                        .expect("direct collection item should retain expected identity"),
+                    &is_cancel_requested,
+                )
+                .await?,
+            )
+        } else {
+            selection.or_else(|| default_selection_for_input(&input))
+        };
         let plan = run_bbdown_until_cancelled(
             client.plan_playback_input(input, selection),
             is_cancel_requested,
@@ -484,11 +501,66 @@ impl BbdownBilibiliAdapter {
         )
         .await?;
         let plan = BilibiliPlaybackPlan::from_core_with_preferences(plan, &preferences)?;
-        if let Some(expected_identity) = input_selection.expected_identity.as_ref() {
+        if let Some(expected_identity) = expected_identity.as_ref() {
             plan.validate_expected_identity(expected_identity)?;
         }
         Ok(plan)
     }
+}
+
+async fn resolve_direct_collection_item_page(
+    client: &BiliClient,
+    input: &Input,
+    expected_identity: &PlaybackExpectedIdentity,
+    is_cancel_requested: &impl Fn() -> bool,
+) -> Result<Selection, BilibiliDownloadError> {
+    let resolved = match run_bbdown_core_until_cancelled(
+        client.resolve(input.clone(), None),
+        is_cancel_requested,
+        "Cancelled while BBDown collection item metadata resolution was running.",
+    )
+    .await?
+    {
+        Ok(resolved) => resolved,
+        Err(error) => return Err(failed(error)),
+    };
+    direct_collection_item_page_selection(resolved, expected_identity)
+}
+
+fn direct_collection_item_page_selection(
+    resolved: ResolvedContent,
+    expected_identity: &PlaybackExpectedIdentity,
+) -> Result<Selection, BilibiliDownloadError> {
+    let ResolvedContent::Video(video) = resolved else {
+        return Err(BilibiliDownloadError::Failed(
+            "Selected Bilibili collection item did not resolve as a video.".to_owned(),
+        ));
+    };
+    if expected_identity.aid.is_some_and(|aid| aid != video.aid)
+        || matches!(
+            (expected_identity.bvid.as_deref(), video.bvid.as_deref()),
+            (Some(expected), Some(actual)) if !expected.eq_ignore_ascii_case(actual)
+        )
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "Selected Bilibili item no longer matches the resolved candidate. Resolve the input again and retry."
+                .to_owned(),
+        ));
+    }
+    let expected_cid = expected_identity
+        .cid
+        .expect("validated collection identity should include cid");
+    let page = video
+        .pages
+        .iter()
+        .find(|page| page.cid == expected_cid)
+        .ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "Selected Bilibili item no longer matches the resolved candidate. Resolve the input again and retry."
+                    .to_owned(),
+            )
+        })?;
+    Ok(Selection::Page(page.index))
 }
 
 fn bbdown_client_config(
@@ -872,13 +944,12 @@ impl BilibiliBbdownProgressAccumulator {
                 entry_title,
                 kind,
                 path,
-                error,
                 ..
             } => {
                 self.active_entry_in_progress = true;
                 self.rollback_file_progress(path);
                 Some(self.published_rollback_bytes_progress(format!(
-                    "Retrying {} for {entry_title} after BBDown error: {error}",
+                    "Retrying {} for {entry_title} after a BBDown error.",
                     download_file_kind_label(kind),
                 )))
             }
@@ -903,15 +974,15 @@ impl BilibiliBbdownProgressAccumulator {
                     format!("Downloaded {entry_count} Bilibili entry(s)."),
                 )
             }
-            DownloadProgressEvent::PlanCancelled { error, .. } => {
+            DownloadProgressEvent::PlanCancelled { .. } => {
                 self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
-                self.message_progress(progress, format!("BBDown download cancelled: {error}"))
+                self.message_progress(progress, "BBDown download cancelled.".to_owned())
             }
-            DownloadProgressEvent::PlanFailed { error, .. } => {
+            DownloadProgressEvent::PlanFailed { .. } => {
                 self.active_entry_in_progress = false;
                 let progress = self.current_download_progress();
-                self.message_progress(progress, format!("BBDown download failed: {error}"))
+                self.message_progress(progress, "BBDown download failed.".to_owned())
             }
             DownloadProgressEvent::MuxStarted { .. }
             | DownloadProgressEvent::MuxCompleted { .. }
@@ -1260,6 +1331,22 @@ impl PlaybackExpectedIdentity {
         self.is_valid_page_identity()
     }
 
+    fn direct_video_input(&self) -> Option<Input> {
+        self.bvid
+            .as_ref()
+            .map(|bvid| Input::Bvid(bvid.clone()))
+            .or_else(|| self.aid.map(Input::Aid))
+    }
+
+    fn same_collection_item(&self, other: &Self) -> bool {
+        self.aid == other.aid
+            && self.cid == other.cid
+            && match (self.bvid.as_deref(), other.bvid.as_deref()) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => true,
+            }
+    }
+
     fn matches(&self, entry: &BilibiliPlaybackEntry) -> bool {
         if let Some(expected_bvid) = self.bvid.as_deref()
             && let Some(actual_bvid) = entry.bvid.as_deref()
@@ -1305,7 +1392,7 @@ fn playback_selection_from_id(
         if !playback_input_accepts_collection_item_selection(input) {
             return Err(invalid_selection_id(selection_id));
         }
-        return playback_collection_item_selection_from_id(item, selection_id);
+        return playback_collection_item_selection_from_id(input, item, selection_id);
     }
     if let Some(episode) = selection_id.strip_prefix("episode:") {
         if !playback_input_accepts_episode_selection(input) {
@@ -1364,7 +1451,11 @@ fn playback_page_selection_from_id(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_index(index_text, selection_id)?;
-    let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    let parsed = playback_selection_parts_from_parts(parts, selection_id)?;
+    if parsed.source_token.is_some() {
+        return Err(invalid_selection_id(selection_id));
+    }
+    let expected_identity = parsed.expected_identity;
     if !expected_identity
         .as_ref()
         .is_some_and(PlaybackExpectedIdentity::is_valid_page_identity)
@@ -1380,39 +1471,122 @@ fn playback_page_selection_from_id(
 }
 
 fn playback_collection_item_selection_from_id(
+    input: &Input,
     item: &str,
     selection_id: &str,
 ) -> Result<PlaybackInputSelection, BilibiliDownloadError> {
+    let parsed = parse_collection_item_selection(item, selection_id)?;
+    let expected_source_token =
+        collection_source_token(input).ok_or_else(|| invalid_selection_id(selection_id))?;
+    if parsed.source_token.as_deref() != Some(expected_source_token.as_str()) {
+        return Err(invalid_selection_id(selection_id));
+    }
+
+    Ok(PlaybackInputSelection {
+        input_override: parsed.expected_identity.direct_video_input(),
+        selection: None,
+        expected_identity: Some(parsed.expected_identity),
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedCollectionItemSelection {
+    index: u32,
+    source_token: Option<String>,
+    expected_identity: PlaybackExpectedIdentity,
+}
+
+fn parse_collection_item_selection(
+    item: &str,
+    selection_id: &str,
+) -> Result<ParsedCollectionItemSelection, BilibiliDownloadError> {
     let mut parts = item.split(':');
     let index_text = parts
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_selection_id(selection_id))?;
     let index = parse_selection_index(index_text, selection_id)?;
-    let expected_identity = playback_expected_identity_from_parts(parts, selection_id)?;
+    let parsed = playback_selection_parts_from_parts(parts, selection_id)?;
+    let expected_identity = parsed.expected_identity;
     if !expected_identity
         .as_ref()
         .is_some_and(PlaybackExpectedIdentity::is_valid_collection_item_identity)
     {
         return Err(invalid_selection_id(selection_id));
     }
-    let selection = Some(
-        IndexSelection::single(index)
-            .map(Selection::Indices)
-            .map_err(failed)?,
-    );
-
-    Ok(PlaybackInputSelection {
-        input_override: None,
-        selection,
-        expected_identity,
+    Ok(ParsedCollectionItemSelection {
+        index,
+        source_token: parsed.source_token,
+        expected_identity: expected_identity.expect("validated collection identity should exist"),
     })
 }
 
-fn playback_expected_identity_from_parts<'a>(
+pub(crate) fn recover_stable_collection_candidate(
+    selection_id: &str,
+    source: &str,
+    source_kind: &str,
+    current_candidates: &[BilibiliResolvedCandidate],
+) -> Option<BilibiliResolvedCandidate> {
+    let item = selection_id.strip_prefix("item:")?;
+    let parsed = parse_collection_item_selection(item, selection_id).ok()?;
+    let input = playback_input_for_planning(source).ok()?;
+    let expected_source_token = collection_source_token(&input)?;
+    if parsed.source_token.as_deref() != Some(expected_source_token.as_str()) {
+        return None;
+    }
+    let mut candidate = current_candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .selection_id
+                .strip_prefix("item:")
+                .and_then(|item| {
+                    parse_collection_item_selection(item, &candidate.selection_id).ok()
+                })
+                .is_some_and(|current| {
+                    current.source_token.as_deref() == Some(expected_source_token.as_str())
+                        && parsed
+                            .expected_identity
+                            .same_collection_item(&current.expected_identity)
+                })
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            let content_id = parsed.expected_identity.bvid.clone().unwrap_or_else(|| {
+                format!(
+                    "av{}",
+                    parsed
+                        .expected_identity
+                        .aid
+                        .expect("validated collection identity should include aid without bvid")
+                )
+            });
+            BilibiliResolvedCandidate {
+                selection_id: selection_id.to_owned(),
+                title: content_id.clone(),
+                subtitle: "Resolved Bilibili collection item".to_owned(),
+                source_kind: source_kind.to_owned(),
+                content_id,
+                index: parsed.index,
+                duration_seconds: None,
+                cover_uri: String::new(),
+            }
+        });
+    candidate.selection_id = selection_id.to_owned();
+    candidate.index = parsed.index;
+    Some(candidate)
+}
+
+struct ParsedSelectionParts {
+    source_token: Option<String>,
+    expected_identity: Option<PlaybackExpectedIdentity>,
+}
+
+fn playback_selection_parts_from_parts<'a>(
     mut parts: impl Iterator<Item = &'a str>,
     selection_id: &str,
-) -> Result<Option<PlaybackExpectedIdentity>, BilibiliDownloadError> {
+) -> Result<ParsedSelectionParts, BilibiliDownloadError> {
+    let mut source_token = None;
     let mut bvid = None;
     let mut aid = None;
     let mut cid = None;
@@ -1421,6 +1595,9 @@ fn playback_expected_identity_from_parts<'a>(
             return Err(invalid_selection_id(selection_id));
         };
         match kind {
+            "source" if source_token.is_none() && !value.trim().is_empty() => {
+                source_token = Some(value.trim().to_owned());
+            }
             "bvid" if bvid.is_none() && !value.trim().is_empty() => {
                 bvid = Some(value.trim().to_owned());
             }
@@ -1435,9 +1612,15 @@ fn playback_expected_identity_from_parts<'a>(
     }
 
     if bvid.is_none() && aid.is_none() && cid.is_none() {
-        return Ok(None);
+        return Ok(ParsedSelectionParts {
+            source_token,
+            expected_identity: None,
+        });
     }
-    Ok(Some(PlaybackExpectedIdentity { bvid, aid, cid }))
+    Ok(ParsedSelectionParts {
+        source_token,
+        expected_identity: Some(PlaybackExpectedIdentity { bvid, aid, cid }),
+    })
 }
 
 fn parse_selection_index(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
@@ -1578,7 +1761,7 @@ impl BilibiliInputResolution {
                     .iter()
                     .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
                     .map(|item| BilibiliResolvedCandidate {
-                        selection_id: collection_item_selection_id(item),
+                        selection_id: collection_item_selection_id(input, item),
                         title: item.title.clone(),
                         subtitle: collection_item_subtitle(source_kind, item.index, &item.owner),
                         source_kind: source_kind.to_owned(),
@@ -1650,20 +1833,59 @@ fn page_selection_id(page: &bbdown_core::PageMetadata, video_bvid: Option<&str>)
         )
 }
 
-fn collection_item_selection_id(item: &bbdown_core::VideoCollectionItem) -> String {
+fn collection_item_selection_id(input: &Input, item: &bbdown_core::VideoCollectionItem) -> String {
+    let source_token = collection_source_token(input)
+        .expect("resolved Bilibili collection should have a stable source token");
     item.bvid
         .as_deref()
         .map(str::trim)
         .filter(|bvid| !bvid.is_empty())
         .map_or_else(
-            || format!("item:{}:cid:{}:aid:{}", item.index, item.cid, item.aid),
+            || {
+                format!(
+                    "item:{}:source:{}:cid:{}:aid:{}",
+                    item.index, source_token, item.cid, item.aid
+                )
+            },
             |bvid| {
                 format!(
-                    "item:{}:cid:{}:bvid:{}:aid:{}",
-                    item.index, item.cid, bvid, item.aid
+                    "item:{}:source:{}:cid:{}:bvid:{}:aid:{}",
+                    item.index, source_token, item.cid, bvid, item.aid
                 )
             },
         )
+}
+
+fn collection_source_token(input: &Input) -> Option<String> {
+    match input {
+        Input::SpaceVideos(owner_mid) => Some(format!("space-videos-{owner_mid}")),
+        Input::FavoriteList {
+            media_id,
+            owner_mid,
+        } => Some(format!(
+            "favorite-{}-{}",
+            optional_u64_source_component(*media_id),
+            optional_u64_source_component(*owner_mid)
+        )),
+        Input::CollectionList(list_id) => Some(format!("collection-{list_id}")),
+        Input::SeriesList(list_id) => Some(format!("series-{list_id}")),
+        Input::SpaceCollectionList { list_id, owner_mid } => {
+            Some(format!("space-collection-{owner_mid}-{list_id}"))
+        }
+        Input::SpaceSeriesList { list_id, owner_mid } => {
+            Some(format!("space-series-{owner_mid}-{list_id}"))
+        }
+        Input::RecommendationFeed => Some("recommendation".to_owned()),
+        Input::FollowingFeed => Some("following".to_owned()),
+        Input::SpaceDynamic(owner_mid) => Some(format!("space-dynamic-{owner_mid}")),
+        Input::History => Some("history".to_owned()),
+        Input::WatchLater => Some("watch-later".to_owned()),
+        _ => None,
+    }
+}
+
+fn optional_u64_source_component(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 fn episode_selection_id(epid: u64) -> String {
@@ -3240,18 +3462,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_bvid_selection_id_as_stable_index_selection() {
+    fn parses_collection_item_bvid_selection_id_as_direct_video_selection() {
         let input_selection = playback_selection_from_id(
             &Input::History,
-            Some("item:7:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
+            Some("item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
         )
         .unwrap();
 
-        assert_eq!(input_selection.input_override, None);
         assert_eq!(
-            input_selection.selection,
-            Some(Selection::Indices(IndexSelection::single(7).unwrap()))
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
         );
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -3263,16 +3485,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_collection_item_aid_selection_id_as_stable_index_selection() {
-        let input_selection =
-            playback_selection_from_id(&Input::History, Some("item:7:cid:270001:aid:170001"))
-                .unwrap();
+    fn parses_collection_item_aid_selection_id_as_direct_video_selection() {
+        let input_selection = playback_selection_from_id(
+            &Input::History,
+            Some("item:7:source:history:cid:270001:aid:170001"),
+        )
+        .unwrap();
 
-        assert_eq!(input_selection.input_override, None);
-        assert_eq!(
-            input_selection.selection,
-            Some(Selection::Indices(IndexSelection::single(7).unwrap()))
-        );
+        assert_eq!(input_selection.input_override, Some(Input::Aid(170_001)));
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -3280,6 +3501,150 @@ mod tests {
                 aid: Some(170_001),
                 cid: Some(270_001),
             })
+        );
+    }
+
+    #[test]
+    fn recovers_reordered_collection_candidate_by_stable_identity() {
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let current = BilibiliResolvedCandidate {
+            selection_id: "item:1:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+                .to_owned(),
+            title: "Current recommendation title".to_owned(),
+            subtitle: "Current owner".to_owned(),
+            source_kind: "recommendation".to_owned(),
+            content_id: "BV1xx411c7mD".to_owned(),
+            index: 1,
+            duration_seconds: Some(120),
+            cover_uri: "https://example.invalid/cover.jpg".to_owned(),
+        };
+
+        let recovered = recover_stable_collection_candidate(
+            selection_id,
+            "https://www.bilibili.com/",
+            "recommendation",
+            &[current],
+        )
+        .expect("stable identity should recover a reordered candidate");
+
+        assert_eq!(recovered.selection_id, selection_id);
+        assert_eq!(recovered.index, 7);
+        assert_eq!(recovered.title, "Current recommendation title");
+        assert_eq!(recovered.duration_seconds, Some(120));
+    }
+
+    #[test]
+    fn recovers_missing_collection_candidate_from_server_owned_selection_id() {
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+
+        let recovered = recover_stable_collection_candidate(
+            selection_id,
+            "https://www.bilibili.com/",
+            "recommendation",
+            &[],
+        )
+        .expect("valid stable identity should recover without a refreshed feed match");
+
+        assert_eq!(recovered.selection_id, selection_id);
+        assert_eq!(recovered.index, 7);
+        assert_eq!(recovered.title, "BV1xx411c7mD");
+        assert_eq!(recovered.content_id, "BV1xx411c7mD");
+        assert_eq!(recovered.source_kind, "recommendation");
+    }
+
+    #[test]
+    fn rejects_collection_item_selection_bound_to_another_source() {
+        let history_selection = "item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+
+        assert!(playback_selection_from_id(&Input::WatchLater, Some(history_selection)).is_err());
+        assert!(
+            recover_stable_collection_candidate(
+                history_selection,
+                "https://www.bilibili.com/",
+                "recommendation",
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_collection_item_selection_uses_the_page_matching_cid() {
+        let resolved = ResolvedContent::Video(bbdown_core::VideoMetadata {
+            aid: 170_001,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            title: "Multi page video".to_owned(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: None,
+            tags: Vec::new(),
+            pages: vec![
+                bbdown_core::PageMetadata {
+                    index: 1,
+                    aid: 170_001,
+                    cid: 270_000,
+                    epid: None,
+                    title: "Part 1".to_owned(),
+                    duration_seconds: Some(60),
+                },
+                bbdown_core::PageMetadata {
+                    index: 2,
+                    aid: 170_001,
+                    cid: 270_001,
+                    epid: None,
+                    title: "Part 2".to_owned(),
+                    duration_seconds: Some(90),
+                },
+            ],
+        });
+
+        let selection = direct_collection_item_page_selection(
+            resolved,
+            &PlaybackExpectedIdentity {
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_001),
+            },
+        )
+        .expect("matching cid should select its actual video page");
+
+        assert_eq!(selection, Selection::Page(2));
+    }
+
+    #[test]
+    fn direct_collection_item_selection_rejects_missing_cid() {
+        let resolved = ResolvedContent::Video(bbdown_core::VideoMetadata {
+            aid: 170_001,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            title: "Changed multi page video".to_owned(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: None,
+            tags: Vec::new(),
+            pages: vec![bbdown_core::PageMetadata {
+                index: 1,
+                aid: 170_001,
+                cid: 270_000,
+                epid: None,
+                title: "Remaining part".to_owned(),
+                duration_seconds: Some(60),
+            }],
+        });
+
+        let error = direct_collection_item_page_selection(
+            resolved,
+            &PlaybackExpectedIdentity {
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_001),
+            },
+        )
+        .expect_err("a missing cid must not fall back to another page");
+
+        assert!(
+            matches!(error, BilibiliDownloadError::Failed(message) if message.contains("no longer matches"))
         );
     }
 
@@ -3520,18 +3885,24 @@ mod tests {
         let candidate = &resolution.candidates[0];
         assert_eq!(
             candidate.selection_id,
-            "item:3:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+            "item:3:source:favorite-456-none:cid:270001:bvid:BV1xx411c7mD:aid:170001"
         );
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
 
-        let input_selection =
-            playback_selection_from_id(&Input::History, Some(&candidate.selection_id)).unwrap();
-        assert_eq!(input_selection.input_override, None);
+        let input_selection = playback_selection_from_id(
+            &Input::FavoriteList {
+                media_id: Some(456),
+                owner_mid: None,
+            },
+            Some(&candidate.selection_id),
+        )
+        .unwrap();
         assert_eq!(
-            input_selection.selection,
-            Some(Selection::Indices(IndexSelection::single(3).unwrap()))
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
         );
+        assert_eq!(input_selection.selection, None);
         assert_eq!(
             input_selection.expected_identity,
             Some(PlaybackExpectedIdentity {
@@ -4410,6 +4781,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("Retrying video"))
         );
+        assert!(
+            failed_progress
+                .message
+                .as_deref()
+                .is_none_or(|message| !message.contains("stream reset"))
+        );
 
         let plan_cancelled = cancelled_accumulator
             .record(&DownloadProgressEvent::PlanCancelled {
@@ -4422,6 +4799,10 @@ mod tests {
         assert_progress_near(plan_cancelled.progress, DOWNLOAD_PROGRESS_START);
         assert_eq!(None, plan_cancelled.downloaded_bytes);
         assert_eq!(None, plan_cancelled.total_bytes);
+        assert_eq!(
+            Some("BBDown download cancelled."),
+            plan_cancelled.message.as_deref()
+        );
 
         let (mut failed_accumulator, _) = accumulator_after_failed_bbdown_file_attempt();
         let plan_failed = failed_accumulator
@@ -4435,6 +4816,10 @@ mod tests {
         assert_progress_near(plan_failed.progress, DOWNLOAD_PROGRESS_START);
         assert_eq!(None, plan_failed.downloaded_bytes);
         assert_eq!(None, plan_failed.total_bytes);
+        assert_eq!(
+            Some("BBDown download failed."),
+            plan_failed.message.as_deref()
+        );
     }
 
     #[tokio::test]

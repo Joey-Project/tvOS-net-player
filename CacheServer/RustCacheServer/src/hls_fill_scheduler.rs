@@ -22,6 +22,7 @@ struct HlsFillSchedulerInner {
     demoted: Vec<HlsFillJob>,
     current: Option<HlsFillCurrentJob>,
     worker_started: bool,
+    closed: bool,
     next_sequence: u64,
 }
 
@@ -44,10 +45,21 @@ pub(crate) enum HlsFillPriority {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HlsFillPreemptionToken {
     preempted: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct HlsFillCurrentJob {
     job: HlsFillJob,
+}
+
+pub(crate) struct HlsFillWorkerGuard {
+    scheduler: HlsFillScheduler,
+}
+
+impl Drop for HlsFillWorkerGuard {
+    fn drop(&mut self) {
+        self.scheduler.mark_worker_stopped();
+    }
 }
 
 impl HlsFillScheduler {
@@ -85,44 +97,111 @@ impl HlsFillScheduler {
         should_start_worker
     }
 
+    #[cfg(test)]
     pub(crate) async fn next_job(&self) -> HlsFillJob {
+        self.next_job_until_shutdown()
+            .await
+            .expect("HLS fill scheduler shut down while a test was awaiting work")
+    }
+
+    pub(crate) async fn next_job_until_shutdown(&self) -> Option<HlsFillJob> {
         loop {
             let notified = self.notify.notified();
             {
                 let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+                if inner.closed {
+                    return None;
+                }
                 if let Some(job) = inner.foreground.pop_back().or_else(|| inner.demoted.pop()) {
                     inner.current = Some(HlsFillCurrentJob { job: job.clone() });
-                    return job;
+                    return Some(job);
                 }
             }
             notified.await;
         }
     }
 
-    pub(crate) fn finish_current(&self, job: &HlsFillJob) {
+    pub(crate) fn finish_current(&self, job: &HlsFillJob, requeue_preempted: bool) {
         let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
-        if inner.current.as_ref().is_some_and(|current| {
+        let is_current = inner.current.as_ref().is_some_and(|current| {
             current.job.sequence == job.sequence && current.job.task_id == job.task_id
-        }) {
-            inner.current = None;
+        });
+        if !is_current {
+            return;
+        }
+        let current = inner
+            .current
+            .take()
+            .expect("matched HLS fill current job should exist");
+        let should_requeue = requeue_preempted
+            && !current.job.token.is_cancelled()
+            && !inner.closed
+            && !inner.has_queued_session(&current.job.session.id);
+        if should_requeue {
+            let job = inner.refresh_job(current.job, HlsFillPriority::Demoted);
+            inner.demoted.push(job);
+        }
+        drop(inner);
+        if should_requeue {
+            self.notify.notify_one();
         }
     }
 
-    pub(crate) fn requeue_preempted(&self, job: HlsFillJob) {
+    pub(crate) fn is_idle(&self) -> bool {
+        let inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        inner.current.is_none() && inner.foreground.is_empty() && inner.demoted.is_empty()
+    }
+
+    pub(crate) fn cancel_task(&self, task_id: &str) {
         let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
-        if inner.has_queued_session(&job.session.id) {
-            return;
+        inner.foreground.retain(|job| job.task_id != task_id);
+        inner.demoted.retain(|job| job.task_id != task_id);
+        if let Some(current) = inner.current.as_ref()
+            && current.job.task_id == task_id
+        {
+            current.job.token.cancel();
         }
-        let job = inner.refresh_job(job, HlsFillPriority::Demoted);
-        inner.demoted.push(job);
-        let should_start_worker = !inner.worker_started;
-        inner.worker_started = true;
-        debug_assert!(
-            !should_start_worker,
-            "HLS fill worker should already be running before preempted jobs are requeued"
-        );
-        drop(inner);
-        self.notify.notify_one();
+    }
+
+    pub(crate) async fn shutdown_and_wait_for_worker(&self) {
+        {
+            let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+            inner.closed = true;
+            inner.foreground.clear();
+            inner.demoted.clear();
+            if let Some(current) = inner.current.as_ref() {
+                current.job.token.cancel();
+            }
+        }
+        self.notify.notify_waiters();
+
+        loop {
+            let notified = self.notify.notified();
+            if !self
+                .inner
+                .lock()
+                .expect("HLS fill scheduler lock poisoned")
+                .worker_started
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn worker_guard(&self) -> HlsFillWorkerGuard {
+        HlsFillWorkerGuard {
+            scheduler: self.clone(),
+        }
+    }
+
+    pub(crate) fn diagnostic_counts(&self) -> (bool, usize, usize) {
+        let inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        (
+            inner.current.is_some(),
+            inner.foreground.len(),
+            inner.demoted.len(),
+        )
     }
 
     pub(crate) fn promote_session_to_foreground(
@@ -131,6 +210,9 @@ impl HlsFillScheduler {
         restart_current: bool,
     ) -> bool {
         let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        if inner.closed {
+            return false;
+        }
         if let Some(current) = inner.current.as_ref()
             && current.job.session.id == session_id
         {
@@ -188,6 +270,9 @@ impl HlsFillScheduler {
         preempt_current: bool,
     ) -> bool {
         let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        if inner.closed {
+            return false;
+        }
         if preempt_current
             && inner
                 .current
@@ -206,6 +291,14 @@ impl HlsFillScheduler {
         let should_start_worker = !inner.worker_started;
         inner.worker_started = true;
         should_start_worker
+    }
+
+    fn mark_worker_stopped(&self) {
+        self.inner
+            .lock()
+            .expect("HLS fill scheduler lock poisoned")
+            .worker_started = false;
+        self.notify.notify_one();
     }
 }
 
@@ -268,6 +361,14 @@ impl HlsFillPreemptionToken {
     pub(crate) fn is_preempted(&self) -> bool {
         self.preempted.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -302,7 +403,7 @@ mod tests {
         ));
 
         assert!(old_job.token.is_preempted());
-        scheduler.finish_current(&old_job);
+        scheduler.finish_current(&old_job, false);
         let new_job = scheduler.next_job().await;
         assert_eq!("new-task", new_job.task_id);
     }
@@ -329,10 +430,10 @@ mod tests {
         ));
 
         assert!(active_job.token.is_preempted());
-        scheduler.finish_current(&active_job);
+        scheduler.finish_current(&active_job, false);
         let newest_job = scheduler.next_job().await;
         assert_eq!("newest-queued-task", newest_job.task_id);
-        scheduler.finish_current(&newest_job);
+        scheduler.finish_current(&newest_job, false);
         let older_job = scheduler.next_job().await;
         assert_eq!("older-queued-task", older_job.task_id);
     }
@@ -353,9 +454,70 @@ mod tests {
 
         let first = scheduler.next_job().await;
         assert_eq!("newer-task", first.task_id);
-        scheduler.finish_current(&first);
+        scheduler.finish_current(&first, false);
         let second = scheduler.next_job().await;
         assert_eq!("older-task", second.task_id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_task_removes_queued_jobs_and_cancels_current_without_requeue() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_foreground(
+            "task-a".to_owned(),
+            sample_session("session-a-current"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current = scheduler.next_job().await;
+        assert!(!scheduler.enqueue_demoted(
+            "task-a".to_owned(),
+            sample_session("session-a-queued"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!scheduler.enqueue_demoted(
+            "task-b".to_owned(),
+            sample_session("session-b"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+
+        scheduler.cancel_task("task-a");
+
+        assert!(current.token.is_cancelled());
+        assert_eq!(
+            0,
+            scheduler.queued_session_count_for_tests("session-a-queued")
+        );
+        scheduler.finish_current(&current, true);
+        let remaining = scheduler.next_job().await;
+        assert_eq!("task-b", remaining.task_id);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_idle_worker_and_waits_for_worker_guard() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_foreground(
+            "task-a".to_owned(),
+            sample_session("session-a"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current = scheduler.next_job().await;
+        scheduler.finish_current(&current, false);
+
+        let worker_scheduler = scheduler.clone();
+        let worker = tokio::spawn(async move {
+            let _guard = worker_scheduler.worker_guard();
+            assert!(worker_scheduler.next_job_until_shutdown().await.is_none());
+        });
+
+        scheduler.shutdown_and_wait_for_worker().await;
+        worker.await.expect("idle HLS fill worker should exit");
+        assert!(!scheduler.worker_started_for_tests());
+        assert!(scheduler.is_idle());
+        assert!(!scheduler.enqueue_demoted(
+            "task-b".to_owned(),
+            sample_session("session-b"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(scheduler.is_idle());
     }
 
     #[tokio::test]
@@ -377,7 +539,7 @@ mod tests {
         assert!(scheduler.promote_session_to_foreground("session-b", false));
 
         assert!(active_job.token.is_preempted());
-        scheduler.finish_current(&active_job);
+        scheduler.finish_current(&active_job, false);
         let promoted = scheduler.next_job().await;
         assert_eq!("session-b", promoted.session.id);
         assert_eq!(HlsFillPriority::Foreground, promoted.priority);
@@ -405,11 +567,11 @@ mod tests {
         assert_eq!(1, scheduler.queued_session_count_for_tests("session-a"));
         assert_eq!(1, scheduler.queued_session_count_for_tests("session-b"));
 
-        scheduler.finish_current(&active_job);
+        scheduler.finish_current(&active_job, false);
         let promoted = scheduler.next_job().await;
         assert_eq!("session-a", promoted.session.id);
         assert_eq!(HlsFillPriority::Foreground, promoted.priority);
-        scheduler.finish_current(&promoted);
+        scheduler.finish_current(&promoted, false);
         let displaced = scheduler.next_job().await;
         assert_eq!("session-b", displaced.session.id);
     }
@@ -449,7 +611,7 @@ mod tests {
         assert!(active_job.token.is_preempted());
         assert_eq!(1, scheduler.queued_session_count_for_tests("session-a"));
 
-        scheduler.finish_current(&active_job);
+        scheduler.finish_current(&active_job, false);
         let restarted = scheduler.next_job().await;
         assert_eq!("session-a", restarted.session.id);
         assert_eq!(HlsFillPriority::Foreground, restarted.priority);
@@ -473,8 +635,7 @@ mod tests {
         ));
         assert!(scheduler.promote_session_to_foreground("session-a", false));
 
-        scheduler.finish_current(&active_job);
-        scheduler.requeue_preempted(active_job);
+        scheduler.finish_current(&active_job, true);
         assert_eq!(1, scheduler.queued_session_count_for_tests("session-a"));
     }
 

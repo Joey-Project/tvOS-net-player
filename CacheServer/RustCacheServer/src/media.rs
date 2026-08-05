@@ -184,7 +184,7 @@ async fn hls_segment_response(
                 total_length: cached.total_length,
                 segments: cached.segments,
             }
-        } else if !advertised_resource {
+        } else if !advertised_resource && !resource_has_upstream(&resource) {
             return empty_response(StatusCode::NOT_FOUND);
         } else if let Some(prewarmed) = state
             .state
@@ -279,7 +279,7 @@ async fn hls_segment_response(
         return build_file_response(opened_file, range, head_only).await;
     }
 
-    if !advertised_resource {
+    if !advertised_resource && !resource_has_upstream(&resource) {
         return empty_response(StatusCode::NOT_FOUND);
     }
 
@@ -342,6 +342,15 @@ async fn hls_segment_response(
         head_only,
     )
     .await
+}
+
+fn resource_has_upstream(resource: &HlsMediaResource) -> bool {
+    !resource.request.url.trim().is_empty()
+        || resource
+            .request
+            .backup_urls
+            .iter()
+            .any(|url| !url.trim().is_empty())
 }
 
 async fn proxy_hls_media_resource(
@@ -1646,7 +1655,10 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let source_session = hls_session("session-1", "http://127.0.0.1:9/source.m4s");
+        let mut source_session = hls_session("session-1", "http://127.0.0.1:9/source.m4s");
+        source_session.variant.video.request.url.clear();
+        source_session.variant.video.request.backup_urls.clear();
+        source_session.variant.video.request.headers.clear();
         let mut completed_session = hls_session("session-1", "http://127.0.0.1:9/generated.m4s");
         completed_session.variant.id = "transcoded-h264".to_owned();
         completed_session.variant.video.id = "transcoded.m4s".to_owned();
@@ -1678,6 +1690,70 @@ mod tests {
         )
         .await;
         assert_eq!(StatusCode::NOT_FOUND, segment_response.status());
+    }
+
+    #[tokio::test]
+    async fn hls_hidden_runtime_variant_serves_stale_completion_transition_requests() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut session = hls_session_with_alternate("session-1", &upstream_url);
+        let mut audio_request = media_request(&upstream_url, Vec::new());
+        audio_request.kind = BilibiliMediaRequestKind::Audio;
+        audio_request.mime_type = Some("audio/mp4".to_owned());
+        session.alternate_variants[0]
+            .codecs
+            .push("mp4a.40.2".to_owned());
+        session.alternate_variants[0].audio = Some(HlsMediaResource {
+            id: "v1-audio.m4s".to_owned(),
+            request: audio_request,
+        });
+        session.advertise_alternate_variants = false;
+        assert!(!session.master_playlist().contains("segments/v1-video.m3u8"));
+        assert!(!session.master_playlist().contains("segments/v1-audio.m3u8"));
+        insert_authorized_hls_session(&state, session);
+
+        for (playlist_id, segment_id) in [
+            ("v1-video.m3u8", "v1-video.m4s"),
+            ("v1-audio.m3u8", "v1-audio.m4s"),
+        ] {
+            let playlist_response = hls_segment_get(
+                State(MediaState::new(state.clone())),
+                Path(("session-1".to_owned(), playlist_id.to_owned())),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(StatusCode::OK, playlist_response.status());
+            let playlist_body = to_bytes(playlist_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let playlist_body = String::from_utf8(playlist_body.to_vec()).unwrap();
+            assert!(playlist_body.contains(segment_id));
+
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
+            let segment_response = hls_segment_get(
+                State(MediaState::new(state.clone())),
+                Path(("session-1".to_owned(), segment_id.to_owned())),
+                headers,
+            )
+            .await;
+            assert_eq!(StatusCode::PARTIAL_CONTENT, segment_response.status());
+            assert_eq!(
+                format!("bytes 1-3/{}", fake_mp4().len()),
+                segment_response.headers()[CONTENT_RANGE]
+            );
+            let body = to_bytes(segment_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&fake_mp4()[1..=3], &body[..]);
+        }
     }
 
     #[tokio::test]

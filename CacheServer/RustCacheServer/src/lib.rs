@@ -21,13 +21,14 @@ mod transcoding;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Display,
     io,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant as MonotonicInstant, SystemTime},
 };
 
 use axum::{Router, routing::get};
@@ -56,7 +57,8 @@ use crate::{
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
-        sanitized_completed_session, source_completed_session_for_restore,
+        completed_runtime_session, sanitized_completed_session,
+        source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -81,6 +83,16 @@ const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
+const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const CREDENTIAL_SAFE_LOG_DETAIL: &str =
+    "detail omitted because Bilibili credential material is configured";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
+    "Bilibili error detail omitted because credential material is configured.";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL: &str =
+    "Bilibili download progress detail omitted because credential material is configured.";
+pub(crate) const CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL: &str =
+    "Bilibili cancellation detail omitted because credential material is configured.";
+const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -93,6 +105,7 @@ pub struct AppState {
     pub(crate) hls_upstream_client: reqwest::Client,
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
+    playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
@@ -110,6 +123,16 @@ pub struct AppState {
 pub(crate) struct HlsCacheEvictionProtectionGuard {
     session_id: String,
     protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+pub(crate) struct PlaybackPlanningActivityGuard {
+    active_jobs: Arc<AtomicUsize>,
+}
+
+impl Drop for PlaybackPlanningActivityGuard {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for HlsCacheEvictionProtectionGuard {
@@ -288,6 +311,7 @@ impl AppState {
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
         ));
+        let playback_planning_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
         let lan_transcoding_permits = Arc::new(Semaphore::new(
@@ -308,6 +332,7 @@ impl AppState {
             hls_upstream_client,
             playback_planner,
             playback_planning_permits,
+            playback_planning_active_jobs,
             hls_cache_finalization_permits,
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
@@ -465,6 +490,7 @@ impl AppState {
             Arc::clone(&self.tasks),
             adapter,
             max_concurrent_tasks,
+            self.options.bbdown_credential_path.is_some(),
         ))
     }
 
@@ -694,6 +720,116 @@ impl AppState {
         self.hls_sessions.remove(session_id);
         self.hls_network_policy.remove_session(session_id);
         self.hls_playback_progress.remove_session(session_id);
+    }
+
+    pub(crate) fn register_completed_hls_runtime_session(&self, session: &HlsPlaybackSession) {
+        self.register_completed_hls_runtime_session_with_grace(
+            session,
+            HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD,
+        );
+    }
+
+    fn register_completed_hls_runtime_session_with_grace(
+        &self,
+        session: &HlsPlaybackSession,
+        grace_period: Duration,
+    ) {
+        let runtime_session = completed_runtime_session(session);
+        let sanitized_session = sanitized_completed_session(session);
+        let session_id = runtime_session.id.clone();
+        let deadline = MonotonicInstant::now()
+            .checked_add(grace_period)
+            .expect("HLS completion grace deadline should fit in Instant");
+        let generation = self.hls_sessions.insert_with_scrub_deadline(
+            runtime_session,
+            sanitized_session,
+            deadline,
+        );
+
+        let registry = self.hls_sessions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace_period).await;
+            registry.scrub_generation(&session_id, generation);
+        });
+    }
+
+    pub(crate) fn begin_playback_planning(&self) -> PlaybackPlanningActivityGuard {
+        self.playback_planning_active_jobs
+            .fetch_add(1, Ordering::SeqCst);
+        PlaybackPlanningActivityGuard {
+            active_jobs: Arc::clone(&self.playback_planning_active_jobs),
+        }
+    }
+
+    pub(crate) fn error_detail_for_log(&self, detail: &dyn Display) -> String {
+        error_detail_for_log(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn error_detail_for_client(&self, detail: &dyn Display) -> String {
+        credential_safe_client_error(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn cancellation_detail_for_client(&self, detail: &str) -> String {
+        credential_safe_client_cancellation(self.options.bbdown_credential_path.is_some(), detail)
+    }
+
+    pub(crate) fn error_with_context_for_client(
+        &self,
+        context: &'static str,
+        detail: &dyn Display,
+    ) -> String {
+        credential_safe_client_error_with_context(
+            self.options.bbdown_credential_path.is_some(),
+            context,
+            detail,
+        )
+    }
+
+    pub(crate) fn bilibili_error_details_are_sensitive(&self) -> bool {
+        self.options.bbdown_credential_path.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn background_work_is_idle(&self) -> bool {
+        self.playback_planning_active_jobs.load(Ordering::SeqCst) == 0
+            && self.playback_planning_permits.available_permits()
+                == self.options.bilibili_worker_max_concurrent_tasks.max(1)
+            && self.hls_cache_finalization_permits.available_permits()
+                == HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS
+            && self.lan_transcoding_permits.available_permits()
+                == self.options.lan_transcoding_max_concurrent_jobs.max(1)
+            && self.lan_transcoding_active_job_count() == 0
+            && self.hls_fill_scheduler.is_idle()
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_hls_fill_work_for_task(&self, task_id: &str) {
+        self.hls_fill_scheduler.cancel_task(task_id);
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_hls_fill_worker(&self) {
+        self.hls_fill_scheduler.shutdown_and_wait_for_worker().await;
+    }
+
+    #[doc(hidden)]
+    pub fn background_work_diagnostics(&self) -> String {
+        let (hls_fill_current, hls_fill_foreground, hls_fill_demoted) =
+            self.hls_fill_scheduler.diagnostic_counts();
+        format!(
+            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}",
+            self.playback_planning_active_jobs.load(Ordering::SeqCst),
+            self.playback_planning_permits.available_permits(),
+            self.options.bilibili_worker_max_concurrent_tasks.max(1),
+            self.hls_cache_finalization_permits.available_permits(),
+            HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS,
+            self.lan_transcoding_active_job_count(),
+            self.lan_transcoding_permits.available_permits(),
+            self.options.lan_transcoding_max_concurrent_jobs.max(1),
+            hls_fill_current,
+            hls_fill_foreground,
+            hls_fill_demoted,
+        )
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
@@ -1359,6 +1495,195 @@ impl AppState {
     }
 }
 
+fn error_detail_for_log(credentials_configured: bool, detail: &dyn Display) -> String {
+    if credentials_configured {
+        CREDENTIAL_SAFE_LOG_DETAIL.to_owned()
+    } else {
+        detail.to_string()
+    }
+}
+
+pub(crate) fn credential_safe_client_error(
+    credentials_configured: bool,
+    detail: &dyn Display,
+) -> String {
+    let detail = detail.to_string();
+    if !credentials_configured {
+        return detail;
+    }
+
+    let class = tagged_bilibili_failure_class(&detail)
+        .unwrap_or_else(|| classify_bilibili_failure(&detail));
+    format!(
+        "{CREDENTIAL_SAFE_CLIENT_DETAIL} [{BILIBILI_FAILURE_CLASS_TAG}={}]",
+        class.as_str()
+    )
+}
+
+pub(crate) fn credential_safe_client_cancellation(
+    credentials_configured: bool,
+    detail: &str,
+) -> String {
+    if !credentials_configured
+        || detail == CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL
+        || task_registry::is_known_safe_cancellation_message(detail)
+    {
+        return detail.to_owned();
+    }
+
+    CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL.to_owned()
+}
+
+fn credential_safe_client_error_with_context(
+    credentials_configured: bool,
+    context: &'static str,
+    detail: &dyn Display,
+) -> String {
+    let detail = credential_safe_client_error(credentials_configured, detail);
+    if credentials_configured {
+        format!("{detail} {context}.")
+    } else {
+        format!("{context}: {detail}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BilibiliFailureClass {
+    Credential,
+    EmptyAccountState,
+    UpstreamSchemaOrAvailability,
+    RestrictedProxy,
+    ServerBug,
+}
+
+impl BilibiliFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::EmptyAccountState => "empty_account_state",
+            Self::UpstreamSchemaOrAvailability => "upstream_schema_or_availability",
+            Self::RestrictedProxy => "restricted_proxy",
+            Self::ServerBug => "server_bug",
+        }
+    }
+}
+
+fn tagged_bilibili_failure_class(detail: &str) -> Option<BilibiliFailureClass> {
+    if !detail.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL) {
+        return None;
+    }
+    [
+        BilibiliFailureClass::Credential,
+        BilibiliFailureClass::EmptyAccountState,
+        BilibiliFailureClass::RestrictedProxy,
+        BilibiliFailureClass::UpstreamSchemaOrAvailability,
+        BilibiliFailureClass::ServerBug,
+    ]
+    .into_iter()
+    .find(|class| {
+        detail.contains(&format!(
+            "[{BILIBILI_FAILURE_CLASS_TAG}={}]",
+            class.as_str()
+        ))
+    })
+}
+
+fn classify_bilibili_failure(detail: &str) -> BilibiliFailureClass {
+    let detail = untagged_bilibili_failure_detail(detail);
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "area",
+            "region",
+            "restricted",
+            "proxy",
+            "\u{5730}\u{533a}",
+            "\u{7248}\u{6743}",
+            "\u{4e0d}\u{53ef}\u{89c2}\u{770b}",
+        ],
+    ) {
+        return BilibiliFailureClass::RestrictedProxy;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "empty account",
+            "watch later is empty",
+            "history is empty",
+            "\u{6ca1}\u{6709}\u{66f4}\u{591a}",
+        ],
+    ) {
+        return BilibiliFailureClass::EmptyAccountState;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "credential file",
+            "credential store",
+            "credential profile",
+            "cookie",
+            "login",
+            "not logged",
+            "sessdata",
+            "csrf",
+            "unauthorized",
+            "-101",
+            "\u{8d26}\u{53f7}\u{672a}\u{767b}\u{5f55}",
+            "\u{672a}\u{767b}\u{5f55}",
+        ],
+    ) {
+        return BilibiliFailureClass::Credential;
+    }
+    if contains_bilibili_failure_marker(
+        &detail,
+        &[
+            "upstream",
+            "schema",
+            "availability",
+            "playurl",
+            "resolve",
+            "selected bilibili item",
+            "selected collection item",
+            "was not found",
+            "no longer matches",
+            "failed to fetch",
+            "request failed",
+            "network",
+            "connection",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "http status",
+            "missing field",
+            "stream reset",
+        ],
+    ) {
+        return BilibiliFailureClass::UpstreamSchemaOrAvailability;
+    }
+    BilibiliFailureClass::ServerBug
+}
+
+fn untagged_bilibili_failure_detail(detail: &str) -> String {
+    let mut detail = detail.to_ascii_lowercase();
+    for class in [
+        BilibiliFailureClass::Credential,
+        BilibiliFailureClass::EmptyAccountState,
+        BilibiliFailureClass::RestrictedProxy,
+        BilibiliFailureClass::UpstreamSchemaOrAvailability,
+        BilibiliFailureClass::ServerBug,
+    ] {
+        detail = detail.replace(
+            &format!("[{BILIBILI_FAILURE_CLASS_TAG}={}]", class.as_str()),
+            "",
+        );
+    }
+    detail
+}
+
+fn contains_bilibili_failure_marker(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn refresh_restored_hls_playback_source(
     tasks: &BilibiliTaskRegistry,
     playback_uri_factory: &PlaybackUriFactory,
@@ -1706,6 +2031,112 @@ mod tests {
         transcoding::HlsTranscodingPlan,
     };
 
+    #[test]
+    fn credential_safe_log_detail_omits_raw_upstream_error() {
+        let detail = "https://example.test/video.m4s?access_key=credential-sensitive-marker";
+
+        assert_eq!(detail, error_detail_for_log(false, &detail));
+        let safe = error_detail_for_log(true, &detail);
+        assert_eq!(CREDENTIAL_SAFE_LOG_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_error_omits_raw_upstream_error() {
+        let detail = "https://example.test/video.m4s?access_key=credential-sensitive-marker";
+
+        assert_eq!(detail, credential_safe_client_error(false, &detail));
+        let safe = credential_safe_client_error(true, &detail);
+        assert!(safe.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL));
+        assert!(safe.contains("[bilibili_failure_class=server_bug]"));
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_error_preserves_only_existing_failure_class() {
+        let detail = format!(
+            "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy] appended-sensitive-marker"
+        );
+
+        let safe = credential_safe_client_error(true, &detail);
+
+        assert_eq!(
+            format!("{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"),
+            safe
+        );
+        assert!(!safe.contains("appended-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_error_does_not_trust_raw_failure_class_tag() {
+        let detail =
+            "upstream request failed [bilibili_failure_class=credential] raw-sensitive-marker";
+
+        let safe = credential_safe_client_error(true, &detail);
+
+        assert!(safe.contains("[bilibili_failure_class=upstream_schema_or_availability]"));
+        assert!(!safe.contains("raw-sensitive-marker"));
+    }
+
+    #[test]
+    fn credential_safe_client_cancellation_preserves_only_server_owned_detail() {
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        assert_eq!(
+            "Cancelled before playback planning started.",
+            credential_safe_client_cancellation(
+                true,
+                "Cancelled before playback planning started."
+            )
+        );
+        assert_eq!(
+            CREDENTIAL_SAFE_CLIENT_CANCELLATION_DETAIL,
+            credential_safe_client_cancellation(
+                true,
+                &format!(
+                    "Cancelled after upstream request https://example.test/media?access_key={synthetic_access_token}"
+                )
+            )
+        );
+        assert_eq!(
+            "adapter cancellation detail",
+            credential_safe_client_cancellation(false, "adapter cancellation detail")
+        );
+    }
+
+    #[test]
+    fn credential_safe_client_error_context_survives_boundary_redaction() {
+        assert_eq!(
+            "Playable online; offline cache fill failed: upstream request failed",
+            credential_safe_client_error_with_context(
+                false,
+                "Playable online; offline cache fill failed",
+                &"upstream request failed",
+            )
+        );
+        for context in [
+            "Playable online; offline cache fill failed",
+            "Failed to restore offline HLS cache after restart",
+        ] {
+            let wrapped = credential_safe_client_error_with_context(
+                true,
+                context,
+                &"restricted proxy response-sensitive-marker",
+            );
+
+            assert!(wrapped.starts_with(CREDENTIAL_SAFE_CLIENT_DETAIL));
+            assert!(wrapped.contains("[bilibili_failure_class=restricted_proxy]"));
+            assert!(wrapped.contains(context));
+            assert!(!wrapped.contains("response-sensitive-marker"));
+            assert_eq!(
+                format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"
+                ),
+                credential_safe_client_error(true, &wrapped)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn binds_ipv4_and_ipv6_wildcard_on_same_port() {
         let port = match free_port() {
@@ -1728,6 +2159,214 @@ mod tests {
         }
 
         drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_session_scrubs_alternate_upstream_after_grace_period() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-grace");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        session.alternate_variants = vec![alternate];
+
+        state
+            .register_completed_hls_runtime_session_with_grace(&session, Duration::from_millis(10));
+
+        let runtime = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should be registered");
+        assert!(runtime.variant.video.request.url.is_empty());
+        assert_eq!(
+            "https://example.test/alternate-video.m4s",
+            runtime.alternate_variants[0].video.request.url
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let scrubbed = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(scrubbed.variant.video.request.url.is_empty());
+        assert!(scrubbed.alternate_variants[0].video.request.url.is_empty());
+        assert!(
+            scrubbed.alternate_variants[0]
+                .video
+                .request
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completed_runtime_session_enforces_expired_grace_during_lookup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-expired-lookup");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        alternate
+            .video
+            .request
+            .headers
+            .push(crate::bbdown_adapter::BilibiliHttpHeader {
+                name: "Authorization".to_owned(),
+                value: "credential-sensitive-marker".to_owned(),
+            });
+        session.alternate_variants = vec![alternate];
+
+        state.hls_sessions.insert_with_scrub_deadline(
+            completed_runtime_session(&session),
+            sanitized_completed_session(&session),
+            MonotonicInstant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("expired monotonic deadline should fit"),
+        );
+
+        let served = state
+            .hls_playback_session(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(served.alternate_variants[0].video.request.url.is_empty());
+        assert!(
+            served.alternate_variants[0]
+                .video
+                .request
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completed_runtime_timer_scrub_does_not_recheck_deadline() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-timer-scrub");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        session.alternate_variants = vec![alternate];
+
+        let generation = state.hls_sessions.insert_with_scrub_deadline(
+            completed_runtime_session(&session),
+            sanitized_completed_session(&session),
+            MonotonicInstant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("future monotonic deadline should fit"),
+        );
+
+        assert!(state.hls_sessions.scrub_generation(&session.id, generation));
+        let scrubbed = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(scrubbed.alternate_variants[0].video.request.url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_scrub_does_not_replace_newer_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut completed = sample_hls_session("completion-replaced");
+        let mut alternate = completed.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        completed.alternate_variants = vec![alternate];
+        state.register_completed_hls_runtime_session_with_grace(
+            &completed,
+            Duration::from_millis(10),
+        );
+
+        let newer = completed_runtime_session(&completed);
+        state.hls_sessions.insert(newer.clone());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(Some(newer), state.hls_sessions.get(&completed.id));
+    }
+
+    #[tokio::test]
+    async fn background_work_idle_tracks_pending_and_active_work() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        assert!(state.background_work_is_idle());
+
+        let planning_activity = state.begin_playback_planning();
+        assert!(!state.background_work_is_idle());
+        drop(planning_activity);
+        assert!(state.background_work_is_idle());
+
+        let planning_permit = Arc::clone(&state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .expect("planning permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(planning_permit);
+
+        let finalization_permit = Arc::clone(&state.hls_cache_finalization_permits)
+            .acquire_owned()
+            .await
+            .expect("finalization permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(finalization_permit);
+
+        let transcoding_permit = Arc::clone(&state.lan_transcoding_permits)
+            .acquire_owned()
+            .await
+            .expect("transcoding permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(transcoding_permit);
+
+        state
+            .lan_transcoding_active_jobs
+            .fetch_add(1, Ordering::SeqCst);
+        assert!(!state.background_work_is_idle());
+        state
+            .lan_transcoding_active_jobs
+            .fetch_sub(1, Ordering::SeqCst);
+
+        let (task_id, session) = create_playable_hls_task(&state, "BV1background-idle");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!state.background_work_is_idle());
+        let current_job = state.hls_fill_scheduler.next_job().await;
+        assert!(!state.background_work_is_idle());
+        state.cancel_hls_fill_work_for_task(&task_id);
+        assert!(current_job.token.is_cancelled());
+        state.hls_fill_scheduler.finish_current(&current_job, false);
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn app_state_shutdown_stops_idle_hls_fill_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        state.enqueue_hls_cache_fill_foreground(
+            "missing-task".to_owned(),
+            sample_hls_session("shutdown-worker"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.hls_fill_scheduler.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HLS fill worker should finish the rejected job");
+        assert!(state.hls_fill_scheduler.worker_started_for_tests());
+
+        tokio::time::timeout(Duration::from_secs(1), state.shutdown_hls_fill_worker())
+            .await
+            .expect("idle HLS fill worker should stop after shutdown");
+        assert!(!state.hls_fill_scheduler.worker_started_for_tests());
     }
 
     #[tokio::test]

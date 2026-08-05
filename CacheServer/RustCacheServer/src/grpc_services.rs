@@ -18,7 +18,7 @@ use crate::{
     AppState,
     bbdown_adapter::{
         BilibiliPlaybackPlan, BilibiliPlaybackVariant as AdapterPlaybackVariant,
-        BilibiliPlaybackVariantKind,
+        BilibiliPlaybackVariantKind, recover_stable_collection_candidate,
     },
     bilibili_playback::{
         BilibiliInputResolution, BilibiliInputResolveRequest, BilibiliPlaybackPlanningRequest,
@@ -53,7 +53,7 @@ use crate::{
     hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
         HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
-        completed_runtime_session, hls_session_declared_size_bytes, timestamp_from_system_time,
+        hls_session_declared_size_bytes, timestamp_from_system_time,
     },
     hls_fill_scheduler::HlsFillPreemptionToken,
     hls_network_policy::{
@@ -64,7 +64,10 @@ use crate::{
         PlaybackProgressReport,
     },
     library::ROOT_ID,
-    task_registry::{BilibiliTaskProgress, BilibiliTaskRegistry, current_timestamp},
+    task_registry::{
+        BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
+    },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
         LanTranscodingStatusSnapshot,
@@ -692,7 +695,7 @@ impl TaskService for TaskGrpcService {
                 cancellation: crate::task_registry::BilibiliTaskCancellation::default(),
             })
             .await
-            .map_err(playback_status_from_error)?;
+            .map_err(|error| playback_status_from_error(&self.state, error))?;
         Ok(Response::new(BilibiliResolveResult::from(resolution)))
     }
 
@@ -705,7 +708,10 @@ impl TaskService for TaskGrpcService {
             .state
             .tasks
             .create_bilibili_task(&request.url_or_id, request.options)?;
-        Ok(Response::new(task))
+        Ok(Response::new(task_for_client(
+            task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn create_bilibili_playback_task(
@@ -724,7 +730,10 @@ impl TaskService for TaskGrpcService {
             selection_plan.task_selection.clone(),
         )?;
         if !creation.created {
-            return Ok(Response::new(creation.task));
+            return Ok(Response::new(task_for_client(
+                creation.task,
+                self.state.bilibili_error_details_are_sensitive(),
+            )));
         }
 
         let task_id = creation.task.id.clone();
@@ -735,23 +744,35 @@ impl TaskService for TaskGrpcService {
         let cancellation = creation
             .cancellation
             .expect("new playback task should include a planning cancellation token");
+        let task_source = creation.task.source.clone();
         let state = self.state.clone();
-        tokio::spawn(run_bilibili_playback_planning(
-            state,
-            task_id,
-            creation.task.source.clone(),
-            options,
-            selection_plan,
-            playback_source_uri,
-            cancellation,
-        ));
+        let planning_activity = state.begin_playback_planning();
+        tokio::spawn(async move {
+            let _planning_activity = planning_activity;
+            run_bilibili_playback_planning(
+                state,
+                task_id,
+                task_source,
+                options,
+                selection_plan,
+                playback_source_uri,
+                cancellation,
+            )
+            .await;
+        });
 
-        Ok(Response::new(creation.task))
+        Ok(Response::new(task_for_client(
+            creation.task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn get_task(&self, request: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(self.state.tasks.get_task(&request.id)?))
+        Ok(Response::new(task_for_client(
+            self.state.tasks.get_task(&request.id)?,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
 
     async fn watch_tasks(
@@ -761,11 +782,14 @@ impl TaskService for TaskGrpcService {
         let request = request.into_inner();
         let mut subscription = self.state.tasks.subscribe(&request.ids)?;
         let snapshots = subscription.snapshots().to_vec();
+        let redact_error_details = self.state.bilibili_error_details_are_sensitive();
         let (sender, receiver) = mpsc::channel(128);
         tokio::spawn(async move {
             for task in snapshots {
                 if sender
-                    .send(Ok(TaskEvent { task: Some(task) }))
+                    .send(Ok(TaskEvent {
+                        task: Some(task_for_client(task, redact_error_details)),
+                    }))
                     .await
                     .is_err()
                 {
@@ -782,7 +806,9 @@ impl TaskService for TaskGrpcService {
                 match result {
                     Ok(task) => {
                         if sender
-                            .send(Ok(TaskEvent { task: Some(task) }))
+                            .send(Ok(TaskEvent {
+                                task: Some(task_for_client(task, redact_error_details)),
+                            }))
                             .await
                             .is_err()
                         {
@@ -815,8 +841,49 @@ impl TaskService for TaskGrpcService {
                 let _ = self.state.hls_cache.remove_session(&session_id);
             }
         }
-        Ok(Response::new(task))
+        Ok(Response::new(task_for_client(
+            task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
     }
+}
+
+fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
+    if !redact_error_details {
+        return task;
+    }
+    match task.state() {
+        TaskState::Running | TaskState::CancelRequested
+            if task.kind() == TaskKind::BilibiliDownload =>
+        {
+            task.message = crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL.to_owned();
+        }
+        TaskState::Failed => {
+            task.message = crate::credential_safe_client_error(true, &task.message);
+        }
+        TaskState::Cancelled => {
+            task.message = crate::credential_safe_client_cancellation(true, &task.message);
+        }
+        TaskState::Playable | TaskState::Completed
+            if task.kind() == TaskKind::BilibiliProgressivePlayback
+                && task.message.contains("offline cache fill failed") =>
+        {
+            task.message = crate::credential_safe_client_error(true, &task.message);
+        }
+        _ => {}
+    }
+    for item in &mut task.result_items {
+        match item.state() {
+            TaskState::Failed => {
+                item.message = crate::credential_safe_client_error(true, &item.message);
+            }
+            TaskState::Cancelled => {
+                item.message = crate::credential_safe_client_cancellation(true, &item.message);
+            }
+            _ => {}
+        }
+    }
+    task
 }
 
 #[derive(Clone)]
@@ -1177,10 +1244,7 @@ async fn run_bilibili_playback_planning(
         if cancellation.is_cancel_requested() {
             if state
                 .tasks
-                .complete_task_cancelled(
-                    &task_id,
-                    "Cancelled before playback planning started.".to_owned(),
-                )
+                .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
                 .is_ok()
             {
                 cleanup.disarm();
@@ -1213,10 +1277,7 @@ async fn run_bilibili_playback_planning(
     if cancellation.is_cancel_requested() {
         if state
             .tasks
-            .complete_task_cancelled(
-                &task_id,
-                "Cancelled before playback planning started.".to_owned(),
-            )
+            .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
             .is_ok()
         {
             cleanup.disarm();
@@ -1272,9 +1333,10 @@ async fn run_single_bilibili_playback_planning(
     let plan = match state.playback_planner.plan(planning_request).await {
         Ok(plan) => plan,
         Err(error) => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_failed(&task_id, playback_error_message(error))
+                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
                 .is_ok();
         }
     };
@@ -1283,7 +1345,7 @@ async fn run_single_bilibili_playback_planning(
         Err(error) => {
             return state
                 .tasks
-                .complete_task_failed(&task_id, error.message().to_owned())
+                .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
                 .is_ok();
         }
     };
@@ -1309,7 +1371,8 @@ async fn run_single_bilibili_playback_planning(
             } else {
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
-                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {error}"
+                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                 }
                 state.enqueue_hls_cache_fill_foreground(
@@ -1348,15 +1411,17 @@ async fn run_explicit_bilibili_playback_planning(
     {
         Ok(resolution) => resolution,
         Err(error) if cancellation.is_cancel_requested() => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_cancelled(&task_id, playback_error_message(error))
+                .complete_task_cancelled(&task_id, state.cancellation_detail_for_client(&message))
                 .is_ok();
         }
         Err(error) => {
+            let message = playback_error_message(error);
             return state
                 .tasks
-                .complete_task_failed(&task_id, playback_error_message(error))
+                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
                 .is_ok();
         }
     };
@@ -1439,6 +1504,7 @@ async fn run_explicit_bilibili_playback_planning(
                     uri: playback_source_uri,
                     expires_at: None,
                 };
+                result_items[index].title = metadata.title.clone();
                 result_items[index].state = TaskState::Playable.into();
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
@@ -1448,7 +1514,8 @@ async fn run_explicit_bilibili_playback_planning(
                 planned_sessions.push(metadata.hls_session.clone());
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
-                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {error}"
+                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                 }
                 if primary.is_none() {
@@ -1466,7 +1533,7 @@ async fn run_explicit_bilibili_playback_planning(
             Err(error) if cancellation.is_cancel_requested() => {
                 eprintln!(
                     "Bilibili playback planning for task {task_id} observed cancellation after planner error: {}",
-                    playback_error_message(error)
+                    state.error_detail_for_log(&playback_error_message(error))
                 );
                 return complete_cancelled_explicit_bilibili_playback(
                     &state,
@@ -1478,7 +1545,8 @@ async fn run_explicit_bilibili_playback_planning(
             }
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
-                result_items[index].message = playback_error_message(error);
+                let message = playback_error_message(error);
+                result_items[index].message = state.error_detail_for_client(&message);
             }
         }
 
@@ -1578,7 +1646,7 @@ fn complete_cancelled_explicit_bilibili_playback(
     let _ = state.tasks.update_playback_results(
         task_id,
         Some(title.to_owned()),
-        "Cancelled while planning Bilibili playback results.".to_owned(),
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
         result_items_progress(result_items),
         result_items.to_vec(),
     );
@@ -1586,7 +1654,7 @@ fn complete_cancelled_explicit_bilibili_playback(
         .tasks
         .complete_task_cancelled(
             task_id,
-            "Cancelled while planning Bilibili playback results.".to_owned(),
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
         )
         .is_ok()
 }
@@ -1604,6 +1672,14 @@ fn selected_bilibili_candidates(
                     .iter()
                     .find(|candidate| candidate.selection_id == *selection_id)
                     .cloned()
+                    .or_else(|| {
+                        recover_stable_collection_candidate(
+                            selection_id,
+                            &resolution.source,
+                            &resolution.source_kind,
+                            &resolution.candidates,
+                        )
+                    })
                     .ok_or_else(|| {
                         format!(
                             "Selected Bilibili item {selection_id:?} was not found. Resolve the input again and retry."
@@ -1694,7 +1770,7 @@ fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
 fn mark_results_cancelled(items: &mut [BilibiliTaskResultItem]) {
     for item in items {
         item.state = TaskState::Cancelled.into();
-        item.message = "Cancelled while planning Bilibili playback results.".to_owned();
+        item.message = PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned();
         item.library_item_id.clear();
         item.playback_source = None;
         item.playback_session = None;
@@ -1757,8 +1833,8 @@ pub(crate) async fn run_hls_cache_finalization(
 }
 
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
-    loop {
-        let job = state.hls_fill_scheduler.next_job().await;
+    let _worker_guard = state.hls_fill_scheduler.worker_guard();
+    while let Some(job) = state.hls_fill_scheduler.next_job_until_shutdown().await {
         let session_id = job.session.id.clone();
         let outcome = run_hls_cache_finalization_inner(
             state.clone(),
@@ -1768,12 +1844,11 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
             job.token.clone(),
         )
         .await;
-        state.hls_fill_scheduler.finish_current(&job);
-        if outcome == HlsCacheFinalizationOutcome::Preempted
+        let should_requeue = outcome == HlsCacheFinalizationOutcome::Preempted
             && state
                 .tasks
-                .is_hls_session_playable_for_task(&job.task_id, &session_id)
-        {
+                .is_hls_session_playable_for_task(&job.task_id, &session_id);
+        if should_requeue {
             let message = match job.priority {
                 crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
                     "Playable online; offline cache fill paused behind newer playback."
@@ -1791,8 +1866,10 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                     message: Some(message.to_owned()),
                 },
             );
-            state.hls_fill_scheduler.requeue_preempted(job);
         }
+        state
+            .hls_fill_scheduler
+            .finish_current(&job, should_requeue);
     }
 }
 
@@ -1816,6 +1893,9 @@ async fn run_hls_cache_finalization_inner(
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
+        if preemption.is_cancelled() {
+            return HlsCacheFinalizationOutcome::Finished;
+        }
         if !state
             .tasks
             .is_hls_session_playable_for_task(&task_id, &session_id)
@@ -1842,9 +1922,10 @@ async fn run_hls_cache_finalization_inner(
     };
     let _eviction_protection = state.protect_hls_cache_session_from_eviction(&session_id);
     let control = || {
-        if !state
-            .tasks
-            .is_hls_session_playable_for_task(&task_id, &session_id)
+        if preemption.is_cancelled()
+            || !state
+                .tasks
+                .is_hls_session_playable_for_task(&task_id, &session_id)
         {
             HlsCacheFillControl::Cancel
         } else if preemption.is_preempted() {
@@ -1893,7 +1974,8 @@ async fn run_hls_cache_finalization_inner(
         }
         Err(error) => {
             eprintln!(
-                "Failed to prewarm HLS playback cache for task {task_id}; continuing full cache fill: {error}"
+                "Failed to prewarm HLS playback cache for task {task_id}; continuing full cache fill: {}",
+                state.error_detail_for_log(&error)
             );
         }
     }
@@ -1914,7 +1996,8 @@ async fn run_hls_cache_finalization_inner(
         || control() != HlsCacheFillControl::Continue,
     ) {
         eprintln!(
-            "Failed to run HLS cache eviction before finalization for task {task_id}: {error}"
+            "Failed to run HLS cache eviction before finalization for task {task_id}: {}",
+            state.error_detail_for_log(&error)
         );
     }
     if control() == HlsCacheFillControl::Preempt {
@@ -1955,16 +2038,15 @@ async fn run_hls_cache_finalization_inner(
                         &library_item_id,
                     ) =>
                 {
-                    state
-                        .hls_sessions
-                        .insert(completed_runtime_session(&completion.session));
+                    state.register_completed_hls_runtime_session(&completion.session);
                     if let Err(error) = state.enforce_hls_cache_quota(
                         "after_hls_finalization",
                         [session_id.clone()],
                         0,
                     ) {
                         eprintln!(
-                            "Failed to run HLS cache eviction after finalization for task {task_id}: {error}"
+                            "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
+                            state.error_detail_for_log(&error)
                         );
                     }
                 }
@@ -1991,15 +2073,20 @@ async fn run_hls_cache_finalization_inner(
             match failure_mode {
                 HlsCacheFinalizationFailureMode::KeepPlayable => {
                     eprintln!(
-                        "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {error}"
+                        "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {}",
+                        state.error_detail_for_log(&error)
                     );
                     if let Err(status) = state.tasks.fail_hls_cache_fill_for_playback_session(
                         &task_id,
                         &session_id,
-                        format!("Playable online; offline cache fill failed: {error}"),
+                        state.error_with_context_for_client(
+                            "Playable online; offline cache fill failed",
+                            &error,
+                        ),
                     ) {
                         eprintln!(
-                            "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {status}"
+                            "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
+                            state.error_detail_for_log(&status)
                         );
                     }
                 }
@@ -2010,11 +2097,15 @@ async fn run_hls_cache_finalization_inner(
                         .tasks
                         .fail_unrestorable_playback_session_after_cache_restore(
                             &session_id,
-                            format!("Failed to restore offline HLS cache after restart: {error}"),
+                            state.error_with_context_for_client(
+                                "Failed to restore offline HLS cache after restart",
+                                &error,
+                            ),
                         )
                     {
                         eprintln!(
-                            "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {status}"
+                            "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {}",
+                            state.error_detail_for_log(&status)
                         );
                     }
                 }
@@ -2425,10 +2516,14 @@ fn playback_error_message(error: BilibiliDownloadError) -> String {
     }
 }
 
-fn playback_status_from_error(error: BilibiliDownloadError) -> Status {
+fn playback_status_from_error(state: &AppState, error: BilibiliDownloadError) -> Status {
     match error {
-        BilibiliDownloadError::Failed(message) => Status::failed_precondition(message),
-        BilibiliDownloadError::Cancelled(message) => Status::cancelled(message),
+        BilibiliDownloadError::Failed(message) => {
+            Status::failed_precondition(state.error_detail_for_client(&message))
+        }
+        BilibiliDownloadError::Cancelled(message) => {
+            Status::cancelled(state.cancellation_detail_for_client(&message))
+        }
     }
 }
 
@@ -2696,6 +2791,7 @@ mod tests {
         routing::get,
     };
     use tokio::sync::{mpsc, oneshot};
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -3721,6 +3817,581 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_configured_rpc_errors_omit_upstream_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let sensitive_detail = "upstream failed at https://example.test/playurl?access_key=credential-sensitive-marker";
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credential_path),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(FailingPlaybackPlanner {
+                detail: sensitive_detail.to_owned(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1credential-error".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: None,
+            }))
+            .await
+            .expect("playback task should be accepted before async planning")
+            .into_inner();
+        let _ = wait_for_task_state(&tasks, &created.id, TaskState::Failed).await;
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: created.id.clone(),
+            }))
+            .await
+            .expect("failed task should remain readable")
+            .into_inner();
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            snapshot.message
+        );
+        assert!(!snapshot.message.contains("credential-sensitive-marker"));
+
+        let legacy_task = tasks
+            .create_bilibili_task("BV1stored-credential-error", None)
+            .expect("legacy task should be created");
+        tasks
+            .complete_task_failed(&legacy_task.id, sensitive_detail.to_owned())
+            .expect("legacy task should store its original failure");
+        let legacy_snapshot = service
+            .get_task(Request::new(GetTaskRequest { id: legacy_task.id }))
+            .await
+            .expect("legacy failed task should remain readable")
+            .into_inner();
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            legacy_snapshot.message
+        );
+        assert!(
+            !legacy_snapshot
+                .message
+                .contains("credential-sensitive-marker")
+        );
+
+        let status = service
+            .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+                url_or_id: "BV1credential-error".to_owned(),
+                options: None,
+            }))
+            .await
+            .expect_err("resolve should return the planner error");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            status.message()
+        );
+        assert!(!status.message().contains("credential-sensitive-marker"));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_omits_running_download_detail_from_get_and_watch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let task = tasks
+            .create_bilibili_task("BV1running-credential-error", None)
+            .expect("download task should be created");
+        let _work_item = tasks
+            .try_claim_next_bilibili_task()
+            .expect("download task should become running");
+        assert!(
+            tasks.update_task_progress(
+                &task.id,
+                BilibiliTaskProgress {
+                    progress: Some(0.25),
+                    message: Some(
+                        "retrying https://example.test/media?access_key=running-sensitive-marker"
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                },
+            )
+        );
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: task.id.clone(),
+            }))
+            .await
+            .expect("running task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Running, snapshot.state());
+        assert_eq!(0.25, snapshot.progress);
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            snapshot.message
+        );
+        assert!(!snapshot.message.contains("running-sensitive-marker"));
+
+        let mut stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![task.id.clone()],
+            }))
+            .await
+            .expect("running task watch should start")
+            .into_inner();
+        let watched_snapshot = stream
+            .next()
+            .await
+            .expect("watch should include its initial snapshot")
+            .expect("initial task event should succeed")
+            .task
+            .expect("initial event should include a task");
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            watched_snapshot.message
+        );
+
+        assert!(tasks.update_task_progress(
+            &task.id,
+            BilibiliTaskProgress {
+                progress: Some(0.5),
+                message: Some("BBDown failed with watch-sensitive-marker".to_owned()),
+                ..Default::default()
+            },
+        ));
+        let watched_update = stream
+            .next()
+            .await
+            .expect("watch should include the progress update")
+            .expect("progress task event should succeed")
+            .task
+            .expect("progress event should include a task");
+        assert_eq!(0.5, watched_update.progress);
+        assert_eq!(
+            crate::CREDENTIAL_SAFE_CLIENT_RUNNING_DETAIL,
+            watched_update.message
+        );
+        assert!(!watched_update.message.contains("watch-sensitive-marker"));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_omits_persisted_playable_cache_fill_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let created = tasks
+            .create_bilibili_playback_task("BV1playable-credential-error", None, None)
+            .expect("playback task should be created");
+        tasks
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                PlaybackSource {
+                    item_id: created.task.id.clone(),
+                    variant_id: "source".to_owned(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        created.task.id
+                    ),
+                    expires_at: None,
+                },
+                BilibiliPlaybackSession {
+                    id: created.task.id.clone(),
+                    selected_variant_id: "source".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("playback task should become playable");
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        let sensitive_detail = format!(
+            "Playable online; offline cache fill failed: upstream request https://example.test/media?access_key={synthetic_access_token}"
+        );
+        let degraded = tasks
+            .fail_hls_cache_fill_for_playback_session(
+                &created.task.id,
+                &created.task.id,
+                sensitive_detail.clone(),
+            )
+            .expect("cache fill failure should be accepted")
+            .expect("cache fill failure should update the playable task");
+        assert_eq!(TaskState::Playable, degraded.state());
+        assert!(
+            fs::read_to_string(&task_state_path)
+                .expect("persisted task state should remain readable")
+                .contains(synthetic_access_token)
+        );
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: created.task.id.clone(),
+            }))
+            .await
+            .expect("persisted playable task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Playable, snapshot.state());
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            snapshot.message
+        );
+        assert!(!snapshot.message.contains(synthetic_access_token));
+
+        let mut stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![created.task.id],
+            }))
+            .await
+            .expect("playable task watch should start")
+            .into_inner();
+        let watched_snapshot = stream
+            .next()
+            .await
+            .expect("watch should include its initial snapshot")
+            .expect("initial task event should succeed")
+            .task
+            .expect("initial event should include a task");
+        assert_eq!(TaskState::Playable, watched_snapshot.state());
+        assert_eq!(snapshot.message, watched_snapshot.message);
+        assert!(!watched_snapshot.message.contains(synthetic_access_token));
+    }
+
+    #[tokio::test]
+    async fn credential_configured_rpc_preserves_internal_cancellation_messages() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            bbdown_credential_path: Some(credential_path),
+            ..CacheServerOptions::default()
+        });
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let queued = tasks
+            .create_bilibili_task("BV1queued-cancel", None)
+            .expect("queued task should be created");
+        let queued_cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest { id: queued.id }))
+            .await
+            .expect("queued task cancellation should succeed")
+            .into_inner();
+        assert_eq!(TaskState::Cancelled, queued_cancelled.state());
+        assert_eq!(
+            "Cancelled before the download adapter started.",
+            queued_cancelled.message
+        );
+        assert!(!queued_cancelled.message.contains("server_bug"));
+
+        let running = tasks
+            .create_bilibili_task("BV1running-cancel", None)
+            .expect("running task should be created");
+        let work_item = tasks
+            .try_claim_next_bilibili_task()
+            .expect("download task should become running");
+        assert_eq!(running.id, work_item.task_id);
+        service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: running.id.clone(),
+            }))
+            .await
+            .expect("running task cancellation should be requested");
+        tasks
+            .complete_task_cancelled(&running.id, "Cancelled by request.".to_owned())
+            .expect("running task should finish cancellation");
+
+        let running_cancelled = service
+            .get_task(Request::new(GetTaskRequest { id: running.id }))
+            .await
+            .expect("cancelled task should remain readable")
+            .into_inner();
+        assert_eq!(TaskState::Cancelled, running_cancelled.state());
+        assert_eq!("Cancelled by request.", running_cancelled.message);
+        assert!(!running_cancelled.message.contains("server_bug"));
+
+        let planning = tasks
+            .create_bilibili_playback_task("BV1planning-cancel", None, None)
+            .expect("playback planning task should be created");
+        tasks
+            .complete_task_cancelled(
+                &planning.task.id,
+                PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            )
+            .expect("playback planning task should finish cancellation");
+        let planning_snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: planning.task.id.clone(),
+            }))
+            .await
+            .expect("cancelled playback planning task should remain readable")
+            .into_inner();
+        assert_eq!(
+            PLAYBACK_PLANNING_CANCELLED_MESSAGE,
+            planning_snapshot.message
+        );
+        assert!(!planning_snapshot.message.contains("server_bug"));
+        let mut planning_stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![planning.task.id],
+            }))
+            .await
+            .expect("cancelled playback planning watch should start")
+            .into_inner();
+        let watched_planning = planning_stream
+            .next()
+            .await
+            .expect("watch should include its initial planning snapshot")
+            .expect("initial planning event should succeed")
+            .task
+            .expect("initial planning event should include a task");
+        assert_eq!(planning_snapshot.message, watched_planning.message);
+
+        let explicit = tasks
+            .create_bilibili_playback_task("BV1result-planning-cancel", None, None)
+            .expect("explicit playback task should be created");
+        tasks
+            .update_playback_results(
+                &explicit.task.id,
+                None,
+                PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: format!("{}-result-1", explicit.task.id),
+                    state: TaskState::Cancelled.into(),
+                    message: PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("explicit playback result should record cancellation");
+        tasks
+            .complete_task_cancelled(
+                &explicit.task.id,
+                PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            )
+            .expect("explicit playback task should finish cancellation");
+        let explicit_snapshot = service
+            .get_task(Request::new(GetTaskRequest {
+                id: explicit.task.id.clone(),
+            }))
+            .await
+            .expect("cancelled explicit playback task should remain readable")
+            .into_inner();
+        assert_eq!(
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+            explicit_snapshot.message
+        );
+        assert_eq!(1, explicit_snapshot.result_items.len());
+        assert_eq!(
+            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+            explicit_snapshot.result_items[0].message
+        );
+        assert!(!explicit_snapshot.message.contains("server_bug"));
+        let mut explicit_stream = service
+            .watch_tasks(Request::new(WatchTasksRequest {
+                ids: vec![explicit.task.id],
+            }))
+            .await
+            .expect("cancelled explicit playback watch should start")
+            .into_inner();
+        let watched_explicit = explicit_stream
+            .next()
+            .await
+            .expect("watch should include its initial explicit snapshot")
+            .expect("initial explicit event should succeed")
+            .task
+            .expect("initial explicit event should include a task");
+        assert_eq!(explicit_snapshot.message, watched_explicit.message);
+        assert_eq!(
+            explicit_snapshot.result_items[0].message,
+            watched_explicit.result_items[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_configured_result_item_omits_upstream_detail() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let credential_path = root_path.join("credentials.json");
+        fs::write(&credential_path, "{}").expect("empty credential store should be written");
+        let sensitive_detail = "restricted proxy rejected playurl at https://example.test/playurl?access_key=result-sensitive-marker";
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credential_path),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndScriptedPlaybackPlanner {
+                resolve_requests: Arc::new(Mutex::new(Vec::new())),
+                playback_requests: Arc::new(Mutex::new(Vec::new())),
+                resolution: sample_resolution_with_pages(),
+                results: Mutex::new(HashMap::from([(
+                    "page:1".to_owned(),
+                    Err(BilibiliDownloadError::Failed(sensitive_detail.to_owned())),
+                )])),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1credential-result-error".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: Some(BilibiliTaskSelection {
+                    mode: BILIBILI_TASK_SELECTION_MODE_SINGLE,
+                    selection_ids: vec!["page:1".to_owned()],
+                    range_start_index: 0,
+                    range_end_index: 0,
+                }),
+            }))
+            .await
+            .expect("playback task should be accepted before async planning")
+            .into_inner();
+        let _ = wait_for_task_state(&tasks, &created.id, TaskState::Failed).await;
+
+        let snapshot = service
+            .get_task(Request::new(GetTaskRequest { id: created.id }))
+            .await
+            .expect("failed task should remain readable")
+            .into_inner();
+        assert_eq!(1, snapshot.result_items.len());
+        assert_eq!(
+            crate::credential_safe_client_error(true, &sensitive_detail),
+            snapshot.result_items[0].message
+        );
+        assert!(
+            snapshot.result_items[0]
+                .message
+                .contains("[bilibili_failure_class=restricted_proxy]")
+        );
+        assert!(
+            !snapshot.result_items[0]
+                .message
+                .contains("result-sensitive-marker")
+        );
+    }
+
+    #[test]
+    fn task_client_boundary_redacts_failed_child_of_completed_parent() {
+        let task = Task {
+            state: TaskState::Completed.into(),
+            message: "Completed with one playable result.".to_owned(),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: "upstream result-sensitive-marker".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let sanitized = task_for_client(task, true);
+
+        assert_eq!("Completed with one playable result.", sanitized.message);
+        assert_eq!(
+            crate::credential_safe_client_error(true, &"upstream result-sensitive-marker"),
+            sanitized.result_items[0].message
+        );
+        assert!(
+            !sanitized.result_items[0]
+                .message
+                .contains("result-sensitive-marker")
+        );
+    }
+
+    #[test]
+    fn task_client_boundary_redacts_cache_fill_failure_from_playable_parent_states() {
+        let sensitive_detail =
+            "Playable online; offline cache fill failed: upstream response-sensitive-marker";
+
+        for state in [TaskState::Playable, TaskState::Completed] {
+            let task = Task {
+                kind: TaskKind::BilibiliProgressivePlayback.into(),
+                state: state.into(),
+                message: sensitive_detail.to_owned(),
+                ..Default::default()
+            };
+
+            let sanitized = task_for_client(task, true);
+
+            assert_eq!(state, sanitized.state());
+            assert_eq!(
+                crate::credential_safe_client_error(true, &sensitive_detail),
+                sanitized.message
+            );
+            assert!(!sanitized.message.contains("response-sensitive-marker"));
+        }
+
+        let wrapped = format!(
+            "{} [bilibili_failure_class=restricted_proxy] Playable online; offline cache fill failed.",
+            crate::CREDENTIAL_SAFE_CLIENT_DETAIL
+        );
+        let sanitized = task_for_client(
+            Task {
+                kind: TaskKind::BilibiliProgressivePlayback.into(),
+                state: TaskState::Playable.into(),
+                message: wrapped,
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(
+            format!(
+                "{} [bilibili_failure_class=restricted_proxy]",
+                crate::CREDENTIAL_SAFE_CLIENT_DETAIL
+            ),
+            sanitized.message
+        );
+    }
+
+    #[tokio::test]
     async fn create_bilibili_playback_task_fails_all_selection_for_truncated_resolution() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -4222,7 +4893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_playback_task_scrubs_runtime_hls_alternates_after_finalization() {
+    async fn completed_playback_task_keeps_runtime_hls_alternates_for_stale_clients() {
         let (selected_upstream_url, _selected_upstream_task) = start_mp4_upstream().await;
         let (alternate_upstream_url, _alternate_upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -4290,9 +4961,9 @@ mod tests {
         let runtime_alternate = runtime_session
             .media_resource("v1-video.m4s")
             .expect("runtime alternate media resource should remain serveable");
-        assert!(runtime_alternate.request.url.is_empty());
+        assert_eq!(alternate_upstream_url, runtime_alternate.request.url);
         assert!(runtime_alternate.request.backup_urls.is_empty());
-        assert!(runtime_alternate.request.headers.is_empty());
+        assert!(!runtime_alternate.request.headers.is_empty());
 
         let persisted_session = state
             .hls_cache
@@ -4373,6 +5044,67 @@ mod tests {
                 .expect("playback request log should not be poisoned")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_item_ids_recover_when_a_refreshed_feed_no_longer_contains_the_item() {
+        let selection_id = "item:7:source:recommendation:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let resolution = BilibiliInputResolution {
+            source: "https://www.bilibili.com/".to_owned(),
+            title: "Refreshed recommendations".to_owned(),
+            source_kind: "recommendation".to_owned(),
+            candidates: vec![AdapterBilibiliResolvedCandidate {
+                selection_id:
+                    "item:1:source:recommendation:cid:270002:bvid:BV1yy411c7mD:aid:170002"
+                        .to_owned(),
+                title: "Different recommendation".to_owned(),
+                subtitle: String::new(),
+                source_kind: "recommendation".to_owned(),
+                content_id: "BV1yy411c7mD".to_owned(),
+                index: 1,
+                duration_seconds: Some(60),
+                cover_uri: String::new(),
+            }],
+            default_selection_id: String::new(),
+            candidates_truncated: false,
+        };
+
+        let selected = selected_bilibili_candidates(
+            &resolution,
+            &BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                selection_ids: vec![selection_id.to_owned()],
+            },
+        )
+        .expect("server-owned stable item identity should survive feed refresh");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].selection_id, selection_id);
+        assert_eq!(selected[0].content_id, "BV1xx411c7mD");
+        assert_eq!(selected[0].index, 7);
+    }
+
+    #[test]
+    fn explicit_item_ids_reject_selection_bound_to_another_source() {
+        let resolution = BilibiliInputResolution {
+            source: "https://www.bilibili.com/".to_owned(),
+            title: "Refreshed recommendations".to_owned(),
+            source_kind: "recommendation".to_owned(),
+            candidates: Vec::new(),
+            default_selection_id: String::new(),
+            candidates_truncated: false,
+        };
+
+        let error = selected_bilibili_candidates(
+            &resolution,
+            &BilibiliPlaybackSelectionPlanMode::ExplicitIds {
+                selection_ids: vec![
+                    "item:7:source:history:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+                ],
+            },
+        )
+        .expect_err("cross-source stable selection should be rejected");
+
+        assert!(error.contains("was not found"));
     }
 
     #[tokio::test]
@@ -4697,6 +5429,51 @@ mod tests {
             .expect("test should send playback plan");
         let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
         assert_eq!(TaskState::Playable, playable.state());
+    }
+
+    #[tokio::test]
+    async fn create_playback_task_registers_background_work_before_spawn_poll() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(PendingPlaybackPlanner),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state.clone());
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1registered-before-poll".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+
+        assert!(!state.background_work_is_idle());
+        tasks
+            .cancel_task(&created.id)
+            .expect("pending planning task should accept cancellation");
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled planning task should release background activity");
     }
 
     #[tokio::test]
@@ -5741,7 +6518,7 @@ mod tests {
 
         assert!(report.accepted);
         assert!(active_job.token.is_preempted());
-        state.hls_fill_scheduler.finish_current(&active_job);
+        state.hls_fill_scheduler.finish_current(&active_job, false);
         let promoted = state.hls_fill_scheduler.next_job().await;
         assert_eq!(demoted_task_id, promoted.task_id);
         assert_eq!(
@@ -9858,9 +10635,9 @@ mod tests {
         let runtime_source_video = runtime_session
             .media_resource("video.m4s")
             .expect("runtime source video lookup should remain addressable");
-        assert!(runtime_source_video.request.url.is_empty());
+        assert_eq!(upstream_url, runtime_source_video.request.url);
         assert!(runtime_source_video.request.backup_urls.is_empty());
-        assert!(runtime_source_video.request.headers.is_empty());
+        assert!(!runtime_source_video.request.headers.is_empty());
         let restored_source_video = restored_session
             .media_resource("video.m4s")
             .expect("persisted source video lookup should remain addressable");
@@ -10962,6 +11739,28 @@ mod tests {
                     entries: Vec::new(),
                 })
             })
+        }
+    }
+
+    struct FailingPlaybackPlanner {
+        detail: String,
+    }
+
+    impl BilibiliPlaybackPlanner for FailingPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            _request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            let detail = self.detail.clone();
+            Box::pin(async move { Err(BilibiliDownloadError::Failed(detail)) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let detail = self.detail.clone();
+            Box::pin(async move { Err(BilibiliDownloadError::Failed(detail)) })
         }
     }
 

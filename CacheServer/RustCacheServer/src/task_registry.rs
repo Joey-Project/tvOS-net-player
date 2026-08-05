@@ -40,9 +40,38 @@ const CANCELLED_AFTER_RESTART_MESSAGE: &str = "Cancelled during cache server res
 const CANCEL_REQUESTED_MESSAGE: &str = "Cancellation requested.";
 const CANCELLED_BY_REQUEST_MESSAGE: &str = "Cancelled by request.";
 const CANCELLED_MESSAGE: &str = "Cancelled before the download adapter started.";
+pub(crate) const PLAYBACK_PLANNING_CANCELLED_MESSAGE: &str =
+    "Cancelled before playback planning started.";
+pub(crate) const PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE: &str =
+    "Cancelled while planning Bilibili playback results.";
 const WATCHER_EVENT_BUFFER_CAPACITY: usize = 128;
 const DEFAULT_MAX_TERMINAL_TASKS: usize = 200;
 const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+pub(crate) fn is_known_safe_cancellation_message(message: &str) -> bool {
+    matches!(
+        message,
+        CANCEL_REQUESTED_MESSAGE
+            | CANCELLED_BY_REQUEST_MESSAGE
+            | CANCELLED_AFTER_RESTART_MESSAGE
+            | CANCELLED_MESSAGE
+            | PLAYBACK_PLANNING_CANCELLED_MESSAGE
+            | PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE
+            | "Cancelled before the BBDown adapter started."
+            | "Cancelled while BBDown planning was running."
+            | "Cancelled after Bilibili planning completed."
+            | "Cancelled before the BBDown download started."
+            | "Cancelled while the BBDown download was running."
+            | "Cancelled before BBDown muxing started."
+            | "Cancelled while BBDown muxing was running."
+            | "Cancelled after BBDown muxing completed."
+            | "Cancelled after the BBDown download finished."
+            | "Cancelled before committing the BBDown archive."
+            | "Cancelled while BBDown input resolution was running."
+            | "Cancelled while BBDown playback planning was running."
+            | "Cancelled while BBDown collection item metadata resolution was running."
+    )
+}
 
 pub struct BilibiliTaskRegistry {
     inner: Arc<Mutex<RegistryInner>>,

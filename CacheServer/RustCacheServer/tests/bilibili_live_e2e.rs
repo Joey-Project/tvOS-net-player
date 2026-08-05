@@ -1,5 +1,13 @@
-use std::{collections::HashSet, env, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    env, fs,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use futures_util::FutureExt;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -12,10 +20,9 @@ use tvos_net_player_cache_server::{
     generated::tvos_net_player::v1::{
         BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliResolveResult,
         BilibiliResolvedCandidate, BilibiliTaskResultItem, BilibiliTaskSelection,
-        CancelTaskRequest, CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest,
-        GetTaskRequest, PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task,
-        TaskState, server_service_client::ServerServiceClient,
-        task_service_client::TaskServiceClient,
+        CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest, GetTaskRequest,
+        PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task, TaskState,
+        server_service_client::ServerServiceClient, task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
 };
@@ -24,16 +31,19 @@ const BILIBILI_TASK_SELECTION_MODE_SINGLE: i32 = 3;
 const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
 const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
+const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
+const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
+    "Bilibili error detail omitted because credential material is configured.";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live Bilibili network access and is intentionally outside default CI"]
 async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     let fixture_set = LiveFixtureSet::load();
     let run_policy = LiveRunPolicy::from_env();
-    let server = LiveTestServer::start().await;
     let http = reqwest::Client::new();
     let mut ran_cases = 0usize;
-    let mut credential_status: Option<BilibiliCredentialStatus> = None;
+    let mut failed_cases = Vec::new();
 
     for case in fixture_set.cases.iter().filter(|case| {
         run_policy
@@ -49,26 +59,42 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
             }
         }
 
-        if case.requires_authentication && credential_status.is_none() {
-            credential_status =
-                Some(fetch_bilibili_credential_status(server.channel().await).await);
-        }
-
         ran_cases += 1;
         println!("running {}", case.id);
-        run_live_case(
-            case,
-            server.channel().await,
-            &http,
-            &server.media_url,
-            credential_status.as_ref(),
-        )
+        let server = LiveTestServer::start().await;
+        let task_tracker = LiveTaskTracker::default();
+        let outcome = AssertUnwindSafe(async {
+            let credential_status = fetch_bilibili_credential_status(server.channel().await).await;
+            run_live_case(
+                case,
+                server.channel().await,
+                &http,
+                &server.media_url,
+                Some(&credential_status),
+                &task_tracker,
+            )
+            .await;
+        })
+        .catch_unwind()
         .await;
+        if outcome.is_err() {
+            failed_cases.push(case.id.clone());
+        }
+        server
+            .shutdown(&task_tracker)
+            .await
+            .unwrap_or_else(|message| panic!("{}: live case teardown failed: {message}", case.id));
     }
 
     assert!(
         ran_cases > 0,
         "no live Bilibili e2e cases matched the filter"
+    );
+    assert!(
+        failed_cases.is_empty(),
+        "{} live Bilibili e2e case(s) failed: {}",
+        failed_cases.len(),
+        failed_cases.join(", ")
     );
 }
 
@@ -78,6 +104,7 @@ async fn run_live_case(
     http: &reqwest::Client,
     media_url: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
+    task_tracker: &LiveTaskTracker,
 ) {
     assert_authenticated_case_ready(case, credential_status);
 
@@ -147,6 +174,7 @@ async fn run_live_case(
             )
         })
         .into_inner();
+    task_tracker.record(&created.id);
 
     let playable = wait_for_playable_task(
         &mut task_client,
@@ -187,10 +215,6 @@ async fn run_live_case(
         )
         .await;
     }
-
-    let _ = task_client
-        .cancel_task(Request::new(CancelTaskRequest { id: playable.id }))
-        .await;
 }
 
 async fn wait_for_playable_task(
@@ -220,10 +244,10 @@ async fn wait_for_playable_task(
             TaskState::Failed | TaskState::Cancelled => {
                 panic!(
                     "{}",
-                    live_failure_message(
+                    live_task_failure_message(
                         case,
                         &format!("task ended in {:?}", task.state()),
-                        &task.message,
+                        &task,
                         credential_status,
                     )
                 );
@@ -231,14 +255,14 @@ async fn wait_for_playable_task(
             _ if tokio::time::Instant::now() >= deadline => {
                 panic!(
                     "{}",
-                    live_failure_message(
+                    live_task_failure_message(
                         case,
                         &format!(
                             "task did not become playable within {:?}; last state {:?}",
                             timeout,
                             task.state()
                         ),
-                        &task.message,
+                        &task,
                         credential_status,
                     )
                 );
@@ -325,20 +349,26 @@ async fn assert_hls_master(
 
     let source_url = assert_lan_media_url(case, &source.uri, media_url, label);
 
-    let response =
-        http.get(&source.uri).send().await.unwrap_or_else(|error| {
-            panic!("{}: {label} HLS master request failed: {error}", case.id)
-        });
+    let response = http.get(&source.uri).send().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: {label} HLS master request failed: {}",
+            case.id,
+            error.without_url()
+        )
+    });
     assert_eq!(
         StatusCode::OK,
         response.status(),
         "{}: {label} HLS master returned unexpected status",
         case.id
     );
-    let playlist = response
-        .text()
-        .await
-        .unwrap_or_else(|error| panic!("{}: {label} HLS master body failed: {error}", case.id));
+    let playlist = response.text().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: {label} HLS master body failed: {}",
+            case.id,
+            error.without_url()
+        )
+    });
     assert!(
         playlist.contains("#EXTM3U"),
         "{}: {label} HLS master is not an m3u8 playlist",
@@ -348,31 +378,34 @@ async fn assert_hls_master(
         assert_playlist_stays_on_lan(case, &source_url, &playlist, media_url, label);
     for media_playlist_url in media_playlist_urls {
         let nested_label = format!("{label} media playlist");
+        let media_playlist_origin = lan_media_origin_for_diagnostic(&media_playlist_url);
         let response = http
             .get(media_playlist_url.clone())
             .send()
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "{}: {nested_label} request failed for {media_playlist_url}: {error}",
-                    case.id
+                    "{}: {nested_label} request failed for origin={media_playlist_origin}: {}",
+                    case.id,
+                    error.without_url()
                 )
             });
         assert_eq!(
             StatusCode::OK,
             response.status(),
-            "{}: {nested_label} returned non-OK status for {media_playlist_url}",
+            "{}: {nested_label} returned non-OK status for origin={media_playlist_origin}",
             case.id
         );
         let media_playlist = response.text().await.unwrap_or_else(|error| {
             panic!(
-                "{}: {nested_label} response body failed for {media_playlist_url}: {error}",
-                case.id
+                "{}: {nested_label} response body failed for origin={media_playlist_origin}: {}",
+                case.id,
+                error.without_url()
             )
         });
         assert!(
             media_playlist.starts_with("#EXTM3U"),
-            "{}: {nested_label} is not an m3u8 playlist for {media_playlist_url}",
+            "{}: {nested_label} is not an m3u8 playlist for origin={media_playlist_origin}",
             case.id
         );
         assert_playlist_stays_on_lan(
@@ -396,7 +429,7 @@ fn assert_playlist_stays_on_lan(
     for uri in playlist_referenced_uris(playlist) {
         let resolved = base_url.join(&uri).unwrap_or_else(|error| {
             panic!(
-                "{}: {label} playlist URI is not resolvable against {base_url}: {uri}: {error}",
+                "{}: {label} playlist contains an unresolvable URI: {error}",
                 case.id
             )
         });
@@ -449,10 +482,15 @@ fn assert_lan_media_url(case: &LiveCase, uri: &str, media_url: &str, label: &str
             parsed.host_str(),
             parsed.port_or_known_default()
         ),
-        "{}: {label} escaped the LAN media listener: {uri}",
-        case.id
+        "{}: {label} escaped the LAN media listener: origin={}",
+        case.id,
+        lan_media_origin_for_diagnostic(&parsed)
     );
     parsed
+}
+
+fn lan_media_origin_for_diagnostic(url: &Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,6 +763,12 @@ fn assert_stable_item_candidate(case: &LiveCase, candidate: &BilibiliResolvedCan
         selection_id
     );
     assert!(
+        selection_id.contains(":source:"),
+        "{}: stable collection item selection lacks source binding: {}",
+        case.id,
+        selection_id
+    );
+    assert!(
         selection_id.contains(":cid:"),
         "{}: stable collection item id is missing cid: {}",
         case.id,
@@ -829,9 +873,7 @@ async fn fetch_bilibili_credential_status(
     ServerServiceClient::new(channel)
         .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
         .await
-        .unwrap_or_else(|error| {
-            panic!("failed to read Bilibili credential status from live server: {error}")
-        })
+        .unwrap_or_else(|_| panic!("failed to read Bilibili credential status from live server"))
         .into_inner()
 }
 
@@ -874,7 +916,54 @@ fn live_failure_message(
     credential_status: Option<&BilibiliCredentialStatus>,
 ) -> String {
     let class = classify_live_failure(case, phase, detail, credential_status);
+    let detail = safe_live_failure_detail(detail, credential_status);
     format!("{}: {phase} failed [{}]: {detail}", case.id, class.as_str())
+}
+
+fn live_task_failure_message(
+    case: &LiveCase,
+    phase: &str,
+    task: &Task,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> String {
+    let classification_detail = task_failure_classification_detail(task);
+    let class = classify_live_failure(case, phase, &classification_detail, credential_status);
+    let failed_result_count = task
+        .result_items
+        .iter()
+        .filter(|item| item.state() == TaskState::Failed)
+        .count();
+    let detail = safe_live_failure_detail(&task.message, credential_status);
+    format!(
+        "{}: {phase} failed [{}]: {detail}; failed_result_count={failed_result_count}",
+        case.id,
+        class.as_str(),
+    )
+}
+
+fn safe_live_failure_detail<'a>(
+    detail: &'a str,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> &'a str {
+    if credential_status
+        .is_some_and(|status| status.credential_path_configured || status.credential_file_loaded)
+    {
+        "upstream detail omitted because credential material is configured"
+    } else {
+        detail
+    }
+}
+
+fn task_failure_classification_detail(task: &Task) -> String {
+    let mut details = Vec::with_capacity(task.result_items.len() + 1);
+    details.push(task.message.as_str());
+    details.extend(
+        task.result_items
+            .iter()
+            .map(|item| item.message.as_str())
+            .filter(|message| !message.trim().is_empty()),
+    );
+    details.join("; ")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -904,13 +993,17 @@ fn classify_live_failure(
     detail: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
 ) -> LiveFailureClass {
-    let detail = detail.to_ascii_lowercase();
     if case.requires_authentication
         && credential_status
             .is_some_and(|status| !status.credential_file_loaded || !status.web_cookie_present)
     {
         return LiveFailureClass::Credential;
     }
+    if let Some(class) = tagged_live_failure_class(detail) {
+        return class;
+    }
+
+    let detail = untagged_live_failure_detail(detail);
     if case.requires_authentication
         && contains_any(
             &detail,
@@ -978,6 +1071,43 @@ fn classify_live_failure(
     LiveFailureClass::ServerBug
 }
 
+fn untagged_live_failure_detail(detail: &str) -> String {
+    let mut detail = detail.to_ascii_lowercase();
+    for class in [
+        LiveFailureClass::Credential,
+        LiveFailureClass::EmptyAccountState,
+        LiveFailureClass::RestrictedProxy,
+        LiveFailureClass::UpstreamSchemaOrAvailability,
+        LiveFailureClass::ServerBug,
+    ] {
+        detail = detail.replace(
+            &format!("[{BILIBILI_FAILURE_CLASS_TAG}={}]", class.as_str()),
+            "",
+        );
+    }
+    detail
+}
+
+fn tagged_live_failure_class(detail: &str) -> Option<LiveFailureClass> {
+    if !detail.contains(CREDENTIAL_SAFE_CLIENT_DETAIL) {
+        return None;
+    }
+    [
+        LiveFailureClass::Credential,
+        LiveFailureClass::EmptyAccountState,
+        LiveFailureClass::RestrictedProxy,
+        LiveFailureClass::UpstreamSchemaOrAvailability,
+        LiveFailureClass::ServerBug,
+    ]
+    .into_iter()
+    .find(|class| {
+        detail.contains(&format!(
+            "[{BILIBILI_FAILURE_CLASS_TAG}={}]",
+            class.as_str()
+        ))
+    })
+}
+
 fn looks_like_upstream_planning_failure(detail: &str) -> bool {
     contains_any(
         detail,
@@ -1009,12 +1139,34 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+#[derive(Clone, Default)]
+struct LiveTaskTracker {
+    task_id: Arc<Mutex<Option<String>>>,
+}
+
+impl LiveTaskTracker {
+    fn record(&self, task_id: &str) {
+        *self
+            .task_id
+            .lock()
+            .expect("live task tracker lock should not be poisoned") = Some(task_id.to_owned());
+    }
+
+    fn task_id(&self) -> Option<String> {
+        self.task_id
+            .lock()
+            .expect("live task tracker lock should not be poisoned")
+            .clone()
+    }
+}
+
 struct LiveTestServer {
-    _temp_root: TempDir,
+    temp_root: Option<TempDir>,
+    state: AppState,
     grpc_url: String,
     media_url: String,
-    _grpc_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    _media_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    grpc_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+    media_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
 }
 
 impl LiveTestServer {
@@ -1029,15 +1181,16 @@ impl LiveTestServer {
         let state = AppState::new(options);
 
         let grpc_task = tokio::spawn(run_grpc_listener(grpc_listener, state.clone()));
-        let media_task = tokio::spawn(run_media_listener(media_listener, state));
+        let media_task = tokio::spawn(run_media_listener(media_listener, state.clone()));
 
         wait_for_grpc(&grpc_url).await;
         Self {
-            _temp_root: temp_root,
+            temp_root: Some(temp_root),
+            state,
             grpc_url,
             media_url,
-            _grpc_task: grpc_task,
-            _media_task: media_task,
+            grpc_task: Some(grpc_task),
+            media_task: Some(media_task),
         }
     }
 
@@ -1047,6 +1200,158 @@ impl LiveTestServer {
             .connect()
             .await
             .unwrap()
+    }
+
+    async fn shutdown(mut self, task_tracker: &LiveTaskTracker) -> Result<(), String> {
+        let listener_result = self.stop_listeners().await;
+        let background_result = self.cancel_case_tasks_and_wait(task_tracker).await;
+        self.finish_teardown(combine_teardown_results(listener_result, background_result))
+    }
+
+    fn temp_root_path(&self) -> &Path {
+        self.temp_root
+            .as_ref()
+            .expect("live e2e temp root should be present")
+            .path()
+    }
+
+    fn finish_teardown(mut self, result: Result<(), String>) -> Result<(), String> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let retained_root = self
+                    .temp_root
+                    .take()
+                    .expect("live e2e temp root should be present")
+                    .keep();
+                Err(format!(
+                    "{error}; retained live e2e root for recovery: {}",
+                    retained_root.display()
+                ))
+            }
+        }
+    }
+
+    async fn cancel_case_tasks_and_wait(
+        &self,
+        task_tracker: &LiveTaskTracker,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + LIVE_CASE_TEARDOWN_TIMEOUT;
+        loop {
+            let task_ids = self.case_task_ids(task_tracker)?;
+            self.cancel_case_tasks(&task_ids)?;
+            if self.case_tasks_are_terminal(&task_ids)? && self.state.background_work_is_idle() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let stable_task_ids = self.case_task_ids(task_tracker)?;
+                self.cancel_case_tasks(&stable_task_ids)?;
+                if stable_task_ids == task_ids
+                    && self.case_tasks_are_terminal(&stable_task_ids)?
+                    && self.state.background_work_is_idle()
+                {
+                    self.state.shutdown_hls_fill_worker().await;
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "background planning/cache work did not become idle ({})",
+                    self.state.background_work_diagnostics()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn case_task_ids(&self, task_tracker: &LiveTaskTracker) -> Result<Vec<String>, String> {
+        let subscription = self
+            .state
+            .tasks
+            .subscribe(&[])
+            .map_err(|_| "case task registry could not be inspected".to_owned())?;
+        let mut task_ids = subscription
+            .snapshots()
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<HashSet<_>>();
+        if let Some(task_id) = task_tracker.task_id() {
+            task_ids.insert(task_id);
+        }
+        let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
+        task_ids.sort();
+        Ok(task_ids)
+    }
+
+    fn cancel_case_tasks(&self, task_ids: &[String]) -> Result<(), String> {
+        for task_id in task_ids {
+            self.state
+                .tasks
+                .cancel_task(task_id)
+                .map_err(|_| format!("case task {task_id} could not be cancelled"))?;
+            self.state.cancel_hls_fill_work_for_task(task_id);
+        }
+        Ok(())
+    }
+
+    fn case_tasks_are_terminal(&self, task_ids: &[String]) -> Result<bool, String> {
+        task_ids.iter().try_fold(true, |all_terminal, task_id| {
+            let task = self
+                .state
+                .tasks
+                .get_task(task_id)
+                .map_err(|_| format!("case task {task_id} disappeared during teardown"))?;
+            Ok(all_terminal
+                && matches!(
+                    task.state(),
+                    TaskState::Succeeded
+                        | TaskState::Completed
+                        | TaskState::Failed
+                        | TaskState::Cancelled
+                ))
+        })
+    }
+
+    async fn stop_listeners(&mut self) -> Result<(), String> {
+        let grpc_result = abort_and_wait_listener("gRPC", self.grpc_task.take()).await;
+        let media_result = abort_and_wait_listener("media", self.media_task.take()).await;
+        combine_teardown_results(grpc_result, media_result)
+    }
+}
+
+impl Drop for LiveTestServer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.grpc_task {
+            task.abort();
+        }
+        if let Some(task) = &self.media_task {
+            task.abort();
+        }
+    }
+}
+
+async fn abort_and_wait_listener(
+    name: &str,
+    task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+) -> Result<(), String> {
+    let Some(task) = task else {
+        return Ok(());
+    };
+    task.abort();
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("{name} listener failed: {error}")),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(format!("{name} listener join failed: {error}")),
+    }
+}
+
+fn combine_teardown_results(
+    first: Result<(), String>,
+    second: Result<(), String>,
+) -> Result<(), String> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(format!("{first}; {second}")),
     }
 }
 
@@ -1077,35 +1382,44 @@ fn live_server_options(
         "--Cache:HlsCacheMaxBytes".to_owned(),
         "0".to_owned(),
     ];
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH",
-        "Cache:BBDownCredentialPath",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_AREA",
-        "Cache:BBDownRestrictedArea",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY",
-        "Cache:BBDownRestrictedAreaProxy",
-    );
-    push_arg_from_env(
-        &mut args,
-        "BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY",
-        "Cache:BBDownRestrictedApiProxy",
-    );
+    args.extend(live_server_environment_args(|key| env::var(key).ok()));
 
     CacheServerOptions::from_args(args)
         .expect("live e2e cache server options should parse")
         .normalized_for_runtime()
 }
 
-fn push_arg_from_env(args: &mut Vec<String>, env_key: &str, config_key: &str) {
-    let Some(value) = env::var(env_key)
-        .ok()
+fn live_server_environment_args(get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (env_key, config_key) in [
+        (
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH",
+            "Cache:BBDownCredentialPath",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE",
+            "Cache:BBDownCredentialProfile",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_AREA",
+            "Cache:BBDownRestrictedArea",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY",
+            "Cache:BBDownRestrictedAreaProxy",
+        ),
+        (
+            "BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY",
+            "Cache:BBDownRestrictedApiProxy",
+        ),
+    ] {
+        push_arg_from_value(&mut args, get_env(env_key), config_key);
+    }
+    args
+}
+
+fn push_arg_from_value(args: &mut Vec<String>, value: Option<String>, config_key: &str) {
+    let Some(value) = value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
@@ -1134,6 +1448,99 @@ async fn wait_for_grpc(grpc_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_media_origin_diagnostic_omits_credential_query() {
+        // Synthetic token fixture: joey-private-v3/access-a.
+        let synthetic_access_token = "codex_synth_v1_access_a";
+        let url = Url::parse(&format!(
+            "https://upstream.example.test/media/video.m4s?access_key={synthetic_access_token}"
+        ))
+        .expect("synthetic upstream URL should parse");
+
+        let diagnostic = lan_media_origin_for_diagnostic(&url);
+
+        assert_eq!("https://upstream.example.test", diagnostic);
+        assert!(!diagnostic.contains(synthetic_access_token));
+        assert!(!diagnostic.contains("access_key"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_untracked_registry_task_before_removing_case_root() {
+        let server = LiveTestServer::start().await;
+        let root_path = server.temp_root_path().to_owned();
+        let tasks = Arc::clone(&server.state.tasks);
+        let task = tasks
+            .create_bilibili_task("BV1xx411c7mD", None)
+            .expect("untracked case task should be created");
+        let task_tracker = LiveTaskTracker::default();
+
+        assert_eq!(TaskState::Queued, task.state());
+        assert!(task_tracker.task_id().is_none());
+
+        server
+            .shutdown(&task_tracker)
+            .await
+            .expect("case shutdown should discover and cancel untracked tasks");
+
+        assert_eq!(
+            TaskState::Cancelled,
+            tasks
+                .get_task(&task.id)
+                .expect("cancelled task should remain in the registry")
+                .state()
+        );
+        assert!(
+            !root_path.exists(),
+            "case root should be removed only after listeners and background work stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_retains_case_root_and_persisted_state_for_recovery() {
+        let mut server = LiveTestServer::start().await;
+        let root_path = server.temp_root_path().to_owned();
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        server
+            .state
+            .tasks
+            .create_bilibili_task("BV1retained-state", None)
+            .expect("diagnostic task state should be persisted");
+        assert!(task_state_path.exists());
+        server
+            .stop_listeners()
+            .await
+            .expect("test listeners should stop cleanly");
+
+        let error = server
+            .finish_teardown(Err("forced teardown failure".to_owned()))
+            .expect_err("forced teardown failure should be reported");
+
+        assert!(error.contains("forced teardown failure"));
+        assert!(error.contains(&root_path.display().to_string()));
+        assert!(
+            root_path.exists(),
+            "failed teardown should retain the isolated root and persisted state"
+        );
+        assert!(task_state_path.exists());
+        fs::remove_dir_all(&root_path).expect("retained test root should be removable");
+    }
+
+    #[test]
+    fn live_server_environment_args_maps_named_credential_profile() {
+        let args = live_server_environment_args(|key| match key {
+            "BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE" => Some("family-room".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(
+            vec![
+                "--Cache:BBDownCredentialProfile".to_owned(),
+                "family-room".to_owned(),
+            ],
+            args
+        );
+    }
 
     #[test]
     fn fixture_set_includes_authenticated_page_fetch_cases() {
@@ -1228,7 +1635,8 @@ mod tests {
     fn stable_item_candidate_contract_accepts_complete_identity() {
         let case = test_case("space-videos", false, false);
         let valid = BilibiliResolvedCandidate {
-            selection_id: "item:1:cid:270001:bvid:BV1xx411c7mD:aid:170001".to_owned(),
+            selection_id: "item:1:source:space-videos-123:cid:270001:bvid:BV1xx411c7mD:aid:170001"
+                .to_owned(),
             source_kind: "space".to_owned(),
             content_id: "BV1xx411c7mD".to_owned(),
             index: 1,
@@ -1526,6 +1934,145 @@ mod tests {
                 "{detail}"
             );
         }
+    }
+
+    #[test]
+    fn task_failure_message_classifies_child_result_without_exposing_raw_detail() {
+        let case = test_case("bangumi-media-series", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            access_key_present: true,
+            ..Default::default()
+        };
+        let task = Task {
+            message: "request failed with parent-sensitive-marker".to_owned(),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: "restricted proxy rejected child-sensitive-marker".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let message =
+            live_task_failure_message(&case, "task ended in Failed", &task, Some(&status));
+
+        assert!(message.contains("[restricted_proxy]"));
+        assert!(message.contains("failed_result_count=1"));
+        assert!(!message.contains("parent-sensitive-marker"));
+        assert!(!message.contains("child-sensitive-marker"));
+    }
+
+    #[test]
+    fn task_failure_message_uses_typed_rpc_class_after_detail_redaction() {
+        let case = test_case("bangumi-media-series", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            access_key_present: true,
+            ..Default::default()
+        };
+        let task = Task {
+            message: format!("{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=server_bug]"),
+            result_items: vec![BilibiliTaskResultItem {
+                state: TaskState::Failed.into(),
+                message: format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=restricted_proxy]"
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let message =
+            live_task_failure_message(&case, "task ended in Failed", &task, Some(&status));
+
+        assert!(message.contains("[restricted_proxy]"));
+        assert!(message.contains("failed_result_count=1"));
+    }
+
+    #[test]
+    fn authenticated_failure_prefers_typed_upstream_class_over_safe_marker_wording() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            LiveFailureClass::UpstreamSchemaOrAvailability,
+            classify_live_failure(
+                &case,
+                "task ended in Failed",
+                &format!(
+                    "{CREDENTIAL_SAFE_CLIENT_DETAIL} [bilibili_failure_class=upstream_schema_or_availability]"
+                ),
+                Some(&status),
+            )
+        );
+    }
+
+    #[test]
+    fn failure_classification_does_not_trust_raw_upstream_class_tag() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            LiveFailureClass::UpstreamSchemaOrAvailability,
+            classify_live_failure(
+                &case,
+                "task ended in Failed",
+                "upstream request failed [bilibili_failure_class=credential]",
+                Some(&status),
+            )
+        );
+    }
+
+    #[test]
+    fn live_failure_message_omits_raw_detail_when_credentials_are_loaded() {
+        let case = test_case("authenticated-history", true, false);
+        let status = BilibiliCredentialStatus {
+            credential_file_loaded: true,
+            web_cookie_present: true,
+            ..Default::default()
+        };
+
+        let message = live_failure_message(
+            &case,
+            "resolve",
+            "login cookie rejected credential-sensitive-marker",
+            Some(&status),
+        );
+
+        assert!(message.contains("[credential]"));
+        assert!(message.contains("upstream detail omitted"));
+        assert!(!message.contains("credential-sensitive-marker"));
+        assert!(!message.contains("cookie"));
+    }
+
+    #[test]
+    fn live_failure_message_omits_raw_detail_when_credential_path_fails_to_load() {
+        let case = test_case("bangumi-episode", false, true);
+        let status = BilibiliCredentialStatus {
+            credential_path_configured: true,
+            credential_file_loaded: false,
+            ..Default::default()
+        };
+
+        let message = live_failure_message(
+            &case,
+            "resolve",
+            "failed to read /private/credential-sensitive-marker.json",
+            Some(&status),
+        );
+
+        assert!(message.contains("upstream detail omitted"));
+        assert!(!message.contains("credential-sensitive-marker"));
+        assert!(!message.contains("/private/"));
     }
 
     #[test]

@@ -63,6 +63,7 @@ collection/list cases 默认跳过，需要通过 `BILIBILI_LIVE_E2E_CASES` 或 
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
 BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY='hk=https://proxy.example/playurl' \
 BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://proxy.example/api' \
@@ -74,9 +75,12 @@ just test-bilibili-live
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_CASES=authenticated-history \
 just test-bilibili-live
 ```
+
+当 credential 文件是多 profile store 且目标凭证不是 default profile 时，使用 `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` 选择 server 侧 profile；该值只是 profile ID，测试不会把 cookie/access key 传给客户端或写入日志。
 
 ## LAN Cache Server
 
