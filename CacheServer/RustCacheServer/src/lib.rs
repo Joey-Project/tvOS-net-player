@@ -56,7 +56,8 @@ use crate::{
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
-        sanitized_completed_session, source_completed_session_for_restore,
+        completed_runtime_session, sanitized_completed_session,
+        source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -81,6 +82,7 @@ const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
+const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -93,6 +95,7 @@ pub struct AppState {
     pub(crate) hls_upstream_client: reqwest::Client,
     pub(crate) playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     pub(crate) playback_planning_permits: Arc<Semaphore>,
+    playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
@@ -110,6 +113,16 @@ pub struct AppState {
 pub(crate) struct HlsCacheEvictionProtectionGuard {
     session_id: String,
     protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+pub(crate) struct PlaybackPlanningActivityGuard {
+    active_jobs: Arc<AtomicUsize>,
+}
+
+impl Drop for PlaybackPlanningActivityGuard {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for HlsCacheEvictionProtectionGuard {
@@ -288,6 +301,7 @@ impl AppState {
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
         ));
+        let playback_planning_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
         let lan_transcoding_permits = Arc::new(Semaphore::new(
@@ -308,6 +322,7 @@ impl AppState {
             hls_upstream_client,
             playback_planner,
             playback_planning_permits,
+            playback_planning_active_jobs,
             hls_cache_finalization_permits,
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
@@ -694,6 +709,76 @@ impl AppState {
         self.hls_sessions.remove(session_id);
         self.hls_network_policy.remove_session(session_id);
         self.hls_playback_progress.remove_session(session_id);
+    }
+
+    pub(crate) fn register_completed_hls_runtime_session(&self, session: &HlsPlaybackSession) {
+        self.register_completed_hls_runtime_session_with_grace(
+            session,
+            HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD,
+        );
+    }
+
+    fn register_completed_hls_runtime_session_with_grace(
+        &self,
+        session: &HlsPlaybackSession,
+        grace_period: Duration,
+    ) {
+        let runtime_session = completed_runtime_session(session);
+        let sanitized_session = sanitized_completed_session(session);
+        let session_id = runtime_session.id.clone();
+        let generation = self.hls_sessions.insert(runtime_session);
+
+        let registry = self.hls_sessions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace_period).await;
+            registry.replace_if_generation(&session_id, generation, sanitized_session);
+        });
+    }
+
+    pub(crate) fn begin_playback_planning(&self) -> PlaybackPlanningActivityGuard {
+        self.playback_planning_active_jobs
+            .fetch_add(1, Ordering::SeqCst);
+        PlaybackPlanningActivityGuard {
+            active_jobs: Arc::clone(&self.playback_planning_active_jobs),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn background_work_is_idle(&self) -> bool {
+        self.playback_planning_active_jobs.load(Ordering::SeqCst) == 0
+            && self.playback_planning_permits.available_permits()
+                == self.options.bilibili_worker_max_concurrent_tasks.max(1)
+            && self.hls_cache_finalization_permits.available_permits()
+                == HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS
+            && self.lan_transcoding_permits.available_permits()
+                == self.options.lan_transcoding_max_concurrent_jobs.max(1)
+            && self.lan_transcoding_active_job_count() == 0
+            && self.hls_fill_scheduler.is_idle()
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_hls_fill_work_for_task(&self, task_id: &str) {
+        self.hls_fill_scheduler.cancel_task(task_id);
+    }
+
+    #[doc(hidden)]
+    pub fn background_work_diagnostics(&self) -> String {
+        let (hls_fill_current, hls_fill_foreground, hls_fill_demoted) =
+            self.hls_fill_scheduler.diagnostic_counts();
+        format!(
+            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}",
+            self.playback_planning_active_jobs.load(Ordering::SeqCst),
+            self.playback_planning_permits.available_permits(),
+            self.options.bilibili_worker_max_concurrent_tasks.max(1),
+            self.hls_cache_finalization_permits.available_permits(),
+            HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS,
+            self.lan_transcoding_active_job_count(),
+            self.lan_transcoding_permits.available_permits(),
+            self.options.lan_transcoding_max_concurrent_jobs.max(1),
+            hls_fill_current,
+            hls_fill_foreground,
+            hls_fill_demoted,
+        )
     }
 
     fn completed_hls_task_is_authorized(&self, session_id: &str) -> bool {
@@ -1728,6 +1813,122 @@ mod tests {
         }
 
         drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_session_scrubs_alternate_upstream_after_grace_period() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut session = sample_hls_session("completion-grace");
+        let mut alternate = session.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://example.test/alternate-video.m4s".to_owned();
+        session.alternate_variants = vec![alternate];
+
+        state
+            .register_completed_hls_runtime_session_with_grace(&session, Duration::from_millis(10));
+
+        let runtime = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should be registered");
+        assert!(runtime.variant.video.request.url.is_empty());
+        assert_eq!(
+            "https://example.test/alternate-video.m4s",
+            runtime.alternate_variants[0].video.request.url
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let scrubbed = state
+            .hls_sessions
+            .get(&session.id)
+            .expect("completed runtime session should remain registered");
+        assert!(scrubbed.variant.video.request.url.is_empty());
+        assert!(scrubbed.alternate_variants[0].video.request.url.is_empty());
+        assert!(
+            scrubbed.alternate_variants[0]
+                .video
+                .request
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_scrub_does_not_replace_newer_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let mut completed = sample_hls_session("completion-replaced");
+        let mut alternate = completed.variant.clone();
+        alternate.id = "h264-alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        completed.alternate_variants = vec![alternate];
+        state.register_completed_hls_runtime_session_with_grace(
+            &completed,
+            Duration::from_millis(10),
+        );
+
+        let newer = completed_runtime_session(&completed);
+        state.hls_sessions.insert(newer.clone());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(Some(newer), state.hls_sessions.get(&completed.id));
+    }
+
+    #[tokio::test]
+    async fn background_work_idle_tracks_pending_and_active_work() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        assert!(state.background_work_is_idle());
+
+        let planning_activity = state.begin_playback_planning();
+        assert!(!state.background_work_is_idle());
+        drop(planning_activity);
+        assert!(state.background_work_is_idle());
+
+        let planning_permit = Arc::clone(&state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .expect("planning permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(planning_permit);
+
+        let finalization_permit = Arc::clone(&state.hls_cache_finalization_permits)
+            .acquire_owned()
+            .await
+            .expect("finalization permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(finalization_permit);
+
+        let transcoding_permit = Arc::clone(&state.lan_transcoding_permits)
+            .acquire_owned()
+            .await
+            .expect("transcoding permit should be available");
+        assert!(!state.background_work_is_idle());
+        drop(transcoding_permit);
+
+        state
+            .lan_transcoding_active_jobs
+            .fetch_add(1, Ordering::SeqCst);
+        assert!(!state.background_work_is_idle());
+        state
+            .lan_transcoding_active_jobs
+            .fetch_sub(1, Ordering::SeqCst);
+
+        let (task_id, session) = create_playable_hls_task(&state, "BV1background-idle");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!state.background_work_is_idle());
+        let current_job = state.hls_fill_scheduler.next_job().await;
+        assert!(!state.background_work_is_idle());
+        state.cancel_hls_fill_work_for_task(&task_id);
+        assert!(current_job.token.is_cancelled());
+        state.hls_fill_scheduler.finish_current(&current_job);
+        assert!(state.background_work_is_idle());
     }
 
     #[tokio::test]

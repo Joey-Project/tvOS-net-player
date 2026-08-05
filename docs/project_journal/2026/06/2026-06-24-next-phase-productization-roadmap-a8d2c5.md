@@ -82,10 +82,10 @@ superseded_by:
 ### PR 5: Authenticated And Restricted Live Validation Expansion
 
 - Status: completed by the `wip/authenticated-restricted-live-validation` slice.
-- Added named credential-profile selection, per-case server isolation, aggregate failures, and credential-safe output for opt-in live validation.
+- Added named credential-profile selection, per-case server isolation, aggregate failures, credential-safe output, and teardown that cancels both task lifecycle work and scheduler fills before waiting for terminal task plus stable registered background-work quiescence. Terminal multi-result parents cannot leave secondary cache fills running against a dropped live-test root.
 - Passed authenticated history, watch-later, recommendations, space videos, and restricted Bangumi media/episode through the LAN cache/HLS path.
 - Added stable dynamic collection-item recovery and exact page selection so feed reordering cannot silently play a different item.
-- Fixed completed-HLS alternate-playlist and range races without persisting upstream URLs or headers.
+- Fixed completed-HLS alternate-playlist and range races without persisting upstream URLs or headers: hidden runtime alternate requests receive a fixed 60-second absolute compatibility grace, then an atomic generation-bound scrub removes them without touching a newer same-id session.
 - Classified following/dynamic as an upstream schema/availability failure because `bbdown-core v0.5.0` does not yet accept numeric-string `module_author.pub_ts`; keep this as an explicit dependency follow-up.
 - Kept every credential-dependent and restricted case outside default CI.
 

@@ -1,4 +1,11 @@
-use std::{collections::HashSet, env, fs, panic::AssertUnwindSafe, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    env, fs,
+    panic::AssertUnwindSafe,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::FutureExt;
 use reqwest::{StatusCode, Url};
@@ -13,10 +20,9 @@ use tvos_net_player_cache_server::{
     generated::tvos_net_player::v1::{
         BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliResolveResult,
         BilibiliResolvedCandidate, BilibiliTaskResultItem, BilibiliTaskSelection,
-        CancelTaskRequest, CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest,
-        GetTaskRequest, PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task,
-        TaskState, server_service_client::ServerServiceClient,
-        task_service_client::TaskServiceClient,
+        CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest, GetTaskRequest,
+        PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task, TaskState,
+        server_service_client::ServerServiceClient, task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
 };
@@ -25,6 +31,7 @@ const BILIBILI_TASK_SELECTION_MODE_SINGLE: i32 = 3;
 const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
 const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
+const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live Bilibili network access and is intentionally outside default CI"]
@@ -34,7 +41,6 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     let http = reqwest::Client::new();
     let mut ran_cases = 0usize;
     let mut failed_cases = Vec::new();
-    let mut retired_servers = Vec::new();
 
     for case in fixture_set.cases.iter().filter(|case| {
         run_policy
@@ -53,6 +59,7 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
         ran_cases += 1;
         println!("running {}", case.id);
         let server = LiveTestServer::start().await;
+        let task_tracker = LiveTaskTracker::default();
         let outcome = AssertUnwindSafe(async {
             let credential_status = fetch_bilibili_credential_status(server.channel().await).await;
             run_live_case(
@@ -61,6 +68,7 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
                 &http,
                 &server.media_url,
                 Some(&credential_status),
+                &task_tracker,
             )
             .await;
         })
@@ -69,12 +77,13 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
         if outcome.is_err() {
             failed_cases.push(case.id.clone());
         }
+        server
+            .cancel_tracked_task_and_wait(&task_tracker)
+            .await
+            .unwrap_or_else(|message| panic!("{}: live case teardown failed: {message}", case.id));
         server.stop_listeners();
-        retired_servers.push(server);
+        drop(server);
     }
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    drop(retired_servers);
 
     assert!(
         ran_cases > 0,
@@ -94,6 +103,7 @@ async fn run_live_case(
     http: &reqwest::Client,
     media_url: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
+    task_tracker: &LiveTaskTracker,
 ) {
     assert_authenticated_case_ready(case, credential_status);
 
@@ -163,6 +173,7 @@ async fn run_live_case(
             )
         })
         .into_inner();
+    task_tracker.record(&created.id);
 
     let playable = wait_for_playable_task(
         &mut task_client,
@@ -203,10 +214,6 @@ async fn run_live_case(
         )
         .await;
     }
-
-    let _ = task_client
-        .cancel_task(Request::new(CancelTaskRequest { id: playable.id }))
-        .await;
 }
 
 async fn wait_for_playable_task(
@@ -1068,8 +1075,30 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+#[derive(Clone, Default)]
+struct LiveTaskTracker {
+    task_id: Arc<Mutex<Option<String>>>,
+}
+
+impl LiveTaskTracker {
+    fn record(&self, task_id: &str) {
+        *self
+            .task_id
+            .lock()
+            .expect("live task tracker lock should not be poisoned") = Some(task_id.to_owned());
+    }
+
+    fn task_id(&self) -> Option<String> {
+        self.task_id
+            .lock()
+            .expect("live task tracker lock should not be poisoned")
+            .clone()
+    }
+}
+
 struct LiveTestServer {
     _temp_root: TempDir,
+    state: AppState,
     grpc_url: String,
     media_url: String,
     _grpc_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
@@ -1088,11 +1117,12 @@ impl LiveTestServer {
         let state = AppState::new(options);
 
         let grpc_task = tokio::spawn(run_grpc_listener(grpc_listener, state.clone()));
-        let media_task = tokio::spawn(run_media_listener(media_listener, state));
+        let media_task = tokio::spawn(run_media_listener(media_listener, state.clone()));
 
         wait_for_grpc(&grpc_url).await;
         Self {
             _temp_root: temp_root,
+            state,
             grpc_url,
             media_url,
             _grpc_task: grpc_task,
@@ -1106,6 +1136,45 @@ impl LiveTestServer {
             .connect()
             .await
             .unwrap()
+    }
+
+    async fn cancel_tracked_task_and_wait(
+        &self,
+        task_tracker: &LiveTaskTracker,
+    ) -> Result<(), String> {
+        let task_id = task_tracker.task_id();
+        if let Some(task_id) = task_id.as_deref() {
+            self.state
+                .tasks
+                .cancel_task(task_id)
+                .map_err(|_| "tracked task could not be cancelled".to_owned())?;
+            self.state.cancel_hls_fill_work_for_task(task_id);
+        }
+
+        let deadline = tokio::time::Instant::now() + LIVE_CASE_TEARDOWN_TIMEOUT;
+        loop {
+            let task_is_terminal = task_id.as_deref().is_none_or(|task_id| {
+                self.state.tasks.get_task(task_id).is_ok_and(|task| {
+                    matches!(
+                        task.state(),
+                        TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+                    )
+                })
+            });
+            if task_is_terminal && self.state.background_work_is_idle() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if self.state.background_work_is_idle() {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "background planning/cache work did not become idle ({})",
+                    self.state.background_work_diagnostics()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn stop_listeners(&self) {

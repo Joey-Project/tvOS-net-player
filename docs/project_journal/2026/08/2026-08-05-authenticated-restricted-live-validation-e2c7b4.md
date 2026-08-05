@@ -21,9 +21,9 @@ superseded_by:
 ## Delivered
 
 - Added `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` and mapped it to the server's `Cache:BBDownCredentialProfile` setting.
-- Added per-case server isolation, aggregate failure reporting, credential-safe details, and failure classes for credential, empty account state, upstream schema/availability, restricted proxy, and server defects.
+- Added per-case server isolation, aggregate failure reporting, credential-safe details, and failure classes for credential, empty account state, upstream schema/availability, restricted proxy, and server defects. Teardown now tracks the created task, cancels it, explicitly cancels its queued/current scheduler fills, and proves the task and registered planning/finalization/transcoding/HLS-fill work are idle before dropping that case's cache root. This also covers terminal multi-result parents whose secondary cache fill remains active after the primary cache completes.
 - Preserved stable Bilibili collection-item identity when recommendations or other dynamic feeds reorder between selection and task execution, including exact page selection by embedded CID.
-- Kept completed HLS playlists upstream-free while allowing already-issued alternate playlist and range URLs to finish safely from in-memory runtime metadata.
+- Kept completed HLS playlists and persisted manifests upstream-free while allowing already-issued alternate playlist and range URLs to finish from in-memory runtime metadata during one fixed 60-second absolute grace period. An atomic generation-bound scrub prevents a delayed timer from overwriting even a byte-for-byte identical newer same-id session.
 - Refreshed the restricted proxy inventory with separately recorded availability timestamps; restricted playback remains web API mode only.
 
 ## Live Evidence
@@ -31,6 +31,7 @@ superseded_by:
 - Public ordinary-video, multi-part-video, and space-collection cases passed through server-owned HLS playback.
 - The named credential profile passed homepage recommendations, authenticated history, authenticated watch-later, and space videos.
 - `bangumi-media-series` and `bangumi-episode` passed with the available web-mode restricted proxy.
+- Public/credential-backed cases used the persistent named profile only against Bilibili official endpoints. Restricted proxy validation used a separate temporary access-key-only profile, so the persistent Web cookie was not sent to the public proxy; the temporary store was deleted after both cases passed.
 - The unavailable proxy fixture failed safely as `restricted_proxy`, without leaking credential or upstream response details.
 - Following/dynamic cases remain blocked by a `bbdown-core v0.5.0` compatibility issue: the upstream dynamic payload now returns `module_author.pub_ts` as a numeric string while the dependency requires an integer. This is an external dependency follow-up, not a passing live case.
 
@@ -40,6 +41,11 @@ superseded_by:
 - `just lint`
 - `just pre-commit`
 - `scripts/test-cache-server.sh`
+- `cargo test -p tvos-net-player-cache-server completed_runtime --locked`
+- `cargo test -p tvos-net-player-cache-server background_work --locked`
+- `cargo test -p tvos-net-player-cache-server cancelling_task_removes_queued_jobs_and_cancels_current_without_requeue --locked`
+- `cargo test -p tvos-net-player-cache-server --test bilibili_live_e2e --locked`
+- Opt-in real live e2e: ordinary video, multi-part video, space collection/videos, homepage recommendations, authenticated history/watch-later, and both restricted Bangumi fixtures.
 - `just test`
 - `just test-macos`
 - `just build-cache-server`

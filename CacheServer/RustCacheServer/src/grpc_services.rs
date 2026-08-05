@@ -53,7 +53,7 @@ use crate::{
     hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
         HlsCacheEvictionSummary, HlsCacheFillControl, HlsCacheFillProgress, HlsCacheStore,
-        completed_runtime_session, hls_session_declared_size_bytes, timestamp_from_system_time,
+        hls_session_declared_size_bytes, timestamp_from_system_time,
     },
     hls_fill_scheduler::HlsFillPreemptionToken,
     hls_network_policy::{
@@ -735,16 +735,22 @@ impl TaskService for TaskGrpcService {
         let cancellation = creation
             .cancellation
             .expect("new playback task should include a planning cancellation token");
+        let task_source = creation.task.source.clone();
         let state = self.state.clone();
-        tokio::spawn(run_bilibili_playback_planning(
-            state,
-            task_id,
-            creation.task.source.clone(),
-            options,
-            selection_plan,
-            playback_source_uri,
-            cancellation,
-        ));
+        let planning_activity = state.begin_playback_planning();
+        tokio::spawn(async move {
+            let _planning_activity = planning_activity;
+            run_bilibili_playback_planning(
+                state,
+                task_id,
+                task_source,
+                options,
+                selection_plan,
+                playback_source_uri,
+                cancellation,
+            )
+            .await;
+        });
 
         Ok(Response::new(creation.task))
     }
@@ -1824,6 +1830,9 @@ async fn run_hls_cache_finalization_inner(
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
+        if preemption.is_cancelled() {
+            return HlsCacheFinalizationOutcome::Finished;
+        }
         if !state
             .tasks
             .is_hls_session_playable_for_task(&task_id, &session_id)
@@ -1850,9 +1859,10 @@ async fn run_hls_cache_finalization_inner(
     };
     let _eviction_protection = state.protect_hls_cache_session_from_eviction(&session_id);
     let control = || {
-        if !state
-            .tasks
-            .is_hls_session_playable_for_task(&task_id, &session_id)
+        if preemption.is_cancelled()
+            || !state
+                .tasks
+                .is_hls_session_playable_for_task(&task_id, &session_id)
         {
             HlsCacheFillControl::Cancel
         } else if preemption.is_preempted() {
@@ -1963,9 +1973,7 @@ async fn run_hls_cache_finalization_inner(
                         &library_item_id,
                     ) =>
                 {
-                    state
-                        .hls_sessions
-                        .insert(completed_runtime_session(&completion.session));
+                    state.register_completed_hls_runtime_session(&completion.session);
                     if let Err(error) = state.enforce_hls_cache_quota(
                         "after_hls_finalization",
                         [session_id.clone()],
@@ -4740,6 +4748,51 @@ mod tests {
             .expect("test should send playback plan");
         let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
         assert_eq!(TaskState::Playable, playable.state());
+    }
+
+    #[tokio::test]
+    async fn create_playback_task_registers_background_work_before_spawn_poll() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(PendingPlaybackPlanner),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state.clone());
+
+        let created = service
+            .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                url_or_id: "BV1registered-before-poll".to_owned(),
+                options: None,
+                selection_id: String::new(),
+                selection: None,
+            }))
+            .await
+            .expect("playback task should be created")
+            .into_inner();
+
+        assert!(!state.background_work_is_idle());
+        tasks
+            .cancel_task(&created.id)
+            .expect("pending planning task should accept cancellation");
+        let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled planning task should release background activity");
     }
 
     #[tokio::test]

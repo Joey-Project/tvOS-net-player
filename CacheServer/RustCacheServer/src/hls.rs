@@ -21,30 +21,66 @@ const DEFAULT_DURATION_SECONDS: u32 = 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct HlsPlaybackRegistry {
-    inner: Arc<RwLock<HashMap<String, HlsPlaybackSession>>>,
+    inner: Arc<RwLock<HlsPlaybackRegistryInner>>,
+}
+
+#[derive(Default)]
+struct HlsPlaybackRegistryInner {
+    sessions: HashMap<String, HlsPlaybackSession>,
+    generations: HashMap<String, u64>,
+    next_generation: u64,
 }
 
 impl HlsPlaybackRegistry {
-    pub(crate) fn insert(&self, session: HlsPlaybackSession) {
-        self.inner
+    pub(crate) fn insert(&self, session: HlsPlaybackSession) -> u64 {
+        let mut inner = self
+            .inner
             .write()
-            .expect("HLS playback registry lock poisoned")
-            .insert(session.id.clone(), session);
+            .expect("HLS playback registry lock poisoned");
+        inner.next_generation = inner
+            .next_generation
+            .checked_add(1)
+            .expect("HLS playback registry generation exhausted");
+        let generation = inner.next_generation;
+        let session_id = session.id.clone();
+        inner.sessions.insert(session_id.clone(), session);
+        inner.generations.insert(session_id, generation);
+        generation
     }
 
     pub(crate) fn remove(&self, session_id: &str) {
-        self.inner
+        let mut inner = self
+            .inner
             .write()
-            .expect("HLS playback registry lock poisoned")
-            .remove(session_id);
+            .expect("HLS playback registry lock poisoned");
+        inner.sessions.remove(session_id);
+        inner.generations.remove(session_id);
     }
 
     pub(crate) fn get(&self, session_id: &str) -> Option<HlsPlaybackSession> {
         self.inner
             .read()
             .expect("HLS playback registry lock poisoned")
+            .sessions
             .get(session_id)
             .cloned()
+    }
+
+    pub(crate) fn replace_if_generation(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        replacement: HlsPlaybackSession,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("HLS playback registry lock poisoned");
+        if inner.generations.get(session_id) != Some(&expected_generation) {
+            return false;
+        }
+        inner.sessions.insert(session_id.to_owned(), replacement);
+        true
     }
 }
 
