@@ -3856,11 +3856,13 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let sensitive_detail = "upstream failed at https://example.test/playurl?access_key=credential-sensitive-marker";
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
+                task_state_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 bbdown_credential_path: Some(credential_path),
@@ -3942,9 +3944,11 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credential_path),
             ..CacheServerOptions::default()
@@ -4132,9 +4136,11 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credential_path),
             ..CacheServerOptions::default()

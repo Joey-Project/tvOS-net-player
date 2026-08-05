@@ -29,6 +29,7 @@ superseded_by:
 - Explicit codec input retains precedence over compatible-first selection. The compatible-first path, HLS alternate filtering, and transcoding planning share one conservative H.264/AAC HLS compatibility predicate.
 - Requested options remain part of persisted task state, and effective policy remains part of persisted HLS session state. Legacy snapshots and manifests recover through safe defaults without a schema-version bump.
 - Explicit non-default client policies require the new server capability. Default requests remain usable with legacy servers through a documented fallback to their older planner and weak-network behavior.
+- Credential RPC tests keep task persistence inside their fixture roots so parallel test processes cannot load or claim another fixture's queued task.
 
 ## Client UX
 
@@ -57,6 +58,7 @@ superseded_by:
 - `just lint`: passed after the final Rust media-handler refactor and policy tests.
 - `scripts/test.sh`: 268 Swift package tests passed with no failures, including policy changes after multi-candidate resolution.
 - `scripts/test-cache-server.sh`: 499 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation and session-removal serialization regressions.
+- `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml credential_configured_rpc_ -- --nocapture`: 4 credential RPC tests passed concurrently after isolating their task-state paths.
 - `just build-cache-server`: the optimized Rust LAN cache server build passed.
 - `just build`: the generic tvOS Simulator app build passed.
 - `just build-for-testing`: the generic tvOS Simulator test bundle build passed.
