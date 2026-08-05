@@ -78,11 +78,9 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
             failed_cases.push(case.id.clone());
         }
         server
-            .cancel_tracked_task_and_wait(&task_tracker)
+            .shutdown(&task_tracker)
             .await
             .unwrap_or_else(|message| panic!("{}: live case teardown failed: {message}", case.id));
-        server.stop_listeners();
-        drop(server);
     }
 
     assert!(
@@ -1107,8 +1105,8 @@ struct LiveTestServer {
     state: AppState,
     grpc_url: String,
     media_url: String,
-    _grpc_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    _media_task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    grpc_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+    media_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
 }
 
 impl LiveTestServer {
@@ -1131,8 +1129,8 @@ impl LiveTestServer {
             state,
             grpc_url,
             media_url,
-            _grpc_task: grpc_task,
-            _media_task: media_task,
+            grpc_task: Some(grpc_task),
+            media_task: Some(media_task),
         }
     }
 
@@ -1144,32 +1142,28 @@ impl LiveTestServer {
             .unwrap()
     }
 
-    async fn cancel_tracked_task_and_wait(
+    async fn shutdown(mut self, task_tracker: &LiveTaskTracker) -> Result<(), String> {
+        let listener_result = self.stop_listeners().await;
+        let background_result = self.cancel_case_tasks_and_wait(task_tracker).await;
+        combine_teardown_results(listener_result, background_result)
+    }
+
+    async fn cancel_case_tasks_and_wait(
         &self,
         task_tracker: &LiveTaskTracker,
     ) -> Result<(), String> {
-        let task_id = task_tracker.task_id();
-        if let Some(task_id) = task_id.as_deref() {
-            self.state
-                .tasks
-                .cancel_task(task_id)
-                .map_err(|_| "tracked task could not be cancelled".to_owned())?;
-            self.state.cancel_hls_fill_work_for_task(task_id);
-        }
-
         let deadline = tokio::time::Instant::now() + LIVE_CASE_TEARDOWN_TIMEOUT;
         loop {
-            let task_is_terminal = task_id.as_deref().is_none_or(|task_id| {
-                self.state.tasks.get_task(task_id).is_ok_and(|task| {
-                    matches!(
-                        task.state(),
-                        TaskState::Completed | TaskState::Failed | TaskState::Cancelled
-                    )
-                })
-            });
-            if task_is_terminal && self.state.background_work_is_idle() {
+            let task_ids = self.case_task_ids(task_tracker)?;
+            self.cancel_case_tasks(&task_ids)?;
+            if self.case_tasks_are_terminal(&task_ids)? && self.state.background_work_is_idle() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                if self.state.background_work_is_idle() {
+                let stable_task_ids = self.case_task_ids(task_tracker)?;
+                self.cancel_case_tasks(&stable_task_ids)?;
+                if stable_task_ids == task_ids
+                    && self.case_tasks_are_terminal(&stable_task_ids)?
+                    && self.state.background_work_is_idle()
+                {
                     self.state.shutdown_hls_fill_worker().await;
                     return Ok(());
                 }
@@ -1184,16 +1178,96 @@ impl LiveTestServer {
         }
     }
 
-    fn stop_listeners(&self) {
-        self._grpc_task.abort();
-        self._media_task.abort();
+    fn case_task_ids(&self, task_tracker: &LiveTaskTracker) -> Result<Vec<String>, String> {
+        let subscription = self
+            .state
+            .tasks
+            .subscribe(&[])
+            .map_err(|_| "case task registry could not be inspected".to_owned())?;
+        let mut task_ids = subscription
+            .snapshots()
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<HashSet<_>>();
+        if let Some(task_id) = task_tracker.task_id() {
+            task_ids.insert(task_id);
+        }
+        let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
+        task_ids.sort();
+        Ok(task_ids)
+    }
+
+    fn cancel_case_tasks(&self, task_ids: &[String]) -> Result<(), String> {
+        for task_id in task_ids {
+            self.state
+                .tasks
+                .cancel_task(task_id)
+                .map_err(|_| format!("case task {task_id} could not be cancelled"))?;
+            self.state.cancel_hls_fill_work_for_task(task_id);
+        }
+        Ok(())
+    }
+
+    fn case_tasks_are_terminal(&self, task_ids: &[String]) -> Result<bool, String> {
+        task_ids.iter().try_fold(true, |all_terminal, task_id| {
+            let task = self
+                .state
+                .tasks
+                .get_task(task_id)
+                .map_err(|_| format!("case task {task_id} disappeared during teardown"))?;
+            Ok(all_terminal
+                && matches!(
+                    task.state(),
+                    TaskState::Succeeded
+                        | TaskState::Completed
+                        | TaskState::Failed
+                        | TaskState::Cancelled
+                ))
+        })
+    }
+
+    async fn stop_listeners(&mut self) -> Result<(), String> {
+        let grpc_result = abort_and_wait_listener("gRPC", self.grpc_task.take()).await;
+        let media_result = abort_and_wait_listener("media", self.media_task.take()).await;
+        combine_teardown_results(grpc_result, media_result)
     }
 }
 
 impl Drop for LiveTestServer {
     fn drop(&mut self) {
-        self._grpc_task.abort();
-        self._media_task.abort();
+        if let Some(task) = &self.grpc_task {
+            task.abort();
+        }
+        if let Some(task) = &self.media_task {
+            task.abort();
+        }
+    }
+}
+
+async fn abort_and_wait_listener(
+    name: &str,
+    task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+) -> Result<(), String> {
+    let Some(task) = task else {
+        return Ok(());
+    };
+    task.abort();
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("{name} listener failed: {error}")),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(format!("{name} listener join failed: {error}")),
+    }
+}
+
+fn combine_teardown_results(
+    first: Result<(), String>,
+    second: Result<(), String>,
+) -> Result<(), String> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(format!("{first}; {second}")),
     }
 }
 
@@ -1290,6 +1364,37 @@ async fn wait_for_grpc(grpc_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_cancels_untracked_registry_task_before_removing_case_root() {
+        let server = LiveTestServer::start().await;
+        let root_path = server._temp_root.path().to_owned();
+        let tasks = Arc::clone(&server.state.tasks);
+        let task = tasks
+            .create_bilibili_task("BV1xx411c7mD", None)
+            .expect("untracked case task should be created");
+        let task_tracker = LiveTaskTracker::default();
+
+        assert_eq!(TaskState::Queued, task.state());
+        assert!(task_tracker.task_id().is_none());
+
+        server
+            .shutdown(&task_tracker)
+            .await
+            .expect("case shutdown should discover and cancel untracked tasks");
+
+        assert_eq!(
+            TaskState::Cancelled,
+            tasks
+                .get_task(&task.id)
+                .expect("cancelled task should remain in the registry")
+                .state()
+        );
+        assert!(
+            !root_path.exists(),
+            "case root should be removed only after listeners and background work stop"
+        );
+    }
 
     #[test]
     fn live_server_environment_args_maps_named_credential_profile() {
