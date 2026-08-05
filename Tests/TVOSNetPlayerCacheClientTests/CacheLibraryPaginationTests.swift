@@ -283,10 +283,11 @@ final class CacheLibraryPaginationTests: XCTestCase {
             ),
             CacheServerCapability.bilibiliTaskSelection
         )
-        XCTAssertNil(
+        XCTAssertEqual(
             GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackPolicy(
                 options: BilibiliPlaybackTaskOptions()
-            )
+            ),
+            CacheServerCapability.bilibiliPlaybackPolicy
         )
         let policyOptions = BilibiliPlaybackTaskOptions(
             playbackPolicy: BilibiliPlaybackPolicy(transcodingPreference: .force)
@@ -305,6 +306,14 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 CacheServerCapability.bilibiliTaskSelection,
                 CacheServerCapability.bilibiliPlaybackPolicy,
             ]
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilitiesForBilibiliPlaybackTask(
+                selectionID: "",
+                selection: nil,
+                options: BilibiliPlaybackTaskOptions()
+            ),
+            [CacheServerCapability.bilibiliPlaybackPolicy]
         )
     }
 

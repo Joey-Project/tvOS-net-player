@@ -1395,6 +1395,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_registration_is_serialized_with_session_removal() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let session = hls_session(
+            "session-registration-race",
+            "https://example.test/video.m4s",
+        );
+        let session_id = session.id.clone();
+        let (registration_started_tx, registration_started_rx) = mpsc::channel();
+        let (release_registration_tx, release_registration_rx) = mpsc::channel();
+        let registration_state = state.clone();
+        let registration_session_id = session_id.clone();
+        let registrar = thread::spawn(move || {
+            registration_state
+                .hls_sessions
+                .insert_with_generation_update(session, |generation| {
+                    registration_started_tx.send(()).unwrap();
+                    release_registration_rx.recv().unwrap();
+                    registration_state
+                        .hls_network_policy
+                        .advance_session_generation(&registration_session_id, generation);
+                })
+        });
+
+        registration_started_rx.recv().unwrap();
+        let (removal_started_tx, removal_started_rx) = mpsc::channel();
+        let (removal_done_tx, removal_done_rx) = mpsc::channel();
+        let removal_state = state.clone();
+        let removal_session_id = session_id.clone();
+        let remover = thread::spawn(move || {
+            removal_started_tx.send(()).unwrap();
+            removal_state.remove_hls_playback_session(&removal_session_id);
+            removal_done_tx.send(()).unwrap();
+        });
+
+        removal_started_rx.recv().unwrap();
+        assert!(
+            removal_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "session removal must wait for the registration policy update"
+        );
+        release_registration_tx.send(()).unwrap();
+        registrar.join().unwrap();
+        removal_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("session removal should finish after registration");
+        remover.join().unwrap();
+
+        assert!(state.hls_sessions.get(&session_id).is_none());
+        assert_eq!(
+            None,
+            state
+                .hls_network_policy
+                .session_generation_for_tests(&session_id)
+        );
+    }
+
     #[tokio::test]
     async fn hls_media_playlist_uses_mp4_initialization_map_and_byte_range() {
         let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;

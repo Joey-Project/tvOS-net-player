@@ -28,7 +28,7 @@ superseded_by:
 - Unspecified wire values normalize to automatic transcoding, compatible-first selection, and adaptive weak-network recovery. The playback session reports normalized effective values.
 - Explicit codec input retains precedence over compatible-first selection. The compatible-first path, HLS alternate filtering, and transcoding planning share one conservative H.264/AAC HLS compatibility predicate.
 - Requested options remain part of persisted task state, and effective policy remains part of persisted HLS session state. Legacy snapshots and manifests recover through safe defaults without a schema-version bump.
-- Non-default client policies require the new playback-policy server capability so an older server cannot silently ignore an explicit user choice.
+- Every client playback-policy request requires the new server capability because even the default compatible-first behavior has semantics that an older server would silently ignore.
 
 ## Client UX
 
@@ -56,7 +56,7 @@ superseded_by:
 - Cache-server architecture: `docs/architecture/cache-server.md`
 - `just lint`: passed after the final Rust media-handler refactor and policy tests.
 - `scripts/test.sh`: 268 Swift package tests passed with no failures, including policy changes after multi-candidate resolution.
-- `scripts/test-cache-server.sh`: 498 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation and session-removal serialization regressions.
+- `scripts/test-cache-server.sh`: 499 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation and session-removal serialization regressions.
 - `just build-cache-server`: the optimized Rust LAN cache server build passed.
 - `just build`: the generic tvOS Simulator app build passed.
 - `just build-for-testing`: the generic tvOS Simulator test bundle build passed.

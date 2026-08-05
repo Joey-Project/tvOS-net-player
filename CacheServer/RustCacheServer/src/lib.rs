@@ -720,17 +720,19 @@ impl AppState {
 
     pub(crate) fn register_hls_playback_session(&self, session: HlsPlaybackSession) -> u64 {
         let session_id = session.id.clone();
-        let generation = self.hls_sessions.insert(session);
-        self.hls_network_policy
-            .advance_session_generation(&session_id, generation);
-        generation
+        self.hls_sessions
+            .insert_with_generation_update(session, |generation| {
+                self.hls_network_policy
+                    .advance_session_generation(&session_id, generation);
+            })
     }
 
     pub(crate) fn remove_hls_playback_session(&self, session_id: &str) {
-        if let Some(generation) = self.hls_sessions.remove(session_id) {
-            self.hls_network_policy
-                .remove_session_generation(session_id, generation);
-        }
+        self.hls_sessions
+            .remove_with_generation_update(session_id, |generation| {
+                self.hls_network_policy
+                    .remove_session_generation(session_id, generation);
+            });
         self.hls_playback_progress.remove_session(session_id);
     }
 
@@ -752,13 +754,17 @@ impl AppState {
         let deadline = MonotonicInstant::now()
             .checked_add(grace_period)
             .expect("HLS completion grace deadline should fit in Instant");
-        let generation = self.hls_sessions.insert_with_scrub_deadline(
-            runtime_session,
-            sanitized_session,
-            deadline,
-        );
-        self.hls_network_policy
-            .advance_session_generation(&session.id, generation);
+        let generation = self
+            .hls_sessions
+            .insert_with_scrub_deadline_and_generation_update(
+                runtime_session,
+                sanitized_session,
+                deadline,
+                |generation| {
+                    self.hls_network_policy
+                        .advance_session_generation(&session.id, generation);
+                },
+            );
 
         let registry = self.hls_sessions.clone();
         tokio::spawn(async move {

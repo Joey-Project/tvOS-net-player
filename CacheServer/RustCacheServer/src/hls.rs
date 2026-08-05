@@ -49,6 +49,14 @@ pub(crate) struct HlsPlaybackSessionHandle {
 
 impl HlsPlaybackRegistry {
     pub(crate) fn insert(&self, session: HlsPlaybackSession) -> u64 {
+        self.insert_with_generation_update(session, |_| {})
+    }
+
+    pub(crate) fn insert_with_generation_update(
+        &self,
+        session: HlsPlaybackSession,
+        update: impl FnOnce(u64),
+    ) -> u64 {
         let mut inner = self
             .inner
             .write()
@@ -62,14 +70,32 @@ impl HlsPlaybackRegistry {
         inner.sessions.insert(session_id.clone(), session);
         inner.generations.insert(session_id.clone(), generation);
         inner.pending_scrubs.remove(&session_id);
+        update(generation);
+        drop(inner);
         generation
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_with_scrub_deadline(
         &self,
         session: HlsPlaybackSession,
         replacement: HlsPlaybackSession,
         deadline: Instant,
+    ) -> u64 {
+        self.insert_with_scrub_deadline_and_generation_update(
+            session,
+            replacement,
+            deadline,
+            |_| {},
+        )
+    }
+
+    pub(crate) fn insert_with_scrub_deadline_and_generation_update(
+        &self,
+        session: HlsPlaybackSession,
+        replacement: HlsPlaybackSession,
+        deadline: Instant,
+        update: impl FnOnce(u64),
     ) -> u64 {
         let mut inner = self
             .inner
@@ -91,10 +117,16 @@ impl HlsPlaybackRegistry {
                 replacement,
             },
         );
+        update(generation);
+        drop(inner);
         generation
     }
 
-    pub(crate) fn remove(&self, session_id: &str) -> Option<u64> {
+    pub(crate) fn remove_with_generation_update(
+        &self,
+        session_id: &str,
+        update: impl FnOnce(u64),
+    ) -> Option<u64> {
         let mut inner = self
             .inner
             .write()
@@ -102,6 +134,10 @@ impl HlsPlaybackRegistry {
         inner.sessions.remove(session_id);
         let generation = inner.generations.remove(session_id);
         inner.pending_scrubs.remove(session_id);
+        if let Some(generation) = generation {
+            update(generation);
+        }
+        drop(inner);
         generation
     }
 

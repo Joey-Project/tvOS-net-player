@@ -123,6 +123,16 @@ impl HlsNetworkPolicy {
     }
 
     #[cfg(test)]
+    pub(crate) fn session_generation_for_tests(&self, session_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("HLS network policy lock poisoned")
+            .sessions
+            .get(session_id)
+            .map(|session| session.generation)
+    }
+
+    #[cfg(test)]
     pub(crate) fn variant_is_advertisable_at(
         &self,
         session_id: &str,
