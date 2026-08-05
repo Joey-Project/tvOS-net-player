@@ -224,7 +224,7 @@ scripts/test-cache-server.sh
 ## Codex Review Gate
 
 模板自带的 `.github/workflows/codex-review-gate.yml` 仍然保留。它写入 `codex/review-gate` status check，并把
-`JoeyTeng/codex-review-gate-action` pin 到 v1.2.1 commit SHA，避免 privileged `pull_request_target` 运行依赖可移动 tag。
+`JoeyTeng/codex-review-gate-action` 设为仓库 owner 明确批准的 floating `v1` major；自动获取兼容更新是有意设计。
 
 启用 required status check 时，可以使用 `JoeyTeng/codex-review-gate` 的 bootstrap helper：
 
