@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::{
     bbdown_adapter::{BilibiliMediaRequest, BilibiliPlaybackVariant, BilibiliPlaybackVariantKind},
     codecs::{codec_list_matches, is_aac_codec, is_h264_codec},
@@ -24,25 +26,32 @@ pub(crate) struct PlaybackPolicy {
 }
 
 impl PlaybackPolicy {
-    pub(crate) fn from_playback_options(options: Option<&BilibiliPlaybackOptions>) -> Self {
+    pub(crate) fn from_playback_options(
+        options: Option<&BilibiliPlaybackOptions>,
+    ) -> Result<Self, PlaybackPolicyError> {
         Self::from_proto(options.and_then(|options| options.playback_policy.as_ref()))
     }
 
-    pub(crate) fn from_proto(policy: Option<&ProtoBilibiliPlaybackPolicy>) -> Self {
+    pub(crate) fn from_proto(
+        policy: Option<&ProtoBilibiliPlaybackPolicy>,
+    ) -> Result<Self, PlaybackPolicyError> {
         let Some(policy) = policy else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        Self {
+        Ok(Self {
             transcoding_preference: TranscodingPreference::from_proto_i32(
                 policy.transcoding_preference,
-            ),
+            )
+            .map_err(|value| PlaybackPolicyError::new("transcoding_preference", value))?,
             compatible_variant_preference: CompatibleVariantPreference::from_proto_i32(
                 policy.compatible_variant_preference,
-            ),
+            )
+            .map_err(|value| PlaybackPolicyError::new("compatible_variant_preference", value))?,
             weak_network_preference: WeakNetworkPreference::from_proto_i32(
                 policy.weak_network_preference,
-            ),
-        }
+            )
+            .map_err(|value| PlaybackPolicyError::new("weak_network_preference", value))?,
+        })
     }
 
     pub(crate) fn to_proto(self) -> ProtoBilibiliPlaybackPolicy {
@@ -53,6 +62,30 @@ impl PlaybackPolicy {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackPolicyError {
+    field: &'static str,
+    value: i32,
+}
+
+impl PlaybackPolicyError {
+    fn new(field: &'static str, value: i32) -> Self {
+        Self { field, value }
+    }
+}
+
+impl fmt::Display for PlaybackPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Unknown Bilibili playback policy value {} for {}.",
+            self.value, self.field
+        )
+    }
+}
+
+impl std::error::Error for PlaybackPolicyError {}
 
 impl Default for PlaybackPolicy {
     fn default() -> Self {
@@ -74,12 +107,14 @@ pub(crate) enum TranscodingPreference {
 }
 
 impl TranscodingPreference {
-    fn from_proto_i32(value: i32) -> Self {
+    fn from_proto_i32(value: i32) -> Result<Self, i32> {
         match ProtoTranscodingPreference::try_from(value) {
-            Ok(ProtoTranscodingPreference::Never) => Self::Never,
-            Ok(ProtoTranscodingPreference::Force) => Self::Force,
-            Ok(ProtoTranscodingPreference::Unspecified | ProtoTranscodingPreference::Auto)
-            | Err(_) => Self::Auto,
+            Ok(ProtoTranscodingPreference::Never) => Ok(Self::Never),
+            Ok(ProtoTranscodingPreference::Force) => Ok(Self::Force),
+            Ok(ProtoTranscodingPreference::Unspecified | ProtoTranscodingPreference::Auto) => {
+                Ok(Self::Auto)
+            }
+            Err(_) => Err(value),
         }
     }
 
@@ -101,14 +136,14 @@ pub(crate) enum CompatibleVariantPreference {
 }
 
 impl CompatibleVariantPreference {
-    fn from_proto_i32(value: i32) -> Self {
+    fn from_proto_i32(value: i32) -> Result<Self, i32> {
         match ProtoCompatibleVariantPreference::try_from(value) {
-            Ok(ProtoCompatibleVariantPreference::PreferRequested) => Self::PreferRequested,
+            Ok(ProtoCompatibleVariantPreference::PreferRequested) => Ok(Self::PreferRequested),
             Ok(
                 ProtoCompatibleVariantPreference::Unspecified
                 | ProtoCompatibleVariantPreference::PreferCompatible,
-            )
-            | Err(_) => Self::PreferCompatible,
+            ) => Ok(Self::PreferCompatible),
+            Err(_) => Err(value),
         }
     }
 
@@ -130,12 +165,14 @@ pub(crate) enum WeakNetworkPreference {
 }
 
 impl WeakNetworkPreference {
-    fn from_proto_i32(value: i32) -> Self {
+    fn from_proto_i32(value: i32) -> Result<Self, i32> {
         match ProtoWeakNetworkPreference::try_from(value) {
-            Ok(ProtoWeakNetworkPreference::HoldDowngrade) => Self::HoldDowngrade,
-            Ok(ProtoWeakNetworkPreference::AvplayerManaged) => Self::AvPlayerManaged,
-            Ok(ProtoWeakNetworkPreference::Unspecified | ProtoWeakNetworkPreference::Adaptive)
-            | Err(_) => Self::Adaptive,
+            Ok(ProtoWeakNetworkPreference::HoldDowngrade) => Ok(Self::HoldDowngrade),
+            Ok(ProtoWeakNetworkPreference::AvplayerManaged) => Ok(Self::AvPlayerManaged),
+            Ok(ProtoWeakNetworkPreference::Unspecified | ProtoWeakNetworkPreference::Adaptive) => {
+                Ok(Self::Adaptive)
+            }
+            Err(_) => Err(value),
         }
     }
 
@@ -302,7 +339,8 @@ mod tests {
             transcoding_preference: ProtoTranscodingPreference::Unspecified.into(),
             compatible_variant_preference: ProtoCompatibleVariantPreference::Unspecified.into(),
             weak_network_preference: ProtoWeakNetworkPreference::Unspecified.into(),
-        }));
+        }))
+        .expect("unspecified policy values should be accepted");
 
         assert_eq!(PlaybackPolicy::default(), policy);
         let proto = policy.to_proto();
@@ -326,7 +364,8 @@ mod tests {
             transcoding_preference: ProtoTranscodingPreference::Force.into(),
             compatible_variant_preference: ProtoCompatibleVariantPreference::PreferRequested.into(),
             weak_network_preference: ProtoWeakNetworkPreference::HoldDowngrade.into(),
-        }));
+        }))
+        .expect("known policy values should be accepted");
 
         assert_eq!(TranscodingPreference::Force, policy.transcoding_preference);
         assert_eq!(
@@ -337,5 +376,39 @@ mod tests {
             WeakNetworkPreference::HoldDowngrade,
             policy.weak_network_preference
         );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_enum_values() {
+        let cases = [
+            (
+                "transcoding_preference",
+                BilibiliPlaybackPolicy {
+                    transcoding_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "compatible_variant_preference",
+                BilibiliPlaybackPolicy {
+                    compatible_variant_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "weak_network_preference",
+                BilibiliPlaybackPolicy {
+                    weak_network_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+        ];
+
+        for (field, proto) in cases {
+            let error = PlaybackPolicy::from_proto(Some(&proto))
+                .expect_err("unknown policy enum value should be rejected");
+            assert_eq!(field, error.field);
+            assert_eq!(99, error.value);
+        }
     }
 }

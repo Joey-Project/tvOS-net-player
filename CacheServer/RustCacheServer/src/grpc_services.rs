@@ -681,6 +681,8 @@ impl TaskService for TaskGrpcService {
         if source.is_empty() {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
         }
+        PlaybackPolicy::from_playback_options(request.options.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let _permit = Arc::clone(&self.state.playback_planning_permits)
             .acquire_owned()
@@ -722,6 +724,8 @@ impl TaskService for TaskGrpcService {
     ) -> Result<Response<Task>, Status> {
         let url_or_id = request.get_ref().url_or_id.clone();
         let options = request.get_ref().options.clone();
+        let playback_policy = PlaybackPolicy::from_playback_options(options.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let selection_plan = playback_selection_plan(
             normalized_optional_string(&request.get_ref().selection_id),
             request.get_ref().selection.clone(),
@@ -749,13 +753,17 @@ impl TaskService for TaskGrpcService {
         let task_source = creation.task.source.clone();
         let state = self.state.clone();
         let planning_activity = state.begin_playback_planning();
+        let playback_configuration = ValidatedPlaybackConfiguration {
+            options,
+            policy: playback_policy,
+        };
         tokio::spawn(async move {
             let _planning_activity = planning_activity;
             run_bilibili_playback_planning(
                 state,
                 task_id,
                 task_source,
-                options,
+                playback_configuration,
                 selection_plan,
                 playback_source_uri,
                 cancellation,
@@ -1230,11 +1238,16 @@ impl Drop for PlaybackPlanningCleanup {
     }
 }
 
+struct ValidatedPlaybackConfiguration {
+    options: Option<BilibiliPlaybackOptions>,
+    policy: PlaybackPolicy,
+}
+
 async fn run_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_plan: BilibiliPlaybackSelectionPlan,
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
@@ -1292,7 +1305,7 @@ async fn run_bilibili_playback_planning(
                 state,
                 task_id,
                 source,
-                options,
+                playback_configuration,
                 selection_id,
                 playback_source_uri,
                 cancellation,
@@ -1304,7 +1317,7 @@ async fn run_bilibili_playback_planning(
                 state,
                 task_id,
                 source,
-                options,
+                playback_configuration,
                 selection_plan,
                 playback_source_uri,
                 cancellation,
@@ -1321,12 +1334,15 @@ async fn run_single_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_id: Option<String>,
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) -> bool {
-    let playback_policy = PlaybackPolicy::from_playback_options(options.as_ref());
+    let ValidatedPlaybackConfiguration {
+        options,
+        policy: playback_policy,
+    } = playback_configuration;
     let planning_request = BilibiliPlaybackPlanningRequest {
         source,
         options,
@@ -1399,12 +1415,15 @@ async fn run_explicit_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_plan: BilibiliPlaybackSelectionPlan,
     primary_playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) -> bool {
-    let playback_policy = PlaybackPolicy::from_playback_options(options.as_ref());
+    let ValidatedPlaybackConfiguration {
+        options,
+        policy: playback_policy,
+    } = playback_configuration;
     let resolution = match state
         .playback_planner
         .resolve_input(BilibiliInputResolveRequest {
@@ -2798,8 +2817,8 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliTaskSelection,
-            CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
+            BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliPlaybackPolicy,
+            BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
             GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
             ResolveBilibiliInputRequest, TaskKind, TaskState,
@@ -3448,6 +3467,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_bilibili_input_rejects_unknown_playback_policy() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = TaskGrpcService::new(state);
+
+        let error = service
+            .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+                url_or_id: "BV1unknown".to_owned(),
+                options: Some(BilibiliPlaybackOptions {
+                    quality_preference: String::new(),
+                    encoding_preference: String::new(),
+                    prefer_tv_api: false,
+                    audio_language: String::new(),
+                    playback_policy: Some(BilibiliPlaybackPolicy {
+                        weak_network_preference: 99,
+                        ..BilibiliPlaybackPolicy::default()
+                    }),
+                }),
+            }))
+            .await
+            .expect_err("unknown playback policy should be rejected before resolution");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert!(error.message().contains("weak_network_preference"));
+    }
+
+    #[tokio::test]
     async fn resolve_bilibili_input_waits_for_playback_planning_permit() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -3562,6 +3620,71 @@ mod tests {
             vec![("BV1select".to_owned(), Some("page:2".to_owned()))],
             *requests
         );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_rejects_unknown_policy_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join("state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = TaskGrpcService::new(state);
+        let cases = [
+            (
+                "transcoding_preference",
+                BilibiliPlaybackPolicy {
+                    transcoding_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "compatible_variant_preference",
+                BilibiliPlaybackPolicy {
+                    compatible_variant_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "weak_network_preference",
+                BilibiliPlaybackPolicy {
+                    weak_network_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+        ];
+
+        for (field, playback_policy) in cases {
+            let error = service
+                .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                    url_or_id: format!("BV1unknown-{field}"),
+                    options: Some(BilibiliPlaybackOptions {
+                        quality_preference: String::new(),
+                        encoding_preference: String::new(),
+                        prefer_tv_api: false,
+                        audio_language: String::new(),
+                        playback_policy: Some(playback_policy),
+                    }),
+                    selection_id: String::new(),
+                    selection: None,
+                }))
+                .await
+                .expect_err("unknown playback policy should be rejected before task creation");
+
+            assert_eq!(tonic::Code::InvalidArgument, error.code());
+            assert!(error.message().contains(field));
+        }
+        assert!(!task_state_path.exists());
     }
 
     #[tokio::test]

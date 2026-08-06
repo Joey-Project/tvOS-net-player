@@ -355,9 +355,10 @@ impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
             transcoding_plan: session
                 .transcoding_plan
                 .map(PersistedLanTranscodingPlan::from),
-            effective_policy: session
-                .effective_policy
-                .map(|policy| PlaybackPolicy::from_proto(Some(&policy))),
+            effective_policy: session.effective_policy.map(|policy| {
+                PlaybackPolicy::from_proto(Some(&policy))
+                    .expect("server-owned playback session policy should use known enum values")
+            }),
         }
     }
 }
@@ -556,9 +557,10 @@ impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
             encoding_preference: options.encoding_preference,
             prefer_tv_api: options.prefer_tv_api,
             audio_language: options.audio_language,
-            playback_policy: options
-                .playback_policy
-                .map(|policy| PlaybackPolicy::from_proto(Some(&policy))),
+            playback_policy: options.playback_policy.map(|policy| {
+                PlaybackPolicy::from_proto(Some(&policy))
+                    .expect("validated playback options should use known policy enum values")
+            }),
         }
     }
 }

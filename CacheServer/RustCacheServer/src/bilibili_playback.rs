@@ -77,6 +77,8 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
         request: BilibiliInputResolveRequest,
     ) -> BilibiliInputResolveFuture<'a> {
         Box::pin(async move {
+            PlaybackPolicy::from_playback_options(request.options.as_ref())
+                .map_err(|error| BilibiliDownloadError::Failed(error.to_string()))?;
             let download_options = request.options.as_ref().map(playback_to_download_options);
             self.resolve_playback_input(&request.source, download_options.as_ref(), || {
                 request.cancellation.is_cancel_requested()
@@ -91,7 +93,9 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
     ) -> BilibiliPlaybackPlanningFuture<'a> {
         Box::pin(async move {
             let download_options = request.options.as_ref().map(playback_to_download_options);
-            let playback_policy = PlaybackPolicy::from_playback_options(request.options.as_ref());
+            let playback_policy =
+                PlaybackPolicy::from_playback_options(request.options.as_ref())
+                    .map_err(|error| BilibiliDownloadError::Failed(error.to_string()))?;
             self.plan_playback(
                 &request.source,
                 request.selection_id.as_deref(),
