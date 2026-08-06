@@ -92,11 +92,13 @@ superseded_by:
 
 ### PR 7: Transcoding And ABR Policy Controls
 
-- Status: pending; intentionally executed before deferred PR 6.
-- Add product-level controls and policy surfaces for transcoding and ABR behavior before schema v2 work.
-- Cover automatic/manual transcoding preference, compatible-variant preference, weak-network downgrade/upgrade policy, and conservative AVPlayer-safe defaults.
-- Keep expensive quality heuristics and broad policy automation incremental and testable.
-- Validate through macOS app and deterministic server tests before considering physical Apple TV validation.
+- Status: completed by the `wip/transcoding-abr-policy-controls` slice; intentionally executed before deferred PR 6.
+- Added an additive protobuf v1 playback-policy contract and capability without changing the deferred task result/artifact schema.
+- Kept ffmpeg availability and concurrency as server startup hard bounds while allowing each playback request to select automatic/never/forced transcoding behavior.
+- Added compatible-first or requested-first variant selection, with explicit codec requests retaining precedence and a shared conservative AVPlayer H.264/AAC HLS compatibility predicate.
+- Added per-session adaptive recovery, held downgrade, or AVPlayer-managed weak-network behavior, with the effective policy persisted in task state and HLS manifests.
+- Added shared tvOS/macOS policy controls and local preference persistence; macOS remains the first validation surface while physical Apple TV validation stays deferred.
+- Kept expensive quality heuristics and broad automation out of this slice.
 
 ### PR 6: Bilibili Task Options And Result Schema v2
 

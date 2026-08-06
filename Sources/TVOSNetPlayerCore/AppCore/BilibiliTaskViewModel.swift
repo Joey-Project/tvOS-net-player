@@ -178,7 +178,21 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
 private struct BilibiliResolvedInputContext: Equatable {
     let source: String
     let endpoint: CacheServerEndpoint
-    let options: BilibiliPlaybackTaskOptions
+    let options: BilibiliPlaybackResolutionOptions
+}
+
+private struct BilibiliPlaybackResolutionOptions: Equatable {
+    let qualityPreference: String
+    let encodingPreference: String
+    let audioLanguagePreference: String
+    let preferTVAPI: Bool
+
+    init(_ options: BilibiliPlaybackTaskOptions) {
+        qualityPreference = options.qualityPreference
+        encodingPreference = options.encodingPreference
+        audioLanguagePreference = options.audioLanguagePreference
+        preferTVAPI = options.preferTVAPI
+    }
 }
 
 private struct BilibiliCandidateSelectionRequest {
@@ -234,8 +248,91 @@ public extension BilibiliDanmakuFormat {
     }
 }
 
+public extension BilibiliTranscodingPreference {
+    var title: String {
+        switch self {
+        case .auto:
+            return "Auto"
+        case .never:
+            return "Never"
+        case .force:
+            return "Force"
+        }
+    }
+
+    var summaryTitle: String {
+        switch self {
+        case .auto:
+            return "auto transcode"
+        case .never:
+            return "never transcode"
+        case .force:
+            return "force transcode"
+        }
+    }
+}
+
+public extension BilibiliCompatibleVariantPreference {
+    var title: String {
+        switch self {
+        case .preferCompatible:
+            return "Compatible"
+        case .preferRequested:
+            return "Requested"
+        }
+    }
+
+    var summaryTitle: String {
+        switch self {
+        case .preferCompatible:
+            return "prefer compatible"
+        case .preferRequested:
+            return "prefer requested"
+        }
+    }
+}
+
+public extension BilibiliWeakNetworkPreference {
+    var title: String {
+        switch self {
+        case .adaptive:
+            return "Adaptive"
+        case .holdDowngrade:
+            return "Hold Downgrade"
+        case .avPlayerManaged:
+            return "AVPlayer Managed"
+        }
+    }
+
+    var summaryTitle: String {
+        switch self {
+        case .adaptive:
+            return "adaptive network"
+        case .holdDowngrade:
+            return "hold downgrade"
+        case .avPlayerManaged:
+            return "AVPlayer managed"
+        }
+    }
+}
+
+public extension BilibiliPlaybackPolicy {
+    var summaryText: String {
+        [
+            transcodingPreference.summaryTitle,
+            compatibleVariantPreference.summaryTitle,
+            weakNetworkPreference.summaryTitle,
+        ].joined(separator: ", ")
+    }
+}
+
 @MainActor
 public final class BilibiliTaskViewModel: ObservableObject {
+    public static let playbackTranscodingPreferenceDefaultsKey = "BilibiliPlaybackTranscodingPreference"
+    public static let playbackCompatibleVariantPreferenceDefaultsKey =
+        "BilibiliPlaybackCompatibleVariantPreference"
+    public static let playbackWeakNetworkPreferenceDefaultsKey = "BilibiliPlaybackWeakNetworkPreference"
+
     private static let cacheServerAddressGuidance =
         "Use a cache server address or URL, such as mac-mini.local:50051 or https://cache.example.com."
 
@@ -243,6 +340,21 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public var qualityPreference: String
     @Published public var encodingPreference: String
     @Published public var audioLanguagePreference: String
+    @Published public var playbackTranscodingPreference: BilibiliTranscodingPreference {
+        didSet {
+            persistPlaybackPolicy()
+        }
+    }
+    @Published public var playbackCompatibleVariantPreference: BilibiliCompatibleVariantPreference {
+        didSet {
+            persistPlaybackPolicy()
+        }
+    }
+    @Published public var playbackWeakNetworkPreference: BilibiliWeakNetworkPreference {
+        didSet {
+            persistPlaybackPolicy()
+        }
+    }
     @Published public var submissionMode: BilibiliTaskSubmissionMode = .playback {
         didSet {
             if submissionMode == .download {
@@ -303,6 +415,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
     }
 
+    private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private var activeEndpoint: CacheServerEndpoint?
@@ -321,6 +434,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         qualityPreference: String = "",
         encodingPreference: String = "",
         audioLanguagePreference: String = "",
+        playbackPolicy: BilibiliPlaybackPolicy? = nil,
+        defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
@@ -330,6 +445,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
         self.audioLanguagePreference = audioLanguagePreference
+        self.defaults = defaults
+        let initialPlaybackPolicy = playbackPolicy ?? Self.loadPlaybackPolicy(from: defaults)
+        playbackTranscodingPreference = initialPlaybackPolicy.transcodingPreference
+        playbackCompatibleVariantPreference = initialPlaybackPolicy.compatibleVariantPreference
+        playbackWeakNetworkPreference = initialPlaybackPolicy.weakNetworkPreference
         self.operationTimeout = operationTimeout
         self.clientFactory = clientFactory
     }
@@ -559,6 +679,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         currentTask?.bilibiliTaskResultSummary
     }
 
+    public var activePlaybackPolicySummary: String? {
+        guard let currentTask else {
+            return nil
+        }
+
+        return Self.activePlaybackPolicySummary(for: currentTask)
+    }
+
     public var fetchNotice: BilibiliFetchNotice? {
         if let errorNotice = Self.errorNotice(for: errorMessage, currentTask: currentTask) {
             return errorNotice
@@ -609,6 +737,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public var availableSubtitleAIPolicies: [BilibiliSubtitleAIPolicy] {
         BilibiliSubtitleAIPolicy.allCases
+    }
+
+    public var availableTranscodingPreferences: [BilibiliTranscodingPreference] {
+        BilibiliTranscodingPreference.allCases
+    }
+
+    public var availableCompatibleVariantPreferences: [BilibiliCompatibleVariantPreference] {
+        BilibiliCompatibleVariantPreference.allCases
+    }
+
+    public var availableWeakNetworkPreferences: [BilibiliWeakNetworkPreference] {
+        BilibiliWeakNetworkPreference.allCases
     }
 
     public var availableDanmakuFormats: [BilibiliDanmakuFormat] {
@@ -767,7 +907,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
                 endpoint: endpoint,
-                options: options
+                options: BilibiliPlaybackResolutionOptions(options)
             )
             applyResolvedCandidateDefaults(resolved)
             isResolving = false
@@ -792,7 +932,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 endpoint: endpoint,
                 sequence: sequence,
                 client: client,
-                options: options
+                options: currentPlaybackOptions
             )
         } catch {
             guard sequence == operationSequence else {
@@ -812,7 +952,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                     endpoint: endpoint,
                     sequence: sequence,
                     client: client,
-                    options: options
+                    options: currentPlaybackOptions
                 )
                 return
             }
@@ -900,7 +1040,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             resolvedInputContext = BilibiliResolvedInputContext(
                 source: source,
                 endpoint: endpoint,
-                options: options
+                options: BilibiliPlaybackResolutionOptions(options)
             )
             applyResolvedCandidateDefaults(resolved)
             isResolving = false
@@ -1717,6 +1857,24 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return "\(task.bilibiliDisplayTitle) failed."
     }
 
+    private static func activePlaybackPolicySummary(for task: CacheTask) -> String? {
+        guard let session = task.bilibiliPlaybackSessionForPolicySummary else {
+            return nil
+        }
+
+        var parts: [String] = []
+        if let effectivePolicy = session.effectivePolicy {
+            parts.append("Policy: \(effectivePolicy.summaryText)")
+        }
+        if let transcodingPlan = session.transcodingPlan,
+            let planSummary = transcodingPlan.summaryText
+        {
+            parts.append("Transcoding: \(planSummary)")
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     private static func errorNotice(
         for errorMessage: String?,
         currentTask: CacheTask?
@@ -2006,6 +2164,10 @@ private func normalizedNonEmpty(_ value: String) -> String? {
 }
 
 private extension CacheTask {
+    var bilibiliPlaybackSessionForPolicySummary: CacheBilibiliPlaybackSession? {
+        playbackSession ?? resultItems.lazy.compactMap(\.playbackSession).first
+    }
+
     var bilibiliDisplayTitle: String {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !title.isEmpty {
@@ -2360,6 +2522,23 @@ private extension BilibiliResolvedCandidate {
     }
 }
 
+private extension LanTranscodingPlan {
+    var summaryText: String? {
+        let reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !reason.isEmpty {
+            return reason
+        }
+
+        let profileID = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !profileID.isEmpty {
+            return profileID
+        }
+
+        let state = state.trimmingCharacters(in: .whitespacesAndNewlines)
+        return state.isEmpty ? nil : state
+    }
+}
+
 private func playableURL(for source: CachePlaybackSource, expectedItemID: String) -> URL? {
     guard source.isPlayableByTVOSClient,
         source.itemID == expectedItemID
@@ -2371,11 +2550,20 @@ private func playableURL(for source: CachePlaybackSource, expectedItemID: String
 }
 
 private extension BilibiliTaskViewModel {
+    var currentPlaybackPolicy: BilibiliPlaybackPolicy {
+        BilibiliPlaybackPolicy(
+            transcodingPreference: playbackTranscodingPreference,
+            compatibleVariantPreference: playbackCompatibleVariantPreference,
+            weakNetworkPreference: playbackWeakNetworkPreference
+        )
+    }
+
     var currentPlaybackOptions: BilibiliPlaybackTaskOptions {
         BilibiliPlaybackTaskOptions(
             qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
             encodingPreference: encodingPreference.trimmingCharacters(in: .whitespacesAndNewlines),
-            audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines)
+            audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            playbackPolicy: currentPlaybackPolicy
         )
     }
 
@@ -2414,13 +2602,14 @@ private extension BilibiliTaskViewModel {
         }
 
         return resolvedInputContext.source == source
-            && resolvedInputContext.options == options
+            && resolvedInputContext.options == BilibiliPlaybackResolutionOptions(options)
             && Self.normalizedBilibiliSource(resolvedInput.source) == source
     }
 
     func currentSubmissionMatches(source: String, options: BilibiliPlaybackTaskOptions) -> Bool {
         Self.normalizedBilibiliSource(sourceText) == source
-            && currentPlaybackOptions == options
+            && BilibiliPlaybackResolutionOptions(currentPlaybackOptions)
+                == BilibiliPlaybackResolutionOptions(options)
     }
 
     func discardStaleResolveSubmission() {
@@ -2436,6 +2625,50 @@ private extension BilibiliTaskViewModel {
 
     static func normalizedBilibiliSource(_ source: String) -> String {
         source.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func loadPlaybackPolicy(from defaults: UserDefaults) -> BilibiliPlaybackPolicy {
+        BilibiliPlaybackPolicy(
+            transcodingPreference: BilibiliTranscodingPreference(
+                rawValue: defaults.string(forKey: playbackTranscodingPreferenceDefaultsKey) ?? ""
+            ) ?? .auto,
+            compatibleVariantPreference: BilibiliCompatibleVariantPreference(
+                rawValue: defaults.string(forKey: playbackCompatibleVariantPreferenceDefaultsKey) ?? ""
+            ) ?? .preferCompatible,
+            weakNetworkPreference: BilibiliWeakNetworkPreference(
+                rawValue: defaults.string(forKey: playbackWeakNetworkPreferenceDefaultsKey) ?? ""
+            ) ?? .adaptive
+        )
+    }
+
+    func persistPlaybackPolicy() {
+        persist(
+            playbackTranscodingPreference,
+            defaultValue: .auto,
+            key: Self.playbackTranscodingPreferenceDefaultsKey
+        )
+        persist(
+            playbackCompatibleVariantPreference,
+            defaultValue: .preferCompatible,
+            key: Self.playbackCompatibleVariantPreferenceDefaultsKey
+        )
+        persist(
+            playbackWeakNetworkPreference,
+            defaultValue: .adaptive,
+            key: Self.playbackWeakNetworkPreferenceDefaultsKey
+        )
+    }
+
+    func persist<T: RawRepresentable & Equatable>(
+        _ value: T,
+        defaultValue: T,
+        key: String
+    ) where T.RawValue == String {
+        if value == defaultValue {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(value.rawValue, forKey: key)
+        }
     }
 }
 

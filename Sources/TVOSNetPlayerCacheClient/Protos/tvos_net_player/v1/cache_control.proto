@@ -65,6 +65,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_LAN_TRANSCODING = 9;
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_PROFILES = 10;
   SERVER_CAPABILITY_BILIBILI_LOGIN_SESSIONS = 11;
+  SERVER_CAPABILITY_BILIBILI_PLAYBACK_POLICY = 12;
 }
 
 message CheckHealthRequest {}
@@ -284,6 +285,33 @@ message BilibiliPlaybackOptions {
   string encoding_preference = 2;
   bool prefer_tv_api = 3;
   string audio_language = 4;
+  BilibiliPlaybackPolicy playback_policy = 5;
+}
+
+message BilibiliPlaybackPolicy {
+  BilibiliTranscodingPreference transcoding_preference = 1;
+  BilibiliCompatibleVariantPreference compatible_variant_preference = 2;
+  BilibiliWeakNetworkPreference weak_network_preference = 3;
+}
+
+enum BilibiliTranscodingPreference {
+  BILIBILI_TRANSCODING_PREFERENCE_UNSPECIFIED = 0;
+  BILIBILI_TRANSCODING_PREFERENCE_AUTO = 1;
+  BILIBILI_TRANSCODING_PREFERENCE_NEVER = 2;
+  BILIBILI_TRANSCODING_PREFERENCE_FORCE = 3;
+}
+
+enum BilibiliCompatibleVariantPreference {
+  BILIBILI_COMPATIBLE_VARIANT_PREFERENCE_UNSPECIFIED = 0;
+  BILIBILI_COMPATIBLE_VARIANT_PREFERENCE_PREFER_COMPATIBLE = 1;
+  BILIBILI_COMPATIBLE_VARIANT_PREFERENCE_PREFER_REQUESTED = 2;
+}
+
+enum BilibiliWeakNetworkPreference {
+  BILIBILI_WEAK_NETWORK_PREFERENCE_UNSPECIFIED = 0;
+  BILIBILI_WEAK_NETWORK_PREFERENCE_ADAPTIVE = 1;
+  BILIBILI_WEAK_NETWORK_PREFERENCE_HOLD_DOWNGRADE = 2;
+  BILIBILI_WEAK_NETWORK_PREFERENCE_AVPLAYER_MANAGED = 3;
 }
 
 message ResolveBilibiliInputRequest {
@@ -408,6 +436,7 @@ message BilibiliPlaybackSession {
   BilibiliPlaybackVariant selected_variant = 5;
   repeated BilibiliPlaybackVariant variants = 6;
   LanTranscodingPlan transcoding_plan = 7;
+  BilibiliPlaybackPolicy effective_policy = 8;
 }
 
 message BilibiliPlaybackVariant {

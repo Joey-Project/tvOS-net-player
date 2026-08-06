@@ -13,6 +13,7 @@ use crate::generated::tvos_net_player::v1::{
     BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, LanTranscodingPlan,
     PlaybackSource, Task,
 };
+use crate::playback_policy::PlaybackPolicy;
 
 const TASK_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -332,6 +333,8 @@ struct PersistedBilibiliPlaybackSession {
     variants: Vec<PersistedBilibiliPlaybackVariant>,
     #[serde(default)]
     transcoding_plan: Option<PersistedLanTranscodingPlan>,
+    #[serde(default)]
+    effective_policy: Option<PlaybackPolicy>,
 }
 
 impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
@@ -352,6 +355,10 @@ impl From<BilibiliPlaybackSession> for PersistedBilibiliPlaybackSession {
             transcoding_plan: session
                 .transcoding_plan
                 .map(PersistedLanTranscodingPlan::from),
+            effective_policy: session.effective_policy.map(|policy| {
+                PlaybackPolicy::from_proto(Some(&policy))
+                    .expect("server-owned playback session policy should use known enum values")
+            }),
         }
     }
 }
@@ -370,6 +377,7 @@ impl From<PersistedBilibiliPlaybackSession> for BilibiliPlaybackSession {
                 .map(BilibiliPlaybackVariant::from)
                 .collect(),
             transcoding_plan: session.transcoding_plan.map(LanTranscodingPlan::from),
+            effective_policy: Some(session.effective_policy.unwrap_or_default().to_proto()),
         }
     }
 }
@@ -538,6 +546,8 @@ struct PersistedBilibiliPlaybackOptions {
     prefer_tv_api: bool,
     #[serde(default)]
     audio_language: String,
+    #[serde(default)]
+    playback_policy: Option<PlaybackPolicy>,
 }
 
 impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
@@ -547,6 +557,10 @@ impl From<BilibiliPlaybackOptions> for PersistedBilibiliPlaybackOptions {
             encoding_preference: options.encoding_preference,
             prefer_tv_api: options.prefer_tv_api,
             audio_language: options.audio_language,
+            playback_policy: options.playback_policy.map(|policy| {
+                PlaybackPolicy::from_proto(Some(&policy))
+                    .expect("validated playback options should use known policy enum values")
+            }),
         }
     }
 }
@@ -558,6 +572,7 @@ impl From<PersistedBilibiliPlaybackOptions> for BilibiliPlaybackOptions {
             encoding_preference: options.encoding_preference,
             prefer_tv_api: options.prefer_tv_api,
             audio_language: options.audio_language,
+            playback_policy: options.playback_policy.map(PlaybackPolicy::to_proto),
         }
     }
 }
@@ -578,9 +593,10 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 mod tests {
     use super::*;
     use crate::generated::tvos_net_player::v1::{
-        BilibiliDanmakuFormat, BilibiliPlaybackVariant, BilibiliSubtitleAiPolicy,
-        BilibiliTaskResultItem, BilibiliTaskSelection, LanTranscodingPlan, LanTranscodingPlanState,
-        PlaybackProtocol, TaskKind, TaskState,
+        BilibiliCompatibleVariantPreference, BilibiliDanmakuFormat, BilibiliPlaybackPolicy,
+        BilibiliPlaybackVariant, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
+        BilibiliTaskSelection, BilibiliTranscodingPreference, BilibiliWeakNetworkPreference,
+        LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskKind, TaskState,
     };
 
     #[test]
@@ -619,6 +635,87 @@ mod tests {
         assert_eq!(1, records.len());
         assert!(records[0].task.bilibili_selection.is_none());
         assert!(records[0].task.result_items.is_empty());
+    }
+
+    #[test]
+    fn load_legacy_playback_sessions_default_effective_policy() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "bilibili-playback-legacy-policy",
+      "kind": 3,
+      "state": 6,
+      "source": "BV1legacy",
+      "title": "Legacy playback",
+      "progress": 0.5,
+      "downloaded_bytes": 0,
+      "total_bytes": 0,
+      "message": "Playable.",
+      "library_item_id": "",
+      "created_at": null,
+      "updated_at": null,
+      "finished_at": null,
+      "playback_source": null,
+      "playback_session": {
+        "id": "bilibili-playback-legacy-policy",
+        "title": "Legacy playback",
+        "content_id": "cid-primary",
+        "selected_variant_id": "h264",
+        "selected_variant": null
+      },
+      "result_items": [
+        {
+          "id": "bilibili-playback-legacy-policy-result-1",
+          "selection_id": "page:1",
+          "title": "Part 1",
+          "subtitle": "Page 1",
+          "source_kind": "video_page",
+          "content_id": "cid-result",
+          "index": 1,
+          "state": 6,
+          "message": "Playable.",
+          "library_item_id": "",
+          "playback_source": null,
+          "playback_session": {
+            "id": "bilibili-playback-legacy-policy-result-1",
+            "title": "Part 1",
+            "content_id": "cid-result",
+            "selected_variant_id": "h264",
+            "selected_variant": null
+          }
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .expect("legacy playback snapshot should be written");
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("legacy playback snapshot should load");
+        let expected = PlaybackPolicy::default().to_proto();
+
+        assert_eq!(
+            Some(&expected),
+            records[0]
+                .task
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.effective_policy.as_ref())
+        );
+        assert_eq!(
+            Some(&expected),
+            records[0].task.result_items[0]
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.effective_policy.as_ref())
+        );
     }
 
     #[test]
@@ -687,6 +784,7 @@ mod tests {
             .expect("playback options should restore");
         assert_eq!("720p", playback_options.quality_preference);
         assert!(playback_options.audio_language.is_empty());
+        assert!(playback_options.playback_policy.is_none());
     }
 
     #[test]
@@ -710,6 +808,12 @@ mod tests {
             uri: "http://media.example.test:8080/hls/bilibili-playback-result-1/master.m3u8"
                 .to_owned(),
             expires_at: None,
+        };
+        let playback_policy = BilibiliPlaybackPolicy {
+            transcoding_preference: BilibiliTranscodingPreference::Force.into(),
+            compatible_variant_preference: BilibiliCompatibleVariantPreference::PreferRequested
+                .into(),
+            weak_network_preference: BilibiliWeakNetworkPreference::HoldDowngrade.into(),
         };
         let playback_session = BilibiliPlaybackSession {
             id: "bilibili-playback-result-1".to_owned(),
@@ -739,6 +843,7 @@ mod tests {
                 target_audio_codec: "aac".to_owned(),
                 output_protocol: PlaybackProtocol::Hls.into(),
             }),
+            effective_policy: Some(playback_policy),
         };
         let result_item = BilibiliTaskResultItem {
             id: "bilibili-playback-result-1".to_owned(),
@@ -794,6 +899,7 @@ mod tests {
                     encoding_preference: "h264".to_owned(),
                     prefer_tv_api: false,
                     audio_language: "ja-jp".to_owned(),
+                    playback_policy: Some(playback_policy),
                 }),
             }])
             .expect("task state should persist");
@@ -834,5 +940,21 @@ mod tests {
             .as_ref()
             .expect("playback options should round-trip");
         assert_eq!("ja-jp", playback_options.audio_language);
+        assert_eq!(
+            Some(BilibiliTranscodingPreference::Force),
+            playback_options
+                .playback_policy
+                .as_ref()
+                .map(|policy| policy.transcoding_preference())
+        );
+        assert_eq!(
+            Some(BilibiliWeakNetworkPreference::HoldDowngrade),
+            records[0]
+                .task
+                .playback_session
+                .as_ref()
+                .and_then(|session| session.effective_policy.as_ref())
+                .map(|policy| policy.weak_network_preference())
+        );
     }
 }

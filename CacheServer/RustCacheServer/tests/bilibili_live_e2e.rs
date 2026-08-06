@@ -679,6 +679,7 @@ impl LivePlaybackOptions {
             encoding_preference: self.encoding_preference.clone(),
             prefer_tv_api: self.prefer_tv_api,
             audio_language: self.audio_language.clone(),
+            playback_policy: None,
         }
     }
 }

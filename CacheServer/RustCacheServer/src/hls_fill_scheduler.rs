@@ -685,6 +685,7 @@ mod tests {
             abr: Default::default(),
             variants: Vec::new(),
             transcoding: Default::default(),
+            effective_policy: crate::playback_policy::PlaybackPolicy::default(),
         }
     }
 }

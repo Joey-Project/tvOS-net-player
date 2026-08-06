@@ -329,6 +329,10 @@ struct ContentView: View {
                     .textContentType(.none)
             }
 
+            if bilibiliModel.submissionMode == .playback {
+                bilibiliPlaybackPolicyControls
+            }
+
             if bilibiliModel.submissionMode == .download {
                 bilibiliDownloadOptions
             }
@@ -430,6 +434,12 @@ struct ContentView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                    if let summary = bilibiliModel.activePlaybackPolicySummary {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                     if let badge = bilibiliModel.progressiveCacheStatusBadge {
                         Label(badge.label, systemImage: badge.systemImage)
                             .font(.caption)
@@ -574,6 +584,31 @@ struct ContentView: View {
                 }
                 .disabled(!model.canClear)
             }
+        }
+    }
+
+    private var bilibiliPlaybackPolicyControls: some View {
+        HStack(spacing: 10) {
+            Picker("Transcode", selection: $bilibiliModel.playbackTranscodingPreference) {
+                ForEach(bilibiliModel.availableTranscodingPreferences, id: \.self) { preference in
+                    Text(preference.title).tag(preference)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Picker("Variant", selection: $bilibiliModel.playbackCompatibleVariantPreference) {
+                ForEach(bilibiliModel.availableCompatibleVariantPreferences, id: \.self) { preference in
+                    Text(preference.title).tag(preference)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Picker("Weak Network", selection: $bilibiliModel.playbackWeakNetworkPreference) {
+                ForEach(bilibiliModel.availableWeakNetworkPreferences, id: \.self) { preference in
+                    Text(preference.title).tag(preference)
+                }
+            }
+            .pickerStyle(.menu)
         }
     }
 

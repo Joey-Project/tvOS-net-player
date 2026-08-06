@@ -279,6 +279,13 @@ public final class GRPCCacheControlClient: CacheControlClient {
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
     ) async throws -> BilibiliResolveResult {
+        if let requiredCapability = Self.requiredCapabilityForBilibiliPlaybackPolicy(options: options) {
+            let serverInfo = try await getServerInfo()
+            guard serverInfo.capabilities.contains(requiredCapability) else {
+                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+            }
+        }
+
         do {
             return try await withGRPCClient(
                 transport: .http2NIOTS(
@@ -343,13 +350,17 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
         let normalizedSelectionID = selectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if let requiredCapability = Self.requiredCapabilityForBilibiliPlaybackTask(
+        let requiredCapabilities = Self.requiredCapabilitiesForBilibiliPlaybackTask(
             selectionID: normalizedSelectionID,
-            selection: selection
-        ) {
+            selection: selection,
+            options: options
+        )
+        if !requiredCapabilities.isEmpty {
             let serverInfo = try await getServerInfo()
-            guard serverInfo.capabilities.contains(requiredCapability) else {
-                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+            for requiredCapability in requiredCapabilities {
+                guard serverInfo.capabilities.contains(requiredCapability) else {
+                    throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+                }
             }
         }
 
@@ -405,11 +416,38 @@ public final class GRPCCacheControlClient: CacheControlClient {
         return nil
     }
 
+    static func requiredCapabilitiesForBilibiliPlaybackTask(
+        selectionID: String,
+        selection: BilibiliTaskSelection?,
+        options: BilibiliPlaybackTaskOptions
+    ) -> [String] {
+        var capabilities: [String] = []
+        if let selectionCapability = requiredCapabilityForBilibiliPlaybackTask(
+            selectionID: selectionID,
+            selection: selection
+        ) {
+            capabilities.append(selectionCapability)
+        }
+        if let policyCapability = requiredCapabilityForBilibiliPlaybackPolicy(options: options) {
+            capabilities.append(policyCapability)
+        }
+        return capabilities
+    }
+
+    static func requiredCapabilityForBilibiliPlaybackPolicy(
+        options: BilibiliPlaybackTaskOptions
+    ) -> String? {
+        options.playbackPolicy.isDefault ? nil : CacheServerCapability.bilibiliPlaybackPolicy
+    }
+
     private static func unsupportedFeature(forMissingCapability capability: String)
         -> CacheControlClientUnsupportedFeature
     {
         if capability == CacheServerCapability.bilibiliTaskSelection {
             return .bilibiliTaskSelection
+        }
+        if capability == CacheServerCapability.bilibiliPlaybackPolicy {
+            return .bilibiliPlaybackPolicy
         }
         return .bilibiliResolve
     }
@@ -965,6 +1003,9 @@ extension CacheBilibiliPlaybackSession {
             variants: proto.variants.map(CacheBilibiliPlaybackVariant.init),
             transcodingPlan: proto.hasTranscodingPlan
                 ? LanTranscodingPlan(proto.transcodingPlan)
+                : nil,
+            effectivePolicy: proto.hasEffectivePolicy
+                ? BilibiliPlaybackPolicy(proto.effectivePolicy)
                 : nil
         )
     }
@@ -1003,12 +1044,114 @@ extension CacheBilibiliPlaybackVariant {
 }
 
 extension TvosNetPlayer_V1_BilibiliPlaybackOptions {
-    fileprivate init(_ options: BilibiliPlaybackTaskOptions) {
+    init(_ options: BilibiliPlaybackTaskOptions) {
         self.init()
         qualityPreference = options.qualityPreference
         encodingPreference = options.encodingPreference
         audioLanguage = options.audioLanguagePreference
         preferTvApi = options.preferTVAPI
+        playbackPolicy = TvosNetPlayer_V1_BilibiliPlaybackPolicy(options.playbackPolicy)
+    }
+}
+
+extension BilibiliPlaybackPolicy {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliPlaybackPolicy) {
+        self.init(
+            transcodingPreference: BilibiliTranscodingPreference(proto.transcodingPreference),
+            compatibleVariantPreference: BilibiliCompatibleVariantPreference(proto.compatibleVariantPreference),
+            weakNetworkPreference: BilibiliWeakNetworkPreference(proto.weakNetworkPreference)
+        )
+    }
+}
+
+extension BilibiliTranscodingPreference {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliTranscodingPreference) {
+        switch proto {
+        case .auto:
+            self = .auto
+        case .never:
+            self = .never
+        case .force:
+            self = .force
+        case .unspecified, .UNRECOGNIZED(_):
+            self = .auto
+        }
+    }
+}
+
+extension BilibiliCompatibleVariantPreference {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliCompatibleVariantPreference) {
+        switch proto {
+        case .preferCompatible:
+            self = .preferCompatible
+        case .preferRequested:
+            self = .preferRequested
+        case .unspecified, .UNRECOGNIZED(_):
+            self = .preferCompatible
+        }
+    }
+}
+
+extension BilibiliWeakNetworkPreference {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliWeakNetworkPreference) {
+        switch proto {
+        case .adaptive:
+            self = .adaptive
+        case .holdDowngrade:
+            self = .holdDowngrade
+        case .avplayerManaged:
+            self = .avPlayerManaged
+        case .unspecified, .UNRECOGNIZED(_):
+            self = .adaptive
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliPlaybackPolicy {
+    init(_ policy: BilibiliPlaybackPolicy) {
+        self.init()
+        transcodingPreference = TvosNetPlayer_V1_BilibiliTranscodingPreference(policy.transcodingPreference)
+        compatibleVariantPreference = TvosNetPlayer_V1_BilibiliCompatibleVariantPreference(
+            policy.compatibleVariantPreference
+        )
+        weakNetworkPreference = TvosNetPlayer_V1_BilibiliWeakNetworkPreference(policy.weakNetworkPreference)
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliTranscodingPreference {
+    init(_ preference: BilibiliTranscodingPreference) {
+        switch preference {
+        case .auto:
+            self = .auto
+        case .never:
+            self = .never
+        case .force:
+            self = .force
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliCompatibleVariantPreference {
+    init(_ preference: BilibiliCompatibleVariantPreference) {
+        switch preference {
+        case .preferCompatible:
+            self = .preferCompatible
+        case .preferRequested:
+            self = .preferRequested
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliWeakNetworkPreference {
+    init(_ preference: BilibiliWeakNetworkPreference) {
+        switch preference {
+        case .adaptive:
+            self = .adaptive
+        case .holdDowngrade:
+            self = .holdDowngrade
+        case .avPlayerManaged:
+            self = .avplayerManaged
+        }
     }
 }
 

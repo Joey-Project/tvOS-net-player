@@ -37,6 +37,13 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedBilibiliPlaybackPolicyCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliPlaybackPolicy),
+            CacheServerCapability.bilibiliPlaybackPolicy
+        )
+    }
+
     func testGeneratedLanTranscodingCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.lanTranscoding),
@@ -65,6 +72,9 @@ final class CacheLibraryPaginationTests: XCTestCase {
         proto.playbackSession.transcodingPlan.targetVideoCodec = "h264"
         proto.playbackSession.transcodingPlan.targetAudioCodec = "aac"
         proto.playbackSession.transcodingPlan.outputProtocol = .hls
+        proto.playbackSession.effectivePolicy.transcodingPreference = .force
+        proto.playbackSession.effectivePolicy.compatibleVariantPreference = .preferRequested
+        proto.playbackSession.effectivePolicy.weakNetworkPreference = .holdDowngrade
         proto.bilibiliSelection.mode = .range
         proto.bilibiliSelection.selectionIds = ["page:1", "page:2"]
         proto.bilibiliSelection.rangeStartIndex = 1
@@ -106,6 +116,48 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(task.resultItems.first?.playbackSource?.playbackProtocol, expectedPlaybackProtocol)
         XCTAssertEqual(task.playbackSession?.transcodingPlan?.state, expectedTranscodingState)
         XCTAssertEqual(task.playbackSession?.transcodingPlan?.outputProtocol, expectedPlaybackProtocol)
+        XCTAssertEqual(
+            task.playbackSession?.effectivePolicy,
+            BilibiliPlaybackPolicy(
+                transcodingPreference: .force,
+                compatibleVariantPreference: .preferRequested,
+                weakNetworkPreference: .holdDowngrade
+            )
+        )
+    }
+
+    func testBilibiliPlaybackTaskOptionsMapPolicyToGeneratedSchema() {
+        let options = BilibiliPlaybackTaskOptions(
+            qualityPreference: "1080p",
+            encodingPreference: "h264",
+            audioLanguagePreference: "ja-jp",
+            preferTVAPI: true,
+            playbackPolicy: BilibiliPlaybackPolicy(
+                transcodingPreference: .never,
+                compatibleVariantPreference: .preferRequested,
+                weakNetworkPreference: .avPlayerManaged
+            )
+        )
+
+        let proto = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+
+        XCTAssertEqual(proto.qualityPreference, "1080p")
+        XCTAssertEqual(proto.encodingPreference, "h264")
+        XCTAssertEqual(proto.audioLanguage, "ja-jp")
+        XCTAssertTrue(proto.preferTvApi)
+        XCTAssertEqual(proto.playbackPolicy.transcodingPreference, .never)
+        XCTAssertEqual(proto.playbackPolicy.compatibleVariantPreference, .preferRequested)
+        XCTAssertEqual(proto.playbackPolicy.weakNetworkPreference, .avplayerManaged)
+    }
+
+    func testBilibiliPlaybackTaskOptionsDefaultsMapConservativePolicy() {
+        let options = BilibiliPlaybackTaskOptions()
+        let proto = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+
+        XCTAssertEqual(options.playbackPolicy, .default)
+        XCTAssertEqual(proto.playbackPolicy.transcodingPreference, .auto)
+        XCTAssertEqual(proto.playbackPolicy.compatibleVariantPreference, .preferCompatible)
+        XCTAssertEqual(proto.playbackPolicy.weakNetworkPreference, .adaptive)
     }
 
     func testBilibiliDownloadTaskOptionsMapToGeneratedSchema() {
@@ -158,6 +210,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliCredentialProfiles,
                 CacheServerCapability.bilibiliLoginSessions,
+                CacheServerCapability.bilibiliPlaybackPolicy,
                 CacheServerCapability.bilibiliResolve,
                 CacheServerCapability.bilibiliTaskSelection,
                 CacheServerCapability.lanTranscoding,
@@ -174,12 +227,14 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(supported.supportsBilibiliCredentialStatus)
         XCTAssertTrue(supported.supportsBilibiliCredentialProfiles)
         XCTAssertTrue(supported.supportsBilibiliLoginSessions)
+        XCTAssertTrue(supported.supportsBilibiliPlaybackPolicy)
         XCTAssertTrue(supported.supportsBilibiliResolve)
         XCTAssertTrue(supported.supportsBilibiliTaskSelection)
         XCTAssertTrue(supported.supportsLanTranscoding)
         XCTAssertFalse(unsupported.supportsBilibiliCredentialStatus)
         XCTAssertFalse(unsupported.supportsBilibiliCredentialProfiles)
         XCTAssertFalse(unsupported.supportsBilibiliLoginSessions)
+        XCTAssertFalse(unsupported.supportsBilibiliPlaybackPolicy)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
         XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
         XCTAssertFalse(unsupported.supportsLanTranscoding)
@@ -227,6 +282,37 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 selection: BilibiliTaskSelection(mode: "single", selectionIDs: ["page:2"])
             ),
             CacheServerCapability.bilibiliTaskSelection
+        )
+        XCTAssertNil(
+            GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackPolicy(
+                options: BilibiliPlaybackTaskOptions()
+            )
+        )
+        let policyOptions = BilibiliPlaybackTaskOptions(
+            playbackPolicy: BilibiliPlaybackPolicy(transcodingPreference: .force)
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilityForBilibiliPlaybackPolicy(options: policyOptions),
+            CacheServerCapability.bilibiliPlaybackPolicy
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilitiesForBilibiliPlaybackTask(
+                selectionID: "page:2",
+                selection: BilibiliTaskSelection(mode: "single", selectionIDs: ["page:2"]),
+                options: policyOptions
+            ),
+            [
+                CacheServerCapability.bilibiliTaskSelection,
+                CacheServerCapability.bilibiliPlaybackPolicy,
+            ]
+        )
+        XCTAssertEqual(
+            GRPCCacheControlClient.requiredCapabilitiesForBilibiliPlaybackTask(
+                selectionID: "",
+                selection: nil,
+                options: BilibiliPlaybackTaskOptions()
+            ),
+            []
         )
     }
 

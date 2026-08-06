@@ -37,6 +37,7 @@ use crate::{
     },
     library::{OpenedMediaFile, open_read_no_follow},
     mp4_segments::{Mp4SegmentRange, mp4_fragment_ranges},
+    playback_policy::PlaybackPolicy,
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS,
         LAN_TRANSCODING_AUDIO_CODEC, LAN_TRANSCODING_MAX_FRAME_RATE, LAN_TRANSCODING_MAX_HEIGHT,
@@ -2766,6 +2767,8 @@ struct PersistedHlsSession {
     variants: Vec<PersistedHlsVariantMetadata>,
     #[serde(default)]
     transcoding: PersistedHlsTranscodingPlan,
+    #[serde(default)]
+    effective_policy: PlaybackPolicy,
 }
 
 impl From<HlsPlaybackSession> for PersistedHlsSession {
@@ -2788,6 +2791,7 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
                 .map(PersistedHlsVariantMetadata::from)
                 .collect(),
             transcoding: PersistedHlsTranscodingPlan::from(session.transcoding),
+            effective_policy: session.effective_policy,
         }
     }
 }
@@ -2814,6 +2818,7 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
                 .map(HlsVariantMetadata::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
             transcoding: HlsTranscodingPlan::from(session.transcoding),
+            effective_policy: session.effective_policy,
         })
     }
 }
@@ -3451,7 +3456,12 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use crate::hls_playback_progress::PlaybackProgressIntent;
+    use crate::{
+        hls_playback_progress::PlaybackProgressIntent,
+        playback_policy::{
+            CompatibleVariantPreference, TranscodingPreference, WeakNetworkPreference,
+        },
+    };
 
     use super::*;
 
@@ -3489,6 +3499,25 @@ mod tests {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
         let session = sample_session("session-1", "https://example.test/video.m4s");
+
+        store
+            .save_session(&session)
+            .expect("session manifest should save");
+        let sessions = store.load_sessions().expect("session manifest should load");
+
+        assert_eq!(vec![session], sessions);
+    }
+
+    #[test]
+    fn saves_and_loads_hls_session_effective_policy() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-policy", "https://example.test/video.m4s");
+        session.effective_policy = PlaybackPolicy {
+            transcoding_preference: TranscodingPreference::Force,
+            compatible_variant_preference: CompatibleVariantPreference::PreferRequested,
+            weak_network_preference: WeakNetworkPreference::HoldDowngrade,
+        };
 
         store
             .save_session(&session)
@@ -3633,6 +3662,7 @@ mod tests {
         object.remove("abr");
         object.remove("variants");
         object.remove("transcoding");
+        object.remove("effective_policy");
 
         let manifest_path = store
             .session_dir("session-legacy")
@@ -3647,6 +3677,7 @@ mod tests {
         assert!(sessions[0].abr.groups.is_empty());
         assert!(sessions[0].variants.is_empty());
         assert_eq!(HlsTranscodingPlan::default(), sessions[0].transcoding);
+        assert_eq!(PlaybackPolicy::default(), sessions[0].effective_policy);
         assert_eq!(session, sessions[0]);
     }
 
@@ -6769,6 +6800,7 @@ mod tests {
             abr: Default::default(),
             variants: Vec::new(),
             transcoding: Default::default(),
+            effective_policy: PlaybackPolicy::default(),
         }
     }
 

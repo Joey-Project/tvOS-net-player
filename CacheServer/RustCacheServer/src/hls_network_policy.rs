@@ -4,11 +4,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::playback_policy::WeakNetworkPreference;
+
 const RETRYING_WINDOW: Duration = Duration::from_secs(30);
 const CACHE_ONLY_WINDOW: Duration = Duration::from_secs(30);
 const DEGRADE_DURATION: Duration = Duration::from_secs(120);
 const SLOW_RESPONSE_THRESHOLD: Duration = Duration::from_secs(3);
 const SLOW_RESPONSE_DEGRADE_COUNT: u32 = 2;
+#[cfg(test)]
+const TEST_SESSION_GENERATION: u64 = 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct HlsNetworkPolicy {
@@ -16,47 +20,165 @@ pub(crate) struct HlsNetworkPolicy {
 }
 
 impl HlsNetworkPolicy {
-    pub(crate) fn variant_is_advertisable(&self, session_id: &str, variant_id: &str) -> bool {
-        self.variant_is_advertisable_at(session_id, variant_id, SystemTime::now())
-    }
-
-    pub(crate) fn record_upstream_retry(&self, session_id: &str, variant_id: &str) {
-        self.record_upstream_retry_at(session_id, variant_id, SystemTime::now());
-    }
-
-    pub(crate) fn record_upstream_success(
+    pub(crate) fn variant_is_advertisable_for_policy(
         &self,
+        weak_network_preference: WeakNetworkPreference,
         session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+    ) -> bool {
+        self.variant_is_advertisable_at_for_policy(
+            weak_network_preference,
+            session_id,
+            session_generation,
+            variant_id,
+            SystemTime::now(),
+        )
+    }
+
+    pub(crate) fn record_upstream_retry_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+    ) {
+        self.record_upstream_retry_at_for_policy(
+            weak_network_preference,
+            session_id,
+            session_generation,
+            variant_id,
+            SystemTime::now(),
+        );
+    }
+
+    pub(crate) fn record_upstream_success_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
         variant_id: &str,
         response_time: Duration,
     ) {
-        self.record_upstream_success_at(session_id, variant_id, response_time, SystemTime::now());
+        self.record_upstream_success_at_for_policy(
+            weak_network_preference,
+            session_id,
+            session_generation,
+            variant_id,
+            response_time,
+            SystemTime::now(),
+        );
     }
 
+    #[cfg(test)]
     pub(crate) fn record_upstream_failure(&self, session_id: &str, variant_id: &str) {
-        self.record_upstream_failure_at(session_id, variant_id, SystemTime::now());
+        self.record_upstream_failure_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            variant_id,
+        );
     }
 
-    pub(crate) fn record_cache_hit(&self, session_id: &str) {
-        self.record_cache_hit_at(session_id, SystemTime::now());
+    pub(crate) fn record_upstream_failure_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+    ) {
+        self.record_upstream_failure_at_for_policy(
+            weak_network_preference,
+            session_id,
+            session_generation,
+            variant_id,
+            SystemTime::now(),
+        );
     }
 
-    pub(crate) fn remove_session(&self, session_id: &str) {
-        self.remove_session_at(session_id, SystemTime::now());
+    pub(crate) fn record_cache_hit_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+    ) {
+        self.record_cache_hit_at_for_policy(
+            weak_network_preference,
+            session_id,
+            session_generation,
+            SystemTime::now(),
+        );
+    }
+
+    pub(crate) fn advance_session_generation(&self, session_id: &str, generation: u64) {
+        self.advance_session_generation_at(session_id, generation, SystemTime::now());
+    }
+
+    pub(crate) fn remove_session_generation(&self, session_id: &str, generation: u64) {
+        self.remove_session_generation_at(session_id, generation, SystemTime::now());
     }
 
     pub(crate) fn snapshot(&self) -> HlsWeakNetworkSnapshot {
         self.snapshot_at(SystemTime::now())
     }
 
+    #[cfg(test)]
+    pub(crate) fn session_generation_for_tests(&self, session_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("HLS network policy lock poisoned")
+            .session_generations
+            .get(session_id)
+            .copied()
+    }
+
+    #[cfg(test)]
+    fn active_session_count_for_tests(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("HLS network policy lock poisoned")
+            .sessions
+            .len()
+    }
+
+    #[cfg(test)]
+    fn take_prune_visit_count_for_tests(&self) -> usize {
+        let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        std::mem::take(&mut state.prune_visit_count)
+    }
+
+    #[cfg(test)]
     pub(crate) fn variant_is_advertisable_at(
         &self,
         session_id: &str,
         variant_id: &str,
         now: SystemTime,
     ) -> bool {
+        self.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            variant_id,
+            now,
+        )
+    }
+
+    pub(crate) fn variant_is_advertisable_at_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+        now: SystemTime,
+    ) -> bool {
+        if weak_network_preference == WeakNetworkPreference::AvPlayerManaged {
+            return true;
+        }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
+        if state.session_generations.get(session_id) != Some(&session_generation) {
+            return true;
+        }
         state
             .sessions
             .get(session_id)
@@ -64,19 +186,43 @@ impl HlsNetworkPolicy {
             .is_none_or(|variant| !variant.is_degraded(now))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_upstream_retry_at(
         &self,
         session_id: &str,
         variant_id: &str,
         now: SystemTime,
     ) {
+        self.record_upstream_retry_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            variant_id,
+            now,
+        );
+    }
+
+    pub(crate) fn record_upstream_retry_at_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+        now: SystemTime,
+    ) {
+        if weak_network_preference == WeakNetworkPreference::AvPlayerManaged {
+            return;
+        }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
-        let variant = state.variant_mut(session_id, variant_id);
+        state.prune_session(session_id, now);
+        let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
+            return;
+        };
         variant.retrying_until = Some(now + RETRYING_WINDOW);
         state.last_changed_at = Some(now);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_upstream_success_at(
         &self,
         session_id: &str,
@@ -84,42 +230,112 @@ impl HlsNetworkPolicy {
         response_time: Duration,
         now: SystemTime,
     ) {
+        self.record_upstream_success_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            variant_id,
+            response_time,
+            now,
+        );
+    }
+
+    pub(crate) fn record_upstream_success_at_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+        response_time: Duration,
+        now: SystemTime,
+    ) {
+        if weak_network_preference == WeakNetworkPreference::AvPlayerManaged {
+            return;
+        }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
-        let variant = state.variant_mut(session_id, variant_id);
+        state.prune_session(session_id, now);
+        let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
+            return;
+        };
         variant.consecutive_failures = 0;
         if response_time >= SLOW_RESPONSE_THRESHOLD {
             variant.consecutive_slow_responses += 1;
             variant.retrying_until = Some(now + RETRYING_WINDOW);
             if variant.consecutive_slow_responses >= SLOW_RESPONSE_DEGRADE_COUNT {
-                variant.unhealthy_until = Some(now + DEGRADE_DURATION);
+                set_variant_degraded(variant, weak_network_preference, now);
                 variant.unhealthy_reason = Some(HlsWeakNetworkReason::SlowUpstream);
             }
         } else {
             variant.consecutive_slow_responses = 0;
         }
         state.last_changed_at = Some(now);
+        state.prune_session(session_id, now);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_upstream_failure_at(
         &self,
         session_id: &str,
         variant_id: &str,
         now: SystemTime,
     ) {
+        self.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            variant_id,
+            now,
+        );
+    }
+
+    pub(crate) fn record_upstream_failure_at_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+        now: SystemTime,
+    ) {
+        if weak_network_preference == WeakNetworkPreference::AvPlayerManaged {
+            return;
+        }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
-        let variant = state.variant_mut(session_id, variant_id);
+        state.prune_session(session_id, now);
+        let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
+            return;
+        };
         variant.consecutive_failures += 1;
         variant.retrying_until = Some(now + RETRYING_WINDOW);
-        variant.unhealthy_until = Some(now + DEGRADE_DURATION);
+        set_variant_degraded(variant, weak_network_preference, now);
         variant.unhealthy_reason = Some(HlsWeakNetworkReason::UpstreamFailed);
         state.last_changed_at = Some(now);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_cache_hit_at(&self, session_id: &str, now: SystemTime) {
+        self.record_cache_hit_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            session_id,
+            TEST_SESSION_GENERATION,
+            now,
+        );
+    }
+
+    pub(crate) fn record_cache_hit_at_for_policy(
+        &self,
+        weak_network_preference: WeakNetworkPreference,
+        session_id: &str,
+        session_generation: u64,
+        now: SystemTime,
+    ) {
+        if weak_network_preference == WeakNetworkPreference::AvPlayerManaged {
+            return;
+        }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
+        if state.session_generations.get(session_id) != Some(&session_generation) {
+            return;
+        }
         let Some(session) = state.sessions.get_mut(session_id) else {
             return;
         };
@@ -130,12 +346,41 @@ impl HlsNetworkPolicy {
         state.last_changed_at = Some(now);
     }
 
-    fn remove_session_at(&self, session_id: &str, now: SystemTime) {
+    fn advance_session_generation_at(&self, session_id: &str, generation: u64, now: SystemTime) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
-        if state.sessions.remove(session_id).is_some() {
-            state.last_changed_at = Some(now);
+        state.prune_session(session_id, now);
+        let should_advance = state
+            .session_generations
+            .get(session_id)
+            .is_none_or(|current| *current < generation);
+        if should_advance {
+            state
+                .session_generations
+                .insert(session_id.to_owned(), generation);
+            if state.sessions.remove(session_id).is_some() {
+                state.last_changed_at = Some(now);
+            }
         }
+    }
+
+    fn remove_session_generation_at(&self, session_id: &str, generation: u64, now: SystemTime) {
+        let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        state.prune_session(session_id, now);
+        let should_remove = state
+            .session_generations
+            .get(session_id)
+            .is_some_and(|current| *current <= generation);
+        if should_remove {
+            state.session_generations.remove(session_id);
+            if state.sessions.remove(session_id).is_some() {
+                state.last_changed_at = Some(now);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_session_at(&self, session_id: &str, now: SystemTime) {
+        self.remove_session_generation_at(session_id, TEST_SESSION_GENERATION, now);
     }
 
     pub(crate) fn snapshot_at(&self, now: SystemTime) -> HlsWeakNetworkSnapshot {
@@ -147,37 +392,83 @@ impl HlsNetworkPolicy {
 
 #[derive(Default)]
 struct HlsNetworkPolicyState {
+    // Fence stale events without putting idle sessions on snapshot and pruning hot paths.
+    session_generations: HashMap<String, u64>,
     sessions: HashMap<String, HlsSessionNetworkState>,
     last_changed_at: Option<SystemTime>,
+    #[cfg(test)]
+    prune_visit_count: usize,
 }
 
 impl HlsNetworkPolicyState {
-    fn variant_mut(&mut self, session_id: &str, variant_id: &str) -> &mut HlsVariantNetworkState {
-        self.sessions
-            .entry(session_id.to_owned())
-            .or_default()
-            .variants
-            .entry(variant_id.to_owned())
-            .or_default()
+    fn variant_mut(
+        &mut self,
+        session_id: &str,
+        session_generation: u64,
+        variant_id: &str,
+    ) -> Option<&mut HlsVariantNetworkState> {
+        let should_advance = self
+            .session_generations
+            .get(session_id)
+            .is_none_or(|current| *current < session_generation);
+        if should_advance {
+            self.session_generations
+                .insert(session_id.to_owned(), session_generation);
+            self.sessions.remove(session_id);
+        } else if self.session_generations.get(session_id) != Some(&session_generation) {
+            return None;
+        }
+        Some(
+            self.sessions
+                .entry(session_id.to_owned())
+                .or_default()
+                .variants
+                .entry(variant_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    fn prune_session(&mut self, session_id: &str, now: SystemTime) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.prune_visit_count += 1;
+        }
+        Self::prune_session_state(session, now);
+        if !session.has_active_state() {
+            self.sessions.remove(session_id);
+        }
     }
 
     fn prune_expired(&mut self, now: SystemTime) {
+        #[cfg(test)]
+        {
+            self.prune_visit_count += self.sessions.len();
+        }
         self.sessions.retain(|_, session| {
-            session.variants.retain(|_, variant| {
-                variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
-                if variant.unhealthy_until.is_some_and(|until| until <= now) {
-                    variant.unhealthy_until = None;
-                    variant.unhealthy_reason = None;
-                    variant.consecutive_failures = 0;
-                    variant.consecutive_slow_responses = 0;
-                }
-                variant.retrying_until.is_some() || variant.unhealthy_until.is_some()
-            });
-            session.cache_only_until = session
-                .cache_only_until
-                .filter(|until| *until > now && session.has_degraded_variant(now));
-            !session.variants.is_empty() || session.cache_only_until.is_some()
+            Self::prune_session_state(session, now);
+            session.has_active_state()
         });
+    }
+
+    fn prune_session_state(session: &mut HlsSessionNetworkState, now: SystemTime) {
+        session.variants.retain(|_, variant| {
+            variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
+            if !variant.hold_degraded && variant.unhealthy_until.is_some_and(|until| until <= now) {
+                variant.unhealthy_until = None;
+                variant.unhealthy_reason = None;
+                variant.consecutive_failures = 0;
+                variant.consecutive_slow_responses = 0;
+            }
+            variant.retrying_until.is_some()
+                || variant.unhealthy_until.is_some()
+                || variant.hold_degraded
+        });
+        session.cache_only_until = session
+            .cache_only_until
+            .filter(|until| *until > now && session.has_degraded_variant(now));
     }
 
     fn snapshot(&self, now: SystemTime) -> HlsWeakNetworkSnapshot {
@@ -244,6 +535,10 @@ impl HlsSessionNetworkState {
             .values()
             .any(|variant| variant.is_degraded(now))
     }
+
+    fn has_active_state(&self) -> bool {
+        !self.variants.is_empty() || self.cache_only_until.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -253,11 +548,12 @@ struct HlsVariantNetworkState {
     retrying_until: Option<SystemTime>,
     unhealthy_until: Option<SystemTime>,
     unhealthy_reason: Option<HlsWeakNetworkReason>,
+    hold_degraded: bool,
 }
 
 impl HlsVariantNetworkState {
     fn is_degraded(&self, now: SystemTime) -> bool {
-        self.unhealthy_until.is_some_and(|until| until > now)
+        self.hold_degraded || self.unhealthy_until.is_some_and(|until| until > now)
     }
 }
 
@@ -299,6 +595,19 @@ impl HlsWeakNetworkState {
 enum HlsWeakNetworkReason {
     SlowUpstream,
     UpstreamFailed,
+}
+
+fn set_variant_degraded(
+    variant: &mut HlsVariantNetworkState,
+    weak_network_preference: WeakNetworkPreference,
+    now: SystemTime,
+) {
+    if weak_network_preference == WeakNetworkPreference::HoldDowngrade {
+        variant.hold_degraded = true;
+        variant.unhealthy_until = None;
+    } else {
+        variant.unhealthy_until = Some(now + DEGRADE_DURATION);
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +677,73 @@ mod tests {
             HlsWeakNetworkState::Normal,
             policy.snapshot_at(recovered_at).state
         );
+    }
+
+    #[test]
+    fn hold_downgrade_policy_keeps_variant_hidden_until_session_removal() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            now,
+        );
+
+        let after_adaptive_recovery = now + DEGRADE_DURATION + Duration::from_secs(1);
+        assert!(!policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            after_adaptive_recovery,
+        ));
+        assert_eq!(
+            HlsWeakNetworkState::UpstreamFailed,
+            policy.snapshot_at(after_adaptive_recovery).state
+        );
+
+        policy.remove_session_at("session", after_adaptive_recovery);
+        assert!(policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            after_adaptive_recovery,
+        ));
+    }
+
+    #[test]
+    fn avplayer_managed_policy_does_not_accumulate_server_downgrade_state() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::AvPlayerManaged,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            now,
+        );
+        policy.record_upstream_success_at_for_policy(
+            WeakNetworkPreference::AvPlayerManaged,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            SLOW_RESPONSE_THRESHOLD,
+            now,
+        );
+
+        assert!(policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::AvPlayerManaged,
+            "session",
+            TEST_SESSION_GENERATION,
+            "1080p",
+            now,
+        ));
+        assert_eq!(HlsWeakNetworkState::Normal, policy.snapshot_at(now).state);
     }
 
     #[test]
@@ -471,5 +847,165 @@ mod tests {
         assert_eq!(0, snapshot.degraded_session_count);
         assert_eq!(0, snapshot.unhealthy_variant_count);
         assert_eq!(0, snapshot.cache_only_session_count);
+    }
+
+    #[test]
+    fn stale_generation_cannot_modify_or_remove_newer_state() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        policy.advance_session_generation_at("session", 1, now);
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            1,
+            "1080p",
+            now,
+        );
+        assert_eq!(
+            HlsWeakNetworkState::UpstreamFailed,
+            policy.snapshot_at(now).state
+        );
+
+        let next_generation_at = now + Duration::from_secs(1);
+        policy.advance_session_generation_at("session", 2, next_generation_at);
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            1,
+            "stale-1080p",
+            next_generation_at,
+        );
+        assert_eq!(
+            HlsWeakNetworkState::Normal,
+            policy.snapshot_at(next_generation_at).state
+        );
+
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            2,
+            "720p",
+            next_generation_at,
+        );
+        policy.remove_session_generation_at("session", 1, next_generation_at);
+        assert_eq!(
+            HlsWeakNetworkState::UpstreamFailed,
+            policy.snapshot_at(next_generation_at).state
+        );
+        assert!(policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            1,
+            "720p",
+            next_generation_at,
+        ));
+        assert!(!policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session",
+            2,
+            "720p",
+            next_generation_at,
+        ));
+
+        policy.remove_session_generation_at("session", 2, next_generation_at);
+        assert_eq!(
+            HlsWeakNetworkState::Normal,
+            policy.snapshot_at(next_generation_at).state
+        );
+    }
+
+    #[test]
+    fn idle_registrations_and_expired_events_do_not_accumulate_active_sessions() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            policy.advance_session_generation_at(&format!("idle-session-{session_index}"), 1, now);
+        }
+
+        assert_eq!(0, policy.active_session_count_for_tests());
+
+        policy.advance_session_generation_at("active-session", 2, now);
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            "active-session",
+            2,
+            "1080p",
+            now,
+        );
+        assert_eq!(1, policy.active_session_count_for_tests());
+
+        let recovered_at = now + DEGRADE_DURATION + Duration::from_secs(1);
+        assert_eq!(
+            HlsWeakNetworkState::Normal,
+            policy.snapshot_at(recovered_at).state
+        );
+        assert_eq!(0, policy.active_session_count_for_tests());
+        assert_eq!(
+            Some(2),
+            policy.session_generation_for_tests("active-session")
+        );
+
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            "active-session",
+            1,
+            "stale-1080p",
+            recovered_at,
+        );
+        assert_eq!(0, policy.active_session_count_for_tests());
+    }
+
+    #[test]
+    fn healthy_successes_do_not_accumulate_active_sessions() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            let session_id = format!("healthy-session-{session_index}");
+            policy.advance_session_generation_at(&session_id, 1, now);
+            policy.record_upstream_success_at_for_policy(
+                WeakNetworkPreference::Adaptive,
+                &session_id,
+                1,
+                "1080p",
+                Duration::from_millis(50),
+                now,
+            );
+        }
+
+        assert_eq!(0, policy.active_session_count_for_tests());
+    }
+
+    #[test]
+    fn targeted_queries_only_prune_the_requested_hold_session() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            let session_id = format!("hold-session-{session_index}");
+            policy.advance_session_generation_at(&session_id, 1, now);
+            policy.record_upstream_failure_at_for_policy(
+                WeakNetworkPreference::HoldDowngrade,
+                &session_id,
+                1,
+                "1080p",
+                now,
+            );
+        }
+        assert_eq!(10_000, policy.active_session_count_for_tests());
+        policy.take_prune_visit_count_for_tests();
+
+        assert!(!policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "hold-session-9999",
+            1,
+            "1080p",
+            now + Duration::from_secs(1),
+        ));
+
+        assert_eq!(1, policy.take_prune_visit_count_for_tests());
+        assert_eq!(10_000, policy.active_session_count_for_tests());
     }
 }

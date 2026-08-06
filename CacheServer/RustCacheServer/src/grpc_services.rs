@@ -64,6 +64,7 @@ use crate::{
         PlaybackProgressReport,
     },
     library::ROOT_ID,
+    playback_policy::PlaybackPolicy,
     task_registry::{
         BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
         PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
@@ -129,6 +130,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliTaskSelection.into(),
                 ServerCapability::BilibiliCredentialStatus.into(),
                 ServerCapability::BilibiliCredentialProfiles.into(),
+                ServerCapability::BilibiliPlaybackPolicy.into(),
                 ServerCapability::Hls.into(),
             ],
         };
@@ -679,6 +681,8 @@ impl TaskService for TaskGrpcService {
         if source.is_empty() {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
         }
+        PlaybackPolicy::from_playback_options(request.options.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let _permit = Arc::clone(&self.state.playback_planning_permits)
             .acquire_owned()
@@ -720,6 +724,8 @@ impl TaskService for TaskGrpcService {
     ) -> Result<Response<Task>, Status> {
         let url_or_id = request.get_ref().url_or_id.clone();
         let options = request.get_ref().options.clone();
+        let playback_policy = PlaybackPolicy::from_playback_options(options.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let selection_plan = playback_selection_plan(
             normalized_optional_string(&request.get_ref().selection_id),
             request.get_ref().selection.clone(),
@@ -747,13 +753,17 @@ impl TaskService for TaskGrpcService {
         let task_source = creation.task.source.clone();
         let state = self.state.clone();
         let planning_activity = state.begin_playback_planning();
+        let playback_configuration = ValidatedPlaybackConfiguration {
+            options,
+            policy: playback_policy,
+        };
         tokio::spawn(async move {
             let _planning_activity = planning_activity;
             run_bilibili_playback_planning(
                 state,
                 task_id,
                 task_source,
-                options,
+                playback_configuration,
                 selection_plan,
                 playback_source_uri,
                 cancellation,
@@ -1228,11 +1238,16 @@ impl Drop for PlaybackPlanningCleanup {
     }
 }
 
+struct ValidatedPlaybackConfiguration {
+    options: Option<BilibiliPlaybackOptions>,
+    policy: PlaybackPolicy,
+}
+
 async fn run_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_plan: BilibiliPlaybackSelectionPlan,
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
@@ -1290,7 +1305,7 @@ async fn run_bilibili_playback_planning(
                 state,
                 task_id,
                 source,
-                options,
+                playback_configuration,
                 selection_id,
                 playback_source_uri,
                 cancellation,
@@ -1302,7 +1317,7 @@ async fn run_bilibili_playback_planning(
                 state,
                 task_id,
                 source,
-                options,
+                playback_configuration,
                 selection_plan,
                 playback_source_uri,
                 cancellation,
@@ -1319,11 +1334,15 @@ async fn run_single_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_id: Option<String>,
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) -> bool {
+    let ValidatedPlaybackConfiguration {
+        options,
+        policy: playback_policy,
+    } = playback_configuration;
     let planning_request = BilibiliPlaybackPlanningRequest {
         source,
         options,
@@ -1340,15 +1359,16 @@ async fn run_single_bilibili_playback_planning(
                 .is_ok();
         }
     };
-    let metadata = match playback_task_metadata_with_options(&task_id, plan, &state.options) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return state
-                .tasks
-                .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
-                .is_ok();
-        }
-    };
+    let metadata =
+        match playback_task_metadata_with_policy(&task_id, plan, &state.options, playback_policy) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return state
+                    .tasks
+                    .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
+                    .is_ok();
+            }
+        };
 
     let playback_source = PlaybackSource {
         item_id: task_id.clone(),
@@ -1357,7 +1377,7 @@ async fn run_single_bilibili_playback_planning(
         uri: playback_source_uri,
         expires_at: None,
     };
-    state.hls_sessions.insert(metadata.hls_session.clone());
+    state.register_hls_playback_session(metadata.hls_session.clone());
     match state.tasks.complete_playback_playable(
         &task_id,
         metadata.title,
@@ -1395,11 +1415,15 @@ async fn run_explicit_bilibili_playback_planning(
     state: AppState,
     task_id: String,
     source: String,
-    options: Option<BilibiliPlaybackOptions>,
+    playback_configuration: ValidatedPlaybackConfiguration,
     selection_plan: BilibiliPlaybackSelectionPlan,
     primary_playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) -> bool {
+    let ValidatedPlaybackConfiguration {
+        options,
+        policy: playback_policy,
+    } = playback_configuration;
     let resolution = match state
         .playback_planner
         .resolve_input(BilibiliInputResolveRequest {
@@ -1481,8 +1505,13 @@ async fn run_explicit_bilibili_playback_planning(
             cancellation: cancellation.clone(),
         };
         let item_outcome = match state.playback_planner.plan(planning_request).await {
-            Ok(plan) => playback_task_metadata_with_options(&session_id, plan, &state.options)
-                .map_err(|error| BilibiliDownloadError::Failed(error.message().to_owned())),
+            Ok(plan) => playback_task_metadata_with_policy(
+                &session_id,
+                plan,
+                &state.options,
+                playback_policy,
+            )
+            .map_err(|error| BilibiliDownloadError::Failed(error.message().to_owned())),
             Err(error) => Err(error),
         };
 
@@ -1509,7 +1538,7 @@ async fn run_explicit_bilibili_playback_planning(
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
                 result_items[index].playback_session = Some(metadata.playback_session.clone());
-                state.hls_sessions.insert(metadata.hls_session.clone());
+                state.register_hls_playback_session(metadata.hls_session.clone());
                 planned_session_ids.push(session_id.clone());
                 planned_sessions.push(metadata.hls_session.clone());
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
@@ -2199,10 +2228,20 @@ fn playback_task_metadata(
     playback_task_metadata_with_options(task_id, plan, &CacheServerOptions::default())
 }
 
+#[cfg(test)]
 fn playback_task_metadata_with_options(
     task_id: &str,
     plan: BilibiliPlaybackPlan,
     options: &CacheServerOptions,
+) -> Result<PlaybackTaskMetadata, Status> {
+    playback_task_metadata_with_policy(task_id, plan, options, PlaybackPolicy::default())
+}
+
+fn playback_task_metadata_with_policy(
+    task_id: &str,
+    plan: BilibiliPlaybackPlan,
+    options: &CacheServerOptions,
+    playback_policy: PlaybackPolicy,
 ) -> Result<PlaybackTaskMetadata, Status> {
     let entry = plan
         .entries
@@ -2217,15 +2256,17 @@ fn playback_task_metadata_with_options(
         entry.title.clone()
     };
     let selected_variant = playback_variant_from_adapter(&selected.variant);
-    let mut hls_session = HlsPlaybackSession::from_playback_entry(
+    let mut hls_session = HlsPlaybackSession::from_playback_entry_with_policy(
         task_id,
         &title,
         &selected.variant,
         &entry.abr,
         &entry.variants,
+        playback_policy,
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    hls_session.transcoding = HlsTranscodingPlan::for_variant(options, &selected.variant);
+    hls_session.transcoding =
+        HlsTranscodingPlan::for_variant_with_policy(options, &selected.variant, playback_policy);
     let playback_session = BilibiliPlaybackSession {
         id: task_id.to_owned(),
         title: title.clone(),
@@ -2238,6 +2279,7 @@ fn playback_task_metadata_with_options(
             .map(playback_variant_from_adapter)
             .collect(),
         transcoding_plan: Some(proto_lan_transcoding_plan(&hls_session.transcoding)),
+        effective_policy: Some(playback_policy.to_proto()),
     };
 
     Ok(PlaybackTaskMetadata {
@@ -2278,6 +2320,7 @@ pub(crate) fn playback_session_from_hls_cache_session(
         selected_variant: Some(selected_variant),
         variants,
         transcoding_plan: Some(proto_lan_transcoding_plan(&session.transcoding)),
+        effective_policy: Some(session.effective_policy.to_proto()),
     }
 }
 
@@ -2774,14 +2817,17 @@ mod tests {
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
-            BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliTaskSelection,
-            CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
+            BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliPlaybackPolicy,
+            BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
             GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
             ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
         hls_cache::sanitized_completed_session,
         hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
+        playback_policy::{
+            CompatibleVariantPreference, TranscodingPreference, WeakNetworkPreference,
+        },
     };
     use axum::{
         Router,
@@ -2834,6 +2880,10 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::BilibiliCredentialProfiles as i32))
+        );
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliPlaybackPolicy as i32))
         );
         assert!(
             !info
@@ -3388,6 +3438,7 @@ mod tests {
                     encoding_preference: "h264".to_owned(),
                     prefer_tv_api: false,
                     audio_language: "ja-jp".to_owned(),
+                    playback_policy: None,
                 }),
             }))
             .await
@@ -3413,6 +3464,45 @@ mod tests {
                 .as_ref()
                 .map(|options| options.quality_preference.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_bilibili_input_rejects_unknown_playback_policy() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = TaskGrpcService::new(state);
+
+        let error = service
+            .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+                url_or_id: "BV1unknown".to_owned(),
+                options: Some(BilibiliPlaybackOptions {
+                    quality_preference: String::new(),
+                    encoding_preference: String::new(),
+                    prefer_tv_api: false,
+                    audio_language: String::new(),
+                    playback_policy: Some(BilibiliPlaybackPolicy {
+                        weak_network_preference: 99,
+                        ..BilibiliPlaybackPolicy::default()
+                    }),
+                }),
+            }))
+            .await
+            .expect_err("unknown playback policy should be rejected before resolution");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert!(error.message().contains("weak_network_preference"));
     }
 
     #[tokio::test]
@@ -3530,6 +3620,71 @@ mod tests {
             vec![("BV1select".to_owned(), Some("page:2".to_owned()))],
             *requests
         );
+    }
+
+    #[tokio::test]
+    async fn create_bilibili_playback_task_rejects_unknown_policy_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join("state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = TaskGrpcService::new(state);
+        let cases = [
+            (
+                "transcoding_preference",
+                BilibiliPlaybackPolicy {
+                    transcoding_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "compatible_variant_preference",
+                BilibiliPlaybackPolicy {
+                    compatible_variant_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+            (
+                "weak_network_preference",
+                BilibiliPlaybackPolicy {
+                    weak_network_preference: 99,
+                    ..BilibiliPlaybackPolicy::default()
+                },
+            ),
+        ];
+
+        for (field, playback_policy) in cases {
+            let error = service
+                .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
+                    url_or_id: format!("BV1unknown-{field}"),
+                    options: Some(BilibiliPlaybackOptions {
+                        quality_preference: String::new(),
+                        encoding_preference: String::new(),
+                        prefer_tv_api: false,
+                        audio_language: String::new(),
+                        playback_policy: Some(playback_policy),
+                    }),
+                    selection_id: String::new(),
+                    selection: None,
+                }))
+                .await
+                .expect_err("unknown playback policy should be rejected before task creation");
+
+            assert_eq!(tonic::Code::InvalidArgument, error.code());
+            assert!(error.message().contains(field));
+        }
+        assert!(!task_state_path.exists());
     }
 
     #[tokio::test]
@@ -3824,11 +3979,13 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let sensitive_detail = "upstream failed at https://example.test/playurl?access_key=credential-sensitive-marker";
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
+                task_state_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 bbdown_credential_path: Some(credential_path),
@@ -3910,9 +4067,11 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credential_path),
             ..CacheServerOptions::default()
@@ -4100,9 +4259,11 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let credential_path = root_path.join("credentials.json");
+        let task_state_path = root_path.join(".state").join("tasks.json");
         fs::write(&credential_path, "{}").expect("empty credential store should be written");
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credential_path),
             ..CacheServerOptions::default()
@@ -5138,6 +5299,7 @@ mod tests {
                         encoding_preference: "h264".to_owned(),
                         prefer_tv_api: false,
                         audio_language: "ja-jp".to_owned(),
+                        playback_policy: None,
                     }),
                     selection_id: String::new(),
                     selection: None,
@@ -5183,6 +5345,12 @@ mod tests {
         assert_eq!("BV1progressive-cid1", session.content_id);
         assert_eq!("h264", session.selected_variant_id);
         assert_eq!(2, session.variants.len());
+        assert_eq!(
+            PlaybackPolicy::default().to_proto(),
+            session
+                .effective_policy
+                .expect("playback session should expose its effective policy")
+        );
         let transcoding_plan = session
             .transcoding_plan
             .as_ref()
@@ -5227,6 +5395,10 @@ mod tests {
         assert_eq!(hls_session.abr, restored_hls_session.abr);
         assert_eq!(hls_session.variants, restored_hls_session.variants);
         assert_eq!(hls_session.transcoding, restored_hls_session.transcoding);
+        assert_eq!(
+            PlaybackPolicy::default(),
+            restored_hls_session.effective_policy
+        );
 
         let cancelled = service
             .cancel_task(Request::new(CancelTaskRequest {
@@ -5274,6 +5446,54 @@ mod tests {
         assert_eq!(LanTranscodingPlanState::Ready as i32, proto_plan.state);
         assert_eq!("hevc", proto_plan.source_variant_id);
         assert_eq!(PlaybackProtocol::Hls as i32, proto_plan.output_protocol);
+    }
+
+    #[test]
+    fn playback_metadata_returns_normalized_effective_policy() {
+        let mut plan = sample_playback_plan();
+        let selected_hevc = plan.entries[0].variants[1].clone();
+        plan.entries[0].selected_variant = Some(BilibiliSelectedPlaybackVariant {
+            variant: selected_hevc,
+            selection: BilibiliPlaybackVariantSelection {
+                policy: BilibiliPlaybackVariantSelectionPolicy::ExplicitEncodingPreference,
+                codec_rank: Some(1),
+                score: 100,
+            },
+        });
+        let policy = PlaybackPolicy {
+            transcoding_preference: TranscodingPreference::Never,
+            compatible_variant_preference: CompatibleVariantPreference::PreferRequested,
+            weak_network_preference: WeakNetworkPreference::HoldDowngrade,
+        };
+
+        let metadata = playback_task_metadata_with_policy(
+            "bilibili-playback-policy",
+            plan,
+            &CacheServerOptions {
+                lan_transcoding_enabled: true,
+                ..CacheServerOptions::default()
+            },
+            policy,
+        )
+        .expect("playback metadata should map");
+
+        assert_eq!(policy, metadata.hls_session.effective_policy);
+        assert_eq!(
+            HlsTranscodingPlanState::Disabled,
+            metadata.hls_session.transcoding.state
+        );
+        assert_eq!(
+            Some(policy.to_proto()),
+            metadata.playback_session.effective_policy
+        );
+        assert_eq!(
+            Some(LanTranscodingPlanState::Disabled),
+            metadata
+                .playback_session
+                .transcoding_plan
+                .as_ref()
+                .map(|plan| plan.state())
+        );
     }
 
     #[tokio::test]
@@ -5843,9 +6063,17 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_some()
         );
-        state
-            .hls_network_policy
-            .record_upstream_failure(&completed.id, "h264");
+        let generation = state
+            .hls_sessions
+            .get_with_generation(&completed.id)
+            .expect("completed HLS session should remain registered")
+            .generation;
+        state.hls_network_policy.record_upstream_failure_for_policy(
+            WeakNetworkPreference::Adaptive,
+            &completed.id,
+            generation,
+            "h264",
+        );
         assert_eq!(
             RuntimeTestHlsWeakNetworkState::UpstreamFailed,
             state.hls_weak_network_status().state

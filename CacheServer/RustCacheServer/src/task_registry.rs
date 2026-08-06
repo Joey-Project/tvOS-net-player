@@ -5492,6 +5492,7 @@ mod tests {
             encoding_preference: "h264".to_owned(),
             prefer_tv_api: false,
             audio_language: String::new(),
+            playback_policy: None,
         }
     }
 
@@ -5517,6 +5518,7 @@ mod tests {
             ),
             variants: Vec::new(),
             transcoding_plan: None,
+            effective_policy: None,
         }
     }
 
