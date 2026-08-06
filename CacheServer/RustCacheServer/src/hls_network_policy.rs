@@ -127,9 +127,18 @@ impl HlsNetworkPolicy {
         self.inner
             .lock()
             .expect("HLS network policy lock poisoned")
-            .sessions
+            .session_generations
             .get(session_id)
-            .map(|session| session.generation)
+            .copied()
+    }
+
+    #[cfg(test)]
+    fn active_session_count_for_tests(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("HLS network policy lock poisoned")
+            .sessions
+            .len()
     }
 
     #[cfg(test)]
@@ -161,10 +170,12 @@ impl HlsNetworkPolicy {
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
         state.prune_expired(now);
+        if state.session_generations.get(session_id) != Some(&session_generation) {
+            return true;
+        }
         state
             .sessions
             .get(session_id)
-            .filter(|session| session.generation == session_generation)
             .and_then(|session| session.variants.get(variant_id))
             .is_none_or(|variant| !variant.is_degraded(now))
     }
@@ -315,12 +326,12 @@ impl HlsNetworkPolicy {
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
         state.prune_expired(now);
+        if state.session_generations.get(session_id) != Some(&session_generation) {
+            return;
+        }
         let Some(session) = state.sessions.get_mut(session_id) else {
             return;
         };
-        if session.generation != session_generation {
-            return;
-        }
         if !session.has_degraded_variant(now) {
             return;
         }
@@ -332,19 +343,14 @@ impl HlsNetworkPolicy {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
         state.prune_expired(now);
         let should_advance = state
-            .sessions
+            .session_generations
             .get(session_id)
-            .is_none_or(|session| session.generation < generation);
+            .is_none_or(|current| *current < generation);
         if should_advance {
-            let cleared_active_state = state
-                .sessions
-                .get(session_id)
-                .is_some_and(HlsSessionNetworkState::has_active_state);
-            state.sessions.insert(
-                session_id.to_owned(),
-                HlsSessionNetworkState::new(generation),
-            );
-            if cleared_active_state {
+            state
+                .session_generations
+                .insert(session_id.to_owned(), generation);
+            if state.sessions.remove(session_id).is_some() {
                 state.last_changed_at = Some(now);
             }
         }
@@ -353,18 +359,13 @@ impl HlsNetworkPolicy {
     fn remove_session_generation_at(&self, session_id: &str, generation: u64, now: SystemTime) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
         state.prune_expired(now);
-        let removed_active_state = state
-            .sessions
-            .get(session_id)
-            .filter(|session| session.generation <= generation)
-            .is_some_and(HlsSessionNetworkState::has_active_state);
         let should_remove = state
-            .sessions
+            .session_generations
             .get(session_id)
-            .is_some_and(|session| session.generation <= generation);
+            .is_some_and(|current| *current <= generation);
         if should_remove {
-            state.sessions.remove(session_id);
-            if removed_active_state {
+            state.session_generations.remove(session_id);
+            if state.sessions.remove(session_id).is_some() {
                 state.last_changed_at = Some(now);
             }
         }
@@ -384,6 +385,8 @@ impl HlsNetworkPolicy {
 
 #[derive(Default)]
 struct HlsNetworkPolicyState {
+    // Fence stale events without putting idle sessions on snapshot and pruning hot paths.
+    session_generations: HashMap<String, u64>,
     sessions: HashMap<String, HlsSessionNetworkState>,
     last_changed_at: Option<SystemTime>,
 }
@@ -396,23 +399,28 @@ impl HlsNetworkPolicyState {
         variant_id: &str,
     ) -> Option<&mut HlsVariantNetworkState> {
         let should_advance = self
-            .sessions
+            .session_generations
             .get(session_id)
-            .is_none_or(|session| session.generation < session_generation);
+            .is_none_or(|current| *current < session_generation);
         if should_advance {
-            self.sessions.insert(
-                session_id.to_owned(),
-                HlsSessionNetworkState::new(session_generation),
-            );
+            self.session_generations
+                .insert(session_id.to_owned(), session_generation);
+            self.sessions.remove(session_id);
+        } else if self.session_generations.get(session_id) != Some(&session_generation) {
+            return None;
         }
-        self.sessions
-            .get_mut(session_id)
-            .filter(|session| session.generation == session_generation)
-            .map(|session| session.variants.entry(variant_id.to_owned()).or_default())
+        Some(
+            self.sessions
+                .entry(session_id.to_owned())
+                .or_default()
+                .variants
+                .entry(variant_id.to_owned())
+                .or_default(),
+        )
     }
 
     fn prune_expired(&mut self, now: SystemTime) {
-        for session in self.sessions.values_mut() {
+        self.sessions.retain(|_, session| {
             session.variants.retain(|_, variant| {
                 variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
                 if !variant.hold_degraded
@@ -430,7 +438,8 @@ impl HlsNetworkPolicyState {
             session.cache_only_until = session
                 .cache_only_until
                 .filter(|until| *until > now && session.has_degraded_variant(now));
-        }
+            session.has_active_state()
+        });
     }
 
     fn snapshot(&self, now: SystemTime) -> HlsWeakNetworkSnapshot {
@@ -485,21 +494,13 @@ impl HlsNetworkPolicyState {
     }
 }
 
+#[derive(Default)]
 struct HlsSessionNetworkState {
-    generation: u64,
     variants: HashMap<String, HlsVariantNetworkState>,
     cache_only_until: Option<SystemTime>,
 }
 
 impl HlsSessionNetworkState {
-    fn new(generation: u64) -> Self {
-        Self {
-            generation,
-            variants: HashMap::new(),
-            cache_only_until: None,
-        }
-    }
-
     fn has_degraded_variant(&self, now: SystemTime) -> bool {
         self.variants
             .values()
@@ -883,5 +884,47 @@ mod tests {
             HlsWeakNetworkState::Normal,
             policy.snapshot_at(next_generation_at).state
         );
+    }
+
+    #[test]
+    fn idle_registrations_and_expired_events_do_not_accumulate_active_sessions() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            policy.advance_session_generation_at(&format!("idle-session-{session_index}"), 1, now);
+        }
+
+        assert_eq!(0, policy.active_session_count_for_tests());
+
+        policy.advance_session_generation_at("active-session", 2, now);
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            "active-session",
+            2,
+            "1080p",
+            now,
+        );
+        assert_eq!(1, policy.active_session_count_for_tests());
+
+        let recovered_at = now + DEGRADE_DURATION + Duration::from_secs(1);
+        assert_eq!(
+            HlsWeakNetworkState::Normal,
+            policy.snapshot_at(recovered_at).state
+        );
+        assert_eq!(0, policy.active_session_count_for_tests());
+        assert_eq!(
+            Some(2),
+            policy.session_generation_for_tests("active-session")
+        );
+
+        policy.record_upstream_failure_at_for_policy(
+            WeakNetworkPreference::Adaptive,
+            "active-session",
+            1,
+            "stale-1080p",
+            recovered_at,
+        );
+        assert_eq!(0, policy.active_session_count_for_tests());
     }
 }
