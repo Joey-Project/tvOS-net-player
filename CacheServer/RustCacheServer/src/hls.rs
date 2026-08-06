@@ -12,7 +12,10 @@ use crate::bbdown_adapter::{
     BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
 use crate::codecs::is_aac_codec;
-use crate::playback_policy::{PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible};
+use crate::playback_policy::{
+    PlaybackPolicy, variant_has_avplayer_h264_aac_hls_codecs,
+    variant_is_avplayer_h264_aac_hls_compatible,
+};
 use crate::transcoding::HlsTranscodingPlan;
 use url::Url;
 
@@ -1066,7 +1069,7 @@ fn playable_alternate_variants(
     selected_variant: &AdapterPlaybackVariant,
     variants: &[AdapterPlaybackVariant],
 ) -> Result<Vec<HlsVariant>, HlsSessionError> {
-    if !is_avplayer_safe_alternate_variant(selected_variant) {
+    if !variant_has_avplayer_h264_aac_hls_codecs(selected_variant) {
         return Ok(Vec::new());
     }
 
@@ -1508,6 +1511,43 @@ mod tests {
         let master = session.master_playlist();
         assert_eq!(1, master.matches("#EXT-X-STREAM-INF").count());
         assert!(!master.contains("v1-video"));
+    }
+
+    #[test]
+    fn high_spec_h264_selected_variant_keeps_safe_abr_fallback() {
+        let mut selected = dash_variant();
+        selected.id = "h264-4k".to_owned();
+        selected.bandwidth = Some(20_000_000);
+        selected.width = Some(3840);
+        selected.height = Some(2160);
+        selected.frame_rate = Some("120".to_owned());
+        selected.codecs = vec!["avc1.640033".to_owned(), "mp4a.40.2".to_owned()];
+        selected.video.as_mut().unwrap().codecs = Some("avc1.640033".to_owned());
+        selected.abr = Some(abr_level("dash-video", 1, 2, true));
+
+        let mut alternate = dash_variant();
+        alternate.id = "h264-1080p".to_owned();
+        alternate.bandwidth = Some(1_000_000);
+        alternate.abr = Some(abr_level("dash-video", 0, 2, true));
+
+        let session = HlsPlaybackSession::from_playback_entry(
+            "session-1",
+            "Episode",
+            &selected,
+            &AdapterAbrMetadata { groups: Vec::new() },
+            &[selected.clone(), alternate],
+        )
+        .unwrap();
+
+        assert_eq!(1, session.alternate_variants.len());
+        assert_eq!("h264-1080p", session.alternate_variants[0].id);
+        assert_eq!(
+            2,
+            session
+                .master_playlist()
+                .matches("#EXT-X-STREAM-INF")
+                .count()
+        );
     }
 
     #[test]

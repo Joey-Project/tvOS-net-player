@@ -4385,6 +4385,39 @@ mod tests {
     }
 
     #[test]
+    fn compatible_policy_does_not_prefer_variant_with_unknown_envelope() {
+        let mut plan = sample_playback_plan();
+        let h264 = plan.entries[0]
+            .variants
+            .iter_mut()
+            .find(|variant| variant.id == "h264")
+            .expect("H.264 variant should exist");
+        h264.width = None;
+        h264.height = None;
+        h264.bandwidth = None;
+        h264.frame_rate = Some("unknown".to_owned());
+        let video = h264.video.as_mut().expect("H.264 video should exist");
+        video.width = None;
+        video.height = None;
+        video.bandwidth = None;
+        video.frame_rate = Some("unknown".to_owned());
+        video.codecs = Some("avc1".to_owned());
+
+        let options = bilibili_options_with_quality("4k");
+        let mapped = BilibiliPlaybackPlan::from_core(plan, Some(&options)).unwrap();
+
+        assert_eq!(
+            "av1",
+            mapped.entries[0]
+                .selected_variant
+                .as_ref()
+                .unwrap()
+                .variant
+                .id
+        );
+    }
+
+    #[test]
     fn compatible_policy_ignores_non_dash_h264_candidate() {
         let mut plan = sample_playback_plan();
         let entry = &mut plan.entries[0];

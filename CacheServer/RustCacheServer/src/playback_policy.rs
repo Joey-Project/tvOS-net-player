@@ -188,6 +188,14 @@ impl WeakNetworkPreference {
 pub(crate) fn variant_is_avplayer_h264_aac_hls_compatible(
     variant: &BilibiliPlaybackVariant,
 ) -> bool {
+    variant_has_avplayer_h264_aac_hls_codecs(variant)
+        && variant.video.as_ref().is_some_and(|video| {
+            variant_is_within_transcoding_profile_envelope(variant, video)
+                && variant_h264_level_is_within_transcoding_profile(variant, video)
+        })
+}
+
+pub(crate) fn variant_has_avplayer_h264_aac_hls_codecs(variant: &BilibiliPlaybackVariant) -> bool {
     if variant.kind != BilibiliPlaybackVariantKind::Dash {
         return false;
     }
@@ -199,29 +207,19 @@ pub(crate) fn variant_is_avplayer_h264_aac_hls_compatible(
             .audio
             .as_ref()
             .is_none_or(|audio| variant_has_codec(variant, Some(audio), is_aac_codec))
-        && variant_is_within_transcoding_profile_envelope(variant, video)
-        && variant_h264_level_is_within_transcoding_profile(variant, video)
 }
 
 fn variant_is_within_transcoding_profile_envelope(
     variant: &BilibiliPlaybackVariant,
     video: &BilibiliMediaRequest,
 ) -> bool {
-    bounded_u32(variant.width, LAN_TRANSCODING_MAX_WIDTH)
-        && bounded_u32(video.width, LAN_TRANSCODING_MAX_WIDTH)
-        && bounded_u32(variant.height, LAN_TRANSCODING_MAX_HEIGHT)
-        && bounded_u32(video.height, LAN_TRANSCODING_MAX_HEIGHT)
-        && bounded_frame_rate(variant.frame_rate.as_deref())
-        && bounded_frame_rate(video.frame_rate.as_deref())
-        && bounded_u64(
-            variant.bandwidth,
-            transcoding_profile_total_bandwidth(variant.audio.is_some()),
+    bounded_u32_with_evidence(variant.width, video.width, LAN_TRANSCODING_MAX_WIDTH)
+        && bounded_u32_with_evidence(variant.height, video.height, LAN_TRANSCODING_MAX_HEIGHT)
+        && bounded_frame_rate_with_evidence(
+            variant.frame_rate.as_deref(),
+            video.frame_rate.as_deref(),
         )
-        && bounded_u64(video.bandwidth, LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS)
-        && variant
-            .audio
-            .as_ref()
-            .is_none_or(|audio| bounded_u64(audio.bandwidth, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS))
+        && bounded_bandwidth_with_evidence(variant, video)
 }
 
 fn transcoding_profile_total_bandwidth(has_audio: bool) -> u64 {
@@ -233,20 +231,47 @@ fn transcoding_profile_total_bandwidth(has_audio: bool) -> u64 {
         }
 }
 
-fn bounded_u32(value: Option<u32>, max: u32) -> bool {
-    value.is_none_or(|value| value <= max)
+fn bounded_u32_with_evidence(first: Option<u32>, second: Option<u32>, max: u32) -> bool {
+    let values = [first, second];
+    values.iter().flatten().next().is_some()
+        && values
+            .into_iter()
+            .flatten()
+            .all(|value| value > 0 && value <= max)
 }
 
-fn bounded_u64(value: Option<u64>, max: u64) -> bool {
-    value.is_none_or(|value| value <= max)
+fn bounded_bandwidth_with_evidence(
+    variant: &BilibiliPlaybackVariant,
+    video: &BilibiliMediaRequest,
+) -> bool {
+    let audio_bandwidth = variant.audio.as_ref().and_then(|audio| audio.bandwidth);
+    let has_component_evidence =
+        video.bandwidth.is_some() && (variant.audio.is_none() || audio_bandwidth.is_some());
+    (variant.bandwidth.is_some() || has_component_evidence)
+        && bounded_optional_u64(
+            variant.bandwidth,
+            transcoding_profile_total_bandwidth(variant.audio.is_some()),
+        )
+        && bounded_optional_u64(video.bandwidth, LAN_TRANSCODING_MAX_VIDEO_BANDWIDTH_BPS)
+        && bounded_optional_u64(audio_bandwidth, LAN_TRANSCODING_AUDIO_BANDWIDTH_BPS)
 }
 
-fn bounded_frame_rate(frame_rate: Option<&str>) -> bool {
-    let Some(frame_rate) = frame_rate.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
+fn bounded_optional_u64(value: Option<u64>, max: u64) -> bool {
+    value.is_none_or(|value| value > 0 && value <= max)
+}
 
-    parse_frame_rate(frame_rate).is_none_or(|rate| rate <= LAN_TRANSCODING_MAX_FRAME_RATE)
+fn bounded_frame_rate_with_evidence(first: Option<&str>, second: Option<&str>) -> bool {
+    let mut saw_evidence = false;
+    for frame_rate in [first, second].into_iter().flatten() {
+        saw_evidence = true;
+        let Some(rate) = parse_frame_rate(frame_rate.trim()) else {
+            return false;
+        };
+        if rate <= 0.0 || rate > LAN_TRANSCODING_MAX_FRAME_RATE {
+            return false;
+        }
+    }
+    saw_evidence
 }
 
 fn parse_frame_rate(frame_rate: &str) -> Option<f64> {
@@ -273,17 +298,27 @@ fn variant_h264_level_is_within_transcoding_profile(
         return codec_list_h264_is_within_transcoding_profile(codecs);
     }
 
-    variant
-        .codecs
-        .iter()
-        .all(|codecs| codec_list_h264_is_within_transcoding_profile(codecs))
+    let mut saw_h264 = false;
+    for codecs in &variant.codecs {
+        for codec in codecs.split(',').filter(|codec| is_h264_codec(codec)) {
+            saw_h264 = true;
+            if !h264_codec_is_within_transcoding_profile(codec) {
+                return false;
+            }
+        }
+    }
+    saw_h264
 }
 
 fn codec_list_h264_is_within_transcoding_profile(codecs: &str) -> bool {
-    codecs
-        .split(',')
-        .filter(|codec| is_h264_codec(codec))
-        .all(h264_codec_is_within_transcoding_profile)
+    let mut saw_h264 = false;
+    for codec in codecs.split(',').filter(|codec| is_h264_codec(codec)) {
+        saw_h264 = true;
+        if !h264_codec_is_within_transcoding_profile(codec) {
+            return false;
+        }
+    }
+    saw_h264
 }
 
 fn h264_codec_is_within_transcoding_profile(codec: &str) -> bool {
@@ -293,14 +328,14 @@ fn h264_codec_is_within_transcoding_profile(codec: &str) -> bool {
         .or_else(|| codec.strip_prefix("avc3."))
         .and_then(|value| value.split('.').next())
     else {
-        return true;
+        return false;
     };
     if profile_level_id.len() != 6
         || !profile_level_id
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        return true;
+        return false;
     }
 
     let profile_idc = u8::from_str_radix(&profile_level_id[0..2], 16).ok();

@@ -604,6 +604,55 @@ mod tests {
     }
 
     #[test]
+    fn h264_aac_variant_with_unknown_envelope_requires_transcoding() {
+        let mut missing_dimensions =
+            variant("missing-dimensions", "avc1.640028", Some("mp4a.40.2"));
+        missing_dimensions.width = None;
+        missing_dimensions.height = None;
+        missing_dimensions.video.as_mut().unwrap().width = None;
+        missing_dimensions.video.as_mut().unwrap().height = None;
+
+        let mut missing_bandwidth = variant("missing-bandwidth", "avc1.640028", Some("mp4a.40.2"));
+        missing_bandwidth.bandwidth = None;
+        missing_bandwidth.video.as_mut().unwrap().bandwidth = None;
+        missing_bandwidth.audio.as_mut().unwrap().bandwidth = None;
+
+        let mut missing_frame_rate =
+            variant("missing-frame-rate", "avc1.640028", Some("mp4a.40.2"));
+        missing_frame_rate.frame_rate = None;
+        missing_frame_rate.video.as_mut().unwrap().frame_rate = None;
+
+        let mut malformed_frame_rate =
+            variant("malformed-frame-rate", "avc1.640028", Some("mp4a.40.2"));
+        malformed_frame_rate.frame_rate = Some("unknown".to_owned());
+        malformed_frame_rate.video.as_mut().unwrap().frame_rate = Some("unknown".to_owned());
+
+        let missing_profile = variant("missing-profile", "avc1", Some("mp4a.40.2"));
+        let malformed_profile = variant("malformed-profile", "avc1.zzzzzz", Some("mp4a.40.2"));
+        let options = CacheServerOptions {
+            lan_transcoding_enabled: true,
+            ..CacheServerOptions::default()
+        };
+
+        for candidate in [
+            missing_dimensions,
+            missing_bandwidth,
+            missing_frame_rate,
+            malformed_frame_rate,
+            missing_profile,
+            malformed_profile,
+        ] {
+            let plan = HlsTranscodingPlan::for_variant(&options, &candidate);
+            assert_eq!(
+                HlsTranscodingPlanState::Ready,
+                plan.state,
+                "{} should require transcoding",
+                candidate.id
+            );
+        }
+    }
+
+    #[test]
     fn non_h264_variant_is_ready_only_when_enabled() {
         let variant = variant("hevc", "hvc1.1.6.L120.90", Some("mp4a.40.2"));
 
@@ -730,7 +779,7 @@ mod tests {
             bandwidth: Some(1_000_000),
             width: Some(1920),
             height: Some(1080),
-            frame_rate: None,
+            frame_rate: Some("60".to_owned()),
             duration_seconds: Some(60),
             abr: None,
             video: Some(media_request(BilibiliMediaRequestKind::Video, video_codec)),
@@ -754,7 +803,7 @@ mod tests {
             }),
             width: Some(1920),
             height: Some(1080),
-            frame_rate: None,
+            frame_rate: (kind == BilibiliMediaRequestKind::Video).then(|| "60".to_owned()),
             size: Some(10_000_000),
             duration_seconds: Some(60),
             cache_key: BilibiliMediaCacheKey {

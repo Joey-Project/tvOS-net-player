@@ -40,6 +40,7 @@ superseded_by:
 - Weak-network generation fences are stored separately from active retry/degrade state. Idle and healthy sessions do not retain active state, expired state is removed while its stale-event fence remains valid, and media hot paths prune only their target session.
 - Hold-downgrade sessions recheck media-playlist and segment requests so an AVPlayer instance with an already-loaded master cannot return to a held higher variant. The lowest-bandwidth fallback remains servable, while adaptive mode keeps its existing non-disruptive stale-request behavior.
 - Playback policy parsing defaults only `UNSPECIFIED` enum values. Resolve and create RPCs reject unknown nonzero values with `INVALID_ARGUMENT` before calling the planner or persisting a task.
+- Conservative compatibility requires positive, bounded dimensions, bandwidth, frame-rate, and H.264 profile-level evidence. Unknown or malformed metadata stays on the Auto transcoding path, while high-spec H.264 selections retain proven-safe lower variants in their switchable ABR group.
 - Playback-only policy changes preserve an already resolved multi-candidate selection and are applied when the task is created without repeating page resolution.
 
 ## Non-Goals
@@ -60,7 +61,7 @@ superseded_by:
 - Cache-server architecture: `docs/architecture/cache-server.md`
 - `just lint`: passed after the final Rust media-handler refactor and policy tests.
 - `scripts/test.sh`: 268 Swift package tests passed with no failures, including policy changes after multi-candidate resolution.
-- `scripts/test-cache-server.sh`: 507 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation, session-removal serialization, bounded weak-network active-state, stale Hold Downgrade URL, and unknown playback-policy enum regressions.
+- `scripts/test-cache-server.sh`: 510 Rust unit tests, 34 default live-e2e support tests, and 6 integration tests passed; the opt-in real-network live test remained ignored by default. The suite includes stale-generation, session-removal serialization, bounded weak-network active-state, stale Hold Downgrade URL, unknown playback-policy enum, high-spec H.264 ABR fallback, and unknown-envelope regressions.
 - `cargo test --manifest-path CacheServer/RustCacheServer/Cargo.toml credential_configured_rpc_ -- --nocapture`: 4 credential RPC tests passed concurrently after isolating their task-state paths.
 - `just build-cache-server`: the optimized Rust LAN cache server build passed.
 - `just build`: the generic tvOS Simulator app build passed.
