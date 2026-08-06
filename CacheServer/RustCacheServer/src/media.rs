@@ -22,7 +22,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     AppState,
     hls::{
-        HlsMediaResource, HlsMediaSegment, mp4_initialization_length,
+        HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, mp4_initialization_length,
         should_forward_media_request_header,
     },
     hls_cache::OpenedPrewarmedHlsResource,
@@ -169,12 +169,13 @@ async fn hls_segment_response(
     let Some(handle) = state.state.hls_playback_session_for_serving(&session_id) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+    let generation = handle.generation;
     let session = handle.session;
     let weak_network_preference = session.effective_policy.weak_network_preference;
     let policy_recorder = HlsNetworkPolicyRecorder::new(
         &state,
         session_id.clone(),
-        handle.generation,
+        generation,
         weak_network_preference,
     );
 
@@ -190,6 +191,16 @@ async fn hls_segment_response(
         } else {
             return empty_response(StatusCode::NOT_FOUND);
         };
+        if !hls_variant_is_servable_for_request(
+            &state,
+            &session,
+            &session_id,
+            generation,
+            &variant_id,
+            advertised_resource,
+        ) {
+            return weak_network_variant_unavailable_response(head_only);
+        }
         let initialization = if let Some(cached) = state
             .state
             .hls_cache
@@ -271,6 +282,17 @@ async fn hls_segment_response(
     } else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+
+    if !hls_variant_is_servable_for_request(
+        &state,
+        &session,
+        &session_id,
+        generation,
+        &variant_id,
+        advertised_resource,
+    ) {
+        return weak_network_variant_unavailable_response(head_only);
+    }
 
     if let Some(opened_file) = state
         .state
@@ -356,6 +378,44 @@ async fn hls_segment_response(
         head_only,
     )
     .await
+}
+
+fn hls_variant_is_servable_for_request(
+    state: &MediaState,
+    session: &HlsPlaybackSession,
+    session_id: &str,
+    generation: u64,
+    variant_id: &str,
+    advertised_resource: bool,
+) -> bool {
+    let weak_network_preference = session.effective_policy.weak_network_preference;
+    if !advertised_resource || weak_network_preference != WeakNetworkPreference::HoldDowngrade {
+        return true;
+    }
+
+    session.variant_is_advertised_with_filter(variant_id, |variant| {
+        state
+            .state
+            .hls_network_policy
+            .variant_is_advertisable_for_policy(
+                weak_network_preference,
+                session_id,
+                generation,
+                &variant.id,
+            )
+    })
+}
+
+fn weak_network_variant_unavailable_response(head_only: bool) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CACHE_CONTROL, "no-store")
+        .body(if head_only {
+            Body::empty()
+        } else {
+            Body::from("HLS variant unavailable under the active weak-network policy.\n")
+        })
+        .expect("HLS weak-network response should build")
 }
 
 #[derive(Clone)]
@@ -1248,6 +1308,101 @@ mod tests {
         assert!(master.contains("BANDWIDTH=600000"));
         assert!(master.contains("segments/v1-video.m3u8\n"));
         assert!(!master.contains("segments/video.m3u8\n"));
+    }
+
+    #[tokio::test]
+    async fn hold_downgrade_rejects_stale_high_variant_urls_after_master_load() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut session = hls_session_with_alternate("session-1", &upstream_url);
+        session.effective_policy.weak_network_preference = WeakNetworkPreference::HoldDowngrade;
+        let generation = insert_authorized_hls_session(&state, session);
+
+        let initial_master = hls_master_playlist_get(
+            State(MediaState::new(state.clone())),
+            Path("session-1".to_owned()),
+        )
+        .await;
+        let initial_master = to_bytes(initial_master.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            2,
+            String::from_utf8(initial_master.to_vec())
+                .unwrap()
+                .matches("#EXT-X-STREAM-INF")
+                .count()
+        );
+
+        state.hls_network_policy.record_upstream_failure_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "session-1",
+            generation,
+            "h264-1080p",
+        );
+
+        let stale_playlist = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, stale_playlist.status());
+
+        let stale_segment = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, stale_segment.status());
+
+        let lower_playlist = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "v1-video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, lower_playlist.status());
+    }
+
+    #[tokio::test]
+    async fn adaptive_downgrade_keeps_stale_high_variant_url_servable() {
+        let (upstream_url, _upstream_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let generation = insert_authorized_hls_session(
+            &state,
+            hls_session_with_alternate("session-1", &upstream_url),
+        );
+        state.hls_network_policy.record_upstream_failure_for_policy(
+            WeakNetworkPreference::Adaptive,
+            "session-1",
+            generation,
+            "h264-1080p",
+        );
+
+        let stale_playlist = hls_segment_get(
+            State(MediaState::new(state)),
+            Path(("session-1".to_owned(), "video.m3u8".to_owned())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, stale_playlist.status());
     }
 
     #[tokio::test]
@@ -2289,7 +2444,7 @@ mod tests {
         parse_range(Some(&HeaderValue::from_static(value)), size).unwrap()
     }
 
-    fn insert_authorized_hls_session(state: &AppState, session: HlsPlaybackSession) {
+    fn insert_authorized_hls_session(state: &AppState, session: HlsPlaybackSession) -> u64 {
         let session_id = session.id.clone();
         let variant_id = session.variant.id.clone();
         let playback_source = PlaybackSource {
@@ -2328,7 +2483,7 @@ mod tests {
             transcoding_plan: None,
             effective_policy: Some(session.effective_policy.to_proto()),
         };
-        state.hls_sessions.insert(session);
+        let generation = state.register_hls_playback_session(session);
         let task = state
             .tasks
             .create_bilibili_playback_task(&format!("BV1{session_id}"), None, None)
@@ -2363,6 +2518,7 @@ mod tests {
                 .is_playback_result_session_playable(&session_id, false),
             "inserted HLS fixture session should be authorized through its result item"
         );
+        generation
     }
 
     async fn start_hls_upstream() -> (String, JoinHandle<()>) {

@@ -381,6 +381,16 @@ impl HlsPlaybackSession {
         playlist
     }
 
+    pub(crate) fn variant_is_advertised_with_filter(
+        &self,
+        variant_id: &str,
+        is_variant_advertisable: impl Fn(&HlsVariant) -> bool,
+    ) -> bool {
+        self.advertised_variants_with_filter(is_variant_advertisable)
+            .into_iter()
+            .any(|variant| variant.id == variant_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn media_playlist_resource(&self, playlist_id: &str) -> Option<HlsMediaResource> {
         self.media_playlist_resource_ref(playlist_id)

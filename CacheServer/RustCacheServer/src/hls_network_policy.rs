@@ -142,6 +142,12 @@ impl HlsNetworkPolicy {
     }
 
     #[cfg(test)]
+    fn take_prune_visit_count_for_tests(&self) -> usize {
+        let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
+        std::mem::take(&mut state.prune_visit_count)
+    }
+
+    #[cfg(test)]
     pub(crate) fn variant_is_advertisable_at(
         &self,
         session_id: &str,
@@ -169,7 +175,7 @@ impl HlsNetworkPolicy {
             return true;
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         if state.session_generations.get(session_id) != Some(&session_generation) {
             return true;
         }
@@ -208,7 +214,7 @@ impl HlsNetworkPolicy {
             return;
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
             return;
         };
@@ -247,7 +253,7 @@ impl HlsNetworkPolicy {
             return;
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
             return;
         };
@@ -263,6 +269,7 @@ impl HlsNetworkPolicy {
             variant.consecutive_slow_responses = 0;
         }
         state.last_changed_at = Some(now);
+        state.prune_session(session_id, now);
     }
 
     #[cfg(test)]
@@ -293,7 +300,7 @@ impl HlsNetworkPolicy {
             return;
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         let Some(variant) = state.variant_mut(session_id, session_generation, variant_id) else {
             return;
         };
@@ -325,7 +332,7 @@ impl HlsNetworkPolicy {
             return;
         }
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         if state.session_generations.get(session_id) != Some(&session_generation) {
             return;
         }
@@ -341,7 +348,7 @@ impl HlsNetworkPolicy {
 
     fn advance_session_generation_at(&self, session_id: &str, generation: u64, now: SystemTime) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         let should_advance = state
             .session_generations
             .get(session_id)
@@ -358,7 +365,7 @@ impl HlsNetworkPolicy {
 
     fn remove_session_generation_at(&self, session_id: &str, generation: u64, now: SystemTime) {
         let mut state = self.inner.lock().expect("HLS network policy lock poisoned");
-        state.prune_expired(now);
+        state.prune_session(session_id, now);
         let should_remove = state
             .session_generations
             .get(session_id)
@@ -389,6 +396,8 @@ struct HlsNetworkPolicyState {
     session_generations: HashMap<String, u64>,
     sessions: HashMap<String, HlsSessionNetworkState>,
     last_changed_at: Option<SystemTime>,
+    #[cfg(test)]
+    prune_visit_count: usize,
 }
 
 impl HlsNetworkPolicyState {
@@ -419,27 +428,47 @@ impl HlsNetworkPolicyState {
         )
     }
 
+    fn prune_session(&mut self, session_id: &str, now: SystemTime) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.prune_visit_count += 1;
+        }
+        Self::prune_session_state(session, now);
+        if !session.has_active_state() {
+            self.sessions.remove(session_id);
+        }
+    }
+
     fn prune_expired(&mut self, now: SystemTime) {
+        #[cfg(test)]
+        {
+            self.prune_visit_count += self.sessions.len();
+        }
         self.sessions.retain(|_, session| {
-            session.variants.retain(|_, variant| {
-                variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
-                if !variant.hold_degraded
-                    && variant.unhealthy_until.is_some_and(|until| until <= now)
-                {
-                    variant.unhealthy_until = None;
-                    variant.unhealthy_reason = None;
-                    variant.consecutive_failures = 0;
-                    variant.consecutive_slow_responses = 0;
-                }
-                variant.retrying_until.is_some()
-                    || variant.unhealthy_until.is_some()
-                    || variant.hold_degraded
-            });
-            session.cache_only_until = session
-                .cache_only_until
-                .filter(|until| *until > now && session.has_degraded_variant(now));
+            Self::prune_session_state(session, now);
             session.has_active_state()
         });
+    }
+
+    fn prune_session_state(session: &mut HlsSessionNetworkState, now: SystemTime) {
+        session.variants.retain(|_, variant| {
+            variant.retrying_until = variant.retrying_until.filter(|until| *until > now);
+            if !variant.hold_degraded && variant.unhealthy_until.is_some_and(|until| until <= now) {
+                variant.unhealthy_until = None;
+                variant.unhealthy_reason = None;
+                variant.consecutive_failures = 0;
+                variant.consecutive_slow_responses = 0;
+            }
+            variant.retrying_until.is_some()
+                || variant.unhealthy_until.is_some()
+                || variant.hold_degraded
+        });
+        session.cache_only_until = session
+            .cache_only_until
+            .filter(|until| *until > now && session.has_degraded_variant(now));
     }
 
     fn snapshot(&self, now: SystemTime) -> HlsWeakNetworkSnapshot {
@@ -926,5 +955,57 @@ mod tests {
             recovered_at,
         );
         assert_eq!(0, policy.active_session_count_for_tests());
+    }
+
+    #[test]
+    fn healthy_successes_do_not_accumulate_active_sessions() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            let session_id = format!("healthy-session-{session_index}");
+            policy.advance_session_generation_at(&session_id, 1, now);
+            policy.record_upstream_success_at_for_policy(
+                WeakNetworkPreference::Adaptive,
+                &session_id,
+                1,
+                "1080p",
+                Duration::from_millis(50),
+                now,
+            );
+        }
+
+        assert_eq!(0, policy.active_session_count_for_tests());
+    }
+
+    #[test]
+    fn targeted_queries_only_prune_the_requested_hold_session() {
+        let policy = HlsNetworkPolicy::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        for session_index in 0..10_000 {
+            let session_id = format!("hold-session-{session_index}");
+            policy.advance_session_generation_at(&session_id, 1, now);
+            policy.record_upstream_failure_at_for_policy(
+                WeakNetworkPreference::HoldDowngrade,
+                &session_id,
+                1,
+                "1080p",
+                now,
+            );
+        }
+        assert_eq!(10_000, policy.active_session_count_for_tests());
+        policy.take_prune_visit_count_for_tests();
+
+        assert!(!policy.variant_is_advertisable_at_for_policy(
+            WeakNetworkPreference::HoldDowngrade,
+            "hold-session-9999",
+            1,
+            "1080p",
+            now + Duration::from_secs(1),
+        ));
+
+        assert_eq!(1, policy.take_prune_visit_count_for_tests());
+        assert_eq!(10_000, policy.active_session_count_for_tests());
     }
 }
