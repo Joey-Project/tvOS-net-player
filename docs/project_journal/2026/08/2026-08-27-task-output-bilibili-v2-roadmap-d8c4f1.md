@@ -120,6 +120,10 @@ superseded_by:
 - Legacy-managed result projection is validated before snapshot construction, and the one trailing JSON newline is included inside the 128 MiB writer bound. Oversized staged legacy state therefore cannot install a snapshot that the loader would reject.
 - Resource v2 remains gated until startup's bounded orphan scan succeeds. If the sanitized startup rewrite fails, a later durable mutation reruns orphan cleanup synchronously before re-enabling v2 and opaque resource-ID reuse.
 - Grouped HLS deletion keeps failed child session IDs as a process-local cleanup intent after the task tombstone commits. Repeating the same library-item deletion completes those remaining sessions; restart cleanup covers a crash between metadata and byte deletion.
+- Final PR 6B review hardening retains the complete parent-directory fsync chain across retries, marks projection-validation failures unhealthy, and restores resource-serving capability after a successful cleanup retry.
+- Committed task state now controls HLS quota protection while a newer snapshot is pending or rejected. Quota eviction honors a refused task mutation, and explicit deletion serializes with finalization so a newly completed manifest cannot be removed before task completion and runtime registration commit together.
+- Committed task outputs are shared immutable views with precomputed resource authorization. Repeated first-page requests copy only the requested page, while resource GET authorization and the no-follow file open are one cleanup-serialized operation whose descriptor survives later unlink.
+- Persisted collection limits are enforced while JSON arrays are decoded, public media bases are checked after canonical percent encoding, and task-output v2 drops immediately when an in-memory snapshot cannot satisfy its durable contract.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -133,4 +137,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the current post-review Rust suite contains 579 passing unit tests, 34 default live-e2e helper tests with 1 opt-in real-network case ignored, and 6 passing integration tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the current post-review Rust suite passes 588 unit tests, 34 default live-e2e helper tests with 1 opt-in real-network case ignored, and 6 integration tests. Final pass counts are recorded after the full delivery gate.

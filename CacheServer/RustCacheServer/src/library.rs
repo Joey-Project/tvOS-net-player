@@ -93,15 +93,6 @@ impl LocalMediaLibrary {
             .await
     }
 
-    pub(crate) async fn open_resource_file(
-        &self,
-        relative_path: &str,
-    ) -> Option<OpenedResourceFile> {
-        let relative_path = relative_path.to_owned();
-        self.run_blocking(move |library, _| library.open_resource_file_blocking(&relative_path))
-            .await
-    }
-
     pub async fn cache_root(&self) -> CacheRoot {
         self.run_blocking(|library, _| library.cache_root_blocking())
             .await
@@ -225,20 +216,6 @@ impl LocalMediaLibrary {
         Some(OpenedMediaFile {
             file,
             content_type: media_file.content_type,
-            last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-            size_bytes: metadata.len(),
-        })
-    }
-
-    fn open_resource_file_blocking(&self, relative_path: &str) -> Option<OpenedResourceFile> {
-        let file = open_read_no_follow(&self.root_path(), relative_path).ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.file_type().is_file() {
-            return None;
-        }
-
-        Some(OpenedResourceFile {
-            file,
             last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
             size_bytes: metadata.len(),
         })
@@ -579,12 +556,6 @@ pub struct OpenedMediaFile {
     pub content_type: String,
     pub last_modified: SystemTime,
     pub size_bytes: u64,
-}
-
-pub(crate) struct OpenedResourceFile {
-    pub(crate) file: File,
-    pub(crate) last_modified: SystemTime,
-    pub(crate) size_bytes: u64,
 }
 
 pub struct LibraryItemPage {

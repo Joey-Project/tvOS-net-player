@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fs::File,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use prost_types::Timestamp;
@@ -22,8 +23,8 @@ use crate::{
     },
     hls_cache::HlsCacheStore,
     library::{
-        list_directory_names_no_follow_bounded, remove_empty_directory_no_follow,
-        remove_file_no_follow,
+        list_directory_names_no_follow_bounded, open_read_no_follow,
+        remove_empty_directory_no_follow, remove_file_no_follow,
     },
     task_output::{TaskOutputRecord, TaskResourceRecord, resource_id_is_canonical},
     task_store::{PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore},
@@ -322,12 +323,11 @@ impl BilibiliTaskRegistry {
             .expect("known task must have output");
         Ok(TaskOutputSnapshot {
             task_id: normalized_id,
-            revision: output.revision,
-            snapshot_id: output.snapshot_id.clone(),
+            revision: output.record.revision,
+            snapshot_id: output.record.snapshot_id.clone(),
             resource_lease_id: String::new(),
-            results: output.results.clone(),
-            resources: output.resources.clone(),
-            encoded_bytes: output.encoded_bytes(),
+            encoded_bytes: output.encoded_bytes,
+            output: Arc::clone(output),
         })
     }
 
@@ -353,15 +353,14 @@ impl BilibiliTaskRegistry {
             .expect("known task must have output");
         let snapshot = TaskOutputSnapshot {
             task_id: normalized_id,
-            revision: output.revision,
-            snapshot_id: output.snapshot_id.clone(),
+            revision: output.record.revision,
+            snapshot_id: output.record.snapshot_id.clone(),
             resource_lease_id: format!("task-output-resource-lease-{}", Uuid::new_v4().simple()),
-            results: output.results.clone(),
-            resources: output.resources.clone(),
-            encoded_bytes: output.encoded_bytes(),
+            encoded_bytes: output.encoded_bytes,
+            output: Arc::clone(output),
         };
         let retained = RetainedTaskResourceSnapshot::from_output(&snapshot, expires_at);
-        if !retained.resources_by_id.is_empty() {
+        if !retained.output.available_resources_by_id.is_empty() {
             inner
                 .retained_resource_snapshots
                 .insert(snapshot.resource_lease_id.clone(), retained);
@@ -410,7 +409,7 @@ impl BilibiliTaskRegistry {
         let retained_resource_ids = inner
             .retained_resource_snapshots
             .values()
-            .flat_map(|snapshot| snapshot.resources_by_id.keys())
+            .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
             .map(String::as_str)
             .collect::<HashSet<_>>();
         for resource in &resources {
@@ -494,6 +493,7 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    #[cfg(test)]
     pub(crate) fn task_resource(&self, id: &str) -> Option<TaskResourceRecord> {
         let normalized_id = normalize(id).to_ascii_lowercase();
         if normalized_id.is_empty() {
@@ -505,13 +505,18 @@ impl BilibiliTaskRegistry {
         let record = inner
             .visible_outputs_by_task_id
             .values()
-            .find_map(|output| output.resource(&normalized_id))
+            .find_map(|output| output.available_resources_by_id.get(&normalized_id))
             .cloned()
             .or_else(|| {
                 inner
                     .retained_resource_snapshots
                     .values()
-                    .find_map(|snapshot| snapshot.resources_by_id.get(&normalized_id))
+                    .find_map(|snapshot| {
+                        snapshot
+                            .output
+                            .available_resources_by_id
+                            .get(&normalized_id)
+                    })
                     .cloned()
             })
             .filter(|record| {
@@ -524,6 +529,67 @@ impl BilibiliTaskRegistry {
         drop(inner);
         self.cleanup_durable_resource_bodies();
         record
+    }
+
+    pub(crate) fn open_task_resource(&self, id: &str) -> Option<OpenedTaskResource> {
+        let normalized_id = normalize(id).to_ascii_lowercase();
+        if normalized_id.is_empty() {
+            return None;
+        }
+        let resource_root_path = self.resource_root_path.as_ref()?;
+        let now = current_timestamp();
+        let cleanup_guard = self
+            .resource_cleanup_lock
+            .lock()
+            .expect("task resource cleanup lock poisoned");
+        let record = {
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
+            inner
+                .visible_outputs_by_task_id
+                .values()
+                .find_map(|output| output.available_resources_by_id.get(&normalized_id))
+                .cloned()
+                .or_else(|| {
+                    inner
+                        .retained_resource_snapshots
+                        .values()
+                        .find_map(|snapshot| {
+                            snapshot
+                                .output
+                                .available_resources_by_id
+                                .get(&normalized_id)
+                                .cloned()
+                        })
+                })
+                .filter(|record| {
+                    record
+                        .resource
+                        .expires_at
+                        .as_ref()
+                        .is_none_or(|expires_at| {
+                            timestamp_nanos(expires_at) > timestamp_nanos(&now)
+                        })
+                })?
+        };
+
+        // The cleanup lock protects object identity from authorization through the no-follow open.
+        // After open, the file descriptor keeps that exact body object readable even if cleanup
+        // unlinks its pathname; this does not claim to freeze in-place content mutations.
+        let file = open_read_no_follow(resource_root_path, &record.relative_path()).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        let opened = OpenedTaskResource {
+            record,
+            file,
+            last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            size_bytes: metadata.len(),
+        };
+        drop(cleanup_guard);
+        self.cleanup_durable_resource_bodies();
+        Some(opened)
     }
 
     pub(crate) fn release_task_output_snapshots(&self, resource_lease_ids: &[String]) {
@@ -1863,7 +1929,7 @@ impl BilibiliTaskRegistry {
     pub fn protected_hls_cache_session_ids(&self) -> HashSet<String> {
         let inner = self.inner.lock().expect("task registry lock poisoned");
         inner
-            .tasks_by_id
+            .visible_tasks_by_id
             .values()
             .filter(|task| task.kind() == TaskKind::BilibiliProgressivePlayback)
             .flat_map(|task| match task.state() {
@@ -2146,7 +2212,16 @@ impl BilibiliTaskRegistry {
             inner.tasks_by_id.insert(task_id, task);
         }
         inner.visible_tasks_by_id = inner.tasks_by_id.clone();
-        inner.visible_outputs_by_task_id = inner.outputs_by_task_id.clone();
+        inner.visible_outputs_by_task_id = inner
+            .outputs_by_task_id
+            .iter()
+            .map(|(task_id, output)| {
+                (
+                    task_id.clone(),
+                    Arc::new(VisibleTaskOutput::new(output.clone())),
+                )
+            })
+            .collect();
 
         let orphan_resource_scan_pending = resource_root_path.is_some();
         Self {
@@ -2213,6 +2288,9 @@ impl BilibiliTaskRegistry {
             match self.persistence_snapshot_locked(&mut inner) {
                 Ok(snapshot) => (snapshot, false),
                 Err(error) => {
+                    if let Some(persistence) = self.persistence.as_ref() {
+                        persistence.mark_unavailable();
+                    }
                     eprintln!("Rejected invalid legacy task output snapshot: {error}");
                     (None, true)
                 }
@@ -2310,19 +2388,36 @@ impl BilibiliTaskRegistry {
     }
 
     fn install_visible_snapshot_locked(inner: &mut RegistryInner, records: &[PersistedTaskRecord]) {
+        let previous_outputs = std::mem::take(&mut inner.visible_outputs_by_task_id);
         inner.visible_tasks_by_id = records
             .iter()
             .map(|record| (record.task.id.clone(), record.task.clone()))
             .collect();
         inner.visible_outputs_by_task_id = records
             .iter()
-            .map(|record| (record.task.id.clone(), record.output.clone()))
+            .map(|record| {
+                let output = shared_visible_task_output(
+                    previous_outputs.get(&record.task.id),
+                    &record.output,
+                );
+                (record.task.id.clone(), output)
+            })
             .collect();
     }
 
     fn install_visible_live_state_locked(inner: &mut RegistryInner) {
+        let previous_outputs = std::mem::take(&mut inner.visible_outputs_by_task_id);
         inner.visible_tasks_by_id = inner.tasks_by_id.clone();
-        inner.visible_outputs_by_task_id = inner.outputs_by_task_id.clone();
+        inner.visible_outputs_by_task_id = inner
+            .outputs_by_task_id
+            .iter()
+            .map(|(task_id, output)| {
+                (
+                    task_id.clone(),
+                    shared_visible_task_output(previous_outputs.get(task_id), output),
+                )
+            })
+            .collect();
     }
 
     fn mark_resource_cleanup_durable_locked(
@@ -2356,6 +2451,13 @@ impl BilibiliTaskRegistry {
                 .collect::<Vec<_>>()
         };
         if candidates.is_empty() {
+            if !self
+                .orphan_resource_scan_pending
+                .load(AtomicOrdering::Acquire)
+            {
+                self.resource_storage_available
+                    .store(true, AtomicOrdering::Release);
+            }
             return true;
         }
 
@@ -2409,6 +2511,14 @@ impl BilibiliTaskRegistry {
             for resource_id in cleaned {
                 inner.durable_resource_cleanup_ids.remove(&resource_id);
             }
+        }
+        if cleanup_succeeded
+            && !self
+                .orphan_resource_scan_pending
+                .load(AtomicOrdering::Acquire)
+        {
+            self.resource_storage_available
+                .store(true, AtomicOrdering::Release);
         }
         cleanup_succeeded
     }
@@ -2611,15 +2721,88 @@ impl Default for TaskRetentionPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct TaskOutputSnapshot {
     pub(crate) task_id: String,
     pub(crate) revision: u64,
     pub(crate) snapshot_id: String,
     pub(crate) resource_lease_id: String,
-    pub(crate) results: Vec<TaskResult>,
-    pub(crate) resources: Vec<TaskResourceRecord>,
     pub(crate) encoded_bytes: usize,
+    pub(crate) output: Arc<VisibleTaskOutput>,
+}
+
+pub(crate) struct OpenedTaskResource {
+    pub(crate) record: TaskResourceRecord,
+    pub(crate) file: File,
+    pub(crate) last_modified: SystemTime,
+    pub(crate) size_bytes: u64,
+}
+
+#[cfg(test)]
+impl TaskOutputSnapshot {
+    pub(crate) fn for_tests(
+        task_id: impl Into<String>,
+        revision: u64,
+        snapshot_id: impl Into<String>,
+        resource_lease_id: impl Into<String>,
+        results: Vec<TaskResult>,
+        encoded_bytes: usize,
+    ) -> Self {
+        let snapshot_id = snapshot_id.into();
+        let output = TaskOutputRecord {
+            revision,
+            snapshot_id: snapshot_id.clone(),
+            primary_result_id: results
+                .first()
+                .map(|result| result.id.clone())
+                .unwrap_or_default(),
+            results,
+            resources: Vec::new(),
+            legacy_managed: false,
+        };
+        let mut output = VisibleTaskOutput::new(output);
+        output.encoded_bytes = encoded_bytes;
+        Self {
+            task_id: task_id.into(),
+            revision,
+            snapshot_id,
+            resource_lease_id: resource_lease_id.into(),
+            encoded_bytes,
+            output: Arc::new(output),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VisibleTaskOutput {
+    pub(crate) record: TaskOutputRecord,
+    encoded_bytes: usize,
+    available_resources_by_id: HashMap<String, TaskResourceRecord>,
+}
+
+impl VisibleTaskOutput {
+    fn new(record: TaskOutputRecord) -> Self {
+        let available_ids = record
+            .results
+            .iter()
+            .flat_map(|result| &result.artifacts)
+            .filter(|artifact| artifact.state() == TaskArtifactState::Available)
+            .filter_map(|artifact| artifact.resource.as_ref())
+            .map(|resource| resource.id.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let available_resources_by_id = record
+            .resources
+            .iter()
+            .filter(|resource| available_ids.contains(&resource.resource.id))
+            .map(|resource| (resource.resource.id.clone(), resource.clone()))
+            .collect();
+        let encoded_bytes = record.encoded_bytes();
+        Self {
+            record,
+            encoded_bytes,
+            available_resources_by_id,
+        }
+    }
 }
 
 pub struct BilibiliTaskWorkItem {
@@ -2695,7 +2878,7 @@ struct RegistryInner {
     tasks_by_id: HashMap<String, Task>,
     outputs_by_task_id: HashMap<String, TaskOutputRecord>,
     visible_tasks_by_id: HashMap<String, Task>,
-    visible_outputs_by_task_id: HashMap<String, TaskOutputRecord>,
+    visible_outputs_by_task_id: HashMap<String, Arc<VisibleTaskOutput>>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
@@ -2753,28 +2936,14 @@ impl RegistryMutationCheckpoint {
 
 struct RetainedTaskResourceSnapshot {
     expires_at: Instant,
-    resources_by_id: HashMap<String, TaskResourceRecord>,
+    output: Arc<VisibleTaskOutput>,
 }
 
 impl RetainedTaskResourceSnapshot {
     fn from_output(snapshot: &TaskOutputSnapshot, expires_at: Instant) -> Self {
-        let available_ids = snapshot
-            .results
-            .iter()
-            .flat_map(|result| &result.artifacts)
-            .filter(|artifact| artifact.state() == TaskArtifactState::Available)
-            .filter_map(|artifact| artifact.resource.as_ref())
-            .map(|resource| resource.id.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let resources_by_id = snapshot
-            .resources
-            .iter()
-            .filter(|record| available_ids.contains(&record.resource.id))
-            .map(|record| (record.resource.id.clone(), record.clone()))
-            .collect();
         Self {
             expires_at,
-            resources_by_id,
+            output: Arc::clone(&snapshot.output),
         }
     }
 }
@@ -2796,6 +2965,10 @@ impl TaskStatePersistence {
 
     fn is_available(&self) -> bool {
         self.available.load(AtomicOrdering::Acquire)
+    }
+
+    fn mark_unavailable(&self) {
+        self.available.store(false, AtomicOrdering::Release);
     }
 
     fn path(&self) -> &Path {
@@ -3568,16 +3741,29 @@ fn authorized_resource_ids_locked(inner: &RegistryInner) -> HashSet<&str> {
     inner
         .visible_outputs_by_task_id
         .values()
-        .flat_map(|output| &output.resources)
+        .flat_map(|output| &output.record.resources)
         .map(|resource| resource.resource.id.as_str())
         .chain(
             inner
                 .retained_resource_snapshots
                 .values()
-                .flat_map(|snapshot| snapshot.resources_by_id.keys())
+                .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
                 .map(String::as_str),
         )
         .collect()
+}
+
+fn shared_visible_task_output(
+    previous: Option<&Arc<VisibleTaskOutput>>,
+    record: &TaskOutputRecord,
+) -> Arc<VisibleTaskOutput> {
+    previous
+        .filter(|output| {
+            output.record.revision == record.revision
+                && output.record.snapshot_id == record.snapshot_id
+        })
+        .cloned()
+        .unwrap_or_else(|| Arc::new(VisibleTaskOutput::new(record.clone())))
 }
 
 fn reconcile_task_output_locked(
@@ -4157,7 +4343,10 @@ mod tests {
         assert_eq!(durable_task, registry.get_task(&created.task.id).unwrap());
         let visible_output = registry.task_output_snapshot(&created.task.id).unwrap();
         assert_eq!(durable_output.revision, visible_output.revision);
-        assert_eq!(durable_output.results, visible_output.results);
+        assert_eq!(
+            durable_output.output.record.results,
+            visible_output.output.record.results
+        );
 
         std::fs::remove_dir(&path).expect("blocking directory should be removable");
         std::fs::write(&path, durable_state).expect("durable state should be restored");
@@ -5817,7 +6006,10 @@ mod tests {
         assert_eq!(durable_task, registry.get_task(&created.task.id).unwrap());
         let visible_output = registry.task_output_snapshot(&created.task.id).unwrap();
         assert_eq!(durable_output.revision, visible_output.revision);
-        assert_eq!(durable_output.results, visible_output.results);
+        assert_eq!(
+            durable_output.output.record.results,
+            visible_output.output.record.results
+        );
         assert!(registry.task_resource("child-media").is_some());
         assert!(resource_path.exists());
         std::fs::remove_dir(&state_path).unwrap();
@@ -5829,6 +6021,8 @@ mod tests {
 
         let snapshot = registry.task_output_snapshot(&created.task.id).unwrap();
         let child = snapshot
+            .output
+            .record
             .results
             .iter()
             .find(|result| result.id == child_session_id)
@@ -5928,7 +6122,10 @@ mod tests {
         assert_eq!(durable_task, registry.get_task(&created.task.id).unwrap());
         let visible_output = registry.task_output_snapshot(&created.task.id).unwrap();
         assert_eq!(durable_output.revision, visible_output.revision);
-        assert_eq!(durable_output.results, visible_output.results);
+        assert_eq!(
+            durable_output.output.record.results,
+            visible_output.output.record.results
+        );
         std::fs::remove_dir(&state_path).unwrap();
         std::fs::write(&state_path, durable_state).unwrap();
 
@@ -6379,7 +6576,13 @@ mod tests {
         let restored = BilibiliTaskRegistry::with_persistence_path(&path);
         assert_eq!(
             "result-one",
-            restored.task_output_snapshot(&task.id).unwrap().results[0].id
+            restored
+                .task_output_snapshot(&task.id)
+                .unwrap()
+                .output
+                .record
+                .results[0]
+                .id
         );
     }
 
@@ -6496,6 +6699,12 @@ mod tests {
         assert_eq!(
             vec![created.task.id.clone()],
             registry.playback_hls_session_ids(&created.task.id)
+        );
+        assert!(
+            registry
+                .protected_hls_cache_session_ids()
+                .contains(&created.task.id),
+            "eviction protection must follow the last committed playable task"
         );
 
         let error = registry
@@ -6672,7 +6881,10 @@ mod tests {
         let visible_output = registry.task_output_snapshot(&task.id).unwrap();
         assert_eq!(durable_output.revision, visible_output.revision);
         assert_eq!(durable_output.snapshot_id, visible_output.snapshot_id);
-        assert_eq!(durable_output.results, visible_output.results);
+        assert_eq!(
+            durable_output.output.record.results,
+            visible_output.output.record.results
+        );
         assert!(registry.task_resource("failed-output-resource").is_none());
         assert!(
             tokio::time::timeout(Duration::from_millis(25), subscription.recv())
@@ -6690,7 +6902,10 @@ mod tests {
         let restarted = BilibiliTaskRegistry::with_persistence_path(&path);
         let restarted_output = restarted.task_output_snapshot(&task.id).unwrap();
         assert_eq!(durable_output.revision, restarted_output.revision);
-        assert_eq!(durable_output.results, restarted_output.results);
+        assert_eq!(
+            durable_output.output.record.results,
+            restarted_output.output.record.results
+        );
         assert!(restarted.task_resource("failed-output-resource").is_none());
         drop(restarted);
 
@@ -6865,7 +7080,7 @@ mod tests {
             .task_output_snapshot(&task.id)
             .expect("generic output should restore");
         assert_eq!(summary.revision, snapshot.revision);
-        assert_eq!("episode-one", snapshot.results[0].id);
+        assert_eq!("episode-one", snapshot.output.record.results[0].id);
         let restored_resource = restored
             .task_resource("subtitle-resource")
             .expect("available resource should restore");
@@ -6933,6 +7148,7 @@ mod tests {
             .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
             .unwrap();
         assert_eq!(first_snapshot.snapshot_id, second_snapshot.snapshot_id);
+        assert!(Arc::ptr_eq(&first_snapshot.output, &second_snapshot.output));
         assert_ne!(
             first_snapshot.resource_lease_id,
             second_snapshot.resource_lease_id
@@ -6959,6 +7175,152 @@ mod tests {
         assert!(!resource_path.exists());
         assert!(!resource_path.parent().unwrap().exists());
         assert!(registry.task_resource("subtitle-retained").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_cleanup_reenables_v2_after_a_transient_filesystem_failure() {
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-cleanup-recovery", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cleanup-recovery".to_owned(),
+            content_type: "text/plain".to_owned(),
+            size_bytes: 4,
+            size_known: true,
+            etag: "v1".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource should be valid");
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "artifact-one".to_owned(),
+                        kind: TaskArtifactKind::Metadata.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource.clone()],
+            )
+            .expect("resource output should persist");
+        let resource_path = root_path.join(resource.relative_path());
+        std::fs::create_dir_all(&resource_path)
+            .expect("a directory at the body path should block file cleanup");
+
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "replacement".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("metadata replacement should remain durable");
+
+        assert!(!registry.task_output_v2_available());
+        std::fs::remove_dir(&resource_path).expect("cleanup blocker should be removable");
+        assert!(registry.cleanup_durable_resource_bodies());
+        assert!(registry.task_output_v2_available());
+        assert!(!resource_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn opened_resource_body_survives_retained_lease_release() {
+        use std::io::Read as _;
+
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-open-lease", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "opened-resource".to_owned(),
+            content_type: "text/plain".to_owned(),
+            size_bytes: 4,
+            size_known: true,
+            etag: "v1".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource should be valid");
+        let resource_path = root_path.join(resource.relative_path());
+        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
+        std::fs::write(&resource_path, b"test").unwrap();
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "artifact-one".to_owned(),
+                        kind: TaskArtifactKind::Metadata.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("resource output should persist");
+        let retained = registry
+            .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
+            .expect("output snapshot should retain its resource");
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "replacement".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("resource retirement should persist");
+
+        let mut opened = registry
+            .open_task_resource("opened-resource")
+            .expect("retained resource should authorize an atomic open");
+        registry.release_task_output_snapshots(&[retained.resource_lease_id]);
+        assert!(!resource_path.exists());
+
+        let mut body = Vec::new();
+        opened
+            .file
+            .read_to_end(&mut body)
+            .expect("the opened descriptor should pin the authorized body object");
+        assert_eq!(b"test", body.as_slice());
     }
 
     #[test]
@@ -7023,7 +7385,7 @@ mod tests {
 
         assert!(running.revision > queued.revision);
         assert_ne!(running.snapshot_id, queued.snapshot_id);
-        assert_eq!(TaskState::Running, running.results[0].state());
+        assert_eq!(TaskState::Running, running.output.record.results[0].state());
         assert_eq!(
             running.revision,
             registry
@@ -7075,6 +7437,8 @@ mod tests {
             durable_snapshot,
             std::fs::read(&path).expect("durable snapshot should remain readable")
         );
+        assert!(!registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
         drop(registry);
 
         let restored = BilibiliTaskRegistry::with_persistence_path(&path);
@@ -7083,6 +7447,8 @@ mod tests {
             restored
                 .task_output_snapshot(&creation.task.id)
                 .unwrap()
+                .output
+                .record
                 .results
                 .iter()
                 .all(|result| {

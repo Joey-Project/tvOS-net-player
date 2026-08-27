@@ -440,6 +440,11 @@ fn validate_public_media_base_uri(value: &str) -> Result<(), ConfigError> {
     }
     let url = Url::parse(value)
         .map_err(|_| ConfigError::new("Public media base URI must be a valid HTTP(S) URL."))?;
+    if url.as_str().len() > MAX_TASK_RESOURCE_BASE_URI_BYTES {
+        return Err(ConfigError::new(format!(
+            "Canonical public media base URI cannot exceed {MAX_TASK_RESOURCE_BASE_URI_BYTES} bytes."
+        )));
+    }
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(ConfigError::new(
             "Public media base URI must be an absolute HTTP(S) URL with a host.",
@@ -776,6 +781,23 @@ mod tests {
             .validate()
             .expect_err("public base URI must fit task result projection limits");
         assert!(error.to_string().contains("cannot exceed"));
+    }
+
+    #[test]
+    fn rejects_public_media_base_uri_that_expands_past_the_canonical_limit() {
+        let prefix = "https://example.test/";
+        let remaining_bytes = MAX_TASK_RESOURCE_BASE_URI_BYTES - prefix.len();
+        let mut path = "a ".repeat(remaining_bytes.saturating_sub(1) / 2);
+        path.push_str(&"a".repeat(remaining_bytes - path.len()));
+        let options = CacheServerOptions {
+            public_media_base_uri: Some(format!("{prefix}{path}")),
+            ..CacheServerOptions::default()
+        };
+
+        let error = options
+            .validate()
+            .expect_err("canonical URI must fit task result projection limits");
+        assert!(error.to_string().contains("Canonical"));
     }
 
     #[test]

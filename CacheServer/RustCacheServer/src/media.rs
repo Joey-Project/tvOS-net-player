@@ -146,14 +146,10 @@ async fn resource_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(record) = state.state.tasks.task_resource(&resource_id) else {
+    let Some(opened_resource) = state.state.tasks.open_task_resource(&resource_id) else {
         return resource_not_found_response();
     };
-    let relative_path = record.relative_path();
-    let resource = record.resource;
-    let Some(opened_resource) = state.state.library.open_resource_file(&relative_path).await else {
-        return resource_not_found_response();
-    };
+    let resource = opened_resource.record.resource;
 
     if resource.size_known
         && u64::try_from(resource.size_bytes).ok() != Some(opened_resource.size_bytes)

@@ -726,7 +726,7 @@ struct TaskResultPageSnapshot {
     revision: u64,
     snapshot_id: String,
     resource_lease_id: String,
-    results: Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+    output: Arc<crate::task_registry::VisibleTaskOutput>,
     encoded_bytes: usize,
     expires_at: Instant,
     tokens_by_offset: HashMap<usize, String>,
@@ -793,7 +793,6 @@ impl TaskResultPageStore {
         if let Some(existing) = self.snapshots_by_id.get_mut(&snapshot.snapshot_id)
             && existing.task_id == snapshot.task_id
             && existing.revision == snapshot.revision
-            && existing.results == snapshot.results
         {
             released_resource_lease_ids.push(std::mem::replace(
                 &mut existing.resource_lease_id,
@@ -822,9 +821,9 @@ impl TaskResultPageStore {
         while self
             .snapshots_by_id
             .values()
-            .map(|snapshot| snapshot.results.len())
+            .map(|snapshot| snapshot.output.record.results.len())
             .sum::<usize>()
-            .saturating_add(snapshot.results.len())
+            .saturating_add(snapshot.output.record.results.len())
             > MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS
         {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
@@ -863,7 +862,7 @@ impl TaskResultPageStore {
                 revision: snapshot.revision,
                 snapshot_id: snapshot_id.clone(),
                 resource_lease_id: snapshot.resource_lease_id,
-                results: snapshot.results,
+                output: snapshot.output,
                 encoded_bytes: snapshot.encoded_bytes,
                 expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
                 tokens_by_offset: HashMap::new(),
@@ -897,18 +896,19 @@ impl TaskResultPageStore {
         let snapshot = self.snapshots_by_id.get_mut(snapshot_id).ok_or_else(|| {
             Status::invalid_argument("Task result snapshot is no longer available.")
         })?;
-        if offset > snapshot.results.len() {
+        if offset > snapshot.output.record.results.len() {
             return Err(Status::invalid_argument(
                 "Task result page token offset is invalid.",
             ));
         }
         let requested_end = offset
             .saturating_add(page_size.max(1))
-            .min(snapshot.results.len());
+            .min(snapshot.output.record.results.len());
         let mut end = offset;
         let mut encoded_bytes = TASK_RESULT_PAGE_METADATA_RESERVE_BYTES;
         while end < requested_end {
-            let result_bytes = projected_task_result_encoded_bytes(&snapshot.results[end]);
+            let result_bytes =
+                projected_task_result_encoded_bytes(&snapshot.output.record.results[end]);
             let entry_bytes = result_bytes
                 .saturating_add(prost::length_delimiter_len(result_bytes))
                 .saturating_add(1);
@@ -927,8 +927,8 @@ impl TaskResultPageStore {
             encoded_bytes = encoded_bytes.saturating_add(entry_bytes);
             end += 1;
         }
-        let results = snapshot.results[offset..end].to_vec();
-        let next_page_token = if end < snapshot.results.len() {
+        let results = snapshot.output.record.results[offset..end].to_vec();
+        let next_page_token = if end < snapshot.output.record.results.len() {
             if let Some(token) = snapshot.tokens_by_offset.get(&end) {
                 token.clone()
             } else {
@@ -950,7 +950,13 @@ impl TaskResultPageStore {
         Ok((
             results,
             PageInfo {
-                total_size: snapshot.results.len().try_into().unwrap_or(u64::MAX),
+                total_size: snapshot
+                    .output
+                    .record
+                    .results
+                    .len()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 next_page_token,
                 snapshot_id: snapshot.snapshot_id.clone(),
             },
@@ -2540,38 +2546,41 @@ async fn run_hls_cache_finalization_inner(
             let completed_playback_session =
                 playback_session_from_hls_cache_session(&completion.session);
             let library_item_id = completion.library_item_id.clone();
-            let finalized = state
-                .tasks
-                .complete_playback_hls_session_cached_with_metadata(
-                    &task_id,
-                    &session_id,
-                    library_item_id.clone(),
-                    completed_playback_session,
-                );
-            match finalized {
-                Ok(task)
-                    if state.tasks.playback_task_has_completed_hls_cache_item(
-                        &task,
+            let finalized = {
+                let _deletion_guard = state.completed_hls_mutation_guard();
+                match state
+                    .tasks
+                    .complete_playback_hls_session_cached_with_metadata(
+                        &task_id,
                         &session_id,
-                        &library_item_id,
-                    ) =>
-                {
-                    state.register_completed_hls_runtime_session(&completion.session);
-                    if let Err(error) = state.enforce_hls_cache_quota(
-                        "after_hls_finalization",
-                        [session_id.clone()],
-                        0,
+                        library_item_id.clone(),
+                        completed_playback_session,
                     ) {
-                        eprintln!(
-                            "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
-                            state.error_detail_for_log(&error)
-                        );
+                    Ok(task)
+                        if state.tasks.playback_task_has_completed_hls_cache_item(
+                            &task,
+                            &session_id,
+                            &library_item_id,
+                        ) =>
+                    {
+                        state.register_completed_hls_runtime_session(&completion.session);
+                        true
                     }
+                    Ok(_) | Err(_) => false,
                 }
-                Ok(_) | Err(_) => {
-                    state.remove_hls_playback_session(&session_id);
-                    let _ = state.hls_cache.remove_session(&session_id);
+            };
+            if finalized {
+                if let Err(error) =
+                    state.enforce_hls_cache_quota("after_hls_finalization", [session_id.clone()], 0)
+                {
+                    eprintln!(
+                        "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
+                        state.error_detail_for_log(&error)
+                    );
                 }
+            } else {
+                state.remove_hls_playback_session(&session_id);
+                let _ = state.hls_cache.remove_session(&session_id);
             }
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
@@ -3339,14 +3348,15 @@ mod tests {
             task_result("result-1", TaskState::Completed),
             task_result("result-2", TaskState::Completed),
         ];
-        let snapshot = |resource_lease_id: &str| crate::task_registry::TaskOutputSnapshot {
-            task_id: "task-one".to_owned(),
-            revision: 7,
-            snapshot_id: "snapshot-one".to_owned(),
-            resource_lease_id: resource_lease_id.to_owned(),
-            results: results.clone(),
-            resources: Vec::new(),
-            encoded_bytes: 1024,
+        let snapshot = |resource_lease_id: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-one",
+                7,
+                "snapshot-one",
+                resource_lease_id,
+                results.clone(),
+                1024,
+            )
         };
         let mut pages = TaskResultPageStore::default();
 
@@ -3379,14 +3389,15 @@ mod tests {
     #[test]
     fn task_result_page_store_evicts_snapshots_by_encoded_bytes() {
         let now = Instant::now();
-        let snapshot = |id: &str, lease: &str| crate::task_registry::TaskOutputSnapshot {
-            task_id: format!("task-{id}"),
-            revision: 1,
-            snapshot_id: format!("snapshot-{id}"),
-            resource_lease_id: lease.to_owned(),
-            results: Vec::new(),
-            resources: Vec::new(),
-            encoded_bytes: MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+        let snapshot = |id: &str, lease: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                Vec::new(),
+                MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+            )
         };
         let mut pages = TaskResultPageStore::default();
 
@@ -3416,15 +3427,14 @@ mod tests {
             .iter()
             .map(Message::encoded_len)
             .fold(0_usize, usize::saturating_add);
-        let snapshot = crate::task_registry::TaskOutputSnapshot {
-            task_id: "task-large-page".to_owned(),
-            revision: 3,
-            snapshot_id: "snapshot-large-page".to_owned(),
-            resource_lease_id: "lease-large-page".to_owned(),
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-large-page",
+            3,
+            "snapshot-large-page",
+            "lease-large-page",
             results,
-            resources: Vec::new(),
             encoded_bytes,
-        };
+        );
         let mut pages = TaskResultPageStore::default();
 
         let (first, released, inserted) = pages.first_page(snapshot, now, 50);
@@ -7292,6 +7302,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_library_item_refuses_a_completed_manifest_owned_by_a_playable_task() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                allow_library_item_delete: true,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, hls_session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1finalization-delete-race", &upstream_url);
+        let completed_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &hls_session)
+            .await
+            .expect("cache fill should install its completed manifest");
+        assert_eq!(library_item_id, completed_item_id);
+
+        let deleted = CacheGrpcService::new(state.clone())
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: library_item_id.clone(),
+            }))
+            .await
+            .expect("the in-flight finalization item should be refused without an error")
+            .into_inner();
+
+        assert!(!deleted.deleted);
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(task_id)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_library_item_removes_completed_hls_cache_and_task_record() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -8619,16 +8684,17 @@ mod tests {
     }
 
     #[test]
-    fn completed_hls_cleanup_item_accepts_playable_secondary_result_cache() {
+    fn completed_hls_cleanup_item_preserves_committed_secondary_after_failed_save() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = temp.path().join(".state").join("tasks.json");
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
-                task_state_path: temp.path().join(".state").join("tasks.json"),
+                task_state_path: task_state_path.clone(),
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -8731,6 +8797,35 @@ mod tests {
                 &child_session_id,
                 &child_library_item_id,
             )
+        );
+
+        std::fs::remove_file(&task_state_path).expect("task state should be removable");
+        std::fs::create_dir(&task_state_path)
+            .expect("a directory should reject the next snapshot replacement");
+        state
+            .tasks
+            .complete_task_failed(&creation.task.id, "Hidden failure.".to_owned())
+            .expect("legacy mutation should remain staged in memory");
+
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(
+            state
+                .tasks
+                .protected_hls_cache_session_ids()
+                .contains(&child_session_id)
+        );
+        assert!(
+            !state
+                .remove_evicted_completed_hls_task(&crate::hls_cache::HlsCacheCompletedEntry {
+                    session_id: child_session_id,
+                    library_item_id: child_library_item_id,
+                    size_bytes: 1,
+                    updated_at: SystemTime::now(),
+                })
+                .expect("a rejected task mutation should skip physical eviction")
         );
     }
 

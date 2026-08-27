@@ -390,14 +390,17 @@ impl AppState {
                         let completed_playback_session =
                             playback_session_from_hls_cache_session(session);
                         let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
-                        match self
-                            .tasks
-                            .complete_playback_hls_session_cached_with_metadata(
-                                &task_id,
-                                &session.id,
-                                library_item_id.clone(),
-                                completed_playback_session,
-                            ) {
+                        let completion = {
+                            let _deletion_guard = self.completed_hls_mutation_guard();
+                            self.tasks
+                                .complete_playback_hls_session_cached_with_metadata(
+                                    &task_id,
+                                    &session.id,
+                                    library_item_id.clone(),
+                                    completed_playback_session,
+                                )
+                        };
+                        match completion {
                             Ok(task)
                                 if self.tasks.playback_task_has_completed_hls_cache_item(
                                     &task,
@@ -638,6 +641,14 @@ impl AppState {
         if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
             return Ok(Some(false));
         }
+        if !authorized
+            && self
+                .tasks
+                .playback_task_for_any_hls_session(&session_id)
+                .is_some()
+        {
+            return Ok(Some(false));
+        }
         let session_ids = if authorized {
             let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
             let (task_cleanup_session_id, task_cleanup_library_item_id) = self
@@ -656,6 +667,12 @@ impl AppState {
 
         self.remove_hls_sessions_for_library_item(item_id, &session_ids)?;
         Ok(Some(true))
+    }
+
+    pub(crate) fn completed_hls_mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.completed_hls_deletion_lock
+            .lock()
+            .expect("completed HLS deletion lock poisoned")
     }
 
     fn completed_hls_delete_session_ids(
@@ -1225,7 +1242,19 @@ impl AppState {
             }) {
                 continue;
             }
-            self.remove_evicted_completed_hls_task(&entry)?;
+            let _deletion_guard = self.completed_hls_mutation_guard();
+            if session_ids.iter().any(|session_id| {
+                self.hls_cache_session_is_currently_protected_from_eviction(
+                    session_id,
+                    protected_session_ids_for_completed_entry,
+                )
+            }) || !self.completed_hls_cache_entry_is_evictable(&entry)
+            {
+                continue;
+            }
+            if !self.remove_evicted_completed_hls_task(&entry)? {
+                continue;
+            }
             self.remove_hls_sessions(&session_ids)?;
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(
@@ -1420,11 +1449,14 @@ impl AppState {
             })
     }
 
-    fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) -> io::Result<()> {
+    fn remove_evicted_completed_hls_task(
+        &self,
+        entry: &HlsCacheCompletedEntry,
+    ) -> io::Result<bool> {
         let Some((removal_session_id, removal_library_item_id)) =
             self.completed_hls_task_cleanup_item(&entry.session_id, &entry.library_item_id)
         else {
-            return Ok(());
+            return Ok(true);
         };
         self.tasks
             .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)
@@ -1433,8 +1465,7 @@ impl AppState {
                     "failed to persist HLS playback task removal before evicting {}: {status}",
                     entry.session_id
                 ))
-            })?;
-        Ok(())
+            })
     }
 
     pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {

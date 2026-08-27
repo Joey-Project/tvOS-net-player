@@ -1,18 +1,23 @@
 use std::{
+    fmt,
     fs::{self, File},
     io::{self, Read, Write},
+    marker::PhantomData,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[cfg(test)]
 use std::sync::{
-    Barrier, Mutex,
+    Barrier,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
 use prost_types::Timestamp;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, SeqAccess, Visitor},
+};
 
 use crate::generated::tvos_net_player::v1::{
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
@@ -21,11 +26,16 @@ use crate::generated::tvos_net_player::v1::{
     TaskResultProgress,
 };
 use crate::playback_policy::PlaybackPolicy;
-use crate::task_output::{TaskOutputRecord, TaskResourceRecord};
+use crate::task_output::{
+    MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS, TaskOutputRecord, TaskResourceRecord,
+};
 
 const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
 const TASK_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PERSISTED_TASKS: usize = 10_000;
+const MAX_PERSISTED_BILIBILI_VARIANTS: usize = 10_000;
+const MAX_PERSISTED_DANMAKU_FORMATS: usize = 16;
 
 #[cfg(test)]
 type TaskStateSaveBarriers = (Arc<Barrier>, Arc<Barrier>);
@@ -33,6 +43,7 @@ type TaskStateSaveBarriers = (Arc<Barrier>, Arc<Barrier>);
 #[derive(Clone)]
 pub(crate) struct TaskStateStore {
     path: Arc<PathBuf>,
+    pending_directory_syncs: Arc<Mutex<Vec<PathBuf>>>,
     #[cfg(test)]
     fail_next_directory_sync: Arc<AtomicBool>,
     #[cfg(test)]
@@ -49,6 +60,7 @@ impl TaskStateStore {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Arc::new(path.into()),
+            pending_directory_syncs: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             fail_next_directory_sync: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -99,7 +111,18 @@ impl TaskStateStore {
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
-        let directories_to_sync = prepare_parent_directory(self.path())?;
+        let snapshot = PersistedTaskSnapshot {
+            schema_version: TASK_STATE_SCHEMA_VERSION,
+            tasks: records
+                .iter()
+                .cloned()
+                .map(PersistedTaskFile::from)
+                .collect(),
+        };
+        snapshot.validate_collection_limits()?;
+        let directories_to_sync = parent_directories_requiring_sync(self.path())?;
+        self.remember_pending_directory_syncs(&directories_to_sync);
+        create_parent_directory(self.path())?;
         #[cfg(test)]
         if let Some((entered, resume)) = self
             .next_save_barriers
@@ -111,14 +134,6 @@ impl TaskStateStore {
             resume.wait();
         }
 
-        let snapshot = PersistedTaskSnapshot {
-            schema_version: TASK_STATE_SCHEMA_VERSION,
-            tasks: records
-                .iter()
-                .cloned()
-                .map(PersistedTaskFile::from)
-                .collect(),
-        };
         let mut serialized = BoundedSnapshotWriter::new(MAX_TASK_STATE_SNAPSHOT_BYTES);
         serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
         serialized.write_all(b"\n")?;
@@ -138,9 +153,28 @@ impl TaskStateStore {
                 io::Error::other("injected task state directory sync failure"),
             ));
         }
-        match sync_directories(&directories_to_sync) {
-            Ok(()) => Ok(TaskStateSaveOutcome::Durable),
+        let mut pending_directory_syncs = self
+            .pending_directory_syncs
+            .lock()
+            .expect("task state directory sync lock poisoned");
+        match sync_directories(&pending_directory_syncs) {
+            Ok(()) => {
+                pending_directory_syncs.clear();
+                Ok(TaskStateSaveOutcome::Durable)
+            }
             Err(error) => Ok(TaskStateSaveOutcome::InstalledButNotDurable(error)),
+        }
+    }
+
+    fn remember_pending_directory_syncs(&self, directories: &[PathBuf]) {
+        let mut pending = self
+            .pending_directory_syncs
+            .lock()
+            .expect("task state directory sync lock poisoned");
+        for directory in directories {
+            if !pending.contains(directory) {
+                pending.push(directory.clone());
+            }
         }
     }
 
@@ -156,6 +190,14 @@ impl TaskStateStore {
             .next_save_barriers
             .lock()
             .expect("task state save barrier lock poisoned") = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    fn pending_directory_syncs(&self) -> Vec<PathBuf> {
+        self.pending_directory_syncs
+            .lock()
+            .expect("task state directory sync lock poisoned")
+            .clone()
     }
 }
 
@@ -198,6 +240,175 @@ fn snapshot_size_error() -> io::Error {
     )
 }
 
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    limit: usize,
+    label: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        limit: usize,
+        label: &'static str,
+        marker: PhantomData<fn() -> T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "an array containing at most {} {}",
+                self.limit, self.label
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(self.limit));
+            while values.len() < self.limit {
+                let Some(value) = sequence.next_element()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format!(
+                    "{} cannot exceed {} entries",
+                    self.label, self.limit
+                )));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        limit,
+        label,
+        marker: PhantomData,
+    })
+}
+
+fn deserialize_persisted_tasks<'de, D>(deserializer: D) -> Result<Vec<PersistedTaskFile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_PERSISTED_TASKS, "persisted tasks")
+}
+
+fn deserialize_bilibili_result_items<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedBilibiliTaskResultItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_TASK_RESULTS, "Bilibili task result items")
+}
+
+fn deserialize_task_results<'de, D>(deserializer: D) -> Result<Vec<PersistedTaskResult>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TaskResultsVisitor;
+
+    impl<'de> Visitor<'de> for TaskResultsVisitor {
+        type Value = Vec<PersistedTaskResult>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_TASK_RESULTS} task results containing at most {MAX_TASK_ARTIFACTS} artifacts"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut results =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_TASK_RESULTS));
+            let mut artifact_count = 0_usize;
+            while results.len() < MAX_TASK_RESULTS {
+                let Some(result) = sequence.next_element::<PersistedTaskResult>()? else {
+                    return Ok(results);
+                };
+                artifact_count = artifact_count.saturating_add(result.artifacts.len());
+                if artifact_count > MAX_TASK_ARTIFACTS {
+                    return Err(de::Error::custom(format!(
+                        "task output artifacts cannot exceed {MAX_TASK_ARTIFACTS} entries"
+                    )));
+                }
+                results.push(result);
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format!(
+                    "task output results cannot exceed {MAX_TASK_RESULTS} entries"
+                )));
+            }
+            Ok(results)
+        }
+    }
+
+    deserializer.deserialize_seq(TaskResultsVisitor)
+}
+
+fn deserialize_task_resources<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedCacheResourceRef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_TASK_RESOURCES, "task output resources")
+}
+
+fn deserialize_task_artifacts<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedTaskArtifact>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_TASK_ARTIFACTS, "task result artifacts")
+}
+
+fn deserialize_selection_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_TASK_RESULTS, "Bilibili selection ids")
+}
+
+fn deserialize_playback_variants<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedBilibiliPlaybackVariant>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_PERSISTED_BILIBILI_VARIANTS,
+        "Bilibili playback variants",
+    )
+}
+
+fn deserialize_danmaku_formats<'de, D>(deserializer: D) -> Result<Vec<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_PERSISTED_DANMAKU_FORMATS,
+        "Bilibili danmaku formats",
+    )
+}
+
 #[cfg(unix)]
 fn parent_directory_sync_chain(path: &Path) -> io::Result<Vec<PathBuf>> {
     let Some(parent) = path.parent() else {
@@ -229,17 +440,27 @@ fn parent_directory_sync_chain(path: &Path) -> io::Result<Vec<PathBuf>> {
     ))
 }
 
-fn prepare_parent_directory(path: &Path) -> io::Result<Vec<PathBuf>> {
+#[cfg(unix)]
+fn parent_directories_requiring_sync(path: &Path) -> io::Result<Vec<PathBuf>> {
+    parent_directory_sync_chain(path)
+}
+
+#[cfg(not(unix))]
+fn parent_directories_requiring_sync(_path: &Path) -> io::Result<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
+fn create_parent_directory(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
+    fs::create_dir_all(parent)
+}
 
-    #[cfg(unix)]
-    let directories_to_sync = parent_directory_sync_chain(path)?;
-    #[cfg(not(unix))]
-    let directories_to_sync = Vec::new();
-
-    fs::create_dir_all(parent)?;
+#[cfg(test)]
+fn prepare_parent_directory(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let directories_to_sync = parent_directories_requiring_sync(path)?;
+    create_parent_directory(path)?;
     Ok(directories_to_sync)
 }
 
@@ -267,8 +488,82 @@ pub(crate) struct PersistedTaskRecord {
 #[derive(Serialize, Deserialize)]
 struct PersistedTaskSnapshot {
     schema_version: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_persisted_tasks")]
     tasks: Vec<PersistedTaskFile>,
+}
+
+impl PersistedTaskSnapshot {
+    fn validate_collection_limits(&self) -> io::Result<()> {
+        validate_collection_len("persisted tasks", self.tasks.len(), MAX_PERSISTED_TASKS)?;
+        for task in &self.tasks {
+            validate_collection_len(
+                "Bilibili task result items",
+                task.result_items.len(),
+                MAX_TASK_RESULTS,
+            )?;
+            if let Some(selection) = task.bilibili_selection.as_ref() {
+                validate_collection_len(
+                    "Bilibili selection ids",
+                    selection.selection_ids.len(),
+                    MAX_TASK_RESULTS,
+                )?;
+            }
+            if let Some(options) = task.bilibili_options.as_ref() {
+                validate_collection_len(
+                    "Bilibili danmaku formats",
+                    options.danmaku_formats.len(),
+                    MAX_PERSISTED_DANMAKU_FORMATS,
+                )?;
+            }
+            if let Some(session) = task.playback_session.as_ref() {
+                validate_collection_len(
+                    "Bilibili playback variants",
+                    session.variants.len(),
+                    MAX_PERSISTED_BILIBILI_VARIANTS,
+                )?;
+            }
+            for item in &task.result_items {
+                if let Some(session) = item.playback_session.as_ref() {
+                    validate_collection_len(
+                        "Bilibili playback variants",
+                        session.variants.len(),
+                        MAX_PERSISTED_BILIBILI_VARIANTS,
+                    )?;
+                }
+            }
+            if let Some(output) = task.output.as_ref() {
+                validate_collection_len(
+                    "task output results",
+                    output.results.len(),
+                    MAX_TASK_RESULTS,
+                )?;
+                validate_collection_len(
+                    "task output resources",
+                    output.resources.len(),
+                    MAX_TASK_RESOURCES,
+                )?;
+                let artifact_count = output.results.iter().fold(0_usize, |count, result| {
+                    count.saturating_add(result.artifacts.len())
+                });
+                validate_collection_len(
+                    "task output artifacts",
+                    artifact_count,
+                    MAX_TASK_ARTIFACTS,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_collection_len(label: &str, len: usize, limit: usize) -> io::Result<()> {
+    if len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} cannot exceed {limit} entries"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -296,7 +591,7 @@ struct PersistedTaskFile {
     bilibili_playback_options: Option<PersistedBilibiliPlaybackOptions>,
     #[serde(default)]
     bilibili_selection: Option<PersistedBilibiliTaskSelection>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bilibili_result_items")]
     result_items: Vec<PersistedBilibiliTaskResultItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<PersistedTaskOutput>,
@@ -407,7 +702,9 @@ struct PersistedTaskOutput {
     revision: u64,
     snapshot_id: String,
     primary_result_id: String,
+    #[serde(deserialize_with = "deserialize_task_results")]
     results: Vec<PersistedTaskResult>,
+    #[serde(deserialize_with = "deserialize_task_resources")]
     resources: Vec<PersistedCacheResourceRef>,
     legacy_managed: bool,
 }
@@ -467,6 +764,7 @@ struct PersistedTaskResult {
     problem: Option<PersistedTaskProblem>,
     library_item_id: String,
     playback_source: Option<PersistedPlaybackSource>,
+    #[serde(deserialize_with = "deserialize_task_artifacts")]
     artifacts: Vec<PersistedTaskArtifact>,
     created_at: Option<PersistedTimestamp>,
     updated_at: Option<PersistedTimestamp>,
@@ -681,7 +979,7 @@ impl PersistedCacheResourceRef {
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedBilibiliTaskSelection {
     mode: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_selection_ids")]
     selection_ids: Vec<String>,
     range_start_index: u32,
     range_end_index: u32,
@@ -811,7 +1109,7 @@ struct PersistedBilibiliPlaybackSession {
     content_id: String,
     selected_variant_id: String,
     selected_variant: Option<PersistedBilibiliPlaybackVariant>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_playback_variants")]
     variants: Vec<PersistedBilibiliPlaybackVariant>,
     #[serde(default)]
     transcoding_plan: Option<PersistedLanTranscodingPlan>,
@@ -985,7 +1283,7 @@ struct PersistedBilibiliDownloadOptions {
     subtitle_ai_policy: i32,
     #[serde(default)]
     download_cover: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_danmaku_formats")]
     danmaku_formats: Vec<i32>,
 }
 
@@ -1098,6 +1396,129 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_collections_that_the_loader_would_reject() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let task = Task {
+            id: "task-one".to_owned(),
+            source: "BV1collection-limit".to_owned(),
+            ..Default::default()
+        };
+        let record = PersistedTaskRecord {
+            output: TaskOutputRecord::from_legacy_task(&task),
+            task,
+            options: Some(BilibiliDownloadOptions {
+                danmaku_formats: vec![0; MAX_PERSISTED_DANMAKU_FORMATS + 1],
+                ..Default::default()
+            }),
+            playback_options: None,
+        };
+
+        let error = TaskStateStore::new(&path)
+            .save(&[record])
+            .expect_err("writer and loader collection limits must match");
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bounded_vector_deserializer_rejects_an_extra_item_without_retaining_it() {
+        let mut deserializer = serde_json::Deserializer::from_str("[1, 2, 3]");
+        let parsed: Result<Vec<u8>, _> =
+            deserialize_bounded_vec(&mut deserializer, 2, "test values");
+
+        let error = parsed.expect_err("the third item must exceed the bound");
+        assert!(error.to_string().contains("cannot exceed 2"));
+    }
+
+    #[test]
+    fn persisted_task_output_bounds_results_during_deserialization() {
+        let result = PersistedTaskResult {
+            id: "result".to_owned(),
+            state: TaskState::Completed.into(),
+            title: String::new(),
+            subtitle: String::new(),
+            progress: None,
+            problem: None,
+            library_item_id: String::new(),
+            playback_source: None,
+            artifacts: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let output = PersistedTaskOutput {
+            revision: 1,
+            snapshot_id: "snapshot".to_owned(),
+            primary_result_id: String::new(),
+            results: vec![result; MAX_TASK_RESULTS + 1],
+            resources: Vec::new(),
+            legacy_managed: false,
+        };
+        let bytes = serde_json::to_vec(&output).expect("fixture should serialize");
+
+        let error = match serde_json::from_slice::<PersistedTaskOutput>(&bytes) {
+            Ok(_) => panic!("persisted results must be bounded while decoding"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("task output results cannot exceed")
+        );
+    }
+
+    #[test]
+    fn persisted_task_output_bounds_aggregate_artifacts_during_deserialization() {
+        let artifact = PersistedTaskArtifact {
+            id: "artifact".to_owned(),
+            kind: TaskArtifactKind::Metadata.into(),
+            state: TaskArtifactState::Available.into(),
+            title: String::new(),
+            format: String::new(),
+            language_tag: String::new(),
+            is_ai_generated: false,
+            resource: None,
+            problem: None,
+        };
+        let result = |id: &str, artifacts| PersistedTaskResult {
+            id: id.to_owned(),
+            state: TaskState::Completed.into(),
+            title: String::new(),
+            subtitle: String::new(),
+            progress: None,
+            problem: None,
+            library_item_id: String::new(),
+            playback_source: None,
+            artifacts,
+            created_at: None,
+            updated_at: None,
+        };
+        let output = PersistedTaskOutput {
+            revision: 1,
+            snapshot_id: "snapshot".to_owned(),
+            primary_result_id: String::new(),
+            results: vec![
+                result("first", vec![artifact.clone(); MAX_TASK_ARTIFACTS]),
+                result("second", vec![artifact]),
+            ],
+            resources: Vec::new(),
+            legacy_managed: false,
+        };
+        let bytes = serde_json::to_vec(&output).expect("fixture should serialize");
+
+        let error = match serde_json::from_slice::<PersistedTaskOutput>(&bytes) {
+            Ok(_) => panic!("aggregate artifact count must be bounded while decoding"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("task output artifacts cannot exceed")
+        );
+    }
+
+    #[test]
     fn save_creates_initially_missing_nested_state_directory() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_directory = temp.path().join("state").join("task-store");
@@ -1145,6 +1566,38 @@ mod tests {
             prepare_parent_directory(&path)
                 .expect("an existing parent directory should still be prepared")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_retry_retains_the_original_creation_chain() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first_directory = temp.path().join("state");
+        let state_directory = first_directory.join("task-store");
+        let path = state_directory.join("tasks.json");
+        let store = TaskStateStore::new(path);
+
+        store.fail_next_directory_sync();
+        assert!(matches!(
+            store.save(&[]).expect("rename should commit the snapshot"),
+            TaskStateSaveOutcome::InstalledButNotDurable(_)
+        ));
+        assert_eq!(
+            vec![
+                state_directory.clone(),
+                first_directory,
+                temp.path().to_path_buf(),
+            ],
+            store.pending_directory_syncs()
+        );
+
+        assert!(matches!(
+            store
+                .save(&[])
+                .expect("directory sync retry should succeed"),
+            TaskStateSaveOutcome::Durable
+        ));
+        assert!(store.pending_directory_syncs().is_empty());
     }
 
     #[test]

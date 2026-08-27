@@ -9,9 +9,9 @@ use prost::Message;
 use uuid::Uuid;
 
 const MAX_RESOURCE_ID_BYTES: usize = 200;
-const MAX_TASK_RESULTS: usize = 10_000;
-const MAX_TASK_RESOURCES: usize = 50_000;
-const MAX_TASK_ARTIFACTS: usize = 50_000;
+pub(crate) const MAX_TASK_RESULTS: usize = 10_000;
+pub(crate) const MAX_TASK_RESOURCES: usize = 50_000;
+pub(crate) const MAX_TASK_ARTIFACTS: usize = 50_000;
 pub(crate) const MAX_TASK_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TASK_RESOURCE_BASE_URI_BYTES: usize = 2 * 1024;
 const MAX_TASK_RESOURCE_URI_PROJECTION_OVERHEAD_BYTES: usize = 16;
@@ -250,27 +250,6 @@ impl TaskOutputRecord {
         task_output_encoded_bytes(&self.results, &self.resources)
             .saturating_add(self.snapshot_id.len())
             .saturating_add(self.primary_result_id.len())
-    }
-
-    pub(crate) fn resource(&self, id: &str) -> Option<&TaskResourceRecord> {
-        let available = self
-            .results
-            .iter()
-            .flat_map(|result| &result.artifacts)
-            .any(|artifact| {
-                artifact.state() == TaskArtifactState::Available
-                    && artifact
-                        .resource
-                        .as_ref()
-                        .is_some_and(|resource| resource.id == id)
-            });
-        available
-            .then(|| {
-                self.resources
-                    .iter()
-                    .find(|record| record.resource.id == id)
-            })
-            .flatten()
     }
 
     pub(crate) fn mark_playback_cache_deleted(
