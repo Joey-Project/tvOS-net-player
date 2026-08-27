@@ -115,6 +115,11 @@ superseded_by:
 - Completed HLS deletion and quota eviction persist task deletion metadata before removing cache directories. Physical cleanup is idempotent, retries can remove an already-unowned cache item, and startup removes sessions that no longer have an authorized persisted task.
 - Cancelling a playable progressive task now commits the terminal task/output state before its RPC removes HLS bytes. A rejected state snapshot rolls the cancellation back, returns `Unavailable`, and preserves the playable task and cache session for a safe retry.
 - HLS playback authorization and cache-item lookup use the same last-committed task view as `GetTask` and reconnecting watchers. Cancellation first retries a previously rejected snapshot, so hidden terminal work cannot revoke or delete media before it becomes committed.
+- New task creation now uses the same commit boundary: with persistence configured, rejected download and playback creation rolls back queue/deduplication/planning state, returns `Unavailable`, and starts no worker or planner. Repairing persistence allows the identical request to create a fresh durable task.
+- Result and output limits now reserve the worst-case 2 KiB server media base plus protobuf nesting and credential-redaction growth for every client-visible resource reference. Each result is rechecked after URI projection, and the page store reserves protobuf field framing and response metadata inside its 4 MiB projected-byte budget even when the requested item count is larger.
+- Legacy-managed result projection is validated before snapshot construction, and the one trailing JSON newline is included inside the 128 MiB writer bound. Oversized staged legacy state therefore cannot install a snapshot that the loader would reject.
+- Resource v2 remains gated until startup's bounded orphan scan succeeds. If the sanitized startup rewrite fails, a later durable mutation reruns orphan cleanup synchronously before re-enabling v2 and opaque resource-ID reuse.
+- Grouped HLS deletion keeps failed child session IDs as a process-local cleanup intent after the task tombstone commits. Repeating the same library-item deletion completes those remaining sessions; restart cleanup covers a crash between metadata and byte deletion.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -128,4 +133,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the current post-review Rust suite contains 572 passing unit tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the current post-review Rust suite contains 579 passing unit tests, 34 default live-e2e helper tests with 1 opt-in real-network case ignored, and 6 passing integration tests.

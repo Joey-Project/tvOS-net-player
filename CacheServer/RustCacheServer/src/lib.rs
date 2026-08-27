@@ -121,6 +121,8 @@ pub struct AppState {
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
     hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
     hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
+    completed_hls_deletion_lock: Arc<Mutex<()>>,
+    pending_hls_session_cleanup_by_library_item: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 pub(crate) struct HlsCacheEvictionProtectionGuard {
@@ -343,6 +345,8 @@ impl AppState {
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
             hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
             hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
+            completed_hls_deletion_lock: Arc::new(Mutex::new(())),
+            pending_hls_session_cleanup_by_library_item: Arc::new(Mutex::new(HashMap::new())),
         };
         state.resume_incomplete_hls_cache_finalizers(
             &restored_hls_sessions,
@@ -616,6 +620,20 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return Ok(Some(false));
         }
+        let _deletion_guard = self
+            .completed_hls_deletion_lock
+            .lock()
+            .expect("completed HLS deletion lock poisoned");
+        let pending_session_ids = self
+            .pending_hls_session_cleanup_by_library_item
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .get(item_id)
+            .cloned();
+        if let Some(pending_session_ids) = pending_session_ids {
+            self.remove_hls_sessions_for_library_item(item_id, &pending_session_ids)?;
+            return Ok(Some(true));
+        }
         let authorized = self.get_completed_hls_library_item(item_id).is_some();
         if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
             return Ok(Some(false));
@@ -636,11 +654,7 @@ impl AppState {
             vec![session_id]
         };
 
-        self.remove_hls_sessions(&session_ids).map_err(|error| {
-            Status::internal(format!(
-                "Failed to delete completed HLS cache item: {error}"
-            ))
-        })?;
+        self.remove_hls_sessions_for_library_item(item_id, &session_ids)?;
         Ok(Some(true))
     }
 
@@ -712,7 +726,44 @@ impl AppState {
     }
 
     fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
+        let (_, first_error) = self.remove_hls_sessions_collecting_failures(session_ids);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn remove_hls_sessions_for_library_item(
+        &self,
+        library_item_id: &str,
+        session_ids: &[String],
+    ) -> Result<(), Status> {
+        let (failed_session_ids, first_error) =
+            self.remove_hls_sessions_collecting_failures(session_ids);
+        let mut pending = self
+            .pending_hls_session_cleanup_by_library_item
+            .lock()
+            .expect("pending HLS cleanup lock poisoned");
+        if failed_session_ids.is_empty() {
+            pending.remove(library_item_id);
+        } else {
+            pending.insert(library_item_id.to_owned(), failed_session_ids);
+        }
+        drop(pending);
+        if let Some(error) = first_error {
+            return Err(Status::internal(format!(
+                "Failed to delete completed HLS cache item: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove_hls_sessions_collecting_failures(
+        &self,
+        session_ids: &[String],
+    ) -> (Vec<String>, Option<io::Error>) {
         let mut removed = HashSet::new();
+        let mut failed_session_ids = Vec::new();
         let mut first_error = None;
         for session_id in session_ids {
             if !removed.insert(session_id) {
@@ -721,14 +772,12 @@ impl AppState {
             match self.hls_cache.remove_session(session_id) {
                 Ok(()) => self.remove_hls_playback_session(session_id),
                 Err(error) => {
+                    failed_session_ids.push(session_id.clone());
                     first_error.get_or_insert(error);
                 }
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        (failed_session_ids, first_error)
     }
 
     pub(crate) fn register_hls_playback_session(&self, session: HlsPlaybackSession) -> u64 {

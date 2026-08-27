@@ -126,7 +126,6 @@ impl TaskStateStore {
         let temp_path = temp_path_for(self.path());
         let mut temp_file = File::create(&temp_path)?;
         temp_file.write_all(&bytes)?;
-        temp_file.write_all(b"\n")?;
         temp_file.sync_all()?;
         drop(temp_file);
         fs::rename(temp_path, self.path())?;
@@ -1082,6 +1081,21 @@ mod tests {
         LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskArtifactKind,
         TaskArtifactState, TaskKind, TaskProblemCategory, TaskState,
     };
+
+    #[test]
+    fn bounded_snapshot_writer_counts_the_trailing_newline() {
+        let mut writer = BoundedSnapshotWriter::new(4);
+        writer.write_all(b"abc").unwrap();
+        writer.write_all(b"\n").unwrap();
+        assert_eq!(b"abc\n", writer.into_inner().as_slice());
+
+        let mut writer = BoundedSnapshotWriter::new(3);
+        writer.write_all(b"abc").unwrap();
+        let error = writer
+            .write_all(b"\n")
+            .expect_err("the trailing newline must stay inside the snapshot limit");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
 
     #[test]
     fn save_creates_initially_missing_nested_state_directory() {

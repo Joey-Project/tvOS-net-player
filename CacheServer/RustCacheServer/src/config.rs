@@ -8,7 +8,7 @@ use std::{
 use bbdown_core::{CredentialProfileSelection, CredentialStore};
 use url::Url;
 
-use crate::task_registry::TaskRetentionPolicy;
+use crate::{task_output::MAX_TASK_RESOURCE_BASE_URI_BYTES, task_registry::TaskRetentionPolicy};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const DEFAULT_HLS_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -433,6 +433,11 @@ fn parse_http_url(value: &str) -> Result<Url, ConfigError> {
 }
 
 fn validate_public_media_base_uri(value: &str) -> Result<(), ConfigError> {
+    if value.len() > MAX_TASK_RESOURCE_BASE_URI_BYTES {
+        return Err(ConfigError::new(format!(
+            "Public media base URI cannot exceed {MAX_TASK_RESOURCE_BASE_URI_BYTES} bytes."
+        )));
+    }
     let url = Url::parse(value)
         .map_err(|_| ConfigError::new("Public media base URI must be a valid HTTP(S) URL."))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -755,6 +760,22 @@ mod tests {
         };
 
         options.validate().expect("public base URI should be valid");
+    }
+
+    #[test]
+    fn rejects_oversized_public_media_base_uri() {
+        let options = CacheServerOptions {
+            public_media_base_uri: Some(format!(
+                "https://example.test/{}",
+                "a".repeat(MAX_TASK_RESOURCE_BASE_URI_BYTES)
+            )),
+            ..CacheServerOptions::default()
+        };
+
+        let error = options
+            .validate()
+            .expect_err("public base URI must fit task result projection limits");
+        assert!(error.to_string().contains("cannot exceed"));
     }
 
     #[test]

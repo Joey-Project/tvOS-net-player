@@ -10,6 +10,7 @@ use bbdown_core::{
     DEFAULT_CREDENTIAL_PROFILE,
 };
 use futures_core::Stream;
+use prost::Message;
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep},
@@ -69,6 +70,7 @@ use crate::{
     },
     library::ROOT_ID,
     playback_policy::PlaybackPolicy,
+    task_output::{MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes},
     task_registry::{
         BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
         PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
@@ -94,6 +96,8 @@ const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback pla
 const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
 const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
 const MAX_TASK_RESULT_PAGE_SIZE: usize = 200;
+const MAX_TASK_RESULT_PAGE_ENCODED_BYTES: usize = 4 * 1024 * 1024;
+const TASK_RESULT_PAGE_METADATA_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -898,7 +902,31 @@ impl TaskResultPageStore {
                 "Task result page token offset is invalid.",
             ));
         }
-        let end = offset.saturating_add(page_size).min(snapshot.results.len());
+        let requested_end = offset
+            .saturating_add(page_size.max(1))
+            .min(snapshot.results.len());
+        let mut end = offset;
+        let mut encoded_bytes = TASK_RESULT_PAGE_METADATA_RESERVE_BYTES;
+        while end < requested_end {
+            let result_bytes = projected_task_result_encoded_bytes(&snapshot.results[end]);
+            let entry_bytes = result_bytes
+                .saturating_add(prost::length_delimiter_len(result_bytes))
+                .saturating_add(1);
+            if encoded_bytes.saturating_add(entry_bytes) > MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+                && end == offset
+            {
+                return Err(Status::resource_exhausted(
+                    "A task result exceeds the response page byte budget.",
+                ));
+            }
+            if end > offset
+                && encoded_bytes.saturating_add(entry_bytes) > MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+            {
+                break;
+            }
+            encoded_bytes = encoded_bytes.saturating_add(entry_bytes);
+            end += 1;
+        }
         let results = snapshot.results[offset..end].to_vec();
         let next_page_token = if end < snapshot.results.len() {
             if let Some(token) = snapshot.tokens_by_offset.get(&end) {
@@ -1186,7 +1214,7 @@ impl TaskService for TaskGrpcService {
                             .create_task_resource(&request, resource_id)
                     })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             page_info: Some(page_info),
             output_revision,
         }))
@@ -1308,14 +1336,14 @@ fn task_result_for_client(
     mut result: crate::generated::tvos_net_player::v1::TaskResult,
     redact_error_details: bool,
     resource_uri: impl Fn(&str) -> String,
-) -> crate::generated::tvos_net_player::v1::TaskResult {
+) -> Result<crate::generated::tvos_net_player::v1::TaskResult, Status> {
     for artifact in &mut result.artifacts {
         if let Some(resource) = artifact.resource.as_mut() {
             resource.uri = resource_uri(&resource.id);
         }
     }
     if !redact_error_details {
-        return result;
+        return bounded_client_task_result(result);
     }
     match result.state() {
         TaskState::Failed => {
@@ -1343,7 +1371,18 @@ fn task_result_for_client(
             problem.message = crate::credential_safe_client_error(true, &problem.message);
         }
     }
-    result
+    bounded_client_task_result(result)
+}
+
+fn bounded_client_task_result(
+    result: crate::generated::tvos_net_player::v1::TaskResult,
+) -> Result<crate::generated::tvos_net_player::v1::TaskResult, Status> {
+    if result.encoded_len() > MAX_TASK_RESULT_ENCODED_BYTES {
+        return Err(Status::resource_exhausted(
+            "A task result exceeds the encoded response limit.",
+        ));
+    }
+    Ok(result)
 }
 
 #[derive(Clone)]
@@ -3362,6 +3401,58 @@ mod tests {
         assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
     }
 
+    #[test]
+    fn task_result_pages_respect_encoded_byte_budget_before_count_limit() {
+        let now = Instant::now();
+        let results = (0..8)
+            .map(|index| TaskResult {
+                id: format!("result-{index}"),
+                state: TaskState::Completed.into(),
+                title: "x".repeat(900_000),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let encoded_bytes = results
+            .iter()
+            .map(Message::encoded_len)
+            .fold(0_usize, usize::saturating_add);
+        let snapshot = crate::task_registry::TaskOutputSnapshot {
+            task_id: "task-large-page".to_owned(),
+            revision: 3,
+            snapshot_id: "snapshot-large-page".to_owned(),
+            resource_lease_id: "lease-large-page".to_owned(),
+            results,
+            resources: Vec::new(),
+            encoded_bytes,
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (first, released, inserted) = pages.first_page(snapshot, now, 50);
+        let first = first.expect("first byte-bounded page should be available");
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert_eq!(4, first.0.len());
+        assert_eq!(8, first.1.total_size);
+        assert!(!first.1.next_page_token.is_empty());
+        assert!(
+            ListTaskResultsResponse {
+                results: first.0.clone(),
+                page_info: Some(first.1.clone()),
+                output_revision: first.2,
+            }
+            .encoded_len()
+                <= MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+        );
+
+        let (second, released) =
+            pages.continuation_page(&first.1.next_page_token, "task-large-page", now, 50);
+        let second = second.expect("continuation page should use the byte-derived offset");
+        assert!(released.is_empty());
+        assert_eq!(4, second.0.len());
+        assert!(second.1.next_page_token.is_empty());
+        assert_eq!(8, second.1.total_size);
+    }
+
     #[tokio::test]
     async fn task_result_page_reaper_starts_once_for_a_shared_store() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -3822,10 +3913,11 @@ mod tests {
         });
         fs::remove_file(&task_state_path).expect("startup should probe task persistence");
         fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
-        state
+        let error = state
             .tasks
             .create_bilibili_task("BV1save-failure", None)
-            .expect("legacy task creation should remain available in memory");
+            .expect_err("task creation must reject an uncommitted snapshot");
+        assert_eq!(tonic::Code::Unavailable, error.code());
 
         let info = ServerGrpcService::new(state.clone())
             .get_server_info(Request::new(GetServerInfoRequest {}))
@@ -7404,7 +7496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_library_item_removes_sibling_result_hls_sessions() {
+    async fn delete_library_item_retries_failed_sibling_result_hls_cleanup() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -7536,13 +7628,40 @@ mod tests {
                 .playback_session(&child_session_id)
                 .is_some()
         );
+        state
+            .hls_cache
+            .fail_next_remove_session(child_session_id.clone());
+
+        let error = cache_service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: library_item_id.clone(),
+            }))
+            .await
+            .expect_err("partial HLS cache cleanup should be retryable");
+
+        assert_eq!(tonic::Code::Internal, error.code());
+        assert!(state.tasks.get_task(&creation.task.id).is_err());
+        assert!(state.hls_sessions.get(&creation.task.id).is_none());
+        assert!(state.hls_sessions.get(&child_session_id).is_some());
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&creation.task.id)
+                .is_none()
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
 
         let deleted = cache_service
             .delete_library_item(Request::new(DeleteLibraryItemRequest {
                 id: library_item_id,
             }))
             .await
-            .expect("completed HLS cache item should delete")
+            .expect("retry should finish the remaining HLS cache cleanup")
             .into_inner();
 
         assert!(deleted.deleted);

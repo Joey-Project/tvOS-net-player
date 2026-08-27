@@ -67,6 +67,8 @@ const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
+    #[cfg(test)]
+    remove_session_failures: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +163,8 @@ impl HlsCacheStore {
     pub(crate) fn new(root_path: impl Into<PathBuf>) -> Self {
         Self {
             root_path: Arc::new(root_path.into()),
+            #[cfg(test)]
+            remove_session_failures: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -178,6 +182,15 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn remove_session(&self, session_id: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .remove_session_failures
+            .lock()
+            .expect("HLS remove-session failure lock poisoned")
+            .remove(session_id)
+        {
+            return Err(io::Error::other("injected HLS session removal failure"));
+        }
         let session_dir = self.session_dir(session_id)?;
         self.reject_cache_path_symlink(&session_dir)?;
         match fs::remove_dir_all(session_dir) {
@@ -185,6 +198,14 @@ impl HlsCacheStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remove_session(&self, session_id: impl Into<String>) {
+        self.remove_session_failures
+            .lock()
+            .expect("HLS remove-session failure lock poisoned")
+            .insert(session_id.into());
     }
 
     #[cfg(test)]

@@ -12,7 +12,11 @@ const MAX_RESOURCE_ID_BYTES: usize = 200;
 const MAX_TASK_RESULTS: usize = 10_000;
 const MAX_TASK_RESOURCES: usize = 50_000;
 const MAX_TASK_ARTIFACTS: usize = 50_000;
-const MAX_TASK_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TASK_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TASK_RESOURCE_BASE_URI_BYTES: usize = 2 * 1024;
+const MAX_TASK_RESOURCE_URI_PROJECTION_OVERHEAD_BYTES: usize = 16;
+const MAX_TASK_CLIENT_REDACTION_MESSAGE_BYTES: usize = 256;
+const MAX_TASK_CLIENT_REDACTION_OVERHEAD_BYTES: usize = 16;
 const MAX_TASK_RESOURCE_ENCODED_BYTES: usize = 64 * 1024;
 const MAX_TASK_OUTPUT_STRING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_OUTPUT_ENCODED_BYTES: usize = 32 * 1024 * 1024;
@@ -171,20 +175,27 @@ impl TaskOutputRecord {
         })
     }
 
-    pub(crate) fn reconcile_legacy_task(&mut self, task: &Task) -> bool {
+    pub(crate) fn reconcile_legacy_task(
+        &mut self,
+        task: &Task,
+    ) -> Result<bool, TaskOutputValidationError> {
         if !self.legacy_managed {
-            return false;
+            return Ok(false);
         }
-        let results = legacy_task_results(task);
+        let mut results = legacy_task_results(task);
+        validate_collection_sizes(&results, &[])?;
+        validate_and_bind_resources(&mut results, &[])?;
+        validate_collection_sizes(&results, &[])?;
+        validate_result_ids(&results)?;
         let primary_result_id = legacy_primary_result_id(task, &results);
         if self.results == results && self.primary_result_id == primary_result_id {
-            return false;
+            return Ok(false);
         }
         self.results = results;
         self.primary_result_id = primary_result_id;
         self.revision = self.revision.saturating_add(1).max(1);
         self.snapshot_id = new_snapshot_id();
-        true
+        Ok(true)
     }
 
     pub(crate) fn summary(&self) -> TaskOutputSummary {
@@ -510,6 +521,15 @@ fn validate_collection_sizes(
             result.id
         )));
     }
+    if let Some(result) = results
+        .iter()
+        .find(|result| projected_task_result_encoded_bytes(result) > MAX_TASK_RESULT_ENCODED_BYTES)
+    {
+        return Err(TaskOutputValidationError::new(format!(
+            "task result cannot exceed {MAX_TASK_RESULT_ENCODED_BYTES} encoded bytes after client projection: {}",
+            result.id
+        )));
+    }
     if let Some(resource) = resources
         .iter()
         .find(|resource| resource.resource.encoded_len() > MAX_TASK_RESOURCE_ENCODED_BYTES)
@@ -531,7 +551,71 @@ fn validate_collection_sizes(
             "task output cannot exceed {MAX_TASK_OUTPUT_ENCODED_BYTES} encoded bytes"
         )));
     }
+    let projected_encoded_bytes = task_output_projected_encoded_bytes(results, resources);
+    if projected_encoded_bytes > MAX_TASK_OUTPUT_ENCODED_BYTES {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_OUTPUT_ENCODED_BYTES} encoded bytes after client projection"
+        )));
+    }
     Ok(())
+}
+
+pub(crate) fn projected_task_result_encoded_bytes(result: &TaskResult) -> usize {
+    let projected_resource_bytes = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.resource.is_some())
+        .count()
+        .saturating_mul(
+            MAX_TASK_RESOURCE_BASE_URI_BYTES
+                .saturating_add(MAX_TASK_RESOURCE_URI_PROJECTION_OVERHEAD_BYTES),
+        );
+    let projected_redaction_bytes = projected_task_result_redaction_bytes(result);
+    result
+        .encoded_len()
+        .saturating_add(projected_resource_bytes)
+        .saturating_add(projected_redaction_bytes)
+}
+
+fn projected_task_result_redaction_bytes(result: &TaskResult) -> usize {
+    result
+        .problem
+        .iter()
+        .map(|problem| projected_redaction_message_growth(&problem.message))
+        .chain(
+            result
+                .progress
+                .iter()
+                .map(|progress| projected_redaction_message_growth(&progress.message)),
+        )
+        .chain(result.artifacts.iter().filter_map(|artifact| {
+            artifact
+                .problem
+                .as_ref()
+                .map(|problem| projected_redaction_message_growth(&problem.message))
+        }))
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn projected_redaction_message_growth(message: &str) -> usize {
+    MAX_TASK_CLIENT_REDACTION_MESSAGE_BYTES
+        .saturating_sub(message.len())
+        .saturating_add(MAX_TASK_CLIENT_REDACTION_OVERHEAD_BYTES)
+}
+
+fn task_output_projected_encoded_bytes(
+    results: &[TaskResult],
+    resources: &[TaskResourceRecord],
+) -> usize {
+    results
+        .iter()
+        .map(projected_task_result_encoded_bytes)
+        .chain(
+            resources
+                .iter()
+                .map(|resource| resource.resource.encoded_len()),
+        )
+        .fold(0_usize, usize::saturating_add)
 }
 
 fn task_output_encoded_bytes(results: &[TaskResult], resources: &[TaskResourceRecord]) -> usize {
@@ -1077,6 +1161,39 @@ mod tests {
         .expect_err("resource binding must be bounded before repeated metadata is cloned");
 
         assert!(error.to_string().contains("after resource binding"));
+    }
+
+    #[test]
+    fn output_preflights_public_resource_uri_projection() {
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "shared-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource should be valid");
+        let artifacts = (0..600)
+            .map(|index| TaskArtifact {
+                id: format!("artifact-{index}"),
+                kind: TaskArtifactKind::CoverImage.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(resource.resource.clone()),
+                ..Default::default()
+            })
+            .collect();
+
+        let error = TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts,
+                ..Default::default()
+            }],
+            vec![resource],
+        )
+        .expect_err("public resource URI projection must stay within the result limit");
+
+        assert!(error.to_string().contains("client projection"));
     }
 
     #[test]
