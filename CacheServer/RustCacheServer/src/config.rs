@@ -130,6 +130,9 @@ impl CacheServerOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let grpc_url = parse_http_url(&self.grpc_listen_url)?;
         let media_url = parse_http_url(&self.media_listen_url)?;
+        if let Some(public_media_base_uri) = self.public_media_base_uri.as_deref() {
+            validate_public_media_base_uri(public_media_base_uri)?;
+        }
         if grpc_url.port_or_known_default() == media_url.port_or_known_default() {
             return Err(ConfigError::new(
                 "gRPC and media listen URLs must use distinct ports in this slice.",
@@ -422,6 +425,26 @@ fn parse_http_url(value: &str) -> Result<Url, ConfigError> {
     }
 
     Ok(url)
+}
+
+fn validate_public_media_base_uri(value: &str) -> Result<(), ConfigError> {
+    let url = Url::parse(value)
+        .map_err(|_| ConfigError::new("Public media base URI must be a valid HTTP(S) URL."))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ConfigError::new(
+            "Public media base URI must be an absolute HTTP(S) URL with a host.",
+        ));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::new(
+            "Public media base URI must not contain userinfo, a query, or a fragment.",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_bool(value: &str) -> Result<bool, ConfigError> {
@@ -717,6 +740,35 @@ mod tests {
             "127.0.0.1:51000".parse::<SocketAddr>().unwrap(),
             options.grpc_listen_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn accepts_public_media_base_uri_with_a_path_prefix() {
+        let options = CacheServerOptions {
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            ..CacheServerOptions::default()
+        };
+
+        options.validate().expect("public base URI should be valid");
+    }
+
+    #[test]
+    fn rejects_public_media_base_uri_with_credentials_or_query_material() {
+        for value in [
+            "https://user:secret@atri.ink/cache",
+            "https://atri.ink/cache?token=secret",
+            "https://atri.ink/cache#fragment",
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(value.to_owned()),
+                ..CacheServerOptions::default()
+            };
+
+            let error = options
+                .validate()
+                .expect_err("unsafe public base URI should be rejected");
+            assert!(!error.to_string().contains("secret"));
+        }
     }
 
     #[test]

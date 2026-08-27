@@ -92,13 +92,16 @@ superseded_by:
 ## Current State
 
 - PR 6A provides the additive generic pagination, task output summary, per-result progress/problem, artifact, resource-reference, and paginated task-result contracts plus generated Swift public models.
-- The Rust server deliberately omits `SERVER_CAPABILITY_TASK_OUTPUT_V2` and returns `UNIMPLEMENTED` from `ListTaskResults` until PR 6B provides durable output storage and HTTP resource serving.
+- PR 6B implements ordered generic output state in the Rust task registry, derives compact summaries for legacy and v2 reads, and migrates disk snapshots from schema v1 to a fail-closed v2 format that persists results, problems, artifacts, public resource metadata, revisions, snapshot IDs, and primary-result identity.
+- `ListTaskResults` now serves bounded immutable snapshots through random, task-bound continuation tokens. Existing snapshots remain internally consistent across later output revisions, while malformed, cross-task, expired, and evicted tokens fail explicitly.
+- Available artifacts can be served with GET, HEAD, and single-range requests from the fixed `.tvos-net-player/resources/<opaque-id>/body` namespace. Resource paths stay server-only, secure no-follow opening prevents symlink traversal, declared sizes are checked, and client URIs are projected through the configured LAN or public media base.
+- The Rust server advertises `SERVER_CAPABILITY_TASK_OUTPUT_V2` only when durable task state and secure HTTP Range serving are available. Legacy task result fields remain populated for older clients.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
 
-- Implement PR 6B task-result snapshot persistence, bounded pagination, generic resource serving, and capability enablement.
-- Preserve legacy task result fields for old clients while making the generic v2 state authoritative for new clients.
+- Implement PR 6C paginated Bilibili resolution sessions and stable candidate selection across pages.
+- Keep accepted candidate identities independent from resolution-session expiry and live-list drift.
 
 ## Evidence
 
@@ -106,3 +109,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`

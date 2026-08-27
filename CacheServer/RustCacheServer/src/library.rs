@@ -27,7 +27,6 @@ pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
 const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
-const INTERNAL_HLS_CACHE_DIR: &str = "hls";
 
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
@@ -91,6 +90,15 @@ impl LocalMediaLibrary {
         let item_id = item_id.to_owned();
         let variant_id = variant_id.to_owned();
         self.run_blocking(move |library, _| library.open_media_file_blocking(&item_id, &variant_id))
+            .await
+    }
+
+    pub(crate) async fn open_resource_file(
+        &self,
+        relative_path: &str,
+    ) -> Option<OpenedResourceFile> {
+        let relative_path = relative_path.to_owned();
+        self.run_blocking(move |library, _| library.open_resource_file_blocking(&relative_path))
             .await
     }
 
@@ -217,6 +225,20 @@ impl LocalMediaLibrary {
         Some(OpenedMediaFile {
             file,
             content_type: media_file.content_type,
+            last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            size_bytes: metadata.len(),
+        })
+    }
+
+    fn open_resource_file_blocking(&self, relative_path: &str) -> Option<OpenedResourceFile> {
+        let file = open_read_no_follow(&self.root_path(), relative_path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+
+        Some(OpenedResourceFile {
+            file,
             last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
             size_bytes: metadata.len(),
         })
@@ -373,7 +395,7 @@ impl LocalMediaLibrary {
         let Some(relative_path) = relative_path(&root_path, &full_candidate_path) else {
             return Ok(None);
         };
-        if is_internal_hls_cache_path(&relative_path) {
+        if is_internal_cache_path(&relative_path) {
             return Ok(None);
         }
         let media_content_type = content_type(&full_candidate_path).to_owned();
@@ -436,7 +458,7 @@ impl LocalMediaLibrary {
         }
 
         let relative_path = relative_path(root_path, &full_candidate_path)?;
-        if is_internal_hls_cache_path(&relative_path) {
+        if is_internal_cache_path(&relative_path) {
             return None;
         }
         if !self.supports_http_range_playback() {
@@ -559,6 +581,12 @@ pub struct OpenedMediaFile {
     pub size_bytes: u64,
 }
 
+pub(crate) struct OpenedResourceFile {
+    pub(crate) file: File,
+    pub(crate) last_modified: SystemTime,
+    pub(crate) size_bytes: u64,
+}
+
 pub struct LibraryItemPage {
     pub items: Vec<LibraryItem>,
     pub next_page_offset: Option<i64>,
@@ -647,7 +675,7 @@ fn collect_media_candidates(
         }
 
         if file_type.is_dir() {
-            if is_internal_hls_cache_dir(root_path, &path) {
+            if is_internal_cache_dir(root_path, &path) {
                 continue;
             }
             collect_media_candidates(
@@ -689,20 +717,19 @@ fn collect_media_candidates(
     Ok(())
 }
 
-fn is_internal_hls_cache_dir(root_path: &Path, path: &Path) -> bool {
+fn is_internal_cache_dir(root_path: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root_path) else {
         return false;
     };
-    is_internal_hls_cache_components(relative.components())
+    is_internal_cache_components(relative.components())
 }
 
-fn is_internal_hls_cache_path(relative_path: &str) -> bool {
-    is_internal_hls_cache_components(Path::new(relative_path).components())
+fn is_internal_cache_path(relative_path: &str) -> bool {
+    is_internal_cache_components(Path::new(relative_path).components())
 }
 
-fn is_internal_hls_cache_components(mut components: Components<'_>) -> bool {
+fn is_internal_cache_components(mut components: Components<'_>) -> bool {
     matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
-        && matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_HLS_CACHE_DIR)
 }
 
 fn create_item_id(relative_path: &str) -> String {
@@ -1109,13 +1136,19 @@ mod tests {
     }
 
     #[test]
-    fn local_scan_excludes_internal_hls_cache_files() {
+    fn local_scan_excludes_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
         fs::create_dir_all(root_path.join(".tvos-net-player/hls/session-1")).unwrap();
+        fs::create_dir_all(root_path.join(".tvos-net-player/resources/resource-1")).unwrap();
         fs::write(
             root_path.join(".tvos-net-player/hls/session-1/video.m4s"),
             b"hls",
+        )
+        .unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/resources/resource-1/body.m4s"),
+            b"resource",
         )
         .unwrap();
         fs::write(root_path.join("Visible.m4s"), b"media").unwrap();
@@ -1133,20 +1166,20 @@ mod tests {
     }
 
     #[test]
-    fn local_direct_lookup_excludes_internal_hls_cache_files() {
+    fn local_direct_lookup_excludes_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
-        fs::write(&internal_path, b"hls").unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
         let root_path = root_path.canonicalize().unwrap();
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
             root_path,
             allowed_extensions: vec![".m4s".to_owned()],
             ..CacheServerOptions::default()
         }));
-        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+        let item_id = create_item_id(".tvos-net-player/resources/resource-1/body.m4s");
 
         assert!(library.get_item_blocking(&item_id).is_none());
         assert!(
@@ -1219,25 +1252,25 @@ mod tests {
     }
 
     #[test]
-    fn delete_item_rejects_internal_hls_cache_files() {
+    fn delete_item_rejects_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
-        fs::write(&internal_path, b"hls").unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
         let root_path = root_path.canonicalize().unwrap();
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
             root_path,
             allowed_extensions: vec![".m4s".to_owned()],
             ..CacheServerOptions::default()
         }));
-        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+        let item_id = create_item_id(".tvos-net-player/resources/resource-1/body.m4s");
 
         assert!(
             !library
                 .delete_item_blocking(&item_id)
-                .expect("internal HLS delete should be ignored")
+                .expect("internal cache delete should be ignored")
         );
         assert!(internal_path.exists());
     }

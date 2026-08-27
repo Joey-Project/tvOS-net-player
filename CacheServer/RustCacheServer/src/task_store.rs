@@ -10,12 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::generated::tvos_net_player::v1::{
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
-    BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, LanTranscodingPlan,
-    PlaybackSource, Task,
+    BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, CacheResourceRef,
+    LanTranscodingPlan, PlaybackSource, Task, TaskArtifact, TaskProblem, TaskResult,
+    TaskResultProgress,
 };
 use crate::playback_policy::PlaybackPolicy;
+use crate::task_output::{TaskOutputRecord, TaskResourceRecord};
 
-const TASK_STATE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
+const TASK_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub(crate) struct TaskStateStore {
@@ -41,7 +44,10 @@ impl TaskStateStore {
         };
         let snapshot: PersistedTaskSnapshot =
             serde_json::from_slice(&bytes).map_err(invalid_data)?;
-        if snapshot.schema_version != TASK_STATE_SCHEMA_VERSION {
+        if !matches!(
+            snapshot.schema_version,
+            LEGACY_TASK_STATE_SCHEMA_VERSION | TASK_STATE_SCHEMA_VERSION
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -51,11 +57,12 @@ impl TaskStateStore {
             ));
         }
 
-        Ok(snapshot
+        let schema_version = snapshot.schema_version;
+        snapshot
             .tasks
             .into_iter()
-            .map(PersistedTaskRecord::from)
-            .collect())
+            .map(|file| file.into_record(schema_version))
+            .collect()
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<()> {
@@ -87,6 +94,7 @@ pub(crate) struct PersistedTaskRecord {
     pub(crate) task: Task,
     pub(crate) options: Option<BilibiliDownloadOptions>,
     pub(crate) playback_options: Option<BilibiliPlaybackOptions>,
+    pub(crate) output: TaskOutputRecord,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,6 +131,8 @@ struct PersistedTaskFile {
     bilibili_selection: Option<PersistedBilibiliTaskSelection>,
     #[serde(default)]
     result_items: Vec<PersistedBilibiliTaskResultItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<PersistedTaskOutput>,
 }
 
 impl From<PersistedTaskRecord> for PersistedTaskFile {
@@ -158,42 +168,346 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
             bilibili_playback_options: record
                 .playback_options
                 .map(PersistedBilibiliPlaybackOptions::from),
+            output: Some(PersistedTaskOutput::from(record.output)),
         }
     }
 }
 
-impl From<PersistedTaskFile> for PersistedTaskRecord {
-    fn from(file: PersistedTaskFile) -> Self {
-        Self {
-            task: Task {
-                id: file.id,
-                kind: file.kind,
-                state: file.state,
-                source: file.source,
-                title: file.title,
-                progress: file.progress,
-                downloaded_bytes: file.downloaded_bytes,
-                total_bytes: file.total_bytes,
-                message: file.message,
-                library_item_id: file.library_item_id,
-                created_at: file.created_at.map(Timestamp::from),
-                updated_at: file.updated_at.map(Timestamp::from),
-                finished_at: file.finished_at.map(Timestamp::from),
-                playback_source: file.playback_source.map(PlaybackSource::from),
-                playback_session: file.playback_session.map(BilibiliPlaybackSession::from),
-                bilibili_selection: file.bilibili_selection.map(BilibiliTaskSelection::from),
-                result_items: file
-                    .result_items
-                    .into_iter()
-                    .map(BilibiliTaskResultItem::from)
-                    .collect(),
-                output_summary: None,
-            },
-            options: file.bilibili_options.map(BilibiliDownloadOptions::from),
-            playback_options: file
+impl PersistedTaskFile {
+    fn into_record(self, schema_version: u32) -> io::Result<PersistedTaskRecord> {
+        let task = Task {
+            id: self.id,
+            kind: self.kind,
+            state: self.state,
+            source: self.source,
+            title: self.title,
+            progress: self.progress,
+            downloaded_bytes: self.downloaded_bytes,
+            total_bytes: self.total_bytes,
+            message: self.message,
+            library_item_id: self.library_item_id,
+            created_at: self.created_at.map(Timestamp::from),
+            updated_at: self.updated_at.map(Timestamp::from),
+            finished_at: self.finished_at.map(Timestamp::from),
+            playback_source: self.playback_source.map(PlaybackSource::from),
+            playback_session: self.playback_session.map(BilibiliPlaybackSession::from),
+            bilibili_selection: self.bilibili_selection.map(BilibiliTaskSelection::from),
+            result_items: self
+                .result_items
+                .into_iter()
+                .map(BilibiliTaskResultItem::from)
+                .collect(),
+            output_summary: None,
+        };
+        let output = match schema_version {
+            LEGACY_TASK_STATE_SCHEMA_VERSION => {
+                let legacy = TaskOutputRecord::from_legacy_task(&task);
+                TaskOutputRecord::restored(
+                    legacy.revision,
+                    legacy.snapshot_id,
+                    String::new(),
+                    legacy.results,
+                    legacy.resources,
+                    legacy.legacy_managed,
+                )
+                .map_err(invalid_data)?
+            }
+            TASK_STATE_SCHEMA_VERSION => self
+                .output
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task state schema v2 task is missing output",
+                    )
+                })?
+                .into_output()?,
+            _ => unreachable!("task state schema version was validated before conversion"),
+        };
+
+        Ok(PersistedTaskRecord {
+            task,
+            options: self.bilibili_options.map(BilibiliDownloadOptions::from),
+            playback_options: self
                 .bilibili_playback_options
                 .map(BilibiliPlaybackOptions::from),
+            output,
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedTaskOutput {
+    revision: u64,
+    snapshot_id: String,
+    primary_result_id: String,
+    results: Vec<PersistedTaskResult>,
+    resources: Vec<PersistedCacheResourceRef>,
+    legacy_managed: bool,
+}
+
+impl From<TaskOutputRecord> for PersistedTaskOutput {
+    fn from(output: TaskOutputRecord) -> Self {
+        Self {
+            revision: output.revision,
+            snapshot_id: output.snapshot_id,
+            primary_result_id: output.primary_result_id,
+            results: output
+                .results
+                .into_iter()
+                .map(PersistedTaskResult::from)
+                .collect(),
+            resources: output
+                .resources
+                .into_iter()
+                .map(PersistedCacheResourceRef::from)
+                .collect(),
+            legacy_managed: output.legacy_managed,
         }
+    }
+}
+
+impl PersistedTaskOutput {
+    fn into_output(self) -> io::Result<TaskOutputRecord> {
+        let results = self
+            .results
+            .into_iter()
+            .map(PersistedTaskResult::into_result)
+            .collect::<io::Result<Vec<_>>>()?;
+        let resources = self
+            .resources
+            .into_iter()
+            .map(PersistedCacheResourceRef::into_record)
+            .collect::<io::Result<Vec<_>>>()?;
+        TaskOutputRecord::restored(
+            self.revision,
+            self.snapshot_id,
+            self.primary_result_id,
+            results,
+            resources,
+            self.legacy_managed,
+        )
+        .map_err(invalid_data)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedTaskResult {
+    id: String,
+    state: i32,
+    title: String,
+    subtitle: String,
+    progress: Option<PersistedTaskResultProgress>,
+    problem: Option<PersistedTaskProblem>,
+    library_item_id: String,
+    playback_source: Option<PersistedPlaybackSource>,
+    artifacts: Vec<PersistedTaskArtifact>,
+    created_at: Option<PersistedTimestamp>,
+    updated_at: Option<PersistedTimestamp>,
+}
+
+impl From<TaskResult> for PersistedTaskResult {
+    fn from(result: TaskResult) -> Self {
+        Self {
+            id: result.id,
+            state: result.state,
+            title: result.title,
+            subtitle: result.subtitle,
+            progress: result.progress.map(PersistedTaskResultProgress::from),
+            problem: result.problem.map(PersistedTaskProblem::from),
+            library_item_id: result.library_item_id,
+            playback_source: result.playback_source.map(PersistedPlaybackSource::from),
+            artifacts: result
+                .artifacts
+                .into_iter()
+                .map(PersistedTaskArtifact::from)
+                .collect(),
+            created_at: result.created_at.map(PersistedTimestamp::from),
+            updated_at: result.updated_at.map(PersistedTimestamp::from),
+        }
+    }
+}
+
+impl PersistedTaskResult {
+    fn into_result(self) -> io::Result<TaskResult> {
+        Ok(TaskResult {
+            id: self.id,
+            state: self.state,
+            title: self.title,
+            subtitle: self.subtitle,
+            progress: self.progress.map(TaskResultProgress::from),
+            problem: self.problem.map(TaskProblem::from),
+            library_item_id: self.library_item_id,
+            playback_source: self.playback_source.map(PlaybackSource::from),
+            artifacts: self
+                .artifacts
+                .into_iter()
+                .map(PersistedTaskArtifact::into_artifact)
+                .collect::<io::Result<Vec<_>>>()?,
+            created_at: self.created_at.map(Timestamp::from),
+            updated_at: self.updated_at.map(Timestamp::from),
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedTaskResultProgress {
+    fraction: f64,
+    completed_bytes: i64,
+    total_bytes: i64,
+    total_bytes_known: bool,
+    phase: String,
+    message: String,
+}
+
+impl From<TaskResultProgress> for PersistedTaskResultProgress {
+    fn from(progress: TaskResultProgress) -> Self {
+        Self {
+            fraction: progress.fraction,
+            completed_bytes: progress.completed_bytes,
+            total_bytes: progress.total_bytes,
+            total_bytes_known: progress.total_bytes_known,
+            phase: progress.phase,
+            message: progress.message,
+        }
+    }
+}
+
+impl From<PersistedTaskResultProgress> for TaskResultProgress {
+    fn from(progress: PersistedTaskResultProgress) -> Self {
+        Self {
+            fraction: progress.fraction,
+            completed_bytes: progress.completed_bytes,
+            total_bytes: progress.total_bytes,
+            total_bytes_known: progress.total_bytes_known,
+            phase: progress.phase,
+            message: progress.message,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedTaskProblem {
+    category: i32,
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+impl From<TaskProblem> for PersistedTaskProblem {
+    fn from(problem: TaskProblem) -> Self {
+        Self {
+            category: problem.category,
+            code: problem.code,
+            message: problem.message,
+            retryable: problem.retryable,
+        }
+    }
+}
+
+impl From<PersistedTaskProblem> for TaskProblem {
+    fn from(problem: PersistedTaskProblem) -> Self {
+        Self {
+            category: problem.category,
+            code: problem.code,
+            message: problem.message,
+            retryable: problem.retryable,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedTaskArtifact {
+    id: String,
+    kind: i32,
+    state: i32,
+    title: String,
+    format: String,
+    language_tag: String,
+    is_ai_generated: bool,
+    resource: Option<PersistedCacheResourceRef>,
+    problem: Option<PersistedTaskProblem>,
+}
+
+impl From<TaskArtifact> for PersistedTaskArtifact {
+    fn from(artifact: TaskArtifact) -> Self {
+        Self {
+            id: artifact.id,
+            kind: artifact.kind,
+            state: artifact.state,
+            title: artifact.title,
+            format: artifact.format,
+            language_tag: artifact.language_tag,
+            is_ai_generated: artifact.is_ai_generated,
+            resource: artifact.resource.map(PersistedCacheResourceRef::from),
+            problem: artifact.problem.map(PersistedTaskProblem::from),
+        }
+    }
+}
+
+impl PersistedTaskArtifact {
+    fn into_artifact(self) -> io::Result<TaskArtifact> {
+        Ok(TaskArtifact {
+            id: self.id,
+            kind: self.kind,
+            state: self.state,
+            title: self.title,
+            format: self.format,
+            language_tag: self.language_tag,
+            is_ai_generated: self.is_ai_generated,
+            resource: self
+                .resource
+                .map(PersistedCacheResourceRef::into_record)
+                .transpose()?
+                .map(|record| record.resource),
+            problem: self.problem.map(TaskProblem::from),
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedCacheResourceRef {
+    id: String,
+    content_type: String,
+    size_bytes: i64,
+    size_known: bool,
+    supports_byte_ranges: bool,
+    etag: String,
+    expires_at: Option<PersistedTimestamp>,
+}
+
+impl From<TaskResourceRecord> for PersistedCacheResourceRef {
+    fn from(record: TaskResourceRecord) -> Self {
+        Self::from(record.resource)
+    }
+}
+
+impl From<CacheResourceRef> for PersistedCacheResourceRef {
+    fn from(resource: CacheResourceRef) -> Self {
+        Self {
+            id: resource.id,
+            content_type: resource.content_type,
+            size_bytes: resource.size_bytes,
+            size_known: resource.size_known,
+            supports_byte_ranges: resource.supports_byte_ranges,
+            etag: resource.etag,
+            expires_at: resource.expires_at.map(PersistedTimestamp::from),
+        }
+    }
+}
+
+impl PersistedCacheResourceRef {
+    fn into_record(self) -> io::Result<TaskResourceRecord> {
+        TaskResourceRecord::new(CacheResourceRef {
+            id: self.id,
+            uri: String::new(),
+            content_type: self.content_type,
+            size_bytes: self.size_bytes,
+            size_known: self.size_known,
+            supports_byte_ranges: self.supports_byte_ranges,
+            etag: self.etag,
+            expires_at: self.expires_at.map(Timestamp::from),
+        })
+        .map_err(invalid_data)
     }
 }
 
@@ -597,7 +911,8 @@ mod tests {
         BilibiliCompatibleVariantPreference, BilibiliDanmakuFormat, BilibiliPlaybackPolicy,
         BilibiliPlaybackVariant, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
         BilibiliTaskSelection, BilibiliTranscodingPreference, BilibiliWeakNetworkPreference,
-        LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskKind, TaskState,
+        LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskArtifactKind,
+        TaskArtifactState, TaskKind, TaskProblemCategory, TaskState,
     };
 
     #[test]
@@ -636,6 +951,105 @@ mod tests {
         assert_eq!(1, records.len());
         assert!(records[0].task.bilibili_selection.is_none());
         assert!(records[0].task.result_items.is_empty());
+    }
+
+    #[test]
+    fn migrates_v1_snapshot_to_legacy_managed_output() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "bilibili-v1-output",
+      "kind": 1,
+      "state": 10,
+      "source": "BV1legacyOutput",
+      "title": "Legacy collection",
+      "progress": 1.0,
+      "downloaded_bytes": 200,
+      "total_bytes": 200,
+      "message": "Finished.",
+      "library_item_id": "",
+      "created_at": { "seconds": 100, "nanos": 1 },
+      "updated_at": { "seconds": 200, "nanos": 2 },
+      "finished_at": { "seconds": 200, "nanos": 2 },
+      "result_items": [
+        {
+          "id": "legacy-result-second",
+          "selection_id": "page:2",
+          "title": "Second",
+          "subtitle": "Page 2",
+          "source_kind": "video_page",
+          "content_id": "cid-2",
+          "index": 2,
+          "state": 4,
+          "message": "Provider failed.",
+          "library_item_id": ""
+        },
+        {
+          "id": "legacy-result-first",
+          "selection_id": "page:1",
+          "title": "First",
+          "subtitle": "Page 1",
+          "source_kind": "video_page",
+          "content_id": "cid-1",
+          "index": 1,
+          "state": 10,
+          "message": "Cached.",
+          "library_item_id": "bilibili.hls.first"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .expect("v1 snapshot should be written");
+
+        let records = TaskStateStore::new(path)
+            .load()
+            .expect("v1 snapshot should migrate");
+        let output = &records[0].output;
+
+        assert_eq!(1, output.revision);
+        assert!(output.snapshot_id.starts_with("task-output-"));
+        assert_eq!("legacy-result-first", output.primary_result_id);
+        assert!(output.legacy_managed);
+        assert!(output.resources.is_empty());
+        assert_eq!(
+            vec!["legacy-result-second", "legacy-result-first"],
+            output
+                .results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(TaskState::Failed, output.results[0].state());
+        assert_eq!("Page 2", output.results[0].subtitle);
+        assert_eq!(
+            Some(TaskProblemCategory::Upstream),
+            output.results[0]
+                .problem
+                .as_ref()
+                .map(|problem| problem.category())
+        );
+        assert_eq!(
+            1.0,
+            output.results[1]
+                .progress
+                .as_ref()
+                .expect("legacy result progress should exist")
+                .fraction
+        );
+        assert_eq!(
+            Some(Timestamp {
+                seconds: 100,
+                nanos: 1,
+            }),
+            output.results[0].created_at
+        );
     }
 
     #[test]
@@ -789,6 +1203,247 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_nested_v2_task_output_without_persisting_resource_locations() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let subtitle_resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "subtitle-z".to_owned(),
+            uri: "file:///private/tmp/must-not-persist".to_owned(),
+            content_type: "text/vtt; charset=utf-8".to_owned(),
+            size_bytes: 321,
+            size_known: true,
+            supports_byte_ranges: true,
+            etag: "subtitle-etag".to_owned(),
+            expires_at: Some(Timestamp {
+                seconds: 10_000,
+                nanos: 11,
+            }),
+        })
+        .expect("subtitle resource should be valid");
+        let cover_resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cover-a".to_owned(),
+            uri: "https://upstream.example.test/private-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 654,
+            size_known: false,
+            supports_byte_ranges: false,
+            etag: "cover-etag".to_owned(),
+            expires_at: Some(Timestamp {
+                seconds: 20_000,
+                nanos: 22,
+            }),
+        })
+        .expect("cover resource should be valid");
+        let results = vec![
+            TaskResult {
+                id: "result-z".to_owned(),
+                state: TaskState::Failed.into(),
+                title: "Failed result".to_owned(),
+                subtitle: "Nested fields".to_owned(),
+                progress: Some(TaskResultProgress {
+                    fraction: 0.75,
+                    completed_bytes: 750,
+                    total_bytes: 1_000,
+                    total_bytes_known: true,
+                    phase: "packaging".to_owned(),
+                    message: "Packaging artifacts.".to_owned(),
+                }),
+                problem: Some(TaskProblem {
+                    category: TaskProblemCategory::Upstream.into(),
+                    code: "bilibili.test_failure".to_owned(),
+                    message: "Provider failed.".to_owned(),
+                    retryable: true,
+                }),
+                library_item_id: "library.result-z".to_owned(),
+                playback_source: Some(PlaybackSource {
+                    item_id: "library.result-z".to_owned(),
+                    variant_id: "h264".to_owned(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: "http://media.example.test/result-z/master.m3u8".to_owned(),
+                    expires_at: Some(Timestamp {
+                        seconds: 30_000,
+                        nanos: 33,
+                    }),
+                }),
+                artifacts: vec![
+                    TaskArtifact {
+                        id: "artifact-cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Unavailable.into(),
+                        title: "Cover".to_owned(),
+                        format: "jpeg".to_owned(),
+                        language_tag: String::new(),
+                        is_ai_generated: false,
+                        resource: Some(cover_resource.resource.clone()),
+                        problem: Some(TaskProblem {
+                            category: TaskProblemCategory::Permission.into(),
+                            code: "artifact.cover_denied".to_owned(),
+                            message: "Cover access denied.".to_owned(),
+                            retryable: false,
+                        }),
+                    },
+                    TaskArtifact {
+                        id: "artifact-subtitle".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        title: "Japanese subtitles".to_owned(),
+                        format: "vtt".to_owned(),
+                        language_tag: "ja-JP".to_owned(),
+                        is_ai_generated: true,
+                        resource: Some(subtitle_resource.resource.clone()),
+                        problem: None,
+                    },
+                ],
+                created_at: Some(Timestamp {
+                    seconds: 100,
+                    nanos: 1,
+                }),
+                updated_at: Some(Timestamp {
+                    seconds: 200,
+                    nanos: 2,
+                }),
+            },
+            TaskResult {
+                id: "result-a".to_owned(),
+                state: TaskState::Completed.into(),
+                title: "Completed result".to_owned(),
+                subtitle: "Second result".to_owned(),
+                progress: None,
+                problem: None,
+                library_item_id: "library.result-a".to_owned(),
+                playback_source: None,
+                artifacts: Vec::new(),
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+        let output = TaskOutputRecord::restored(
+            42,
+            "snapshot-v2-nested".to_owned(),
+            "result-a".to_owned(),
+            results,
+            vec![subtitle_resource, cover_resource],
+            false,
+        )
+        .expect("nested output should be valid");
+        let task = Task {
+            id: "task-v2-output".to_owned(),
+            kind: TaskKind::BilibiliDownload.into(),
+            state: TaskState::Failed.into(),
+            source: "BV1nestedOutput".to_owned(),
+            ..Default::default()
+        };
+        TaskStateStore::new(path.clone())
+            .save(&[PersistedTaskRecord {
+                task,
+                options: None,
+                playback_options: None,
+                output: output.clone(),
+            }])
+            .expect("v2 task output should persist");
+
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("persisted snapshot should be readable"),
+        )
+        .expect("persisted snapshot should be valid JSON");
+        assert_eq!(Some(2), snapshot["schema_version"].as_u64());
+        let resource_json = snapshot["tasks"][0]["output"]["resources"][0]
+            .as_object()
+            .expect("persisted output resource should be an object");
+        assert!(!resource_json.contains_key("uri"));
+        assert!(!resource_json.contains_key("relative_path"));
+        assert!(!resource_json.contains_key("local_path"));
+        let artifact_resource_json =
+            snapshot["tasks"][0]["output"]["results"][0]["artifacts"][0]["resource"]
+                .as_object()
+                .expect("persisted artifact resource should be an object");
+        assert!(!artifact_resource_json.contains_key("uri"));
+        assert!(!artifact_resource_json.contains_key("relative_path"));
+        assert!(!artifact_resource_json.contains_key("local_path"));
+
+        snapshot["tasks"][0]["output"]["resources"][0]
+            .as_object_mut()
+            .expect("persisted output resource should be mutable")
+            .insert(
+                "uri".to_owned(),
+                serde_json::Value::String("file:///private/tmp/tampered".to_owned()),
+            );
+        snapshot["tasks"][0]["output"]["results"][0]["artifacts"][0]["resource"]
+            .as_object_mut()
+            .expect("persisted artifact resource should be mutable")
+            .insert(
+                "uri".to_owned(),
+                serde_json::Value::String("https://upstream.example.test/tampered".to_owned()),
+            );
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&snapshot).expect("tampered snapshot should serialize"),
+        )
+        .expect("tampered snapshot should be written");
+
+        let records = TaskStateStore::new(path.clone())
+            .load()
+            .expect("v2 task output should reload");
+        assert_eq!(output, records[0].output);
+        assert_eq!("result-a", records[0].output.primary_result_id);
+        assert_eq!(
+            vec!["result-z", "result-a"],
+            records[0]
+                .output
+                .results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["artifact-cover", "artifact-subtitle"],
+            records[0].output.results[0]
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["subtitle-z", "cover-a"],
+            records[0]
+                .output
+                .resources
+                .iter()
+                .map(|resource| resource.resource.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            "/resources/subtitle-z",
+            records[0].output.resources[0].resource.uri
+        );
+        assert_eq!(
+            "/resources/cover-a",
+            records[0].output.results[0].artifacts[0]
+                .resource
+                .as_ref()
+                .expect("cover artifact resource should reload")
+                .uri
+        );
+
+        snapshot["tasks"][0]["output"]["snapshot_id"] = serde_json::Value::String(String::new());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&snapshot).expect("legacy snapshot should serialize"),
+        )
+        .expect("legacy snapshot should be written");
+        let regenerated = TaskStateStore::new(path)
+            .load()
+            .expect("blank snapshot id should be repaired");
+        assert_eq!(42, regenerated[0].output.revision);
+        assert!(
+            regenerated[0]
+                .output
+                .snapshot_id
+                .starts_with("task-output-")
+        );
+    }
+
+    #[test]
     fn round_trips_bilibili_selection_and_result_items() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
@@ -860,31 +1515,33 @@ mod tests {
             playback_source: Some(playback_source.clone()),
             playback_session: Some(playback_session.clone()),
         };
+        let task = Task {
+            id: "bilibili-playback-task".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Playable.into(),
+            source: "BV1persist".to_owned(),
+            title: "Persisted task".to_owned(),
+            progress: 0.5,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            message: "Playable.".to_owned(),
+            library_item_id: String::new(),
+            created_at: Some(Timestamp {
+                seconds: timestamp.seconds,
+                nanos: timestamp.nanos,
+            }),
+            updated_at: Some(timestamp),
+            finished_at: None,
+            playback_source: Some(playback_source.clone()),
+            playback_session: Some(playback_session.clone()),
+            bilibili_selection: Some(selection.clone()),
+            result_items: vec![result_item.clone()],
+            output_summary: None,
+        };
+        let output = TaskOutputRecord::from_legacy_task(&task);
         TaskStateStore::new(path.clone())
             .save(&[PersistedTaskRecord {
-                task: Task {
-                    id: "bilibili-playback-task".to_owned(),
-                    kind: TaskKind::BilibiliProgressivePlayback.into(),
-                    state: TaskState::Playable.into(),
-                    source: "BV1persist".to_owned(),
-                    title: "Persisted task".to_owned(),
-                    progress: 0.5,
-                    downloaded_bytes: 0,
-                    total_bytes: 0,
-                    message: "Playable.".to_owned(),
-                    library_item_id: String::new(),
-                    created_at: Some(Timestamp {
-                        seconds: timestamp.seconds,
-                        nanos: timestamp.nanos,
-                    }),
-                    updated_at: Some(timestamp),
-                    finished_at: None,
-                    playback_source: Some(playback_source.clone()),
-                    playback_session: Some(playback_session.clone()),
-                    bilibili_selection: Some(selection.clone()),
-                    result_items: vec![result_item.clone()],
-                    output_summary: None,
-                },
+                task,
                 options: Some(BilibiliDownloadOptions {
                     quality_preference: "1080p".to_owned(),
                     encoding_preference: String::new(),
@@ -903,6 +1560,7 @@ mod tests {
                     audio_language: "ja-jp".to_owned(),
                     playback_policy: Some(playback_policy),
                 }),
+                output: output.clone(),
             }])
             .expect("task state should persist");
 
@@ -911,6 +1569,7 @@ mod tests {
             .expect("task state should reload");
 
         assert_eq!(1, records.len());
+        assert_eq!(output, records[0].output);
         assert_eq!(Some(selection), records[0].task.bilibili_selection);
         assert_eq!(vec![result_item], records[0].task.result_items);
         assert_eq!(

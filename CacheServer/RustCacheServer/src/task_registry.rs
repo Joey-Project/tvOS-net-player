@@ -17,9 +17,10 @@ use crate::{
     generated::tvos_net_player::v1::{
         BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliPlaybackOptions,
         BilibiliPlaybackSession, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
-        BilibiliTaskSelection, PlaybackSource, Task, TaskKind, TaskState,
+        BilibiliTaskSelection, PlaybackSource, Task, TaskKind, TaskResult, TaskState,
     },
     hls_cache::HlsCacheStore,
+    task_output::{TaskOutputRecord, TaskResourceRecord},
     task_store::{PersistedTaskRecord, TaskStateStore},
 };
 
@@ -132,7 +133,7 @@ impl BilibiliTaskRegistry {
         }
 
         let now = current_timestamp();
-        let task = Task {
+        let mut task = Task {
             id: format!("bilibili-{}", Uuid::new_v4().simple()),
             kind: TaskKind::BilibiliDownload.into(),
             state: TaskState::Queued.into(),
@@ -152,6 +153,8 @@ impl BilibiliTaskRegistry {
             result_items: Vec::new(),
             output_summary: None,
         };
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        task.output_summary = Some(output.summary());
 
         inner
             .active_task_ids_by_key
@@ -160,6 +163,7 @@ impl BilibiliTaskRegistry {
             .download_options_by_id
             .insert(task.id.clone(), options.clone());
         inner.queued_task_ids.push_back(task.id.clone());
+        inner.outputs_by_task_id.insert(task.id.clone(), output);
         inner.tasks_by_id.insert(task.id.clone(), task.clone());
         let snapshot = self.persistence_snapshot_locked(&mut inner);
         Self::publish_locked(&mut inner, task.clone());
@@ -182,7 +186,7 @@ impl BilibiliTaskRegistry {
 
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let now = current_timestamp();
-        let task = Task {
+        let mut task = Task {
             id: format!("bilibili-playback-{}", Uuid::new_v4().simple()),
             kind: TaskKind::BilibiliProgressivePlayback.into(),
             state: TaskState::Preparing.into(),
@@ -202,6 +206,8 @@ impl BilibiliTaskRegistry {
             result_items: Vec::new(),
             output_summary: None,
         };
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        task.output_summary = Some(output.summary());
 
         inner
             .playback_options_by_id
@@ -210,6 +216,7 @@ impl BilibiliTaskRegistry {
         inner
             .planning_cancellations_by_id
             .insert(task.id.clone(), cancellation.clone());
+        inner.outputs_by_task_id.insert(task.id.clone(), output);
         inner.tasks_by_id.insert(task.id.clone(), task.clone());
         let snapshot = self.persistence_snapshot_locked(&mut inner);
         Self::publish_locked(&mut inner, task.clone());
@@ -224,12 +231,117 @@ impl BilibiliTaskRegistry {
 
     pub fn get_task(&self, id: &str) -> Result<Task, Status> {
         let normalized_id = normalize_required_id(id)?;
-        let inner = self.inner.lock().expect("task registry lock poisoned");
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        reconcile_task_output_locked(&mut inner, &normalized_id);
         inner
             .tasks_by_id
             .get(&normalized_id)
             .cloned()
             .ok_or_else(task_not_found)
+    }
+
+    pub(crate) fn task_output_snapshot(&self, id: &str) -> Result<TaskOutputSnapshot, Status> {
+        let normalized_id = normalize_required_id(id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if !inner.tasks_by_id.contains_key(&normalized_id) {
+            return Err(task_not_found());
+        }
+        reconcile_task_output_locked(&mut inner, &normalized_id);
+        let output = inner
+            .outputs_by_task_id
+            .get(&normalized_id)
+            .expect("known task must have reconciled output");
+        Ok(TaskOutputSnapshot {
+            task_id: normalized_id,
+            revision: output.revision,
+            snapshot_id: output.snapshot_id.clone(),
+            results: output.results.clone(),
+        })
+    }
+
+    // The v2 BBDown execution adapter lands in PR6D and writes through this boundary.
+    #[allow(dead_code)]
+    pub(crate) fn replace_task_output(
+        &self,
+        id: &str,
+        results: Vec<TaskResult>,
+        resources: Vec<TaskResourceRecord>,
+    ) -> Result<Task, Status> {
+        let normalized_id = normalize_required_id(id)?;
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if !inner.tasks_by_id.contains_key(&normalized_id) {
+            return Err(task_not_found());
+        }
+        for resource in &resources {
+            let duplicate_owner = inner.outputs_by_task_id.iter().any(|(task_id, output)| {
+                task_id != &normalized_id && output.contains_resource_id(&resource.resource.id)
+            });
+            if duplicate_owner {
+                return Err(Status::already_exists(format!(
+                    "Task resource id is already registered: {}.",
+                    resource.resource.id
+                )));
+            }
+        }
+
+        let output = TaskOutputRecord::replace(
+            inner.outputs_by_task_id.get(&normalized_id),
+            results,
+            resources,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let changed = inner
+            .outputs_by_task_id
+            .get(&normalized_id)
+            .is_none_or(|previous| previous != &output);
+        inner
+            .outputs_by_task_id
+            .insert(normalized_id.clone(), output);
+        let summary = inner
+            .outputs_by_task_id
+            .get(&normalized_id)
+            .expect("inserted task output must exist")
+            .summary();
+        inner
+            .tasks_by_id
+            .get_mut(&normalized_id)
+            .expect("known task must exist")
+            .output_summary = Some(summary);
+        let snapshot = changed
+            .then(|| self.persistence_snapshot_locked(&mut inner))
+            .flatten();
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .expect("known task must exist")
+            .clone();
+        if changed {
+            Self::publish_locked(&mut inner, task.clone());
+        }
+        drop(inner);
+        self.persist_snapshot(snapshot);
+        Ok(task)
+    }
+
+    pub(crate) fn task_resource(&self, id: &str) -> Option<TaskResourceRecord> {
+        let normalized_id = normalize(id);
+        if normalized_id.is_empty() {
+            return None;
+        }
+        let now = current_timestamp();
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .outputs_by_task_id
+            .values()
+            .find_map(|output| output.resource(&normalized_id))
+            .filter(|record| {
+                record
+                    .resource
+                    .expires_at
+                    .as_ref()
+                    .is_none_or(|expires_at| timestamp_nanos(expires_at) > timestamp_nanos(&now))
+            })
+            .cloned()
     }
 
     pub fn cancel_task(&self, id: &str) -> Result<Task, Status> {
@@ -1353,6 +1465,7 @@ impl BilibiliTaskRegistry {
         inner
             .planning_cancellations_by_id
             .remove(&normalized_task_id);
+        inner.outputs_by_task_id.remove(&normalized_task_id);
         let snapshot = self.persistence_snapshot_locked(&mut inner);
         Self::publish_locked(&mut inner, removed_task);
         drop(inner);
@@ -1531,6 +1644,7 @@ impl BilibiliTaskRegistry {
         let watcher_id = Uuid::new_v4();
         let lagged = Arc::new(AtomicBool::new(false));
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        reconcile_all_task_outputs_locked(&mut inner);
         inner.watchers.insert(
             watcher_id,
             TaskWatcher {
@@ -1733,23 +1847,43 @@ impl BilibiliTaskRegistry {
         retention_policy: TaskRetentionPolicy,
     ) -> Self {
         let mut inner = RegistryInner::default();
+        let mut restored_resource_ids = HashSet::new();
         for record in records {
-            let Some((task, download_options, playback_options)) = restore_persisted_record(record)
+            let Some((mut task, download_options, playback_options, mut output)) =
+                restore_persisted_record(record)
             else {
                 continue;
             };
+            output.reconcile_legacy_task(&task);
+            task.output_summary = Some(output.summary());
 
             let is_active_task = is_active(task.state());
             let task_id = task.id.clone();
-            if is_active_task && task.kind() == TaskKind::BilibiliDownload {
-                let active_key = active_key_for_task(
-                    &task,
-                    download_options.as_ref(),
-                    playback_options.as_ref(),
-                );
-                if inner.active_task_ids_by_key.contains_key(&active_key) {
-                    continue;
-                }
+            let active_download_key = (is_active_task && task.kind() == TaskKind::BilibiliDownload)
+                .then(|| {
+                    active_key_for_task(&task, download_options.as_ref(), playback_options.as_ref())
+                });
+            if active_download_key
+                .as_ref()
+                .is_some_and(|active_key| inner.active_task_ids_by_key.contains_key(active_key))
+            {
+                continue;
+            }
+            if output
+                .resources
+                .iter()
+                .any(|resource| restored_resource_ids.contains(&resource.resource.id))
+            {
+                continue;
+            }
+            restored_resource_ids.extend(
+                output
+                    .resources
+                    .iter()
+                    .map(|resource| resource.resource.id.clone()),
+            );
+
+            if let Some(active_key) = active_download_key {
                 inner
                     .active_task_ids_by_key
                     .insert(active_key, task_id.clone());
@@ -1763,6 +1897,7 @@ impl BilibiliTaskRegistry {
                     .playback_options_by_id
                     .insert(task_id.clone(), playback_options);
             }
+            inner.outputs_by_task_id.insert(task_id.clone(), output);
             inner.tasks_by_id.insert(task_id, task);
         }
 
@@ -1786,6 +1921,7 @@ impl BilibiliTaskRegistry {
         &self,
         inner: &mut RegistryInner,
     ) -> Option<TaskPersistenceSnapshot> {
+        reconcile_all_task_outputs_locked(inner);
         self.persistence.as_ref()?;
         prune_terminal_tasks_locked(inner, &self.retention_policy, &current_timestamp());
         inner.persistence_generation += 1;
@@ -1856,6 +1992,16 @@ impl BilibiliTaskRegistry {
     }
 
     fn publish_locked(inner: &mut RegistryInner, task: Task) {
+        let task = if inner.tasks_by_id.contains_key(&task.id) {
+            reconcile_task_output_locked(inner, &task.id);
+            inner
+                .tasks_by_id
+                .get(&task.id)
+                .expect("published task must exist")
+                .clone()
+        } else {
+            task
+        };
         let mut inactive_watchers = Vec::new();
         for (watcher_id, watcher) in &inner.watchers {
             if !watcher.matches(&task) {
@@ -1908,6 +2054,14 @@ impl Default for TaskRetentionPolicy {
             max_terminal_task_age: Some(DEFAULT_TERMINAL_TASK_RETENTION),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TaskOutputSnapshot {
+    pub(crate) task_id: String,
+    pub(crate) revision: u64,
+    pub(crate) snapshot_id: String,
+    pub(crate) results: Vec<TaskResult>,
 }
 
 pub struct BilibiliTaskWorkItem {
@@ -1981,6 +2135,7 @@ impl Drop for TaskSubscription {
 #[derive(Default)]
 struct RegistryInner {
     tasks_by_id: HashMap<String, Task>,
+    outputs_by_task_id: HashMap<String, TaskOutputRecord>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
@@ -2628,6 +2783,7 @@ fn restore_persisted_record(
     Task,
     Option<BilibiliDownloadOptions>,
     Option<BilibiliPlaybackOptions>,
+    TaskOutputRecord,
 )> {
     let mut task = record.task;
     task.id = normalize(&task.id);
@@ -2710,7 +2866,31 @@ fn restore_persisted_record(
         task.finished_at = Some(updated_at);
     }
 
-    Some((task, record.options, record.playback_options))
+    Some((task, record.options, record.playback_options, record.output))
+}
+
+fn reconcile_all_task_outputs_locked(inner: &mut RegistryInner) {
+    let task_ids = inner.tasks_by_id.keys().cloned().collect::<Vec<_>>();
+    for task_id in task_ids {
+        reconcile_task_output_locked(inner, &task_id);
+    }
+}
+
+fn reconcile_task_output_locked(inner: &mut RegistryInner, task_id: &str) {
+    let Some(task) = inner.tasks_by_id.get(task_id).cloned() else {
+        inner.outputs_by_task_id.remove(task_id);
+        return;
+    };
+    let output = inner
+        .outputs_by_task_id
+        .entry(task_id.to_owned())
+        .or_insert_with(|| TaskOutputRecord::from_legacy_task(&task));
+    output.reconcile_legacy_task(&task);
+    inner
+        .tasks_by_id
+        .get_mut(task_id)
+        .expect("reconciled task must exist")
+        .output_summary = Some(output.summary());
 }
 
 fn persisted_records_locked(inner: &RegistryInner) -> Vec<PersistedTaskRecord> {
@@ -2724,6 +2904,11 @@ fn persisted_records_locked(inner: &RegistryInner) -> Vec<PersistedTaskRecord> {
     tasks
         .into_iter()
         .map(|task| PersistedTaskRecord {
+            output: inner
+                .outputs_by_task_id
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_else(|| TaskOutputRecord::from_legacy_task(&task)),
             options: inner
                 .download_options_by_id
                 .get(&task.id)
@@ -2787,6 +2972,7 @@ fn prune_terminal_tasks_locked(
 
     for task_id in prune_ids {
         inner.tasks_by_id.remove(&task_id);
+        inner.outputs_by_task_id.remove(&task_id);
         inner.download_options_by_id.remove(&task_id);
         inner.playback_options_by_id.remove(&task_id);
         inner.running_cancellations_by_id.remove(&task_id);
@@ -5227,6 +5413,106 @@ mod tests {
     }
 
     #[test]
+    fn generic_task_output_round_trips_with_summary_and_resource_state() {
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let task = registry
+            .create_bilibili_task("BV1generic-output", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "subtitle-resource".to_owned(),
+            content_type: "text/vtt".to_owned(),
+            size_bytes: 12,
+            size_known: true,
+            supports_byte_ranges: true,
+            etag: "subtitle-v1".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource should be valid");
+        let updated = registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "episode-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    title: "Episode one".to_owned(),
+                    artifacts: vec![TaskArtifact {
+                        id: "subtitle-artifact".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("generic output should be stored");
+        let summary = updated
+            .output_summary
+            .expect("generic output should populate a summary");
+        assert_eq!(1, summary.result_count);
+        assert_eq!(1, summary.available_artifact_count);
+        assert_eq!("episode-one", summary.primary_result_id);
+
+        drop(registry);
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        let snapshot = restored
+            .task_output_snapshot(&task.id)
+            .expect("generic output should restore");
+        assert_eq!(summary.revision, snapshot.revision);
+        assert_eq!("episode-one", snapshot.results[0].id);
+        let restored_resource = restored
+            .task_resource("subtitle-resource")
+            .expect("available resource should restore");
+        assert_eq!(
+            "/resources/subtitle-resource",
+            restored_resource.resource.uri
+        );
+        assert_eq!(
+            ".tvos-net-player/resources/subtitle-resource/body",
+            restored_resource.relative_path()
+        );
+    }
+
+    #[test]
+    fn legacy_managed_output_revision_advances_with_task_state() {
+        let registry = BilibiliTaskRegistry::default();
+        let task = registry
+            .create_bilibili_task("BV1legacy-output", None)
+            .expect("task should be created");
+        let queued = registry
+            .task_output_snapshot(&task.id)
+            .expect("queued output should exist");
+
+        let claimed = registry
+            .try_claim_next_bilibili_task()
+            .expect("task should be claimed");
+        assert_eq!(task.id, claimed.task_id);
+        let running = registry
+            .task_output_snapshot(&task.id)
+            .expect("running output should exist");
+
+        assert!(running.revision > queued.revision);
+        assert_ne!(running.snapshot_id, queued.snapshot_id);
+        assert_eq!(TaskState::Running, running.results[0].state());
+        assert_eq!(
+            running.revision,
+            registry
+                .get_task(&task.id)
+                .unwrap()
+                .output_summary
+                .unwrap()
+                .revision
+        );
+    }
+
+    #[test]
     fn older_persistence_snapshot_cannot_overwrite_newer_snapshot() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
@@ -5424,27 +5710,29 @@ mod tests {
         timestamp: Timestamp,
     ) -> PersistedTaskRecord {
         let finished_at = is_terminal(state).then(|| copy_timestamp(&timestamp));
+        let task = Task {
+            id: id.to_owned(),
+            kind: kind.into(),
+            state: state.into(),
+            source: source.to_owned(),
+            title: String::new(),
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            message: QUEUED_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            created_at: Some(copy_timestamp(&timestamp)),
+            updated_at: Some(copy_timestamp(&timestamp)),
+            finished_at,
+            playback_source: None,
+            playback_session: None,
+            bilibili_selection: None,
+            result_items: Vec::new(),
+            output_summary: None,
+        };
         PersistedTaskRecord {
-            task: Task {
-                id: id.to_owned(),
-                kind: kind.into(),
-                state: state.into(),
-                source: source.to_owned(),
-                title: String::new(),
-                progress: 0.0,
-                downloaded_bytes: 0,
-                total_bytes: 0,
-                message: QUEUED_MESSAGE.to_owned(),
-                library_item_id: String::new(),
-                created_at: Some(copy_timestamp(&timestamp)),
-                updated_at: Some(copy_timestamp(&timestamp)),
-                finished_at,
-                playback_source: None,
-                playback_session: None,
-                bilibili_selection: None,
-                result_items: Vec::new(),
-                output_summary: None,
-            },
+            output: TaskOutputRecord::from_legacy_task(&task),
+            task,
             options: None,
             playback_options: None,
         }

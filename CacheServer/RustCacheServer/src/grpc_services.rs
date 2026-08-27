@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use bbdown_core::{
@@ -43,7 +43,7 @@ use crate::{
         LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListCacheRootsRequest, ListCacheRootsResponse,
         ListLibraryItemsRequest, ListLibraryItemsResponse, ListTaskResultsRequest,
-        ListTaskResultsResponse, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
+        ListTaskResultsResponse, PageInfo, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
         PlaybackProtocol, PlaybackSource, ReportPlaybackProgressRequest,
         ReportPlaybackProgressResponse, RescanLibraryRequest, RescanLibraryResponse,
         ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
@@ -75,6 +75,7 @@ use crate::{
         LanTranscodingStatusSnapshot,
     },
 };
+use uuid::Uuid;
 
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
@@ -88,6 +89,12 @@ const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback planning.";
 const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
+const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
+const MAX_TASK_RESULT_PAGE_SIZE: usize = 200;
+const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
+const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
+const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -138,6 +145,10 @@ impl ServerService for ServerGrpcService {
 
         if self.state.library.supports_http_range_playback() {
             info.capabilities.push(ServerCapability::HttpRange.into());
+            if self.state.tasks.persistence_available() {
+                info.capabilities
+                    .push(ServerCapability::TaskOutputV2.into());
+            }
             if let Some(base_uri) = self
                 .state
                 .options
@@ -661,11 +672,195 @@ impl LibraryService for LibraryGrpcService {
 #[derive(Clone)]
 pub struct TaskGrpcService {
     state: AppState,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
 }
 
 impl TaskGrpcService {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            result_pages: Arc::new(StdMutex::new(TaskResultPageStore::default())),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskResultPageStore {
+    snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
+    snapshot_order: VecDeque<String>,
+    cursors_by_token: HashMap<String, TaskResultPageCursor>,
+}
+
+#[derive(Clone)]
+struct TaskResultPageSnapshot {
+    task_id: String,
+    revision: u64,
+    snapshot_id: String,
+    results: Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+    expires_at: Instant,
+    tokens_by_offset: HashMap<usize, String>,
+}
+
+#[derive(Clone)]
+struct TaskResultPageCursor {
+    snapshot_id: String,
+    task_id: String,
+    offset: usize,
+}
+
+impl TaskResultPageStore {
+    fn insert(
+        &mut self,
+        snapshot: crate::task_registry::TaskOutputSnapshot,
+        now: Instant,
+    ) -> String {
+        self.prune(now);
+        if let Some(existing) = self.snapshots_by_id.get(&snapshot.snapshot_id)
+            && existing.task_id == snapshot.task_id
+            && existing.revision == snapshot.revision
+            && existing.results == snapshot.results
+        {
+            return existing.snapshot_id.clone();
+        }
+
+        while self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS {
+            let Some(oldest_id) = self.snapshot_order.pop_front() else {
+                break;
+            };
+            self.remove_snapshot(&oldest_id);
+        }
+        while self
+            .snapshots_by_id
+            .values()
+            .map(|snapshot| snapshot.results.len())
+            .sum::<usize>()
+            .saturating_add(snapshot.results.len())
+            > MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS
+        {
+            let Some(oldest_id) = self.snapshot_order.pop_front() else {
+                break;
+            };
+            self.remove_snapshot(&oldest_id);
+        }
+
+        let snapshot_id = if self.snapshots_by_id.contains_key(&snapshot.snapshot_id) {
+            format!("task-output-page-{}", Uuid::new_v4().simple())
+        } else {
+            snapshot.snapshot_id
+        };
+        self.snapshot_order.push_back(snapshot_id.clone());
+        self.snapshots_by_id.insert(
+            snapshot_id.clone(),
+            TaskResultPageSnapshot {
+                task_id: snapshot.task_id,
+                revision: snapshot.revision,
+                snapshot_id: snapshot_id.clone(),
+                results: snapshot.results,
+                expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
+                tokens_by_offset: HashMap::new(),
+            },
+        );
+        snapshot_id
+    }
+
+    fn resolve_token(
+        &mut self,
+        token: &str,
+        task_id: &str,
+        now: Instant,
+    ) -> Result<(String, usize), Status> {
+        self.prune(now);
+        let cursor = self
+            .cursors_by_token
+            .get(token)
+            .ok_or_else(|| {
+                Status::invalid_argument("Task result page token is invalid or expired.")
+            })?
+            .clone();
+        if cursor.task_id != task_id {
+            return Err(Status::invalid_argument(
+                "Task result page token does not belong to this task.",
+            ));
+        }
+        if !self.snapshots_by_id.contains_key(&cursor.snapshot_id) {
+            return Err(Status::invalid_argument(
+                "Task result page token is invalid or expired.",
+            ));
+        }
+        Ok((cursor.snapshot_id, cursor.offset))
+    }
+
+    fn page(
+        &mut self,
+        snapshot_id: &str,
+        offset: usize,
+        page_size: usize,
+    ) -> Result<
+        (
+            Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+            PageInfo,
+            u64,
+        ),
+        Status,
+    > {
+        let snapshot = self.snapshots_by_id.get_mut(snapshot_id).ok_or_else(|| {
+            Status::invalid_argument("Task result snapshot is no longer available.")
+        })?;
+        if offset > snapshot.results.len() {
+            return Err(Status::invalid_argument(
+                "Task result page token offset is invalid.",
+            ));
+        }
+        let end = offset.saturating_add(page_size).min(snapshot.results.len());
+        let results = snapshot.results[offset..end].to_vec();
+        let next_page_token = if end < snapshot.results.len() {
+            if let Some(token) = snapshot.tokens_by_offset.get(&end) {
+                token.clone()
+            } else {
+                let token = format!("task-results-{}", Uuid::new_v4().simple());
+                snapshot.tokens_by_offset.insert(end, token.clone());
+                self.cursors_by_token.insert(
+                    token.clone(),
+                    TaskResultPageCursor {
+                        snapshot_id: snapshot.snapshot_id.clone(),
+                        task_id: snapshot.task_id.clone(),
+                        offset: end,
+                    },
+                );
+                token
+            }
+        } else {
+            String::new()
+        };
+        Ok((
+            results,
+            PageInfo {
+                total_size: snapshot.results.len().try_into().unwrap_or(u64::MAX),
+                next_page_token,
+                snapshot_id: snapshot.snapshot_id.clone(),
+            },
+            snapshot.revision,
+        ))
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let expired_ids = self
+            .snapshots_by_id
+            .iter()
+            .filter(|(_, snapshot)| snapshot.expires_at <= now)
+            .map(|(snapshot_id, _)| snapshot_id.clone())
+            .collect::<Vec<_>>();
+        for snapshot_id in expired_ids {
+            self.remove_snapshot(&snapshot_id);
+        }
+    }
+
+    fn remove_snapshot(&mut self, snapshot_id: &str) {
+        self.snapshots_by_id.remove(snapshot_id);
+        self.snapshot_order
+            .retain(|candidate| candidate != snapshot_id);
+        self.cursors_by_token
+            .retain(|_, cursor| cursor.snapshot_id != snapshot_id);
     }
 }
 
@@ -788,11 +983,76 @@ impl TaskService for TaskGrpcService {
 
     async fn list_task_results(
         &self,
-        _request: Request<ListTaskResultsRequest>,
+        request: Request<ListTaskResultsRequest>,
     ) -> Result<Response<ListTaskResultsResponse>, Status> {
-        Err(Status::unimplemented(
-            "Paginated task results are not enabled by this server version.",
-        ))
+        if !self.state.tasks.persistence_available()
+            || !self.state.library.supports_http_range_playback()
+        {
+            return Err(Status::failed_precondition(
+                "Durable task output is unavailable on this cache server.",
+            ));
+        }
+
+        let request_body = request.get_ref();
+        let task_id = request_body.task_id.trim().to_owned();
+        if task_id.is_empty() {
+            return Err(Status::invalid_argument("Task id is required."));
+        }
+        let page_size = request_body
+            .page
+            .as_ref()
+            .map(|page| page.page_size as usize)
+            .filter(|page_size| *page_size > 0)
+            .unwrap_or(DEFAULT_TASK_RESULT_PAGE_SIZE)
+            .min(MAX_TASK_RESULT_PAGE_SIZE);
+        let page_token = request_body
+            .page
+            .as_ref()
+            .map(|page| page.page_token.trim())
+            .unwrap_or_default();
+        if page_token.len() > MAX_TASK_RESULT_PAGE_TOKEN_BYTES {
+            return Err(Status::invalid_argument(
+                "Task result page token is too long.",
+            ));
+        }
+        let now = Instant::now();
+
+        let (snapshot_id, offset) = if page_token.is_empty() {
+            let snapshot = self.state.tasks.task_output_snapshot(&task_id)?;
+            let mut pages = self
+                .result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            (pages.insert(snapshot, now), 0)
+        } else {
+            let (snapshot_id, offset) = self
+                .result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .resolve_token(page_token, &task_id, now)?;
+            self.state.tasks.get_task(&task_id)?;
+            (snapshot_id, offset)
+        };
+        let (results, page_info, output_revision) = self
+            .result_pages
+            .lock()
+            .expect("task result page store lock poisoned")
+            .page(&snapshot_id, offset, page_size)?;
+        let redact_error_details = self.state.bilibili_error_details_are_sensitive();
+        Ok(Response::new(ListTaskResultsResponse {
+            results: results
+                .into_iter()
+                .map(|result| {
+                    task_result_for_client(result, redact_error_details, |resource_id| {
+                        self.state
+                            .playback_uri_factory
+                            .create_task_resource(&request, resource_id)
+                    })
+                })
+                .collect(),
+            page_info: Some(page_info),
+            output_revision,
+        }))
     }
 
     async fn watch_tasks(
@@ -861,6 +1121,7 @@ impl TaskService for TaskGrpcService {
                 let _ = self.state.hls_cache.remove_session(&session_id);
             }
         }
+        let task = self.state.tasks.get_task(&task.id)?;
         Ok(Response::new(task_for_client(
             task,
             self.state.bilibili_error_details_are_sensitive(),
@@ -904,6 +1165,48 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
         }
     }
     task
+}
+
+fn task_result_for_client(
+    mut result: crate::generated::tvos_net_player::v1::TaskResult,
+    redact_error_details: bool,
+    resource_uri: impl Fn(&str) -> String,
+) -> crate::generated::tvos_net_player::v1::TaskResult {
+    for artifact in &mut result.artifacts {
+        if let Some(resource) = artifact.resource.as_mut() {
+            resource.uri = resource_uri(&resource.id);
+        }
+    }
+    if !redact_error_details {
+        return result;
+    }
+    match result.state() {
+        TaskState::Failed => {
+            if let Some(problem) = result.problem.as_mut() {
+                problem.message = crate::credential_safe_client_error(true, &problem.message);
+            }
+            if let Some(progress) = result.progress.as_mut() {
+                progress.message = crate::credential_safe_client_error(true, &progress.message);
+            }
+        }
+        TaskState::Cancelled => {
+            if let Some(problem) = result.problem.as_mut() {
+                problem.message =
+                    crate::credential_safe_client_cancellation(true, &problem.message);
+            }
+            if let Some(progress) = result.progress.as_mut() {
+                progress.message =
+                    crate::credential_safe_client_cancellation(true, &progress.message);
+            }
+        }
+        _ => {}
+    }
+    for artifact in &mut result.artifacts {
+        if let Some(problem) = artifact.problem.as_mut() {
+            problem.message = crate::credential_safe_client_error(true, &problem.message);
+        }
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -2831,7 +3134,8 @@ mod tests {
             BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
             GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
-            ListTaskResultsRequest, ResolveBilibiliInputRequest, TaskKind, TaskState,
+            ListTaskResultsRequest, PageRequest, ResolveBilibiliInputRequest, TaskKind, TaskResult,
+            TaskState,
         },
         hls_cache::sanitized_completed_session,
         hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
@@ -2860,6 +3164,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
@@ -2906,14 +3211,13 @@ mod tests {
                 .contains(&(ServerCapability::LanTranscoding as i32))
         );
         assert!(
-            !info
-                .capabilities
+            info.capabilities
                 .contains(&(ServerCapability::TaskOutputV2 as i32))
         );
     }
 
     #[tokio::test]
-    async fn list_task_results_remains_unimplemented_until_v2_output_is_available() {
+    async fn list_task_results_keeps_an_immutable_snapshot_across_output_updates() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -2921,20 +3225,325 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let service = TaskGrpcService::new(state);
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1task-output", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Failed),
+                    task_result("result-3", TaskState::Running),
+                ],
+                Vec::new(),
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
 
-        let status = service
+        let first_page = service
             .list_task_results(Request::new(ListTaskResultsRequest {
-                task_id: "task-1".to_owned(),
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 2,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("first task-result page should load")
+            .into_inner();
+        let first_page_info = first_page
+            .page_info
+            .clone()
+            .expect("first page should include page info");
+        assert_eq!(
+            vec!["result-1", "result-2"],
+            result_ids(&first_page.results)
+        );
+        assert_eq!(3, first_page_info.total_size);
+        assert!(!first_page_info.next_page_token.is_empty());
+        assert!(first_page.output_revision > 0);
+
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should advance");
+
+        let second_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: first_page_info.next_page_token,
+                }),
+            }))
+            .await
+            .expect("old snapshot should remain pageable")
+            .into_inner();
+        assert_eq!(vec!["result-3"], result_ids(&second_page.results));
+        assert_eq!(first_page.output_revision, second_page.output_revision);
+        assert_eq!(
+            first_page_info.snapshot_id,
+            second_page.page_info.unwrap().snapshot_id
+        );
+
+        let latest_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
                 page: None,
             }))
             .await
-            .expect_err("v2 task output should remain capability-gated");
+            .expect("latest task-result snapshot should load")
+            .into_inner();
+        assert_eq!(vec!["replacement"], result_ids(&latest_page.results));
+        assert!(latest_page.output_revision > first_page.output_revision);
+        assert_ne!(
+            first_page_info.snapshot_id,
+            latest_page.page_info.unwrap().snapshot_id
+        );
+    }
 
-        assert_eq!(tonic::Code::Unimplemented, status.code());
+    #[tokio::test]
+    async fn list_task_results_rejects_unknown_and_cross_task_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first = state
+            .tasks
+            .create_bilibili_task("BV1first", None)
+            .expect("first task should be created");
+        let second = state
+            .tasks
+            .create_bilibili_task("BV1second", None)
+            .expect("second task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &first.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Completed),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let service = TaskGrpcService::new(state);
+        let first_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let token = first_page.page_info.unwrap().next_page_token;
+
+        let cross_task = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: second.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: token,
+                }),
+            }))
+            .await
+            .expect_err("page token must be bound to its task");
+        assert_eq!(tonic::Code::InvalidArgument, cross_task.code());
+
+        let unknown = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "missing".to_owned(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: "edited-token".to_owned(),
+                }),
+            }))
+            .await
+            .expect_err("unknown token must be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, unknown.code());
+    }
+
+    #[tokio::test]
+    async fn task_output_v2_is_not_advertised_when_durable_state_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let task_state_path = temp.path().join("tasks.json");
+        fs::write(&task_state_path, "{ invalid json")
+            .expect("invalid task state should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should remain available")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+
+        let status = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "task-one".to_owned(),
+                page: None,
+            }))
+            .await
+            .expect_err("durable task output should remain gated");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+    }
+
+    #[tokio::test]
+    async fn list_task_results_enforces_default_and_maximum_page_sizes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1page-size", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                (0..201)
+                    .map(|index| task_result(&format!("result-{index:03}"), TaskState::Completed))
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        let service = TaskGrpcService::new(state);
+
+        let default_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 0,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(DEFAULT_TASK_RESULT_PAGE_SIZE, default_page.results.len());
+        assert!(!default_page.page_info.unwrap().next_page_token.is_empty());
+
+        let maximum_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: Some(PageRequest {
+                    page_size: u32::MAX,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(MAX_TASK_RESULT_PAGE_SIZE, maximum_page.results.len());
+        assert!(!maximum_page.page_info.unwrap().next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_task_results_projects_resource_uris_through_public_media_base() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1resource-uri", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cover_one".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 42,
+            size_known: true,
+            ..Default::default()
+        })
+        .unwrap();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover-artifact".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .unwrap();
+
+        let page = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let uri = &page.results[0].artifacts[0]
+            .resource
+            .as_ref()
+            .expect("artifact should include resource")
+            .uri;
+        assert_eq!("https://atri.ink/cache/resources/cover_one", uri);
+        assert!(!uri.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    fn task_result(id: &str, state: TaskState) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    fn result_ids(results: &[TaskResult]) -> Vec<&str> {
+        results.iter().map(|result| result.id.as_str()).collect()
     }
 
     #[test]

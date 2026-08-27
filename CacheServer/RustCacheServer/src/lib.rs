@@ -16,6 +16,7 @@ pub mod media;
 mod mp4_segments;
 pub mod playback;
 mod playback_policy;
+mod task_output;
 pub mod task_registry;
 mod task_store;
 mod transcoding;
@@ -70,7 +71,7 @@ use crate::{
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
-        hls_segment_head, media_get, media_head,
+        hls_segment_head, media_get, media_head, resource_get, resource_head,
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
@@ -1886,6 +1887,10 @@ pub async fn run_media_listener(
         .route(
             "/media/{item_id}/{variant_id}",
             get(media_get).head(media_head),
+        )
+        .route(
+            "/resources/{resource_id}",
+            get(resource_get).head(resource_head),
         )
         .route(
             "/hls/{session_id}/master.m3u8",

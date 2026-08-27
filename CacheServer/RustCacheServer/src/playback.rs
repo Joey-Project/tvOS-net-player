@@ -31,6 +31,15 @@ impl PlaybackUriFactory {
         Self::hls_master_playlist_uri(&base_uri, session_id)
     }
 
+    pub fn create_task_resource<T>(&self, request: &Request<T>, resource_id: &str) -> String {
+        let base_uri = self.create_base_uri(request);
+        format!(
+            "{}/resources/{}",
+            base_uri.trim_end_matches('/'),
+            urlencoding::encode(resource_id)
+        )
+    }
+
     pub fn create_hls_master_playlist_for_runtime(&self, session_id: &str) -> String {
         let base_uri = self.configured_base_uri();
         Self::hls_master_playlist_uri(&base_uri, session_id)
@@ -214,6 +223,20 @@ mod tests {
         assert_eq!(
             "http://media.example.test:9090/hls/session-1/master.m3u8",
             uri
+        );
+    }
+
+    #[test]
+    fn creates_task_resource_uri_under_public_base_path() {
+        let factory = PlaybackUriFactory::new(Arc::new(CacheServerOptions {
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            ..CacheServerOptions::default()
+        }));
+        let request = Request::new(());
+
+        assert_eq!(
+            "https://atri.ink/cache/resources/subtitle_one",
+            factory.create_task_resource(&request, "subtitle_one")
         );
     }
 

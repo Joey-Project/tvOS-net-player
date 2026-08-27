@@ -5,7 +5,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
     http::{
-        HeaderMap, HeaderValue, Method, Response, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
             LAST_MODIFIED, RANGE,
@@ -31,6 +31,7 @@ use crate::{
 };
 
 const HLS_INITIALIZATION_SCAN_BYTES: u64 = 1024 * 1024;
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 
 #[derive(Clone)]
 pub struct MediaState {
@@ -59,6 +60,22 @@ pub async fn media_head(
     headers: HeaderMap,
 ) -> Response<Body> {
     media_response(state, item_id, variant_id, headers, true).await
+}
+
+pub async fn resource_get(
+    State(state): State<MediaState>,
+    Path(resource_id): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    resource_response(state, resource_id, headers, false).await
+}
+
+pub async fn resource_head(
+    State(state): State<MediaState>,
+    Path(resource_id): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    resource_response(state, resource_id, headers, true).await
 }
 
 pub async fn hls_master_playlist_get(
@@ -121,6 +138,61 @@ async fn media_response(
     };
 
     build_file_response(opened_file, range, head_only).await
+}
+
+async fn resource_response(
+    state: MediaState,
+    resource_id: String,
+    headers: HeaderMap,
+    head_only: bool,
+) -> Response<Body> {
+    let Some(record) = state.state.tasks.task_resource(&resource_id) else {
+        return resource_not_found_response();
+    };
+    let relative_path = record.relative_path();
+    let resource = record.resource;
+    let Some(opened_resource) = state.state.library.open_resource_file(&relative_path).await else {
+        return resource_not_found_response();
+    };
+
+    if resource.size_known
+        && u64::try_from(resource.size_bytes).ok() != Some(opened_resource.size_bytes)
+    {
+        return resource_not_found_response();
+    }
+
+    let requested_range = match parse_range(headers.get(RANGE), opened_resource.size_bytes) {
+        Ok(range) => range,
+        Err(_) => {
+            return resource_range_not_satisfiable_response(
+                opened_resource.size_bytes,
+                &resource.content_type,
+                resource.supports_byte_ranges,
+                &resource.etag,
+            );
+        }
+    };
+    let range = if resource.supports_byte_ranges {
+        requested_range
+    } else {
+        None
+    };
+    let opened_file = OpenedMediaFile {
+        file: opened_resource.file,
+        content_type: resource.content_type,
+        last_modified: opened_resource.last_modified,
+        size_bytes: opened_resource.size_bytes,
+    };
+    let mut response = build_file_response(opened_file, range, head_only).await;
+    if !response.status().is_success() {
+        return resource_not_found_response();
+    }
+    apply_resource_headers(
+        response.headers_mut(),
+        resource.supports_byte_ranges,
+        &resource.etag,
+    );
+    response
 }
 
 fn hls_master_playlist_response(
@@ -881,8 +953,71 @@ fn copy_hls_upstream_headers(
 }
 
 fn content_type_header_value(value: &str) -> HeaderValue {
+    if value.is_empty() {
+        return HeaderValue::from_static("application/octet-stream");
+    }
     HeaderValue::from_str(value)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+}
+
+fn resource_not_found_response() -> Response<Body> {
+    let mut response = empty_response(StatusCode::NOT_FOUND);
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
+fn resource_range_not_satisfiable_response(
+    size: u64,
+    content_type: &str,
+    supports_byte_ranges: bool,
+    etag: &str,
+) -> Response<Body> {
+    let mut response = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+    response.headers_mut().insert(
+        CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{size}"))
+            .expect("content range header should be valid"),
+    );
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, content_type_header_value(content_type));
+    apply_resource_headers(response.headers_mut(), supports_byte_ranges, etag);
+    response
+}
+
+fn apply_resource_headers(headers: &mut HeaderMap, supports_byte_ranges: bool, etag: &str) {
+    headers.insert(
+        ACCEPT_RANGES,
+        if supports_byte_ranges {
+            HeaderValue::from_static("bytes")
+        } else {
+            HeaderValue::from_static("none")
+        },
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if let Some(etag) = quoted_etag_header_value(etag) {
+        headers.insert(ETAG, etag);
+    }
+}
+
+fn quoted_etag_header_value(value: &str) -> Option<HeaderValue> {
+    if value.is_empty() {
+        return None;
+    }
+    let opaque = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    if opaque.is_empty()
+        || !opaque
+            .bytes()
+            .all(|byte| byte == b'!' || matches!(byte, b'#'..=b'~'))
+    {
+        return None;
+    }
+    HeaderValue::from_str(&format!("\"{opaque}\"")).ok()
 }
 
 async fn build_file_response(
@@ -1208,7 +1343,7 @@ fn parse_range(header: Option<&HeaderValue>, size: u64) -> Result<Option<ByteRan
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, sync::mpsc, thread};
+    use std::{convert::Infallible, fs, path::PathBuf, sync::mpsc, thread};
 
     use super::*;
     use axum::{
@@ -1227,10 +1362,105 @@ mod tests {
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
             BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
-            PlaybackProtocol, PlaybackSource, TaskState,
+            CacheResourceRef, PlaybackProtocol, PlaybackSource, TaskArtifact, TaskArtifactKind,
+            TaskArtifactState, TaskResult, TaskState,
         },
         hls::{HlsMediaResource, HlsPlaybackSession, HlsVariant},
+        task_output::TaskResourceRecord,
     };
+
+    struct TaskResourceFixture {
+        temp: TempDir,
+        state: MediaState,
+        resource_id: String,
+        resource_path: PathBuf,
+    }
+
+    fn test_resource(id: &str, body: &[u8]) -> CacheResourceRef {
+        CacheResourceRef {
+            id: id.to_owned(),
+            content_type: "text/vtt; charset=utf-8".to_owned(),
+            size_bytes: body.len().try_into().unwrap(),
+            size_known: true,
+            supports_byte_ranges: true,
+            etag: "resource-v1".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn task_resource_fixture(
+        resource: CacheResourceRef,
+        body: Option<&[u8]>,
+    ) -> TaskResourceFixture {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path.canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1-resource-test", None)
+            .expect("test task should be created");
+        let record = TaskResourceRecord::new(resource).expect("test resource should be valid");
+        let resource_id = record.resource.id.clone();
+        let resource_path = root_path.join(record.relative_path());
+        fs::create_dir_all(resource_path.parent().unwrap())
+            .expect("resource directory should be created");
+        if let Some(body) = body {
+            fs::write(&resource_path, body).expect("resource body should be written");
+        }
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "artifact-one".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(record.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![record],
+            )
+            .expect("test task output should be replaced");
+
+        TaskResourceFixture {
+            temp,
+            state: MediaState::new(state),
+            resource_id,
+            resource_path,
+        }
+    }
+
+    async fn assert_path_free_not_found(response: Response<Body>, private_path: &std::path::Path) {
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+        let private_path = private_path.to_string_lossy();
+        assert!(response.headers().values().all(|value| {
+            value
+                .to_str()
+                .map(|value| !value.contains(private_path.as_ref()))
+                .unwrap_or(true)
+        }));
+        assert_eq!(
+            Some("nosniff"),
+            response
+                .headers()
+                .get(&X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok())
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+    }
 
     #[test]
     fn parses_standard_ranges() {
@@ -1247,6 +1477,198 @@ mod tests {
         assert!(parse_range(Some(&HeaderValue::from_static("bytes=99-100")), 16).is_err());
         assert!(parse_range(Some(&HeaderValue::from_static("items=0-1")), 16).is_err());
         assert!(parse_range(Some(&HeaderValue::from_static("bytes=0-1,2-3")), 16).is_err());
+    }
+
+    #[tokio::test]
+    async fn task_resource_get_streams_full_body_with_canonical_headers() {
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(test_resource("resource-full", body), Some(body));
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!("text/vtt; charset=utf-8", response.headers()[CONTENT_TYPE]);
+        assert_eq!("16", response.headers()[CONTENT_LENGTH]);
+        assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
+        assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+        assert_eq!(
+            Some("nosniff"),
+            response
+                .headers()
+                .get(&X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(
+            body.as_slice(),
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_resource_head_returns_full_headers_without_a_body() {
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(test_resource("resource-head", body), Some(body));
+
+        let response = resource_head(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!("text/vtt; charset=utf-8", response.headers()[CONTENT_TYPE]);
+        assert_eq!("16", response.headers()[CONTENT_LENGTH]);
+        assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
+        assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn task_resource_get_supports_normal_and_suffix_ranges() {
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(test_resource("resource-range", body), Some(body));
+
+        for (header, expected_range, expected_body) in [
+            ("bytes=2-5", "bytes 2-5/16", &b"2345"[..]),
+            ("bytes=-4", "bytes 12-15/16", &b"cdef"[..]),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static(header));
+
+            let response = resource_get(
+                State(fixture.state.clone()),
+                Path(fixture.resource_id.clone()),
+                headers,
+            )
+            .await;
+
+            assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+            assert_eq!(expected_range, response.headers()[CONTENT_RANGE]);
+            assert_eq!("4", response.headers()[CONTENT_LENGTH]);
+            assert_eq!(
+                expected_body,
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resource_rejects_invalid_and_multipart_ranges() {
+        let body = b"0123456789abcdef";
+        let fixture =
+            task_resource_fixture(test_resource("resource-invalid-range", body), Some(body));
+
+        for header in ["bytes=99-100", "bytes=0-1,4-5"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static(header));
+
+            let response = resource_get(
+                State(fixture.state.clone()),
+                Path(fixture.resource_id.clone()),
+                headers,
+            )
+            .await;
+
+            assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, response.status());
+            assert_eq!("bytes */16", response.headers()[CONTENT_RANGE]);
+            assert!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resource_not_found_responses_do_not_disclose_paths() {
+        let body = b"0123456789abcdef";
+        let valid = task_resource_fixture(test_resource("resource-valid", body), Some(body));
+        assert_path_free_not_found(
+            resource_get(
+                State(valid.state.clone()),
+                Path("unknown-resource".to_owned()),
+                HeaderMap::new(),
+            )
+            .await,
+            &valid.resource_path,
+        )
+        .await;
+
+        let missing = task_resource_fixture(test_resource("resource-missing", body), None);
+        assert_path_free_not_found(
+            resource_get(
+                State(missing.state.clone()),
+                Path(missing.resource_id.clone()),
+                HeaderMap::new(),
+            )
+            .await,
+            &missing.resource_path,
+        )
+        .await;
+
+        let mut mismatched_resource = test_resource("resource-mismatch", body);
+        mismatched_resource.size_bytes += 1;
+        let mismatched = task_resource_fixture(mismatched_resource, Some(body));
+        assert_path_free_not_found(
+            resource_get(
+                State(mismatched.state.clone()),
+                Path(mismatched.resource_id.clone()),
+                HeaderMap::new(),
+            )
+            .await,
+            &mismatched.resource_path,
+        )
+        .await;
+
+        let mut expired_resource = test_resource("resource-expired", body);
+        expired_resource.expires_at = Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        let expired = task_resource_fixture(expired_resource, Some(body));
+        assert_path_free_not_found(
+            resource_get(
+                State(expired.state.clone()),
+                Path(expired.resource_id.clone()),
+                HeaderMap::new(),
+            )
+            .await,
+            &expired.resource_path,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_resource_refuses_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(test_resource("resource-symlink", body), None);
+        let outside_path = fixture.temp.path().join("outside-secret.txt");
+        fs::write(&outside_path, b"secret resource contents").unwrap();
+        symlink(&outside_path, &fixture.resource_path).unwrap();
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_path_free_not_found(response, &outside_path).await;
     }
 
     #[tokio::test]
