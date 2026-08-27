@@ -8,7 +8,7 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-            LAST_MODIFIED, RANGE,
+            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE,
         },
     },
 };
@@ -161,7 +161,21 @@ async fn resource_response(
         return resource_not_found_response();
     }
 
-    let requested_range = match parse_range(headers.get(RANGE), opened_resource.size_bytes) {
+    let etag = quoted_etag_header_value(&resource.etag);
+    if resource_is_not_modified(&headers, etag.as_ref(), opened_resource.last_modified) {
+        return resource_not_modified_response(
+            &resource.content_type,
+            resource.supports_byte_ranges,
+            etag,
+            opened_resource.last_modified,
+        );
+    }
+
+    let range_header = (resource.supports_byte_ranges
+        && range_validator_matches(&headers, etag.as_ref(), opened_resource.last_modified))
+    .then(|| headers.get(RANGE))
+    .flatten();
+    let requested_range = match parse_range(range_header, opened_resource.size_bytes) {
         Ok(range) => range,
         Err(_) => {
             return resource_range_not_satisfiable_response(
@@ -172,18 +186,13 @@ async fn resource_response(
             );
         }
     };
-    let range = if resource.supports_byte_ranges {
-        requested_range
-    } else {
-        None
-    };
     let opened_file = OpenedMediaFile {
         file: opened_resource.file,
         content_type: resource.content_type,
         last_modified: opened_resource.last_modified,
         size_bytes: opened_resource.size_bytes,
     };
-    let mut response = build_file_response(opened_file, range, head_only).await;
+    let mut response = build_file_response(opened_file, requested_range, head_only).await;
     if !response.status().is_success() {
         return resource_not_found_response();
     }
@@ -1020,6 +1029,94 @@ fn quoted_etag_header_value(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("\"{opaque}\"")).ok()
 }
 
+fn resource_is_not_modified(
+    headers: &HeaderMap,
+    etag: Option<&HeaderValue>,
+    last_modified: std::time::SystemTime,
+) -> bool {
+    if let Some(if_none_match) = headers.get(IF_NONE_MATCH) {
+        return if_none_match_matches(if_none_match, etag);
+    }
+    headers
+        .get(IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .is_some_and(|date| is_not_modified_since(last_modified, date))
+}
+
+fn if_none_match_matches(value: &HeaderValue, etag: Option<&HeaderValue>) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let current = etag.and_then(|etag| etag.to_str().ok());
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || current.is_some_and(|current| weak_etag_value(candidate) == weak_etag_value(current))
+    })
+}
+
+fn weak_etag_value(value: &str) -> &str {
+    value.strip_prefix("W/").unwrap_or(value)
+}
+
+fn range_validator_matches(
+    headers: &HeaderMap,
+    etag: Option<&HeaderValue>,
+    last_modified: std::time::SystemTime,
+) -> bool {
+    let Some(if_range) = headers.get(IF_RANGE) else {
+        return true;
+    };
+    let Ok(if_range) = if_range.to_str() else {
+        return false;
+    };
+    if if_range.starts_with('"') || if_range.starts_with("W/\"") {
+        return !if_range.starts_with("W/")
+            && etag
+                .and_then(|etag| etag.to_str().ok())
+                .is_some_and(|etag| etag == if_range);
+    }
+    httpdate::parse_http_date(if_range)
+        .ok()
+        .is_some_and(|date| is_not_modified_since(last_modified, date))
+}
+
+fn is_not_modified_since(
+    last_modified: std::time::SystemTime,
+    comparison: std::time::SystemTime,
+) -> bool {
+    let Ok(last_modified) = last_modified.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    let Ok(comparison) = comparison.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    last_modified.as_secs() <= comparison.as_secs()
+}
+
+fn resource_not_modified_response(
+    content_type: &str,
+    supports_byte_ranges: bool,
+    etag: Option<HeaderValue>,
+    last_modified: std::time::SystemTime,
+) -> Response<Body> {
+    let mut response = empty_response(StatusCode::NOT_MODIFIED);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, content_type_header_value(content_type));
+    response.headers_mut().insert(
+        LAST_MODIFIED,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified))
+            .expect("last-modified header should be valid"),
+    );
+    apply_resource_headers(response.headers_mut(), supports_byte_ranges, "");
+    if let Some(etag) = etag {
+        response.headers_mut().insert(ETAG, etag);
+    }
+    response
+}
+
 async fn build_file_response(
     opened_file: OpenedMediaFile,
     range: Option<ByteRange>,
@@ -1556,6 +1653,71 @@ mod tests {
             assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
             assert_eq!(expected_range, response.headers()[CONTENT_RANGE]);
             assert_eq!("4", response.headers()[CONTENT_LENGTH]);
+            assert_eq!(
+                expected_body,
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resource_honors_conditional_get_validators() {
+        let body = b"0123456789abcdef";
+        let fixture =
+            task_resource_fixture(test_resource("resource-conditional", body), Some(body));
+        let baseline = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let last_modified = baseline.headers()[LAST_MODIFIED].clone();
+
+        for (name, value) in [
+            (IF_NONE_MATCH, HeaderValue::from_static("W/\"resource-v1\"")),
+            (IF_MODIFIED_SINCE, last_modified),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value);
+            let response = resource_get(
+                State(fixture.state.clone()),
+                Path(fixture.resource_id.clone()),
+                headers,
+            )
+            .await;
+
+            assert_eq!(StatusCode::NOT_MODIFIED, response.status());
+            assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+            assert!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resource_applies_ranges_only_when_if_range_matches() {
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(test_resource("resource-if-range", body), Some(body));
+
+        for (validator, expected_status, expected_body) in [
+            ("\"resource-v1\"", StatusCode::PARTIAL_CONTENT, &b"2345"[..]),
+            ("\"stale\"", StatusCode::OK, body.as_slice()),
+            ("W/\"resource-v1\"", StatusCode::OK, body.as_slice()),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static("bytes=2-5"));
+            headers.insert(IF_RANGE, HeaderValue::from_str(validator).unwrap());
+            let response = resource_get(
+                State(fixture.state.clone()),
+                Path(fixture.resource_id.clone()),
+                headers,
+            )
+            .await;
+
+            assert_eq!(expected_status, response.status());
             assert_eq!(
                 expected_body,
                 &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]

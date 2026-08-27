@@ -53,7 +53,7 @@ use crate::{
     config::CacheServerOptions,
     grpc_services::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
-        TaskGrpcService, playback_session_from_hls_cache_session,
+        TaskGrpcService, TaskResultPageStore, playback_session_from_hls_cache_session,
     },
     hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
@@ -115,6 +115,7 @@ pub struct AppState {
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login_sessions: Arc<Mutex<VecDeque<BilibiliLoginSession>>>,
+    pub(crate) task_result_pages: Arc<Mutex<TaskResultPageStore>>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
@@ -183,10 +184,13 @@ impl AppState {
         let options = Arc::new(options);
         let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
-        let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path_and_retention(
-            task_state_path,
-            task_retention_policy,
-        ));
+        let tasks = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                task_state_path,
+                task_retention_policy,
+                Some(options.root_path.clone()),
+            ),
+        );
         let hls_sessions = HlsPlaybackRegistry::default();
         let hls_cache = HlsCacheStore::new(library.root_path());
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
@@ -342,6 +346,7 @@ impl AppState {
             hls_network_policy,
             hls_playback_progress,
             bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),

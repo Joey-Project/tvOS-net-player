@@ -96,6 +96,8 @@ superseded_by:
 - `ListTaskResults` now serves bounded immutable snapshots through random, task-bound continuation tokens. Existing snapshots remain internally consistent across later output revisions, while malformed, cross-task, expired, and evicted tokens fail explicitly.
 - Available artifacts can be served with GET, HEAD, and single-range requests from the fixed `.tvos-net-player/resources/<opaque-id>/body` namespace. Resource paths stay server-only, secure no-follow opening prevents symlink traversal, declared sizes are checked, and client URIs are projected through the configured LAN or public media base.
 - The Rust server advertises `SERVER_CAPABILITY_TASK_OUTPUT_V2` only when durable task state and secure HTTP Range serving are available. Legacy task result fields remain populated for older clients.
+- PR 6B review hardening makes pagination state process-wide across dual-stack listeners, dynamically drops v2 after post-start persistence failures, keeps legacy progress from creating rollback-prone revisions, and synchronizes cache deletion with authoritative result summaries and artifacts.
+- Resource IDs are canonicalized before filesystem use and cannot be rebound to different live representations. Immutable page snapshots retain their resources, conditional HTTP requests implement validator and `If-Range` semantics, durable retirement removes old bodies, and startup no-follow scanning closes the metadata-commit/resource-delete crash window.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -109,4 +111,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite contains 544 passing unit tests.

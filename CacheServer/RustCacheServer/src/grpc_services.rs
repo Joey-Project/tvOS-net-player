@@ -677,15 +677,16 @@ pub struct TaskGrpcService {
 
 impl TaskGrpcService {
     pub fn new(state: AppState) -> Self {
+        let result_pages = Arc::clone(&state.task_result_pages);
         Self {
             state,
-            result_pages: Arc::new(StdMutex::new(TaskResultPageStore::default())),
+            result_pages,
         }
     }
 }
 
 #[derive(Default)]
-struct TaskResultPageStore {
+pub(crate) struct TaskResultPageStore {
     snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
     snapshot_order: VecDeque<String>,
     cursors_by_token: HashMap<String, TaskResultPageCursor>,
@@ -713,21 +714,23 @@ impl TaskResultPageStore {
         &mut self,
         snapshot: crate::task_registry::TaskOutputSnapshot,
         now: Instant,
-    ) -> String {
-        self.prune(now);
+    ) -> (String, Vec<String>, bool) {
+        let mut removed_snapshot_ids = self.prune(now);
         if let Some(existing) = self.snapshots_by_id.get(&snapshot.snapshot_id)
             && existing.task_id == snapshot.task_id
             && existing.revision == snapshot.revision
             && existing.results == snapshot.results
         {
-            return existing.snapshot_id.clone();
+            return (existing.snapshot_id.clone(), removed_snapshot_ids, false);
         }
 
         while self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
                 break;
             };
-            self.remove_snapshot(&oldest_id);
+            if self.remove_snapshot(&oldest_id) {
+                removed_snapshot_ids.push(oldest_id);
+            }
         }
         while self
             .snapshots_by_id
@@ -740,7 +743,9 @@ impl TaskResultPageStore {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
                 break;
             };
-            self.remove_snapshot(&oldest_id);
+            if self.remove_snapshot(&oldest_id) {
+                removed_snapshot_ids.push(oldest_id);
+            }
         }
 
         let snapshot_id = if self.snapshots_by_id.contains_key(&snapshot.snapshot_id) {
@@ -760,16 +765,10 @@ impl TaskResultPageStore {
                 tokens_by_offset: HashMap::new(),
             },
         );
-        snapshot_id
+        (snapshot_id, removed_snapshot_ids, true)
     }
 
-    fn resolve_token(
-        &mut self,
-        token: &str,
-        task_id: &str,
-        now: Instant,
-    ) -> Result<(String, usize), Status> {
-        self.prune(now);
+    fn resolve_token(&mut self, token: &str, task_id: &str) -> Result<(String, usize), Status> {
         let cursor = self
             .cursors_by_token
             .get(token)
@@ -843,24 +842,26 @@ impl TaskResultPageStore {
         ))
     }
 
-    fn prune(&mut self, now: Instant) {
+    fn prune(&mut self, now: Instant) -> Vec<String> {
         let expired_ids = self
             .snapshots_by_id
             .iter()
             .filter(|(_, snapshot)| snapshot.expires_at <= now)
             .map(|(snapshot_id, _)| snapshot_id.clone())
             .collect::<Vec<_>>();
-        for snapshot_id in expired_ids {
-            self.remove_snapshot(&snapshot_id);
+        for snapshot_id in &expired_ids {
+            self.remove_snapshot(snapshot_id);
         }
+        expired_ids
     }
 
-    fn remove_snapshot(&mut self, snapshot_id: &str) {
-        self.snapshots_by_id.remove(snapshot_id);
+    fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
+        let removed = self.snapshots_by_id.remove(snapshot_id).is_some();
         self.snapshot_order
             .retain(|candidate| candidate != snapshot_id);
         self.cursors_by_token
             .retain(|_, cursor| cursor.snapshot_id != snapshot_id);
+        removed
     }
 }
 
@@ -1018,18 +1019,43 @@ impl TaskService for TaskGrpcService {
         let now = Instant::now();
 
         let (snapshot_id, offset) = if page_token.is_empty() {
-            let snapshot = self.state.tasks.task_output_snapshot(&task_id)?;
-            let mut pages = self
-                .result_pages
-                .lock()
-                .expect("task result page store lock poisoned");
-            (pages.insert(snapshot, now), 0)
-        } else {
-            let (snapshot_id, offset) = self
+            let snapshot = self
+                .state
+                .tasks
+                .retain_task_output_snapshot(&task_id, now + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
+            let (snapshot_id, mut released_snapshot_ids, inserted_new_snapshot) = self
                 .result_pages
                 .lock()
                 .expect("task result page store lock poisoned")
-                .resolve_token(page_token, &task_id, now)?;
+                .insert(snapshot, now);
+            released_snapshot_ids.retain(|released| released != &snapshot_id);
+            self.state
+                .tasks
+                .release_task_output_snapshots(&released_snapshot_ids);
+            if inserted_new_snapshot {
+                let tasks = Arc::clone(&self.state.tasks);
+                tokio::spawn(async move {
+                    sleep(TASK_RESULT_PAGE_SNAPSHOT_TTL).await;
+                    tasks.prune_expired_task_output_snapshots();
+                });
+            }
+            (snapshot_id, 0)
+        } else {
+            let (resolution, released_snapshot_ids) = {
+                let mut pages = self
+                    .result_pages
+                    .lock()
+                    .expect("task result page store lock poisoned");
+                let released_snapshot_ids = pages.prune(now);
+                (
+                    pages.resolve_token(page_token, &task_id),
+                    released_snapshot_ids,
+                )
+            };
+            self.state
+                .tasks
+                .release_task_output_snapshots(&released_snapshot_ids);
+            let (snapshot_id, offset) = resolution?;
             self.state.tasks.get_task(&task_id)?;
             (snapshot_id, offset)
         };
@@ -3279,7 +3305,8 @@ mod tests {
             )
             .expect("task output should advance");
 
-        let second_page = service
+        let reconnected_service = TaskGrpcService::new(state.clone());
+        let second_page = reconnected_service
             .list_task_results(Request::new(ListTaskResultsRequest {
                 task_id: task.id.clone(),
                 page: Some(PageRequest {
@@ -3415,6 +3442,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_v2_capability_drops_after_a_snapshot_save_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let task_state_path = temp.path().join("state").join("tasks.json");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        fs::remove_file(&task_state_path).expect("startup should probe task persistence");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        state
+            .tasks
+            .create_bilibili_task("BV1save-failure", None)
+            .expect("legacy task creation should remain available in memory");
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should remain available")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        let status = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "missing".to_owned(),
+                page: None,
+            }))
+            .await
+            .expect_err("v2 result reads must fail after persistence degrades");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+    }
+
+    #[tokio::test]
     async fn list_task_results_enforces_default_and_maximum_page_sizes() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
@@ -3532,6 +3596,93 @@ mod tests {
             .uri;
         assert_eq!("https://atri.ink/cache/resources/cover_one", uri);
         assert!(!uri.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn immutable_result_snapshot_keeps_its_resources_authorized() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1snapshot-resource", None)
+            .unwrap();
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "snapshot-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    TaskResult {
+                        id: "result-2".to_owned(),
+                        state: TaskState::Completed.into(),
+                        artifacts: vec![TaskArtifact {
+                            id: "cover".to_owned(),
+                            kind: TaskArtifactKind::CoverImage.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(resource.resource.clone()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                vec![resource],
+            )
+            .unwrap();
+        let first = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .unwrap();
+
+        let old_second_page = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: first.page_info.unwrap().next_page_token,
+                }),
+            }))
+            .await
+            .expect("a reconnected client should finish the immutable snapshot")
+            .into_inner();
+        let returned_resource = old_second_page.results[0].artifacts[0]
+            .resource
+            .as_ref()
+            .expect("old snapshot resource should remain projected");
+        assert_eq!("snapshot-cover", returned_resource.id);
+        assert!(state.tasks.task_resource("snapshot-cover").is_some());
     }
 
     fn task_result(id: &str, state: TaskState) -> TaskResult {
@@ -4300,6 +4451,8 @@ mod tests {
             },
             Arc::new(EmptyPlaybackPlanner),
         );
+        let initial_snapshot = fs::read(&task_state_path)
+            .expect("startup persistence probe should write an empty snapshot");
         let service = TaskGrpcService::new(state);
         let cases = [
             (
@@ -4345,7 +4498,7 @@ mod tests {
             assert_eq!(tonic::Code::InvalidArgument, error.code());
             assert!(error.message().contains(field));
         }
-        assert!(!task_state_path.exists());
+        assert_eq!(initial_snapshot, fs::read(task_state_path).unwrap());
     }
 
     #[tokio::test]

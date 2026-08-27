@@ -930,7 +930,89 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
 }
 
 #[cfg(unix)]
-fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+pub(crate) fn list_directory_names_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<Vec<String>> {
+    use std::{
+        ffi::CStr,
+        os::fd::{AsRawFd, IntoRawFd},
+    };
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+    )?;
+    for segment in &segments {
+        directory = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )?;
+    }
+
+    let fd = directory.into_raw_fd();
+    // SAFETY: fd is a uniquely owned open directory descriptor transferred to fdopendir.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so ownership of fd was not transferred.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+
+    let mut names = Vec::new();
+    loop {
+        set_errno(0);
+        // SAFETY: stream remains open and exclusively owned until closedir below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: stream was returned by fdopendir and is closed exactly once.
+            unsafe { libc::closedir(stream) };
+            return if error.raw_os_error() == Some(0) {
+                Ok(names)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: readdir returns a live dirent whose d_name is NUL-terminated for this call.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        if let Ok(name) = std::str::from_utf8(bytes) {
+            names.push(name.to_owned());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn list_directory_names_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<Vec<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory listing is not implemented on this platform",
+    ))
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn set_errno(value: i32) {
+    // SAFETY: __error returns the calling thread's errno pointer on Apple platforms.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn set_errno(value: i32) {
+    // SAFETY: __errno_location returns the calling thread's errno pointer on supported Unix CI.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
@@ -962,7 +1044,7 @@ fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()
 }
 
 #[cfg(not(unix))]
-fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
     fs::remove_file(root_path.join(relative_path))
 }
 

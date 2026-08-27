@@ -20,6 +20,7 @@ pub(crate) struct TaskResourceRecord {
 impl TaskResourceRecord {
     pub(crate) fn new(mut resource: CacheResourceRef) -> Result<Self, TaskOutputValidationError> {
         validate_resource_id(&resource.id)?;
+        resource.id.make_ascii_lowercase();
         resource.uri = resource_uri(&resource.id);
         if resource.content_type.trim().is_empty()
             || HeaderValue::from_str(&resource.content_type).is_err()
@@ -38,7 +39,11 @@ impl TaskResourceRecord {
     }
 
     pub(crate) fn relative_path(&self) -> String {
-        format!("{INTERNAL_RESOURCE_DIR}/{}/body", self.resource.id)
+        Self::relative_path_for_id(&self.resource.id)
+    }
+
+    pub(crate) fn relative_path_for_id(id: &str) -> String {
+        format!("{INTERNAL_RESOURCE_DIR}/{id}/body")
     }
 }
 
@@ -73,6 +78,7 @@ impl TaskOutputRecord {
         validate_collection_sizes(&results, &resources)?;
         validate_and_bind_resources(&mut results, &resources)?;
         validate_result_ids(&results)?;
+        validate_resource_representations(previous, &resources)?;
 
         let unchanged = previous.is_some_and(|previous| {
             previous.results == results
@@ -231,7 +237,81 @@ impl TaskOutputRecord {
     }
 
     pub(crate) fn contains_resource_id(&self, id: &str) -> bool {
-        self.resources.iter().any(|record| record.resource.id == id)
+        self.resources
+            .iter()
+            .any(|record| record.resource.id.eq_ignore_ascii_case(id))
+    }
+
+    pub(crate) fn mark_playback_cache_deleted(
+        &mut self,
+        session_id: &str,
+        library_item_id: &str,
+        message: &str,
+    ) -> Vec<String> {
+        if self.legacy_managed {
+            return Vec::new();
+        }
+        let mut changed = false;
+        for result in &mut self.results {
+            let matches_cache = (!library_item_id.is_empty()
+                && result.library_item_id == library_item_id)
+                || result.id == session_id
+                || result
+                    .playback_source
+                    .as_ref()
+                    .is_some_and(|source| source.item_id == session_id);
+            if !matches_cache {
+                continue;
+            }
+            result.state = TaskState::Failed.into();
+            result.library_item_id.clear();
+            result.playback_source = None;
+            result.problem = Some(TaskProblem {
+                category: TaskProblemCategory::NotFound.into(),
+                code: "cache.playback_deleted".to_owned(),
+                message: message.to_owned(),
+                retryable: false,
+            });
+            for artifact in &mut result.artifacts {
+                if artifact.kind() != TaskArtifactKind::Media
+                    || artifact.state() != TaskArtifactState::Available
+                {
+                    continue;
+                }
+                artifact.state = TaskArtifactState::Deleted.into();
+                artifact.resource = None;
+                artifact.problem = Some(TaskProblem {
+                    category: TaskProblemCategory::NotFound.into(),
+                    code: "cache.resource_deleted".to_owned(),
+                    message: message.to_owned(),
+                    retryable: false,
+                });
+            }
+            changed = true;
+        }
+        if !changed {
+            return Vec::new();
+        }
+
+        let referenced_ids = self
+            .results
+            .iter()
+            .flat_map(|result| &result.artifacts)
+            .filter_map(|artifact| artifact.resource.as_ref())
+            .map(|resource| resource.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut retired_ids = Vec::new();
+        self.resources.retain(|resource| {
+            let retained = referenced_ids.contains(resource.resource.id.as_str());
+            if !retained {
+                retired_ids.push(resource.resource.id.clone());
+            }
+            retained
+        });
+        self.primary_result_id = inferred_primary_result_id(&self.results);
+        self.revision = self.revision.saturating_add(1).max(1);
+        self.snapshot_id = new_snapshot_id();
+        retired_ids
     }
 }
 
@@ -444,13 +524,14 @@ fn validate_and_bind_resources(
                 }
                 continue;
             };
-            let Some(canonical) = resources_by_id.get(reference.id.as_str()) else {
+            let canonical_id = reference.id.to_ascii_lowercase();
+            let Some(canonical) = resources_by_id.get(canonical_id.as_str()) else {
                 return Err(TaskOutputValidationError::new(format!(
                     "task artifact references unknown resource: {}",
                     reference.id
                 )));
             };
-            referenced_ids.insert(reference.id.clone());
+            referenced_ids.insert(canonical_id);
             artifact.resource = Some((*canonical).clone());
         }
     }
@@ -463,6 +544,29 @@ fn validate_and_bind_resources(
             "task resource is not referenced by an artifact: {}",
             unreferenced.resource.id
         )));
+    }
+    Ok(())
+}
+
+fn validate_resource_representations(
+    previous: Option<&TaskOutputRecord>,
+    resources: &[TaskResourceRecord],
+) -> Result<(), TaskOutputValidationError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    for resource in resources {
+        if let Some(existing) = previous
+            .resources
+            .iter()
+            .find(|existing| existing.resource.id == resource.resource.id)
+            && existing != resource
+        {
+            return Err(TaskOutputValidationError::new(format!(
+                "task resource id cannot be reused for a different representation: {}",
+                resource.resource.id
+            )));
+        }
     }
     Ok(())
 }
@@ -480,17 +584,24 @@ fn validate_problem(
 }
 
 fn validate_resource_id(id: &str) -> Result<(), TaskOutputValidationError> {
-    if id.is_empty()
-        || id.len() > MAX_RESOURCE_ID_BYTES
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !resource_id_is_valid(id) {
         return Err(TaskOutputValidationError::new(
             "task resource id must use 1-200 ASCII letters, digits, '-' or '_'",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn resource_id_is_canonical(id: &str) -> bool {
+    resource_id_is_valid(id) && !id.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn resource_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_RESOURCE_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_snapshot_id(id: &str) -> Result<(), TaskOutputValidationError> {
@@ -602,6 +713,62 @@ mod tests {
             ".tvos-net-player/resources/subtitle-one/body",
             resource.relative_path()
         );
+    }
+
+    #[test]
+    fn resource_ids_are_canonicalized_before_filesystem_mapping() {
+        let upper = TaskResourceRecord::new(CacheResourceRef {
+            id: "Cover-One".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let lower = TaskResourceRecord::new(CacheResourceRef {
+            id: "cover-one".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!("cover-one", upper.resource.id);
+        assert_eq!(lower.resource.id, upper.resource.id);
+        let error = TaskOutputRecord::replace(None, Vec::new(), vec![upper, lower])
+            .expect_err("case-distinct resource ids must collide");
+        assert!(error.to_string().contains("duplicate task resource id"));
+    }
+
+    #[test]
+    fn resource_ids_cannot_change_representation_within_a_task() {
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "subtitle-one".to_owned(),
+            content_type: "text/vtt".to_owned(),
+            etag: "v1".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "artifact-one".to_owned(),
+                kind: TaskArtifactKind::Subtitle.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(resource.resource.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let previous =
+            TaskOutputRecord::replace(None, vec![result.clone()], vec![resource.clone()]).unwrap();
+        let changed = TaskResourceRecord::new(CacheResourceRef {
+            id: "subtitle-one".to_owned(),
+            content_type: "text/vtt".to_owned(),
+            etag: "v2".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = TaskOutputRecord::replace(Some(&previous), vec![result], vec![changed])
+            .expect_err("a resource id must identify one immutable representation");
+        assert!(error.to_string().contains("different representation"));
     }
 
     #[test]
