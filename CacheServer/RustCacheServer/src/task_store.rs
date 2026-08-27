@@ -66,9 +66,7 @@ impl TaskStateStore {
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<()> {
-        if let Some(parent) = self.path().parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let directories_to_sync = prepare_parent_directory(self.path())?;
 
         let snapshot = PersistedTaskSnapshot {
             schema_version: TASK_STATE_SCHEMA_VERSION,
@@ -86,20 +84,65 @@ impl TaskStateStore {
         temp_file.sync_all()?;
         drop(temp_file);
         fs::rename(temp_path, self.path())?;
-        sync_parent_directory(self.path())
+        sync_directories(&directories_to_sync)
     }
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
+fn parent_directory_sync_chain(path: &Path) -> io::Result<Vec<PathBuf>> {
     let Some(parent) = path.parent() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    File::open(parent)?.sync_all()
+
+    let mut directories = Vec::new();
+    for ancestor in parent.ancestors() {
+        let ancestor = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        directories.push(ancestor.to_path_buf());
+
+        match fs::metadata(ancestor) {
+            Ok(_) => return Ok(directories),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "task state directory has no existing ancestor: {}",
+            parent.display()
+        ),
+    ))
+}
+
+fn prepare_parent_directory(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let Some(parent) = path.parent() else {
+        return Ok(Vec::new());
+    };
+
+    #[cfg(unix)]
+    let directories_to_sync = parent_directory_sync_chain(path)?;
+    #[cfg(not(unix))]
+    let directories_to_sync = Vec::new();
+
+    fs::create_dir_all(parent)?;
+    Ok(directories_to_sync)
+}
+
+#[cfg(unix)]
+fn sync_directories(directories: &[PathBuf]) -> io::Result<()> {
+    for directory in directories {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+fn sync_directories(_directories: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
@@ -928,6 +971,56 @@ mod tests {
         LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskArtifactKind,
         TaskArtifactState, TaskKind, TaskProblemCategory, TaskState,
     };
+
+    #[test]
+    fn save_creates_initially_missing_nested_state_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_directory = temp.path().join("state").join("task-store");
+        let path = state_directory.join("tasks.json");
+        assert!(!state_directory.exists());
+
+        let store = TaskStateStore::new(path.clone());
+        store
+            .save(&[])
+            .expect("task state should persist in a new nested directory");
+
+        assert!(path.is_file());
+        assert!(
+            store
+                .load()
+                .expect("persisted task state should load")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepares_new_parent_directories_for_bottom_up_sync() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first_directory = temp.path().join("state");
+        let state_directory = first_directory.join("task-store");
+        let path = state_directory.join("tasks.json");
+
+        let directories_to_sync =
+            prepare_parent_directory(&path).expect("nested parent directories should be prepared");
+
+        assert_eq!(
+            vec![
+                state_directory.clone(),
+                first_directory,
+                temp.path().to_path_buf(),
+            ],
+            directories_to_sync
+        );
+        assert!(state_directory.is_dir());
+        sync_directories(&directories_to_sync).expect("prepared directories should be syncable");
+
+        assert_eq!(
+            vec![state_directory],
+            prepare_parent_directory(&path)
+                .expect("an existing parent directory should still be prepared")
+        );
+    }
 
     #[test]
     fn load_legacy_snapshot_defaults_bilibili_schema_fields() {

@@ -101,6 +101,9 @@ superseded_by:
 - PR 6B final hardening serializes authoritative output publication with durable snapshot replacement, fsyncs the task-state parent directory, and defers startup orphan cleanup until the sanitized state rewrite is durable. Failed writes remain gated and an identical retry can recover the installed output safely.
 - Pagination now owns unique resource lease IDs, so duplicate first-page requests and snapshot-ID reuse cannot release a newer lease. Existing continuation tokens remain valid after terminal task metadata is pruned, while expired or evicted page snapshots release only their own resource lease.
 - Task-state persistence health is independent from generic resource-storage health: HLS recovery can continue when the v2 resource namespace is unavailable, while the `TASK_OUTPUT_V2` capability still requires both. Resource `HEAD` ignores `Range`, repeated `If-None-Match` fields support quoted commas, and configured public media bases are canonicalized before URI projection.
+- The final independent-review follow-up stages durable task events until their complete registry snapshot is saved, then publishes each task's latest pending event exactly once. A failed generic-output write can therefore recover through any later successful mutation without exposing a rollback-prone revision or requiring an identical retry.
+- Reused first-page snapshots atomically renew their expiry and transfer ownership to the new resource lease. First-page insertion and continuation-token resolution now include page extraction in the same page-store critical section, so concurrent capacity eviction cannot invalidate an already accepted request.
+- First-time task-state directory creation records the missing directory chain and fsyncs it from the state directory through the nearest pre-existing ancestor after the atomic state-file rename.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -114,4 +117,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite contains 548 passing unit tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the final post-review Rust suite contains 553 passing unit tests.

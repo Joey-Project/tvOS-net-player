@@ -710,19 +710,62 @@ struct TaskResultPageCursor {
     offset: usize,
 }
 
+type TaskResultPagePayload = (
+    Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+    PageInfo,
+    u64,
+);
+type TaskResultPageResult = Result<TaskResultPagePayload, Status>;
+
 impl TaskResultPageStore {
+    fn first_page(
+        &mut self,
+        snapshot: crate::task_registry::TaskOutputSnapshot,
+        now: Instant,
+        page_size: usize,
+    ) -> (TaskResultPageResult, Vec<String>, bool) {
+        let (snapshot_id, released_resource_lease_ids, inserted_new_snapshot) =
+            self.insert(snapshot, now);
+        (
+            self.page(&snapshot_id, 0, page_size),
+            released_resource_lease_ids,
+            inserted_new_snapshot,
+        )
+    }
+
+    fn continuation_page(
+        &mut self,
+        token: &str,
+        task_id: &str,
+        now: Instant,
+        page_size: usize,
+    ) -> (TaskResultPageResult, Vec<String>) {
+        let released_resource_lease_ids = self.prune(now);
+        let page = self
+            .resolve_token(token, task_id)
+            .and_then(|(snapshot_id, offset)| self.page(&snapshot_id, offset, page_size));
+        (page, released_resource_lease_ids)
+    }
+
     fn insert(
         &mut self,
         snapshot: crate::task_registry::TaskOutputSnapshot,
         now: Instant,
     ) -> (String, Vec<String>, bool) {
         let mut released_resource_lease_ids = self.prune(now);
-        if let Some(existing) = self.snapshots_by_id.get(&snapshot.snapshot_id)
+        if let Some(existing) = self.snapshots_by_id.get_mut(&snapshot.snapshot_id)
             && existing.task_id == snapshot.task_id
             && existing.revision == snapshot.revision
             && existing.results == snapshot.results
         {
-            released_resource_lease_ids.push(snapshot.resource_lease_id);
+            released_resource_lease_ids.push(std::mem::replace(
+                &mut existing.resource_lease_id,
+                snapshot.resource_lease_id,
+            ));
+            existing.expires_at = now + TASK_RESULT_PAGE_SNAPSHOT_TTL;
+            self.snapshot_order
+                .retain(|candidate| candidate != &existing.snapshot_id);
+            self.snapshot_order.push_back(existing.snapshot_id.clone());
             return (
                 existing.snapshot_id.clone(),
                 released_resource_lease_ids,
@@ -796,19 +839,7 @@ impl TaskResultPageStore {
         Ok((cursor.snapshot_id, cursor.offset))
     }
 
-    fn page(
-        &mut self,
-        snapshot_id: &str,
-        offset: usize,
-        page_size: usize,
-    ) -> Result<
-        (
-            Vec<crate::generated::tvos_net_player::v1::TaskResult>,
-            PageInfo,
-            u64,
-        ),
-        Status,
-    > {
+    fn page(&mut self, snapshot_id: &str, offset: usize, page_size: usize) -> TaskResultPageResult {
         let snapshot = self.snapshots_by_id.get_mut(snapshot_id).ok_or_else(|| {
             Status::invalid_argument("Task result snapshot is no longer available.")
         })?;
@@ -1028,50 +1059,43 @@ impl TaskService for TaskGrpcService {
         }
         let now = Instant::now();
 
-        let (snapshot_id, offset) = if page_token.is_empty() {
-            let snapshot = self
-                .state
-                .tasks
-                .retain_task_output_snapshot(&task_id, now + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
-            let (snapshot_id, released_resource_lease_ids, inserted_new_snapshot) = self
-                .result_pages
-                .lock()
-                .expect("task result page store lock poisoned")
-                .insert(snapshot, now);
-            self.state
-                .tasks
-                .release_task_output_snapshots(&released_resource_lease_ids);
-            if inserted_new_snapshot {
-                let tasks = Arc::clone(&self.state.tasks);
-                tokio::spawn(async move {
-                    sleep(TASK_RESULT_PAGE_SNAPSHOT_TTL).await;
-                    tasks.prune_expired_task_output_snapshots();
-                });
-            }
-            (snapshot_id, 0)
-        } else {
-            let (resolution, released_resource_lease_ids) = {
-                let mut pages = self
-                    .result_pages
-                    .lock()
-                    .expect("task result page store lock poisoned");
-                let released_resource_lease_ids = pages.prune(now);
-                (
-                    pages.resolve_token(page_token, &task_id),
-                    released_resource_lease_ids,
-                )
+        let ((results, page_info, output_revision), schedule_resource_prune) =
+            if page_token.is_empty() {
+                let snapshot = self
+                    .state
+                    .tasks
+                    .retain_task_output_snapshot(&task_id, now + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
+                let (page, released_resource_lease_ids, _) = {
+                    let mut pages = self
+                        .result_pages
+                        .lock()
+                        .expect("task result page store lock poisoned");
+                    pages.first_page(snapshot, now, page_size)
+                };
+                self.state
+                    .tasks
+                    .release_task_output_snapshots(&released_resource_lease_ids);
+                (page?, true)
+            } else {
+                let (page, released_resource_lease_ids) = {
+                    let mut pages = self
+                        .result_pages
+                        .lock()
+                        .expect("task result page store lock poisoned");
+                    pages.continuation_page(page_token, &task_id, now, page_size)
+                };
+                self.state
+                    .tasks
+                    .release_task_output_snapshots(&released_resource_lease_ids);
+                (page?, false)
             };
-            self.state
-                .tasks
-                .release_task_output_snapshots(&released_resource_lease_ids);
-            let (snapshot_id, offset) = resolution?;
-            (snapshot_id, offset)
-        };
-        let (results, page_info, output_revision) = self
-            .result_pages
-            .lock()
-            .expect("task result page store lock poisoned")
-            .page(&snapshot_id, offset, page_size)?;
+        if schedule_resource_prune {
+            let tasks = Arc::clone(&self.state.tasks);
+            tokio::spawn(async move {
+                sleep(TASK_RESULT_PAGE_SNAPSHOT_TTL).await;
+                tasks.prune_expired_task_output_snapshots();
+            });
+        }
         let redact_error_details = self.state.bilibili_error_details_are_sensitive();
         Ok(Response::new(ListTaskResultsResponse {
             results: results
@@ -3188,6 +3212,50 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn duplicate_task_result_first_page_renews_snapshot_and_resource_lease() {
+        let now = Instant::now();
+        let refresh_at = now + Duration::from_secs(1);
+        let results = vec![
+            task_result("result-1", TaskState::Completed),
+            task_result("result-2", TaskState::Completed),
+        ];
+        let snapshot = |resource_lease_id: &str| crate::task_registry::TaskOutputSnapshot {
+            task_id: "task-one".to_owned(),
+            revision: 7,
+            snapshot_id: "snapshot-one".to_owned(),
+            resource_lease_id: resource_lease_id.to_owned(),
+            results: results.clone(),
+            resources: Vec::new(),
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (first_page, released, inserted) = pages.first_page(snapshot("lease-old"), now, 1);
+        let first_page = first_page.expect("first page should be inserted");
+        let first_token = first_page.1.next_page_token;
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert!(!first_token.is_empty());
+
+        let (refreshed_page, released, inserted) =
+            pages.first_page(snapshot("lease-new"), refresh_at, 1);
+        let refreshed_page = refreshed_page.expect("duplicate first page should be served");
+        assert!(!inserted);
+        assert_eq!(vec!["lease-old"], released);
+        assert_eq!(first_token, refreshed_page.1.next_page_token);
+
+        assert!(
+            pages
+                .prune(now + TASK_RESULT_PAGE_SNAPSHOT_TTL + Duration::from_millis(500))
+                .is_empty(),
+            "the refreshed snapshot must outlive its original expiry"
+        );
+        assert_eq!(
+            vec!["lease-new"],
+            pages.prune(refresh_at + TASK_RESULT_PAGE_SNAPSHOT_TTL)
+        );
+    }
 
     #[tokio::test]
     async fn get_server_info_advertises_bilibili_resolve_capability() {
