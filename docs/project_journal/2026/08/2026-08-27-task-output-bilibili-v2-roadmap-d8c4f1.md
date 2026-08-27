@@ -104,6 +104,11 @@ superseded_by:
 - The final independent-review follow-up stages durable task events until their complete registry snapshot is saved, then publishes each task's latest pending event exactly once. A failed generic-output write can therefore recover through any later successful mutation without exposing a rollback-prone revision or requiring an identical retry.
 - Reused first-page snapshots atomically renew their expiry and transfer ownership to the new resource lease. First-page insertion and continuation-token resolution now include page extraction in the same page-store critical section, so concurrent capacity eviction cannot invalidate an already accepted request.
 - First-time task-state directory creation records the missing directory chain and fsyncs it from the state directory through the nearest pre-existing ancestor after the atomic state-file rename.
+- Durability-required output replacement and cache deletion now use rollback checkpoints. A failed snapshot save restores the previously durable task, output, queue, cancellation, cleanup, and pending-publication view before releasing the registry lock, while persistence generations remain monotonic for recovery. `GetTask`, new subscriptions, resource authorization, and restart therefore cannot observe a rejected authoritative mutation.
+- Whole-task cache-deletion tombstones advance the previous output revision and use a fresh snapshot identity, so clients cannot discard a deletion event as stale.
+- Task-result pagination uses one reaper per shared page store instead of one sleeper per first-page request. The reaper expires page snapshots and continuation tokens during idle periods and releases exactly their retained resource leases.
+- Resource ownership, immutable-representation validation, and cleanup authorization build hash maps or sets once per operation, keeping maximum-sized output updates and cleanup scans linear rather than quadratic.
+- Retired task resources remove both the `body` file and their now-empty opaque-ID directory through fd-relative no-follow operations. Startup scans are bounded, unexpected non-empty directories remain reserved for retry, and repeated HTTP `Range` fields are rejected before a partial response is selected.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -117,4 +122,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the final post-review Rust suite contains 553 passing unit tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the final post-review Rust suite contains 564 passing unit tests.

@@ -930,9 +930,10 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
 }
 
 #[cfg(unix)]
-pub(crate) fn list_directory_names_no_follow(
+pub(crate) fn list_directory_names_no_follow_bounded(
     root_path: &Path,
     relative_path: &str,
+    max_names: usize,
 ) -> io::Result<Vec<String>> {
     use std::{
         ffi::CStr,
@@ -961,16 +962,16 @@ pub(crate) fn list_directory_names_no_follow(
         unsafe { libc::close(fd) };
         return Err(error);
     }
+    let stream = DirectoryStream { stream };
 
     let mut names = Vec::new();
+    let mut entry_count = 0_usize;
     loop {
         set_errno(0);
         // SAFETY: stream remains open and exclusively owned until closedir below.
-        let entry = unsafe { libc::readdir(stream) };
+        let entry = unsafe { libc::readdir(stream.stream) };
         if entry.is_null() {
             let error = io::Error::last_os_error();
-            // SAFETY: stream was returned by fdopendir and is closed exactly once.
-            unsafe { libc::closedir(stream) };
             return if error.raw_os_error() == Some(0) {
                 Ok(names)
             } else {
@@ -982,16 +983,37 @@ pub(crate) fn list_directory_names_no_follow(
         if matches!(bytes, b"." | b"..") {
             continue;
         }
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > max_names {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory entry limit exceeded: {max_names}"),
+            ));
+        }
         if let Ok(name) = std::str::from_utf8(bytes) {
             names.push(name.to_owned());
         }
     }
 }
 
+#[cfg(unix)]
+struct DirectoryStream {
+    stream: *mut libc::DIR,
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: stream was returned by fdopendir and is owned by this wrapper.
+        unsafe { libc::closedir(self.stream) };
+    }
+}
+
 #[cfg(not(unix))]
-pub(crate) fn list_directory_names_no_follow(
+pub(crate) fn list_directory_names_no_follow_bounded(
     _root_path: &Path,
     _relative_path: &str,
+    _max_names: usize,
 ) -> io::Result<Vec<String>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1046,6 +1068,55 @@ pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io
 #[cfg(not(unix))]
 pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
     fs::remove_file(root_path.join(relative_path))
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_empty_directory_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        directory = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )?;
+    }
+
+    // Protect path containment and no-follow access policy, not continuity of the leaf's
+    // identity across calls: every parent is verified, and unlinkat removes only its named empty
+    // child. A replacement that is not an empty directory fails instead of being traversed.
+    // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
+    let result = unsafe {
+        libc::unlinkat(
+            directory.as_raw_fd(),
+            segments.last().expect("segments is not empty").as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_empty_directory_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory removal is not implemented on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1355,6 +1426,138 @@ mod tests {
                 .expect("internal cache delete should be ignored")
         );
         assert!(internal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_removes_empty_leaf_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+        fs::create_dir_all(&resource_dir).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect("empty resource directory should be removed");
+
+        assert!(!resource_dir.exists());
+        assert!(root_path.join(".tvos-net-player/resources").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_rejects_non_empty_leaf_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+        fs::create_dir_all(&resource_dir).unwrap();
+        fs::write(resource_dir.join("body"), b"resource").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+
+        let error =
+            remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+                .expect_err("non-empty resource directory must not be removed");
+
+        assert_eq!(io::ErrorKind::DirectoryNotEmpty, error.kind());
+        assert!(resource_dir.is_dir());
+        assert!(resource_dir.join("body").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_refuses_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        let outside_dir = temp.path().join("outside-resource");
+        fs::create_dir_all(&resources_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, resources_dir.join("resource-1")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let link_path = root_path.join(".tvos-net-player/resources/resource-1");
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect_err("symlink leaf must not be followed or removed");
+
+        assert!(outside_dir.is_dir());
+        assert!(
+            fs::symlink_metadata(link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_refuses_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_dir = root_path.join(".tvos-net-player");
+        let outside_resources = temp.path().join("outside-resources");
+        let outside_resource_dir = outside_resources.join("resource-1");
+        fs::create_dir_all(&internal_dir).unwrap();
+        fs::create_dir_all(&outside_resource_dir).unwrap();
+        symlink(&outside_resources, internal_dir.join("resources")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect_err("symlink parent must not be followed");
+
+        assert!(outside_resource_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_rejects_non_normal_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        for relative_path in [
+            "",
+            ".",
+            "../resource-1",
+            ".tvos-net-player/../resource-1",
+            "/resource-1",
+        ] {
+            let error = remove_empty_directory_no_follow(&root_path, relative_path)
+                .expect_err("non-normal directory path should be rejected");
+            assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_directory_names_no_follow_bounded_fails_when_limit_is_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        fs::create_dir_all(resources_dir.join("resource-a")).unwrap();
+        fs::create_dir_all(resources_dir.join("resource-b")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        let error =
+            list_directory_names_no_follow_bounded(&root_path, ".tvos-net-player/resources", 1)
+                .expect_err("directory listing should fail after the configured limit");
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut names =
+            list_directory_names_no_follow_bounded(&root_path, ".tvos-net-player/resources", 2)
+                .expect("directory listing should fit within the configured limit");
+        names.sort();
+        assert_eq!(
+            vec!["resource-a".to_owned(), "resource-b".to_owned()],
+            names
+        );
     }
 
     #[test]

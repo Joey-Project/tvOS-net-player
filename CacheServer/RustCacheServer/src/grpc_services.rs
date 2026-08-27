@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant, SystemTime},
+    sync::{Arc, Mutex as StdMutex, Weak},
+    time::{Duration, Instant as StdInstant, SystemTime},
 };
 
 use bbdown_core::{
@@ -10,7 +10,10 @@ use bbdown_core::{
     DEFAULT_CREDENTIAL_PROFILE,
 };
 use futures_core::Stream;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, sleep},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -95,6 +98,7 @@ const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
 const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
 const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
+const TASK_RESULT_PAGE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -683,6 +687,24 @@ impl TaskGrpcService {
             result_pages,
         }
     }
+
+    fn ensure_result_page_reaper_started(&self) -> bool {
+        let should_start = {
+            let mut pages = self
+                .result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            pages.mark_reaper_started()
+        };
+        if should_start {
+            spawn_task_result_page_reaper(
+                Arc::downgrade(&self.result_pages),
+                Arc::downgrade(&self.state.tasks),
+                TASK_RESULT_PAGE_REAPER_INTERVAL,
+            );
+        }
+        should_start
+    }
 }
 
 #[derive(Default)]
@@ -690,6 +712,7 @@ pub(crate) struct TaskResultPageStore {
     snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
     snapshot_order: VecDeque<String>,
     cursors_by_token: HashMap<String, TaskResultPageCursor>,
+    reaper_started: bool,
 }
 
 #[derive(Clone)]
@@ -718,6 +741,14 @@ type TaskResultPagePayload = (
 type TaskResultPageResult = Result<TaskResultPagePayload, Status>;
 
 impl TaskResultPageStore {
+    fn mark_reaper_started(&mut self) -> bool {
+        if self.reaper_started {
+            return false;
+        }
+        self.reaper_started = true;
+        true
+    }
+
     fn first_page(
         &mut self,
         snapshot: crate::task_registry::TaskOutputSnapshot,
@@ -906,6 +937,42 @@ impl TaskResultPageStore {
     }
 }
 
+fn spawn_task_result_page_reaper(
+    result_pages: Weak<StdMutex<TaskResultPageStore>>,
+    tasks: Weak<BilibiliTaskRegistry>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            if !prune_task_result_pages_once(&result_pages, &tasks, Instant::now()) {
+                return;
+            }
+            sleep(interval).await;
+        }
+    });
+}
+
+fn prune_task_result_pages_once(
+    result_pages: &Weak<StdMutex<TaskResultPageStore>>,
+    tasks: &Weak<BilibiliTaskRegistry>,
+    now: Instant,
+) -> bool {
+    let Some(result_pages) = result_pages.upgrade() else {
+        return false;
+    };
+    let Some(tasks) = tasks.upgrade() else {
+        return false;
+    };
+    let released_resource_lease_ids = {
+        let mut pages = result_pages
+            .lock()
+            .expect("task result page store lock poisoned");
+        pages.prune(now)
+    };
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    true
+}
+
 #[tonic::async_trait]
 impl TaskService for TaskGrpcService {
     type WatchTasksStream = Pin<Box<dyn Stream<Item = Result<TaskEvent, Status>> + Send + 'static>>;
@@ -1057,45 +1124,38 @@ impl TaskService for TaskGrpcService {
                 "Task result page token is too long.",
             ));
         }
+        self.ensure_result_page_reaper_started();
         let now = Instant::now();
 
-        let ((results, page_info, output_revision), schedule_resource_prune) =
-            if page_token.is_empty() {
-                let snapshot = self
-                    .state
-                    .tasks
-                    .retain_task_output_snapshot(&task_id, now + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
-                let (page, released_resource_lease_ids, _) = {
-                    let mut pages = self
-                        .result_pages
-                        .lock()
-                        .expect("task result page store lock poisoned");
-                    pages.first_page(snapshot, now, page_size)
-                };
-                self.state
-                    .tasks
-                    .release_task_output_snapshots(&released_resource_lease_ids);
-                (page?, true)
-            } else {
-                let (page, released_resource_lease_ids) = {
-                    let mut pages = self
-                        .result_pages
-                        .lock()
-                        .expect("task result page store lock poisoned");
-                    pages.continuation_page(page_token, &task_id, now, page_size)
-                };
-                self.state
-                    .tasks
-                    .release_task_output_snapshots(&released_resource_lease_ids);
-                (page?, false)
+        let (results, page_info, output_revision) = if page_token.is_empty() {
+            let snapshot = self.state.tasks.retain_task_output_snapshot(
+                &task_id,
+                StdInstant::now() + TASK_RESULT_PAGE_SNAPSHOT_TTL,
+            )?;
+            let (page, released_resource_lease_ids, _) = {
+                let mut pages = self
+                    .result_pages
+                    .lock()
+                    .expect("task result page store lock poisoned");
+                pages.first_page(snapshot, now, page_size)
             };
-        if schedule_resource_prune {
-            let tasks = Arc::clone(&self.state.tasks);
-            tokio::spawn(async move {
-                sleep(TASK_RESULT_PAGE_SNAPSHOT_TTL).await;
-                tasks.prune_expired_task_output_snapshots();
-            });
-        }
+            self.state
+                .tasks
+                .release_task_output_snapshots(&released_resource_lease_ids);
+            page?
+        } else {
+            let (page, released_resource_lease_ids) = {
+                let mut pages = self
+                    .result_pages
+                    .lock()
+                    .expect("task result page store lock poisoned");
+                pages.continuation_page(page_token, &task_id, now, page_size)
+            };
+            self.state
+                .tasks
+                .release_task_output_snapshots(&released_resource_lease_ids);
+            page?
+        };
         let redact_error_details = self.state.bilibili_error_details_are_sensitive();
         Ok(Response::new(ListTaskResultsResponse {
             results: results
@@ -3255,6 +3315,123 @@ mod tests {
             vec!["lease-new"],
             pages.prune(refresh_at + TASK_RESULT_PAGE_SNAPSHOT_TTL)
         );
+    }
+
+    #[tokio::test]
+    async fn task_result_page_reaper_starts_once_for_a_shared_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first_listener_service = TaskGrpcService::new(state.clone());
+        let second_listener_service = TaskGrpcService::new(state);
+
+        assert!(first_listener_service.ensure_result_page_reaper_started());
+        assert!(!second_listener_service.ensure_result_page_reaper_started());
+    }
+
+    #[tokio::test]
+    async fn task_result_page_reaper_prunes_idle_snapshots_and_releases_resource_leases() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1idle-snapshot", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "idle-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 42,
+            size_known: true,
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    TaskResult {
+                        id: "result-2".to_owned(),
+                        state: TaskState::Completed.into(),
+                        artifacts: vec![TaskArtifact {
+                            id: "cover".to_owned(),
+                            kind: TaskArtifactKind::CoverImage.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(resource.resource.clone()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let snapshot = state
+            .tasks
+            .retain_task_output_snapshot(&task.id, StdInstant::now() + Duration::from_secs(60 * 60))
+            .expect("snapshot should be retained");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("latest task output should remove the resource");
+
+        let result_pages = Arc::clone(&state.task_result_pages);
+        let expired_snapshot_start = Instant::now()
+            .checked_sub(TASK_RESULT_PAGE_SNAPSHOT_TTL + Duration::from_millis(1))
+            .expect("snapshot start should be representable");
+        let continuation_token = {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock should be available");
+            let (page, released_resource_lease_ids, inserted) =
+                pages.first_page(snapshot, expired_snapshot_start, 1);
+            assert!(inserted);
+            assert!(released_resource_lease_ids.is_empty());
+            let page = page.expect("expired snapshot should still be inserted before reaping");
+            page.1.next_page_token
+        };
+        assert!(!continuation_token.is_empty());
+        assert!(state.tasks.task_resource("idle-cover").is_some());
+
+        assert!(prune_task_result_pages_once(
+            &Arc::downgrade(&result_pages),
+            &Arc::downgrade(&state.tasks),
+            Instant::now(),
+        ));
+
+        assert!(state.tasks.task_resource("idle-cover").is_none());
+        let (page, released_resource_lease_ids) = {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock should be available");
+            assert!(pages.snapshots_by_id.is_empty());
+            assert!(pages.cursors_by_token.is_empty());
+            pages.continuation_page(&continuation_token, &task.id, Instant::now(), 1)
+        };
+        assert!(released_resource_lease_ids.is_empty());
+        let status = page.expect_err("reaped continuation token should be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, status.code());
     }
 
     #[tokio::test]

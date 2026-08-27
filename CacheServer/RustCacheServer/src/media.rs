@@ -171,11 +171,24 @@ async fn resource_response(
         );
     }
 
-    let range_header = (!head_only
+    let range_header = if !head_only
         && resource.supports_byte_ranges
-        && range_validator_matches(&headers, etag.as_ref(), opened_resource.last_modified))
-    .then(|| headers.get(RANGE))
-    .flatten();
+        && range_validator_matches(&headers, etag.as_ref(), opened_resource.last_modified)
+    {
+        match single_range_header(&headers) {
+            Ok(range_header) => range_header,
+            Err(_) => {
+                return resource_range_not_satisfiable_response(
+                    opened_resource.size_bytes,
+                    &resource.content_type,
+                    resource.supports_byte_ranges,
+                    &resource.etag,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let requested_range = match parse_range(range_header, opened_resource.size_bytes) {
         Ok(range) => range,
         Err(_) => {
@@ -1109,6 +1122,16 @@ fn weak_etag_value(value: &str) -> &str {
     value.strip_prefix("W/").unwrap_or(value)
 }
 
+fn single_range_header(headers: &HeaderMap) -> Result<Option<&HeaderValue>, ()> {
+    let mut values = headers.get_all(RANGE).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(());
+    }
+
+    Ok(first)
+}
+
 fn range_validator_matches(
     headers: &HeaderMap,
     etag: Option<&HeaderValue>,
@@ -1717,6 +1740,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_resource_get_rejects_repeated_range_header_fields() {
+        let body = b"0123456789abcdef";
+        let fixture =
+            task_resource_fixture(test_resource("resource-repeated-range", body), Some(body));
+        let mut headers = HeaderMap::new();
+        headers.append(RANGE, HeaderValue::from_static("bytes=2-5"));
+        headers.append(RANGE, HeaderValue::from_static("bytes=6-7"));
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, response.status());
+        assert_eq!("bytes */16", response.headers()[CONTENT_RANGE]);
+        assert_eq!("text/vtt; charset=utf-8", response.headers()[CONTENT_TYPE]);
+        assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
+        assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn task_resource_honors_conditional_get_validators() {
         let body = b"0123456789abcdef";
         let fixture =
@@ -1809,6 +1861,33 @@ mod tests {
                 &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn task_resource_get_ignores_repeated_range_header_fields_when_if_range_mismatches() {
+        let body = b"0123456789abcdef";
+        let fixture = task_resource_fixture(
+            test_resource("resource-if-range-repeated", body),
+            Some(body),
+        );
+        let mut headers = HeaderMap::new();
+        headers.append(RANGE, HeaderValue::from_static("bytes=2-5"));
+        headers.append(RANGE, HeaderValue::from_static("bytes=6-7"));
+        headers.insert(IF_RANGE, HeaderValue::from_static("\"stale\""));
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert!(!response.headers().contains_key(CONTENT_RANGE));
+        assert_eq!(
+            body.as_slice(),
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
+        );
     }
 
     #[tokio::test]

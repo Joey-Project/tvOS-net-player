@@ -45,6 +45,10 @@ impl TaskResourceRecord {
     pub(crate) fn relative_path_for_id(id: &str) -> String {
         format!("{INTERNAL_RESOURCE_DIR}/{id}/body")
     }
+
+    pub(crate) fn relative_directory_for_id(id: &str) -> String {
+        format!("{INTERNAL_RESOURCE_DIR}/{id}")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +72,14 @@ impl TaskOutputRecord {
             resources: Vec::new(),
             legacy_managed: true,
         }
+    }
+
+    pub(crate) fn removed_task_tombstone(task: &Task, previous: Option<&Self>) -> Self {
+        let mut output = Self::from_legacy_task(task);
+        if let Some(previous) = previous {
+            output.revision = previous.revision.saturating_add(1).max(1);
+        }
+        output
     }
 
     pub(crate) fn replace(
@@ -234,12 +246,6 @@ impl TaskOutputRecord {
                     .find(|record| record.resource.id == id)
             })
             .flatten()
-    }
-
-    pub(crate) fn contains_resource_id(&self, id: &str) -> bool {
-        self.resources
-            .iter()
-            .any(|record| record.resource.id.eq_ignore_ascii_case(id))
     }
 
     pub(crate) fn mark_playback_cache_deleted(
@@ -555,12 +561,14 @@ fn validate_resource_representations(
     let Some(previous) = previous else {
         return Ok(());
     };
+    let previous_by_id = previous
+        .resources
+        .iter()
+        .map(|resource| (resource.resource.id.as_str(), resource))
+        .collect::<HashMap<_, _>>();
     for resource in resources {
-        if let Some(existing) = previous
-            .resources
-            .iter()
-            .find(|existing| existing.resource.id == resource.resource.id)
-            && existing != resource
+        if let Some(existing) = previous_by_id.get(resource.resource.id.as_str())
+            && *existing != resource
         {
             return Err(TaskOutputValidationError::new(format!(
                 "task resource id cannot be reused for a different representation: {}",
@@ -789,5 +797,27 @@ mod tests {
         assert_eq!("task-one", output.results[0].id);
         assert_eq!(0.25, output.results[0].progress.as_ref().unwrap().fraction);
         assert_eq!(1, output.summary().revision);
+    }
+
+    #[test]
+    fn removed_task_tombstone_advances_the_previous_revision() {
+        let task = Task {
+            id: "task-one".to_owned(),
+            kind: TaskKind::BilibiliDownload.into(),
+            state: TaskState::Completed.into(),
+            ..Default::default()
+        };
+        let mut previous = TaskOutputRecord::from_legacy_task(&task);
+        previous.revision = 17;
+        let failed = Task {
+            state: TaskState::Failed.into(),
+            ..task
+        };
+
+        let tombstone = TaskOutputRecord::removed_task_tombstone(&failed, Some(&previous));
+
+        assert_eq!(18, tombstone.revision);
+        assert_ne!(previous.snapshot_id, tombstone.snapshot_id);
+        assert_eq!(TaskState::Failed, tombstone.results[0].state());
     }
 }
