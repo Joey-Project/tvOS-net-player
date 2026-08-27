@@ -3490,7 +3490,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3743,7 +3743,7 @@ mod tests {
     async fn list_task_results_continuation_survives_task_retention() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             task_retention_max_terminal_tasks: 1,
             bilibili_worker_enabled: false,
@@ -3814,7 +3814,7 @@ mod tests {
     async fn list_task_results_rejects_unknown_and_cross_task_tokens() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3953,7 +3953,7 @@ mod tests {
     async fn list_task_results_enforces_default_and_maximum_page_sizes() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -4014,7 +4014,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
             bilibili_worker_enabled: false,
@@ -4080,7 +4080,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -4154,6 +4154,12 @@ mod tests {
             .expect("old snapshot resource should remain projected");
         assert_eq!("snapshot-cover", returned_resource.id);
         assert!(state.tasks.task_resource("snapshot-cover").is_some());
+    }
+
+    fn initialized_cache_root(temp: &tempfile::TempDir) -> PathBuf {
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        root_path
     }
 
     fn task_result(id: &str, state: TaskState) -> TaskResult {

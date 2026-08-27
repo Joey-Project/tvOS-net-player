@@ -23,7 +23,7 @@ use crate::{
     },
     hls_cache::HlsCacheStore,
     library::{
-        list_directory_names_no_follow_bounded, open_read_no_follow,
+        list_optional_directory_names_no_follow_bounded, open_read_no_follow,
         remove_empty_directory_no_follow, remove_file_no_follow,
     },
     task_output::{TaskOutputRecord, TaskResourceRecord, resource_id_is_canonical},
@@ -151,6 +151,22 @@ impl BilibiliTaskRegistry {
             .expect("test registry must have persistence")
             .store
             .fail_next_directory_sync();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_resource_cleanup_for_test(
+        &self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _guard = self
+            .resource_cleanup_lock
+            .lock()
+            .expect("task resource cleanup lock poisoned");
+        ready.send(()).expect("test should observe cleanup lock");
+        release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("test should release cleanup lock");
     }
 
     #[cfg(test)]
@@ -412,12 +428,19 @@ impl BilibiliTaskRegistry {
             .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        let visible_resource_ids = inner
+            .visible_outputs_by_task_id
+            .values()
+            .flat_map(|output| output.available_resources_by_id.keys())
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         for resource in &resources {
             let resource_id = resource.resource.id.as_str();
             let current_task_owns_id = current_task_resource_ids.contains(resource_id);
             if other_task_resource_ids.contains(resource_id)
                 || (!current_task_owns_id
-                    && (retained_resource_ids.contains(resource_id)
+                    && (visible_resource_ids.contains(resource_id)
+                        || retained_resource_ids.contains(resource_id)
                         || inner.pending_resource_cleanup_ids.contains(resource_id)
                         || inner.durable_resource_cleanup_ids.contains(resource_id)))
             {
@@ -2309,6 +2332,7 @@ impl BilibiliTaskRegistry {
             _ => PersistenceCommitOutcome::Rejected,
         };
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let mut rejected_resources_need_cleanup = false;
         match outcome {
             PersistenceCommitOutcome::Durable
             | PersistenceCommitOutcome::InstalledButNotDurable => {
@@ -2336,7 +2360,23 @@ impl BilibiliTaskRegistry {
             }
             PersistenceCommitOutcome::Rejected => {
                 if let Some(checkpoint) = rollback_checkpoint {
+                    let rejected_resource_candidates = self
+                        .resource_root_path
+                        .as_ref()
+                        .map(|_| output_resource_ids_locked(&inner))
+                        .unwrap_or_default();
                     checkpoint.restore(&mut inner);
+                    if !rejected_resource_candidates.is_empty() {
+                        let reserved_resource_ids = reserved_resource_ids_locked(&inner);
+                        let orphaned_resource_ids = rejected_resource_candidates
+                            .into_iter()
+                            .filter(|resource_id| !reserved_resource_ids.contains(resource_id))
+                            .collect::<Vec<_>>();
+                        rejected_resources_need_cleanup = !orphaned_resource_ids.is_empty();
+                        inner
+                            .durable_resource_cleanup_ids
+                            .extend(orphaned_resource_ids);
+                    }
                 }
             }
             PersistenceCommitOutcome::Superseded => {
@@ -2353,6 +2393,8 @@ impl BilibiliTaskRegistry {
             } else {
                 self.cleanup_durable_resource_bodies();
             }
+        } else if rejected_resources_need_cleanup {
+            self.cleanup_durable_resource_bodies();
         }
         outcome
     }
@@ -2544,13 +2586,13 @@ impl BilibiliTaskRegistry {
         let Some(resource_root_path) = self.resource_root_path.as_ref() else {
             return true;
         };
-        let resource_ids = match list_directory_names_no_follow_bounded(
+        let resource_ids = match list_optional_directory_names_no_follow_bounded(
             resource_root_path,
             ".tvos-net-player/resources",
             MAX_TASK_RESOURCE_DIRECTORY_NAMES,
         ) {
-            Ok(resource_ids) => resource_ids,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Ok(Some(resource_ids)) => resource_ids,
+            Ok(None) => return true,
             Err(error) => {
                 self.resource_storage_available
                     .store(false, AtomicOrdering::Release);
@@ -2558,14 +2600,22 @@ impl BilibiliTaskRegistry {
                 return false;
             }
         };
+        if let Some(resource_id) = resource_ids
+            .iter()
+            .find(|resource_id| !resource_id_is_canonical(resource_id))
+        {
+            self.resource_storage_available
+                .store(false, AtomicOrdering::Release);
+            eprintln!(
+                "Task resource storage contains a noncanonical directory name; remove it before task output v2 can be enabled: {resource_id}"
+            );
+            return false;
+        }
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let authorized_resource_ids = authorized_resource_ids_locked(&inner);
         let orphaned_resource_ids = resource_ids
             .into_iter()
-            .filter(|resource_id| {
-                resource_id_is_canonical(resource_id)
-                    && !authorized_resource_ids.contains(resource_id.as_str())
-            })
+            .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
             .collect::<Vec<_>>();
         drop(authorized_resource_ids);
         for resource_id in orphaned_resource_ids {
@@ -3749,6 +3799,33 @@ fn authorized_resource_ids_locked(inner: &RegistryInner) -> HashSet<&str> {
                 .values()
                 .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
                 .map(String::as_str),
+        )
+        .collect()
+}
+
+fn output_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
+    inner
+        .outputs_by_task_id
+        .values()
+        .flat_map(|output| &output.resources)
+        .map(|resource| resource.resource.id.clone())
+        .collect()
+}
+
+fn reserved_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
+    output_resource_ids_locked(inner)
+        .into_iter()
+        .chain(
+            inner
+                .visible_outputs_by_task_id
+                .values()
+                .flat_map(|output| output.available_resources_by_id.keys().cloned()),
+        )
+        .chain(
+            inner
+                .retained_resource_snapshots
+                .values()
+                .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys().cloned()),
         )
         .collect()
 }
@@ -6839,7 +6916,13 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
-        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
         let task = registry
             .create_bilibili_task("BV1generic-watch", None)
             .expect("task should be created durably");
@@ -6858,6 +6941,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let resource_path = root_path.join(resource.relative_path());
+        std::fs::create_dir_all(resource_path.parent().unwrap())
+            .expect("staged resource directory should be created");
+        std::fs::write(&resource_path, b"old!").expect("staged resource body should be written");
         let results = vec![TaskResult {
             id: "result-one".to_owned(),
             state: TaskState::Completed.into(),
@@ -6886,6 +6973,8 @@ mod tests {
             visible_output.output.record.results
         );
         assert!(registry.task_resource("failed-output-resource").is_none());
+        assert!(!resource_path.exists());
+        assert!(!resource_path.parent().unwrap().exists());
         assert!(
             tokio::time::timeout(Duration::from_millis(25), subscription.recv())
                 .await
@@ -6925,6 +7014,9 @@ mod tests {
             "a reconnected watcher must not receive the rolled-back output"
         );
 
+        std::fs::create_dir_all(resource_path.parent().unwrap())
+            .expect("retry resource directory should be created");
+        std::fs::write(&resource_path, b"new!").expect("retry resource body should be written");
         registry
             .replace_task_output(&task.id, results.clone(), vec![resource.clone()])
             .expect("an explicit retry should persist the authoritative output");
@@ -7340,6 +7432,55 @@ mod tests {
         assert!(registry.persistence_available());
         assert!(!resource_path.exists());
         assert!(!resource_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn missing_cache_root_keeps_resource_v2_disabled_until_a_retry_can_scan_it() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("missing-cache");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+
+        assert!(registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
+
+        std::fs::create_dir(&root_path).expect("cache root should become available");
+        registry
+            .create_bilibili_task("BV1resource-root-recovery", None)
+            .expect("a durable mutation should retry the resource scan");
+
+        assert!(registry.task_output_v2_available());
+    }
+
+    #[test]
+    fn noncanonical_resource_directory_keeps_v2_disabled_until_removed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let noncanonical_directory = root_path.join(".tvos-net-player/resources/Cover-One");
+        std::fs::create_dir_all(&noncanonical_directory)
+            .expect("noncanonical resource directory should be created");
+        std::fs::write(noncanonical_directory.join("body"), b"stale")
+            .expect("stale resource body should be written");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert!(registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
+        assert!(noncanonical_directory.join("body").exists());
+
+        std::fs::remove_dir_all(&noncanonical_directory)
+            .expect("operator should remove the ambiguous directory");
+        registry
+            .create_bilibili_task("BV1resource-name-recovery", None)
+            .expect("a durable mutation should retry the resource scan");
+
+        assert!(registry.task_output_v2_available());
     }
 
     #[cfg(unix)]

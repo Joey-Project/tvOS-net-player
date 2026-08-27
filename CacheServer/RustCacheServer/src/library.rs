@@ -900,16 +900,23 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
     ))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn list_directory_names_no_follow_bounded(
     root_path: &Path,
     relative_path: &str,
     max_names: usize,
 ) -> io::Result<Vec<String>> {
-    use std::{
-        ffi::CStr,
-        os::fd::{AsRawFd, IntoRawFd},
-    };
+    list_optional_directory_names_no_follow_bounded(root_path, relative_path, max_names)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "managed directory does not exist"))
+}
+
+#[cfg(unix)]
+pub(crate) fn list_optional_directory_names_no_follow_bounded(
+    root_path: &Path,
+    relative_path: &str,
+    max_names: usize,
+) -> io::Result<Option<Vec<String>>> {
+    use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
     let mut directory = open_path(
@@ -917,12 +924,23 @@ pub(crate) fn list_directory_names_no_follow_bounded(
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
     )?;
     for segment in &segments {
-        directory = open_at(
+        directory = match open_at(
             directory.as_raw_fd(),
             segment,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-        )?;
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
     }
+
+    list_open_directory_names_bounded(directory, max_names).map(Some)
+}
+
+#[cfg(unix)]
+fn list_open_directory_names_bounded(directory: File, max_names: usize) -> io::Result<Vec<String>> {
+    use std::{ffi::CStr, os::fd::IntoRawFd};
 
     let fd = directory.into_raw_fd();
     // SAFETY: fd is a uniquely owned open directory descriptor transferred to fdopendir.
@@ -961,9 +979,13 @@ pub(crate) fn list_directory_names_no_follow_bounded(
                 format!("directory entry limit exceeded: {max_names}"),
             ));
         }
-        if let Ok(name) = std::str::from_utf8(bytes) {
-            names.push(name.to_owned());
-        }
+        let name = std::str::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory contains a non-UTF-8 entry name",
+            )
+        })?;
+        names.push(name.to_owned());
     }
 }
 
@@ -980,12 +1002,24 @@ impl Drop for DirectoryStream {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), test))]
 pub(crate) fn list_directory_names_no_follow_bounded(
     _root_path: &Path,
     _relative_path: &str,
     _max_names: usize,
 ) -> io::Result<Vec<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory listing is not implemented on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn list_optional_directory_names_no_follow_bounded(
+    _root_path: &Path,
+    _relative_path: &str,
+    _max_names: usize,
+) -> io::Result<Option<Vec<String>>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow directory listing is not implemented on this platform",

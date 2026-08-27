@@ -146,7 +146,16 @@ async fn resource_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let Some(opened_resource) = state.state.tasks.open_task_resource(&resource_id) else {
+    let tasks = Arc::clone(&state.state.tasks);
+    let opened_resource =
+        tokio::task::spawn_blocking(move || tasks.open_task_resource(&resource_id)).await;
+    let Some(opened_resource) = (match opened_resource {
+        Ok(opened_resource) => opened_resource,
+        Err(error) => {
+            eprintln!("Task resource open worker failed: {error}");
+            None
+        }
+    }) else {
         return resource_not_found_response();
     };
     let resource = opened_resource.record.resource;
@@ -1672,6 +1681,43 @@ mod tests {
             body.as_slice(),
             &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_resource_open_keeps_the_async_executor_responsive() {
+        let body = b"blocking-pool";
+        let fixture = task_resource_fixture(test_resource("resource-blocking", body), Some(body));
+        let tasks = Arc::clone(&fixture.state.state.tasks);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            tasks.block_resource_cleanup_for_test(ready_tx, release_rx);
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup lock holder should start");
+
+        let started = std::time::Instant::now();
+        let request = tokio::spawn(resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let executor_stayed_responsive = started.elapsed() < Duration::from_millis(500);
+
+        let _ = release_tx.send(());
+        holder.join().expect("cleanup lock holder should stop");
+        assert!(
+            executor_stayed_responsive,
+            "resource authorization and open must run outside the async executor"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("resource request should finish after cleanup is released")
+            .expect("resource request task should not panic");
+        assert_eq!(StatusCode::OK, response.status());
     }
 
     #[tokio::test]
