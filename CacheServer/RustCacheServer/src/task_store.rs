@@ -1,8 +1,14 @@
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
+};
+
+#[cfg(test)]
+use std::sync::{
+    Barrier, Mutex,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
 use prost_types::Timestamp;
@@ -19,16 +25,34 @@ use crate::task_output::{TaskOutputRecord, TaskResourceRecord};
 
 const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
 const TASK_STATE_SCHEMA_VERSION: u32 = 2;
+const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+
+#[cfg(test)]
+type TaskStateSaveBarriers = (Arc<Barrier>, Arc<Barrier>);
 
 #[derive(Clone)]
 pub(crate) struct TaskStateStore {
     path: Arc<PathBuf>,
+    #[cfg(test)]
+    fail_next_directory_sync: Arc<AtomicBool>,
+    #[cfg(test)]
+    next_save_barriers: Arc<Mutex<Option<TaskStateSaveBarriers>>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum TaskStateSaveOutcome {
+    Durable,
+    InstalledButNotDurable(io::Error),
 }
 
 impl TaskStateStore {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Arc::new(path.into()),
+            #[cfg(test)]
+            fail_next_directory_sync: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            next_save_barriers: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -37,11 +61,20 @@ impl TaskStateStore {
     }
 
     pub(crate) fn load(&self) -> io::Result<Vec<PersistedTaskRecord>> {
-        let bytes = match fs::read(self.path()) {
-            Ok(bytes) => bytes,
+        let file = match File::open(self.path()) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
+        if file.metadata()?.len() > MAX_TASK_STATE_SNAPSHOT_BYTES as u64 {
+            return Err(snapshot_size_error());
+        }
+        let mut bytes = Vec::new();
+        file.take((MAX_TASK_STATE_SNAPSHOT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_TASK_STATE_SNAPSHOT_BYTES {
+            return Err(snapshot_size_error());
+        }
         let snapshot: PersistedTaskSnapshot =
             serde_json::from_slice(&bytes).map_err(invalid_data)?;
         if !matches!(
@@ -65,8 +98,18 @@ impl TaskStateStore {
             .collect()
     }
 
-    pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<()> {
+    pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
         let directories_to_sync = prepare_parent_directory(self.path())?;
+        #[cfg(test)]
+        if let Some((entered, resume)) = self
+            .next_save_barriers
+            .lock()
+            .expect("task state save barrier lock poisoned")
+            .take()
+        {
+            entered.wait();
+            resume.wait();
+        }
 
         let snapshot = PersistedTaskSnapshot {
             schema_version: TASK_STATE_SCHEMA_VERSION,
@@ -76,7 +119,10 @@ impl TaskStateStore {
                 .map(PersistedTaskFile::from)
                 .collect(),
         };
-        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(invalid_data)?;
+        let mut serialized = BoundedSnapshotWriter::new(MAX_TASK_STATE_SNAPSHOT_BYTES);
+        serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
+        serialized.write_all(b"\n")?;
+        let bytes = serialized.into_inner();
         let temp_path = temp_path_for(self.path());
         let mut temp_file = File::create(&temp_path)?;
         temp_file.write_all(&bytes)?;
@@ -84,8 +130,73 @@ impl TaskStateStore {
         temp_file.sync_all()?;
         drop(temp_file);
         fs::rename(temp_path, self.path())?;
-        sync_directories(&directories_to_sync)
+        #[cfg(test)]
+        if self
+            .fail_next_directory_sync
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            return Ok(TaskStateSaveOutcome::InstalledButNotDurable(
+                io::Error::other("injected task state directory sync failure"),
+            ));
+        }
+        match sync_directories(&directories_to_sync) {
+            Ok(()) => Ok(TaskStateSaveOutcome::Durable),
+            Err(error) => Ok(TaskStateSaveOutcome::InstalledButNotDurable(error)),
+        }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_directory_sync(&self) {
+        self.fail_next_directory_sync
+            .store(true, AtomicOrdering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_save(&self, entered: Arc<Barrier>, resume: Arc<Barrier>) {
+        *self
+            .next_save_barriers
+            .lock()
+            .expect("task state save barrier lock poisoned") = Some((entered, resume));
+    }
+}
+
+struct BoundedSnapshotWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedSnapshotWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedSnapshotWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(snapshot_size_error());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn snapshot_size_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("task state snapshot cannot exceed {MAX_TASK_STATE_SNAPSHOT_BYTES} bytes"),
+    )
 }
 
 #[cfg(unix)]

@@ -5,11 +5,17 @@ use crate::generated::tvos_net_player::v1::{
     TaskProblemCategory, TaskResult, TaskResultProgress, TaskState,
 };
 use http::HeaderValue;
+use prost::Message;
 use uuid::Uuid;
 
 const MAX_RESOURCE_ID_BYTES: usize = 200;
 const MAX_TASK_RESULTS: usize = 10_000;
 const MAX_TASK_RESOURCES: usize = 50_000;
+const MAX_TASK_ARTIFACTS: usize = 50_000;
+const MAX_TASK_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
+const MAX_TASK_RESOURCE_ENCODED_BYTES: usize = 64 * 1024;
+const MAX_TASK_OUTPUT_STRING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TASK_OUTPUT_ENCODED_BYTES: usize = 32 * 1024 * 1024;
 const INTERNAL_RESOURCE_DIR: &str = ".tvos-net-player/resources";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +95,7 @@ impl TaskOutputRecord {
     ) -> Result<Self, TaskOutputValidationError> {
         validate_collection_sizes(&results, &resources)?;
         validate_and_bind_resources(&mut results, &resources)?;
+        validate_collection_sizes(&results, &resources)?;
         validate_result_ids(&results)?;
         validate_resource_representations(previous, &resources)?;
 
@@ -138,6 +145,7 @@ impl TaskOutputRecord {
         validate_collection_sizes(&results, &resources)?;
         validate_result_ids(&results)?;
         validate_and_bind_resources(&mut results, &resources)?;
+        validate_collection_sizes(&results, &resources)?;
         let snapshot_id = if snapshot_id.trim().is_empty() {
             new_snapshot_id()
         } else {
@@ -225,6 +233,12 @@ impl TaskOutputRecord {
             available_artifact_count,
             primary_result_id: self.primary_result_id.clone(),
         }
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> usize {
+        task_output_encoded_bytes(&self.results, &self.resources)
+            .saturating_add(self.snapshot_id.len())
+            .saturating_add(self.primary_result_id.len())
     }
 
     pub(crate) fn resource(&self, id: &str) -> Option<&TaskResourceRecord> {
@@ -476,7 +490,133 @@ fn validate_collection_sizes(
             "task output cannot exceed {MAX_TASK_RESOURCES} resources"
         )));
     }
+    let artifact_count = results
+        .iter()
+        .try_fold(0_usize, |total, result| {
+            total.checked_add(result.artifacts.len())
+        })
+        .unwrap_or(usize::MAX);
+    if artifact_count > MAX_TASK_ARTIFACTS {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_ARTIFACTS} artifacts"
+        )));
+    }
+    if let Some(result) = results
+        .iter()
+        .find(|result| result.encoded_len() > MAX_TASK_RESULT_ENCODED_BYTES)
+    {
+        return Err(TaskOutputValidationError::new(format!(
+            "task result cannot exceed {MAX_TASK_RESULT_ENCODED_BYTES} encoded bytes: {}",
+            result.id
+        )));
+    }
+    if let Some(resource) = resources
+        .iter()
+        .find(|resource| resource.resource.encoded_len() > MAX_TASK_RESOURCE_ENCODED_BYTES)
+    {
+        return Err(TaskOutputValidationError::new(format!(
+            "task resource cannot exceed {MAX_TASK_RESOURCE_ENCODED_BYTES} encoded bytes: {}",
+            resource.resource.id
+        )));
+    }
+    let string_bytes = task_output_string_bytes(results, resources);
+    if string_bytes > MAX_TASK_OUTPUT_STRING_BYTES {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_OUTPUT_STRING_BYTES} string bytes"
+        )));
+    }
+    let encoded_bytes = task_output_encoded_bytes(results, resources);
+    if encoded_bytes > MAX_TASK_OUTPUT_ENCODED_BYTES {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_OUTPUT_ENCODED_BYTES} encoded bytes"
+        )));
+    }
     Ok(())
+}
+
+fn task_output_encoded_bytes(results: &[TaskResult], resources: &[TaskResourceRecord]) -> usize {
+    results
+        .iter()
+        .map(Message::encoded_len)
+        .chain(
+            resources
+                .iter()
+                .map(|resource| resource.resource.encoded_len()),
+        )
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn task_output_string_bytes(results: &[TaskResult], resources: &[TaskResourceRecord]) -> usize {
+    results
+        .iter()
+        .map(task_result_string_bytes)
+        .chain(
+            resources
+                .iter()
+                .map(|resource| resource_string_bytes(&resource.resource)),
+        )
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn task_result_string_bytes(result: &TaskResult) -> usize {
+    [
+        result.id.len(),
+        result.title.len(),
+        result.subtitle.len(),
+        result.library_item_id.len(),
+    ]
+    .into_iter()
+    .chain(
+        result
+            .progress
+            .iter()
+            .flat_map(|progress| [progress.phase.len(), progress.message.len()]),
+    )
+    .chain(result.problem.iter().map(problem_string_bytes))
+    .chain(
+        result
+            .playback_source
+            .iter()
+            .map(playback_source_string_bytes),
+    )
+    .chain(result.artifacts.iter().map(artifact_string_bytes))
+    .fold(0_usize, usize::saturating_add)
+}
+
+fn artifact_string_bytes(artifact: &crate::generated::tvos_net_player::v1::TaskArtifact) -> usize {
+    [
+        artifact.id.len(),
+        artifact.title.len(),
+        artifact.format.len(),
+        artifact.language_tag.len(),
+    ]
+    .into_iter()
+    .chain(artifact.resource.iter().map(resource_string_bytes))
+    .chain(artifact.problem.iter().map(problem_string_bytes))
+    .fold(0_usize, usize::saturating_add)
+}
+
+fn problem_string_bytes(problem: &TaskProblem) -> usize {
+    problem.code.len().saturating_add(problem.message.len())
+}
+
+fn playback_source_string_bytes(
+    source: &crate::generated::tvos_net_player::v1::PlaybackSource,
+) -> usize {
+    source
+        .item_id
+        .len()
+        .saturating_add(source.variant_id.len())
+        .saturating_add(source.uri.len())
+}
+
+fn resource_string_bytes(resource: &CacheResourceRef) -> usize {
+    resource
+        .id
+        .len()
+        .saturating_add(resource.uri.len())
+        .saturating_add(resource.content_type.len())
+        .saturating_add(resource.etag.len())
 }
 
 fn validate_and_bind_resources(
@@ -496,6 +636,7 @@ fn validate_and_bind_resources(
             )));
         }
     }
+    validate_bound_resource_expansion(results, resources, &resources_by_id)?;
 
     let mut referenced_ids = HashSet::new();
     for result in results {
@@ -552,6 +693,79 @@ fn validate_and_bind_resources(
         )));
     }
     Ok(())
+}
+
+fn validate_bound_resource_expansion(
+    results: &[TaskResult],
+    resources: &[TaskResourceRecord],
+    resources_by_id: &HashMap<&str, &CacheResourceRef>,
+) -> Result<(), TaskOutputValidationError> {
+    let mut total_encoded_bytes = resources
+        .iter()
+        .map(|resource| resource.resource.encoded_len())
+        .fold(0_usize, usize::saturating_add);
+    let mut total_string_bytes = resources
+        .iter()
+        .map(|resource| resource_string_bytes(&resource.resource))
+        .fold(0_usize, usize::saturating_add);
+
+    for result in results {
+        let mut result_encoded_bytes = result.encoded_len();
+        let mut result_string_bytes = task_result_string_bytes(result);
+        for artifact in &result.artifacts {
+            let Some(reference) = artifact.resource.as_ref() else {
+                continue;
+            };
+            let canonical_id = reference.id.to_ascii_lowercase();
+            let Some(canonical) = resources_by_id.get(canonical_id.as_str()) else {
+                return Err(TaskOutputValidationError::new(format!(
+                    "task artifact references unknown resource: {}",
+                    reference.id
+                )));
+            };
+            let original_artifact_bytes = length_delimited_field_bytes(artifact.encoded_len());
+            let mut bound_artifact = artifact.clone();
+            bound_artifact.resource = Some((*canonical).clone());
+            let bound_artifact_bytes = length_delimited_field_bytes(bound_artifact.encoded_len());
+            result_encoded_bytes = result_encoded_bytes
+                .saturating_sub(original_artifact_bytes)
+                .saturating_add(bound_artifact_bytes);
+            result_string_bytes = result_string_bytes
+                .saturating_sub(resource_string_bytes(reference))
+                .saturating_add(resource_string_bytes(canonical));
+        }
+        if result_encoded_bytes > MAX_TASK_RESULT_ENCODED_BYTES {
+            return Err(TaskOutputValidationError::new(format!(
+                "task result cannot exceed {MAX_TASK_RESULT_ENCODED_BYTES} encoded bytes after resource binding: {}",
+                result.id
+            )));
+        }
+        total_encoded_bytes = total_encoded_bytes.saturating_add(result_encoded_bytes);
+        total_string_bytes = total_string_bytes.saturating_add(result_string_bytes);
+    }
+
+    if total_string_bytes > MAX_TASK_OUTPUT_STRING_BYTES {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_OUTPUT_STRING_BYTES} string bytes after resource binding"
+        )));
+    }
+    if total_encoded_bytes > MAX_TASK_OUTPUT_ENCODED_BYTES {
+        return Err(TaskOutputValidationError::new(format!(
+            "task output cannot exceed {MAX_TASK_OUTPUT_ENCODED_BYTES} encoded bytes after resource binding"
+        )));
+    }
+    Ok(())
+}
+
+fn length_delimited_field_bytes(payload_bytes: usize) -> usize {
+    1_usize
+        .saturating_add(varint_bytes(payload_bytes))
+        .saturating_add(payload_bytes)
+}
+
+fn varint_bytes(value: usize) -> usize {
+    let bits = usize::BITS as usize - value.leading_zeros() as usize;
+    bits.max(1).div_ceil(7)
 }
 
 fn validate_resource_representations(
@@ -777,6 +991,92 @@ mod tests {
         let error = TaskOutputRecord::replace(Some(&previous), vec![result], vec![changed])
             .expect_err("a resource id must identify one immutable representation");
         assert!(error.to_string().contains("different representation"));
+    }
+
+    #[test]
+    fn output_rejects_unbounded_nested_artifacts() {
+        let artifacts = (0..=MAX_TASK_ARTIFACTS)
+            .map(|index| TaskArtifact {
+                id: format!("artifact-{index}"),
+                kind: TaskArtifactKind::Metadata.into(),
+                state: TaskArtifactState::Unavailable.into(),
+                ..Default::default()
+            })
+            .collect();
+        let error = TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts,
+                ..Default::default()
+            }],
+            Vec::new(),
+        )
+        .expect_err("nested artifacts must be bounded");
+
+        assert!(error.to_string().contains("artifacts"));
+    }
+
+    #[test]
+    fn output_rejects_oversized_results_and_aggregate_strings() {
+        let oversized_result = TaskResult {
+            id: "oversized-result".to_owned(),
+            state: TaskState::Completed.into(),
+            title: "x".repeat(MAX_TASK_RESULT_ENCODED_BYTES + 1),
+            ..Default::default()
+        };
+        let error = TaskOutputRecord::replace(None, vec![oversized_result], Vec::new())
+            .expect_err("one result must not dominate a page");
+        assert!(error.to_string().contains("task result cannot exceed"));
+
+        let results = (0..9)
+            .map(|index| TaskResult {
+                id: format!("result-{index}"),
+                state: TaskState::Completed.into(),
+                title: "x".repeat(950_000),
+                ..Default::default()
+            })
+            .collect();
+        let error = TaskOutputRecord::replace(None, results, Vec::new())
+            .expect_err("aggregate strings must be bounded");
+        assert!(error.to_string().contains("string bytes"));
+    }
+
+    #[test]
+    fn output_preflights_resource_expansion_before_binding_artifacts() {
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "large-metadata".to_owned(),
+            content_type: "x".repeat(60_000),
+            ..Default::default()
+        })
+        .expect("resource metadata should be individually valid");
+        let artifacts = (0..20)
+            .map(|index| TaskArtifact {
+                id: format!("artifact-{index}"),
+                kind: TaskArtifactKind::Metadata.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(CacheResourceRef {
+                    id: resource.resource.id.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+
+        let error = TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts,
+                ..Default::default()
+            }],
+            vec![resource],
+        )
+        .expect_err("resource binding must be bounded before repeated metadata is cloned");
+
+        assert!(error.to_string().contains("after resource binding"));
     }
 
     #[test]

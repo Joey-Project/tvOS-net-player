@@ -96,6 +96,7 @@ const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
 const MAX_TASK_RESULT_PAGE_SIZE: usize = 200;
 const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
 const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 const TASK_RESULT_PAGE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
@@ -722,6 +723,7 @@ struct TaskResultPageSnapshot {
     snapshot_id: String,
     resource_lease_id: String,
     results: Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+    encoded_bytes: usize,
     expires_at: Instant,
     tokens_by_offset: HashMap<usize, String>,
 }
@@ -793,6 +795,7 @@ impl TaskResultPageStore {
                 &mut existing.resource_lease_id,
                 snapshot.resource_lease_id,
             ));
+            existing.encoded_bytes = snapshot.encoded_bytes;
             existing.expires_at = now + TASK_RESULT_PAGE_SNAPSHOT_TTL;
             self.snapshot_order
                 .retain(|candidate| candidate != &existing.snapshot_id);
@@ -827,6 +830,21 @@ impl TaskResultPageStore {
                 released_resource_lease_ids.push(resource_lease_id);
             }
         }
+        while self
+            .snapshots_by_id
+            .values()
+            .map(|snapshot| snapshot.encoded_bytes)
+            .sum::<usize>()
+            .saturating_add(snapshot.encoded_bytes)
+            > MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES
+        {
+            let Some(oldest_id) = self.snapshot_order.pop_front() else {
+                break;
+            };
+            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
+                released_resource_lease_ids.push(resource_lease_id);
+            }
+        }
 
         let snapshot_id = if self.snapshots_by_id.contains_key(&snapshot.snapshot_id) {
             format!("task-output-page-{}", Uuid::new_v4().simple())
@@ -842,6 +860,7 @@ impl TaskResultPageStore {
                 snapshot_id: snapshot_id.clone(),
                 resource_lease_id: snapshot.resource_lease_id,
                 results: snapshot.results,
+                encoded_bytes: snapshot.encoded_bytes,
                 expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
                 tokens_by_offset: HashMap::new(),
             },
@@ -3288,6 +3307,7 @@ mod tests {
             resource_lease_id: resource_lease_id.to_owned(),
             results: results.clone(),
             resources: Vec::new(),
+            encoded_bytes: 1024,
         };
         let mut pages = TaskResultPageStore::default();
 
@@ -3315,6 +3335,31 @@ mod tests {
             vec!["lease-new"],
             pages.prune(refresh_at + TASK_RESULT_PAGE_SNAPSHOT_TTL)
         );
+    }
+
+    #[test]
+    fn task_result_page_store_evicts_snapshots_by_encoded_bytes() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str| crate::task_registry::TaskOutputSnapshot {
+            task_id: format!("task-{id}"),
+            revision: 1,
+            snapshot_id: format!("snapshot-{id}"),
+            resource_lease_id: lease.to_owned(),
+            results: Vec::new(),
+            resources: Vec::new(),
+            encoded_bytes: MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted) = pages.first_page(snapshot("one", "lease-one"), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        let (_, released, inserted) = pages.first_page(snapshot("two", "lease-two"), now, 1);
+
+        assert!(inserted);
+        assert_eq!(vec!["lease-one"], released);
+        assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
     }
 
     #[tokio::test]
@@ -7136,7 +7181,7 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_none()
         );
-        assert!(hls_session_dir.exists());
+        assert!(!hls_session_dir.exists());
 
         let second_corrupted_restore =
             AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
@@ -7151,7 +7196,7 @@ mod tests {
                 .get(&completed.id)
                 .is_none()
         );
-        assert!(hls_session_dir.exists());
+        assert!(!hls_session_dir.exists());
     }
 
     #[tokio::test]
@@ -7195,6 +7240,7 @@ mod tests {
 
         let completed = wait_for_task_state(&state.tasks, &created.id, TaskState::Completed).await;
         let expected_item_id = format!("bilibili.hls.{}", completed.id);
+        let task_state_path = options.task_state_path.clone();
         assert!(
             state
                 .hls_cache
@@ -7216,6 +7262,36 @@ mod tests {
             RuntimeTestHlsWeakNetworkState::UpstreamFailed,
             state.hls_weak_network_status().state
         );
+
+        let durable_state = fs::read(&task_state_path).expect("task state should be readable");
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let failed_delete = cache_service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: expected_item_id.clone(),
+            }))
+            .await
+            .expect_err("cache bytes must remain when the deletion tombstone is rejected");
+        assert_eq!(tonic::Code::Unavailable, failed_delete.code());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&completed.id)
+                .exists()
+        );
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&completed.id).unwrap().state()
+        );
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        fs::write(&task_state_path, durable_state).expect("task state should be restored");
 
         let deleted = cache_service
             .delete_library_item(Request::new(DeleteLibraryItemRequest {
@@ -7276,6 +7352,55 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_keeps_cache_when_state_commit_is_rejected() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-persist", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        assert!(hls_session_dir.exists());
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let error = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect_err("HLS cleanup must wait for a committed cancellation");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        let task = state
+            .tasks
+            .get_task(&task_id)
+            .expect("rejected cancellation should preserve the task");
+        assert_eq!(TaskState::Playable, task.state());
+        assert!(task.playback_source.is_some());
+        assert!(task.playback_session.is_some());
+        assert!(state.hls_sessions.get(&task_id).is_some());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
     }
 
     #[tokio::test]
@@ -12339,7 +12464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_state_hides_cancelled_hls_cache_session_after_restart() {
+    async fn app_state_removes_cancelled_hls_cache_session_after_restart() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -12419,7 +12544,7 @@ mod tests {
             restored
                 .hls_cache
                 .get_completed_library_item(&expected_item_id)
-                .is_some()
+                .is_none()
         );
         let restored_library = LibraryGrpcService::new(restored.clone())
             .list_library_items(Request::new(ListLibraryItemsRequest {
@@ -12435,7 +12560,7 @@ mod tests {
             .into_inner();
         assert!(restored_library.items.is_empty());
         assert!(
-            root_path
+            !root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)

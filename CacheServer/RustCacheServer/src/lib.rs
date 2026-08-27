@@ -271,11 +271,6 @@ impl AppState {
                 &restorable_completed_session_ids,
             );
         }
-        let interrupted_planning_result_session_ids = if hls_cache_scan_succeeded {
-            tasks.interrupted_planning_result_session_ids()
-        } else {
-            HashSet::new()
-        };
         if tasks.persistence_available() && hls_cache_scan_succeeded {
             restored_hls_sessions.retain(|session| {
                 let authorized = restored_hls_session_is_authorized(
@@ -284,11 +279,7 @@ impl AppState {
                     &restorable_completed_session_ids,
                     completed_hls_cache_playback_supported,
                 );
-                if !authorized
-                    && interrupted_planning_result_session_ids.contains(&session.id)
-                    && !completed_cache_session_ids.contains(&session.id)
-                    && let Err(error) = hls_cache.remove_session(&session.id)
-                {
+                if !authorized && let Err(error) = hls_cache.remove_session(&session.id) {
                     eprintln!(
                         "Failed to remove unauthorized restored HLS session {}: {error}",
                         session.id
@@ -625,23 +616,31 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return Ok(Some(false));
         }
-        if self.get_completed_hls_library_item(item_id).is_none() {
+        let authorized = self.get_completed_hls_library_item(item_id).is_some();
+        if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
             return Ok(Some(false));
         }
-        let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
-        let (task_cleanup_session_id, task_cleanup_library_item_id) = self
-            .completed_hls_task_cleanup_item(&session_id, item_id)
-            .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
+        let session_ids = if authorized {
+            let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
+            let (task_cleanup_session_id, task_cleanup_library_item_id) = self
+                .completed_hls_task_cleanup_item(&session_id, item_id)
+                .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
+            if !self.tasks.remove_completed_playback_task(
+                &task_cleanup_session_id,
+                &task_cleanup_library_item_id,
+            )? {
+                return Ok(Some(false));
+            }
+            session_ids
+        } else {
+            vec![session_id]
+        };
 
         self.remove_hls_sessions(&session_ids).map_err(|error| {
             Status::internal(format!(
                 "Failed to delete completed HLS cache item: {error}"
             ))
         })?;
-        self.tasks.remove_completed_playback_task(
-            &task_cleanup_session_id,
-            &task_cleanup_library_item_id,
-        )?;
         Ok(Some(true))
     }
 
@@ -714,12 +713,20 @@ impl AppState {
 
     fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
         let mut removed = HashSet::new();
+        let mut first_error = None;
         for session_id in session_ids {
             if !removed.insert(session_id) {
                 continue;
             }
-            self.hls_cache.remove_session(session_id)?;
-            self.remove_hls_playback_session(session_id);
+            match self.hls_cache.remove_session(session_id) {
+                Ok(()) => self.remove_hls_playback_session(session_id),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -1169,8 +1176,8 @@ impl AppState {
             }) {
                 continue;
             }
+            self.remove_evicted_completed_hls_task(&entry)?;
             self.remove_hls_sessions(&session_ids)?;
-            self.remove_evicted_completed_hls_task(&entry);
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(
                     completed_entry_sizes_by_session_id
@@ -1364,21 +1371,21 @@ impl AppState {
             })
     }
 
-    fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
+    fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) -> io::Result<()> {
         let Some((removal_session_id, removal_library_item_id)) =
             self.completed_hls_task_cleanup_item(&entry.session_id, &entry.library_item_id)
         else {
-            return;
+            return Ok(());
         };
-        if let Err(status) = self
-            .tasks
+        self.tasks
             .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)
-        {
-            eprintln!(
-                "Failed to remove evicted HLS playback task {} after cache eviction: {status}",
-                entry.session_id
-            );
-        }
+            .map_err(|status| {
+                io::Error::other(format!(
+                    "failed to persist HLS playback task removal before evicting {}: {status}",
+                    entry.session_id
+                ))
+            })?;
+        Ok(())
     }
 
     pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {

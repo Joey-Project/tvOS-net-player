@@ -109,6 +109,12 @@ superseded_by:
 - Task-result pagination uses one reaper per shared page store instead of one sleeper per first-page request. The reaper expires page snapshots and continuation tokens during idle periods and releases exactly their retained resource leases.
 - Resource ownership, immutable-representation validation, and cleanup authorization build hash maps or sets once per operation, keeping maximum-sized output updates and cleanup scans linear rather than quadratic.
 - Retired task resources remove both the `body` file and their now-empty opaque-ID directory through fd-relative no-follow operations. Startup scans are bounded, unexpected non-empty directories remain reserved for retry, and repeated HTTP `Range` fields are rejected before a partial response is selected.
+- PR 6B's final review fixes treat atomic rename as the task-state commit point. A parent-directory sync failure keeps working state, the committed client view, and the installed file aligned while disabling v2 until a fully durable retry; a failure before rename still rejects and rolls back durability-required mutations.
+- Persisted mutations now snapshot under the registry mutex, perform bounded JSON serialization/write/fsync outside it, and then install a committed visible view. `GetTask` and new subscriptions continue to expose the prior committed state while a legacy save is pending or rejected, and existing pending watch events publish only after recovery.
+- Generic output is bounded by result, artifact, resource, aggregate-string, per-message encoded, and total encoded-byte budgets. The process-wide immutable page store also evicts by encoded bytes, and task-state JSON is bounded to 128 MiB on read and write.
+- Completed HLS deletion and quota eviction persist task deletion metadata before removing cache directories. Physical cleanup is idempotent, retries can remove an already-unowned cache item, and startup removes sessions that no longer have an authorized persisted task.
+- Cancelling a playable progressive task now commits the terminal task/output state before its RPC removes HLS bytes. A rejected state snapshot rolls the cancellation back, returns `Unavailable`, and preserves the playable task and cache session for a safe retry.
+- HLS playback authorization and cache-item lookup use the same last-committed task view as `GetTask` and reconnecting watchers. Cancellation first retries a previously rejected snapshot, so hidden terminal work cannot revoke or delete media before it becomes committed.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -122,4 +128,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the final post-review Rust suite contains 564 passing unit tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the current post-review Rust suite contains 572 passing unit tests.
