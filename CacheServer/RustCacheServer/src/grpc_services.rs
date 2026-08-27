@@ -145,7 +145,7 @@ impl ServerService for ServerGrpcService {
 
         if self.state.library.supports_http_range_playback() {
             info.capabilities.push(ServerCapability::HttpRange.into());
-            if self.state.tasks.persistence_available() {
+            if self.state.tasks.task_output_v2_available() {
                 info.capabilities
                     .push(ServerCapability::TaskOutputV2.into());
             }
@@ -697,6 +697,7 @@ struct TaskResultPageSnapshot {
     task_id: String,
     revision: u64,
     snapshot_id: String,
+    resource_lease_id: String,
     results: Vec<crate::generated::tvos_net_player::v1::TaskResult>,
     expires_at: Instant,
     tokens_by_offset: HashMap<usize, String>,
@@ -715,21 +716,26 @@ impl TaskResultPageStore {
         snapshot: crate::task_registry::TaskOutputSnapshot,
         now: Instant,
     ) -> (String, Vec<String>, bool) {
-        let mut removed_snapshot_ids = self.prune(now);
+        let mut released_resource_lease_ids = self.prune(now);
         if let Some(existing) = self.snapshots_by_id.get(&snapshot.snapshot_id)
             && existing.task_id == snapshot.task_id
             && existing.revision == snapshot.revision
             && existing.results == snapshot.results
         {
-            return (existing.snapshot_id.clone(), removed_snapshot_ids, false);
+            released_resource_lease_ids.push(snapshot.resource_lease_id);
+            return (
+                existing.snapshot_id.clone(),
+                released_resource_lease_ids,
+                false,
+            );
         }
 
         while self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
                 break;
             };
-            if self.remove_snapshot(&oldest_id) {
-                removed_snapshot_ids.push(oldest_id);
+            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
+                released_resource_lease_ids.push(resource_lease_id);
             }
         }
         while self
@@ -743,8 +749,8 @@ impl TaskResultPageStore {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
                 break;
             };
-            if self.remove_snapshot(&oldest_id) {
-                removed_snapshot_ids.push(oldest_id);
+            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
+                released_resource_lease_ids.push(resource_lease_id);
             }
         }
 
@@ -760,12 +766,13 @@ impl TaskResultPageStore {
                 task_id: snapshot.task_id,
                 revision: snapshot.revision,
                 snapshot_id: snapshot_id.clone(),
+                resource_lease_id: snapshot.resource_lease_id,
                 results: snapshot.results,
                 expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
                 tokens_by_offset: HashMap::new(),
             },
         );
-        (snapshot_id, removed_snapshot_ids, true)
+        (snapshot_id, released_resource_lease_ids, true)
     }
 
     fn resolve_token(&mut self, token: &str, task_id: &str) -> Result<(String, usize), Status> {
@@ -849,19 +856,22 @@ impl TaskResultPageStore {
             .filter(|(_, snapshot)| snapshot.expires_at <= now)
             .map(|(snapshot_id, _)| snapshot_id.clone())
             .collect::<Vec<_>>();
-        for snapshot_id in &expired_ids {
-            self.remove_snapshot(snapshot_id);
-        }
         expired_ids
+            .into_iter()
+            .filter_map(|snapshot_id| self.remove_snapshot(&snapshot_id))
+            .collect()
     }
 
-    fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
-        let removed = self.snapshots_by_id.remove(snapshot_id).is_some();
+    fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<String> {
+        let resource_lease_id = self
+            .snapshots_by_id
+            .remove(snapshot_id)
+            .map(|snapshot| snapshot.resource_lease_id);
         self.snapshot_order
             .retain(|candidate| candidate != snapshot_id);
         self.cursors_by_token
             .retain(|_, cursor| cursor.snapshot_id != snapshot_id);
-        removed
+        resource_lease_id
     }
 }
 
@@ -986,7 +996,7 @@ impl TaskService for TaskGrpcService {
         &self,
         request: Request<ListTaskResultsRequest>,
     ) -> Result<Response<ListTaskResultsResponse>, Status> {
-        if !self.state.tasks.persistence_available()
+        if !self.state.tasks.task_output_v2_available()
             || !self.state.library.supports_http_range_playback()
         {
             return Err(Status::failed_precondition(
@@ -1023,15 +1033,14 @@ impl TaskService for TaskGrpcService {
                 .state
                 .tasks
                 .retain_task_output_snapshot(&task_id, now + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
-            let (snapshot_id, mut released_snapshot_ids, inserted_new_snapshot) = self
+            let (snapshot_id, released_resource_lease_ids, inserted_new_snapshot) = self
                 .result_pages
                 .lock()
                 .expect("task result page store lock poisoned")
                 .insert(snapshot, now);
-            released_snapshot_ids.retain(|released| released != &snapshot_id);
             self.state
                 .tasks
-                .release_task_output_snapshots(&released_snapshot_ids);
+                .release_task_output_snapshots(&released_resource_lease_ids);
             if inserted_new_snapshot {
                 let tasks = Arc::clone(&self.state.tasks);
                 tokio::spawn(async move {
@@ -1041,22 +1050,21 @@ impl TaskService for TaskGrpcService {
             }
             (snapshot_id, 0)
         } else {
-            let (resolution, released_snapshot_ids) = {
+            let (resolution, released_resource_lease_ids) = {
                 let mut pages = self
                     .result_pages
                     .lock()
                     .expect("task result page store lock poisoned");
-                let released_snapshot_ids = pages.prune(now);
+                let released_resource_lease_ids = pages.prune(now);
                 (
                     pages.resolve_token(page_token, &task_id),
-                    released_snapshot_ids,
+                    released_resource_lease_ids,
                 )
             };
             self.state
                 .tasks
-                .release_task_output_snapshots(&released_snapshot_ids);
+                .release_task_output_snapshots(&released_resource_lease_ids);
             let (snapshot_id, offset) = resolution?;
-            self.state.tasks.get_task(&task_id)?;
             (snapshot_id, offset)
         };
         let (results, page_info, output_revision) = self
@@ -3338,6 +3346,77 @@ mod tests {
             first_page_info.snapshot_id,
             latest_page.page_info.unwrap().snapshot_id
         );
+    }
+
+    #[tokio::test]
+    async fn list_task_results_continuation_survives_task_retention() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            task_retention_max_terminal_tasks: 1,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first = state
+            .tasks
+            .create_bilibili_task("BV1retained-page", None)
+            .expect("first task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &first.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Completed),
+                ],
+                Vec::new(),
+            )
+            .expect("first task output should be replaced");
+        state
+            .tasks
+            .complete_task_failed(&first.id, "First task finished.".to_owned())
+            .expect("first task should become terminal");
+        let service = TaskGrpcService::new(state.clone());
+        let first_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("first page should load")
+            .into_inner();
+        let continuation = first_page
+            .page_info
+            .expect("first page should have page info")
+            .next_page_token;
+
+        sleep(Duration::from_millis(2)).await;
+        let second = state
+            .tasks
+            .create_bilibili_task("BV1newer-terminal", None)
+            .expect("second task should be created");
+        state
+            .tasks
+            .complete_task_failed(&second.id, "Second task finished.".to_owned())
+            .expect("second task should become terminal");
+        assert!(state.tasks.get_task(&first.id).is_err());
+
+        let second_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: continuation,
+                }),
+            }))
+            .await
+            .expect("retained snapshot should outlive task metadata")
+            .into_inner();
+        assert_eq!(vec!["result-2"], result_ids(&second_page.results));
     }
 
     #[tokio::test]

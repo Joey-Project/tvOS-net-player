@@ -98,6 +98,9 @@ superseded_by:
 - The Rust server advertises `SERVER_CAPABILITY_TASK_OUTPUT_V2` only when durable task state and secure HTTP Range serving are available. Legacy task result fields remain populated for older clients.
 - PR 6B review hardening makes pagination state process-wide across dual-stack listeners, dynamically drops v2 after post-start persistence failures, keeps legacy progress from creating rollback-prone revisions, and synchronizes cache deletion with authoritative result summaries and artifacts.
 - Resource IDs are canonicalized before filesystem use and cannot be rebound to different live representations. Immutable page snapshots retain their resources, conditional HTTP requests implement validator and `If-Range` semantics, durable retirement removes old bodies, and startup no-follow scanning closes the metadata-commit/resource-delete crash window.
+- PR 6B final hardening serializes authoritative output publication with durable snapshot replacement, fsyncs the task-state parent directory, and defers startup orphan cleanup until the sanitized state rewrite is durable. Failed writes remain gated and an identical retry can recover the installed output safely.
+- Pagination now owns unique resource lease IDs, so duplicate first-page requests and snapshot-ID reuse cannot release a newer lease. Existing continuation tokens remain valid after terminal task metadata is pruned, while expired or evicted page snapshots release only their own resource lease.
+- Task-state persistence health is independent from generic resource-storage health: HLS recovery can continue when the v2 resource namespace is unavailable, while the `TASK_OUTPUT_V2` capability still requires both. Resource `HEAD` ignores `Range`, repeated `If-None-Match` fields support quoted commas, and configured public media bases are canonicalized before URI projection.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -111,4 +114,4 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite contains 544 passing unit tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite contains 548 passing unit tests.

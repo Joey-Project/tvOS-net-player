@@ -171,7 +171,8 @@ async fn resource_response(
         );
     }
 
-    let range_header = (resource.supports_byte_ranges
+    let range_header = (!head_only
+        && resource.supports_byte_ranges
         && range_validator_matches(&headers, etag.as_ref(), opened_resource.last_modified))
     .then(|| headers.get(RANGE))
     .flatten();
@@ -1034,8 +1035,11 @@ fn resource_is_not_modified(
     etag: Option<&HeaderValue>,
     last_modified: std::time::SystemTime,
 ) -> bool {
-    if let Some(if_none_match) = headers.get(IF_NONE_MATCH) {
-        return if_none_match_matches(if_none_match, etag);
+    if headers.contains_key(IF_NONE_MATCH) {
+        return headers
+            .get_all(IF_NONE_MATCH)
+            .iter()
+            .any(|value| if_none_match_field_matches(value, etag));
     }
     headers
         .get(IF_MODIFIED_SINCE)
@@ -1044,16 +1048,61 @@ fn resource_is_not_modified(
         .is_some_and(|date| is_not_modified_since(last_modified, date))
 }
 
-fn if_none_match_matches(value: &HeaderValue, etag: Option<&HeaderValue>) -> bool {
+fn if_none_match_field_matches(value: &HeaderValue, etag: Option<&HeaderValue>) -> bool {
     let Ok(value) = value.to_str() else {
         return false;
     };
     let current = etag.and_then(|etag| etag.to_str().ok());
-    value.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        candidate == "*"
-            || current.is_some_and(|current| weak_etag_value(candidate) == weak_etag_value(current))
-    })
+    let bytes = value.as_bytes();
+    let mut offset = skip_optional_whitespace(bytes, 0);
+    if bytes.get(offset) == Some(&b'*') {
+        offset = skip_optional_whitespace(bytes, offset + 1);
+        return offset == bytes.len();
+    }
+
+    let mut matched = false;
+    loop {
+        offset = skip_optional_whitespace(bytes, offset);
+        let candidate_start = offset;
+        if bytes.get(offset..offset + 2) == Some(b"W/") {
+            offset += 2;
+        }
+        if bytes.get(offset) != Some(&b'"') {
+            return false;
+        }
+        offset += 1;
+        while let Some(byte) = bytes.get(offset) {
+            if *byte == b'"' {
+                break;
+            }
+            if *byte != b'!' && !matches!(*byte, b'#'..=b'~') {
+                return false;
+            }
+            offset += 1;
+        }
+        if bytes.get(offset) != Some(&b'"') {
+            return false;
+        }
+        offset += 1;
+        let candidate = &value[candidate_start..offset];
+        matched |=
+            current.is_some_and(|current| weak_etag_value(candidate) == weak_etag_value(current));
+        offset = skip_optional_whitespace(bytes, offset);
+        if offset == bytes.len() {
+            return matched;
+        }
+        if bytes.get(offset) != Some(&b',') {
+            return false;
+        }
+        offset += 1;
+    }
+}
+
+fn skip_optional_whitespace(value: &[u8], mut offset: usize) -> usize {
+    while matches!(value.get(offset), Some(b' ' | b'\t')) {
+        offset += 1;
+    }
+    offset
 }
 
 fn weak_etag_value(value: &str) -> &str {
@@ -1611,24 +1660,31 @@ mod tests {
         let body = b"0123456789abcdef";
         let fixture = task_resource_fixture(test_resource("resource-head", body), Some(body));
 
-        let response = resource_head(
-            State(fixture.state.clone()),
-            Path(fixture.resource_id.clone()),
-            HeaderMap::new(),
-        )
-        .await;
+        for range in [None, Some("bytes=2-5"), Some("bytes=99-100")] {
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(RANGE, HeaderValue::from_static(range));
+            }
+            let response = resource_head(
+                State(fixture.state.clone()),
+                Path(fixture.resource_id.clone()),
+                headers,
+            )
+            .await;
 
-        assert_eq!(StatusCode::OK, response.status());
-        assert_eq!("text/vtt; charset=utf-8", response.headers()[CONTENT_TYPE]);
-        assert_eq!("16", response.headers()[CONTENT_LENGTH]);
-        assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
-        assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
-        assert!(
-            to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+            assert_eq!(StatusCode::OK, response.status());
+            assert_eq!("text/vtt; charset=utf-8", response.headers()[CONTENT_TYPE]);
+            assert_eq!("16", response.headers()[CONTENT_LENGTH]);
+            assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
+            assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+            assert!(!response.headers().contains_key(CONTENT_RANGE));
+            assert!(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1695,6 +1751,36 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn task_resource_matches_repeated_etags_with_quoted_commas() {
+        let body = b"0123456789abcdef";
+        let mut resource = test_resource("resource-repeated-etag", body);
+        resource.etag = "part,1".to_owned();
+        let fixture = task_resource_fixture(resource, Some(body));
+        let mut headers = HeaderMap::new();
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static("\"stale\""));
+        headers.append(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("W/\"part,1\", \"other\""),
+        );
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::NOT_MODIFIED, response.status());
+        assert_eq!("\"part,1\"", response.headers()[ETAG]);
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

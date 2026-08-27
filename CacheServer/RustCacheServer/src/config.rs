@@ -206,6 +206,11 @@ impl CacheServerOptions {
 
     pub fn normalized_for_runtime(mut self) -> Self {
         self.root_path = self.normalized_root_path();
+        if let Some(value) = self.public_media_base_uri.as_deref()
+            && let Ok(url) = Url::parse(value)
+        {
+            self.public_media_base_uri = Some(url.to_string());
+        }
         if self.bbdown_output_dir.is_some() {
             self.bbdown_output_dir = Some(self.bbdown_output_dir());
         }
@@ -750,6 +755,27 @@ mod tests {
         };
 
         options.validate().expect("public base URI should be valid");
+    }
+
+    #[test]
+    fn runtime_options_canonicalize_public_media_base_uri() {
+        let options = CacheServerOptions {
+            public_media_base_uri: Some("https://ATRI.ink/cache folder".to_owned()),
+            ..CacheServerOptions::default()
+        };
+
+        options
+            .validate()
+            .expect("URL parsing should accept the input");
+        let normalized = options.normalized_for_runtime();
+
+        assert_eq!(
+            Some("https://atri.ink/cache%20folder"),
+            normalized.public_media_base_uri.as_deref()
+        );
+        normalized
+            .validate()
+            .expect("canonical public base URI should remain valid");
     }
 
     #[test]

@@ -85,8 +85,22 @@ impl TaskStateStore {
         temp_file.write_all(b"\n")?;
         temp_file.sync_all()?;
         drop(temp_file);
-        fs::rename(temp_path, self.path())
+        fs::rename(temp_path, self.path())?;
+        sync_parent_directory(self.path())
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone)]
