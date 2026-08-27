@@ -254,6 +254,10 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsBilibiliPlaybackPolicy: Bool {
         capabilities.contains(CacheServerCapability.bilibiliPlaybackPolicy)
     }
+
+    public var supportsTaskOutputV2: Bool {
+        capabilities.contains(CacheServerCapability.taskOutputV2)
+    }
 }
 
 public struct CacheHealthStatus: Equatable, Sendable {
@@ -289,6 +293,7 @@ public enum CacheServerCapability {
     public static let bilibiliPlaybackPolicy = "bilibiliPlaybackPolicy"
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
+    public static let taskOutputV2 = "taskOutputV2"
 }
 
 public struct BilibiliCredentialProfile: Equatable, Sendable {
@@ -1193,6 +1198,218 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct CacheTaskOutputSummary: Equatable, Sendable {
+    public let revision: UInt64
+    public let resultCount: UInt64
+    public let terminalResultCount: UInt64
+    public let successfulResultCount: UInt64
+    public let failedResultCount: UInt64
+    public let cancelledResultCount: UInt64
+    public let availableArtifactCount: UInt64
+    public let primaryResultID: String
+
+    public init(
+        revision: UInt64,
+        resultCount: UInt64,
+        terminalResultCount: UInt64,
+        successfulResultCount: UInt64,
+        failedResultCount: UInt64,
+        cancelledResultCount: UInt64,
+        availableArtifactCount: UInt64,
+        primaryResultID: String
+    ) {
+        self.revision = revision
+        self.resultCount = resultCount
+        self.terminalResultCount = terminalResultCount
+        self.successfulResultCount = successfulResultCount
+        self.failedResultCount = failedResultCount
+        self.cancelledResultCount = cancelledResultCount
+        self.availableArtifactCount = availableArtifactCount
+        self.primaryResultID = primaryResultID
+    }
+}
+
+public struct CacheTaskResultProgress: Equatable, Sendable {
+    public let fraction: Double
+    public let completedBytes: Int64
+    public let totalBytes: Int64
+    public let totalBytesKnown: Bool
+    public let phase: String
+    public let message: String
+
+    public init(
+        fraction: Double,
+        completedBytes: Int64,
+        totalBytes: Int64,
+        totalBytesKnown: Bool,
+        phase: String,
+        message: String
+    ) {
+        self.fraction = fraction
+        self.completedBytes = completedBytes
+        self.totalBytes = totalBytes
+        self.totalBytesKnown = totalBytesKnown
+        self.phase = phase
+        self.message = message
+    }
+}
+
+public struct CacheTaskProblem: Equatable, Sendable {
+    public let category: String
+    public let code: String
+    public let message: String
+    public let retryable: Bool
+
+    public init(category: String, code: String, message: String, retryable: Bool) {
+        self.category = category
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+    }
+}
+
+public struct CacheResourceReference: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let uri: String
+    public let contentType: String
+    public let sizeBytes: Int64
+    public let sizeKnown: Bool
+    public let supportsByteRanges: Bool
+    public let etag: String
+    public let expiresAt: Date?
+
+    public init(
+        id: String,
+        uri: String,
+        contentType: String,
+        sizeBytes: Int64,
+        sizeKnown: Bool,
+        supportsByteRanges: Bool,
+        etag: String,
+        expiresAt: Date?
+    ) {
+        self.id = id
+        self.uri = uri
+        self.contentType = contentType
+        self.sizeBytes = sizeBytes
+        self.sizeKnown = sizeKnown
+        self.supportsByteRanges = supportsByteRanges
+        self.etag = etag
+        self.expiresAt = expiresAt
+    }
+}
+
+public struct CacheTaskArtifact: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let kind: String
+    public let state: String
+    public let title: String
+    public let format: String
+    public let languageTag: String
+    public let isAIGenerated: Bool
+    public let resource: CacheResourceReference?
+    public let problem: CacheTaskProblem?
+
+    public init(
+        id: String,
+        kind: String,
+        state: String,
+        title: String,
+        format: String,
+        languageTag: String,
+        isAIGenerated: Bool,
+        resource: CacheResourceReference?,
+        problem: CacheTaskProblem?
+    ) {
+        self.id = id
+        self.kind = kind
+        self.state = state
+        self.title = title
+        self.format = format
+        self.languageTag = languageTag
+        self.isAIGenerated = isAIGenerated
+        self.resource = resource
+        self.problem = problem
+    }
+}
+
+public struct CacheTaskResult: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let state: String
+    public let title: String
+    public let subtitle: String
+    public let progress: CacheTaskResultProgress?
+    public let problem: CacheTaskProblem?
+    public let libraryItemID: String
+    public let playbackSource: CachePlaybackSource?
+    public let artifacts: [CacheTaskArtifact]
+    public let createdAt: Date?
+    public let updatedAt: Date?
+
+    public init(
+        id: String,
+        state: String,
+        title: String,
+        subtitle: String,
+        progress: CacheTaskResultProgress?,
+        problem: CacheTaskProblem?,
+        libraryItemID: String,
+        playbackSource: CachePlaybackSource?,
+        artifacts: [CacheTaskArtifact],
+        createdAt: Date?,
+        updatedAt: Date?
+    ) {
+        self.id = id
+        self.state = state
+        self.title = title
+        self.subtitle = subtitle
+        self.progress = progress
+        self.problem = problem
+        self.libraryItemID = libraryItemID
+        self.playbackSource = playbackSource
+        self.artifacts = artifacts
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct CachePageInfo: Equatable, Sendable {
+    public let totalSize: UInt64
+    public let nextPageToken: String
+    public let snapshotID: String
+
+    public init(totalSize: UInt64, nextPageToken: String, snapshotID: String) {
+        self.totalSize = totalSize
+        self.nextPageToken = nextPageToken
+        self.snapshotID = snapshotID
+    }
+
+    public var hasMoreItems: Bool {
+        !nextPageToken.isEmpty
+    }
+}
+
+public struct CacheTaskResultsPage: Equatable, Sendable {
+    public let results: [CacheTaskResult]
+    public let pageInfo: CachePageInfo
+    public let outputRevision: UInt64
+
+    public init(
+        results: [CacheTaskResult],
+        pageInfo: CachePageInfo,
+        outputRevision: UInt64
+    ) {
+        self.results = results
+        self.pageInfo = pageInfo
+        self.outputRevision = outputRevision
+    }
+
+    public var totalSize: UInt64 { pageInfo.totalSize }
+    public var nextPageToken: String { pageInfo.nextPageToken }
+    public var snapshotID: String { pageInfo.snapshotID }
+    public var hasMoreResults: Bool { pageInfo.hasMoreItems }
+}
+
 public struct CacheTask: Identifiable, Equatable, Sendable {
     public let id: String
     public let kind: String
@@ -1208,6 +1425,7 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
     public let playbackSession: CacheBilibiliPlaybackSession?
     public let bilibiliSelection: BilibiliTaskSelection?
     public let resultItems: [BilibiliTaskResultItem]
+    public let outputSummary: CacheTaskOutputSummary?
 
     public init(
         id: String,
@@ -1223,7 +1441,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         playbackSource: CachePlaybackSource?,
         playbackSession: CacheBilibiliPlaybackSession?,
         bilibiliSelection: BilibiliTaskSelection? = nil,
-        resultItems: [BilibiliTaskResultItem] = []
+        resultItems: [BilibiliTaskResultItem] = [],
+        outputSummary: CacheTaskOutputSummary? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -1239,6 +1458,7 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         self.playbackSession = playbackSession
         self.bilibiliSelection = bilibiliSelection
         self.resultItems = resultItems
+        self.outputSummary = outputSummary
     }
 
     public var isProgressivePlayback: Bool {

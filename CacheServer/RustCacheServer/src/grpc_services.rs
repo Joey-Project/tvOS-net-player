@@ -42,10 +42,11 @@ use crate::{
         LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
         LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListCacheRootsRequest, ListCacheRootsResponse,
-        ListLibraryItemsRequest, ListLibraryItemsResponse,
-        PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
-        ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
-        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
+        ListLibraryItemsRequest, ListLibraryItemsResponse, ListTaskResultsRequest,
+        ListTaskResultsResponse, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
+        PlaybackProtocol, PlaybackSource, ReportPlaybackProgressRequest,
+        ReportPlaybackProgressResponse, RescanLibraryRequest, RescanLibraryResponse,
+        ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
         StartBilibiliLoginSessionRequest, Task, TaskEvent, TaskKind, TaskState, WatchTasksRequest,
         cache_service_server::CacheService, library_service_server::LibraryService,
         server_service_server::ServerService, task_service_server::TaskService,
@@ -783,6 +784,15 @@ impl TaskService for TaskGrpcService {
             self.state.tasks.get_task(&request.id)?,
             self.state.bilibili_error_details_are_sensitive(),
         )))
+    }
+
+    async fn list_task_results(
+        &self,
+        _request: Request<ListTaskResultsRequest>,
+    ) -> Result<Response<ListTaskResultsResponse>, Status> {
+        Err(Status::unimplemented(
+            "Paginated task results are not enabled by this server version.",
+        ))
     }
 
     async fn watch_tasks(
@@ -2821,7 +2831,7 @@ mod tests {
             BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
             GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
-            ResolveBilibiliInputRequest, TaskKind, TaskState,
+            ListTaskResultsRequest, ResolveBilibiliInputRequest, TaskKind, TaskState,
         },
         hls_cache::sanitized_completed_session,
         hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
@@ -2895,6 +2905,48 @@ mod tests {
                 .capabilities
                 .contains(&(ServerCapability::LanTranscoding as i32))
         );
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_task_results_remains_unimplemented_until_v2_output_is_available() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = TaskGrpcService::new(state);
+
+        let status = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "task-1".to_owned(),
+                page: None,
+            }))
+            .await
+            .expect_err("v2 task output should remain capability-gated");
+
+        assert_eq!(tonic::Code::Unimplemented, status.code());
+    }
+
+    #[test]
+    fn task_output_v2_generated_defaults_remain_legacy_compatible() {
+        let task = Task::default();
+        let page = ListTaskResultsResponse::default();
+
+        assert!(task.output_summary.is_none());
+        assert!(page.results.is_empty());
+        assert!(page.page_info.is_none());
+        assert_eq!(0, page.output_revision);
+        assert_eq!(13, ServerCapability::TaskOutputV2 as i32);
     }
 
     #[tokio::test]

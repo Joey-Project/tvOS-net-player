@@ -967,6 +967,114 @@ extension BilibiliTaskResultItem {
     }
 }
 
+extension CacheTaskOutputSummary {
+    init(_ proto: TvosNetPlayer_V1_TaskOutputSummary) {
+        self.init(
+            revision: proto.revision,
+            resultCount: proto.resultCount,
+            terminalResultCount: proto.terminalResultCount,
+            successfulResultCount: proto.successfulResultCount,
+            failedResultCount: proto.failedResultCount,
+            cancelledResultCount: proto.cancelledResultCount,
+            availableArtifactCount: proto.availableArtifactCount,
+            primaryResultID: proto.primaryResultID
+        )
+    }
+}
+
+extension CacheTaskResultProgress {
+    init(_ proto: TvosNetPlayer_V1_TaskResultProgress) {
+        self.init(
+            fraction: proto.fraction,
+            completedBytes: proto.completedBytes,
+            totalBytes: proto.totalBytes,
+            totalBytesKnown: proto.totalBytesKnown,
+            phase: proto.phase,
+            message: proto.message
+        )
+    }
+}
+
+extension CacheTaskProblem {
+    init(_ proto: TvosNetPlayer_V1_TaskProblem) {
+        self.init(
+            category: String(describing: proto.category),
+            code: proto.code,
+            message: proto.message,
+            retryable: proto.retryable
+        )
+    }
+}
+
+extension CacheResourceReference {
+    init(_ proto: TvosNetPlayer_V1_CacheResourceRef) {
+        self.init(
+            id: proto.id,
+            uri: proto.uri,
+            contentType: proto.contentType,
+            sizeBytes: proto.sizeBytes,
+            sizeKnown: proto.sizeKnown,
+            supportsByteRanges: proto.supportsByteRanges,
+            etag: proto.etag,
+            expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil
+        )
+    }
+}
+
+extension CacheTaskArtifact {
+    init(_ proto: TvosNetPlayer_V1_TaskArtifact) {
+        self.init(
+            id: proto.id,
+            kind: String(describing: proto.kind),
+            state: String(describing: proto.state),
+            title: proto.title,
+            format: proto.format,
+            languageTag: proto.languageTag,
+            isAIGenerated: proto.isAiGenerated,
+            resource: proto.hasResource ? CacheResourceReference(proto.resource) : nil,
+            problem: proto.hasProblem ? CacheTaskProblem(proto.problem) : nil
+        )
+    }
+}
+
+extension CacheTaskResult {
+    init(_ proto: TvosNetPlayer_V1_TaskResult) {
+        self.init(
+            id: proto.id,
+            state: String(describing: proto.state),
+            title: proto.title,
+            subtitle: proto.subtitle,
+            progress: proto.hasProgress ? CacheTaskResultProgress(proto.progress) : nil,
+            problem: proto.hasProblem ? CacheTaskProblem(proto.problem) : nil,
+            libraryItemID: proto.libraryItemID,
+            playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
+            artifacts: proto.artifacts.map(CacheTaskArtifact.init),
+            createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
+            updatedAt: proto.hasUpdatedAt ? Date(proto.updatedAt) : nil
+        )
+    }
+}
+
+extension CachePageInfo {
+    init(_ proto: TvosNetPlayer_V1_PageInfo) {
+        self.init(
+            totalSize: proto.totalSize,
+            nextPageToken: proto.nextPageToken,
+            snapshotID: proto.snapshotID
+        )
+    }
+}
+
+extension CacheTaskResultsPage {
+    init(_ proto: TvosNetPlayer_V1_ListTaskResultsResponse) {
+        self.init(
+            results: proto.results.map(CacheTaskResult.init),
+            pageInfo: CachePageInfo(proto.pageInfo),
+            outputRevision: proto.outputRevision
+        )
+    }
+}
+
 extension CacheTask {
     init(_ proto: TvosNetPlayer_V1_Task) {
         self.init(
@@ -985,7 +1093,10 @@ extension CacheTask {
             bilibiliSelection: proto.hasBilibiliSelection
                 ? BilibiliTaskSelection(proto.bilibiliSelection)
                 : nil,
-            resultItems: proto.resultItems.map(BilibiliTaskResultItem.init)
+            resultItems: proto.resultItems.map(BilibiliTaskResultItem.init),
+            outputSummary: proto.hasOutputSummary
+                ? CacheTaskOutputSummary(proto.outputSummary)
+                : nil
         )
     }
 }

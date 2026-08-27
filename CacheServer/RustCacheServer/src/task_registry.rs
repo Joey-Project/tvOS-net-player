@@ -150,6 +150,7 @@ impl BilibiliTaskRegistry {
             playback_session: None,
             bilibili_selection: None,
             result_items: Vec::new(),
+            output_summary: None,
         };
 
         inner
@@ -199,6 +200,7 @@ impl BilibiliTaskRegistry {
             playback_session: None,
             bilibili_selection: selection,
             result_items: Vec::new(),
+            output_summary: None,
         };
 
         inner
@@ -5441,6 +5443,7 @@ mod tests {
                 playback_session: None,
                 bilibili_selection: None,
                 result_items: Vec::new(),
+                output_summary: None,
             },
             options: None,
             playback_options: None,

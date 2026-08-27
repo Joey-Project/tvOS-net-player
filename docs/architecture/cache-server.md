@@ -107,6 +107,14 @@ Initial services:
 
 Playback sources intentionally return URLs instead of media bytes.
 
+Task output v2 schema foundation:
+
+- `Task.output_summary` is the compact, provider-independent output snapshot carried by task reads and watch events. It identifies an output revision and summarizes result, terminal-state, success/failure/cancellation, and available-artifact counts without embedding an unbounded result list. Both `SUCCEEDED` complete-download results and `COMPLETED` offline-HLS results count as successful terminal results.
+- `TaskService.ListTaskResults` pages immutable task-result snapshots. Page tokens are opaque and bound to the task plus snapshot; every page reports the same `snapshot_id` and `output_revision`. Clients must restart pagination after a revision change instead of combining pages from different snapshots.
+- `TaskResult`, `TaskProblem`, `TaskArtifact`, and `CacheResourceRef` separate generic execution state, client-safe failures, typed output artifacts, and server-owned HTTP resources from provider-specific task options. Resource URIs may be absolute HTTP(S) URLs or origin-relative paths, but cannot disclose local paths, upstream URLs, or credentials.
+- `SERVER_CAPABILITY_TASK_OUTPUT_V2` gates this contract. The current schema-foundation slice intentionally does not advertise the capability and returns `UNIMPLEMENTED` from `ListTaskResults`; persistence, serving, and capability enablement arrive in the next slice.
+- New Swift app flows will require v2 and surface an upgrade-required state when the capability is absent. They will not fall back to Bilibili-specific legacy result fields. Existing legacy RPCs and fields remain server-side for older deployed clients.
+
 Bilibili task selection/result execution:
 
 - `CreateBilibiliPlaybackTaskRequest.selection_id` remains the legacy single-candidate path.

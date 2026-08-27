@@ -31,6 +31,7 @@ service TaskService {
   rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
   rpc CreateBilibiliPlaybackTask(CreateBilibiliPlaybackTaskRequest) returns (Task);
   rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTaskResults(ListTaskResultsRequest) returns (ListTaskResultsResponse);
   rpc WatchTasks(WatchTasksRequest) returns (stream TaskEvent);
   rpc CancelTask(CancelTaskRequest) returns (Task);
 }
@@ -66,6 +67,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_CREDENTIAL_PROFILES = 10;
   SERVER_CAPABILITY_BILIBILI_LOGIN_SESSIONS = 11;
   SERVER_CAPABILITY_BILIBILI_PLAYBACK_POLICY = 12;
+  SERVER_CAPABILITY_TASK_OUTPUT_V2 = 13;
 }
 
 message CheckHealthRequest {}
@@ -360,6 +362,34 @@ message GetTaskRequest {
   string id = 1;
 }
 
+// Page tokens are opaque, server-issued values bound to the originating
+// request scope and snapshot. Clients must not construct or modify them.
+message PageRequest {
+  // Zero selects the server default. Servers enforce a method-specific maximum.
+  uint32 page_size = 1;
+  string page_token = 2;
+}
+
+message PageInfo {
+  // Total number of results in this immutable snapshot, not just this page.
+  uint64 total_size = 1;
+  string next_page_token = 2;
+  // Stable identifier shared by every page read from the same snapshot.
+  string snapshot_id = 3;
+}
+
+message ListTaskResultsRequest {
+  string task_id = 1;
+  PageRequest page = 2;
+}
+
+message ListTaskResultsResponse {
+  repeated TaskResult results = 1;
+  PageInfo page_info = 2;
+  // Matches TaskOutputSummary.revision for the snapshot being paged.
+  uint64 output_revision = 3;
+}
+
 message WatchTasksRequest {
   repeated string ids = 1;
 }
@@ -390,6 +420,24 @@ message Task {
   BilibiliPlaybackSession playback_session = 15;
   BilibiliTaskSelection bilibili_selection = 16;
   repeated BilibiliTaskResultItem result_items = 17;
+  TaskOutputSummary output_summary = 18;
+}
+
+// Compact output metadata for task snapshots and watch events. Detailed
+// results are read through ListTaskResults.
+message TaskOutputSummary {
+  // Revisions start at one and increase whenever the output snapshot changes.
+  uint64 revision = 1;
+  uint64 result_count = 2;
+  // Terminal results are succeeded, completed, failed, or cancelled.
+  uint64 terminal_result_count = 3;
+  // Successful results are in TASK_STATE_SUCCEEDED or TASK_STATE_COMPLETED.
+  uint64 successful_result_count = 4;
+  uint64 failed_result_count = 5;
+  uint64 cancelled_result_count = 6;
+  // Counts available artifacts across all results in this revision.
+  uint64 available_artifact_count = 7;
+  string primary_result_id = 8;
 }
 
 enum TaskKind {
@@ -411,6 +459,101 @@ enum TaskState {
   TASK_STATE_PREPARING = 8;
   TASK_STATE_PLAYABLE = 9;
   TASK_STATE_COMPLETED = 10;
+}
+
+message TaskResult {
+  string id = 1;
+  TaskState state = 2;
+  string title = 3;
+  string subtitle = 4;
+  TaskResultProgress progress = 5;
+  TaskProblem problem = 6;
+  string library_item_id = 7;
+  PlaybackSource playback_source = 8;
+  repeated TaskArtifact artifacts = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message TaskResultProgress {
+  // Normalized progress in the inclusive range 0...1.
+  double fraction = 1;
+  int64 completed_bytes = 2;
+  int64 total_bytes = 3;
+  bool total_bytes_known = 4;
+  string phase = 5;
+  string message = 6;
+}
+
+// Problem messages are safe for clients. Provider-specific machine codes use
+// a stable lowercase namespace such as "bilibili.credential_required".
+message TaskProblem {
+  TaskProblemCategory category = 1;
+  string code = 2;
+  string message = 3;
+  bool retryable = 4;
+}
+
+enum TaskProblemCategory {
+  TASK_PROBLEM_CATEGORY_UNSPECIFIED = 0;
+  TASK_PROBLEM_CATEGORY_INVALID_REQUEST = 1;
+  TASK_PROBLEM_CATEGORY_NOT_FOUND = 2;
+  TASK_PROBLEM_CATEGORY_CONFLICT = 3;
+  TASK_PROBLEM_CATEGORY_AUTHENTICATION = 4;
+  TASK_PROBLEM_CATEGORY_PERMISSION = 5;
+  TASK_PROBLEM_CATEGORY_UPSTREAM = 6;
+  TASK_PROBLEM_CATEGORY_RESOURCE_LIMIT = 7;
+  TASK_PROBLEM_CATEGORY_UNSUPPORTED = 8;
+  TASK_PROBLEM_CATEGORY_CANCELLED = 9;
+  TASK_PROBLEM_CATEGORY_INTERNAL = 10;
+}
+
+message TaskArtifact {
+  string id = 1;
+  TaskArtifactKind kind = 2;
+  TaskArtifactState state = 3;
+  string title = 4;
+  // A provider-independent format label such as "mp4", "ass", or "json".
+  // The resource content_type remains authoritative for HTTP delivery.
+  string format = 5;
+  // BCP 47 language tag when the artifact has a language.
+  string language_tag = 6;
+  bool is_ai_generated = 7;
+  CacheResourceRef resource = 8;
+  TaskProblem problem = 9;
+}
+
+enum TaskArtifactKind {
+  TASK_ARTIFACT_KIND_UNSPECIFIED = 0;
+  TASK_ARTIFACT_KIND_MEDIA = 1;
+  TASK_ARTIFACT_KIND_SUBTITLE = 2;
+  TASK_ARTIFACT_KIND_TIMED_COMMENTS = 3;
+  TASK_ARTIFACT_KIND_COVER_IMAGE = 4;
+  TASK_ARTIFACT_KIND_CHAPTERS = 5;
+  TASK_ARTIFACT_KIND_METADATA = 6;
+  TASK_ARTIFACT_KIND_OTHER = 7;
+}
+
+enum TaskArtifactState {
+  TASK_ARTIFACT_STATE_UNSPECIFIED = 0;
+  TASK_ARTIFACT_STATE_PENDING = 1;
+  TASK_ARTIFACT_STATE_AVAILABLE = 2;
+  TASK_ARTIFACT_STATE_UNAVAILABLE = 3;
+  TASK_ARTIFACT_STATE_DELETED = 4;
+}
+
+// A server-owned HTTP resource. The URI may be an absolute HTTP(S) URL or an
+// origin-relative path. It must never reveal a local filesystem path, an
+// upstream provider URL, or provider authentication material.
+message CacheResourceRef {
+  string id = 1;
+  string uri = 2;
+  string content_type = 3;
+  int64 size_bytes = 4;
+  bool size_known = 5;
+  bool supports_byte_ranges = 6;
+  string etag = 7;
+  google.protobuf.Timestamp expires_at = 8;
 }
 
 message BilibiliTaskResultItem {

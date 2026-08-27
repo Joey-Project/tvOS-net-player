@@ -3,7 +3,7 @@ id: 20260624-a8d2c5
 title: Next Phase Productization Roadmap
 status: active
 created: 2026-06-24
-updated: 2026-08-05
+updated: 2026-08-27
 branch: wip/next-phase-roadmap
 pr:
 supersedes:
@@ -102,10 +102,10 @@ superseded_by:
 
 ### PR 6: Bilibili Task Options And Result Schema v2
 
-- Status: deferred and non-sequential until explicit schema discussion.
-- Discuss schema before implementation.
-- Candidate scope includes per-result artifacts, subtitle/danmaku/cover metadata, episode/page identity, library handoff, and result-level task outputs.
-- Avoid turning this into a generic task-system rewrite unless the schema discussion shows a concrete need.
+- Status: active as five sequential slices after the schema discussion completed.
+- The approved design adds reusable generic pagination, task results, safe problems, artifacts, and server-owned resource references, then builds typed paginated Bilibili v2 contracts on that foundation.
+- New Swift clients use Bilibili v2 directly without legacy RPC fallback; existing v1 RPCs remain server-side compatibility surfaces for old clients.
+- Detailed decisions and PR6A through PR6E scope live in `docs/project_journal/2026/08/2026-08-27-task-output-bilibili-v2-roadmap-d8c4f1.md`.
 
 ## Validation Contract
 
@@ -118,13 +118,12 @@ superseded_by:
   - An independent fresh-context local Codex review over the frozen whole-PR range.
 - All actionable PR comments and unresolved conversations must be addressed or resolved before merge.
 - After each merge, update the local branch that tracks `origin/HEAD` before branching the next PR.
-- Pause before PR 6 and discuss the schema before implementing it.
+- Execute PR 6 as the approved PR6A through PR6E sequence and update local `master` after each merge.
 
 ## Deferred
 
 - Physical Apple TV deployment and real-device playback validation.
 - Full LAN control-plane auth/TLS hardening beyond remote endpoint transport needs.
-- Bilibili task options/result schema v2 implementation until the schema is explicitly discussed.
 
 ## Evidence
 

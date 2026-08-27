@@ -51,6 +51,129 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedTaskOutputV2CapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.taskOutputV2),
+            CacheServerCapability.taskOutputV2
+        )
+
+        let summary = CacheServerSummary(
+            id: "server-1",
+            name: "Cache server",
+            version: "1.0.0",
+            mediaBaseURIs: [],
+            capabilities: [CacheServerCapability.taskOutputV2]
+        )
+        XCTAssertTrue(summary.supportsTaskOutputV2)
+    }
+
+    func testTaskOutputSummaryMapsToPublicModel() {
+        var proto = TvosNetPlayer_V1_Task()
+        proto.id = "task-output-v2"
+        proto.outputSummary.revision = 7
+        proto.outputSummary.resultCount = 3
+        proto.outputSummary.terminalResultCount = 2
+        proto.outputSummary.successfulResultCount = 1
+        proto.outputSummary.failedResultCount = 1
+        proto.outputSummary.cancelledResultCount = 0
+        proto.outputSummary.availableArtifactCount = 4
+        proto.outputSummary.primaryResultID = "result-1"
+
+        let task = CacheTask(proto)
+
+        XCTAssertEqual(task.outputSummary?.revision, 7)
+        XCTAssertEqual(task.outputSummary?.resultCount, 3)
+        XCTAssertEqual(task.outputSummary?.terminalResultCount, 2)
+        XCTAssertEqual(task.outputSummary?.successfulResultCount, 1)
+        XCTAssertEqual(task.outputSummary?.failedResultCount, 1)
+        XCTAssertEqual(task.outputSummary?.cancelledResultCount, 0)
+        XCTAssertEqual(task.outputSummary?.availableArtifactCount, 4)
+        XCTAssertEqual(task.outputSummary?.primaryResultID, "result-1")
+    }
+
+    func testTaskOutputV2DefaultsRemainCompatibleWithLegacyTasks() {
+        let task = CacheTask(TvosNetPlayer_V1_Task())
+        let page = CacheTaskResultsPage(TvosNetPlayer_V1_ListTaskResultsResponse())
+
+        XCTAssertNil(task.outputSummary)
+        XCTAssertTrue(page.results.isEmpty)
+        XCTAssertEqual(page.totalSize, 0)
+        XCTAssertEqual(page.nextPageToken, "")
+        XCTAssertEqual(page.snapshotID, "")
+        XCTAssertEqual(page.outputRevision, 0)
+    }
+
+    func testTaskResultsPageMapsArtifactsProblemsAndResourceMetadata() {
+        var proto = TvosNetPlayer_V1_ListTaskResultsResponse()
+        proto.pageInfo.totalSize = 2
+        proto.pageInfo.nextPageToken = "opaque-page-token"
+        proto.pageInfo.snapshotID = "snapshot-7"
+        proto.outputRevision = 7
+
+        var result = TvosNetPlayer_V1_TaskResult()
+        result.id = "result-1"
+        result.state = .failed
+        result.title = "Episode 1"
+        result.subtitle = "Page 1"
+        result.progress.fraction = 0.5
+        result.progress.completedBytes = 512
+        result.progress.totalBytes = 1_024
+        result.progress.totalBytesKnown = true
+        result.progress.phase = "downloading"
+        result.problem.category = .authentication
+        result.problem.code = "bilibili.credential_required"
+        result.problem.message = "A credential profile is required."
+        result.problem.retryable = true
+        result.libraryItemID = "library-1"
+        result.playbackSource.itemID = "library-1"
+        result.playbackSource.variantID = "h264"
+        result.playbackSource.`protocol` = .hls
+        result.playbackSource.uri = "/v1/library/library-1/master.m3u8"
+        result.createdAt.seconds = 100
+        result.updatedAt.seconds = 200
+
+        var artifact = TvosNetPlayer_V1_TaskArtifact()
+        artifact.id = "subtitle-ja"
+        artifact.kind = .subtitle
+        artifact.state = .available
+        artifact.title = "Japanese"
+        artifact.format = "ass"
+        artifact.languageTag = "ja-JP"
+        artifact.isAiGenerated = false
+        artifact.resource.id = "resource-1"
+        artifact.resource.uri = "/v1/resources/resource-1"
+        artifact.resource.contentType = "text/x-ass"
+        artifact.resource.sizeBytes = 4_096
+        artifact.resource.sizeKnown = true
+        artifact.resource.supportsByteRanges = true
+        artifact.resource.etag = "resource-etag"
+        artifact.resource.expiresAt.seconds = 300
+        result.artifacts = [artifact]
+        proto.results = [result]
+
+        let page = CacheTaskResultsPage(proto)
+        let mapped = page.results.first
+        let mappedArtifact = mapped?.artifacts.first
+
+        XCTAssertEqual(page.totalSize, 2)
+        XCTAssertEqual(page.nextPageToken, "opaque-page-token")
+        XCTAssertEqual(page.snapshotID, "snapshot-7")
+        XCTAssertTrue(page.hasMoreResults)
+        XCTAssertTrue(page.pageInfo.hasMoreItems)
+        XCTAssertEqual(page.outputRevision, 7)
+        XCTAssertEqual(mapped?.progress?.completedBytes, 512)
+        XCTAssertEqual(mapped?.problem?.category, "authentication")
+        XCTAssertEqual(mapped?.problem?.code, "bilibili.credential_required")
+        XCTAssertEqual(mapped?.playbackSource?.uri, "/v1/library/library-1/master.m3u8")
+        XCTAssertEqual(mapped?.createdAt, Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(mappedArtifact?.kind, "subtitle")
+        XCTAssertEqual(mappedArtifact?.state, "available")
+        XCTAssertEqual(mappedArtifact?.languageTag, "ja-JP")
+        XCTAssertEqual(mappedArtifact?.resource?.contentType, "text/x-ass")
+        XCTAssertEqual(mappedArtifact?.resource?.sizeBytes, 4_096)
+        XCTAssertEqual(mappedArtifact?.resource?.expiresAt, Date(timeIntervalSince1970: 300))
+    }
+
     func testBilibiliTaskSchemaMapsSelectionAndResultItems() {
         var proto = TvosNetPlayer_V1_Task()
         proto.id = "task-1"
