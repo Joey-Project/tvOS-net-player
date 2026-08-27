@@ -2549,6 +2549,16 @@ final class BilibiliTaskViewModelTests: XCTestCase {
     }
 
     func testDeletedCachedLibraryItemClearsMatchingResultItem() async {
+        let outputSummary = CacheTaskOutputSummary(
+            revision: 7,
+            resultCount: 2,
+            terminalResultCount: 2,
+            successfulResultCount: 2,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 3,
+            primaryResultID: "bilibili-playback-1"
+        )
         let resultItems: [BilibiliTaskResultItem] = [
             .fixture(
                 id: "bilibili-playback-1",
@@ -2572,7 +2582,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                     source: "BV1done",
                     state: "TASK_STATE_COMPLETED",
                     libraryItemID: "bilibili.hls.bilibili-playback-1",
-                    resultItems: resultItems
+                    resultItems: resultItems,
+                    outputSummary: outputSummary
                 ))
         ])
         let model = BilibiliTaskViewModel(
@@ -2594,6 +2605,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.currentTask?.resultItems[1].libraryItemID, "")
         XCTAssertNil(model.currentTask?.resultItems[1].playbackSource)
         XCTAssertNil(model.currentTask?.resultItems[1].playbackSession)
+        XCTAssertEqual(model.currentTask?.outputSummary, outputSummary)
     }
 
     func testActivePlaybackLibraryItemMatchesCompletedTaskCache() async {
@@ -3580,7 +3592,8 @@ private extension CacheTask {
         playbackSource: CachePlaybackSource? = nil,
         playbackSession: CacheBilibiliPlaybackSession? = nil,
         bilibiliSelection: BilibiliTaskSelection? = nil,
-        resultItems: [BilibiliTaskResultItem] = []
+        resultItems: [BilibiliTaskResultItem] = [],
+        outputSummary: CacheTaskOutputSummary? = nil
     ) -> Self {
         Self(
             id: id,
@@ -3596,7 +3609,8 @@ private extension CacheTask {
             playbackSource: playbackSource,
             playbackSession: playbackSession,
             bilibiliSelection: bilibiliSelection,
-            resultItems: resultItems
+            resultItems: resultItems,
+            outputSummary: outputSummary
         )
     }
 

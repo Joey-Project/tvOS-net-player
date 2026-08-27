@@ -2401,7 +2401,8 @@ private extension CacheTask {
             playbackSource: playbackSource,
             playbackSession: playbackSession,
             bilibiliSelection: bilibiliSelection,
-            resultItems: updatedResultItems
+            resultItems: updatedResultItems,
+            outputSummary: outputSummary
         )
     }
 }
