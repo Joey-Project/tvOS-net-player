@@ -187,6 +187,7 @@ impl From<PersistedTaskFile> for PersistedTaskRecord {
                     .into_iter()
                     .map(BilibiliTaskResultItem::from)
                     .collect(),
+                output_summary: None,
             },
             options: file.bilibili_options.map(BilibiliDownloadOptions::from),
             playback_options: file
@@ -882,6 +883,7 @@ mod tests {
                     playback_session: Some(playback_session.clone()),
                     bilibili_selection: Some(selection.clone()),
                     result_items: vec![result_item.clone()],
+                    output_summary: None,
                 },
                 options: Some(BilibiliDownloadOptions {
                     quality_preference: "1080p".to_owned(),

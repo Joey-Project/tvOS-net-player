@@ -13,7 +13,7 @@
 - [completed] Next PR 4：增加 server-owned credential profile/login foundation，继续避免向客户端暴露 secret。
 - [completed] Next PR 5：扩展 authenticated/restricted live validation，覆盖 history、watch-later、recommendations、space videos、restricted Bangumi 和 collection/list cases，并安全识别 following/dynamic 的外部 schema compatibility failure。
 - [completed] Next PR 7：增加 per-request transcoding/ABR policy controls、兼容变体选择、弱网降级/恢复模式，以及 tvOS/macOS 共享设置。
-- [pending] Deferred/non-sequential Next PR 6：Bilibili task options/result schema v2；开始实现前先暂停讨论 schema。
+- [in_progress] Deferred/non-sequential Next PR 6：按 PR6A 到 PR6E 实现通用 task output/artifact/resource、分页 Bilibili resolution、v2 BBDown 映射，以及直接使用 v2 的 tvOS/macOS 客户端。
 - [pending] 跟进 `bbdown-core` dynamic feed timestamp compatibility：接受整数或 numeric-string `module_author.pub_ts`，升级依赖后重跑 following/dynamic live cases。
 - [completed] PR 9：推进 segment-level fill / prefetch。
 - [completed] PR 10：增加 adaptive weak-network policy 和对应 UX。
