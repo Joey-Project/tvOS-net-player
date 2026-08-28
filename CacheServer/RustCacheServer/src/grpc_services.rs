@@ -1603,10 +1603,7 @@ impl TaskService for TaskGrpcService {
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
-            for session_id in cancellation.hls_session_ids {
-                self.state.remove_hls_playback_session(&session_id);
-                let _ = self.state.hls_cache.remove_session(&session_id);
-            }
+            remove_task_hls_sessions(&self.state, &task.id, &cancellation.hls_session_ids);
         }
         let task = self.state.tasks.get_task(&task.id)?;
         Ok(Response::new(task_for_client(
@@ -2135,7 +2132,7 @@ async fn complete_playback_planning_terminal(
                     || state.tasks.persistence_available() =>
             {
                 let _deletion_guard = state.completed_hls_mutation_guard();
-                remove_hls_sessions(state, &hls_session_ids);
+                remove_task_hls_sessions(state, task_id, &hls_session_ids);
                 return true;
             }
             Ok(_) => {}
@@ -2779,10 +2776,12 @@ fn bilibili_result_item(
     }
 }
 
-fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
-    for session_id in session_ids {
-        state.remove_hls_playback_session(session_id);
-        let _ = state.hls_cache.remove_session(session_id);
+fn remove_task_hls_sessions(state: &AppState, task_id: &str, session_ids: &[String]) {
+    if let Err(error) = state.remove_task_hls_sessions_tracking_failures(task_id, session_ids) {
+        eprintln!(
+            "Failed to remove terminal HLS cache sessions for task {task_id}; physical cleanup remains queued: {}",
+            state.error_detail_for_log(&error)
+        );
     }
 }
 
@@ -3058,8 +3057,7 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.remove_hls_playback_session(&session_id);
-            let _ = state.hls_cache.remove_session(&session_id);
+            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
             return HlsCacheFinalizationOutcome::Finished;
         }
         Err(error) => {
@@ -3112,8 +3110,7 @@ async fn run_hls_cache_finalization_inner(
             return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session);
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.remove_hls_playback_session(&session_id);
-            let _ = state.hls_cache.remove_session(&session_id);
+            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
         }
         Err(crate::hls_cache::HlsCacheError::Preempted) => {
             return HlsCacheFinalizationOutcome::Preempted;
@@ -3161,8 +3158,11 @@ async fn run_hls_cache_finalization_inner(
                                 ),
                             );
                         if failure.is_ok() {
-                            state.remove_hls_playback_session(&session_id);
-                            let _ = state.hls_cache.remove_session(&session_id);
+                            remove_task_hls_sessions(
+                                &state,
+                                &task_id,
+                                std::slice::from_ref(&session_id),
+                            );
                         }
                         failure
                     };
@@ -3230,8 +3230,8 @@ fn publish_completed_hls_cache(
             );
         }
     } else {
-        state.remove_hls_playback_session(session_id);
-        let _ = state.hls_cache.remove_session(session_id);
+        let session_ids = [session_id.to_owned()];
+        remove_task_hls_sessions(state, task_id, &session_ids);
     }
 
     HlsCacheFinalizationOutcome::Finished
@@ -8930,6 +8930,55 @@ mod tests {
         assert_eq!(TaskState::Cancelled, cancelled.state());
         assert!(state.tasks.persistence_available());
         assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_none());
+        assert!(!hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_retries_failed_physical_cleanup() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                hls_cache_max_bytes: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-cleanup-retry", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        state.hls_cache.fail_next_remove_session(task_id.clone());
+
+        let cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("durable cancellation should remain successful")
+            .into_inner();
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
+
+        let summary = state
+            .enforce_hls_cache_quota("cancelled_task_cleanup_retry", Vec::new(), 0)
+            .expect("maintenance should retry cleanup even when quota eviction is disabled");
+
+        assert!(summary.is_none());
         assert!(state.hls_cache.playback_session(&task_id).is_none());
         assert!(!hls_session_dir.exists());
     }

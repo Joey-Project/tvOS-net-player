@@ -1046,6 +1046,32 @@ impl AppState {
             })
     }
 
+    pub(crate) fn remove_task_hls_sessions_tracking_failures(
+        &self,
+        task_id: &str,
+        session_ids: &[String],
+    ) -> io::Result<()> {
+        let mut visited = HashSet::new();
+        let mut first_error = None;
+        for session_id in session_ids {
+            if !visited.insert(session_id.as_str()) {
+                continue;
+            }
+            self.remove_hls_playback_session(session_id);
+            let cleanup_key = format!("task-terminal:{task_id}:{session_id}");
+            if let Err(error) = self.remove_hls_sessions_tracking_failures(
+                &cleanup_key,
+                std::slice::from_ref(session_id),
+            ) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn remove_hls_sessions_tracking_failures(
         &self,
         cleanup_key: &str,

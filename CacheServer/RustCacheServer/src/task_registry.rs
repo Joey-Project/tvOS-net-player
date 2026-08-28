@@ -492,7 +492,7 @@ impl BilibiliTaskRegistry {
             output: Arc::clone(output),
         };
         let retained = RetainedTaskResourceSnapshot::from_output(&snapshot);
-        if !retained.output.available_resources_by_id.is_empty() {
+        if !retained.output.record.resources.is_empty() {
             inner
                 .retained_resource_snapshots
                 .insert(snapshot.resource_lease_id.clone(), retained);
@@ -4413,7 +4413,7 @@ fn resource_body_owner_ids_locked<'a>(
             inner
                 .retained_resource_snapshots
                 .values()
-                .flat_map(|snapshot| snapshot.output.available_resources_by_id.values())
+                .flat_map(|snapshot| &snapshot.output.record.resources)
                 .filter(|resource| {
                     resource
                         .resource
@@ -4455,7 +4455,8 @@ fn resource_body_owner_record_locked(
             inner
                 .retained_resource_snapshots
                 .values()
-                .find_map(|snapshot| snapshot.output.available_resources_by_id.get(resource_id))
+                .flat_map(|snapshot| &snapshot.output.record.resources)
+                .find(|resource| resource.resource.id == resource_id)
                 .filter(|resource| {
                     resource
                         .resource
@@ -4512,7 +4513,8 @@ fn reserved_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
             inner
                 .retained_resource_snapshots
                 .values()
-                .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys().cloned()),
+                .flat_map(|snapshot| &snapshot.output.record.resources)
+                .map(|resource| resource.resource.id.clone()),
         )
         .chain(inner.pending_resource_cleanup_ids.iter().cloned())
         .chain(inner.durable_resource_cleanup_ids.iter().cloned())
@@ -4545,8 +4547,8 @@ fn validate_task_output_resource_claims_locked(
     let retained_resource_ids = inner
         .retained_resource_snapshots
         .values()
-        .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
-        .map(String::as_str)
+        .flat_map(|snapshot| &snapshot.output.record.resources)
+        .map(|resource| resource.resource.id.as_str())
         .collect::<HashSet<_>>();
     let visible_resource_ids = inner
         .visible_outputs_by_task_id
@@ -4612,7 +4614,8 @@ fn validate_task_output_resource_claims_locked(
         inner
             .retained_resource_snapshots
             .values()
-            .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys().cloned()),
+            .flat_map(|snapshot| &snapshot.output.record.resources)
+            .map(|resource| resource.resource.id.clone()),
     );
     projected_resource_ids.extend(inner.pending_resource_cleanup_ids.iter().cloned());
     projected_resource_ids.extend(inner.durable_resource_cleanup_ids.iter().cloned());
@@ -8961,6 +8964,85 @@ mod tests {
             ".tvos-net-player/resources/subtitle-resource/body",
             restored_resource.relative_path()
         );
+    }
+
+    #[test]
+    fn unavailable_snapshot_resource_stays_reserved_without_becoming_servable() {
+        use crate::generated::tvos_net_player::v1::{
+            TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1unavailable-snapshot", None)
+            .expect("task should be created");
+        let resource = test_task_resource("unavailable-snapshot-resource", 4);
+        let resource_path = write_task_resource_body(&root_path, &resource, b"test");
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "unavailable-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "unavailable-artifact".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Unavailable.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource.clone()],
+            )
+            .expect("unavailable resource metadata should commit");
+        let snapshot = registry
+            .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
+            .expect("result page snapshot should retain every referenced resource id");
+
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "replacement".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("current output should release the resource");
+
+        assert!(resource_path.exists());
+        assert!(
+            registry
+                .task_resource("unavailable-snapshot-resource")
+                .is_none()
+        );
+        let other_task = registry
+            .create_bilibili_task("BV1snapshot-collision", None)
+            .expect("second task should be created");
+        let collision = match registry
+            .stage_task_output_replacement(&other_task.id, vec![resource.clone()])
+        {
+            Ok(_) => panic!("an unexpired result page must reserve every referenced resource id"),
+            Err(error) => error,
+        };
+        assert_eq!(tonic::Code::AlreadyExists, collision.code());
+        assert_eq!(b"test", std::fs::read(&resource_path).unwrap().as_slice());
+
+        registry.release_task_output_snapshots(&[snapshot.resource_lease_id]);
+        assert!(!resource_path.exists());
+        let staged = registry
+            .stage_task_output_replacement(&other_task.id, vec![resource])
+            .expect("released snapshot resource id should become reusable");
+        assert_eq!(1, staged.resources_requiring_body_creation().count());
     }
 
     #[test]
