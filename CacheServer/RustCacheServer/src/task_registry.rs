@@ -33,7 +33,7 @@ use crate::{
     },
     task_store::{
         PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore,
-        validate_unique_task_output_identities,
+        validate_unique_task_record_identities,
     },
 };
 
@@ -2491,7 +2491,7 @@ impl BilibiliTaskRegistry {
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
     ) -> io::Result<Self> {
-        validate_unique_task_output_identities(&records)?;
+        validate_unique_task_record_identities(&records)?;
         let mut inner = RegistryInner::default();
         for record in records {
             let Some((mut task, download_options, playback_options, mut output)) =
@@ -8122,58 +8122,98 @@ mod tests {
     }
 
     #[test]
-    fn colliding_task_output_snapshot_blocks_startup_rewrite_and_resource_cleanup() {
-        let temp = tempfile::tempdir().expect("temp dir should be created");
-        let state_path = temp.path().join("state").join("tasks.json");
-        let root_path = temp.path().join("cache");
-        let first_resource = test_task_resource("collision-owned-one", 3);
-        let second_resource = test_task_resource("collision-owned-two", 3);
-        let first_path = write_task_resource_body(&root_path, &first_resource, b"one");
-        let second_path = write_task_resource_body(&root_path, &second_resource, b"two");
-        let record = |id: &str, source: &str, resource: TaskResourceRecord| {
-            let mut record = persisted_task_record(id, source);
-            record.output = TaskOutputRecord::replace(
-                Some(&record.output),
-                vec![test_task_result_with_resources(
-                    &format!("result-{id}"),
-                    std::slice::from_ref(&resource),
-                )],
-                vec![resource],
-            )
-            .expect("persisted output should be valid");
-            record
-        };
-        TaskStateStore::new(&state_path)
-            .save(&[
-                record("collision-one", "BV1collision-one", first_resource),
-                record("collision-two", "BV1collision-two", second_resource),
-            ])
-            .expect("valid fixture should persist");
-        let mut snapshot: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&state_path).expect("fixture should be readable"),
-        )
-        .expect("fixture should decode");
-        snapshot["tasks"][1]["output"]["snapshot_id"] =
-            snapshot["tasks"][0]["output"]["snapshot_id"].clone();
-        let mut colliding_bytes =
-            serde_json::to_vec_pretty(&snapshot).expect("colliding fixture should serialize");
-        colliding_bytes.push(b'\n');
-        std::fs::write(&state_path, &colliding_bytes).expect("colliding fixture should be written");
+    fn direct_restore_rejects_normalized_duplicate_task_ids() {
+        let first = persisted_task_record("normalized-identity", "BV1normalized-one");
+        let mut duplicate = persisted_task_record("distinct-identity", "BV1normalized-two");
+        duplicate.task.id = format!("\u{2003}{}\u{2003}", first.task.id);
 
-        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
-            &state_path,
+        let error = match BilibiliTaskRegistry::from_persisted_records(
+            vec![first, duplicate],
+            None,
+            true,
             TaskRetentionPolicy::default(),
-            Some(root_path),
-        );
+            None,
+        ) {
+            Ok(_) => panic!("direct restore must reject normalized duplicate task ids"),
+            Err(error) => error,
+        };
 
-        assert!(!registry.persistence_available());
-        assert!(!registry.task_output_v2_available());
-        assert_eq!(
-            colliding_bytes,
-            std::fs::read(&state_path).expect("colliding snapshot should remain untouched")
-        );
-        assert!(first_path.exists());
-        assert!(second_path.exists());
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn colliding_task_identity_blocks_startup_rewrite_and_resource_cleanup() {
+        for (fixture_name, duplicate_task_id) in [
+            ("duplicate-task-id", true),
+            ("duplicate-snapshot-id", false),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir should be created");
+            let state_path = temp.path().join("state").join("tasks.json");
+            let root_path = temp.path().join("cache");
+            let first_resource = test_task_resource("collision-owned-one", 3);
+            let second_resource = test_task_resource("collision-owned-two", 3);
+            let first_path = write_task_resource_body(&root_path, &first_resource, b"one");
+            let second_path = write_task_resource_body(&root_path, &second_resource, b"two");
+            let record = |id: &str, source: &str, resource: TaskResourceRecord| {
+                let mut record = persisted_task_record(id, source);
+                record.output = TaskOutputRecord::replace(
+                    Some(&record.output),
+                    vec![test_task_result_with_resources(
+                        &format!("result-{id}"),
+                        std::slice::from_ref(&resource),
+                    )],
+                    vec![resource],
+                )
+                .expect("persisted output should be valid");
+                record
+            };
+            TaskStateStore::new(&state_path)
+                .save(&[
+                    record("collision-one", "BV1collision-one", first_resource),
+                    record("collision-two", "BV1collision-two", second_resource),
+                ])
+                .expect("valid fixture should persist");
+            let mut snapshot: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&state_path).expect("fixture should be readable"),
+            )
+            .expect("fixture should decode");
+            if duplicate_task_id {
+                let first_id = snapshot["tasks"][0]["id"]
+                    .as_str()
+                    .expect("fixture task id should be a string");
+                snapshot["tasks"][1]["id"] =
+                    serde_json::Value::String(format!("\u{2003}{first_id}\u{2003}"));
+            } else {
+                snapshot["tasks"][1]["output"]["snapshot_id"] =
+                    snapshot["tasks"][0]["output"]["snapshot_id"].clone();
+            }
+            let mut colliding_bytes =
+                serde_json::to_vec_pretty(&snapshot).expect("colliding fixture should serialize");
+            colliding_bytes.push(b'\n');
+            std::fs::write(&state_path, &colliding_bytes)
+                .expect("colliding fixture should be written");
+
+            let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            );
+
+            assert!(
+                !registry.persistence_available(),
+                "{fixture_name} must disable persistence"
+            );
+            assert!(
+                !registry.task_output_v2_available(),
+                "{fixture_name} must disable task output v2"
+            );
+            assert_eq!(
+                colliding_bytes,
+                std::fs::read(&state_path).expect("colliding snapshot should remain untouched")
+            );
+            assert!(first_path.exists());
+            assert!(second_path.exists());
+        }
     }
 
     #[test]

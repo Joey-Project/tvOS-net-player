@@ -1245,6 +1245,8 @@ impl AppState {
         session_id: &str,
     ) -> HlsCacheEvictionProtectionGuard {
         let session_id = session_id.to_owned();
+        // Protection registration and physical deletion share this linearization point.
+        let _deletion_guard = self.completed_hls_mutation_guard();
         {
             let mut protected_session_ids = self
                 .hls_cache_eviction_protected_session_ids
@@ -1465,6 +1467,17 @@ impl AppState {
             if evicted_session_id_set.contains(&entry.session_id) {
                 continue;
             }
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+            if self.hls_cache_session_is_currently_protected_from_eviction(
+                &entry.session_id,
+                &partial_protected_session_ids,
+            ) {
+                continue;
+            }
+            let _deletion_guard = self.completed_hls_mutation_guard();
             if should_cancel() {
                 cancelled = true;
                 break;
@@ -2804,6 +2817,46 @@ mod tests {
         })
         .await
         .expect("failed startup HLS deletion should retry without quota activity");
+    }
+
+    #[test]
+    fn eviction_protection_registration_waits_for_hls_deletion_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let deletion_guard = state.completed_hls_mutation_guard();
+        let worker_state = state.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_sender
+                .send(())
+                .expect("registration start should be observable");
+            let protection =
+                worker_state.protect_hls_cache_session_from_eviction("serialized-session");
+            acquired_sender
+                .send(())
+                .expect("registration completion should be observable");
+            protection
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration worker should start");
+        assert!(
+            acquired_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "protection registration must not cross an active HLS deletion mutation"
+        );
+
+        drop(deletion_guard);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration should finish after HLS deletion mutation releases");
+        let protection = worker.join().expect("registration worker should finish");
+        assert!(state.hls_cache_session_has_finalization_protection("serialized-session"));
+        drop(protection);
+        assert!(!state.hls_cache_session_has_finalization_protection("serialized-session"));
     }
 
     #[tokio::test]
