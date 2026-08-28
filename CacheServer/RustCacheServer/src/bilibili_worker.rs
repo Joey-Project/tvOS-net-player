@@ -180,7 +180,10 @@ async fn complete_terminal_task(
 ) {
     loop {
         match complete() {
-            Ok(_) => return,
+            Ok(_) if !registry.persistence_configured() || registry.persistence_available() => {
+                return;
+            }
+            Ok(_) => {}
             Err(error) if error.code() == tonic::Code::Unavailable => {}
             Err(_) => return,
         }
@@ -239,6 +242,117 @@ mod tests {
 
         worker.abort();
         assert_eq!("adapter failed", completed.message);
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_returns_immediately_without_configured_persistence() {
+        let registry = BilibiliTaskRegistry::default();
+        let mut attempts = 0;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_terminal_task(&registry, || {
+                attempts += 1;
+                Ok(Default::default())
+            }),
+        )
+        .await
+        .expect("unconfigured persistence should not delay terminal completion");
+
+        assert_eq!(1, attempts);
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_does_not_retry_non_retryable_errors() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        registry.fail_next_persistence_directory_sync();
+        registry
+            .create_bilibili_task("BV1non-retryable", None)
+            .expect("task should be installed before directory sync fails");
+        assert!(!registry.persistence_available());
+        let mut attempts = 0;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_terminal_task(&registry, || {
+                attempts += 1;
+                Err(tonic::Status::failed_precondition(
+                    "terminal transition is not allowed",
+                ))
+            }),
+        )
+        .await
+        .expect("non-retryable completion errors should return immediately");
+
+        assert_eq!(1, attempts);
+        assert!(!registry.persistence_available());
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_keeps_worker_ownership_until_directory_sync_repair() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&path));
+        let task = registry
+            .create_bilibili_task("BV1worker-directory-sync", None)
+            .expect("task should be created durably");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("task should start running");
+        registry.fail_next_persistence_directory_sync();
+
+        let completion_registry = Arc::clone(&registry);
+        let completion_path = path.clone();
+        let installed = Arc::new(Notify::new());
+        let installed_signal = Arc::clone(&installed);
+        let completion = tokio::spawn(async move {
+            let mut first_attempt = true;
+            complete_terminal_task(&completion_registry, || {
+                let result = completion_registry.complete_task_succeeded(
+                    &work_item.task_id,
+                    "local.default.sample".to_owned(),
+                    "Downloaded into the cache library.".to_owned(),
+                );
+                if first_attempt {
+                    first_attempt = false;
+                    assert!(result.is_ok());
+                    assert!(!completion_registry.persistence_available());
+                    std::fs::remove_file(&completion_path)
+                        .expect("installed snapshot should be removable");
+                    std::fs::create_dir(&completion_path)
+                        .expect("directory should keep persistence unavailable");
+                    installed_signal.notify_one();
+                }
+                result
+            })
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), installed.notified())
+            .await
+            .expect("terminal state should be installed before directory sync fails");
+        assert!(!completion.is_finished());
+        assert!(!registry.persistence_available());
+        assert_eq!(
+            TaskState::Succeeded,
+            registry.get_task(&task.id).unwrap().state()
+        );
+
+        std::fs::remove_dir(&path).expect("blocking directory should be removable");
+        tokio::time::timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("worker should retry after directory repair")
+            .expect("worker task should finish cleanly");
+
+        assert!(registry.persistence_available());
+        drop(registry);
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        assert_eq!(
+            TaskState::Succeeded,
+            restored.get_task(&task.id).unwrap().state()
+        );
     }
 
     #[tokio::test]

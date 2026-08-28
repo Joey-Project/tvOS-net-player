@@ -169,6 +169,7 @@ impl BilibiliTaskRegistry {
             resource_root_path,
         );
         registry.persist_current_state();
+        registry.retire_expired_task_resources();
         registry
     }
 
@@ -390,6 +391,7 @@ impl BilibiliTaskRegistry {
         id: &str,
         expires_at: Instant,
     ) -> Result<TaskOutputSnapshot, Status> {
+        self.retire_expired_task_resources();
         let normalized_id = normalize_required_id(id)?;
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         if !self.task_output_v2_available() {
@@ -436,6 +438,7 @@ impl BilibiliTaskRegistry {
             .iter()
             .map(|resource| resource.resource.id.clone())
             .collect::<HashSet<_>>();
+        self.retire_expired_task_resources_except(&candidate_resource_ids);
         let staged_resources = StagedTaskOutputResources::new(self, candidate_resource_ids.clone());
         if !self
             .resource_storage_available
@@ -591,6 +594,7 @@ impl BilibiliTaskRegistry {
 
     #[cfg(test)]
     pub(crate) fn task_resource(&self, id: &str) -> Option<TaskResourceRecord> {
+        self.retire_expired_task_resources();
         let normalized_id = normalize(id).to_ascii_lowercase();
         if normalized_id.is_empty() {
             return None;
@@ -628,6 +632,7 @@ impl BilibiliTaskRegistry {
     }
 
     pub(crate) fn open_task_resource(&self, id: &str) -> Option<OpenedTaskResource> {
+        self.retire_expired_task_resources();
         let normalized_id = normalize(id).to_ascii_lowercase();
         if normalized_id.is_empty() {
             return None;
@@ -2086,7 +2091,7 @@ impl BilibiliTaskRegistry {
         }
         let inner = self.inner.lock().expect("task registry lock poisoned");
         inner
-            .visible_tasks_by_id
+            .tasks_by_id
             .get(&normalized_task_id)
             .is_some_and(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
@@ -2499,6 +2504,62 @@ impl BilibiliTaskRegistry {
             .is_durable()
     }
 
+    fn retire_expired_task_resources(&self) -> bool {
+        self.retire_expired_task_resources_except(&HashSet::new())
+    }
+
+    fn retire_expired_task_resources_except(
+        &self,
+        excluded_resource_ids: &HashSet<String>,
+    ) -> bool {
+        let now = current_timestamp();
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task_ids = inner
+            .outputs_by_task_id
+            .iter()
+            .filter(|(_, output)| output.has_expired_resources_except(&now, excluded_resource_ids))
+            .map(|(task_id, _)| task_id.clone())
+            .collect::<Vec<_>>();
+        if task_ids.is_empty() {
+            return false;
+        }
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        let mut retired_resource_ids = Vec::new();
+        let mut changed_tasks = Vec::new();
+        for task_id in task_ids {
+            let retired = inner
+                .outputs_by_task_id
+                .get_mut(&task_id)
+                .map(|output| output.retire_expired_resources_except(&now, excluded_resource_ids))
+                .unwrap_or_default();
+            if retired.is_empty() {
+                continue;
+            }
+            retired_resource_ids.extend(retired);
+            let summary = inner
+                .outputs_by_task_id
+                .get(&task_id)
+                .expect("updated task output must exist")
+                .summary();
+            if let Some(task) = inner.tasks_by_id.get_mut(&task_id) {
+                task.output_summary = Some(summary);
+                task.updated_at = Some(copy_timestamp(&now));
+                changed_tasks.push(task.clone());
+            }
+        }
+        if retired_resource_ids.is_empty() {
+            return false;
+        }
+        inner
+            .pending_resource_cleanup_ids
+            .extend(retired_resource_ids);
+        let durability_required = self.persistence.is_some();
+        let checkpoint = durability_required.then_some(checkpoint);
+        self.persist_tasks_and_publish(inner, changed_tasks, durability_required, checkpoint)
+            .is_committed()
+    }
+
     fn persistence_snapshot_locked(
         &self,
         inner: &mut RegistryInner,
@@ -2767,7 +2828,8 @@ impl BilibiliTaskRegistry {
         let candidates = {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
             prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-            let authorized_resource_ids = authorized_resource_ids_locked(&inner);
+            let now = current_timestamp();
+            let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
             inner
                 .durable_resource_cleanup_ids
                 .iter()
@@ -2824,7 +2886,8 @@ impl BilibiliTaskRegistry {
         }
         if !cleaned.is_empty() {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
-            let authorized_resource_ids = authorized_resource_ids_locked(&inner);
+            let now = current_timestamp();
+            let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
             let cleaned = cleaned
                 .into_iter()
                 .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
@@ -2891,7 +2954,8 @@ impl BilibiliTaskRegistry {
             return false;
         }
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        let authorized_resource_ids = authorized_resource_ids_locked(&inner);
+        let now = current_timestamp();
+        let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
         let orphaned_resource_ids = resource_ids
             .into_iter()
             .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
@@ -4090,18 +4154,35 @@ fn prune_expired_resource_snapshots_locked(inner: &mut RegistryInner, now: Insta
         .retain(|_, snapshot| snapshot.expires_at > now);
 }
 
-fn authorized_resource_ids_locked(inner: &RegistryInner) -> HashSet<&str> {
+fn authorized_resource_ids_locked<'a>(
+    inner: &'a RegistryInner,
+    now: &Timestamp,
+) -> HashSet<&'a str> {
     inner
         .visible_outputs_by_task_id
         .values()
-        .flat_map(|output| &output.record.resources)
+        .flat_map(|output| output.available_resources_by_id.values())
+        .filter(|resource| {
+            resource
+                .resource
+                .expires_at
+                .as_ref()
+                .is_none_or(|expires_at| timestamp_nanos(expires_at) > timestamp_nanos(now))
+        })
         .map(|resource| resource.resource.id.as_str())
         .chain(
             inner
                 .retained_resource_snapshots
                 .values()
-                .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
-                .map(String::as_str),
+                .flat_map(|snapshot| snapshot.output.available_resources_by_id.values())
+                .filter(|resource| {
+                    resource
+                        .resource
+                        .expires_at
+                        .as_ref()
+                        .is_none_or(|expires_at| timestamp_nanos(expires_at) > timestamp_nanos(now))
+                })
+                .map(|resource| resource.resource.id.as_str()),
         )
         .collect()
 }
@@ -7578,6 +7659,76 @@ mod tests {
         assert!(!second_path.exists());
         assert!(!first_path.parent().unwrap().exists());
         assert!(!second_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn expired_task_resource_is_retired_durably_and_its_body_is_removed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1expired-resource", None)
+            .expect("task should be created");
+        let mut resource = test_task_resource("expired-output-resource", 7);
+        resource.resource.expires_at = Some(Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        let body_path = write_task_resource_body(&root_path, &resource, b"expired");
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![test_task_result_with_resources(
+                    "expired-result",
+                    std::slice::from_ref(&resource),
+                )],
+                vec![resource],
+            )
+            .expect("expired resource metadata should be accepted before retirement");
+        assert!(body_path.exists());
+
+        let snapshot = registry
+            .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
+            .expect("reading task output should retire expired resources");
+
+        assert!(snapshot.output.record.resources.is_empty());
+        let artifact = &snapshot.output.record.results[0].artifacts[0];
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert_eq!(
+            "cache.resource_expired",
+            artifact.problem.as_ref().unwrap().code
+        );
+        assert_eq!(
+            0,
+            registry
+                .get_task(&task.id)
+                .unwrap()
+                .output_summary
+                .unwrap()
+                .available_artifact_count
+        );
+        assert!(!body_path.exists());
+        assert!(!body_path.parent().unwrap().exists());
+
+        drop(registry);
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let restored_output = restored.task_output_snapshot(&task.id).unwrap();
+        assert!(restored_output.output.record.resources.is_empty());
+        assert_eq!(
+            TaskArtifactState::Unavailable,
+            restored_output.output.record.results[0].artifacts[0].state()
+        );
     }
 
     #[tokio::test]

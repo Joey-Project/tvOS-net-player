@@ -1472,8 +1472,30 @@ fn task_result_for_client(
     redact_error_details: bool,
     resource_uri: impl Fn(&str) -> String,
 ) -> Result<crate::generated::tvos_net_player::v1::TaskResult, Status> {
+    let now = current_timestamp();
     for artifact in &mut result.artifacts {
         if let Some(resource) = artifact.resource.as_mut() {
+            if resource.expires_at.as_ref().is_some_and(|expires_at| {
+                (expires_at.seconds, expires_at.nanos) <= (now.seconds, now.nanos)
+            }) {
+                artifact.resource = None;
+                if artifact.state()
+                    == crate::generated::tvos_net_player::v1::TaskArtifactState::Available
+                {
+                    artifact.state =
+                        crate::generated::tvos_net_player::v1::TaskArtifactState::Unavailable
+                            .into();
+                    artifact.problem = Some(crate::generated::tvos_net_player::v1::TaskProblem {
+                        category:
+                            crate::generated::tvos_net_player::v1::TaskProblemCategory::NotFound
+                                .into(),
+                        code: "cache.resource_expired".to_owned(),
+                        message: "Task resource expired.".to_owned(),
+                        retryable: false,
+                    });
+                }
+                continue;
+            }
             resource.uri = resource_uri(&resource.id);
         }
     }
@@ -4782,6 +4804,46 @@ mod tests {
         assert!(page.page_info.is_none());
         assert_eq!(0, page.output_revision);
         assert_eq!(13, ServerCapability::TaskOutputV2 as i32);
+    }
+
+    #[test]
+    fn task_result_projection_revokes_an_expired_resource() {
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let result = TaskResult {
+            id: "expired-result".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "expired-artifact".to_owned(),
+                kind: TaskArtifactKind::Subtitle.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(CacheResourceRef {
+                    id: "expired-resource".to_owned(),
+                    expires_at: Some(prost_types::Timestamp {
+                        seconds: 0,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let projected = task_result_for_client(result, false, |_| {
+            panic!("an expired resource must not receive a public URI")
+        })
+        .expect("expired result should remain representable");
+
+        let artifact = &projected.artifacts[0];
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert_eq!(
+            "cache.resource_expired",
+            artifact.problem.as_ref().unwrap().code
+        );
     }
 
     #[tokio::test]
@@ -12118,7 +12180,8 @@ mod tests {
 
     #[tokio::test]
     async fn hls_cache_fill_failure_requeues_until_failure_state_is_durable() {
-        let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
+        let (upstream_url, _upstream_task, upstream_requests) =
+            start_counted_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -12157,6 +12220,26 @@ mod tests {
         assert_eq!(TaskState::Playable, pending.state());
         assert!(!pending.message.contains("offline cache fill failed"));
         assert!(!state.tasks.persistence_available());
+        let requests_after_failure = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_failure > 0);
+
+        let blocked_retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            blocked_retry_outcome
+        );
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "a rejected failure marker must be retried before repeating cache work"
+        );
 
         fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
         let retry_outcome = run_hls_cache_finalization_inner(
@@ -12173,6 +12256,11 @@ mod tests {
         assert_eq!(TaskState::Playable, playable.state());
         assert!(playable.message.contains("offline cache fill failed"));
         assert!(state.tasks.persistence_available());
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must not repeat the failed download"
+        );
     }
 
     #[tokio::test]

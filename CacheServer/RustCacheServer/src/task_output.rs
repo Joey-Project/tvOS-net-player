@@ -6,6 +6,7 @@ use crate::generated::tvos_net_player::v1::{
 };
 use http::HeaderValue;
 use prost::Message;
+use prost_types::Timestamp;
 use uuid::Uuid;
 
 const MAX_RESOURCE_ID_BYTES: usize = 200;
@@ -253,6 +254,78 @@ impl TaskOutputRecord {
             .saturating_add(self.primary_result_id.len())
     }
 
+    pub(crate) fn has_expired_resources_except(
+        &self,
+        now: &Timestamp,
+        excluded_resource_ids: &HashSet<String>,
+    ) -> bool {
+        self.resources.iter().any(|resource| {
+            !excluded_resource_ids.contains(&resource.resource.id)
+                && resource
+                    .resource
+                    .expires_at
+                    .as_ref()
+                    .is_some_and(|expires_at| timestamp_at_or_before(expires_at, now))
+        })
+    }
+
+    pub(crate) fn retire_expired_resources_except(
+        &mut self,
+        now: &Timestamp,
+        excluded_resource_ids: &HashSet<String>,
+    ) -> Vec<String> {
+        let expired_ids = self
+            .resources
+            .iter()
+            .filter(|resource| {
+                !excluded_resource_ids.contains(&resource.resource.id)
+                    && resource
+                        .resource
+                        .expires_at
+                        .as_ref()
+                        .is_some_and(|expires_at| timestamp_at_or_before(expires_at, now))
+            })
+            .map(|resource| resource.resource.id.clone())
+            .collect::<HashSet<_>>();
+        if expired_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut retired_ids = Vec::new();
+        self.resources.retain(|resource| {
+            if expired_ids.contains(&resource.resource.id) {
+                retired_ids.push(resource.resource.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for result in &mut self.results {
+            for artifact in &mut result.artifacts {
+                let is_expired = artifact
+                    .resource
+                    .as_ref()
+                    .is_some_and(|resource| expired_ids.contains(&resource.id));
+                if !is_expired {
+                    continue;
+                }
+                artifact.resource = None;
+                if artifact.state() == TaskArtifactState::Available {
+                    artifact.state = TaskArtifactState::Unavailable.into();
+                    artifact.problem = Some(TaskProblem {
+                        category: TaskProblemCategory::NotFound.into(),
+                        code: "cache.resource_expired".to_owned(),
+                        message: "Task resource expired.".to_owned(),
+                        retryable: false,
+                    });
+                }
+            }
+        }
+        self.revision = self.revision.saturating_add(1).max(1);
+        self.snapshot_id = new_snapshot_id();
+        retired_ids
+    }
+
     pub(crate) fn mark_playback_cache_deleted(
         &mut self,
         session_id: &str,
@@ -336,6 +409,10 @@ impl TaskOutputRecord {
         *self = updated;
         Ok(retired_ids)
     }
+}
+
+fn timestamp_at_or_before(left: &Timestamp, right: &Timestamp) -> bool {
+    (left.seconds, left.nanos) <= (right.seconds, right.nanos)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -997,6 +1074,60 @@ mod tests {
         assert_eq!(1, output.summary().successful_result_count);
         assert_eq!(1, output.summary().available_artifact_count);
         assert_eq!("result-one", output.summary().primary_result_id);
+    }
+
+    #[test]
+    fn retiring_expired_resources_updates_artifacts_and_revision() {
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "expired-subtitle".to_owned(),
+            content_type: "text/vtt".to_owned(),
+            expires_at: Some(Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut output = TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "artifact-one".to_owned(),
+                    kind: TaskArtifactKind::Subtitle.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![resource],
+        )
+        .unwrap();
+        let original_revision = output.revision;
+        let original_snapshot_id = output.snapshot_id.clone();
+
+        let retired = output.retire_expired_resources_except(
+            &Timestamp {
+                seconds: 10,
+                nanos: 0,
+            },
+            &HashSet::new(),
+        );
+
+        assert_eq!(vec!["expired-subtitle"], retired);
+        assert!(output.resources.is_empty());
+        assert_eq!(original_revision + 1, output.revision);
+        assert_ne!(original_snapshot_id, output.snapshot_id);
+        assert_eq!(0, output.summary().available_artifact_count);
+        let artifact = &output.results[0].artifacts[0];
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert_eq!(
+            "cache.resource_expired",
+            artifact.problem.as_ref().unwrap().code
+        );
     }
 
     #[test]
