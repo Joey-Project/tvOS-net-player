@@ -147,8 +147,12 @@ impl BilibiliTaskRegistry {
             .is_some_and(TaskStatePersistence::is_available)
     }
 
+    pub(crate) fn persistence_configured(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     #[cfg(test)]
-    fn fail_next_persistence_directory_sync(&self) {
+    pub(crate) fn fail_next_persistence_directory_sync(&self) {
         self.persistence
             .as_ref()
             .expect("test registry must have persistence")
@@ -690,7 +694,7 @@ impl BilibiliTaskRegistry {
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         if self.persistence.is_some() && !self.persistence_available() {
             let outcome = self.persist_and_publish_pending(inner, true, None);
-            if !outcome.is_committed() {
+            if !outcome.is_durable() {
                 return Err(Status::unavailable(
                     "Pending task state could not be persisted before cancellation.",
                 ));
@@ -793,9 +797,25 @@ impl BilibiliTaskRegistry {
 
         Self::clear_active_task_locked(&mut inner, &terminal_task);
 
-        let outcome =
-            self.persist_task_and_publish(inner, task.clone(), durability_required, checkpoint);
-        if durability_required && !outcome.is_committed() {
+        let deletes_hls_data =
+            task.kind() == TaskKind::BilibiliProgressivePlayback && !hls_session_ids.is_empty();
+        let outcome = if deletes_hls_data {
+            self.persist_task_before_destructive_side_effect(
+                inner,
+                task.clone(),
+                durability_required,
+                checkpoint,
+            )
+        } else {
+            self.persist_task_and_publish(inner, task.clone(), durability_required, checkpoint)
+        };
+        if durability_required
+            && if deletes_hls_data {
+                !outcome.is_durable()
+            } else {
+                !outcome.is_committed()
+            }
+        {
             return Err(Status::unavailable(
                 "Task cancellation could not be persisted durably.",
             ));
@@ -1776,9 +1796,13 @@ impl BilibiliTaskRegistry {
                 }
                 let durability_required = self.persistence.is_some();
                 let checkpoint = durability_required.then_some(checkpoint);
-                let outcome =
-                    self.persist_task_and_publish(inner, task, durability_required, checkpoint);
-                if durability_required && !outcome.is_committed() {
+                let outcome = self.persist_task_before_destructive_side_effect(
+                    inner,
+                    task,
+                    durability_required,
+                    checkpoint,
+                );
+                if durability_required && !outcome.is_durable() {
                     return Err(Status::unavailable(
                         "Task cache deletion could not be persisted durably.",
                     ));
@@ -1843,9 +1867,13 @@ impl BilibiliTaskRegistry {
                 }
                 let durability_required = self.persistence.is_some();
                 let checkpoint = durability_required.then_some(checkpoint);
-                let outcome =
-                    self.persist_task_and_publish(inner, task, durability_required, checkpoint);
-                if durability_required && !outcome.is_committed() {
+                let outcome = self.persist_task_before_destructive_side_effect(
+                    inner,
+                    task,
+                    durability_required,
+                    checkpoint,
+                );
+                if durability_required && !outcome.is_durable() {
                     return Err(Status::unavailable(
                         "Task cache deletion could not be persisted durably.",
                     ));
@@ -1898,9 +1926,13 @@ impl BilibiliTaskRegistry {
         );
         let durability_required = self.persistence.is_some();
         let checkpoint = durability_required.then_some(checkpoint);
-        let outcome =
-            self.persist_task_and_publish(inner, removed_task, durability_required, checkpoint);
-        if durability_required && !outcome.is_committed() {
+        let outcome = self.persist_task_before_destructive_side_effect(
+            inner,
+            removed_task,
+            durability_required,
+            checkpoint,
+        );
+        if durability_required && !outcome.is_durable() {
             return Err(Status::unavailable(
                 "Task cache deletion could not be persisted durably.",
             ));
@@ -2448,9 +2480,24 @@ impl BilibiliTaskRegistry {
 
     fn persist_and_publish_pending(
         &self,
+        inner: MutexGuard<'_, RegistryInner>,
+        durability_required: bool,
+        rollback_checkpoint: Option<RegistryMutationCheckpoint>,
+    ) -> PersistenceCommitOutcome {
+        self.persist_and_publish_pending_with_policy(
+            inner,
+            durability_required,
+            rollback_checkpoint,
+            false,
+        )
+    }
+
+    fn persist_and_publish_pending_with_policy(
+        &self,
         mut inner: MutexGuard<'_, RegistryInner>,
         durability_required: bool,
         rollback_checkpoint: Option<RegistryMutationCheckpoint>,
+        require_durable_commit: bool,
     ) -> PersistenceCommitOutcome {
         let (snapshot, snapshot_validation_failed) =
             match self.persistence_snapshot_locked(&mut inner) {
@@ -2479,6 +2526,12 @@ impl BilibiliTaskRegistry {
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let mut rejected_resources_need_cleanup = false;
         match outcome {
+            PersistenceCommitOutcome::InstalledButNotDurable if require_durable_commit => {
+                let checkpoint = rollback_checkpoint.expect(
+                    "a destructive side effect must retain a rollback checkpoint until durable",
+                );
+                checkpoint.restore(&mut inner);
+            }
             PersistenceCommitOutcome::Durable
             | PersistenceCommitOutcome::InstalledButNotDurable => {
                 let snapshot = snapshot
@@ -2553,6 +2606,22 @@ impl BilibiliTaskRegistry {
     ) -> PersistenceCommitOutcome {
         Self::stage_publication_locked(&mut inner, task);
         self.persist_and_publish_pending(inner, durability_required, rollback_checkpoint)
+    }
+
+    fn persist_task_before_destructive_side_effect(
+        &self,
+        mut inner: MutexGuard<'_, RegistryInner>,
+        task: Task,
+        durability_required: bool,
+        rollback_checkpoint: Option<RegistryMutationCheckpoint>,
+    ) -> PersistenceCommitOutcome {
+        Self::stage_publication_locked(&mut inner, task);
+        self.persist_and_publish_pending_with_policy(
+            inner,
+            durability_required,
+            rollback_checkpoint,
+            true,
+        )
     }
 
     fn persist_tasks_and_publish(

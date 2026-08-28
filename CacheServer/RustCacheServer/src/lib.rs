@@ -632,6 +632,7 @@ impl AppState {
             .completed_hls_deletion_lock
             .lock()
             .expect("completed HLS deletion lock poisoned");
+        self.ensure_task_state_durable_for_hls_deletion()?;
         let pending_session_ids = self
             .pending_hls_session_cleanup_by_library_item
             .lock()
@@ -672,6 +673,18 @@ impl AppState {
 
         self.remove_hls_sessions_for_library_item(item_id, &session_ids)?;
         Ok(Some(true))
+    }
+
+    fn ensure_task_state_durable_for_hls_deletion(&self) -> Result<(), Status> {
+        if !self.tasks.persistence_configured()
+            || self.tasks.persistence_available()
+            || self.tasks.retry_pending_persistence()
+        {
+            return Ok(());
+        }
+        Err(Status::unavailable(
+            "Task state is not durable enough to delete HLS cache data.",
+        ))
     }
 
     pub(crate) fn completed_hls_mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -783,24 +796,26 @@ impl AppState {
         Ok(())
     }
 
-    fn retry_pending_hls_session_cleanups(&self) -> io::Result<()> {
+    fn retry_pending_hls_session_cleanups(&self) -> HashSet<String> {
         let pending = self
             .pending_hls_session_cleanup_by_library_item
             .lock()
             .expect("pending HLS cleanup lock poisoned")
             .clone();
-        let mut first_error = None;
         for (cleanup_key, session_ids) in pending {
             if let Err(error) =
                 self.remove_hls_sessions_tracking_failures(&cleanup_key, &session_ids)
             {
-                first_error.get_or_insert(error);
+                eprintln!("Failed to retry pending HLS cache cleanup for {cleanup_key}: {error}");
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        self.pending_hls_session_cleanup_by_library_item
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     fn remove_hls_sessions_collecting_failures(
@@ -1188,13 +1203,13 @@ impl AppState {
         if should_cancel() {
             return Ok(None);
         }
-        {
+        let pending_cleanup_session_ids = {
             let _deletion_guard = self.completed_hls_mutation_guard();
             if should_cancel() {
                 return Ok(None);
             }
-            self.retry_pending_hls_session_cleanups()?;
-        }
+            self.retry_pending_hls_session_cleanups()
+        };
         if should_cancel() {
             return Ok(None);
         }
@@ -1220,6 +1235,7 @@ impl AppState {
         let recent_playback_session_ids = self.recently_used_hls_cache_session_ids();
         let mut completed_group_protected_session_ids = explicitly_protected_session_ids;
         completed_group_protected_session_ids.extend(recent_playback_session_ids.iter().cloned());
+        completed_group_protected_session_ids.extend(pending_cleanup_session_ids);
         let mut stable_protected_session_ids = completed_group_protected_session_ids.clone();
         stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
         let partial_protected_session_ids = completed_group_protected_session_ids.clone();

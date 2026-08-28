@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
@@ -37,6 +38,96 @@ const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PERSISTED_TASKS: usize = 10_000;
 const MAX_PERSISTED_BILIBILI_VARIANTS: usize = 10_000;
 const MAX_PERSISTED_DANMAKU_FORMATS: usize = 16;
+
+thread_local! {
+    static PERSISTED_TASK_RESOURCE_BUDGET: Cell<Option<PersistedTaskResourceBudget>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct PersistedTaskResourceBudget {
+    remaining: usize,
+    limit: usize,
+}
+
+struct PersistedTaskResourceBudgetGuard;
+
+impl PersistedTaskResourceBudgetGuard {
+    fn enter(limit: usize) -> io::Result<Self> {
+        let activated = PERSISTED_TASK_RESOURCE_BUDGET.with(|budget| {
+            if budget.get().is_some() {
+                return false;
+            }
+            budget.set(Some(PersistedTaskResourceBudget {
+                remaining: limit,
+                limit,
+            }));
+            true
+        });
+        if !activated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state resource deserialization is already active",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for PersistedTaskResourceBudgetGuard {
+    fn drop(&mut self) {
+        PERSISTED_TASK_RESOURCE_BUDGET.with(|budget| budget.set(None));
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PersistedTaskResourceBudgetClaim {
+    Unbounded,
+    Claimed,
+    Exhausted,
+}
+
+fn claim_persisted_task_resource_budget() -> PersistedTaskResourceBudgetClaim {
+    PERSISTED_TASK_RESOURCE_BUDGET.with(|budget| match budget.get() {
+        None => PersistedTaskResourceBudgetClaim::Unbounded,
+        Some(state) if state.remaining == 0 => PersistedTaskResourceBudgetClaim::Exhausted,
+        Some(mut state) => {
+            state.remaining -= 1;
+            budget.set(Some(state));
+            PersistedTaskResourceBudgetClaim::Claimed
+        }
+    })
+}
+
+fn release_persisted_task_resource_budget(claim: PersistedTaskResourceBudgetClaim) {
+    if claim != PersistedTaskResourceBudgetClaim::Claimed {
+        return;
+    }
+    PERSISTED_TASK_RESOURCE_BUDGET.with(|budget| {
+        let mut state = budget
+            .get()
+            .expect("claimed task resource budget must remain active");
+        state.remaining = state.remaining.saturating_add(1).min(state.limit);
+        budget.set(Some(state));
+    });
+}
+
+fn persisted_task_resource_capacity(size_hint: Option<usize>) -> usize {
+    let remaining = PERSISTED_TASK_RESOURCE_BUDGET
+        .with(|budget| budget.get())
+        .map(|budget| budget.remaining)
+        .unwrap_or(MAX_TASK_RESOURCES);
+    size_hint
+        .unwrap_or(0)
+        .min(MAX_TASK_RESOURCES)
+        .min(remaining)
+}
+
+fn persisted_task_resource_limit() -> usize {
+    PERSISTED_TASK_RESOURCE_BUDGET
+        .with(|budget| budget.get())
+        .map(|budget| budget.limit)
+        .unwrap_or(MAX_REGISTERED_TASK_RESOURCES)
+}
 
 #[cfg(test)]
 type TaskStateSaveBarriers = (Arc<Barrier>, Arc<Barrier>);
@@ -90,8 +181,7 @@ impl TaskStateStore {
         if bytes.len() > MAX_TASK_STATE_SNAPSHOT_BYTES {
             return Err(snapshot_size_error());
         }
-        let snapshot: PersistedTaskSnapshot =
-            serde_json::from_slice(&bytes).map_err(invalid_data)?;
+        let snapshot = deserialize_task_snapshot(&bytes)?;
         if !matches!(
             snapshot.schema_version,
             LEGACY_TASK_STATE_SCHEMA_VERSION | TASK_STATE_SCHEMA_VERSION
@@ -205,6 +295,18 @@ impl TaskStateStore {
             .expect("task state directory sync lock poisoned")
             .clone()
     }
+}
+
+fn deserialize_task_snapshot(bytes: &[u8]) -> io::Result<PersistedTaskSnapshot> {
+    deserialize_task_snapshot_with_resource_limit(bytes, MAX_REGISTERED_TASK_RESOURCES)
+}
+
+fn deserialize_task_snapshot_with_resource_limit(
+    bytes: &[u8],
+    resource_limit: usize,
+) -> io::Result<PersistedTaskSnapshot> {
+    let _budget = PersistedTaskResourceBudgetGuard::enter(resource_limit)?;
+    serde_json::from_slice(bytes).map_err(invalid_data)
 }
 
 fn validate_registered_task_resource_count(records: &[PersistedTaskRecord]) -> io::Result<()> {
@@ -390,7 +492,51 @@ fn deserialize_task_resources<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_TASK_RESOURCES, "task output resources")
+    struct TaskResourcesVisitor;
+
+    impl<'de> Visitor<'de> for TaskResourcesVisitor {
+        type Value = Vec<PersistedCacheResourceRef>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_TASK_RESOURCES} task output resources within the snapshot-wide resource budget"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut resources =
+                Vec::with_capacity(persisted_task_resource_capacity(sequence.size_hint()));
+            while resources.len() < MAX_TASK_RESOURCES {
+                let claim = claim_persisted_task_resource_budget();
+                if claim == PersistedTaskResourceBudgetClaim::Exhausted {
+                    if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                        let limit = persisted_task_resource_limit();
+                        return Err(de::Error::custom(format!(
+                            "task state cannot contain more than {limit} registered resources"
+                        )));
+                    }
+                    return Ok(resources);
+                }
+                let Some(resource) = sequence.next_element::<PersistedCacheResourceRef>()? else {
+                    release_persisted_task_resource_budget(claim);
+                    return Ok(resources);
+                };
+                resources.push(resource);
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format!(
+                    "task output resources cannot exceed {MAX_TASK_RESOURCES} entries"
+                )));
+            }
+            Ok(resources)
+        }
+    }
+
+    deserializer.deserialize_seq(TaskResourcesVisitor)
 }
 
 fn deserialize_task_artifacts<'de, D>(
@@ -1512,6 +1658,66 @@ mod tests {
         let error = validate_registered_task_resource_count(std::slice::from_ref(&record))
             .expect_err("one additional registered resource must be rejected");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn persisted_resource_budget_is_enforced_while_snapshot_resources_are_decoded() {
+        let persisted_task = |task_id: &str, resource_ids: &[&str]| {
+            let task = Task {
+                id: task_id.to_owned(),
+                source: format!("BV1{task_id}"),
+                ..Default::default()
+            };
+            let mut output = TaskOutputRecord::from_legacy_task(&task);
+            output.resources = resource_ids
+                .iter()
+                .map(|resource_id| {
+                    TaskResourceRecord::new(CacheResourceRef {
+                        id: (*resource_id).to_owned(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                })
+                .collect();
+            PersistedTaskFile::from(PersistedTaskRecord {
+                task,
+                options: None,
+                playback_options: None,
+                output,
+            })
+        };
+        let accepted = PersistedTaskSnapshot {
+            schema_version: TASK_STATE_SCHEMA_VERSION,
+            tasks: vec![
+                persisted_task("budget-one", &["resource-one"]),
+                persisted_task("budget-two", &["resource-two"]),
+            ],
+        };
+        let accepted_bytes = serde_json::to_vec(&accepted).unwrap();
+
+        let decoded = deserialize_task_snapshot_with_resource_limit(&accepted_bytes, 2)
+            .expect("resources at the snapshot limit should decode");
+        assert_eq!(2, decoded.tasks.len());
+
+        let rejected = PersistedTaskSnapshot {
+            schema_version: TASK_STATE_SCHEMA_VERSION,
+            tasks: vec![
+                persisted_task("budget-three", &["resource-three", "resource-four"]),
+                persisted_task("budget-four", &["resource-five"]),
+            ],
+        };
+        let rejected_bytes = serde_json::to_vec(&rejected).unwrap();
+        let error = match deserialize_task_snapshot_with_resource_limit(&rejected_bytes, 2) {
+            Ok(_) => panic!("the third resource must be rejected during deserialization"),
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("cannot contain more than 2 registered resources")
+        );
     }
 
     #[test]

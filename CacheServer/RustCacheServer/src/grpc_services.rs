@@ -7574,6 +7574,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_library_item_waits_for_a_durable_task_tombstone() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let completed =
+            create_completed_hls_playback_task(&state, "BV1durable-delete", &upstream_url).await;
+        let session_path = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&completed.task_id);
+        state.tasks.fail_next_persistence_directory_sync();
+
+        let error = state
+            .delete_completed_hls_library_item(&completed.library_item_id)
+            .expect_err("an installed but non-durable tombstone must not delete HLS bytes");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(!state.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&completed.task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&completed.library_item_id)
+                .is_some()
+        );
+        assert!(session_path.exists());
+
+        let deleted = state
+            .delete_completed_hls_library_item(&completed.library_item_id)
+            .expect("the retry should first make the tombstone durable");
+
+        assert_eq!(Some(true), deleted);
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&completed.library_item_id)
+                .is_none()
+        );
+        assert!(!session_path.exists());
+    }
+
+    #[tokio::test]
     async fn cancel_playable_hls_task_keeps_cache_when_state_commit_is_rejected() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -7620,6 +7679,63 @@ mod tests {
         assert!(state.hls_sessions.get(&task_id).is_some());
         assert!(state.hls_cache.playback_session(&task_id).is_some());
         assert!(hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_waits_for_durable_state_before_removing_cache() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-durable", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        state.tasks.fail_next_persistence_directory_sync();
+
+        let error = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect_err("non-durable cancellation must not remove HLS cache data");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(state.hls_sessions.get(&task_id).is_some());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
+
+        let cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("retry should make cancellation durable before cleanup")
+            .into_inner();
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.tasks.persistence_available());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_none());
+        assert!(!hls_session_dir.exists());
     }
 
     #[tokio::test]
@@ -9062,6 +9178,68 @@ mod tests {
                 .is_none()
         );
         assert!(state.hls_sessions.get(&child_session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_quota_evicts_independent_entries_while_pending_cleanup_still_fails() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                hls_cache_max_bytes: session_size * 3,
+                hls_cache_high_watermark_percent: 50,
+                hls_cache_low_watermark_percent: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let pending =
+            create_completed_hls_playback_task(&state, "BV1pending-cleanup", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let independent =
+            create_completed_hls_playback_task(&state, "BV1independent-eviction", &upstream_url)
+                .await;
+        state
+            .hls_cache
+            .fail_next_remove_session(pending.task_id.clone());
+        state
+            .delete_completed_hls_library_item(&pending.library_item_id)
+            .expect_err("the first physical cleanup should remain pending");
+        state
+            .hls_cache
+            .fail_next_remove_session(pending.task_id.clone());
+
+        let summary = state
+            .enforce_hls_cache_quota("pending-cleanup", Vec::new(), 0)
+            .expect("one undeletable pending session must not abort quota eviction")
+            .expect("the independent completed entry should trigger eviction");
+
+        assert_eq!(
+            vec![independent.task_id.clone()],
+            summary.evicted_session_ids
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&pending.library_item_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&independent.library_item_id)
+                .is_none()
+        );
+        assert!(state.tasks.get_task(&independent.task_id).is_err());
     }
 
     #[tokio::test]
