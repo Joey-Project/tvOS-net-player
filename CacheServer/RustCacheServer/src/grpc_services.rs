@@ -12,8 +12,8 @@ use bbdown_core::{
 use futures_core::Stream;
 use prost::Message;
 use tokio::{
-    sync::mpsc,
-    time::{Instant, sleep},
+    sync::{mpsc, watch},
+    time::{Instant, sleep, timeout},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -70,7 +70,9 @@ use crate::{
     },
     library::ROOT_ID,
     playback_policy::PlaybackPolicy,
-    task_output::{MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes},
+    task_output::{
+        MAX_TASK_ARTIFACTS, MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes,
+    },
     task_registry::{
         BilibiliTaskProgress, BilibiliTaskRegistry, HlsSessionPublicationState,
         PLAYBACK_PLANNING_CANCELLED_MESSAGE, PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
@@ -103,9 +105,14 @@ const TASK_RESULT_PAGE_METADATA_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
 const MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS: usize = MAX_TASK_ARTIFACTS;
+// Preserve one immutable maximum-size revision while admitting its replacement.
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS: usize = MAX_TASK_ARTIFACTS * 2;
 const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
 const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 const TASK_RESULT_PAGE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -138,6 +145,7 @@ impl ServerService for ServerGrpcService {
         &self,
         _request: Request<GetServerInfoRequest>,
     ) -> Result<Response<ServerInfo>, Status> {
+        recover_task_output_v2_for_read(&self.state).await;
         let mut info = ServerInfo {
             id: self.state.options.server_id.clone(),
             name: self.state.options.server_name.clone(),
@@ -714,12 +722,91 @@ impl TaskGrpcService {
     }
 }
 
+async fn recover_task_output_v2_for_read(state: &AppState) {
+    if state.tasks.task_output_v2_available() {
+        return;
+    }
+
+    let now = Instant::now();
+    let Some((mut completion, completion_sender)) = ({
+        let mut pages = state
+            .task_result_pages
+            .lock()
+            .expect("task result page store lock poisoned");
+        let recovery = &mut pages.task_output_read_recovery;
+        if let Some(completion) = recovery.in_flight.as_ref() {
+            Some((completion.clone(), None))
+        } else if !state.tasks.persistence_available()
+            || recovery
+                .retry_not_before
+                .is_some_and(|retry_not_before| retry_not_before > now)
+        {
+            None
+        } else {
+            let (completion_sender, completion) = watch::channel(false);
+            recovery.in_flight = Some(completion.clone());
+            #[cfg(test)]
+            {
+                recovery.attempts_started = recovery.attempts_started.saturating_add(1);
+            }
+            Some((completion, Some(completion_sender)))
+        }
+    }) else {
+        return;
+    };
+
+    if let Some(completion_sender) = completion_sender {
+        spawn_task_output_v2_read_recovery(
+            Arc::downgrade(&state.task_result_pages),
+            Arc::downgrade(&state.tasks),
+            completion_sender,
+        );
+    }
+    let completed = *completion.borrow();
+    if !completed {
+        let _ = timeout(TASK_OUTPUT_READ_RECOVERY_WAIT, completion.changed()).await;
+    }
+}
+
+fn spawn_task_output_v2_read_recovery(
+    result_pages: Weak<StdMutex<TaskResultPageStore>>,
+    tasks: Weak<BilibiliTaskRegistry>,
+    completion: watch::Sender<bool>,
+) {
+    tokio::spawn(async move {
+        let recovered = if let Some(tasks) = tasks.upgrade() {
+            retry_pending_task_persistence(&tasks, "TaskOutputV2 read recovery").await
+                && tasks.task_output_v2_available()
+        } else {
+            false
+        };
+        if let Some(result_pages) = result_pages.upgrade() {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            pages.task_output_read_recovery.in_flight = None;
+            pages.task_output_read_recovery.retry_not_before =
+                (!recovered).then(|| Instant::now() + TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY);
+        }
+        let _ = completion.send(true);
+    });
+}
+
 #[derive(Default)]
 pub(crate) struct TaskResultPageStore {
     snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
     snapshot_order: VecDeque<String>,
     cursors_by_token: HashMap<String, TaskResultPageCursor>,
     reaper_started: bool,
+    task_output_read_recovery: TaskOutputReadRecovery,
+}
+
+#[derive(Default)]
+struct TaskOutputReadRecovery {
+    in_flight: Option<watch::Receiver<bool>>,
+    retry_not_before: Option<Instant>,
+    #[cfg(test)]
+    attempts_started: usize,
 }
 
 #[derive(Clone)]
@@ -730,6 +817,7 @@ struct TaskResultPageSnapshot {
     resource_lease_id: String,
     output: Arc<crate::task_registry::VisibleTaskOutput>,
     encoded_bytes: usize,
+    artifact_count: usize,
     expires_at: Instant,
     tokens_by_offset: HashMap<usize, String>,
 }
@@ -812,7 +900,30 @@ impl TaskResultPageStore {
             );
         }
 
+        let artifact_count = snapshot
+            .output
+            .record
+            .results
+            .iter()
+            .map(|result| result.artifacts.len())
+            .fold(0_usize, usize::saturating_add);
+
         while self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS {
+            let Some(oldest_id) = self.snapshot_order.pop_front() else {
+                break;
+            };
+            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
+                released_resource_lease_ids.push(resource_lease_id);
+            }
+        }
+        while self
+            .snapshots_by_id
+            .values()
+            .map(|snapshot| snapshot.artifact_count)
+            .sum::<usize>()
+            .saturating_add(artifact_count)
+            > MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
+        {
             let Some(oldest_id) = self.snapshot_order.pop_front() else {
                 break;
             };
@@ -866,6 +977,7 @@ impl TaskResultPageStore {
                 resource_lease_id: snapshot.resource_lease_id,
                 output: snapshot.output,
                 encoded_bytes: snapshot.encoded_bytes,
+                artifact_count,
                 expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
                 tokens_by_offset: HashMap::new(),
             },
@@ -908,9 +1020,19 @@ impl TaskResultPageStore {
             .min(snapshot.output.record.results.len());
         let mut end = offset;
         let mut encoded_bytes = TASK_RESULT_PAGE_METADATA_RESERVE_BYTES;
+        let mut artifact_count = 0_usize;
         while end < requested_end {
-            let result_bytes =
-                projected_task_result_encoded_bytes(&snapshot.output.record.results[end]);
+            let result = &snapshot.output.record.results[end];
+            let next_artifact_count = artifact_count.saturating_add(result.artifacts.len());
+            if next_artifact_count > MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS && end == offset {
+                return Err(Status::resource_exhausted(
+                    "A task result exceeds the response page artifact budget.",
+                ));
+            }
+            if end > offset && next_artifact_count > MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS {
+                break;
+            }
+            let result_bytes = projected_task_result_encoded_bytes(result);
             let entry_bytes = result_bytes
                 .saturating_add(prost::length_delimiter_len(result_bytes))
                 .saturating_add(1);
@@ -927,6 +1049,7 @@ impl TaskResultPageStore {
                 break;
             }
             encoded_bytes = encoded_bytes.saturating_add(entry_bytes);
+            artifact_count = next_artifact_count;
             end += 1;
         }
         let results = snapshot.output.record.results[offset..end].to_vec();
@@ -1149,6 +1272,7 @@ impl TaskService for TaskGrpcService {
         &self,
         request: Request<ListTaskResultsRequest>,
     ) -> Result<Response<ListTaskResultsResponse>, Status> {
+        recover_task_output_v2_for_read(&self.state).await;
         if !self.state.tasks.task_output_v2_available()
             || !self.state.library.supports_http_range_playback()
         {
@@ -2526,7 +2650,15 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
         )
         .await;
         let mut should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
-        if should_requeue {
+        let degraded_failure_persistence_pending = outcome
+            == HlsCacheFinalizationOutcome::PersistencePending
+            && state
+                .tasks
+                .hls_session_has_online_playback_after_cache_fill_failure(
+                    &job.task_id,
+                    &job.session.id,
+                );
+        if should_requeue && !degraded_failure_persistence_pending {
             let message = match (outcome, job.priority) {
                 (HlsCacheFinalizationOutcome::PersistencePending, _) => {
                     "Playable publication is pending durable task-state recovery; offline cache fill will retry."
@@ -2614,12 +2746,18 @@ async fn run_hls_cache_finalization_inner(
     }
     let session_id = session.id.clone();
     if failure_mode == HlsCacheFinalizationFailureMode::KeepPlayable
-        && (!state.tasks.persistence_configured() || state.tasks.persistence_available())
         && state
             .tasks
             .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session_id)
     {
-        return HlsCacheFinalizationOutcome::Finished;
+        if state.tasks.persistence_configured() && !state.tasks.persistence_available() {
+            retry_pending_task_persistence(&state.tasks, "HLS cache fill failure").await;
+        }
+        return if !state.tasks.persistence_configured() || state.tasks.persistence_available() {
+            HlsCacheFinalizationOutcome::Finished
+        } else {
+            HlsCacheFinalizationOutcome::PersistencePending
+        };
     }
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
@@ -3521,7 +3659,10 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -3635,6 +3776,79 @@ mod tests {
         assert_eq!(vec!["lease-one"], released);
         assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
         assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
+    }
+
+    #[test]
+    fn task_result_page_store_evicts_snapshots_by_aggregate_artifacts() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str, artifact_count: usize| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                vec![task_result_with_artifacts(
+                    &format!("result-{id}"),
+                    artifact_count,
+                )],
+                artifact_count,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted) =
+            pages.insert(snapshot("one", "lease-one", MAX_TASK_ARTIFACTS), now);
+        assert!(inserted);
+        assert!(released.is_empty());
+        let (_, released, inserted) =
+            pages.insert(snapshot("two", "lease-two", MAX_TASK_ARTIFACTS), now);
+        assert!(inserted);
+        assert!(released.is_empty());
+
+        let (_, released, inserted) = pages.insert(snapshot("three", "lease-three", 1), now);
+
+        assert!(inserted);
+        assert_eq!(vec!["lease-one"], released);
+        assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-three"));
+        assert!(
+            pages
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.artifact_count)
+                .sum::<usize>()
+                <= MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
+        );
+    }
+
+    #[test]
+    fn task_result_pages_serve_a_maximum_artifact_result_with_a_bounded_copy() {
+        let now = Instant::now();
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-max-artifacts",
+            1,
+            "snapshot-max-artifacts",
+            "lease-max-artifacts",
+            vec![task_result_with_artifacts(
+                "result-max-artifacts",
+                MAX_TASK_ARTIFACTS,
+            )],
+            MAX_TASK_ARTIFACTS,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (page, released, inserted) = pages.first_page(snapshot, now, 1);
+        let page = page.expect("maximum valid artifact result should remain pageable");
+
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert_eq!(1, page.0.len());
+        assert_eq!(
+            MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS,
+            page.0[0].artifacts.len()
+        );
+        assert!(page.1.next_page_token.is_empty());
     }
 
     #[test]
@@ -3863,6 +4077,153 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_task_output_recovery_is_shared_and_nonblocking() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1read-recovery", None)
+            .expect("task should persist while its resource root is unavailable");
+        assert!(!state.tasks.task_output_v2_available());
+        fs::create_dir_all(&root_path).expect("resource root should recover");
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let server_service = ServerGrpcService::new(state.clone());
+        let task_service = TaskGrpcService::new(state.clone());
+        let info_request = tokio::spawn(async move {
+            server_service
+                .get_server_info(Request::new(GetServerInfoRequest {}))
+                .await
+        });
+        let results_request = tokio::spawn(async move {
+            task_service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: task.id,
+                    page: None,
+                }))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let attempts_started = state
+                    .task_result_pages
+                    .lock()
+                    .expect("task result page store lock should be available")
+                    .task_output_read_recovery
+                    .attempts_started;
+                if attempts_started == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a read should start one background recovery attempt");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started,
+            "concurrent read paths should share the same recovery"
+        );
+        assert!(!info_request.is_finished());
+        assert!(!results_request.is_finished());
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        let info = timeout(Duration::from_secs(2), info_request)
+            .await
+            .expect("server info should finish after cleanup recovers")
+            .expect("server info task should join")
+            .expect("server info should succeed")
+            .into_inner();
+        let results = timeout(Duration::from_secs(2), results_request)
+            .await
+            .expect("task results should finish after cleanup recovers")
+            .expect("task results task should join")
+            .expect("task results should succeed")
+            .into_inner();
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert!(!results.results.is_empty());
+        assert!(state.tasks.task_output_v2_available());
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_throttles_failed_resource_scans() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("missing-cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.persistence_available());
+        assert!(!state.tasks.task_output_v2_available());
+        let service = ServerGrpcService::new(state.clone());
+
+        let first = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("degraded server info should remain readable")
+            .into_inner();
+        let second = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("repeated degraded server info should remain readable")
+            .into_inner();
+
+        assert!(
+            !first
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert!(
+            !second
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started,
+            "failed read recovery should be throttled during its retry delay"
         );
     }
 
@@ -4391,6 +4752,18 @@ mod tests {
         TaskResult {
             id: id.to_owned(),
             state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    fn task_result_with_artifacts(id: &str, artifact_count: usize) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![
+                crate::generated::tvos_net_player::v1::TaskArtifact::default();
+                artifact_count
+            ],
             ..Default::default()
         }
     }
@@ -11664,6 +12037,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_fill_failure_directory_sync_retry_does_not_repeat_cache_work() {
+        let (upstream_url, _upstream_task, upstream_requests) =
+            start_counted_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1cache-fill-directory-sync-retry",
+            &upstream_url,
+        );
+        state.tasks.fail_next_persistence_directory_sync();
+
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let worker = tokio::spawn(run_hls_cache_fill_worker(state.clone()));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.tasks.persistence_available()
+                    && state
+                        .tasks
+                        .hls_session_has_online_playback_after_cache_fill_failure(
+                            &task_id, &task_id,
+                        )
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cache failure marker should become visible before it is durable");
+        let requests_after_failure = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_failure > 0);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if state.tasks.persistence_available() && state.hls_fill_scheduler.is_idle() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued failure marker should become durable");
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must not repeat the failed download"
+        );
+
+        state
+            .hls_fill_scheduler
+            .shutdown_and_wait_for_worker()
+            .await;
+        worker.await.expect("HLS cache fill worker should stop");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        assert!(
+            restored
+                .tasks
+                .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &task_id),
+            "the failure marker should survive restart"
+        );
+    }
+
+    #[tokio::test]
     async fn hls_cache_fill_failure_requeues_until_failure_state_is_durable() {
         let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -15109,20 +15562,40 @@ mod tests {
     }
 
     async fn start_failing_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let (url, task, _) = start_counted_failing_mp4_upstream().await;
+        (url, task)
+    }
+
+    async fn start_counted_failing_mp4_upstream()
+    -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener should bind");
         let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let upstream_request_count = Arc::clone(&request_count);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/video.m4s", get(upstream_unavailable)),
+                Router::new().route(
+                    "/video.m4s",
+                    get({
+                        let request_count = Arc::clone(&upstream_request_count);
+                        move |headers: HeaderMap| {
+                            let request_count = Arc::clone(&request_count);
+                            async move {
+                                request_count.fetch_add(1, Ordering::Relaxed);
+                                upstream_unavailable(headers).await
+                            }
+                        }
+                    }),
+                ),
             )
             .await
             .expect("upstream should run");
         });
 
-        (format!("http://{addr}/video.m4s"), task)
+        (format!("http://{addr}/video.m4s"), task, request_count)
     }
 
     async fn start_blocked_mp4_upstream()

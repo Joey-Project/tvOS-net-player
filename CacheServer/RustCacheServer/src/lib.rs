@@ -2336,6 +2336,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_task_snapshot_blocks_raw_completed_hls_deletion() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let session_id = "malformed-state-raw-hls";
+        let mut session = sample_hls_session(session_id);
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        let item_id = hls_cache
+            .cache_session_resources(&reqwest::Client::new(), &session)
+            .await
+            .expect("raw completed HLS item should be cached");
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        std::fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state directory should be created");
+        std::fs::write(&task_state_path, b"{ malformed task snapshot")
+            .expect("malformed task snapshot should be written");
+
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+
+        let error = state
+            .delete_completed_hls_library_item(&item_id)
+            .expect_err("raw HLS deletion must fail while configured persistence is unavailable");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+        assert_eq!(
+            b"{ malformed task snapshot",
+            std::fs::read(&task_state_path)
+                .expect("malformed task snapshot should be preserved")
+                .as_slice()
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn completed_runtime_session_scrubs_alternate_upstream_after_grace_period() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = test_app_state(&temp);
@@ -2849,6 +2927,24 @@ mod tests {
             transcoding: HlsTranscodingPlan::default(),
             effective_policy: crate::playback_policy::PlaybackPolicy::default(),
         }
+    }
+
+    fn test_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(test_mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(test_mp4_box(*b"moov", b"metadata"));
+        bytes.extend(test_mp4_box(*b"moof", b"frag"));
+        bytes.extend(test_mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn test_mp4_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + payload.len()).expect("test MP4 box should fit");
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend(size.to_be_bytes());
+        bytes.extend(kind);
+        bytes.extend(payload);
+        bytes
     }
 
     fn free_port() -> io::Result<u16> {

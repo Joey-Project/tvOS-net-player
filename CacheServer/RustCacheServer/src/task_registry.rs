@@ -91,11 +91,40 @@ pub struct BilibiliTaskRegistry {
     mutation_lock: Mutex<()>,
     queue_notify: Arc<Notify>,
     persistence: Option<TaskStatePersistence>,
+    // Load failure suppresses the writable store but must not erase configuration intent.
+    persistence_configured: bool,
     retention_policy: TaskRetentionPolicy,
     resource_root_path: Option<PathBuf>,
     resource_cleanup_lock: Mutex<()>,
     resource_storage_available: AtomicBool,
     orphan_resource_scan_pending: AtomicBool,
+}
+
+struct StagedTaskOutputResources<'a> {
+    registry: &'a BilibiliTaskRegistry,
+    resource_ids: Option<HashSet<String>>,
+}
+
+impl<'a> StagedTaskOutputResources<'a> {
+    fn new(registry: &'a BilibiliTaskRegistry, resource_ids: HashSet<String>) -> Self {
+        Self {
+            registry,
+            resource_ids: Some(resource_ids),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.resource_ids = None;
+    }
+}
+
+impl Drop for StagedTaskOutputResources<'_> {
+    fn drop(&mut self) {
+        if let Some(resource_ids) = self.resource_ids.take() {
+            self.registry
+                .reserve_rejected_staged_resource_cleanup(resource_ids);
+        }
+    }
 }
 
 impl BilibiliTaskRegistry {
@@ -120,12 +149,13 @@ impl BilibiliTaskRegistry {
             Ok(records) => records,
             Err(error) => {
                 eprintln!(
-                    "Failed to load persisted Bilibili task state from {}; task state writeback is disabled until the snapshot is repaired: {error}",
+                    "Failed to load persisted Bilibili task state from {}; task state writeback is disabled for this process; repair the snapshot and restart the cache server: {error}",
                     store.path().display()
                 );
                 return Self::from_persisted_records(
                     Vec::new(),
                     None,
+                    true,
                     retention_policy,
                     resource_root_path,
                 );
@@ -134,6 +164,7 @@ impl BilibiliTaskRegistry {
         let registry = Self::from_persisted_records(
             records,
             Some(store),
+            true,
             retention_policy,
             resource_root_path,
         );
@@ -148,7 +179,7 @@ impl BilibiliTaskRegistry {
     }
 
     pub(crate) fn persistence_configured(&self) -> bool {
-        self.persistence.is_some()
+        self.persistence_configured
     }
 
     #[cfg(test)]
@@ -401,6 +432,11 @@ impl BilibiliTaskRegistry {
         results: Vec<TaskResult>,
         resources: Vec<TaskResourceRecord>,
     ) -> Result<Task, Status> {
+        let candidate_resource_ids = resources
+            .iter()
+            .map(|resource| resource.resource.id.clone())
+            .collect::<HashSet<_>>();
+        let staged_resources = StagedTaskOutputResources::new(self, candidate_resource_ids.clone());
         if !self
             .resource_storage_available
             .load(AtomicOrdering::Acquire)
@@ -416,10 +452,6 @@ impl BilibiliTaskRegistry {
             return Err(task_not_found());
         }
         prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-        let candidate_resource_ids = resources
-            .iter()
-            .map(|resource| resource.resource.id.clone())
-            .collect::<HashSet<_>>();
         let current_task_resource_ids = inner
             .outputs_by_task_id
             .get(&normalized_id)
@@ -484,14 +516,6 @@ impl BilibiliTaskRegistry {
         projected_resource_ids.extend(inner.durable_resource_cleanup_ids.iter().cloned());
         projected_resource_ids.extend(candidate_resource_ids.iter().cloned());
         if projected_resource_ids.len() > MAX_REGISTERED_TASK_RESOURCES {
-            let cleanup_needed = reserve_unowned_resource_cleanup_locked(
-                &mut inner,
-                candidate_resource_ids.iter().cloned(),
-            );
-            drop(inner);
-            if cleanup_needed {
-                self.cleanup_durable_resource_bodies();
-            }
             return Err(Status::resource_exhausted(format!(
                 "Task resource storage cannot register more than {MAX_REGISTERED_TASK_RESOURCES} resource ids."
             )));
@@ -503,15 +527,7 @@ impl BilibiliTaskRegistry {
             resources,
         ) {
             Ok(output) => output,
-            Err(error) => {
-                let cleanup_needed =
-                    reserve_unowned_resource_cleanup_locked(&mut inner, candidate_resource_ids);
-                drop(inner);
-                if cleanup_needed {
-                    self.cleanup_durable_resource_bodies();
-                }
-                return Err(Status::invalid_argument(error.to_string()));
-            }
+            Err(error) => return Err(Status::invalid_argument(error.to_string())),
         };
         let checkpoint = RegistryMutationCheckpoint::capture(&inner);
         let changed = inner
@@ -557,6 +573,7 @@ impl BilibiliTaskRegistry {
             .get(&normalized_id)
             .expect("known task must exist")
             .clone();
+        staged_resources.disarm();
         let outcome = if requires_persistence {
             Self::stage_publication_locked(&mut inner, task.clone());
             self.persist_and_publish_pending(inner, true, Some(checkpoint))
@@ -2384,6 +2401,7 @@ impl BilibiliTaskRegistry {
     fn from_persisted_records(
         records: Vec<PersistedTaskRecord>,
         store: Option<TaskStateStore>,
+        persistence_configured: bool,
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
     ) -> Self {
@@ -2465,6 +2483,7 @@ impl BilibiliTaskRegistry {
             mutation_lock: Mutex::new(()),
             queue_notify: Arc::new(Notify::new()),
             persistence: store.map(TaskStatePersistence::new),
+            persistence_configured,
             retention_policy,
             resource_root_path,
             resource_cleanup_lock: Mutex::new(()),
@@ -2677,6 +2696,20 @@ impl BilibiliTaskRegistry {
         self.mutation_lock
             .lock()
             .expect("task registry mutation lock poisoned")
+    }
+
+    fn reserve_rejected_staged_resource_cleanup(&self, resource_ids: HashSet<String>) {
+        let cleanup_needed = {
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            reserve_unowned_resource_cleanup_locked(&mut inner, resource_ids)
+        };
+        if cleanup_needed
+            && !self
+                .orphan_resource_scan_pending
+                .load(AtomicOrdering::Acquire)
+        {
+            self.cleanup_durable_resource_bodies();
+        }
     }
 
     fn install_visible_snapshot_locked(inner: &mut RegistryInner, records: &[PersistedTaskRecord]) {
@@ -2989,7 +3022,13 @@ impl BilibiliTaskRegistry {
 
 impl Default for BilibiliTaskRegistry {
     fn default() -> Self {
-        Self::from_persisted_records(Vec::new(), None, TaskRetentionPolicy::default(), None)
+        Self::from_persisted_records(
+            Vec::new(),
+            None,
+            false,
+            TaskRetentionPolicy::default(),
+            None,
+        )
     }
 }
 
@@ -6888,6 +6927,10 @@ mod tests {
         let resource_path = root_path.join(".tvos-net-player/resources/unknown-owner/body");
         std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
         std::fs::write(&resource_path, b"preserve").unwrap();
+        TaskStateStore::new(&path)
+            .save(&[persisted_task_record("repaired-task", "BV1repaired-state")])
+            .expect("repair snapshot should be written");
+        let repair_snapshot = std::fs::read(&path).expect("repair snapshot should be readable");
         std::fs::write(&path, b"{ invalid json").expect("invalid state should be written");
 
         let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
@@ -6901,8 +6944,30 @@ mod tests {
         let persisted = std::fs::read_to_string(&path).expect("state file should remain readable");
 
         assert_eq!(TaskState::Queued, task.state());
+        assert!(registry.persistence_configured());
+        assert!(!registry.persistence_available());
+        assert!(!registry.retry_pending_persistence());
         assert_eq!("{ invalid json", persisted);
+        assert_eq!(
+            b"{ invalid json",
+            std::fs::read(&path)
+                .expect("a persistence retry must leave the malformed snapshot unchanged")
+                .as_slice()
+        );
         assert!(resource_path.exists());
+
+        let volatile_task_id = task.id;
+        drop(registry);
+        std::fs::write(&path, repair_snapshot).expect("task snapshot should be repaired");
+        let recovered = BilibiliTaskRegistry::with_persistence_path(&path);
+
+        assert!(recovered.persistence_configured());
+        assert!(recovered.persistence_available());
+        assert!(recovered.get_task("repaired-task").is_ok());
+        assert_eq!(
+            tonic::Code::NotFound,
+            recovered.get_task(&volatile_task_id).unwrap_err().code()
+        );
     }
 
     #[test]
@@ -7427,6 +7492,92 @@ mod tests {
         assert!(!resource_path.exists());
         assert!(!resource_path.parent().unwrap().exists());
         assert!(registry.task_resource("invalid-output-resource").is_none());
+    }
+
+    #[test]
+    fn missing_task_output_cleans_every_unowned_staged_resource_body() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let first = test_task_resource("missing-task-first", 5);
+        let second = test_task_resource("missing-task-second", 6);
+        let first_path = write_task_resource_body(&root_path, &first, b"first");
+        let second_path = write_task_resource_body(&root_path, &second, b"second");
+
+        let error = registry
+            .replace_task_output(
+                "missing-task",
+                vec![test_task_result_with_resources(
+                    "missing-result",
+                    &[first.clone(), second.clone()],
+                )],
+                vec![first, second],
+            )
+            .expect_err("output for a missing task must be rejected");
+
+        assert_eq!(tonic::Code::NotFound, error.code());
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert!(!first_path.parent().unwrap().exists());
+        assert!(!second_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn resource_id_collision_cleans_other_staged_bodies_but_preserves_live_body() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let owner = registry
+            .create_bilibili_task("BV1resource-owner", None)
+            .expect("resource owner should be created");
+        let rejected = registry
+            .create_bilibili_task("BV1resource-collision", None)
+            .expect("rejected output task should be created");
+        let live = test_task_resource("live-resource", 4);
+        let live_path = write_task_resource_body(&root_path, &live, b"live");
+        registry
+            .replace_task_output(
+                &owner.id,
+                vec![test_task_result_with_resources(
+                    "owner-result",
+                    std::slice::from_ref(&live),
+                )],
+                vec![live.clone()],
+            )
+            .expect("live resource should commit");
+        let first = test_task_resource("collision-first", 5);
+        let second = test_task_resource("collision-second", 6);
+        let first_path = write_task_resource_body(&root_path, &first, b"first");
+        let second_path = write_task_resource_body(&root_path, &second, b"second");
+
+        let error = registry
+            .replace_task_output(
+                &rejected.id,
+                vec![test_task_result_with_resources(
+                    "rejected-result",
+                    &[live.clone(), first.clone(), second.clone()],
+                )],
+                vec![live.clone(), first, second],
+            )
+            .expect_err("a resource id owned by another task must reject the whole output");
+
+        assert_eq!(tonic::Code::AlreadyExists, error.code());
+        assert_eq!(b"live", std::fs::read(&live_path).unwrap().as_slice());
+        assert!(registry.task_resource(&live.resource.id).is_some());
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert!(!first_path.parent().unwrap().exists());
+        assert!(!second_path.parent().unwrap().exists());
     }
 
     #[tokio::test]
@@ -8552,5 +8703,49 @@ mod tests {
             uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
             expires_at: None,
         }
+    }
+
+    fn test_task_resource(id: &str, size_bytes: i64) -> TaskResourceRecord {
+        TaskResourceRecord::new(crate::generated::tvos_net_player::v1::CacheResourceRef {
+            id: id.to_owned(),
+            content_type: "text/plain".to_owned(),
+            size_bytes,
+            size_known: true,
+            ..Default::default()
+        })
+        .expect("test resource should be valid")
+    }
+
+    fn test_task_result_with_resources(id: &str, resources: &[TaskResourceRecord]) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: resources
+                .iter()
+                .map(
+                    |resource| crate::generated::tvos_net_player::v1::TaskArtifact {
+                        id: format!("artifact-{}", resource.resource.id),
+                        kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Metadata
+                            .into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn write_task_resource_body(
+        root_path: &Path,
+        resource: &TaskResourceRecord,
+        body: &[u8],
+    ) -> PathBuf {
+        let path = root_path.join(resource.relative_path());
+        std::fs::create_dir_all(path.parent().unwrap())
+            .expect("staged resource directory should be created");
+        std::fs::write(&path, body).expect("staged resource body should be written");
+        path
     }
 }

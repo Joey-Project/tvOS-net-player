@@ -41,6 +41,7 @@ const MAX_PERSISTED_DANMAKU_FORMATS: usize = 16;
 
 thread_local! {
     static PERSISTED_TASK_RESOURCE_BUDGET: Cell<Option<PersistedTaskResourceBudget>> = const { Cell::new(None) };
+    static PERSISTED_TASK_ARTIFACT_BUDGET: Cell<Option<PersistedTaskArtifactBudget>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +128,92 @@ fn persisted_task_resource_limit() -> usize {
         .with(|budget| budget.get())
         .map(|budget| budget.limit)
         .unwrap_or(MAX_REGISTERED_TASK_RESOURCES)
+}
+
+#[derive(Clone, Copy)]
+struct PersistedTaskArtifactBudget {
+    remaining: usize,
+    limit: usize,
+}
+
+struct PersistedTaskArtifactBudgetGuard;
+
+impl PersistedTaskArtifactBudgetGuard {
+    fn enter(limit: usize) -> io::Result<Self> {
+        let activated = PERSISTED_TASK_ARTIFACT_BUDGET.with(|budget| {
+            if budget.get().is_some() {
+                return false;
+            }
+            budget.set(Some(PersistedTaskArtifactBudget {
+                remaining: limit,
+                limit,
+            }));
+            true
+        });
+        if !activated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task output artifact deserialization is already active",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for PersistedTaskArtifactBudgetGuard {
+    fn drop(&mut self) {
+        PERSISTED_TASK_ARTIFACT_BUDGET.with(|budget| budget.set(None));
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PersistedTaskArtifactBudgetClaim {
+    Unbounded,
+    Claimed,
+    Exhausted,
+}
+
+fn claim_persisted_task_artifact_budget() -> PersistedTaskArtifactBudgetClaim {
+    PERSISTED_TASK_ARTIFACT_BUDGET.with(|budget| match budget.get() {
+        None => PersistedTaskArtifactBudgetClaim::Unbounded,
+        Some(state) if state.remaining == 0 => PersistedTaskArtifactBudgetClaim::Exhausted,
+        Some(mut state) => {
+            state.remaining -= 1;
+            budget.set(Some(state));
+            PersistedTaskArtifactBudgetClaim::Claimed
+        }
+    })
+}
+
+fn release_persisted_task_artifact_budget(claim: PersistedTaskArtifactBudgetClaim) {
+    if claim != PersistedTaskArtifactBudgetClaim::Claimed {
+        return;
+    }
+    PERSISTED_TASK_ARTIFACT_BUDGET.with(|budget| {
+        let mut state = budget
+            .get()
+            .expect("claimed task artifact budget must remain active");
+        state.remaining = state.remaining.saturating_add(1).min(state.limit);
+        budget.set(Some(state));
+    });
+}
+
+fn persisted_task_artifact_capacity(size_hint: Option<usize>) -> usize {
+    let remaining = PERSISTED_TASK_ARTIFACT_BUDGET
+        .with(|budget| budget.get())
+        .map(|budget| budget.remaining)
+        .unwrap_or(MAX_TASK_ARTIFACTS);
+    size_hint
+        .unwrap_or(0)
+        .min(MAX_TASK_ARTIFACTS)
+        .min(remaining)
+}
+
+fn persisted_task_artifact_limit() -> usize {
+    PERSISTED_TASK_ARTIFACT_BUDGET
+        .with(|budget| budget.get())
+        .map(|budget| budget.limit)
+        .unwrap_or(MAX_TASK_ARTIFACTS)
 }
 
 #[cfg(test)]
@@ -443,7 +530,19 @@ fn deserialize_task_results<'de, D>(deserializer: D) -> Result<Vec<PersistedTask
 where
     D: Deserializer<'de>,
 {
-    struct TaskResultsVisitor;
+    deserialize_task_results_with_artifact_limit(deserializer, MAX_TASK_ARTIFACTS)
+}
+
+fn deserialize_task_results_with_artifact_limit<'de, D>(
+    deserializer: D,
+    artifact_limit: usize,
+) -> Result<Vec<PersistedTaskResult>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TaskResultsVisitor {
+        artifact_limit: usize,
+    }
 
     impl<'de> Visitor<'de> for TaskResultsVisitor {
         type Value = Vec<PersistedTaskResult>;
@@ -451,7 +550,8 @@ where
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 formatter,
-                "at most {MAX_TASK_RESULTS} task results containing at most {MAX_TASK_ARTIFACTS} artifacts"
+                "at most {MAX_TASK_RESULTS} task results containing at most {} artifacts",
+                self.artifact_limit
             )
         }
 
@@ -461,17 +561,10 @@ where
         {
             let mut results =
                 Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_TASK_RESULTS));
-            let mut artifact_count = 0_usize;
             while results.len() < MAX_TASK_RESULTS {
                 let Some(result) = sequence.next_element::<PersistedTaskResult>()? else {
                     return Ok(results);
                 };
-                artifact_count = artifact_count.saturating_add(result.artifacts.len());
-                if artifact_count > MAX_TASK_ARTIFACTS {
-                    return Err(de::Error::custom(format!(
-                        "task output artifacts cannot exceed {MAX_TASK_ARTIFACTS} entries"
-                    )));
-                }
                 results.push(result);
             }
             if sequence.next_element::<de::IgnoredAny>()?.is_some() {
@@ -483,7 +576,9 @@ where
         }
     }
 
-    deserializer.deserialize_seq(TaskResultsVisitor)
+    let _artifact_budget = PersistedTaskArtifactBudgetGuard::enter(artifact_limit)
+        .map_err(<D::Error as de::Error>::custom)?;
+    deserializer.deserialize_seq(TaskResultsVisitor { artifact_limit })
 }
 
 fn deserialize_task_resources<'de, D>(
@@ -545,7 +640,51 @@ fn deserialize_task_artifacts<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_TASK_ARTIFACTS, "task result artifacts")
+    struct TaskArtifactsVisitor;
+
+    impl<'de> Visitor<'de> for TaskArtifactsVisitor {
+        type Value = Vec<PersistedTaskArtifact>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_TASK_ARTIFACTS} task result artifacts within the task output artifact budget"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut artifacts =
+                Vec::with_capacity(persisted_task_artifact_capacity(sequence.size_hint()));
+            while artifacts.len() < MAX_TASK_ARTIFACTS {
+                let claim = claim_persisted_task_artifact_budget();
+                if claim == PersistedTaskArtifactBudgetClaim::Exhausted {
+                    if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                        let limit = persisted_task_artifact_limit();
+                        return Err(de::Error::custom(format!(
+                            "task output artifacts cannot exceed {limit} entries"
+                        )));
+                    }
+                    return Ok(artifacts);
+                }
+                let Some(artifact) = sequence.next_element::<PersistedTaskArtifact>()? else {
+                    release_persisted_task_artifact_budget(claim);
+                    return Ok(artifacts);
+                };
+                artifacts.push(artifact);
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format!(
+                    "task result artifacts cannot exceed {MAX_TASK_ARTIFACTS} entries"
+                )));
+            }
+            Ok(artifacts)
+        }
+    }
+
+    deserializer.deserialize_seq(TaskArtifactsVisitor)
 }
 
 fn deserialize_selection_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -1579,6 +1718,39 @@ mod tests {
         TaskArtifactState, TaskKind, TaskProblemCategory, TaskState,
     };
 
+    fn persisted_task_artifact_fixture(id: &str) -> PersistedTaskArtifact {
+        PersistedTaskArtifact {
+            id: id.to_owned(),
+            kind: TaskArtifactKind::Metadata.into(),
+            state: TaskArtifactState::Available.into(),
+            title: String::new(),
+            format: String::new(),
+            language_tag: String::new(),
+            is_ai_generated: false,
+            resource: None,
+            problem: None,
+        }
+    }
+
+    fn persisted_task_result_fixture(
+        id: &str,
+        artifacts: Vec<PersistedTaskArtifact>,
+    ) -> PersistedTaskResult {
+        PersistedTaskResult {
+            id: id.to_owned(),
+            state: TaskState::Completed.into(),
+            title: String::new(),
+            subtitle: String::new(),
+            progress: None,
+            problem: None,
+            library_item_id: String::new(),
+            playback_source: None,
+            artifacts,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
     #[test]
     fn bounded_snapshot_writer_counts_the_trailing_newline() {
         let mut writer = BoundedSnapshotWriter::new(4);
@@ -1767,53 +1939,55 @@ mod tests {
     }
 
     #[test]
-    fn persisted_task_output_bounds_aggregate_artifacts_during_deserialization() {
-        let artifact = PersistedTaskArtifact {
-            id: "artifact".to_owned(),
-            kind: TaskArtifactKind::Metadata.into(),
-            state: TaskArtifactState::Available.into(),
-            title: String::new(),
-            format: String::new(),
-            language_tag: String::new(),
-            is_ai_generated: false,
-            resource: None,
-            problem: None,
-        };
-        let result = |id: &str, artifacts| PersistedTaskResult {
-            id: id.to_owned(),
-            state: TaskState::Completed.into(),
-            title: String::new(),
-            subtitle: String::new(),
-            progress: None,
-            problem: None,
-            library_item_id: String::new(),
-            playback_source: None,
-            artifacts,
-            created_at: None,
-            updated_at: None,
-        };
-        let output = PersistedTaskOutput {
-            revision: 1,
-            snapshot_id: "snapshot".to_owned(),
-            primary_result_id: String::new(),
-            results: vec![
-                result("first", vec![artifact.clone(); MAX_TASK_ARTIFACTS]),
-                result("second", vec![artifact]),
-            ],
-            resources: Vec::new(),
-            legacy_managed: false,
-        };
-        let bytes = serde_json::to_vec(&output).expect("fixture should serialize");
+    fn persisted_task_output_rejects_cross_result_artifact_before_decoding_it() {
+        let artifact = persisted_task_artifact_fixture("artifact");
+        let results = vec![
+            persisted_task_result_fixture("first", vec![artifact.clone(), artifact.clone()]),
+            persisted_task_result_fixture("second", vec![artifact]),
+        ];
+        let mut encoded_results = serde_json::to_value(results).expect("fixture should serialize");
+        // A typed decode would reject this before the former post-result aggregate check.
+        encoded_results[1]["artifacts"][0]["kind"] =
+            serde_json::Value::String("must-not-decode".to_owned());
+        let bytes = serde_json::to_vec(&encoded_results).expect("fixture should serialize");
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
 
-        let error = match serde_json::from_slice::<PersistedTaskOutput>(&bytes) {
-            Ok(_) => panic!("aggregate artifact count must be bounded while decoding"),
+        let error = match deserialize_task_results_with_artifact_limit(&mut deserializer, 2) {
+            Ok(_) => panic!("the third artifact must be rejected before typed decoding"),
             Err(error) => error,
         };
         assert!(
             error
                 .to_string()
-                .contains("task output artifacts cannot exceed")
+                .contains("task output artifacts cannot exceed 2 entries"),
+            "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn persisted_task_output_accepts_cross_result_artifacts_at_aggregate_limit() {
+        let results = vec![
+            persisted_task_result_fixture(
+                "first",
+                vec![persisted_task_artifact_fixture("artifact-one")],
+            ),
+            persisted_task_result_fixture(
+                "second",
+                vec![persisted_task_artifact_fixture("artifact-two")],
+            ),
+        ];
+        let bytes = serde_json::to_vec(&results).expect("fixture should serialize");
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+
+        let decoded = deserialize_task_results_with_artifact_limit(&mut deserializer, 2)
+            .expect("artifacts at the aggregate limit should decode");
+        deserializer
+            .end()
+            .expect("fixture should be fully consumed");
+
+        assert_eq!(2, decoded.len());
+        assert_eq!(1, decoded[0].artifacts.len());
+        assert_eq!(1, decoded[1].artifacts.len());
     }
 
     #[test]
