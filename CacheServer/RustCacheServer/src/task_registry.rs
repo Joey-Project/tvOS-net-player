@@ -104,21 +104,56 @@ pub struct BilibiliTaskRegistry {
     orphan_resource_scan_pending: AtomicBool,
 }
 
-struct StagedTaskOutputResources<'a> {
+#[allow(dead_code)]
+pub(crate) struct StagedTaskOutputReplacement<'a> {
     registry: &'a BilibiliTaskRegistry,
+    task_id: String,
+    resources: Option<Vec<TaskResourceRecord>>,
     resource_ids: Option<HashSet<String>>,
 }
 
-impl<'a> StagedTaskOutputResources<'a> {
-    fn new(registry: &'a BilibiliTaskRegistry, resource_ids: HashSet<String>) -> Self {
-        registry.register_staged_task_output_resources(&resource_ids);
+#[allow(dead_code)]
+impl<'a> StagedTaskOutputReplacement<'a> {
+    fn new(
+        registry: &'a BilibiliTaskRegistry,
+        task_id: String,
+        resources: Vec<TaskResourceRecord>,
+        resource_ids: HashSet<String>,
+    ) -> Self {
         Self {
             registry,
+            task_id,
+            resources: Some(resources),
             resource_ids: Some(resource_ids),
         }
     }
 
-    fn disarm(mut self) {
+    pub(crate) fn resources(&self) -> &[TaskResourceRecord] {
+        self.resources
+            .as_deref()
+            .expect("staged task output resources must remain available before commit")
+    }
+
+    pub(crate) fn commit(mut self, results: Vec<TaskResult>) -> Result<Task, Status> {
+        let resources = self
+            .resources
+            .take()
+            .expect("staged task output resources must be committed once");
+        let outcome = self.registry.commit_staged_task_output(
+            &self.task_id,
+            results,
+            resources,
+            self.resource_ids
+                .as_ref()
+                .expect("staged task output resource ids must remain registered"),
+        );
+        if outcome.is_ok() {
+            self.disarm();
+        }
+        outcome
+    }
+
+    fn disarm(&mut self) {
         if let Some(resource_ids) = self.resource_ids.take() {
             self.registry
                 .release_staged_task_output_resources(&resource_ids);
@@ -126,7 +161,7 @@ impl<'a> StagedTaskOutputResources<'a> {
     }
 }
 
-impl Drop for StagedTaskOutputResources<'_> {
+impl Drop for StagedTaskOutputReplacement<'_> {
     fn drop(&mut self) {
         if let Some(resource_ids) = self.resource_ids.take() {
             self.registry
@@ -457,20 +492,63 @@ impl BilibiliTaskRegistry {
         Ok(snapshot)
     }
 
-    // The v2 BBDown execution adapter lands in PR6D and writes through this boundary.
+    /// Claims resource IDs against cleanup before PR6D's adapter creates any body files.
+    /// Bodies must be created only after this returns and while the returned claim remains alive.
     #[allow(dead_code)]
-    pub(crate) fn replace_task_output(
+    pub(crate) fn stage_task_output_replacement(
         &self,
         id: &str,
-        results: Vec<TaskResult>,
         resources: Vec<TaskResourceRecord>,
-    ) -> Result<Task, Status> {
+    ) -> Result<StagedTaskOutputReplacement<'_>, Status> {
+        if !self
+            .resource_storage_available
+            .load(AtomicOrdering::Acquire)
+            && !self
+                .orphan_resource_scan_pending
+                .load(AtomicOrdering::Acquire)
+        {
+            return Err(Status::failed_precondition(
+                "Task resource storage is unavailable.",
+            ));
+        }
+        let normalized_id = normalize_required_id(id)?;
         let candidate_resource_ids = resources
             .iter()
             .map(|resource| resource.resource.id.clone())
             .collect::<HashSet<_>>();
-        let staged_resources = StagedTaskOutputResources::new(self, candidate_resource_ids.clone());
+        self.register_staged_task_output_resources(
+            &normalized_id,
+            &resources,
+            &candidate_resource_ids,
+        )?;
+        let mut staged = StagedTaskOutputReplacement::new(
+            self,
+            normalized_id,
+            resources,
+            candidate_resource_ids.clone(),
+        );
         self.retire_expired_task_resources_except(&candidate_resource_ids);
+        if !self
+            .resource_storage_available
+            .load(AtomicOrdering::Acquire)
+        {
+            staged.disarm();
+            return Err(Status::failed_precondition(
+                "Task resource storage is unavailable.",
+            ));
+        }
+        Ok(staged)
+    }
+
+    #[allow(dead_code)]
+    fn commit_staged_task_output(
+        &self,
+        id: &str,
+        results: Vec<TaskResult>,
+        resources: Vec<TaskResourceRecord>,
+        candidate_resource_ids: &HashSet<String>,
+    ) -> Result<Task, Status> {
+        self.retire_expired_task_resources_except(candidate_resource_ids);
         if !self
             .resource_storage_available
             .load(AtomicOrdering::Acquire)
@@ -486,81 +564,13 @@ impl BilibiliTaskRegistry {
             return Err(task_not_found());
         }
         prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-        let current_task_resource_ids = inner
-            .outputs_by_task_id
-            .get(&normalized_id)
-            .into_iter()
-            .flat_map(|output| &output.resources)
-            .map(|resource| resource.resource.id.as_str())
-            .collect::<HashSet<_>>();
-        let other_task_resource_ids = inner
-            .outputs_by_task_id
-            .iter()
-            .filter(|(task_id, _)| *task_id != &normalized_id)
-            .flat_map(|(_, output)| &output.resources)
-            .map(|resource| resource.resource.id.as_str())
-            .collect::<HashSet<_>>();
-        let retained_resource_ids = inner
-            .retained_resource_snapshots
-            .values()
-            .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let visible_resource_ids = inner
-            .visible_outputs_by_task_id
-            .values()
-            .flat_map(|output| output.available_resources_by_id.keys())
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        for resource in &resources {
-            let resource_id = resource.resource.id.as_str();
-            let current_task_owns_id = current_task_resource_ids.contains(resource_id);
-            let staged_owner_count = inner
-                .staged_resource_owner_counts
-                .get(resource_id)
-                .copied()
-                .unwrap_or_default();
-            if staged_owner_count > 1
-                || other_task_resource_ids.contains(resource_id)
-                || (!current_task_owns_id
-                    && (visible_resource_ids.contains(resource_id)
-                        || retained_resource_ids.contains(resource_id)
-                        || inner.pending_resource_cleanup_ids.contains(resource_id)
-                        || inner.durable_resource_cleanup_ids.contains(resource_id)))
-            {
-                return Err(Status::already_exists(format!(
-                    "Task resource id is already registered: {}.",
-                    resource.resource.id
-                )));
-            }
-        }
-
-        let mut projected_resource_ids = other_task_resource_ids
-            .iter()
-            .map(|resource_id| (*resource_id).to_owned())
-            .collect::<HashSet<_>>();
-        projected_resource_ids.extend(
-            inner
-                .visible_outputs_by_task_id
-                .iter()
-                .filter(|(task_id, _)| *task_id != &normalized_id)
-                .flat_map(|(_, output)| output.available_resources_by_id.keys().cloned()),
-        );
-        projected_resource_ids.extend(
-            inner
-                .retained_resource_snapshots
-                .values()
-                .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys().cloned()),
-        );
-        projected_resource_ids.extend(inner.pending_resource_cleanup_ids.iter().cloned());
-        projected_resource_ids.extend(inner.durable_resource_cleanup_ids.iter().cloned());
-        projected_resource_ids.extend(inner.staged_resource_owner_counts.keys().cloned());
-        projected_resource_ids.extend(candidate_resource_ids.iter().cloned());
-        if projected_resource_ids.len() > MAX_REGISTERED_TASK_RESOURCES {
-            return Err(Status::resource_exhausted(format!(
-                "Task resource storage cannot register more than {MAX_REGISTERED_TASK_RESOURCES} resource ids."
-            )));
-        }
+        validate_task_output_resource_claims_locked(
+            &inner,
+            &normalized_id,
+            &resources,
+            candidate_resource_ids,
+            true,
+        )?;
 
         let output = match TaskOutputRecord::replace(
             inner.outputs_by_task_id.get(&normalized_id),
@@ -626,8 +636,18 @@ impl BilibiliTaskRegistry {
                 "Task output could not be persisted durably.",
             ));
         }
-        staged_resources.disarm();
         Ok(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_task_output(
+        &self,
+        id: &str,
+        results: Vec<TaskResult>,
+        resources: Vec<TaskResourceRecord>,
+    ) -> Result<Task, Status> {
+        self.stage_task_output_replacement(id, resources)?
+            .commit(results)
     }
 
     #[cfg(test)]
@@ -2835,8 +2855,28 @@ impl BilibiliTaskRegistry {
             .expect("task registry mutation lock poisoned")
     }
 
-    fn register_staged_task_output_resources(&self, resource_ids: &HashSet<String>) {
+    fn register_staged_task_output_resources(
+        &self,
+        task_id: &str,
+        resources: &[TaskResourceRecord],
+        resource_ids: &HashSet<String>,
+    ) -> Result<(), Status> {
+        let _cleanup_guard = self
+            .resource_cleanup_lock
+            .lock()
+            .expect("task resource cleanup lock poisoned");
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if !inner.tasks_by_id.contains_key(task_id) {
+            return Err(task_not_found());
+        }
+        prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
+        validate_task_output_resource_claims_locked(
+            &inner,
+            task_id,
+            resources,
+            resource_ids,
+            false,
+        )?;
         for resource_id in resource_ids {
             let count = inner
                 .staged_resource_owner_counts
@@ -2846,6 +2886,7 @@ impl BilibiliTaskRegistry {
                 .checked_add(1)
                 .expect("staged task resource owner count must not overflow");
         }
+        Ok(())
     }
 
     fn release_staged_task_output_resources(&self, resource_ids: &HashSet<String>) {
@@ -2971,6 +3012,13 @@ impl BilibiliTaskRegistry {
     }
 
     fn cleanup_durable_resource_bodies(&self) -> bool {
+        self.cleanup_durable_resource_bodies_with_predelete_hook(|| {})
+    }
+
+    fn cleanup_durable_resource_bodies_with_predelete_hook(
+        &self,
+        predelete_hook: impl FnOnce(),
+    ) -> bool {
         let Some(resource_root_path) = self.resource_root_path.as_ref() else {
             return true;
         };
@@ -3006,6 +3054,7 @@ impl BilibiliTaskRegistry {
             }
             return storage_revalidated;
         }
+        predelete_hook();
 
         let mut cleaned = Vec::new();
         let mut cleanup_succeeded = storage_revalidated;
@@ -4447,6 +4496,97 @@ fn reserved_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
         .chain(inner.resource_storage_revalidation_ids.iter().cloned())
         .chain(inner.staged_resource_owner_counts.keys().cloned())
         .collect()
+}
+
+fn validate_task_output_resource_claims_locked(
+    inner: &RegistryInner,
+    task_id: &str,
+    resources: &[TaskResourceRecord],
+    candidate_resource_ids: &HashSet<String>,
+    claim_is_registered: bool,
+) -> Result<(), Status> {
+    let current_task_resource_ids = inner
+        .outputs_by_task_id
+        .get(task_id)
+        .into_iter()
+        .flat_map(|output| &output.resources)
+        .map(|resource| resource.resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let other_task_resource_ids = inner
+        .outputs_by_task_id
+        .iter()
+        .filter(|(candidate_task_id, _)| candidate_task_id.as_str() != task_id)
+        .flat_map(|(_, output)| &output.resources)
+        .map(|resource| resource.resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let retained_resource_ids = inner
+        .retained_resource_snapshots
+        .values()
+        .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let visible_resource_ids = inner
+        .visible_outputs_by_task_id
+        .values()
+        .flat_map(|output| output.available_resources_by_id.keys())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let expected_staged_owner_count = usize::from(claim_is_registered);
+    for resource in resources {
+        let resource_id = resource.resource.id.as_str();
+        let staged_owner_count = inner
+            .staged_resource_owner_counts
+            .get(resource_id)
+            .copied()
+            .unwrap_or_default();
+        if staged_owner_count < expected_staged_owner_count {
+            return Err(Status::failed_precondition(
+                "Task output resource staging ownership was lost.",
+            ));
+        }
+        let current_task_owns_id = current_task_resource_ids.contains(resource_id);
+        if staged_owner_count > expected_staged_owner_count
+            || other_task_resource_ids.contains(resource_id)
+            || (!current_task_owns_id
+                && (visible_resource_ids.contains(resource_id)
+                    || retained_resource_ids.contains(resource_id)
+                    || inner.pending_resource_cleanup_ids.contains(resource_id)
+                    || inner.durable_resource_cleanup_ids.contains(resource_id)))
+        {
+            return Err(Status::already_exists(format!(
+                "Task resource id is already registered: {}.",
+                resource.resource.id
+            )));
+        }
+    }
+
+    let mut projected_resource_ids = other_task_resource_ids
+        .iter()
+        .map(|resource_id| (*resource_id).to_owned())
+        .collect::<HashSet<_>>();
+    projected_resource_ids.extend(
+        inner
+            .visible_outputs_by_task_id
+            .iter()
+            .filter(|(candidate_task_id, _)| candidate_task_id.as_str() != task_id)
+            .flat_map(|(_, output)| output.available_resources_by_id.keys().cloned()),
+    );
+    projected_resource_ids.extend(
+        inner
+            .retained_resource_snapshots
+            .values()
+            .flat_map(|snapshot| snapshot.output.available_resources_by_id.keys().cloned()),
+    );
+    projected_resource_ids.extend(inner.pending_resource_cleanup_ids.iter().cloned());
+    projected_resource_ids.extend(inner.durable_resource_cleanup_ids.iter().cloned());
+    projected_resource_ids.extend(inner.staged_resource_owner_counts.keys().cloned());
+    projected_resource_ids.extend(candidate_resource_ids.iter().cloned());
+    if projected_resource_ids.len() > MAX_REGISTERED_TASK_RESOURCES {
+        return Err(Status::resource_exhausted(format!(
+            "Task resource storage cannot register more than {MAX_REGISTERED_TASK_RESOURCES} resource ids."
+        )));
+    }
+    Ok(())
 }
 
 fn release_staged_resource_owners_locked(
@@ -7888,7 +8028,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_task_output_cleans_every_unowned_staged_resource_body() {
+    fn missing_task_output_rejects_before_resource_body_creation() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp.path().join("cache");
         std::fs::create_dir_all(&root_path).expect("cache root should be created");
@@ -7899,29 +8039,22 @@ mod tests {
         );
         let first = test_task_resource("missing-task-first", 5);
         let second = test_task_resource("missing-task-second", 6);
-        let first_path = write_task_resource_body(&root_path, &first, b"first");
-        let second_path = write_task_resource_body(&root_path, &second, b"second");
+        let first_path = root_path.join(first.relative_path());
+        let second_path = root_path.join(second.relative_path());
 
-        let error = registry
-            .replace_task_output(
-                "missing-task",
-                vec![test_task_result_with_resources(
-                    "missing-result",
-                    &[first.clone(), second.clone()],
-                )],
-                vec![first, second],
-            )
-            .expect_err("output for a missing task must be rejected");
+        let error =
+            match registry.stage_task_output_replacement("missing-task", vec![first, second]) {
+                Ok(_) => panic!("output for a missing task must be rejected before body creation"),
+                Err(error) => error,
+            };
 
         assert_eq!(tonic::Code::NotFound, error.code());
         assert!(!first_path.exists());
         assert!(!second_path.exists());
-        assert!(!first_path.parent().unwrap().exists());
-        assert!(!second_path.parent().unwrap().exists());
     }
 
     #[test]
-    fn resource_id_collision_cleans_other_staged_bodies_but_preserves_live_body() {
+    fn resource_id_collision_rejects_before_body_creation_and_preserves_live_body() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp.path().join("cache");
         std::fs::create_dir_all(&root_path).expect("cache root should be created");
@@ -7937,40 +8070,33 @@ mod tests {
             .create_bilibili_task("BV1resource-collision", None)
             .expect("rejected output task should be created");
         let live = test_task_resource("live-resource", 4);
+        let staged_live = registry
+            .stage_task_output_replacement(&owner.id, vec![live.clone()])
+            .expect("live resource should acquire staged ownership");
         let live_path = write_task_resource_body(&root_path, &live, b"live");
-        registry
-            .replace_task_output(
-                &owner.id,
-                vec![test_task_result_with_resources(
-                    "owner-result",
-                    std::slice::from_ref(&live),
-                )],
-                vec![live.clone()],
-            )
+        staged_live
+            .commit(vec![test_task_result_with_resources(
+                "owner-result",
+                std::slice::from_ref(&live),
+            )])
             .expect("live resource should commit");
         let first = test_task_resource("collision-first", 5);
         let second = test_task_resource("collision-second", 6);
-        let first_path = write_task_resource_body(&root_path, &first, b"first");
-        let second_path = write_task_resource_body(&root_path, &second, b"second");
+        let first_path = root_path.join(first.relative_path());
+        let second_path = root_path.join(second.relative_path());
 
-        let error = registry
-            .replace_task_output(
-                &rejected.id,
-                vec![test_task_result_with_resources(
-                    "rejected-result",
-                    &[live.clone(), first.clone(), second.clone()],
-                )],
-                vec![live.clone(), first, second],
-            )
-            .expect_err("a resource id owned by another task must reject the whole output");
+        let error = match registry
+            .stage_task_output_replacement(&rejected.id, vec![live.clone(), first, second])
+        {
+            Ok(_) => panic!("a live resource id must reject staging before body creation"),
+            Err(error) => error,
+        };
 
         assert_eq!(tonic::Code::AlreadyExists, error.code());
         assert_eq!(b"live", std::fs::read(&live_path).unwrap().as_slice());
         assert!(registry.task_resource(&live.resource.id).is_some());
         assert!(!first_path.exists());
         assert!(!second_path.exists());
-        assert!(!first_path.parent().unwrap().exists());
-        assert!(!second_path.parent().unwrap().exists());
     }
 
     #[test]
@@ -8503,7 +8629,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_stages_resource_ownership_before_startup_scan_recovery() {
+    fn replacement_claims_resource_before_startup_scan_recovery_and_body_write() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
@@ -8541,16 +8667,16 @@ mod tests {
 
         std::fs::remove_dir(&rewrite_blocker).expect("startup rewrite blocker should be removable");
         let replacement = test_task_resource("staged-during-startup-scan", 5);
+        let staged = registry
+            .stage_task_output_replacement("staged-resource-task", vec![replacement])
+            .expect("replacement should recover persistence before body creation");
+        let replacement = staged.resources()[0].clone();
         let replacement_path = write_task_resource_body(&root_path, &replacement, b"fresh");
-        registry
-            .replace_task_output(
-                "staged-resource-task",
-                vec![test_task_result_with_resources(
-                    "replacement-result",
-                    std::slice::from_ref(&replacement),
-                )],
-                vec![replacement],
-            )
+        staged
+            .commit(vec![test_task_result_with_resources(
+                "replacement-result",
+                std::slice::from_ref(&replacement),
+            )])
             .expect("replacement should recover persistence without deleting its staged body");
 
         assert!(registry.persistence_available());
@@ -8561,6 +8687,106 @@ mod tests {
             registry
                 .open_task_resource("staged-during-startup-scan")
                 .expect("replacement resource storage should remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn staging_waits_for_inflight_cleanup_before_resource_body_creation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_task("BV1cleanup-serialized-stage", None)
+            .expect("task should be created");
+        let resource = test_task_resource("cleanup-serialized-resource", 5);
+        let resource_path = write_task_resource_body(&root_path, &resource, b"stale");
+        registry
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .durable_resource_cleanup_ids
+            .insert(resource.resource.id.clone());
+
+        let (candidate_sender, candidate_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_registry.cleanup_durable_resource_bodies_with_predelete_hook(|| {
+                candidate_sender
+                    .send(())
+                    .expect("cleanup candidate should be observable");
+                release_receiver
+                    .recv()
+                    .expect("cleanup test should release deletion");
+            })
+        });
+        candidate_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup should select the stale body");
+
+        let (stage_started_sender, stage_started_receiver) = std::sync::mpsc::channel();
+        let (stage_acquired_sender, stage_acquired_receiver) = std::sync::mpsc::channel();
+        let stage_registry = Arc::clone(&registry);
+        let stage_root_path = root_path.clone();
+        let stage_task_id = task.id.clone();
+        let stage_resource_path = resource_path.clone();
+        let stage = std::thread::spawn(move || {
+            stage_started_sender
+                .send(())
+                .expect("staging attempt should be observable");
+            let staged = stage_registry
+                .stage_task_output_replacement(&stage_task_id, vec![resource])
+                .expect("staging should wait for cleanup and then acquire ownership");
+            stage_acquired_sender
+                .send(())
+                .expect("staging claim should be observable");
+            assert!(
+                !stage_resource_path.exists(),
+                "the prior cleanup must finish before the claim permits body creation"
+            );
+            let staged_resource = staged.resources()[0].clone();
+            write_task_resource_body(&stage_root_path, &staged_resource, b"fresh");
+            staged
+                .commit(vec![test_task_result_with_resources(
+                    "cleanup-serialized-result",
+                    std::slice::from_ref(&staged_resource),
+                )])
+                .expect("fresh staged body should commit")
+        });
+        stage_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("staging thread should start");
+        assert!(
+            stage_acquired_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "staging must not return while a cleanup candidate can still delete the body"
+        );
+
+        release_sender
+            .send(())
+            .expect("cleanup deletion should be released");
+        assert!(cleanup.join().expect("cleanup thread should finish"));
+        stage_acquired_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("staging should acquire ownership after cleanup finishes");
+        let committed = stage.join().expect("staging thread should finish");
+
+        assert_eq!(task.id, committed.id);
+        assert_eq!(b"fresh", std::fs::read(&resource_path).unwrap().as_slice());
+        assert!(
+            registry
+                .open_task_resource("cleanup-serialized-resource")
+                .expect("committed resource should remain readable")
                 .is_some()
         );
     }

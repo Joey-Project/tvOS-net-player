@@ -133,6 +133,7 @@ struct PendingHlsRuntimeStartup {
     finalizer_restore_sessions: Option<Vec<HlsPlaybackSession>>,
     completed_cache_session_ids: Arc<HashSet<String>>,
     reconciliation_sessions: Vec<HlsPlaybackSession>,
+    reconciliation_session_ids: HashSet<String>,
     restorable_completed_session_ids: Arc<HashSet<String>>,
     finalizer_owned_session_ids: Arc<HashSet<String>>,
 }
@@ -390,12 +391,17 @@ impl AppState {
         };
         let mut startup_reconciliation_sessions = persistence_pending_hls_sessions;
         startup_reconciliation_sessions.extend(failed_startup_hls_deletion_sessions);
+        let startup_reconciliation_session_ids = startup_reconciliation_sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
         let pending_hls_runtime_startup = (!hls_finalizer_restore_sessions.is_empty()
             || !startup_reconciliation_sessions.is_empty())
         .then(|| PendingHlsRuntimeStartup {
             finalizer_restore_sessions: Some(hls_finalizer_restore_sessions),
             completed_cache_session_ids: Arc::new(completed_cache_session_ids),
             reconciliation_sessions: startup_reconciliation_sessions,
+            reconciliation_session_ids: startup_reconciliation_session_ids,
             restorable_completed_session_ids: Arc::new(restorable_completed_session_ids),
             finalizer_owned_session_ids: Arc::new(HashSet::new()),
         });
@@ -569,6 +575,10 @@ impl AppState {
                     }
                     if let Some(shared_pending) = startup.pending.as_mut() {
                         shared_pending.reconciliation_sessions = retry_sessions.clone();
+                        shared_pending.reconciliation_session_ids = retry_sessions
+                            .iter()
+                            .map(|session| session.id.clone())
+                            .collect();
                     }
                     drop(startup);
                     pending_sessions = retry_sessions;
@@ -595,6 +605,10 @@ impl AppState {
         startup.pending = Some(PendingHlsRuntimeStartup {
             finalizer_restore_sessions: None,
             completed_cache_session_ids: Arc::new(HashSet::new()),
+            reconciliation_session_ids: restored_sessions
+                .iter()
+                .map(|session| session.id.clone())
+                .collect(),
             reconciliation_sessions: restored_sessions,
             restorable_completed_session_ids: Arc::new(completed_session_ids),
             finalizer_owned_session_ids: Arc::new(finalizer_owned_session_ids),
@@ -817,6 +831,9 @@ impl AppState {
         &self,
         session_id: &str,
     ) -> Option<HlsPlaybackSessionHandle> {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return None;
+        }
         let _quota_lock = self
             .hls_cache_quota_enforcement_lock
             .lock()
@@ -844,6 +861,9 @@ impl AppState {
     }
 
     fn registered_hls_session_is_authorized_for_serving(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.completed_hls_task_is_authorized(session_id) {
             return true;
         }
@@ -1823,6 +1843,9 @@ impl AppState {
     }
 
     pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return None;
+        }
         if let Some(session) = self.hls_sessions.get(session_id) {
             return Some(session);
         }
@@ -1832,6 +1855,9 @@ impl AppState {
     }
 
     fn ensure_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.hls_sessions.get(session_id).is_some() {
             return true;
         }
@@ -1889,6 +1915,9 @@ impl AppState {
     }
 
     fn ensure_completed_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.hls_sessions.get(session_id).is_some() {
             return true;
         }
@@ -1897,6 +1926,15 @@ impl AppState {
         };
         self.register_hls_playback_session(sanitized_completed_session(&session));
         true
+    }
+
+    fn hls_session_is_quarantined_during_startup_reconciliation(&self, session_id: &str) -> bool {
+        self.hls_runtime_startup
+            .lock()
+            .expect("HLS runtime startup lock poisoned")
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.reconciliation_session_ids.contains(session_id))
     }
 
     fn restored_hls_playback_source_needs_refresh(&self, session: &HlsPlaybackSession) -> bool {
@@ -2824,6 +2862,16 @@ mod tests {
             restored.hls_sessions.get(&task_id).is_none(),
             "completed recovery ownership must not publish a session while persistence is unavailable"
         );
+        assert!(
+            restored
+                .hls_playback_session_for_serving(&task_id)
+                .is_none(),
+            "lazy serving must not reload a quarantined recovery session from disk"
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "a rejected lazy lookup must leave the runtime registry empty"
+        );
 
         std::fs::remove_dir(&task_state_temp_path)
             .expect("task persistence blocker should be removable");
@@ -2839,6 +2887,59 @@ mod tests {
         );
         restored.shutdown_hls_fill_worker().await;
         upstream_task.abort();
+    }
+
+    #[test]
+    fn persistence_pending_hls_session_is_quarantined_from_lazy_serving() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let options = CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, _) = create_playable_hls_task(&initial, "BV1startup-quarantine");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(restored.hls_cache.playback_session(&task_id).is_some());
+        assert!(restored.hls_sessions.get(&task_id).is_none());
+        assert!(
+            !restored.registered_hls_session_is_authorized_for_serving(&task_id),
+            "playback progress authorization must honor startup quarantine"
+        );
+        assert!(
+            restored
+                .hls_playback_session_for_serving(&task_id)
+                .is_none(),
+            "startup quarantine must reject lazy disk registration"
+        );
+        assert!(restored.hls_sessions.get(&task_id).is_none());
+        assert!(restored.hls_cache.playback_session(&task_id).is_some());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state(),
+            "a quarantined lookup must not fail the persisted playable task"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
     }
 
     #[tokio::test]
