@@ -992,6 +992,9 @@ fn resource_not_found_response() -> Response<Body> {
     let mut response = empty_response(StatusCode::NOT_FOUND);
     response
         .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
         .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
@@ -1630,6 +1633,13 @@ mod tests {
             response
                 .headers()
                 .get(&X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(
+            Some("no-store"),
+            response
+                .headers()
+                .get(CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok())
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

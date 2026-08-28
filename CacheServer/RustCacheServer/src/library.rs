@@ -247,11 +247,7 @@ impl LocalMediaLibrary {
             return Ok(false);
         };
 
-        match remove_file_no_follow(&self.root_path(), &media_file.relative_path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        remove_file_no_follow(&self.root_path(), &media_file.relative_path)
     }
 
     fn is_root_available_blocking(&self) -> bool {
@@ -1039,7 +1035,7 @@ fn set_errno(value: i32) {
 }
 
 #[cfg(unix)]
-pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
@@ -1064,22 +1060,31 @@ pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io
         )
     };
     if result != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
-    fs::remove_file(root_path.join(relative_path))
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
+    match fs::remove_file(root_path.join(relative_path)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
 pub(crate) fn remove_empty_directory_no_follow(
     root_path: &Path,
     relative_path: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
@@ -1107,17 +1112,22 @@ pub(crate) fn remove_empty_directory_no_follow(
         )
     };
     if result != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn remove_empty_directory_no_follow(
     _root_path: &Path,
     _relative_path: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow directory removal is not implemented on this platform",

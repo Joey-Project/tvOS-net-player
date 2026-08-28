@@ -58,9 +58,11 @@ pub(crate) enum TaskStateSaveOutcome {
 
 impl TaskStateStore {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        let path = Arc::new(path.into());
+        let pending_directory_syncs = initial_parent_directories_requiring_sync(&path);
         Self {
-            path: Arc::new(path.into()),
-            pending_directory_syncs: Arc::new(Mutex::new(Vec::new())),
+            path,
+            pending_directory_syncs: Arc::new(Mutex::new(pending_directory_syncs)),
             #[cfg(test)]
             fail_next_directory_sync: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -425,7 +427,16 @@ fn parent_directory_sync_chain(path: &Path) -> io::Result<Vec<PathBuf>> {
         directories.push(ancestor.to_path_buf());
 
         match fs::metadata(ancestor) {
-            Ok(_) => return Ok(directories),
+            Ok(metadata) if metadata.is_dir() => return Ok(directories),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "task state parent is not a directory: {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -438,6 +449,26 @@ fn parent_directory_sync_chain(path: &Path) -> io::Result<Vec<PathBuf>> {
             parent.display()
         ),
     ))
+}
+
+#[cfg(unix)]
+fn initial_parent_directories_requiring_sync(path: &Path) -> Vec<PathBuf> {
+    path.parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .map(|ancestor| {
+            if ancestor.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                ancestor.to_path_buf()
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn initial_parent_directories_requiring_sync(_path: &Path) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -1549,15 +1580,16 @@ mod tests {
 
         let directories_to_sync =
             prepare_parent_directory(&path).expect("nested parent directories should be prepared");
+        let expected_directories = vec![
+            state_directory.clone(),
+            first_directory.clone(),
+            temp.path().to_path_buf(),
+        ];
 
-        assert_eq!(
-            vec![
-                state_directory.clone(),
-                first_directory,
-                temp.path().to_path_buf(),
-            ],
-            directories_to_sync
-        );
+        assert_eq!(expected_directories, directories_to_sync);
+        assert_eq!(state_directory, directories_to_sync[0]);
+        assert_eq!(first_directory, directories_to_sync[1]);
+        assert_eq!(temp.path(), directories_to_sync[2]);
         assert!(state_directory.is_dir());
         sync_directories(&directories_to_sync).expect("prepared directories should be syncable");
 
@@ -1575,21 +1607,26 @@ mod tests {
         let first_directory = temp.path().join("state");
         let state_directory = first_directory.join("task-store");
         let path = state_directory.join("tasks.json");
-        let store = TaskStateStore::new(path);
+        let expected_directories = path
+            .parent()
+            .expect("state file should have a parent")
+            .ancestors()
+            .map(|ancestor| {
+                if ancestor.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    ancestor.to_path_buf()
+                }
+            })
+            .collect::<Vec<_>>();
+        let store = TaskStateStore::new(path.clone());
 
         store.fail_next_directory_sync();
         assert!(matches!(
             store.save(&[]).expect("rename should commit the snapshot"),
             TaskStateSaveOutcome::InstalledButNotDurable(_)
         ));
-        assert_eq!(
-            vec![
-                state_directory.clone(),
-                first_directory,
-                temp.path().to_path_buf(),
-            ],
-            store.pending_directory_syncs()
-        );
+        assert_eq!(expected_directories, store.pending_directory_syncs());
 
         assert!(matches!(
             store
@@ -1598,6 +1635,20 @@ mod tests {
             TaskStateSaveOutcome::Durable
         ));
         assert!(store.pending_directory_syncs().is_empty());
+
+        let restarted_store = TaskStateStore::new(path);
+        restarted_store.fail_next_directory_sync();
+        assert!(matches!(
+            restarted_store
+                .save(&[])
+                .expect("restart retry should install the snapshot"),
+            TaskStateSaveOutcome::InstalledButNotDurable(_)
+        ));
+        assert_eq!(
+            expected_directories,
+            restarted_store.pending_directory_syncs(),
+            "a restarted store must reconstruct the complete ancestor sync chain"
+        );
     }
 
     #[test]

@@ -72,8 +72,9 @@ use crate::{
     playback_policy::PlaybackPolicy,
     task_output::{MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes},
     task_registry::{
-        BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
-        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
+        BilibiliTaskProgress, BilibiliTaskRegistry, HlsSessionPublicationState,
+        PLAYBACK_PLANNING_CANCELLED_MESSAGE, PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+        current_timestamp,
     },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
@@ -85,6 +86,7 @@ use uuid::Uuid;
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
 const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
+const HLS_CACHE_PERSISTENCE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED: i32 = 0;
 const BILIBILI_TASK_SELECTION_MODE_DEFAULT: i32 = 1;
 const BILIBILI_TASK_SELECTION_MODE_CURRENT: i32 = 2;
@@ -1282,12 +1284,15 @@ impl TaskService for TaskGrpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        let hls_session_ids = self.state.tasks.playback_hls_session_ids(&request.id);
-        let task = self.state.tasks.cancel_task(&request.id)?;
+        let cancellation = self
+            .state
+            .tasks
+            .cancel_task_with_hls_session_ids(&request.id)?;
+        let task = cancellation.task;
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
-            for session_id in hls_session_ids {
+            for session_id in cancellation.hls_session_ids {
                 self.state.remove_hls_playback_session(&session_id);
                 let _ = self.state.hls_cache.remove_session(&session_id);
             }
@@ -2359,7 +2364,6 @@ pub(crate) async fn run_hls_cache_finalization(
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
     let _worker_guard = state.hls_fill_scheduler.worker_guard();
     while let Some(job) = state.hls_fill_scheduler.next_job_until_shutdown().await {
-        let session_id = job.session.id.clone();
         let outcome = run_hls_cache_finalization_inner(
             state.clone(),
             job.task_id.clone(),
@@ -2368,16 +2372,16 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
             job.token.clone(),
         )
         .await;
-        let should_requeue = outcome == HlsCacheFinalizationOutcome::Preempted
-            && state
-                .tasks
-                .is_hls_session_playable_for_task(&job.task_id, &session_id);
+        let mut should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
         if should_requeue {
-            let message = match job.priority {
-                crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
+            let message = match (outcome, job.priority) {
+                (HlsCacheFinalizationOutcome::PersistencePending, _) => {
+                    "Playable publication is pending durable task-state recovery; offline cache fill will retry."
+                }
+                (_, crate::hls_fill_scheduler::HlsFillPriority::Foreground) => {
                     "Playable online; offline cache fill paused behind newer playback."
                 }
-                crate::hls_fill_scheduler::HlsFillPriority::Demoted => {
+                (_, crate::hls_fill_scheduler::HlsFillPriority::Demoted) => {
                     "Playable online; offline cache fill remains queued behind newer playback."
                 }
             };
@@ -2391,6 +2395,10 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                 },
             );
         }
+        if outcome == HlsCacheFinalizationOutcome::PersistencePending && should_requeue {
+            sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+            should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
+        }
         state
             .hls_fill_scheduler
             .finish_current(&job, should_requeue);
@@ -2401,6 +2409,48 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
 enum HlsCacheFinalizationOutcome {
     Finished,
     Preempted,
+    PersistencePending,
+}
+
+fn hls_cache_fill_should_requeue(
+    state: &AppState,
+    job: &crate::hls_fill_scheduler::HlsFillJob,
+    outcome: HlsCacheFinalizationOutcome,
+) -> bool {
+    let publication = state
+        .tasks
+        .hls_session_publication_state(&job.task_id, &job.session.id);
+    match outcome {
+        HlsCacheFinalizationOutcome::Preempted => {
+            publication == HlsSessionPublicationState::Published
+        }
+        HlsCacheFinalizationOutcome::PersistencePending => {
+            publication != HlsSessionPublicationState::Absent
+        }
+        HlsCacheFinalizationOutcome::Finished => false,
+    }
+}
+
+async fn retry_pending_hls_session_publication(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+) -> HlsSessionPublicationState {
+    let publication = state
+        .tasks
+        .hls_session_publication_state(task_id, session_id);
+    if publication != HlsSessionPublicationState::Pending {
+        return publication;
+    }
+
+    let tasks = Arc::clone(&state.tasks);
+    if let Err(error) = tokio::task::spawn_blocking(move || tasks.retry_pending_persistence()).await
+    {
+        eprintln!("Failed to join task persistence retry for HLS cache fill: {error}");
+    }
+    state
+        .tasks
+        .hls_session_publication_state(task_id, session_id)
 }
 
 async fn run_hls_cache_finalization_inner(
@@ -2420,11 +2470,14 @@ async fn run_hls_cache_finalization_inner(
         if preemption.is_cancelled() {
             return HlsCacheFinalizationOutcome::Finished;
         }
-        if !state
-            .tasks
-            .is_hls_session_playable_for_task(&task_id, &session_id)
-        {
-            return HlsCacheFinalizationOutcome::Finished;
+        match retry_pending_hls_session_publication(&state, &task_id, &session_id).await {
+            HlsSessionPublicationState::Published => {}
+            HlsSessionPublicationState::Pending => {
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+            HlsSessionPublicationState::Absent => {
+                return HlsCacheFinalizationOutcome::Finished;
+            }
         }
         if preemption.is_preempted() {
             return HlsCacheFinalizationOutcome::Preempted;
@@ -9059,6 +9112,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_quota_rechecks_cancellation_after_deletion_lock() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let cached =
+            create_completed_hls_playback_task(&state, "BV1cancel-after-lock", &upstream_url).await;
+        let should_cancel_calls = std::cell::Cell::new(0_usize);
+
+        let summary = state
+            .enforce_hls_cache_quota_until_cancelled("test", Vec::new(), 0, || {
+                let call = should_cancel_calls.get();
+                should_cancel_calls.set(call + 1);
+                call == 4
+            })
+            .expect("eviction scan should remain valid");
+
+        assert!(summary.is_none(), "late cancellation must stop eviction");
+        assert!(should_cancel_calls.get() >= 5);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&cached.library_item_id)
+                .is_some()
+        );
+        assert!(state.tasks.get_task(&cached.task_id).is_ok());
+    }
+
+    #[tokio::test]
     async fn hls_cache_quota_evicts_unprotected_sessions_for_oversized_projected_session() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -12242,6 +12339,101 @@ mod tests {
         assert!(runtime_session.variant.video.request.url.is_empty());
         assert!(runtime_session.variant.video.request.backup_urls.is_empty());
         assert!(runtime_session.variant.video.request.headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_requeues_pending_playable_until_persistence_recovers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1pending-fill", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("legacy playable mutation should remain staged in memory");
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            state
+                .tasks
+                .hls_session_publication_state(&creation.task.id, &creation.task.id)
+        );
+
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            creation.task.id.clone(),
+            metadata.hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+        let outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            job.task_id.clone(),
+            job.session.clone(),
+            job.failure_mode,
+            job.token.clone(),
+        )
+        .await;
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert_eq!(
+            1,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&creation.task.id)
+        );
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        assert_eq!(
+            HlsSessionPublicationState::Published,
+            retry_pending_hls_session_publication(&state, &creation.task.id, &creation.task.id)
+                .await
+        );
+        let retried = state.hls_fill_scheduler.next_job().await;
+        state.hls_fill_scheduler.finish_current(&retried, false);
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(state.tasks.persistence_available());
     }
 
     #[cfg(unix)]

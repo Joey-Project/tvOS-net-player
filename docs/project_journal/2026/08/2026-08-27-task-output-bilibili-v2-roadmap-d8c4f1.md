@@ -125,6 +125,7 @@ superseded_by:
 - Committed task outputs are shared immutable views with precomputed resource authorization. Repeated first-page requests copy only the requested page, while resource GET authorization and the no-follow file open are one cleanup-serialized operation whose descriptor survives later unlink.
 - Persisted collection limits are enforced while JSON arrays are decoded, public media bases are checked after canonical percent encoding, and task-output v2 drops immediately when an in-memory snapshot cannot satisfy its durable contract.
 - Rejected authoritative output commits reserve and remove newly staged resource bodies after rolling metadata back. Startup distinguishes an absent internal namespace from a missing cache root, rejects noncanonical resource-directory aliases, and keeps resource authorization plus no-follow open work off Tokio's async workers.
+- The second PR 6B review follow-up keeps resource IDs reserved when a configured root or intermediate namespace is temporarily unavailable, reconstructs directory-fsync debt after restart, rechecks quota cancellation under the deletion lock, retries fills whose `PLAYABLE` publication is pending, captures repaired HLS session IDs during cancellation, and prevents proxy caching of resource `404` responses.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -138,5 +139,5 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite passes 591 unit tests, 34 default live-e2e helper tests with 1 opt-in real-network case ignored, and 6 integration tests.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite passes 595 unit tests, 34 default live-e2e helper tests with 1 opt-in real-network case ignored, and 6 integration tests.
 - PR 6B client compatibility coverage: Swift package tests pass 272 tests, the macOS app test passes its shared-AppCore integration test, and generic tvOS simulator build-for-testing succeeds. Local tvOS simulator test execution remains blocked by the host CoreSimulator `1051.54.0` being older than Xcode's required `1051.55.0`; GitHub CI remains the executable simulator gate.

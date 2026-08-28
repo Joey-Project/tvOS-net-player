@@ -1243,6 +1243,10 @@ impl AppState {
                 continue;
             }
             let _deletion_guard = self.completed_hls_mutation_guard();
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
             if session_ids.iter().any(|session_id| {
                 self.hls_cache_session_is_currently_protected_from_eviction(
                     session_id,

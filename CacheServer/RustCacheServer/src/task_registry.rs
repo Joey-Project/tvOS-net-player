@@ -625,6 +625,14 @@ impl BilibiliTaskRegistry {
     }
 
     pub fn cancel_task(&self, id: &str) -> Result<Task, Status> {
+        self.cancel_task_with_hls_session_ids(id)
+            .map(|outcome| outcome.task)
+    }
+
+    pub(crate) fn cancel_task_with_hls_session_ids(
+        &self,
+        id: &str,
+    ) -> Result<TaskCancellationOutcome, Status> {
         let normalized_id = normalize_required_id(id)?;
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
@@ -645,11 +653,15 @@ impl BilibiliTaskRegistry {
             return Err(task_not_found());
         };
         if is_terminal(current_state) {
-            return Ok(inner
+            let task = inner
                 .visible_tasks_by_id
                 .get(&normalized_id)
                 .expect("task must exist after state lookup")
-                .clone());
+                .clone();
+            return Ok(TaskCancellationOutcome {
+                hls_session_ids: playback_hls_session_ids(&task),
+                task,
+            });
         }
 
         if matches!(
@@ -672,14 +684,21 @@ impl BilibiliTaskRegistry {
                 task.updated_at = Some(current_timestamp());
                 let task = task.clone();
                 self.persist_task_and_publish(inner, task.clone(), false, None);
-                return Ok(task);
+                return Ok(TaskCancellationOutcome {
+                    hls_session_ids: playback_hls_session_ids(&task),
+                    task,
+                });
             }
 
-            return Ok(inner
+            let task = inner
                 .visible_tasks_by_id
                 .get(&normalized_id)
                 .expect("task must exist after state lookup")
-                .clone());
+                .clone();
+            return Ok(TaskCancellationOutcome {
+                hls_session_ids: playback_hls_session_ids(&task),
+                task,
+            });
         }
 
         let durability_required = self.persistence.is_some()
@@ -688,6 +707,11 @@ impl BilibiliTaskRegistry {
                 .get(&normalized_id)
                 .is_some_and(|task| task.kind() == TaskKind::BilibiliProgressivePlayback);
         let checkpoint = durability_required.then(|| RegistryMutationCheckpoint::capture(&inner));
+        let hls_session_ids = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .map(playback_hls_session_ids)
+            .unwrap_or_default();
         let task = {
             let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
                 return Err(task_not_found());
@@ -721,7 +745,10 @@ impl BilibiliTaskRegistry {
                 "Task cancellation could not be persisted durably.",
             ));
         }
-        Ok(task)
+        Ok(TaskCancellationOutcome {
+            task,
+            hls_session_ids,
+        })
     }
 
     pub async fn claim_next_bilibili_task(&self) -> BilibiliTaskWorkItem {
@@ -1849,21 +1876,40 @@ impl BilibiliTaskRegistry {
     }
 
     pub fn is_hls_session_playable_for_task(&self, task_id: &str, session_id: &str) -> bool {
+        self.hls_session_publication_state(task_id, session_id)
+            == HlsSessionPublicationState::Published
+    }
+
+    pub(crate) fn hls_session_publication_state(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> HlsSessionPublicationState {
         let normalized_task_id = normalize(task_id);
         let normalized_session_id = normalize(session_id);
         if normalized_task_id.is_empty() || normalized_session_id.is_empty() {
-            return false;
+            return HlsSessionPublicationState::Absent;
         }
         let inner = self.inner.lock().expect("task registry lock poisoned");
-        inner
+        if inner
             .visible_tasks_by_id
             .get(&normalized_task_id)
-            .is_some_and(|task| {
-                task.kind() == TaskKind::BilibiliProgressivePlayback
-                    && ((task.state() == TaskState::Playable
-                        && task_uses_hls_session(task, &normalized_session_id))
-                        || completed_task_has_playable_result_session(task, &normalized_session_id))
-            })
+            .is_some_and(|task| task_has_playable_hls_session(task, &normalized_session_id))
+        {
+            HlsSessionPublicationState::Published
+        } else if inner
+            .tasks_by_id
+            .get(&normalized_task_id)
+            .is_some_and(|task| task_has_playable_hls_session(task, &normalized_session_id))
+        {
+            HlsSessionPublicationState::Pending
+        } else {
+            HlsSessionPublicationState::Absent
+        }
+    }
+
+    pub(crate) fn retry_pending_persistence(&self) -> bool {
+        self.persist_current_state()
     }
 
     pub fn hls_session_has_online_playback_after_cache_fill_failure(
@@ -2508,8 +2554,7 @@ impl BilibiliTaskRegistry {
         for resource_id in candidates {
             let relative_path = TaskResourceRecord::relative_path_for_id(&resource_id);
             let body_removed = match remove_file_no_follow(resource_root_path, &relative_path) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(_) => true,
                 Err(error) => {
                     self.resource_storage_available
                         .store(false, AtomicOrdering::Release);
@@ -2524,10 +2569,7 @@ impl BilibiliTaskRegistry {
 
             let relative_directory = TaskResourceRecord::relative_directory_for_id(&resource_id);
             match remove_empty_directory_no_follow(resource_root_path, &relative_directory) {
-                Ok(()) => cleaned.push(resource_id),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    cleaned.push(resource_id);
-                }
+                Ok(_) => cleaned.push(resource_id),
                 Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                     eprintln!(
                         "Retired task resource directory {resource_id} is not empty; keeping the id reserved for a later cleanup: {error}"
@@ -2866,6 +2908,18 @@ pub struct BilibiliPlaybackTaskCreation {
     pub task: Task,
     pub created: bool,
     pub cancellation: Option<BilibiliTaskCancellation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsSessionPublicationState {
+    Published,
+    Pending,
+    Absent,
+}
+
+pub(crate) struct TaskCancellationOutcome {
+    pub(crate) task: Task,
+    pub(crate) hls_session_ids: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -3524,6 +3578,12 @@ fn playback_hls_session_ids(task: &Task) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn task_has_playable_hls_session(task: &Task, session_id: &str) -> bool {
+    task.kind() == TaskKind::BilibiliProgressivePlayback
+        && ((task.state() == TaskState::Playable && task_uses_hls_session(task, session_id))
+            || completed_task_has_playable_result_session(task, session_id))
 }
 
 fn protected_completed_result_hls_session_ids(task: &Task) -> Vec<String> {
@@ -6796,6 +6856,50 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_captures_hls_sessions_after_pending_playable_repair() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let created = registry
+            .create_bilibili_playback_task("BV1pending-playable-cancel", None, None)
+            .expect("playback task should be created durably");
+
+        std::fs::remove_file(&path).expect("state file should be removable");
+        std::fs::create_dir(&path).expect("directory should block snapshot replacement");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Pending playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("legacy playable mutation should remain staged in memory");
+
+        assert_eq!(
+            TaskState::Preparing,
+            registry.get_task(&created.task.id).unwrap().state()
+        );
+        assert!(
+            registry
+                .playback_hls_session_ids(&created.task.id)
+                .is_empty()
+        );
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            registry.hls_session_publication_state(&created.task.id, &created.task.id)
+        );
+
+        std::fs::remove_dir(&path).expect("blocking directory should be removable");
+        let cancellation = registry
+            .cancel_task_with_hls_session_ids(&created.task.id)
+            .expect("cancellation should repair and then persist pending playback");
+
+        assert_eq!(TaskState::Cancelled, cancellation.task.state());
+        assert_eq!(vec![created.task.id], cancellation.hls_session_ids);
+        assert!(registry.persistence_available());
+    }
+
+    #[test]
     fn task_reads_remain_available_while_snapshot_io_is_blocked() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
@@ -7334,6 +7438,94 @@ mod tests {
         std::fs::remove_dir(&resource_path).expect("cleanup blocker should be removable");
         assert!(registry.cleanup_durable_resource_bodies());
         assert!(registry.task_output_v2_available());
+        assert!(!resource_path.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_resource_root_keeps_retired_id_reserved_until_cleanup_retries() {
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let unavailable_root_path = temp.path().join("cache-unavailable");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-root-unavailable", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "root-unavailable-resource".to_owned(),
+            content_type: "text/plain".to_owned(),
+            size_bytes: 4,
+            size_known: true,
+            etag: "v1".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource should be valid");
+        let resource_path = root_path.join(resource.relative_path());
+        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
+        std::fs::write(&resource_path, b"old!").unwrap();
+        let artifact = TaskArtifact {
+            id: "artifact-one".to_owned(),
+            kind: TaskArtifactKind::Metadata.into(),
+            state: TaskArtifactState::Available.into(),
+            resource: Some(resource.resource.clone()),
+            ..Default::default()
+        };
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![artifact.clone()],
+                    ..Default::default()
+                }],
+                vec![resource.clone()],
+            )
+            .expect("resource output should persist");
+
+        std::fs::rename(&root_path, &unavailable_root_path)
+            .expect("cache root should become temporarily unavailable");
+        registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "replacement".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("metadata retirement should remain durable");
+
+        assert!(!registry.task_output_v2_available());
+        let reuse_error = registry
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "reused".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![artifact],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect_err("an unavailable root must keep the retired id reserved");
+        assert_eq!(tonic::Code::FailedPrecondition, reuse_error.code());
+
+        std::fs::rename(&unavailable_root_path, &root_path)
+            .expect("cache root should become available again");
+        assert!(registry.cleanup_durable_resource_bodies());
+        assert!(registry.task_output_v2_available());
+        assert!(!resource_path.exists());
         assert!(!resource_path.parent().unwrap().exists());
     }
 
