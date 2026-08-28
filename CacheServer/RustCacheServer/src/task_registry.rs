@@ -3439,6 +3439,7 @@ struct RegistryMutationCheckpoint {
     queued_task_ids: VecDeque<String>,
     running_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     planning_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
+    pending_resource_cleanup_ids: HashSet<String>,
     pending_publications_by_id: HashMap<String, Task>,
 }
 
@@ -3453,6 +3454,7 @@ impl RegistryMutationCheckpoint {
             queued_task_ids: inner.queued_task_ids.clone(),
             running_cancellations_by_id: inner.running_cancellations_by_id.clone(),
             planning_cancellations_by_id: inner.planning_cancellations_by_id.clone(),
+            pending_resource_cleanup_ids: inner.pending_resource_cleanup_ids.clone(),
             pending_publications_by_id: inner.pending_publications_by_id.clone(),
         }
     }
@@ -3466,6 +3468,7 @@ impl RegistryMutationCheckpoint {
         inner.queued_task_ids = self.queued_task_ids;
         inner.running_cancellations_by_id = self.running_cancellations_by_id;
         inner.planning_cancellations_by_id = self.planning_cancellations_by_id;
+        inner.pending_resource_cleanup_ids = self.pending_resource_cleanup_ids;
         inner.pending_publications_by_id = self.pending_publications_by_id;
     }
 }
@@ -4629,6 +4632,25 @@ fn copy_timestamp(timestamp: &Timestamp) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_checkpoint_restores_pending_resource_cleanup_reservations() {
+        let mut inner = RegistryInner::default();
+        inner
+            .pending_resource_cleanup_ids
+            .insert("existing-resource".to_owned());
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+
+        inner
+            .pending_resource_cleanup_ids
+            .insert("rolled-back-resource".to_owned());
+        checkpoint.restore(&mut inner);
+
+        assert_eq!(
+            HashSet::from(["existing-resource".to_owned()]),
+            inner.pending_resource_cleanup_ids
+        );
+    }
 
     #[test]
     fn dedupes_active_tasks_by_source_and_options() {

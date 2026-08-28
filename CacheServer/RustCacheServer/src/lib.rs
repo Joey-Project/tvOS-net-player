@@ -366,23 +366,94 @@ impl AppState {
         } else {
             &persistence_pending_hls_sessions
         };
-        state.resume_incomplete_hls_cache_finalizers(
+        let hls_finalizer_owned_session_ids = state.resume_incomplete_hls_cache_finalizers(
             hls_finalizer_restore_sessions,
             &completed_cache_session_ids,
         );
+        state.resume_pending_hls_startup_reconciliation(
+            persistence_pending_hls_sessions,
+            restorable_completed_session_ids,
+            hls_finalizer_owned_session_ids,
+        );
         state
+    }
+
+    fn resume_pending_hls_startup_reconciliation(
+        &self,
+        restored_sessions: Vec<HlsPlaybackSession>,
+        completed_session_ids: HashSet<String>,
+        finalizer_owned_session_ids: HashSet<String>,
+    ) {
+        let restored_sessions = restored_sessions
+            .into_iter()
+            .filter(|session| !finalizer_owned_session_ids.contains(&session.id))
+            .collect::<Vec<_>>();
+        if restored_sessions.is_empty() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let tasks = Arc::downgrade(&self.tasks);
+        let hls_sessions = self.hls_sessions.clone();
+        let hls_cache = self.hls_cache.clone();
+        let hls_network_policy = self.hls_network_policy.clone();
+        let hls_playback_progress = self.hls_playback_progress.clone();
+        let completed_hls_cache_playback_supported = self.completed_hls_cache_playback_supported;
+        handle.spawn(async move {
+            loop {
+                let Some(tasks) = tasks.upgrade() else {
+                    return;
+                };
+                if tasks.persistence_available()
+                    || crate::grpc_services::retry_pending_task_persistence(
+                        &tasks,
+                        "HLS startup reconciliation",
+                    )
+                    .await
+                {
+                    for session in restored_sessions {
+                        if restored_hls_session_is_authorized(
+                            &tasks,
+                            &session.id,
+                            &completed_session_ids,
+                            completed_hls_cache_playback_supported,
+                        ) {
+                            continue;
+                        }
+
+                        hls_sessions.remove_with_generation_update(&session.id, |generation| {
+                            hls_network_policy
+                                .remove_session_generation(&session.id, generation);
+                        });
+                        hls_playback_progress.remove_session(&session.id);
+                        if let Err(error) = hls_cache.remove_session(&session.id) {
+                            eprintln!(
+                                "Failed to remove unauthorized HLS session {} after task persistence recovered: {error}",
+                                session.id
+                            );
+                        }
+                    }
+                    return;
+                }
+                drop(tasks);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
     }
 
     fn resume_incomplete_hls_cache_finalizers(
         &self,
         restored_sessions: &[crate::hls::HlsPlaybackSession],
         completed_session_ids: &HashSet<String>,
-    ) {
+    ) -> HashSet<String> {
+        let mut owned_session_ids = HashSet::new();
         if !self.supports_completed_hls_cache_playback() {
-            return;
+            return owned_session_ids;
         }
         if tokio::runtime::Handle::try_current().is_err() {
-            return;
+            return owned_session_ids;
         }
 
         for session in restored_sessions {
@@ -400,6 +471,7 @@ impl AppState {
             {
                 continue;
             }
+            owned_session_ids.insert(session.id.clone());
             if completed_session_ids.contains(&session.id) && self.tasks.persistence_available() {
                 self.hls_sessions
                     .insert(sanitized_completed_session(session));
@@ -465,6 +537,7 @@ impl AppState {
                 HlsCacheFinalizationFailureMode::FailRestoredTask,
             );
         }
+        owned_session_ids
     }
 
     pub(crate) fn enqueue_hls_cache_fill_foreground(
@@ -2555,6 +2628,63 @@ mod tests {
         );
         restored.shutdown_hls_fill_worker().await;
         upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_removes_orphan_hls_after_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let options = CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let orphan_session = sample_hls_session("orphan-startup-session");
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        initial
+            .hls_cache
+            .save_session(&orphan_session)
+            .expect("orphan HLS session should persist");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert!(restored.hls_sessions.get(&orphan_session.id).is_none());
+        assert!(
+            restored
+                .hls_cache
+                .playback_session(&orphan_session.id)
+                .is_some(),
+            "orphan media must remain while task persistence is unavailable"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if restored.tasks.persistence_available()
+                    && restored
+                        .hls_cache
+                        .playback_session(&orphan_session.id)
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("orphan HLS session should be removed after persistence recovers");
     }
 
     #[tokio::test]

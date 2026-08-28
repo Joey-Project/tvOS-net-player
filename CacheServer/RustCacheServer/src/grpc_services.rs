@@ -2075,7 +2075,10 @@ impl Drop for PlaybackPlanningCleanup {
     }
 }
 
-async fn retry_pending_task_persistence(tasks: &Arc<BilibiliTaskRegistry>, context: &str) -> bool {
+pub(crate) async fn retry_pending_task_persistence(
+    tasks: &Arc<BilibiliTaskRegistry>,
+    context: &str,
+) -> bool {
     let tasks = Arc::clone(tasks);
     match tokio::task::spawn_blocking(move || tasks.retry_pending_persistence()).await {
         Ok(persisted) => persisted,
