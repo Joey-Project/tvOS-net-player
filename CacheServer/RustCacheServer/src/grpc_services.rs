@@ -919,6 +919,8 @@ struct TaskResultPageSnapshot {
     artifact_count: usize,
     expires_at: Instant,
     tokens_by_offset: HashMap<usize, String>,
+    published: bool,
+    pending_first_page_registrations: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -926,6 +928,12 @@ struct TaskResultPageCursor {
     snapshot_id: String,
     task_id: String,
     offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskResultPageRegistration {
+    snapshot_id: String,
+    registration_id: String,
 }
 
 type TaskResultPagePayload = (
@@ -949,13 +957,27 @@ impl TaskResultPageStore {
         snapshot: crate::task_registry::TaskOutputSnapshot,
         now: Instant,
         page_size: usize,
-    ) -> (TaskResultPageResult, Vec<String>, bool) {
-        let (snapshot_id, released_resource_lease_ids, inserted_new_snapshot) =
+    ) -> (
+        TaskResultPageResult,
+        Vec<String>,
+        bool,
+        Option<TaskResultPageRegistration>,
+    ) {
+        let (snapshot_id, mut released_resource_lease_ids, inserted_new_snapshot) =
             self.insert(snapshot, now);
+        let mut registration = self.register_first_page(&snapshot_id);
+        let page = self.page(&snapshot_id, 0, page_size);
+        if page.is_err()
+            && let Some(registration) = registration.take()
+            && let Some(resource_lease_id) = self.cancel_first_page(&registration)
+        {
+            released_resource_lease_ids.push(resource_lease_id);
+        }
         (
-            self.page(&snapshot_id, 0, page_size),
+            page,
             released_resource_lease_ids,
             inserted_new_snapshot,
+            registration,
         )
     }
 
@@ -1080,9 +1102,55 @@ impl TaskResultPageStore {
                 artifact_count,
                 expires_at: resource_lease_expires_at,
                 tokens_by_offset: HashMap::new(),
+                published: false,
+                pending_first_page_registrations: HashSet::new(),
             },
         );
         (snapshot_id, released_resource_lease_ids, true)
+    }
+
+    fn register_first_page(&mut self, snapshot_id: &str) -> Option<TaskResultPageRegistration> {
+        let snapshot = self.snapshots_by_id.get_mut(snapshot_id)?;
+        if snapshot.published {
+            return None;
+        }
+        let registration_id = format!("task-result-publication-{}", Uuid::new_v4().simple());
+        snapshot
+            .pending_first_page_registrations
+            .insert(registration_id.clone());
+        Some(TaskResultPageRegistration {
+            snapshot_id: snapshot_id.to_owned(),
+            registration_id,
+        })
+    }
+
+    fn publish_first_page(&mut self, registration: &TaskResultPageRegistration) {
+        let Some(snapshot) = self.snapshots_by_id.get_mut(&registration.snapshot_id) else {
+            return;
+        };
+        if snapshot
+            .pending_first_page_registrations
+            .remove(&registration.registration_id)
+        {
+            snapshot.published = true;
+            snapshot.pending_first_page_registrations.clear();
+        }
+    }
+
+    fn cancel_first_page(&mut self, registration: &TaskResultPageRegistration) -> Option<String> {
+        let should_remove = self
+            .snapshots_by_id
+            .get_mut(&registration.snapshot_id)
+            .is_some_and(|snapshot| {
+                !snapshot.published
+                    && snapshot
+                        .pending_first_page_registrations
+                        .remove(&registration.registration_id)
+                    && snapshot.pending_first_page_registrations.is_empty()
+            });
+        should_remove
+            .then(|| self.remove_snapshot(&registration.snapshot_id))
+            .flatten()
     }
 
     fn resolve_token(&mut self, token: &str, task_id: &str) -> Result<(String, usize), Status> {
@@ -1215,13 +1283,82 @@ impl TaskResultPageStore {
     }
 }
 
+struct FirstTaskResultPage {
+    payload: TaskResultPagePayload,
+    publication: TaskResultPagePublicationGuard,
+}
+
+impl FirstTaskResultPage {
+    fn publish(mut self) -> TaskResultPagePayload {
+        self.publication.publish();
+        self.payload
+    }
+}
+
+struct TaskResultPagePublicationGuard {
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    registration: Option<TaskResultPageRegistration>,
+}
+
+impl TaskResultPagePublicationGuard {
+    fn new(
+        tasks: Arc<BilibiliTaskRegistry>,
+        result_pages: Arc<StdMutex<TaskResultPageStore>>,
+        registration: Option<TaskResultPageRegistration>,
+    ) -> Self {
+        Self {
+            tasks,
+            result_pages,
+            registration,
+        }
+    }
+
+    fn publish(&mut self) {
+        let Some(registration) = self.registration.as_ref() else {
+            return;
+        };
+        let mut pages = match self.result_pages.lock() {
+            Ok(pages) => pages,
+            Err(poisoned) => {
+                eprintln!("Task result page store was poisoned while publishing a first page.");
+                poisoned.into_inner()
+            }
+        };
+        pages.publish_first_page(registration);
+        self.registration = None;
+    }
+}
+
+impl Drop for TaskResultPagePublicationGuard {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let resource_lease_id = {
+            let mut pages = match self.result_pages.lock() {
+                Ok(pages) => pages,
+                Err(poisoned) => {
+                    eprintln!("Task result page store was poisoned while cancelling a first page.");
+                    poisoned.into_inner()
+                }
+            };
+            pages.cancel_first_page(&registration)
+        };
+        if let Some(resource_lease_id) = resource_lease_id {
+            self.tasks
+                .release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        }
+    }
+}
+
 fn first_task_result_page_blocking(
     tasks: Arc<BilibiliTaskRegistry>,
     result_pages: Arc<StdMutex<TaskResultPageStore>>,
     task_id: String,
     page_size: usize,
     cancelled: Arc<AtomicBool>,
-) -> TaskResultPageResult {
+) -> Result<FirstTaskResultPage, Status> {
     let snapshot = tasks
         .retain_task_output_snapshot(&task_id, StdInstant::now() + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
     let resource_lease_id = snapshot.resource_lease_id.clone();
@@ -1242,18 +1379,33 @@ fn first_task_result_page_blocking(
         tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
         return Err(Status::cancelled("Task result pagination was cancelled."));
     }
-    let (page, released_resource_lease_ids) =
+    let (page, released_resource_lease_ids, registration) =
         first_task_result_page_after_lock(&mut pages, snapshot, page_size);
     drop(pages);
     tasks.release_task_output_snapshots(&released_resource_lease_ids);
-    page
+    let publication = TaskResultPagePublicationGuard::new(
+        Arc::clone(&tasks),
+        Arc::clone(&result_pages),
+        registration,
+    );
+    if cancelled.load(AtomicOrdering::Acquire) {
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+    Ok(FirstTaskResultPage {
+        payload: page?,
+        publication,
+    })
 }
 
 fn first_task_result_page_after_lock(
     pages: &mut TaskResultPageStore,
     snapshot: crate::task_registry::TaskOutputSnapshot,
     page_size: usize,
-) -> (TaskResultPageResult, Vec<String>) {
+) -> (
+    TaskResultPageResult,
+    Vec<String>,
+    Option<TaskResultPageRegistration>,
+) {
     let now = Instant::now();
     if Instant::from_std(snapshot.resource_lease_expires_at) <= now {
         return (
@@ -1261,10 +1413,12 @@ fn first_task_result_page_after_lock(
                 "Task result snapshot expired before it could be published.",
             )),
             vec![snapshot.resource_lease_id],
+            None,
         );
     }
-    let (page, released_resource_lease_ids, _) = pages.first_page(snapshot, now, page_size);
-    (page, released_resource_lease_ids)
+    let (page, released_resource_lease_ids, _, registration) =
+        pages.first_page(snapshot, now, page_size);
+    (page, released_resource_lease_ids, registration)
 }
 
 fn continuation_task_result_page_blocking(
@@ -1507,9 +1661,10 @@ impl TaskService for TaskGrpcService {
                         cancellation_signal,
                     )
                 })
-                .await;
+                .await?;
+            let page = page.publish();
             cancellation.complete();
-            page?
+            page
         } else {
             self.run_task_result_blocking(move |tasks, result_pages| {
                 continuation_task_result_page_blocking(
@@ -3961,19 +4116,23 @@ mod tests {
         };
         let mut pages = TaskResultPageStore::default();
 
-        let (first_page, released, inserted) =
+        let (first_page, released, inserted, first_registration) =
             pages.first_page(snapshot("lease-old", initial_deadline), now, 1);
         let first_page = first_page.expect("first page should be inserted");
         let first_token = first_page.1.next_page_token;
         assert!(inserted);
         assert!(released.is_empty());
+        assert!(first_registration.is_some());
         assert!(!first_token.is_empty());
 
-        let (refreshed_page, released, inserted) =
+        let (refreshed_page, released, inserted, refreshed_registration) =
             pages.first_page(snapshot("lease-new", refreshed_deadline), refresh_at, 1);
         let refreshed_page = refreshed_page.expect("duplicate first page should be served");
         assert!(!inserted);
         assert_eq!(vec!["lease-old"], released);
+        pages.publish_first_page(
+            &refreshed_registration.expect("unpublished duplicate should retain a registration"),
+        );
         assert_eq!(first_token, refreshed_page.1.next_page_token);
         assert_eq!(
             refreshed_deadline,
@@ -3994,6 +4153,92 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_cancelled_first_pages_release_the_last_unpublished_lease() {
+        let now = Instant::now();
+        let results = vec![
+            task_result("result-1", TaskState::Completed),
+            task_result("result-2", TaskState::Completed),
+        ];
+        let snapshot = |resource_lease_id: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-concurrent-cancel",
+                7,
+                "snapshot-concurrent-cancel",
+                resource_lease_id,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                results.clone(),
+                1024,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted, first_registration) =
+            pages.first_page(snapshot("lease-first"), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        let first_registration =
+            first_registration.expect("first unpublished page should be registered");
+
+        let (_, released, inserted, second_registration) =
+            pages.first_page(snapshot("lease-second"), now, 1);
+        assert!(!inserted);
+        assert_eq!(vec!["lease-first"], released);
+        let second_registration =
+            second_registration.expect("concurrent unpublished page should be registered");
+
+        assert_eq!(None, pages.cancel_first_page(&first_registration));
+        assert!(
+            pages
+                .snapshots_by_id
+                .contains_key("snapshot-concurrent-cancel")
+        );
+        assert_eq!(
+            Some("lease-second".to_owned()),
+            pages.cancel_first_page(&second_registration)
+        );
+        assert!(pages.snapshots_by_id.is_empty());
+        assert!(pages.cursors_by_token.is_empty());
+    }
+
+    #[test]
+    fn published_first_page_survives_a_concurrent_request_cancellation() {
+        let now = Instant::now();
+        let snapshot = |resource_lease_id: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-concurrent-publish",
+                3,
+                "snapshot-concurrent-publish",
+                resource_lease_id,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                vec![task_result("result", TaskState::Completed)],
+                1024,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, _, _, first_registration) = pages.first_page(snapshot("lease-first"), now, 1);
+        let (_, released, inserted, second_registration) =
+            pages.first_page(snapshot("lease-second"), now, 1);
+        assert!(!inserted);
+        assert_eq!(vec!["lease-first"], released);
+        let first_registration =
+            first_registration.expect("first unpublished page should be registered");
+        let second_registration =
+            second_registration.expect("concurrent unpublished page should be registered");
+
+        pages.publish_first_page(&first_registration);
+        assert_eq!(None, pages.cancel_first_page(&second_registration));
+
+        let snapshot = pages
+            .snapshots_by_id
+            .get("snapshot-concurrent-publish")
+            .expect("a published page snapshot must remain available");
+        assert!(snapshot.published);
+        assert!(snapshot.pending_first_page_registrations.is_empty());
+        assert_eq!("lease-second", snapshot.resource_lease_id);
+    }
+
+    #[test]
     fn expired_task_result_lease_is_released_without_publishing_page() {
         let expired_at = StdInstant::now()
             .checked_sub(Duration::from_millis(1))
@@ -4009,7 +4254,8 @@ mod tests {
         );
         let mut pages = TaskResultPageStore::default();
 
-        let (page, released) = first_task_result_page_after_lock(&mut pages, snapshot, 1);
+        let (page, released, registration) =
+            first_task_result_page_after_lock(&mut pages, snapshot, 1);
 
         assert_eq!(
             tonic::Code::DeadlineExceeded,
@@ -4017,6 +4263,7 @@ mod tests {
                 .code()
         );
         assert_eq!(vec!["lease-expired"], released);
+        assert!(registration.is_none());
         assert!(pages.snapshots_by_id.is_empty());
         assert!(pages.cursors_by_token.is_empty());
     }
@@ -4037,10 +4284,10 @@ mod tests {
         };
         let mut pages = TaskResultPageStore::default();
 
-        let (_, released, inserted) = pages.first_page(snapshot("one", "lease-one"), now, 1);
+        let (_, released, inserted, _) = pages.first_page(snapshot("one", "lease-one"), now, 1);
         assert!(inserted);
         assert!(released.is_empty());
-        let (_, released, inserted) = pages.first_page(snapshot("two", "lease-two"), now, 1);
+        let (_, released, inserted, _) = pages.first_page(snapshot("two", "lease-two"), now, 1);
 
         assert!(inserted);
         assert_eq!(vec!["lease-one"], released);
@@ -4110,7 +4357,7 @@ mod tests {
         );
         let mut pages = TaskResultPageStore::default();
 
-        let (page, released, inserted) = pages.first_page(snapshot, now, 1);
+        let (page, released, inserted, _) = pages.first_page(snapshot, now, 1);
         let page = page.expect("maximum valid artifact result should remain pageable");
 
         assert!(inserted);
@@ -4149,7 +4396,7 @@ mod tests {
         );
         let mut pages = TaskResultPageStore::default();
 
-        let (first, released, inserted) = pages.first_page(snapshot, now, 50);
+        let (first, released, inserted, _) = pages.first_page(snapshot, now, 50);
         let first = first.expect("first byte-bounded page should be available");
         assert!(inserted);
         assert!(released.is_empty());
@@ -4270,7 +4517,7 @@ mod tests {
             let mut pages = result_pages
                 .lock()
                 .expect("task result page store lock should be available");
-            let (page, released_resource_lease_ids, inserted) =
+            let (page, released_resource_lease_ids, inserted, _) =
                 pages.first_page(snapshot, Instant::now(), 1);
             assert!(inserted);
             assert!(released_resource_lease_ids.is_empty());
@@ -4789,6 +5036,145 @@ mod tests {
                 .task_resource("cancelled-retention-cover")
                 .is_none(),
             "the cancelled request must not leak a resource lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_detached_first_page_releases_an_inserted_snapshot_and_lease() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1cancelled-after-insertion", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cancelled-after-insertion-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "cancelled-after-insertion-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let task_id = task.id.clone();
+        let request_task_id = task_id.clone();
+        let (inserted_sender, inserted_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        let request = tokio::spawn(async move {
+            service
+                .run_task_result_blocking(move |tasks, result_pages| {
+                    let page = first_task_result_page_blocking(
+                        tasks,
+                        result_pages,
+                        request_task_id,
+                        1,
+                        Arc::new(AtomicBool::new(false)),
+                    )?;
+                    let _ = inserted_sender.send(());
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release the detached first-page worker");
+                    Ok(page)
+                })
+                .await
+        });
+        inserted_receiver
+            .await
+            .expect("first page should be inserted before cancellation");
+        {
+            let pages = state
+                .task_result_pages
+                .lock()
+                .expect("task result page store should be available");
+            let snapshot = pages
+                .snapshots_by_id
+                .values()
+                .next()
+                .expect("the unpublished snapshot should be registered");
+            assert!(!snapshot.published);
+            assert_eq!(1, snapshot.pending_first_page_registrations.len());
+        }
+
+        request.abort();
+        let join_error = match request.await {
+            Ok(_) => panic!("aborted request should not complete"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+        release_sender
+            .send(())
+            .expect("test should release the detached first-page worker");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .task_result_pages
+                    .lock()
+                    .expect("task result page store should be available")
+                    .snapshots_by_id
+                    .is_empty()
+                    && permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached first-page cleanup should finish");
+
+        state
+            .tasks
+            .replace_task_output(
+                &task_id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should discard the old resource");
+        assert!(
+            state
+                .tasks
+                .task_resource("cancelled-after-insertion-cover")
+                .is_none(),
+            "the detached request must release its retained resource lease"
         );
     }
 
