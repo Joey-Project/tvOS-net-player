@@ -31,7 +31,10 @@ use crate::{
         MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord, TaskResourceRecord,
         resource_id_is_canonical,
     },
-    task_store::{PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore},
+    task_store::{
+        PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore,
+        validate_unique_task_output_identities,
+    },
 };
 
 const QUEUED_MESSAGE: &str = "Queued for the BBDown adapter.";
@@ -159,16 +162,33 @@ impl BilibiliTaskRegistry {
                     true,
                     retention_policy,
                     resource_root_path,
-                );
+                )
+                .expect("empty persisted task records should be valid");
             }
         };
-        let registry = Self::from_persisted_records(
+        let registry = match Self::from_persisted_records(
             records,
-            Some(store),
+            Some(store.clone()),
             true,
-            retention_policy,
-            resource_root_path,
-        );
+            retention_policy.clone(),
+            resource_root_path.clone(),
+        ) {
+            Ok(registry) => registry,
+            Err(error) => {
+                eprintln!(
+                    "Failed to restore persisted Bilibili task state from {}; task state writeback is disabled for this process; repair the snapshot and restart the cache server: {error}",
+                    store.path().display()
+                );
+                return Self::from_persisted_records(
+                    Vec::new(),
+                    None,
+                    true,
+                    retention_policy,
+                    resource_root_path,
+                )
+                .expect("empty persisted task records should be valid");
+            }
+        };
         registry.persist_current_state();
         registry.retire_expired_task_resources();
         registry
@@ -2470,10 +2490,9 @@ impl BilibiliTaskRegistry {
         persistence_configured: bool,
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
-    ) -> Self {
+    ) -> io::Result<Self> {
+        validate_unique_task_output_identities(&records)?;
         let mut inner = RegistryInner::default();
-        let mut restored_resource_ids = HashSet::new();
-        let mut restored_snapshot_ids = HashSet::new();
         for record in records {
             let Some((mut task, download_options, playback_options, mut output)) =
                 restore_persisted_record(record)
@@ -2497,23 +2516,6 @@ impl BilibiliTaskRegistry {
             {
                 continue;
             }
-            if !restored_snapshot_ids.insert(output.snapshot_id.clone()) {
-                continue;
-            }
-            if output
-                .resources
-                .iter()
-                .any(|resource| restored_resource_ids.contains(&resource.resource.id))
-            {
-                continue;
-            }
-            restored_resource_ids.extend(
-                output
-                    .resources
-                    .iter()
-                    .map(|resource| resource.resource.id.clone()),
-            );
-
             if let Some(active_key) = active_download_key {
                 inner
                     .active_task_ids_by_key
@@ -2544,7 +2546,7 @@ impl BilibiliTaskRegistry {
             .collect();
 
         let orphan_resource_scan_pending = resource_root_path.is_some();
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             mutation_lock: Mutex::new(()),
             queue_notify: Arc::new(Notify::new()),
@@ -2555,7 +2557,7 @@ impl BilibiliTaskRegistry {
             resource_cleanup_lock: Mutex::new(()),
             resource_storage_available: AtomicBool::new(!orphan_resource_scan_pending),
             orphan_resource_scan_pending: AtomicBool::new(orphan_resource_scan_pending),
-        }
+        })
     }
 
     fn persist_current_state(&self) -> bool {
@@ -3217,6 +3219,7 @@ impl Default for BilibiliTaskRegistry {
             TaskRetentionPolicy::default(),
             None,
         )
+        .expect("empty persisted task records should be valid")
     }
 }
 
@@ -8116,6 +8119,61 @@ mod tests {
                 .is_err(),
             "an identical durable retry must not publish a duplicate event"
         );
+    }
+
+    #[test]
+    fn colliding_task_output_snapshot_blocks_startup_rewrite_and_resource_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let first_resource = test_task_resource("collision-owned-one", 3);
+        let second_resource = test_task_resource("collision-owned-two", 3);
+        let first_path = write_task_resource_body(&root_path, &first_resource, b"one");
+        let second_path = write_task_resource_body(&root_path, &second_resource, b"two");
+        let record = |id: &str, source: &str, resource: TaskResourceRecord| {
+            let mut record = persisted_task_record(id, source);
+            record.output = TaskOutputRecord::replace(
+                Some(&record.output),
+                vec![test_task_result_with_resources(
+                    &format!("result-{id}"),
+                    std::slice::from_ref(&resource),
+                )],
+                vec![resource],
+            )
+            .expect("persisted output should be valid");
+            record
+        };
+        TaskStateStore::new(&state_path)
+            .save(&[
+                record("collision-one", "BV1collision-one", first_resource),
+                record("collision-two", "BV1collision-two", second_resource),
+            ])
+            .expect("valid fixture should persist");
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path).expect("fixture should be readable"),
+        )
+        .expect("fixture should decode");
+        snapshot["tasks"][1]["output"]["snapshot_id"] =
+            snapshot["tasks"][0]["output"]["snapshot_id"].clone();
+        let mut colliding_bytes =
+            serde_json::to_vec_pretty(&snapshot).expect("colliding fixture should serialize");
+        colliding_bytes.push(b'\n');
+        std::fs::write(&state_path, &colliding_bytes).expect("colliding fixture should be written");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert!(!registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
+        assert_eq!(
+            colliding_bytes,
+            std::fs::read(&state_path).expect("colliding snapshot should remain untouched")
+        );
+        assert!(first_path.exists());
+        assert!(second_path.exists());
     }
 
     #[test]

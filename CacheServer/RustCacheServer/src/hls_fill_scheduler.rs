@@ -152,6 +152,15 @@ impl HlsFillScheduler {
         inner.current.is_none() && inner.foreground.is_empty() && inner.demoted.is_empty()
     }
 
+    pub(crate) fn owns_session(&self, session_id: &str) -> bool {
+        let inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        inner
+            .current
+            .as_ref()
+            .is_some_and(|current| current.job.session.id == session_id)
+            || inner.has_queued_session(session_id)
+    }
+
     pub(crate) fn cancel_task(&self, task_id: &str) {
         let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
         inner.foreground.retain(|job| job.task_id != task_id);
@@ -451,10 +460,14 @@ mod tests {
             sample_session("newer-task"),
             HlsCacheFinalizationFailureMode::KeepPlayable,
         ));
+        assert!(scheduler.owns_session("older-task"));
+        assert!(scheduler.owns_session("newer-task"));
 
         let first = scheduler.next_job().await;
         assert_eq!("newer-task", first.task_id);
+        assert!(scheduler.owns_session("newer-task"));
         scheduler.finish_current(&first, false);
+        assert!(!scheduler.owns_session("newer-task"));
         let second = scheduler.next_job().await;
         assert_eq!("older-task", second.task_id);
     }

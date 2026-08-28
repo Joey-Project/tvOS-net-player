@@ -288,7 +288,7 @@ impl AppState {
                 let authorized = restored_hls_session_is_authorized(
                     &tasks,
                     &session.id,
-                    &restorable_completed_session_ids,
+                    restorable_completed_session_ids.contains(&session.id),
                     completed_hls_cache_playback_supported,
                 );
                 if !authorized && let Err(error) = hls_cache.remove_session(&session.id) {
@@ -384,10 +384,6 @@ impl AppState {
         completed_session_ids: HashSet<String>,
         finalizer_owned_session_ids: HashSet<String>,
     ) {
-        let restored_sessions = restored_sessions
-            .into_iter()
-            .filter(|session| !finalizer_owned_session_ids.contains(&session.id))
-            .collect::<Vec<_>>();
         if restored_sessions.is_empty() {
             return;
         }
@@ -398,10 +394,14 @@ impl AppState {
         let tasks = Arc::downgrade(&self.tasks);
         let hls_sessions = self.hls_sessions.clone();
         let hls_cache = self.hls_cache.clone();
+        let hls_fill_scheduler = self.hls_fill_scheduler.clone();
         let hls_network_policy = self.hls_network_policy.clone();
         let hls_playback_progress = self.hls_playback_progress.clone();
+        let hls_cache_quota_enforcement_lock = Arc::clone(&self.hls_cache_quota_enforcement_lock);
+        let completed_hls_deletion_lock = Arc::clone(&self.completed_hls_deletion_lock);
         let completed_hls_cache_playback_supported = self.completed_hls_cache_playback_supported;
         handle.spawn(async move {
+            let mut pending_sessions = restored_sessions;
             loop {
                 let Some(tasks) = tasks.upgrade() else {
                     return;
@@ -413,29 +413,63 @@ impl AppState {
                     )
                     .await
                 {
-                    for session in restored_sessions {
+                    let mut retry_sessions = Vec::new();
+                    for session in pending_sessions {
+                        if finalizer_owned_session_ids.contains(&session.id)
+                            && hls_fill_scheduler.owns_session(&session.id)
+                        {
+                            retry_sessions.push(session);
+                            continue;
+                        }
+
+                        let _quota_guard = hls_cache_quota_enforcement_lock
+                            .lock()
+                            .expect("HLS cache quota enforcement lock poisoned");
+                        let _deletion_guard = completed_hls_deletion_lock
+                            .lock()
+                            .expect("completed HLS deletion lock poisoned");
+                        if finalizer_owned_session_ids.contains(&session.id)
+                            && hls_fill_scheduler.owns_session(&session.id)
+                        {
+                            retry_sessions.push(session);
+                            continue;
+                        }
+                        let completed_session_is_available = completed_session_ids
+                            .contains(&session.id)
+                            || hls_cache.completed_session(&session.id).is_some();
                         if restored_hls_session_is_authorized(
                             &tasks,
                             &session.id,
-                            &completed_session_ids,
+                            completed_session_is_available,
                             completed_hls_cache_playback_supported,
                         ) {
                             continue;
                         }
 
-                        hls_sessions.remove_with_generation_update(&session.id, |generation| {
-                            hls_network_policy
-                                .remove_session_generation(&session.id, generation);
-                        });
-                        hls_playback_progress.remove_session(&session.id);
-                        if let Err(error) = hls_cache.remove_session(&session.id) {
-                            eprintln!(
-                                "Failed to remove unauthorized HLS session {} after task persistence recovered: {error}",
-                                session.id
-                            );
+                        match hls_cache.remove_session(&session.id) {
+                            Ok(()) => {
+                                hls_sessions.remove_with_generation_update(
+                                    &session.id,
+                                    |generation| {
+                                        hls_network_policy
+                                            .remove_session_generation(&session.id, generation);
+                                    },
+                                );
+                                hls_playback_progress.remove_session(&session.id);
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to remove unauthorized HLS session {} after task persistence recovered; retrying: {error}",
+                                    session.id
+                                );
+                                retry_sessions.push(session);
+                            }
                         }
                     }
-                    return;
+                    if retry_sessions.is_empty() {
+                        return;
+                    }
+                    pending_sessions = retry_sessions;
                 }
                 drop(tasks);
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2010,7 +2044,7 @@ fn refresh_restored_hls_playback_source_for_session(
 fn restored_hls_session_is_authorized(
     tasks: &BilibiliTaskRegistry,
     session_id: &str,
-    completed_session_ids: &HashSet<String>,
+    completed_session_is_available: bool,
     completed_hls_cache_playback_supported: bool,
 ) -> bool {
     let Ok(task) = tasks.get_task(session_id) else {
@@ -2026,7 +2060,7 @@ fn restored_hls_session_is_authorized(
     match task.state() {
         TaskState::Playable => tasks.is_hls_session_playable_for_task(&task.id, session_id),
         TaskState::Completed => {
-            completed_session_ids.contains(session_id)
+            completed_session_is_available
                 && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
         }
         _ => false,
@@ -2685,6 +2719,91 @@ mod tests {
         })
         .await
         .expect("orphan HLS session should be removed after persistence recovers");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_rechecks_finalizer_owned_session_after_release() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let session = sample_hls_session("released-startup-finalizer-session");
+        state
+            .hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        assert!(state.hls_fill_scheduler.enqueue_demoted(
+            "missing-task".to_owned(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+        ));
+        let worker_guard = state.hls_fill_scheduler.worker_guard();
+
+        state.resume_pending_hls_startup_reconciliation(
+            vec![session.clone()],
+            HashSet::new(),
+            HashSet::from([session.id.clone()]),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "startup cleanup must wait while the finalizer owns the session"
+        );
+
+        let job = state.hls_fill_scheduler.next_job().await;
+        state.hls_fill_scheduler.finish_current(&job, false);
+        drop(worker_guard);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.hls_cache.playback_session(&session.id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("released unauthorized HLS session should be reconciled");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_retries_failed_hls_deletion_without_quota() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                hls_cache_max_bytes: 0,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        assert!(!state.hls_cache_policy().eviction_enabled());
+        let session = sample_hls_session("retry-startup-hls-deletion");
+        state
+            .hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        state.hls_cache.fail_next_remove_session(session.id.clone());
+
+        state.resume_pending_hls_startup_reconciliation(
+            vec![session.clone()],
+            HashSet::new(),
+            HashSet::new(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.hls_cache.playback_session(&session.id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed startup HLS deletion should retry without quota activity");
     }
 
     #[tokio::test]

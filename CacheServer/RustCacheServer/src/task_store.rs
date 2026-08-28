@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    collections::HashSet,
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
@@ -289,11 +290,13 @@ impl TaskStateStore {
             .map(|file| file.into_record(schema_version))
             .collect::<io::Result<Vec<_>>>()?;
         validate_registered_task_resource_count(&records)?;
+        validate_unique_task_output_identities(&records)?;
         Ok(records)
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
         validate_registered_task_resource_count(records)?;
+        validate_unique_task_output_identities(records)?;
         let snapshot = PersistedTaskSnapshot {
             schema_version: TASK_STATE_SCHEMA_VERSION,
             tasks: records
@@ -410,6 +413,30 @@ fn validate_registered_task_resource_count(records: &[PersistedTaskRecord]) -> i
                 "task state cannot contain more than {MAX_REGISTERED_TASK_RESOURCES} registered resources"
             ),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_unique_task_output_identities(
+    records: &[PersistedTaskRecord],
+) -> io::Result<()> {
+    let mut snapshot_ids = HashSet::new();
+    let mut resource_ids = HashSet::new();
+    for record in records {
+        if !snapshot_ids.insert(record.output.snapshot_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state contains a duplicate task output snapshot id",
+            ));
+        }
+        for resource in &record.output.resources {
+            if !resource_ids.insert(resource.resource.id.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "task state contains a duplicate task output resource id",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1822,6 +1849,96 @@ mod tests {
 
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn task_state_rejects_cross_task_output_identity_collisions() {
+        let record = |task_id: &str, resource_id: &str| {
+            let task = Task {
+                id: task_id.to_owned(),
+                source: format!("BV1{task_id}"),
+                ..Default::default()
+            };
+            let previous = TaskOutputRecord::from_legacy_task(&task);
+            let resource = TaskResourceRecord::new(CacheResourceRef {
+                id: resource_id.to_owned(),
+                content_type: "text/plain".to_owned(),
+                size_bytes: 4,
+                size_known: true,
+                ..Default::default()
+            })
+            .expect("test resource should be valid");
+            let output = TaskOutputRecord::replace(
+                Some(&previous),
+                vec![TaskResult {
+                    id: format!("result-{task_id}"),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: format!("artifact-{task_id}"),
+                        kind: TaskArtifactKind::Metadata.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("test output should be valid");
+            PersistedTaskRecord {
+                task,
+                options: None,
+                playback_options: None,
+                output,
+            }
+        };
+
+        let first = record("identity-one", "resource-one");
+        let mut duplicate_snapshot = record("identity-two", "resource-two");
+        duplicate_snapshot.output.snapshot_id = first.output.snapshot_id.clone();
+        let duplicate_resource = record("identity-three", "resource-one");
+
+        for (fixture_name, records) in [
+            (
+                "duplicate-snapshot",
+                vec![first.clone(), duplicate_snapshot],
+            ),
+            (
+                "duplicate-resource",
+                vec![first.clone(), duplicate_resource],
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir should be created");
+            let path = temp.path().join(fixture_name).join("tasks.json");
+            std::fs::create_dir_all(path.parent().unwrap())
+                .expect("snapshot directory should be created");
+            let snapshot = PersistedTaskSnapshot {
+                schema_version: TASK_STATE_SCHEMA_VERSION,
+                tasks: records
+                    .iter()
+                    .cloned()
+                    .map(PersistedTaskFile::from)
+                    .collect(),
+            };
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&snapshot).expect("fixture should serialize"),
+            )
+            .expect("fixture should be written");
+
+            let load_error = match TaskStateStore::new(&path).load() {
+                Ok(_) => panic!("colliding output identities must fail closed during load"),
+                Err(error) => error,
+            };
+            assert_eq!(io::ErrorKind::InvalidData, load_error.kind());
+
+            let save_path = temp.path().join(fixture_name).join("saved.json");
+            let save_error = TaskStateStore::new(&save_path)
+                .save(&records)
+                .expect_err("colliding output identities must fail closed during save");
+            assert_eq!(io::ErrorKind::InvalidData, save_error.kind());
+            assert!(!save_path.exists());
+        }
     }
 
     #[test]
