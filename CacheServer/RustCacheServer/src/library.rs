@@ -1044,11 +1044,15 @@ pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
     )?;
     for segment in &segments[..segments.len() - 1] {
-        directory = open_at(
+        directory = match open_at(
             directory.as_raw_fd(),
             segment,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-        )?;
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     }
 
     // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
@@ -1417,6 +1421,23 @@ mod tests {
             .expect_err("missing cache root should be reported");
 
         assert_eq!(io::ErrorKind::NotFound, error.kind());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_no_follow_treats_a_missing_intermediate_directory_as_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let movie_dir = root_path.join("Movies/Series");
+        fs::create_dir_all(&movie_dir).unwrap();
+        fs::write(movie_dir.join("Episode.mp4"), b"sample").unwrap();
+        fs::remove_dir_all(root_path.join("Movies"))
+            .expect("validated nested media directory should be removable");
+
+        assert!(
+            !remove_file_no_follow(&root_path, "Movies/Series/Episode.mp4")
+                .expect("a raced nested deletion should remain idempotent")
+        );
     }
 
     #[test]

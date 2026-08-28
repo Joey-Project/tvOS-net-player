@@ -2837,6 +2837,9 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
+    if let Some(completed_session) = state.hls_cache.completed_session(&session_id) {
+        return publish_completed_hls_cache(&state, &task_id, &session_id, &completed_session);
+    }
     let playback_progress = state.hls_playback_progress_for_session(&session_id);
     let _ = state.tasks.update_playback_cache_progress(
         &task_id,
@@ -2916,48 +2919,7 @@ async fn run_hls_cache_finalization_inner(
         .await
     {
         Ok(completion) => {
-            let completed_playback_session =
-                playback_session_from_hls_cache_session(&completion.session);
-            let library_item_id = completion.library_item_id.clone();
-            let finalized = {
-                let _deletion_guard = state.completed_hls_mutation_guard();
-                match state
-                    .tasks
-                    .complete_playback_hls_session_cached_with_metadata(
-                        &task_id,
-                        &session_id,
-                        library_item_id.clone(),
-                        completed_playback_session,
-                    ) {
-                    Ok(task)
-                        if state.tasks.playback_task_has_completed_hls_cache_item(
-                            &task,
-                            &session_id,
-                            &library_item_id,
-                        ) =>
-                    {
-                        state.register_completed_hls_runtime_session(&completion.session);
-                        true
-                    }
-                    Err(error) if error.code() == tonic::Code::Unavailable => {
-                        return HlsCacheFinalizationOutcome::PersistencePending;
-                    }
-                    Ok(_) | Err(_) => false,
-                }
-            };
-            if finalized {
-                if let Err(error) =
-                    state.enforce_hls_cache_quota("after_hls_finalization", [session_id.clone()], 0)
-                {
-                    eprintln!(
-                        "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                }
-            } else {
-                state.remove_hls_playback_session(&session_id);
-                let _ = state.hls_cache.remove_session(&session_id);
-            }
+            return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session);
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
             state.remove_hls_playback_session(&session_id);
@@ -3027,6 +2989,61 @@ async fn run_hls_cache_finalization_inner(
             }
         }
     }
+    HlsCacheFinalizationOutcome::Finished
+}
+
+fn publish_completed_hls_cache(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+    completed_session: &HlsPlaybackSession,
+) -> HlsCacheFinalizationOutcome {
+    let completed_playback_session = playback_session_from_hls_cache_session(completed_session);
+    let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
+    let finalized = {
+        let _deletion_guard = state.completed_hls_mutation_guard();
+        match state
+            .tasks
+            .complete_playback_hls_session_cached_with_metadata(
+                task_id,
+                session_id,
+                library_item_id.clone(),
+                completed_playback_session,
+            ) {
+            Ok(task)
+                if state.tasks.playback_task_has_completed_hls_cache_item(
+                    &task,
+                    session_id,
+                    &library_item_id,
+                ) =>
+            {
+                state.register_completed_hls_runtime_session(completed_session);
+                true
+            }
+            Err(error) if error.code() == tonic::Code::Unavailable => {
+                // The media and completed manifest are already durable. Serve those files while
+                // the task snapshot retries so another successful persistence write cannot leave
+                // the stale online runtime installed after this job is dropped.
+                state.register_completed_hls_runtime_session(completed_session);
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+            Ok(_) | Err(_) => false,
+        }
+    };
+    if finalized {
+        if let Err(error) =
+            state.enforce_hls_cache_quota("after_hls_finalization", [session_id.to_owned()], 0)
+        {
+            eprintln!(
+                "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
+                state.error_detail_for_log(&error)
+            );
+        }
+    } else {
+        state.remove_hls_playback_session(session_id);
+        let _ = state.hls_cache.remove_session(session_id);
+    }
+
     HlsCacheFinalizationOutcome::Finished
 }
 
@@ -13695,9 +13712,10 @@ mod tests {
         assert!(state.tasks.persistence_available());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn hls_cache_fill_keeps_completed_media_until_terminal_state_persists() {
-        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+    async fn hls_cache_fill_reuses_completed_transcode_until_terminal_state_persists() {
+        let (upstream_url, _upstream_task, upstream_requests) = start_counted_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -13710,6 +13728,8 @@ mod tests {
                 task_state_path: task_state_path.clone(),
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
+                lan_transcoding_enabled: true,
+                lan_transcoding_ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
                 ..CacheServerOptions::default()
             },
             Arc::new(EmptyPlaybackPlanner),
@@ -13723,6 +13743,13 @@ mod tests {
             sample_playback_plan_with_video_url(&upstream_url),
         )
         .expect("playback metadata should map");
+        let mut hls_session = metadata.hls_session.clone();
+        mark_hls_session_transcoding_ready(&mut hls_session);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
         let playback_source = PlaybackSource {
             item_id: creation.task.id.clone(),
             variant_id: metadata.playback_session.selected_variant_id.clone(),
@@ -13750,7 +13777,7 @@ mod tests {
         let first_outcome = run_hls_cache_finalization_inner(
             state.clone(),
             creation.task.id.clone(),
-            metadata.hls_session.clone(),
+            hls_session.clone(),
             HlsCacheFinalizationFailureMode::KeepPlayable,
             HlsFillPreemptionToken::default(),
         )
@@ -13771,12 +13798,24 @@ mod tests {
                 .is_some(),
             "completed media must survive a rejected terminal task snapshot"
         );
+        let requests_after_completion = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_completion > 0);
+        let completed_session = state
+            .hls_cache
+            .completed_session(&creation.task.id)
+            .expect("completed transcoded session should be durable");
+        let runtime_session = state
+            .hls_sessions
+            .get(&creation.task.id)
+            .expect("completed media should replace the online runtime immediately");
+        assert_eq!(completed_session.variant, runtime_session.variant);
+        assert!(runtime_session.variant.video.request.url.is_empty());
 
         fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
         let retry_outcome = run_hls_cache_finalization_inner(
             state.clone(),
             creation.task.id.clone(),
-            metadata.hls_session,
+            hls_session,
             HlsCacheFinalizationFailureMode::KeepPlayable,
             HlsFillPreemptionToken::default(),
         )
@@ -13795,6 +13834,11 @@ mod tests {
                 .is_some()
         );
         assert!(state.hls_sessions.get(&creation.task.id).is_some());
+        assert_eq!(
+            requests_after_completion,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must reuse the completed transcode without another download"
+        );
     }
 
     #[cfg(unix)]
@@ -15769,20 +15813,40 @@ mod tests {
     }
 
     async fn start_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let (url, task, _) = start_counted_mp4_upstream().await;
+        (url, task)
+    }
+
+    async fn start_counted_mp4_upstream() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener should bind");
         let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let upstream_request_count = Arc::clone(&request_count);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/video.m4s", get(upstream_mp4)),
+                Router::new().route(
+                    "/video.m4s",
+                    get({
+                        let request_count = Arc::clone(&upstream_request_count);
+                        move |headers: HeaderMap| {
+                            let request_count = Arc::clone(&request_count);
+                            async move {
+                                request_count.fetch_add(1, Ordering::Relaxed);
+                                upstream_mp4(headers).await
+                            }
+                        }
+                    }),
+                ),
             )
             .await
             .expect("upstream should run");
         });
 
-        (format!("http://{addr}/video.m4s"), task)
+        (format!("http://{addr}/video.m4s"), task, request_count)
     }
 
     async fn start_failing_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
