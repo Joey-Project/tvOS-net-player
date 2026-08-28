@@ -960,6 +960,16 @@ impl BilibiliTaskRegistry {
         let normalized_session_id = normalize_required_id(session_id)?;
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if self.persistence.is_some() && !self.persistence_available() {
+            let outcome = self.persist_and_publish_pending(inner, true, None);
+            if !outcome.is_durable() {
+                return Err(Status::unavailable(
+                    "Pending task state could not be persisted before recording HLS cache fill failure.",
+                ));
+            }
+            inner = self.inner.lock().expect("task registry lock poisoned");
+        }
+        let durability_required = self.persistence.is_some();
         let task = {
             let Some(task) = inner.tasks_by_id.get_mut(&normalized_task_id) else {
                 return Err(task_not_found());
@@ -1006,7 +1016,12 @@ impl BilibiliTaskRegistry {
 
             task.clone()
         };
-        self.persist_task_and_publish(inner, task.clone(), false, None);
+        let outcome = self.persist_task_and_publish(inner, task.clone(), durability_required, None);
+        if durability_required && !outcome.is_durable() {
+            return Err(Status::unavailable(
+                "HLS cache fill failure could not be persisted durably.",
+            ));
+        }
         Ok(Some(task))
     }
 
@@ -1692,6 +1707,17 @@ impl BilibiliTaskRegistry {
         let normalized_session_id = normalize_required_id(session_id)?;
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if self.persistence.is_some() && !self.persistence_available() {
+            let outcome = self.persist_and_publish_pending(inner, true, None);
+            if !outcome.is_durable() {
+                return Err(Status::unavailable(
+                    "Pending task state could not be persisted before rejecting a restored HLS session.",
+                ));
+            }
+            inner = self.inner.lock().expect("task registry lock poisoned");
+        }
+        let durability_required = self.persistence.is_some();
+        let checkpoint = durability_required.then(|| RegistryMutationCheckpoint::capture(&inner));
         let task = {
             let Some(task) = inner.tasks_by_id.values_mut().find(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
@@ -1736,7 +1762,17 @@ impl BilibiliTaskRegistry {
             let terminal_task = Self::terminal_task_locked(&inner, &task);
             Self::clear_active_task_locked(&mut inner, &terminal_task);
         }
-        self.persist_task_and_publish(inner, task.clone(), false, None);
+        let outcome = self.persist_task_before_destructive_side_effect(
+            inner,
+            task.clone(),
+            durability_required,
+            checkpoint,
+        );
+        if durability_required && !outcome.is_durable() {
+            return Err(Status::unavailable(
+                "Restored HLS session failure could not be persisted durably.",
+            ));
+        }
         Ok(Some(task))
     }
 
@@ -6982,6 +7018,97 @@ mod tests {
         registry
             .replace_task_output(&task.id, results, Vec::new())
             .expect("an identical retry should restore durable persistence");
+        assert!(registry.persistence_available());
+    }
+
+    #[test]
+    fn cache_fill_failure_remains_pending_until_persistence_recovers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-fill-pending", None, None)
+            .expect("playback task should be created durably");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playable state should persist");
+
+        std::fs::remove_file(&path).expect("state file should be removable");
+        std::fs::create_dir(&path).expect("directory should block snapshot replacement");
+        let error = registry
+            .fail_hls_cache_fill_for_playback_session(
+                &created.task.id,
+                &created.task.id,
+                "Playable online; offline cache fill failed.".to_owned(),
+            )
+            .expect_err("an unpersisted cache-fill failure must remain pending");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(!registry.persistence_available());
+        assert_eq!(
+            PLAYBACK_PLAYABLE_MESSAGE,
+            registry.get_task(&created.task.id).unwrap().message
+        );
+
+        std::fs::remove_dir(&path).expect("blocking directory should be removable");
+        assert!(registry.retry_pending_persistence());
+        let persisted = registry
+            .get_task(&created.task.id)
+            .expect("task should remain readable");
+        assert_eq!(
+            "Playable online; offline cache fill failed.",
+            persisted.message
+        );
+        assert!(registry.persistence_available());
+    }
+
+    #[test]
+    fn restored_session_failure_rolls_back_until_directory_sync_is_durable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let created = registry
+            .create_bilibili_playback_task("BV1restore-failure-pending", None, None)
+            .expect("playback task should be created durably");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playable state should persist");
+
+        registry.fail_next_persistence_directory_sync();
+        let error = registry
+            .fail_unrestorable_playback_session_after_cache_restore(
+                &created.task.id,
+                "Restored session failed.".to_owned(),
+            )
+            .expect_err("directory durability is required before deleting restored media");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(!registry.persistence_available());
+        assert_eq!(
+            TaskState::Playable,
+            registry.get_task(&created.task.id).unwrap().state()
+        );
+        assert!(registry.is_primary_hls_session_playable(&created.task.id, &created.task.id));
+
+        assert!(registry.retry_pending_persistence());
+        let failed = registry
+            .fail_unrestorable_playback_session_after_cache_restore(
+                &created.task.id,
+                "Restored session failed.".to_owned(),
+            )
+            .expect("durable retry should succeed")
+            .expect("restored session should still be referenced");
+        assert_eq!(TaskState::Failed, failed.state());
         assert!(registry.persistence_available());
     }
 

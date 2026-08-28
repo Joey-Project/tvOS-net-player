@@ -1707,16 +1707,22 @@ fn filter_hls_library_items(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum PlaybackPlanningTerminalState {
+    Failed,
+    Cancelled,
+}
+
 struct PlaybackPlanningCleanup {
-    tasks: Arc<BilibiliTaskRegistry>,
+    state: AppState,
     task_id: String,
     armed: bool,
 }
 
 impl PlaybackPlanningCleanup {
-    fn new(tasks: Arc<BilibiliTaskRegistry>, task_id: String) -> Self {
+    fn new(state: AppState, task_id: String) -> Self {
         Self {
-            tasks,
+            state,
             task_id,
             armed: true,
         }
@@ -1729,11 +1735,85 @@ impl PlaybackPlanningCleanup {
 
 impl Drop for PlaybackPlanningCleanup {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.tasks.complete_task_failed(
+        if !self.armed {
+            return;
+        }
+
+        let state = self.state.clone();
+        let task_id = self.task_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Failed,
+                    PLAYBACK_PLANNING_INTERRUPTED_MESSAGE.to_owned(),
+                    Vec::new(),
+                )
+                .await;
+            });
+        } else {
+            let _ = self.state.tasks.complete_task_failed(
                 &self.task_id,
                 PLAYBACK_PLANNING_INTERRUPTED_MESSAGE.to_owned(),
             );
+        }
+    }
+}
+
+async fn retry_pending_task_persistence(tasks: &Arc<BilibiliTaskRegistry>, context: &str) -> bool {
+    let tasks = Arc::clone(tasks);
+    match tokio::task::spawn_blocking(move || tasks.retry_pending_persistence()).await {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            eprintln!("Failed to join task persistence retry for {context}: {error}");
+            false
+        }
+    }
+}
+
+async fn complete_playback_planning_terminal(
+    state: &AppState,
+    task_id: &str,
+    terminal_state: PlaybackPlanningTerminalState,
+    message: String,
+    additional_hls_session_ids: Vec<String>,
+) -> bool {
+    let mut hls_session_ids = state.tasks.playback_hls_session_ids(task_id);
+    hls_session_ids.extend(additional_hls_session_ids);
+    hls_session_ids.sort();
+    hls_session_ids.dedup();
+
+    loop {
+        let completion = match terminal_state {
+            PlaybackPlanningTerminalState::Failed => {
+                state.tasks.complete_task_failed(task_id, message.clone())
+            }
+            PlaybackPlanningTerminalState::Cancelled => state
+                .tasks
+                .complete_task_cancelled(task_id, message.clone()),
+        };
+        match completion {
+            Ok(_)
+                if !state.tasks.persistence_configured() || state.tasks.persistence_available() =>
+            {
+                let _deletion_guard = state.completed_hls_mutation_guard();
+                remove_hls_sessions(state, &hls_session_ids);
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) if error.code() == tonic::Code::Unavailable => {}
+            Err(error) => {
+                eprintln!(
+                    "Failed to complete Bilibili playback planning task {task_id}: {}",
+                    state.error_detail_for_log(&error)
+                );
+                return false;
+            }
+        }
+
+        if !retry_pending_task_persistence(&state.tasks, "Bilibili playback planning").await {
+            sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
         }
     }
 }
@@ -1752,15 +1832,19 @@ async fn run_bilibili_playback_planning(
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) {
-    let mut cleanup = PlaybackPlanningCleanup::new(Arc::clone(&state.tasks), task_id.clone());
+    let mut cleanup = PlaybackPlanningCleanup::new(state.clone(), task_id.clone());
     let permit_request = Arc::clone(&state.playback_planning_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
         if cancellation.is_cancel_requested() {
-            if state
-                .tasks
-                .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
-                .is_ok()
+            if complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Cancelled,
+                PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                Vec::new(),
+            )
+            .await
             {
                 cleanup.disarm();
             }
@@ -1772,13 +1856,14 @@ async fn run_bilibili_playback_planning(
                 match permit {
                     Ok(permit) => break permit,
                     Err(_) => {
-                        if state
-                            .tasks
-                            .complete_task_failed(
-                                &task_id,
-                                "Playback planning concurrency limiter is unavailable.".to_owned(),
-                            )
-                            .is_ok()
+                        if complete_playback_planning_terminal(
+                            &state,
+                            &task_id,
+                            PlaybackPlanningTerminalState::Failed,
+                            "Playback planning concurrency limiter is unavailable.".to_owned(),
+                            Vec::new(),
+                        )
+                        .await
                         {
                             cleanup.disarm();
                         }
@@ -1790,10 +1875,14 @@ async fn run_bilibili_playback_planning(
         }
     };
     if cancellation.is_cancel_requested() {
-        if state
-            .tasks
-            .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
-            .is_ok()
+        if complete_playback_planning_terminal(
+            &state,
+            &task_id,
+            PlaybackPlanningTerminalState::Cancelled,
+            PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            Vec::new(),
+        )
+        .await
         {
             cleanup.disarm();
         }
@@ -1847,26 +1936,39 @@ async fn run_single_bilibili_playback_planning(
         source,
         options,
         selection_id,
-        cancellation,
+        cancellation: cancellation.clone(),
     };
     let plan = match state.playback_planner.plan(planning_request).await {
         Ok(plan) => plan,
         Err(error) => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
-                .is_ok();
+            let terminal_state = if cancellation.is_cancel_requested() {
+                PlaybackPlanningTerminalState::Cancelled
+            } else {
+                PlaybackPlanningTerminalState::Failed
+            };
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                terminal_state,
+                state.error_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
     };
     let metadata =
         match playback_task_metadata_with_policy(&task_id, plan, &state.options, playback_policy) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return state
-                    .tasks
-                    .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
-                    .is_ok();
+                return complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Failed,
+                    state.error_detail_for_client(&error.message()),
+                    Vec::new(),
+                )
+                .await;
             }
         };
 
@@ -1886,8 +1988,14 @@ async fn run_single_bilibili_playback_planning(
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                state.remove_hls_playback_session(&task_id);
-                let _ = state.hls_cache.remove_session(&task_id);
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Cancelled,
+                    PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    vec![task_id.clone()],
+                )
+                .await
             } else {
                 if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
                     eprintln!(
@@ -1900,13 +2008,22 @@ async fn run_single_bilibili_playback_planning(
                     metadata.hls_session,
                     HlsCacheFinalizationFailureMode::KeepPlayable,
                 );
+                true
             }
-            true
         }
-        Err(_) => {
-            state.remove_hls_playback_session(&task_id);
-            let _ = state.hls_cache.remove_session(&task_id);
-            false
+        Err(error) => {
+            complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                if cancellation.is_cancel_requested() {
+                    PlaybackPlanningTerminalState::Cancelled
+                } else {
+                    PlaybackPlanningTerminalState::Failed
+                },
+                state.error_detail_for_client(&error.message()),
+                vec![task_id.clone()],
+            )
+            .await
         }
     }
 }
@@ -1936,23 +2053,38 @@ async fn run_explicit_bilibili_playback_planning(
         Ok(resolution) => resolution,
         Err(error) if cancellation.is_cancel_requested() => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_cancelled(&task_id, state.cancellation_detail_for_client(&message))
-                .is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Cancelled,
+                state.cancellation_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
         Err(error) => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
-                .is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                state.error_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
     };
     let candidates = match selected_bilibili_candidates(&resolution, &selection_plan.mode) {
         Ok(candidates) => candidates,
         Err(message) => {
-            return state.tasks.complete_task_failed(&task_id, message).is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                message,
+                Vec::new(),
+            )
+            .await;
         }
     };
     let total = candidates.len();
@@ -1994,7 +2126,8 @@ async fn run_explicit_bilibili_playback_planning(
                 &resolution.title,
                 &mut result_items,
                 &planned_session_ids,
-            );
+            )
+            .await;
         }
 
         let session_id = result_items[index].id.clone();
@@ -2070,7 +2203,8 @@ async fn run_explicit_bilibili_playback_planning(
                     &resolution.title,
                     &mut result_items,
                     &planned_session_ids,
-                );
+                )
+                .await;
             }
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
@@ -2095,13 +2229,14 @@ async fn run_explicit_bilibili_playback_planning(
 
     let Some((primary_source, primary_session, primary_hls_session, primary_title)) = primary
     else {
-        return state
-            .tasks
-            .complete_task_failed(
-                &task_id,
-                "Failed to plan any selected Bilibili playback result.".to_owned(),
-            )
-            .is_ok();
+        return complete_playback_planning_terminal(
+            &state,
+            &task_id,
+            PlaybackPlanningTerminalState::Failed,
+            "Failed to plan any selected Bilibili playback result.".to_owned(),
+            planned_session_ids,
+        )
+        .await;
     };
     if cancellation.is_cancel_requested() {
         return complete_cancelled_explicit_bilibili_playback(
@@ -2110,7 +2245,8 @@ async fn run_explicit_bilibili_playback_planning(
             &resolution.title,
             &mut result_items,
             &planned_session_ids,
-        );
+        )
+        .await;
     }
 
     let final_message = if successful_results == total {
@@ -2135,7 +2271,14 @@ async fn run_explicit_bilibili_playback_planning(
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                remove_hls_sessions(&state, &planned_session_ids);
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Cancelled,
+                    PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    planned_session_ids,
+                )
+                .await
             } else {
                 let primary_session_id = primary_hls_session.id.clone();
                 state.enqueue_hls_cache_fill_foreground(
@@ -2153,17 +2296,27 @@ async fn run_explicit_bilibili_playback_planning(
                         HlsCacheFinalizationFailureMode::KeepPlayable,
                     );
                 }
+                true
             }
-            true
         }
-        Err(_) => {
-            remove_hls_sessions(&state, &planned_session_ids);
-            false
+        Err(error) => {
+            complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                if cancellation.is_cancel_requested() {
+                    PlaybackPlanningTerminalState::Cancelled
+                } else {
+                    PlaybackPlanningTerminalState::Failed
+                },
+                state.error_detail_for_client(&error.message()),
+                planned_session_ids,
+            )
+            .await
         }
     }
 }
 
-fn complete_cancelled_explicit_bilibili_playback(
+async fn complete_cancelled_explicit_bilibili_playback(
     state: &AppState,
     task_id: &str,
     title: &str,
@@ -2171,7 +2324,6 @@ fn complete_cancelled_explicit_bilibili_playback(
     planned_session_ids: &[String],
 ) -> bool {
     mark_results_cancelled(result_items);
-    remove_hls_sessions(state, planned_session_ids);
     let _ = state.tasks.update_playback_results(
         task_id,
         Some(title.to_owned()),
@@ -2179,13 +2331,14 @@ fn complete_cancelled_explicit_bilibili_playback(
         result_items_progress(result_items),
         result_items.to_vec(),
     );
-    state
-        .tasks
-        .complete_task_cancelled(
-            task_id,
-            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
-        )
-        .is_ok()
+    complete_playback_planning_terminal(
+        state,
+        task_id,
+        PlaybackPlanningTerminalState::Cancelled,
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+        planned_session_ids.to_vec(),
+    )
+    .await
 }
 
 fn selected_bilibili_candidates(
@@ -2443,11 +2596,7 @@ async fn retry_pending_hls_session_publication(
         return publication;
     }
 
-    let tasks = Arc::clone(&state.tasks);
-    if let Err(error) = tokio::task::spawn_blocking(move || tasks.retry_pending_persistence()).await
-    {
-        eprintln!("Failed to join task persistence retry for HLS cache fill: {error}");
-    }
+    retry_pending_task_persistence(&state.tasks, "HLS cache fill").await;
     state
         .tasks
         .hls_session_publication_state(task_id, session_id)
@@ -2464,6 +2613,14 @@ async fn run_hls_cache_finalization_inner(
         return HlsCacheFinalizationOutcome::Finished;
     }
     let session_id = session.id.clone();
+    if failure_mode == HlsCacheFinalizationFailureMode::KeepPlayable
+        && (!state.tasks.persistence_configured() || state.tasks.persistence_available())
+        && state
+            .tasks
+            .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session_id)
+    {
+        return HlsCacheFinalizationOutcome::Finished;
+    }
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
@@ -2667,6 +2824,9 @@ async fn run_hls_cache_finalization_inner(
                             &error,
                         ),
                     ) {
+                        if status.code() == tonic::Code::Unavailable {
+                            return HlsCacheFinalizationOutcome::PersistencePending;
+                        }
                         eprintln!(
                             "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
                             state.error_detail_for_log(&status)
@@ -2674,18 +2834,27 @@ async fn run_hls_cache_finalization_inner(
                     }
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
-                    state.remove_hls_playback_session(&session_id);
-                    let _ = state.hls_cache.remove_session(&session_id);
-                    if let Err(status) = state
-                        .tasks
-                        .fail_unrestorable_playback_session_after_cache_restore(
-                            &session_id,
-                            state.error_with_context_for_client(
-                                "Failed to restore offline HLS cache after restart",
-                                &error,
-                            ),
-                        )
-                    {
+                    let failure = {
+                        let _deletion_guard = state.completed_hls_mutation_guard();
+                        let failure = state
+                            .tasks
+                            .fail_unrestorable_playback_session_after_cache_restore(
+                                &session_id,
+                                state.error_with_context_for_client(
+                                    "Failed to restore offline HLS cache after restart",
+                                    &error,
+                                ),
+                            );
+                        if failure.is_ok() {
+                            state.remove_hls_playback_session(&session_id);
+                            let _ = state.hls_cache.remove_session(&session_id);
+                        }
+                        failure
+                    };
+                    if let Err(status) = failure {
+                        if status.code() == tonic::Code::Unavailable {
+                            return HlsCacheFinalizationOutcome::PersistencePending;
+                        }
                         eprintln!(
                             "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {}",
                             state.error_detail_for_log(&status)
@@ -11495,6 +11664,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_fill_failure_requeues_until_failure_state_is_durable() {
+        let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1cache-fill-state-retry", &upstream_url);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        let pending = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, pending.state());
+        assert!(!pending.message.contains("offline cache fill failed"));
+        assert!(!state.tasks.persistence_available());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        let playable = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.message.contains("offline cache fill failed"));
+        assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test]
+    async fn restored_hls_failure_keeps_media_until_task_state_is_durable() {
+        let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1restore-state-retry", &upstream_url);
+        let session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(session_dir.exists());
+        assert!(state.hls_sessions.get(&task_id).is_some());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(!session_dir.exists());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test]
     async fn app_state_fails_restored_hls_task_when_cache_finalization_fails() {
         let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -12530,6 +12826,101 @@ mod tests {
         assert!(runtime_session.variant.video.request.url.is_empty());
         assert!(runtime_session.variant.video.request.backup_urls.is_empty());
         assert!(runtime_session.variant.video.request.headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn playback_planning_cleanup_retries_persistence_before_removing_hls_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-cleanup-retry", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        creation.task.id
+                    ),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        let session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&creation.task.id);
+        assert!(session_dir.exists());
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        drop(PlaybackPlanningCleanup::new(
+            state.clone(),
+            creation.task.id.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.tasks.persistence_available() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("planning cleanup should attempt terminal persistence");
+
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(session_dir.exists());
+        assert!(state.hls_sessions.get(&creation.task.id).is_some());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let task = state.tasks.get_task(&creation.task.id).unwrap();
+                if task.state() == TaskState::Failed
+                    && !session_dir.exists()
+                    && state.hls_sessions.get(&creation.task.id).is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("planning cleanup should finish after persistence recovers");
+        assert!(state.tasks.persistence_available());
     }
 
     #[tokio::test]
