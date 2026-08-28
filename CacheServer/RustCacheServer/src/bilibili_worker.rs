@@ -4,7 +4,7 @@ use futures_util::FutureExt;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
-    generated::tvos_net_player::v1::BilibiliDownloadOptions,
+    generated::tvos_net_player::v1::{BilibiliDownloadOptions, Task},
     task_registry::{
         BilibiliTaskCancellation, BilibiliTaskProgress, BilibiliTaskRegistry, BilibiliTaskWorkItem,
     },
@@ -119,9 +119,10 @@ async fn run_one_bilibili_task(
     {
         Ok(result) => result,
         Err(_) => {
-            complete_terminal_task(&registry, || {
+            let task_id = work_item.task_id.clone();
+            complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_failed(
-                    &work_item.task_id,
+                    &task_id,
                     "Bilibili download adapter panicked.".to_owned(),
                 )
             })
@@ -137,8 +138,9 @@ async fn run_one_bilibili_task(
             }
             _ => "Cancelled by request.".to_owned(),
         };
-        complete_terminal_task(&registry, || {
-            registry.complete_task_cancelled(&work_item.task_id, message.clone())
+        let task_id = work_item.task_id.clone();
+        complete_terminal_task(&registry, move |registry| {
+            registry.complete_task_cancelled(&task_id, message.clone())
         })
         .await;
         return;
@@ -146,9 +148,10 @@ async fn run_one_bilibili_task(
 
     match result {
         Ok(output) => {
-            complete_terminal_task(&registry, || {
+            let task_id = work_item.task_id.clone();
+            complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_succeeded(
-                    &work_item.task_id,
+                    &task_id,
                     output.library_item_id.clone(),
                     output.message.clone(),
                 )
@@ -158,28 +161,41 @@ async fn run_one_bilibili_task(
         Err(BilibiliDownloadError::Cancelled(message)) => {
             let message =
                 crate::credential_safe_client_cancellation(credentials_configured, &message);
-            complete_terminal_task(&registry, || {
-                registry.complete_task_cancelled(&work_item.task_id, message.clone())
+            let task_id = work_item.task_id.clone();
+            complete_terminal_task(&registry, move |registry| {
+                registry.complete_task_cancelled(&task_id, message.clone())
             })
             .await;
         }
         Err(error @ BilibiliDownloadError::Failed(_)) => {
             let detail = error.message();
             let message = crate::credential_safe_client_error(credentials_configured, &detail);
-            complete_terminal_task(&registry, || {
-                registry.complete_task_failed(&work_item.task_id, message.clone())
+            let task_id = work_item.task_id.clone();
+            complete_terminal_task(&registry, move |registry| {
+                registry.complete_task_failed(&task_id, message.clone())
             })
             .await;
         }
     }
 }
 
-async fn complete_terminal_task(
-    registry: &BilibiliTaskRegistry,
-    mut complete: impl FnMut() -> Result<crate::generated::tvos_net_player::v1::Task, tonic::Status>,
-) {
+async fn complete_terminal_task<F>(registry: &Arc<BilibiliTaskRegistry>, complete: F)
+where
+    F: Fn(&BilibiliTaskRegistry) -> Result<Task, tonic::Status> + Send + Sync + 'static,
+{
+    let complete = Arc::new(complete);
     loop {
-        match complete() {
+        let completion_registry = Arc::clone(registry);
+        let completion = Arc::clone(&complete);
+        let Some(attempt) = run_blocking_terminal_persistence_attempt(
+            "Bilibili terminal task completion",
+            move || completion(&completion_registry),
+        )
+        .await
+        else {
+            return;
+        };
+        match attempt {
             Ok(_)
                 if !registry.persistence_recovery_supported()
                     || registry.persistence_available() =>
@@ -190,15 +206,47 @@ async fn complete_terminal_task(
             Err(error) if error.code() == tonic::Code::Unavailable => {}
             Err(_) => return,
         }
-        while !registry.retry_pending_persistence() {
+        while !retry_pending_task_persistence(registry).await {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+}
+
+async fn retry_pending_task_persistence(registry: &Arc<BilibiliTaskRegistry>) -> bool {
+    let registry = Arc::clone(registry);
+    run_blocking_terminal_persistence_attempt("Bilibili task persistence retry", move || {
+        registry.retry_pending_persistence()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn run_blocking_terminal_persistence_attempt<T>(
+    context: &'static str,
+    attempt: impl FnOnce() -> T + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(attempt).await {
+        Ok(result) => Some(result),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => {
+            eprintln!("Failed to join {context}: {error}");
+            None
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use crate::generated::tvos_net_player::v1::TaskState;
     use tokio::sync::Notify;
@@ -249,20 +297,145 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_completion_returns_immediately_without_configured_persistence() {
-        let registry = BilibiliTaskRegistry::default();
-        let mut attempts = 0;
+        let registry = Arc::new(BilibiliTaskRegistry::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            complete_terminal_task(&registry, || {
-                attempts += 1;
+            complete_terminal_task(&registry, move |_| {
+                attempt_count.fetch_add(1, Ordering::SeqCst);
                 Ok(Default::default())
             }),
         )
         .await
         .expect("unconfigured persistence should not delay terminal completion");
 
-        assert_eq!(1, attempts);
+        assert_eq!(1, attempts.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_completion_attempt_does_not_block_the_async_runtime() {
+        let registry = Arc::new(BilibiliTaskRegistry::default());
+        let attempt_started = Arc::new(AtomicBool::new(false));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let observer_started = Arc::clone(&attempt_started);
+        let observer_progressed = Arc::clone(&runtime_progressed);
+        let observer_release = Arc::clone(&release);
+        let observer = std::thread::spawn(move || {
+            let start_deadline = Instant::now() + Duration::from_secs(2);
+            while !observer_started.load(Ordering::SeqCst) && Instant::now() < start_deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let started_before_deadline = observer_started.load(Ordering::SeqCst);
+
+            let progress_deadline = Instant::now() + Duration::from_millis(500);
+            while started_before_deadline
+                && !observer_progressed.load(Ordering::SeqCst)
+                && Instant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release = observer_progressed.load(Ordering::SeqCst);
+
+            let (released, release_signal) = &*observer_release;
+            *released
+                .lock()
+                .expect("release lock should not be poisoned") = true;
+            release_signal.notify_one();
+            (started_before_deadline, progressed_before_release)
+        });
+
+        let heartbeat_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            heartbeat_progressed.store(true, Ordering::SeqCst);
+        });
+        let completion_started = Arc::clone(&attempt_started);
+        let completion_release = Arc::clone(&release);
+        complete_terminal_task(&registry, move |_| {
+            completion_started.store(true, Ordering::SeqCst);
+            let (released, release_signal) = &*completion_release;
+            let mut released = released
+                .lock()
+                .expect("release lock should not be poisoned");
+            while !*released {
+                released = release_signal
+                    .wait(released)
+                    .expect("release lock should not be poisoned");
+            }
+            Ok(Default::default())
+        })
+        .await;
+
+        heartbeat.await.expect("heartbeat should finish cleanly");
+        let (started_before_deadline, progressed_before_release) =
+            observer.join().expect("observer should finish cleanly");
+        assert!(started_before_deadline, "the blocking attempt should start");
+        assert!(
+            progressed_before_release,
+            "the async runtime should progress while terminal persistence is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_terminal_completion_does_not_repeat_an_in_flight_attempt() {
+        let registry = Arc::new(BilibiliTaskRegistry::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let completion_registry = Arc::clone(&registry);
+        let completion_attempts = Arc::clone(&attempts);
+        let completion_started = Arc::clone(&started);
+        let completion_finished = Arc::clone(&finished);
+        let completion_release = Arc::clone(&release);
+        let started_wait = started.notified();
+        let completion = tokio::spawn(async move {
+            complete_terminal_task(&completion_registry, move |_| {
+                completion_attempts.fetch_add(1, Ordering::SeqCst);
+                completion_started.notify_one();
+                let (released, release_signal) = &*completion_release;
+                let mut released = released
+                    .lock()
+                    .expect("release lock should not be poisoned");
+                while !*released {
+                    released = release_signal
+                        .wait(released)
+                        .expect("release lock should not be poisoned");
+                }
+                completion_finished.notify_one();
+                Err(tonic::Status::unavailable(
+                    "persistence remains unavailable",
+                ))
+            })
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started_wait)
+            .await
+            .expect("the blocking attempt should start");
+        completion.abort();
+        let finished_wait = finished.notified();
+        let (released, release_signal) = &*release;
+        *released
+            .lock()
+            .expect("release lock should not be poisoned") = true;
+        release_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), finished_wait)
+            .await
+            .expect("the in-flight blocking attempt should finish after cancellation");
+        assert!(
+            completion
+                .await
+                .expect_err("the async owner should remain cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(1, attempts.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -271,19 +444,20 @@ mod tests {
         let path = temp.path().join("tasks.json");
         std::fs::write(&path, b"{ invalid task state")
             .expect("invalid task state should be written");
-        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&path));
         let task = registry
             .create_bilibili_task("BV1detached-persistence", None)
             .expect("registry should remain usable in memory");
         let work_item = registry
             .try_claim_next_bilibili_task()
             .expect("volatile task should start running");
-        let mut attempts = 0;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            complete_terminal_task(&registry, || {
-                attempts += 1;
+            complete_terminal_task(&registry, move |registry| {
+                attempt_count.fetch_add(1, Ordering::SeqCst);
                 registry.complete_task_succeeded(
                     &work_item.task_id,
                     "local.default.sample".to_owned(),
@@ -294,7 +468,7 @@ mod tests {
         .await
         .expect("a detached malformed store cannot recover before restart");
 
-        assert_eq!(1, attempts);
+        assert_eq!(1, attempts.load(Ordering::SeqCst));
         assert!(registry.persistence_configured());
         assert!(!registry.persistence_recovery_supported());
         assert!(!registry.persistence_available());
@@ -308,18 +482,19 @@ mod tests {
     async fn terminal_completion_does_not_retry_non_retryable_errors() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
-        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&path));
         registry.fail_next_persistence_directory_sync();
         registry
             .create_bilibili_task("BV1non-retryable", None)
             .expect("task should be installed before directory sync fails");
         assert!(!registry.persistence_available());
-        let mut attempts = 0;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            complete_terminal_task(&registry, || {
-                attempts += 1;
+            complete_terminal_task(&registry, move |_| {
+                attempt_count.fetch_add(1, Ordering::SeqCst);
                 Err(tonic::Status::failed_precondition(
                     "terminal transition is not allowed",
                 ))
@@ -328,7 +503,7 @@ mod tests {
         .await
         .expect("non-retryable completion errors should return immediately");
 
-        assert_eq!(1, attempts);
+        assert_eq!(1, attempts.load(Ordering::SeqCst));
         assert!(!registry.persistence_available());
     }
 
@@ -349,18 +524,17 @@ mod tests {
         let completion_path = path.clone();
         let installed = Arc::new(Notify::new());
         let installed_signal = Arc::clone(&installed);
+        let first_attempt = Arc::new(AtomicBool::new(true));
         let completion = tokio::spawn(async move {
-            let mut first_attempt = true;
-            complete_terminal_task(&completion_registry, || {
-                let result = completion_registry.complete_task_succeeded(
+            complete_terminal_task(&completion_registry, move |registry| {
+                let result = registry.complete_task_succeeded(
                     &work_item.task_id,
                     "local.default.sample".to_owned(),
                     "Downloaded into the cache library.".to_owned(),
                 );
-                if first_attempt {
-                    first_attempt = false;
+                if first_attempt.swap(false, Ordering::SeqCst) {
                     assert!(result.is_ok());
-                    assert!(!completion_registry.persistence_available());
+                    assert!(!registry.persistence_available());
                     std::fs::remove_file(&completion_path)
                         .expect("installed snapshot should be removable");
                     std::fs::create_dir(&completion_path)

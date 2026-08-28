@@ -275,6 +275,14 @@ impl AppState {
                 &restorable_completed_session_ids,
             );
         }
+        let persistence_pending_hls_sessions = if !tasks.persistence_available()
+            && tasks.persistence_recovery_supported()
+            && hls_cache_scan_succeeded
+        {
+            restored_hls_sessions.clone()
+        } else {
+            Vec::new()
+        };
         if tasks.persistence_available() && hls_cache_scan_succeeded {
             restored_hls_sessions.retain(|session| {
                 let authorized = restored_hls_session_is_authorized(
@@ -353,8 +361,13 @@ impl AppState {
             completed_hls_deletion_lock: Arc::new(Mutex::new(())),
             pending_hls_session_cleanup_by_library_item: Arc::new(Mutex::new(HashMap::new())),
         };
+        let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
+            &restored_hls_sessions
+        } else {
+            &persistence_pending_hls_sessions
+        };
         state.resume_incomplete_hls_cache_finalizers(
-            &restored_hls_sessions,
+            hls_finalizer_restore_sessions,
             &completed_cache_session_ids,
         );
         state
@@ -387,7 +400,7 @@ impl AppState {
             {
                 continue;
             }
-            if completed_session_ids.contains(&session.id) {
+            if completed_session_ids.contains(&session.id) && self.tasks.persistence_available() {
                 self.hls_sessions
                     .insert(sanitized_completed_session(session));
                 match self.hls_cache.save_completed_session(session) {
@@ -423,16 +436,19 @@ impl AppState {
                                         session.id
                                     );
                                 }
+                                continue;
                             }
-                            Ok(_) => {}
+                            Ok(_) => continue,
                             Err(status) => {
                                 eprintln!(
                                     "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
                                     session.id
                                 );
+                                if status.code() != tonic::Code::Unavailable {
+                                    continue;
+                                }
                             }
                         }
-                        continue;
                     }
                     Err(error) => {
                         eprintln!(
@@ -2203,6 +2219,7 @@ mod tests {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
         pin::Pin,
+        sync::atomic::AtomicBool,
         thread,
         time::Instant,
     };
@@ -2348,6 +2365,196 @@ mod tests {
         }
 
         drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_preserves_incomplete_hls_finalizer_ownership() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+        let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
+        let release_upstream = Arc::new(tokio::sync::Notify::new());
+        let upstream_released = Arc::new(AtomicBool::new(false));
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get({
+                let request_started_tx = Arc::clone(&request_started_tx);
+                let release_upstream = Arc::clone(&release_upstream);
+                let upstream_released = Arc::clone(&upstream_released);
+                move || {
+                    let response_body = response_body.clone();
+                    let request_started_tx = Arc::clone(&request_started_tx);
+                    let release_upstream = Arc::clone(&release_upstream);
+                    let upstream_released = Arc::clone(&upstream_released);
+                    async move {
+                        if let Some(sender) = request_started_tx
+                            .lock()
+                            .expect("request-start lock poisoned")
+                            .take()
+                        {
+                            let _ = sender.send(());
+                        }
+                        while !upstream_released.load(Ordering::Acquire) {
+                            release_upstream.notified().await;
+                        }
+                        response_body
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, mut session) =
+            create_playable_hls_task(&initial, "BV1startup-finalizer-pending");
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        initial
+            .hls_cache
+            .save_session(&session)
+            .expect("updated HLS session should persist");
+        initial.hls_sessions.insert(session);
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        tokio::time::timeout(Duration::from_secs(2), request_started_rx)
+            .await
+            .expect("restored finalizer should retain and start the incomplete HLS session")
+            .expect("request-start sender should remain available");
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "recovery ownership must not publish the restored session while persistence is unavailable"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        upstream_released.store(true, Ordering::Release);
+        release_upstream.notify_waiters();
+        let completed = wait_for_test_task_state(&restored, &task_id, TaskState::Completed).await;
+
+        assert_eq!(
+            HlsCacheStore::completed_library_item_id(&task_id),
+            completed.library_item_id
+        );
+        assert!(restored.tasks.persistence_available());
+        restored.shutdown_hls_fill_worker().await;
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_requeues_completed_hls_finalization() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, mut session) =
+            create_playable_hls_task(&initial, "BV1startup-finalizer-completed");
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        initial
+            .hls_cache
+            .save_session(&session)
+            .expect("updated HLS session should persist");
+        initial.hls_sessions.insert(session.clone());
+        let expected_item_id = initial
+            .hls_cache
+            .cache_session_resources(&initial.hls_upstream_client, &session)
+            .await
+            .expect("HLS resources should finish before restart");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            !restored.hls_fill_scheduler.is_idle(),
+            "failed startup finalization must retain a queued retry"
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "completed recovery ownership must not publish a session while persistence is unavailable"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        let completed = wait_for_test_task_state(&restored, &task_id, TaskState::Completed).await;
+
+        assert_eq!(expected_item_id, completed.library_item_id);
+        assert!(restored.tasks.persistence_available());
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+        restored.shutdown_hls_fill_worker().await;
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -2933,6 +3140,27 @@ mod tests {
             },
             Arc::new(NoopPlaybackPlanner),
         )
+    }
+
+    async fn wait_for_test_task_state(
+        state: &AppState,
+        task_id: &str,
+        expected_state: TaskState,
+    ) -> Task {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let task = state
+                    .tasks
+                    .get_task(task_id)
+                    .expect("test task should remain readable");
+                if task.state() == expected_state {
+                    return task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test task should reach the expected state")
     }
 
     fn create_playable_hls_task(state: &AppState, source: &str) -> (String, HlsPlaybackSession) {

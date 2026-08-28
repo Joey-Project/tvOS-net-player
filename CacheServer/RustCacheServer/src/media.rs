@@ -156,14 +156,17 @@ async fn resource_response(
         tasks.open_task_resource(&resource_id)
     })
     .await;
-    let Some(opened_resource) = (match opened_resource {
-        Ok(opened_resource) => opened_resource,
+    let opened_resource = match opened_resource {
+        Ok(Ok(Some(opened_resource))) => opened_resource,
+        Ok(Ok(None)) => return resource_not_found_response(),
+        Ok(Err(error)) => {
+            eprintln!("Task resource storage open failed: {error}");
+            return resource_open_busy_response();
+        }
         Err(error) => {
             eprintln!("Task resource open worker failed: {error}");
-            None
+            return resource_open_busy_response();
         }
-    }) else {
-        return resource_not_found_response();
     };
     let resource = opened_resource.record.resource;
 
@@ -1665,6 +1668,24 @@ mod tests {
         assert!(body.is_empty());
     }
 
+    async fn assert_path_free_unavailable(
+        response: Response<Body>,
+        private_path: &std::path::Path,
+    ) {
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+        let private_path = private_path.to_string_lossy();
+        assert!(response.headers().values().all(|value| {
+            value
+                .to_str()
+                .map(|value| !value.contains(private_path.as_ref()))
+                .unwrap_or(true)
+        }));
+        assert_eq!("no-store", response.headers()[CACHE_CONTROL]);
+        assert_eq!("1", response.headers()[RETRY_AFTER]);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+    }
+
     fn assert_resource_requires_revalidation(response: &Response<Body>) {
         assert_eq!(
             Some("private, no-cache"),
@@ -2030,7 +2051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_resource_not_found_responses_do_not_disclose_paths() {
+    async fn task_resource_error_responses_do_not_disclose_paths() {
         let body = b"0123456789abcdef";
         let valid = task_resource_fixture(test_resource("resource-valid", body), Some(body));
         assert_path_free_not_found(
@@ -2045,7 +2066,7 @@ mod tests {
         .await;
 
         let missing = task_resource_fixture(test_resource("resource-missing", body), None);
-        assert_path_free_not_found(
+        assert_path_free_unavailable(
             resource_get(
                 State(missing.state.clone()),
                 Path(missing.resource_id.clone()),
@@ -2059,7 +2080,7 @@ mod tests {
         let mut mismatched_resource = test_resource("resource-mismatch", body);
         mismatched_resource.size_bytes += 1;
         let mismatched = task_resource_fixture(mismatched_resource, Some(body));
-        assert_path_free_not_found(
+        assert_path_free_unavailable(
             resource_get(
                 State(mismatched.state.clone()),
                 Path(mismatched.resource_id.clone()),
@@ -2106,7 +2127,7 @@ mod tests {
         )
         .await;
 
-        assert_path_free_not_found(response, &outside_path).await;
+        assert_path_free_unavailable(response, &outside_path).await;
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    ffi::CString,
+    ffi::{CString, OsStr},
     fs::{self, File},
     io,
     path::{Component, Components, Path, PathBuf},
@@ -696,7 +696,11 @@ fn is_internal_cache_path(relative_path: &str) -> bool {
 }
 
 fn is_internal_cache_components(mut components: Components<'_>) -> bool {
-    matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
+    matches!(
+        components.next(),
+        Some(Component::Normal(value))
+            if value.eq_ignore_ascii_case(OsStr::new(INTERNAL_CACHE_DIR))
+    )
 }
 
 fn create_item_id(relative_path: &str) -> String {
@@ -1364,6 +1368,76 @@ mod tests {
                 .item_id_for_media_path_blocking(&internal_path)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn local_operations_reject_case_aliased_internal_cache_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_relative_path = ".TVOS-NET-PLAYER/resources/resource-1/body.m4s";
+        let visible_relative_path = ".TVOS-NET-PLAYER-backup/visible.m4s";
+        let internal_path = root_path.join(internal_relative_path);
+        let visible_path = root_path.join(visible_relative_path);
+        fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(visible_path.parent().unwrap()).unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
+        fs::write(&visible_path, b"visible").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let internal_path = root_path.join(internal_relative_path);
+        let visible_path = root_path.join(visible_relative_path);
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+
+        let page = library.list_items_page_blocking(None, 0, 50, BlockingCancellation::default());
+        assert_eq!(
+            vec![visible_relative_path],
+            page.items
+                .iter()
+                .map(|item| item.subtitle.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let internal_item_id = create_item_id(internal_relative_path);
+        assert!(library.get_item_blocking(&internal_item_id).is_none());
+        assert!(
+            library
+                .get_media_file_blocking(&internal_item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .open_media_file_blocking(&internal_item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&internal_path)
+                .is_none()
+        );
+        assert!(
+            !library
+                .delete_item_blocking(&internal_item_id)
+                .expect("case-aliased internal cache delete should be ignored")
+        );
+        assert!(internal_path.exists());
+
+        let visible_item_id = library
+            .item_id_for_media_path_blocking(&visible_path)
+            .expect("a longer first component should remain visible");
+        assert!(
+            library
+                .open_media_file_blocking(&visible_item_id, VARIANT_ID)
+                .is_some()
+        );
+        assert!(
+            library
+                .delete_item_blocking(&visible_item_id)
+                .expect("visible media delete should succeed")
+        );
+        assert!(!visible_path.exists());
     }
 
     #[test]

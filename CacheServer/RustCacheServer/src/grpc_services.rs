@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{
+        Arc, Mutex as StdMutex, Weak,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant as StdInstant, SystemTime},
 };
 
@@ -12,7 +15,7 @@ use bbdown_core::{
 use futures_core::Stream;
 use prost::Message;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
     time::{Instant, sleep, timeout},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -111,6 +114,8 @@ const MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS: usize = MAX_TASK_ARTIFACTS * 2;
 const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
 const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 const TASK_RESULT_PAGE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_TASK_RESULT_BLOCKING_OPERATIONS: usize = 4;
+const TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 
@@ -692,14 +697,22 @@ impl LibraryService for LibraryGrpcService {
 pub struct TaskGrpcService {
     state: AppState,
     result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    result_page_blocking_permits: Arc<Semaphore>,
 }
 
 impl TaskGrpcService {
     pub fn new(state: AppState) -> Self {
         let result_pages = Arc::clone(&state.task_result_pages);
+        let result_page_blocking_permits = Arc::clone(
+            &result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .blocking_operation_permits,
+        );
         Self {
             state,
             result_pages,
+            result_page_blocking_permits,
         }
     }
 
@@ -715,10 +728,81 @@ impl TaskGrpcService {
             spawn_task_result_page_reaper(
                 Arc::downgrade(&self.result_pages),
                 Arc::downgrade(&self.state.tasks),
+                Arc::downgrade(&self.result_page_blocking_permits),
                 TASK_RESULT_PAGE_REAPER_INTERVAL,
             );
         }
         should_start
+    }
+
+    async fn run_task_result_blocking<T, F>(&self, operation: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                Arc<BilibiliTaskRegistry>,
+                Arc<StdMutex<TaskResultPageStore>>,
+            ) -> Result<T, Status>
+            + Send
+            + 'static,
+    {
+        let permit = timeout(
+            TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT,
+            Arc::clone(&self.result_page_blocking_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            Status::resource_exhausted("Task result pagination is busy; retry the request shortly.")
+        })?
+        .map_err(|_| Status::unavailable("Task result pagination is shutting down."))?;
+        let tasks = Arc::clone(&self.state.tasks);
+        let result_pages = Arc::clone(&self.result_pages);
+
+        tokio::task::spawn_blocking(move || {
+            // Keep the admission slot until detached work finishes after RPC cancellation.
+            let _permit = permit;
+            operation(tasks, result_pages)
+        })
+        .await
+        .map_err(task_result_blocking_join_status)?
+    }
+}
+
+struct TaskResultRequestCancellation {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TaskResultRequestCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            armed: true,
+        }
+    }
+
+    fn signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskResultRequestCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, AtomicOrdering::Release);
+        }
+    }
+}
+
+fn task_result_blocking_join_status(error: tokio::task::JoinError) -> Status {
+    eprintln!("Failed to join task result pagination blocking operation: {error}");
+    if error.is_cancelled() {
+        Status::unavailable("Task result pagination was interrupted.")
+    } else {
+        Status::internal("Task result pagination failed unexpectedly.")
     }
 }
 
@@ -792,13 +876,28 @@ fn spawn_task_output_v2_read_recovery(
     });
 }
 
-#[derive(Default)]
 pub(crate) struct TaskResultPageStore {
     snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
     snapshot_order: VecDeque<String>,
     cursors_by_token: HashMap<String, TaskResultPageCursor>,
+    blocking_operation_permits: Arc<Semaphore>,
     reaper_started: bool,
     task_output_read_recovery: TaskOutputReadRecovery,
+}
+
+impl Default for TaskResultPageStore {
+    fn default() -> Self {
+        Self {
+            snapshots_by_id: HashMap::new(),
+            snapshot_order: VecDeque::new(),
+            cursors_by_token: HashMap::new(),
+            blocking_operation_permits: Arc::new(Semaphore::new(
+                MAX_TASK_RESULT_BLOCKING_OPERATIONS,
+            )),
+            reaper_started: false,
+            task_output_read_recovery: TaskOutputReadRecovery::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1115,15 +1214,85 @@ impl TaskResultPageStore {
     }
 }
 
+fn first_task_result_page_blocking(
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    task_id: String,
+    page_size: usize,
+    cancelled: Arc<AtomicBool>,
+) -> TaskResultPageResult {
+    let snapshot = tasks
+        .retain_task_output_snapshot(&task_id, StdInstant::now() + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
+    let resource_lease_id = snapshot.resource_lease_id.clone();
+    if cancelled.load(AtomicOrdering::Acquire) {
+        tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+
+    let mut pages = match result_pages.lock() {
+        Ok(pages) => pages,
+        Err(_) => {
+            tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+            return Err(Status::internal("Task result pagination is unavailable."));
+        }
+    };
+    if cancelled.load(AtomicOrdering::Acquire) {
+        drop(pages);
+        tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+    let (page, released_resource_lease_ids, _) =
+        pages.first_page(snapshot, Instant::now(), page_size);
+    drop(pages);
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    page
+}
+
+fn continuation_task_result_page_blocking(
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    page_token: String,
+    task_id: String,
+    page_size: usize,
+) -> TaskResultPageResult {
+    let (page, released_resource_lease_ids) = {
+        let mut pages = result_pages
+            .lock()
+            .map_err(|_| Status::internal("Task result pagination is unavailable."))?;
+        pages.continuation_page(&page_token, &task_id, Instant::now(), page_size)
+    };
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    page
+}
+
 fn spawn_task_result_page_reaper(
     result_pages: Weak<StdMutex<TaskResultPageStore>>,
     tasks: Weak<BilibiliTaskRegistry>,
+    blocking_operation_permits: Weak<Semaphore>,
     interval: Duration,
 ) {
     tokio::spawn(async move {
         loop {
-            if !prune_task_result_pages_once(&result_pages, &tasks, Instant::now()) {
+            let Some(blocking_operation_permits) = blocking_operation_permits.upgrade() else {
                 return;
+            };
+            let Ok(permit) = blocking_operation_permits.acquire_owned().await else {
+                return;
+            };
+            let result_pages = result_pages.clone();
+            let tasks = tasks.clone();
+            let keep_running = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                prune_task_result_pages_once(&result_pages, &tasks, Instant::now())
+            })
+            .await;
+            match keep_running {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    eprintln!("Failed to join task result page reaper blocking operation: {error}");
+                    return;
+                }
             }
             sleep(interval).await;
         }
@@ -1297,43 +1466,42 @@ impl TaskService for TaskGrpcService {
             .page
             .as_ref()
             .map(|page| page.page_token.trim())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_owned();
         if page_token.len() > MAX_TASK_RESULT_PAGE_TOKEN_BYTES {
             return Err(Status::invalid_argument(
                 "Task result page token is too long.",
             ));
         }
         self.ensure_result_page_reaper_started();
-        let now = Instant::now();
 
         let (results, page_info, output_revision) = if page_token.is_empty() {
-            let snapshot = self.state.tasks.retain_task_output_snapshot(
-                &task_id,
-                StdInstant::now() + TASK_RESULT_PAGE_SNAPSHOT_TTL,
-            )?;
-            let (page, released_resource_lease_ids, _) = {
-                let mut pages = self
-                    .result_pages
-                    .lock()
-                    .expect("task result page store lock poisoned");
-                pages.first_page(snapshot, now, page_size)
-            };
-            self.state
-                .tasks
-                .release_task_output_snapshots(&released_resource_lease_ids);
+            let mut cancellation = TaskResultRequestCancellation::new();
+            let cancellation_signal = cancellation.signal();
+            let page = self
+                .run_task_result_blocking(move |tasks, result_pages| {
+                    first_task_result_page_blocking(
+                        tasks,
+                        result_pages,
+                        task_id,
+                        page_size,
+                        cancellation_signal,
+                    )
+                })
+                .await;
+            cancellation.complete();
             page?
         } else {
-            let (page, released_resource_lease_ids) = {
-                let mut pages = self
-                    .result_pages
-                    .lock()
-                    .expect("task result page store lock poisoned");
-                pages.continuation_page(page_token, &task_id, now, page_size)
-            };
-            self.state
-                .tasks
-                .release_task_output_snapshots(&released_resource_lease_ids);
-            page?
+            self.run_task_result_blocking(move |tasks, result_pages| {
+                continuation_task_result_page_blocking(
+                    tasks,
+                    result_pages,
+                    page_token,
+                    task_id,
+                    page_size,
+                )
+            })
+            .await?
         };
         let redact_error_details = self.state.bilibili_error_details_are_sensitive();
         Ok(Response::new(ListTaskResultsResponse {
@@ -3948,7 +4116,7 @@ mod tests {
     async fn task_result_page_reaper_starts_once_for_a_shared_store() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = AppState::new(CacheServerOptions {
-            root_path: temp.path().join("cache"),
+            root_path: initialized_cache_root(&temp),
             task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3988,6 +4156,14 @@ mod tests {
             ..Default::default()
         })
         .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, vec![0_u8; 42]).expect("resource body should be written");
         state
             .tasks
             .replace_task_output(
@@ -4352,6 +4528,254 @@ mod tests {
                 .attempts_started,
             "failed read recovery should be throttled during its retry delay"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_task_results_retention_runs_off_the_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1blocking-retention", None)
+            .expect("task should be created");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let request = tokio::spawn(async move {
+            service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: task.id,
+                    page: None,
+                }))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task-result retention should enter the bounded blocking pool");
+        timeout(Duration::from_millis(500), sleep(Duration::from_millis(10)))
+            .await
+            .expect("the current-thread runtime must stay responsive during cleanup");
+        assert!(!request.is_finished());
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        let response = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("task-result request should finish after cleanup is released")
+            .expect("task-result request should join")
+            .expect("task-result request should succeed")
+            .into_inner();
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(!response.results.is_empty());
+        assert_eq!(
+            MAX_TASK_RESULT_BLOCKING_OPERATIONS,
+            permits.available_permits()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_list_task_results_releases_an_unpublished_resource_lease() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1cancelled-retention", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cancelled-retention-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "cancelled-retention-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let task_id = task.id.clone();
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let request_task_id = task_id.clone();
+        let request = tokio::spawn(async move {
+            service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: request_task_id,
+                    page: None,
+                }))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task-result retention should enter the bounded blocking pool");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("aborted request should not complete")
+                .is_cancelled()
+        );
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        timeout(Duration::from_secs(2), async {
+            while permits.available_permits() != MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached retention should release its lease and admission permit");
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store should be available")
+                .snapshots_by_id
+                .is_empty(),
+            "a cancelled request must not publish its retained snapshot"
+        );
+        state
+            .tasks
+            .replace_task_output(
+                &task_id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should discard the old resource");
+        assert!(
+            state
+                .tasks
+                .task_resource("cancelled-retention-cover")
+                .is_none(),
+            "the cancelled request must not leak a resource lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_task_results_bounds_blocking_pool_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1bounded-retention", None)
+            .expect("task should be created");
+        let service = TaskGrpcService::new(state);
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 0..MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking admission should remain open"),
+            );
+        }
+
+        let status = timeout(
+            TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT + Duration::from_secs(1),
+            service.list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: None,
+            })),
+        )
+        .await
+        .expect("blocking admission wait should be bounded")
+        .expect_err("saturated blocking admission should reject the request");
+        assert_eq!(tonic::Code::ResourceExhausted, status.code());
+
+        drop(held_permits);
+        let response = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .expect("task results should recover after admission is released")
+            .into_inner();
+        assert!(!response.results.is_empty());
     }
 
     #[tokio::test]
