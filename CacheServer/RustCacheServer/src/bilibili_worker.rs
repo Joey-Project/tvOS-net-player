@@ -180,7 +180,10 @@ async fn complete_terminal_task(
 ) {
     loop {
         match complete() {
-            Ok(_) if !registry.persistence_configured() || registry.persistence_available() => {
+            Ok(_)
+                if !registry.persistence_recovery_supported()
+                    || registry.persistence_available() =>
+            {
                 return;
             }
             Ok(_) => {}
@@ -260,6 +263,45 @@ mod tests {
         .expect("unconfigured persistence should not delay terminal completion");
 
         assert_eq!(1, attempts);
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_returns_when_configured_persistence_cannot_retry() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        std::fs::write(&path, b"{ invalid task state")
+            .expect("invalid task state should be written");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let task = registry
+            .create_bilibili_task("BV1detached-persistence", None)
+            .expect("registry should remain usable in memory");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("volatile task should start running");
+        let mut attempts = 0;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_terminal_task(&registry, || {
+                attempts += 1;
+                registry.complete_task_succeeded(
+                    &work_item.task_id,
+                    "local.default.sample".to_owned(),
+                    "Downloaded into the volatile cache library.".to_owned(),
+                )
+            }),
+        )
+        .await
+        .expect("a detached malformed store cannot recover before restart");
+
+        assert_eq!(1, attempts);
+        assert!(registry.persistence_configured());
+        assert!(!registry.persistence_recovery_supported());
+        assert!(!registry.persistence_available());
+        assert_eq!(
+            TaskState::Succeeded,
+            registry.get_task(&task.id).unwrap().state()
+        );
     }
 
     #[tokio::test]

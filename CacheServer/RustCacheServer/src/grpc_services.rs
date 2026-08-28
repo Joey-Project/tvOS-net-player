@@ -736,7 +736,7 @@ async fn recover_task_output_v2_for_read(state: &AppState) {
         let recovery = &mut pages.task_output_read_recovery;
         if let Some(completion) = recovery.in_flight.as_ref() {
             Some((completion.clone(), None))
-        } else if !state.tasks.persistence_available()
+        } else if !state.tasks.persistence_recovery_supported()
             || recovery
                 .retry_not_before
                 .is_some_and(|retry_not_before| retry_not_before > now)
@@ -1941,7 +1941,8 @@ async fn complete_playback_planning_terminal(
         };
         match completion {
             Ok(_)
-                if !state.tasks.persistence_configured() || state.tasks.persistence_available() =>
+                if !state.tasks.persistence_recovery_supported()
+                    || state.tasks.persistence_available() =>
             {
                 let _deletion_guard = state.completed_hls_mutation_guard();
                 remove_hls_sessions(state, &hls_session_ids);
@@ -2772,10 +2773,12 @@ async fn run_hls_cache_finalization_inner(
             .tasks
             .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session_id)
     {
-        if state.tasks.persistence_configured() && !state.tasks.persistence_available() {
+        if state.tasks.persistence_recovery_supported() && !state.tasks.persistence_available() {
             retry_pending_task_persistence(&state.tasks, "HLS cache fill failure").await;
         }
-        return if !state.tasks.persistence_configured() || state.tasks.persistence_available() {
+        return if !state.tasks.persistence_recovery_supported()
+            || state.tasks.persistence_available()
+        {
             HlsCacheFinalizationOutcome::Finished
         } else {
             HlsCacheFinalizationOutcome::PersistencePending
@@ -4201,6 +4204,91 @@ mod tests {
         );
         assert!(!results.results.is_empty());
         assert!(state.tasks.task_output_v2_available());
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_repairs_transient_persistence_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.task_output_v2_available());
+        state.tasks.fail_next_persistence_directory_sync();
+        state
+            .tasks
+            .create_bilibili_task("BV1read-persistence-recovery", None)
+            .expect("installed task snapshot should remain usable");
+        assert!(state.tasks.persistence_recovery_supported());
+        assert!(!state.tasks.persistence_available());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should recover transient persistence")
+            .into_inner();
+
+        assert!(state.tasks.persistence_available());
+        assert!(state.tasks.task_output_v2_available());
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_skips_detached_malformed_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let task_state_path = temp.path().join("state").join("tasks.json");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state parent should be created");
+        fs::write(&task_state_path, b"{ invalid task state")
+            .expect("invalid task state should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_recovery_supported());
+        assert!(!state.tasks.task_output_v2_available());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("degraded server info should remain readable")
+            .into_inner();
+
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            0,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started
+        );
     }
 
     #[tokio::test]
@@ -13462,6 +13550,54 @@ mod tests {
         .await
         .expect("planning cleanup should finish after persistence recovers");
         assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test]
+    async fn playback_planning_terminal_returns_when_malformed_store_requires_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state parent should be created");
+        fs::write(&task_state_path, b"{ invalid task state")
+            .expect("invalid task state should be written");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-detached-store", None, None)
+            .expect("registry should remain usable in memory");
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_playback_planning_terminal(
+                &state,
+                &creation.task.id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed in volatile mode.".to_owned(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("a detached malformed store cannot recover before restart");
+
+        assert!(completed);
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_recovery_supported());
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
     }
 
     #[tokio::test]

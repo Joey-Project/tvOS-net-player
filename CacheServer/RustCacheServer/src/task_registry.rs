@@ -183,6 +183,10 @@ impl BilibiliTaskRegistry {
         self.persistence_configured
     }
 
+    pub(crate) fn persistence_recovery_supported(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_persistence_directory_sync(&self) {
         self.persistence
