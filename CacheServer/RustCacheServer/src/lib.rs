@@ -173,12 +173,40 @@ impl AppState {
         Self::new_with_playback_planner_factory(options, |_options, _library| playback_planner)
     }
 
+    #[cfg(test)]
+    fn new_with_playback_planner_and_hls_cache(
+        options: CacheServerOptions,
+        playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
+        hls_cache: HlsCacheStore,
+    ) -> Self {
+        Self::new_with_playback_planner_factory_and_hls_cache(
+            options,
+            |_options, _library| playback_planner,
+            Some(hls_cache),
+        )
+    }
+
     fn new_with_playback_planner_factory(
         options: CacheServerOptions,
         playback_planner_factory: impl FnOnce(
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
+    ) -> Self {
+        Self::new_with_playback_planner_factory_and_hls_cache(
+            options,
+            playback_planner_factory,
+            None,
+        )
+    }
+
+    fn new_with_playback_planner_factory_and_hls_cache(
+        options: CacheServerOptions,
+        playback_planner_factory: impl FnOnce(
+            Arc<CacheServerOptions>,
+            Arc<LocalMediaLibrary>,
+        ) -> Arc<dyn BilibiliPlaybackPlanner>,
+        hls_cache_override: Option<HlsCacheStore>,
     ) -> Self {
         options.validate().expect("invalid cache server options");
         let options = options.normalized_for_runtime();
@@ -196,7 +224,8 @@ impl AppState {
             ),
         );
         let hls_sessions = HlsPlaybackRegistry::default();
-        let hls_cache = HlsCacheStore::new(library.root_path());
+        let hls_cache =
+            hls_cache_override.unwrap_or_else(|| HlsCacheStore::new(library.root_path()));
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
         {
             Ok(sessions) => (sessions, true),
@@ -283,22 +312,16 @@ impl AppState {
         } else {
             Vec::new()
         };
+        let mut failed_startup_hls_deletion_sessions = Vec::new();
         if tasks.persistence_available() && hls_cache_scan_succeeded {
-            restored_hls_sessions.retain(|session| {
-                let authorized = restored_hls_session_is_authorized(
+            (restored_hls_sessions, failed_startup_hls_deletion_sessions) =
+                filter_authorized_restored_hls_sessions(
                     &tasks,
-                    &session.id,
-                    restorable_completed_session_ids.contains(&session.id),
+                    &hls_cache,
+                    restored_hls_sessions,
+                    &restorable_completed_session_ids,
                     completed_hls_cache_playback_supported,
                 );
-                if !authorized && let Err(error) = hls_cache.remove_session(&session.id) {
-                    eprintln!(
-                        "Failed to remove unauthorized restored HLS session {}: {error}",
-                        session.id
-                    );
-                }
-                authorized
-            });
         } else {
             restored_hls_sessions.clear();
         }
@@ -370,8 +393,10 @@ impl AppState {
             hls_finalizer_restore_sessions,
             &completed_cache_session_ids,
         );
+        let mut startup_reconciliation_sessions = persistence_pending_hls_sessions;
+        startup_reconciliation_sessions.extend(failed_startup_hls_deletion_sessions);
         state.resume_pending_hls_startup_reconciliation(
-            persistence_pending_hls_sessions,
+            startup_reconciliation_sessions,
             restorable_completed_session_ids,
             hls_finalizer_owned_session_ids,
         );
@@ -459,7 +484,7 @@ impl AppState {
                             }
                             Err(error) => {
                                 eprintln!(
-                                    "Failed to remove unauthorized HLS session {} after task persistence recovered; retrying: {error}",
+                                    "Failed to remove unauthorized HLS session {} during startup reconciliation; retrying: {error}",
                                     session.id
                                 );
                                 retry_sessions.push(session);
@@ -2080,6 +2105,37 @@ fn restored_hls_session_is_authorized(
     }
 }
 
+fn filter_authorized_restored_hls_sessions(
+    tasks: &BilibiliTaskRegistry,
+    hls_cache: &HlsCacheStore,
+    restored_sessions: Vec<HlsPlaybackSession>,
+    completed_session_ids: &HashSet<String>,
+    completed_hls_cache_playback_supported: bool,
+) -> (Vec<HlsPlaybackSession>, Vec<HlsPlaybackSession>) {
+    let mut authorized_sessions = Vec::new();
+    let mut retry_deletion_sessions = Vec::new();
+    for session in restored_sessions {
+        if restored_hls_session_is_authorized(
+            tasks,
+            &session.id,
+            completed_session_ids.contains(&session.id),
+            completed_hls_cache_playback_supported,
+        ) {
+            authorized_sessions.push(session);
+            continue;
+        }
+
+        if let Err(error) = hls_cache.remove_session(&session.id) {
+            eprintln!(
+                "Failed to remove unauthorized restored HLS session {}; retrying: {error}",
+                session.id
+            );
+            retry_deletion_sessions.push(session);
+        }
+    }
+    (authorized_sessions, retry_deletion_sessions)
+}
+
 fn build_hls_upstream_client() -> reqwest::Client {
     // Use a read timeout instead of a whole-request timeout so long segment streams
     // can continue as long as the upstream keeps making progress.
@@ -2777,13 +2833,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reconciliation_retries_failed_hls_deletion_without_quota() {
+    async fn startup_routes_failed_hls_deletion_to_reconciliation_without_quota() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
             .canonicalize()
             .unwrap_or_else(|_| temp.path().to_path_buf());
-        let state = AppState::new_with_playback_planner(
+        let session = sample_hls_session("retry-startup-hls-deletion");
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        hls_cache.fail_next_remove_session(session.id.clone());
+
+        let state = AppState::new_with_playback_planner_and_hls_cache(
             CacheServerOptions {
                 root_path,
                 task_state_path: temp.path().join(".state").join("tasks.json"),
@@ -2792,19 +2855,14 @@ mod tests {
                 ..CacheServerOptions::default()
             },
             Arc::new(NoopPlaybackPlanner),
+            hls_cache,
         );
+        assert!(state.tasks.persistence_available());
         assert!(!state.hls_cache_policy().eviction_enabled());
-        let session = sample_hls_session("retry-startup-hls-deletion");
-        state
-            .hls_cache
-            .save_session(&session)
-            .expect("orphan HLS session should persist");
-        state.hls_cache.fail_next_remove_session(session.id.clone());
-
-        state.resume_pending_hls_startup_reconciliation(
-            vec![session.clone()],
-            HashSet::new(),
-            HashSet::new(),
+        assert!(state.hls_sessions.get(&session.id).is_none());
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "failed startup deletion must remain visible to the retry owner"
         );
 
         tokio::time::timeout(Duration::from_secs(3), async {

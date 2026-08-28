@@ -406,6 +406,7 @@ impl BilibiliTaskRegistry {
             revision: output.record.revision,
             snapshot_id: output.record.snapshot_id.clone(),
             resource_lease_id: String::new(),
+            resource_lease_expires_at: Instant::now(),
             encoded_bytes: output.encoded_bytes,
             output: Arc::clone(output),
         })
@@ -437,10 +438,11 @@ impl BilibiliTaskRegistry {
             revision: output.record.revision,
             snapshot_id: output.record.snapshot_id.clone(),
             resource_lease_id: format!("task-output-resource-lease-{}", Uuid::new_v4().simple()),
+            resource_lease_expires_at: expires_at,
             encoded_bytes: output.encoded_bytes,
             output: Arc::clone(output),
         };
-        let retained = RetainedTaskResourceSnapshot::from_output(&snapshot, expires_at);
+        let retained = RetainedTaskResourceSnapshot::from_output(&snapshot);
         if !retained.output.available_resources_by_id.is_empty() {
             inner
                 .retained_resource_snapshots
@@ -3253,6 +3255,7 @@ pub(crate) struct TaskOutputSnapshot {
     pub(crate) revision: u64,
     pub(crate) snapshot_id: String,
     pub(crate) resource_lease_id: String,
+    pub(crate) resource_lease_expires_at: Instant,
     pub(crate) encoded_bytes: usize,
     pub(crate) output: Arc<VisibleTaskOutput>,
 }
@@ -3271,6 +3274,7 @@ impl TaskOutputSnapshot {
         revision: u64,
         snapshot_id: impl Into<String>,
         resource_lease_id: impl Into<String>,
+        resource_lease_expires_at: Instant,
         results: Vec<TaskResult>,
         encoded_bytes: usize,
     ) -> Self {
@@ -3293,6 +3297,7 @@ impl TaskOutputSnapshot {
             revision,
             snapshot_id,
             resource_lease_id: resource_lease_id.into(),
+            resource_lease_expires_at,
             encoded_bytes,
             output: Arc::new(output),
         }
@@ -3482,9 +3487,9 @@ struct RetainedTaskResourceSnapshot {
 }
 
 impl RetainedTaskResourceSnapshot {
-    fn from_output(snapshot: &TaskOutputSnapshot, expires_at: Instant) -> Self {
+    fn from_output(snapshot: &TaskOutputSnapshot) -> Self {
         Self {
-            expires_at,
+            expires_at: snapshot.resource_lease_expires_at,
             output: Arc::clone(&snapshot.output),
         }
     }

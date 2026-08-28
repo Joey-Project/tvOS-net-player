@@ -979,6 +979,7 @@ impl TaskResultPageStore {
         now: Instant,
     ) -> (String, Vec<String>, bool) {
         let mut released_resource_lease_ids = self.prune(now);
+        let resource_lease_expires_at = Instant::from_std(snapshot.resource_lease_expires_at);
         if let Some(existing) = self.snapshots_by_id.get_mut(&snapshot.snapshot_id)
             && existing.task_id == snapshot.task_id
             && existing.revision == snapshot.revision
@@ -988,7 +989,7 @@ impl TaskResultPageStore {
                 snapshot.resource_lease_id,
             ));
             existing.encoded_bytes = snapshot.encoded_bytes;
-            existing.expires_at = now + TASK_RESULT_PAGE_SNAPSHOT_TTL;
+            existing.expires_at = resource_lease_expires_at;
             self.snapshot_order
                 .retain(|candidate| candidate != &existing.snapshot_id);
             self.snapshot_order.push_back(existing.snapshot_id.clone());
@@ -1077,7 +1078,7 @@ impl TaskResultPageStore {
                 output: snapshot.output,
                 encoded_bytes: snapshot.encoded_bytes,
                 artifact_count,
-                expires_at: now + TASK_RESULT_PAGE_SNAPSHOT_TTL,
+                expires_at: resource_lease_expires_at,
                 tokens_by_offset: HashMap::new(),
             },
         );
@@ -1241,11 +1242,29 @@ fn first_task_result_page_blocking(
         tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
         return Err(Status::cancelled("Task result pagination was cancelled."));
     }
-    let (page, released_resource_lease_ids, _) =
-        pages.first_page(snapshot, Instant::now(), page_size);
+    let (page, released_resource_lease_ids) =
+        first_task_result_page_after_lock(&mut pages, snapshot, page_size);
     drop(pages);
     tasks.release_task_output_snapshots(&released_resource_lease_ids);
     page
+}
+
+fn first_task_result_page_after_lock(
+    pages: &mut TaskResultPageStore,
+    snapshot: crate::task_registry::TaskOutputSnapshot,
+    page_size: usize,
+) -> (TaskResultPageResult, Vec<String>) {
+    let now = Instant::now();
+    if Instant::from_std(snapshot.resource_lease_expires_at) <= now {
+        return (
+            Err(Status::deadline_exceeded(
+                "Task result snapshot expired before it could be published.",
+            )),
+            vec![snapshot.resource_lease_id],
+        );
+    }
+    let (page, released_resource_lease_ids, _) = pages.first_page(snapshot, now, page_size);
+    (page, released_resource_lease_ids)
 }
 
 fn continuation_task_result_page_blocking(
@@ -3923,23 +3942,27 @@ mod tests {
     fn duplicate_task_result_first_page_renews_snapshot_and_resource_lease() {
         let now = Instant::now();
         let refresh_at = now + Duration::from_secs(1);
+        let initial_deadline = now + Duration::from_secs(10);
+        let refreshed_deadline = refresh_at + Duration::from_secs(20);
         let results = vec![
             task_result("result-1", TaskState::Completed),
             task_result("result-2", TaskState::Completed),
         ];
-        let snapshot = |resource_lease_id: &str| {
+        let snapshot = |resource_lease_id: &str, expires_at: Instant| {
             crate::task_registry::TaskOutputSnapshot::for_tests(
                 "task-one",
                 7,
                 "snapshot-one",
                 resource_lease_id,
+                expires_at.into_std(),
                 results.clone(),
                 1024,
             )
         };
         let mut pages = TaskResultPageStore::default();
 
-        let (first_page, released, inserted) = pages.first_page(snapshot("lease-old"), now, 1);
+        let (first_page, released, inserted) =
+            pages.first_page(snapshot("lease-old", initial_deadline), now, 1);
         let first_page = first_page.expect("first page should be inserted");
         let first_token = first_page.1.next_page_token;
         assert!(inserted);
@@ -3947,22 +3970,55 @@ mod tests {
         assert!(!first_token.is_empty());
 
         let (refreshed_page, released, inserted) =
-            pages.first_page(snapshot("lease-new"), refresh_at, 1);
+            pages.first_page(snapshot("lease-new", refreshed_deadline), refresh_at, 1);
         let refreshed_page = refreshed_page.expect("duplicate first page should be served");
         assert!(!inserted);
         assert_eq!(vec!["lease-old"], released);
         assert_eq!(first_token, refreshed_page.1.next_page_token);
+        assert_eq!(
+            refreshed_deadline,
+            pages
+                .snapshots_by_id
+                .get("snapshot-one")
+                .expect("refreshed snapshot should remain stored")
+                .expires_at
+        );
 
         assert!(
             pages
-                .prune(now + TASK_RESULT_PAGE_SNAPSHOT_TTL + Duration::from_millis(500))
+                .prune(initial_deadline + Duration::from_millis(1))
                 .is_empty(),
             "the refreshed snapshot must outlive its original expiry"
         );
-        assert_eq!(
-            vec!["lease-new"],
-            pages.prune(refresh_at + TASK_RESULT_PAGE_SNAPSHOT_TTL)
+        assert_eq!(vec!["lease-new"], pages.prune(refreshed_deadline));
+    }
+
+    #[test]
+    fn expired_task_result_lease_is_released_without_publishing_page() {
+        let expired_at = StdInstant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired lease deadline should be representable");
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-expired",
+            1,
+            "snapshot-expired",
+            "lease-expired",
+            expired_at,
+            vec![task_result("result-expired", TaskState::Completed)],
+            1024,
         );
+        let mut pages = TaskResultPageStore::default();
+
+        let (page, released) = first_task_result_page_after_lock(&mut pages, snapshot, 1);
+
+        assert_eq!(
+            tonic::Code::DeadlineExceeded,
+            page.expect_err("expired snapshot must not be published")
+                .code()
+        );
+        assert_eq!(vec!["lease-expired"], released);
+        assert!(pages.snapshots_by_id.is_empty());
+        assert!(pages.cursors_by_token.is_empty());
     }
 
     #[test]
@@ -3974,6 +4030,7 @@ mod tests {
                 1,
                 format!("snapshot-{id}"),
                 lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
                 Vec::new(),
                 MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
             )
@@ -4000,6 +4057,7 @@ mod tests {
                 1,
                 format!("snapshot-{id}"),
                 lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
                 vec![task_result_with_artifacts(
                     &format!("result-{id}"),
                     artifact_count,
@@ -4043,6 +4101,7 @@ mod tests {
             1,
             "snapshot-max-artifacts",
             "lease-max-artifacts",
+            (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
             vec![task_result_with_artifacts(
                 "result-max-artifacts",
                 MAX_TASK_ARTIFACTS,
@@ -4084,6 +4143,7 @@ mod tests {
             3,
             "snapshot-large-page",
             "lease-large-page",
+            (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
             results,
             encoded_bytes,
         );
@@ -4189,7 +4249,7 @@ mod tests {
                 vec![resource],
             )
             .expect("task output should be replaced");
-        let snapshot = state
+        let mut snapshot = state
             .tasks
             .retain_task_output_snapshot(&task.id, StdInstant::now() + Duration::from_secs(60 * 60))
             .expect("snapshot should be retained");
@@ -4203,15 +4263,15 @@ mod tests {
             .expect("latest task output should remove the resource");
 
         let result_pages = Arc::clone(&state.task_result_pages);
-        let expired_snapshot_start = Instant::now()
-            .checked_sub(TASK_RESULT_PAGE_SNAPSHOT_TTL + Duration::from_millis(1))
-            .expect("snapshot start should be representable");
+        snapshot.resource_lease_expires_at = StdInstant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired lease deadline should be representable");
         let continuation_token = {
             let mut pages = result_pages
                 .lock()
                 .expect("task result page store lock should be available");
             let (page, released_resource_lease_ids, inserted) =
-                pages.first_page(snapshot, expired_snapshot_start, 1);
+                pages.first_page(snapshot, Instant::now(), 1);
             assert!(inserted);
             assert!(released_resource_lease_ids.is_empty());
             let page = page.expect("expired snapshot should still be inserted before reaping");
