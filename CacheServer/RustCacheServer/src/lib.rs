@@ -1189,9 +1189,6 @@ impl AppState {
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<Option<HlsCacheEvictionSummary>> {
         let policy = self.hls_cache_policy();
-        if !policy.eviction_enabled() {
-            return Ok(None);
-        }
         if should_cancel() {
             return Ok(None);
         }
@@ -1211,6 +1208,9 @@ impl AppState {
             self.retry_pending_hls_session_cleanups()
         };
         if should_cancel() {
+            return Ok(None);
+        }
+        if !policy.eviction_enabled() {
             return Ok(None);
         }
         let entries = self.hls_cache.completed_cache_entries()?;
@@ -1527,14 +1527,17 @@ impl AppState {
     }
 
     pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {
-        if !self.hls_cache_policy().eviction_enabled() {
-            return None;
-        }
+        Some(self.spawn_hls_cache_quota_monitor_at_interval(HLS_CACHE_EVICTION_CHECK_INTERVAL))
+    }
 
+    fn spawn_hls_cache_quota_monitor_at_interval(
+        &self,
+        check_interval: Duration,
+    ) -> JoinHandle<()> {
         let state = self.clone();
-        Some(tokio::spawn(async move {
-            let start = tokio::time::Instant::now() + HLS_CACHE_EVICTION_CHECK_INTERVAL;
-            let mut interval = tokio::time::interval_at(start, HLS_CACHE_EVICTION_CHECK_INTERVAL);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + check_interval;
+            let mut interval = tokio::time::interval_at(start, check_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
@@ -1542,7 +1545,15 @@ impl AppState {
                     eprintln!("Failed to run periodic HLS cache eviction: {error}");
                 }
             }
-        }))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_hls_cache_quota_monitor_for_tests(
+        &self,
+        check_interval: Duration,
+    ) -> JoinHandle<()> {
+        self.spawn_hls_cache_quota_monitor_at_interval(check_interval)
     }
 
     pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {

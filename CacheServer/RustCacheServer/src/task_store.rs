@@ -1020,7 +1020,7 @@ impl PersistedTaskFile {
                         "task state schema v2 task is missing output",
                     )
                 })?
-                .into_output()?,
+                .into_output(&task)?,
             _ => unreachable!("task state schema version was validated before conversion"),
         };
 
@@ -1049,44 +1049,75 @@ struct PersistedTaskOutput {
 
 impl From<TaskOutputRecord> for PersistedTaskOutput {
     fn from(output: TaskOutputRecord) -> Self {
+        let TaskOutputRecord {
+            revision,
+            snapshot_id,
+            primary_result_id,
+            results,
+            resources,
+            legacy_managed,
+        } = output;
         Self {
-            revision: output.revision,
-            snapshot_id: output.snapshot_id,
-            primary_result_id: output.primary_result_id,
-            results: output
-                .results
-                .into_iter()
-                .map(PersistedTaskResult::from)
-                .collect(),
-            resources: output
-                .resources
+            revision,
+            snapshot_id,
+            primary_result_id,
+            results: if legacy_managed {
+                Vec::new()
+            } else {
+                results.into_iter().map(PersistedTaskResult::from).collect()
+            },
+            resources: resources
                 .into_iter()
                 .map(PersistedCacheResourceRef::from)
                 .collect(),
-            legacy_managed: output.legacy_managed,
+            legacy_managed,
         }
     }
 }
 
 impl PersistedTaskOutput {
-    fn into_output(self) -> io::Result<TaskOutputRecord> {
-        let results = self
-            .results
+    fn into_output(self, task: &Task) -> io::Result<TaskOutputRecord> {
+        let PersistedTaskOutput {
+            revision,
+            snapshot_id,
+            primary_result_id,
+            results,
+            resources,
+            legacy_managed,
+        } = self;
+        let persisted_results = results
             .into_iter()
             .map(PersistedTaskResult::into_result)
             .collect::<io::Result<Vec<_>>>()?;
-        let resources = self
-            .resources
+        let resources = resources
             .into_iter()
             .map(PersistedCacheResourceRef::into_record)
             .collect::<io::Result<Vec<_>>>()?;
+        let results = if legacy_managed {
+            if !resources.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy-managed task output cannot own resources",
+                ));
+            }
+            let derived_results = TaskOutputRecord::from_legacy_task(task).results;
+            if !persisted_results.is_empty() && persisted_results != derived_results {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy-managed task output does not match its task state",
+                ));
+            }
+            derived_results
+        } else {
+            persisted_results
+        };
         TaskOutputRecord::restored(
-            self.revision,
-            self.snapshot_id,
-            self.primary_result_id,
+            revision,
+            snapshot_id,
+            primary_result_id,
             results,
             resources,
-            self.legacy_managed,
+            legacy_managed,
         )
         .map_err(invalid_data)
     }
@@ -2131,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_snapshot_to_legacy_managed_output() {
+    fn migrates_v1_snapshot_to_compact_legacy_managed_output() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
         fs::write(
@@ -2185,7 +2216,7 @@ mod tests {
         )
         .expect("v1 snapshot should be written");
 
-        let records = TaskStateStore::new(path)
+        let records = TaskStateStore::new(&path)
             .load()
             .expect("v1 snapshot should migrate");
         let output = &records[0].output;
@@ -2226,6 +2257,66 @@ mod tests {
                 nanos: 1,
             }),
             output.results[0].created_at
+        );
+
+        let expected_output = output.clone();
+        TaskStateStore::new(path.clone())
+            .save(&records)
+            .expect("migrated task state should write back as schema v2");
+        let mut persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("migrated task state should remain readable"),
+        )
+        .expect("migrated task state should remain valid JSON");
+        assert_eq!(2, persisted["schema_version"]);
+        assert_eq!(
+            0,
+            persisted["tasks"][0]["output"]["results"]
+                .as_array()
+                .expect("legacy-managed output results should be an array")
+                .len(),
+            "legacy result bodies must not be duplicated during v1 writeback"
+        );
+
+        let reloaded = TaskStateStore::new(&path)
+            .load()
+            .expect("compact legacy-managed output should reload");
+        assert_eq!(expected_output, reloaded[0].output);
+
+        persisted["tasks"][0]["output"]["results"] = serde_json::to_value(
+            expected_output
+                .results
+                .iter()
+                .cloned()
+                .map(PersistedTaskResult::from)
+                .collect::<Vec<_>>(),
+        )
+        .expect("legacy output results should serialize");
+        let mut duplicated_bytes =
+            serde_json::to_vec_pretty(&persisted).expect("duplicated v2 fixture should serialize");
+        duplicated_bytes.push(b'\n');
+        fs::write(&path, duplicated_bytes).expect("duplicated v2 fixture should be written");
+        let duplicated = TaskStateStore::new(&path)
+            .load()
+            .expect("the previous duplicated v2 representation should remain compatible");
+        assert_eq!(expected_output, duplicated[0].output);
+
+        persisted["tasks"][0]["output"]["results"][0]["title"] =
+            serde_json::Value::String("Tampered result".to_owned());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&persisted)
+                .expect("mismatched duplicated v2 fixture should serialize"),
+        )
+        .expect("mismatched duplicated v2 fixture should be written");
+        let error = match TaskStateStore::new(path).load() {
+            Ok(_) => panic!("mismatched duplicated legacy output should fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("legacy-managed task output does not match")
         );
     }
 

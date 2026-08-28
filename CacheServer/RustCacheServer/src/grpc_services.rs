@@ -10584,6 +10584,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_hls_cache_quota_monitor_retries_pending_physical_cleanup() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                hls_cache_max_bytes: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let cached =
+            create_completed_hls_playback_task(&state, "BV1disabled-cleanup", &upstream_url).await;
+        state
+            .hls_cache
+            .fail_next_remove_session(cached.task_id.clone());
+        state
+            .delete_completed_hls_library_item(&cached.library_item_id)
+            .expect_err("the first physical cleanup should remain pending");
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&cached.library_item_id)
+                .is_some()
+        );
+
+        let monitor = state.spawn_hls_cache_quota_monitor_for_tests(Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .hls_cache
+                    .get_completed_library_item(&cached.library_item_id)
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the maintenance monitor should retry pending cleanup");
+        monitor.abort();
+        let _ = monitor.await;
+
+        assert!(state.tasks.get_task(&cached.task_id).is_err());
+    }
+
+    #[tokio::test]
     async fn completed_hls_items_are_hidden_when_cache_playback_is_unsupported() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
