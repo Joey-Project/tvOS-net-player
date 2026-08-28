@@ -125,6 +125,34 @@ pub struct AppState {
     hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
     completed_hls_deletion_lock: Arc<Mutex<()>>,
     pending_hls_session_cleanup_by_library_item: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
+}
+
+#[derive(Clone)]
+struct PendingHlsRuntimeStartup {
+    finalizer_restore_sessions: Option<Vec<HlsPlaybackSession>>,
+    completed_cache_session_ids: Arc<HashSet<String>>,
+    reconciliation_sessions: Vec<HlsPlaybackSession>,
+    restorable_completed_session_ids: Arc<HashSet<String>>,
+    finalizer_owned_session_ids: Arc<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct HlsRuntimeStartupState {
+    pending: Option<PendingHlsRuntimeStartup>,
+    worker_running: bool,
+}
+
+struct HlsRuntimeStartupWorkerGuard {
+    startup: Arc<Mutex<HlsRuntimeStartupState>>,
+}
+
+impl Drop for HlsRuntimeStartupWorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut startup) = self.startup.lock() {
+            startup.worker_running = false;
+        }
+    }
 }
 
 pub(crate) struct HlsCacheEvictionProtectionGuard {
@@ -355,6 +383,22 @@ impl AppState {
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
         let hls_playback_progress = HlsPlaybackProgressTracker::default();
+        let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
+            restored_hls_sessions
+        } else {
+            persistence_pending_hls_sessions.clone()
+        };
+        let mut startup_reconciliation_sessions = persistence_pending_hls_sessions;
+        startup_reconciliation_sessions.extend(failed_startup_hls_deletion_sessions);
+        let pending_hls_runtime_startup = (!hls_finalizer_restore_sessions.is_empty()
+            || !startup_reconciliation_sessions.is_empty())
+        .then(|| PendingHlsRuntimeStartup {
+            finalizer_restore_sessions: Some(hls_finalizer_restore_sessions),
+            completed_cache_session_ids: Arc::new(completed_cache_session_ids),
+            reconciliation_sessions: startup_reconciliation_sessions,
+            restorable_completed_session_ids: Arc::new(restorable_completed_session_ids),
+            finalizer_owned_session_ids: Arc::new(HashSet::new()),
+        });
 
         let state = Self {
             options,
@@ -383,38 +427,62 @@ impl AppState {
             hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
             completed_hls_deletion_lock: Arc::new(Mutex::new(())),
             pending_hls_session_cleanup_by_library_item: Arc::new(Mutex::new(HashMap::new())),
+            hls_runtime_startup: Arc::new(Mutex::new(HlsRuntimeStartupState {
+                pending: pending_hls_runtime_startup,
+                worker_running: false,
+            })),
         };
-        let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
-            &restored_hls_sessions
-        } else {
-            &persistence_pending_hls_sessions
-        };
-        let hls_finalizer_owned_session_ids = state.resume_incomplete_hls_cache_finalizers(
-            hls_finalizer_restore_sessions,
-            &completed_cache_session_ids,
-        );
-        let mut startup_reconciliation_sessions = persistence_pending_hls_sessions;
-        startup_reconciliation_sessions.extend(failed_startup_hls_deletion_sessions);
-        state.resume_pending_hls_startup_reconciliation(
-            startup_reconciliation_sessions,
-            restorable_completed_session_ids,
-            hls_finalizer_owned_session_ids,
-        );
+        state.ensure_hls_runtime_startup();
         state
     }
 
-    fn resume_pending_hls_startup_reconciliation(
-        &self,
-        restored_sessions: Vec<HlsPlaybackSession>,
-        completed_session_ids: HashSet<String>,
-        finalizer_owned_session_ids: HashSet<String>,
-    ) {
-        if restored_sessions.is_empty() {
-            return;
-        }
+    fn ensure_hls_runtime_startup(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let mut pending = {
+            let mut startup = self
+                .hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned");
+            if startup.worker_running {
+                return;
+            }
+            let Some(pending) = startup.pending.clone() else {
+                return;
+            };
+            startup.worker_running = true;
+            pending
+        };
+        let worker_guard = HlsRuntimeStartupWorkerGuard {
+            startup: Arc::clone(&self.hls_runtime_startup),
+        };
+
+        if let Some(finalizer_restore_sessions) = pending.finalizer_restore_sessions.take() {
+            let finalizer_owned_session_ids =
+                Arc::new(self.resume_incomplete_hls_cache_finalizers(
+                    &finalizer_restore_sessions,
+                    &pending.completed_cache_session_ids,
+                ));
+            pending.finalizer_owned_session_ids = Arc::clone(&finalizer_owned_session_ids);
+            let mut startup = self
+                .hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned");
+            if let Some(shared_pending) = startup.pending.as_mut() {
+                shared_pending.finalizer_restore_sessions = None;
+                shared_pending.finalizer_owned_session_ids = finalizer_owned_session_ids;
+            }
+        }
+
+        if pending.reconciliation_sessions.is_empty() {
+            self.hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned")
+                .pending = None;
+            drop(worker_guard);
+            return;
+        }
 
         let tasks = Arc::downgrade(&self.tasks);
         let hls_sessions = self.hls_sessions.clone();
@@ -425,8 +493,10 @@ impl AppState {
         let hls_cache_quota_enforcement_lock = Arc::clone(&self.hls_cache_quota_enforcement_lock);
         let completed_hls_deletion_lock = Arc::clone(&self.completed_hls_deletion_lock);
         let completed_hls_cache_playback_supported = self.completed_hls_cache_playback_supported;
+        let startup = Arc::clone(&self.hls_runtime_startup);
         handle.spawn(async move {
-            let mut pending_sessions = restored_sessions;
+            let _worker_guard = worker_guard;
+            let mut pending_sessions = pending.reconciliation_sessions;
             loop {
                 let Some(tasks) = tasks.upgrade() else {
                     return;
@@ -440,7 +510,7 @@ impl AppState {
                 {
                     let mut retry_sessions = Vec::new();
                     for session in pending_sessions {
-                        if finalizer_owned_session_ids.contains(&session.id)
+                        if pending.finalizer_owned_session_ids.contains(&session.id)
                             && hls_fill_scheduler.owns_session(&session.id)
                         {
                             retry_sessions.push(session);
@@ -453,13 +523,14 @@ impl AppState {
                         let _deletion_guard = completed_hls_deletion_lock
                             .lock()
                             .expect("completed HLS deletion lock poisoned");
-                        if finalizer_owned_session_ids.contains(&session.id)
+                        if pending.finalizer_owned_session_ids.contains(&session.id)
                             && hls_fill_scheduler.owns_session(&session.id)
                         {
                             retry_sessions.push(session);
                             continue;
                         }
-                        let completed_session_is_available = completed_session_ids
+                        let completed_session_is_available = pending
+                            .restorable_completed_session_ids
                             .contains(&session.id)
                             || hls_cache.completed_session(&session.id).is_some();
                         if restored_hls_session_is_authorized(
@@ -491,15 +562,45 @@ impl AppState {
                             }
                         }
                     }
+                    let mut startup = startup.lock().expect("HLS runtime startup lock poisoned");
                     if retry_sessions.is_empty() {
+                        startup.pending = None;
                         return;
                     }
+                    if let Some(shared_pending) = startup.pending.as_mut() {
+                        shared_pending.reconciliation_sessions = retry_sessions.clone();
+                    }
+                    drop(startup);
                     pending_sessions = retry_sessions;
                 }
                 drop(tasks);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+    }
+
+    #[cfg(test)]
+    fn resume_pending_hls_startup_reconciliation(
+        &self,
+        restored_sessions: Vec<HlsPlaybackSession>,
+        completed_session_ids: HashSet<String>,
+        finalizer_owned_session_ids: HashSet<String>,
+    ) {
+        let mut startup = self
+            .hls_runtime_startup
+            .lock()
+            .expect("HLS runtime startup lock poisoned");
+        assert!(!startup.worker_running);
+        assert!(startup.pending.is_none());
+        startup.pending = Some(PendingHlsRuntimeStartup {
+            finalizer_restore_sessions: None,
+            completed_cache_session_ids: Arc::new(HashSet::new()),
+            reconciliation_sessions: restored_sessions,
+            restorable_completed_session_ids: Arc::new(completed_session_ids),
+            finalizer_owned_session_ids: Arc::new(finalizer_owned_session_ids),
+        });
+        drop(startup);
+        self.ensure_hls_runtime_startup();
     }
 
     fn resume_incomplete_hls_cache_finalizers(
@@ -2157,6 +2258,7 @@ pub async fn run(
 pub async fn run_with_state(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let grpc_addrs = state.options.grpc_listen_addrs()?;
     let media_addrs = state.options.media_listen_addrs()?;
     let grpc_listeners = bind_listener_group(grpc_addrs).await?;
@@ -2187,6 +2289,7 @@ pub async fn run_grpc_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_grpc_listener).await
 }
@@ -2195,6 +2298,7 @@ pub async fn run_grpc_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listener = bind_tcp_listener(addr).await?;
     run_grpc_listener(listener, state).await
 }
@@ -2204,6 +2308,7 @@ pub async fn run_grpc_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     Server::builder()
         .add_service(ServerServiceServer::new(ServerGrpcService::new(
             state.clone(),
@@ -2222,6 +2327,7 @@ pub async fn run_media_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_media_listener).await
 }
@@ -2230,6 +2336,7 @@ pub async fn run_media_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listener = bind_tcp_listener(addr).await?;
     run_media_listener(listener, state).await
 }
@@ -2239,6 +2346,7 @@ pub async fn run_media_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let router = Router::new()
         .route("/", get(root))
         .route(
@@ -2875,6 +2983,68 @@ mod tests {
         })
         .await
         .expect("failed startup HLS deletion should retry without quota activity");
+    }
+
+    #[test]
+    fn media_listener_starts_deferred_hls_startup_reconciliation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let session = sample_hls_session("runtime-deferred-startup-reconciliation");
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        hls_cache.fail_next_remove_session(session.id.clone());
+
+        let state = AppState::new_with_playback_planner_and_hls_cache(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                hls_cache_max_bytes: 0,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+            hls_cache,
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "runtime-free construction must retain failed startup cleanup work"
+        );
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime should build")
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("media listener should bind");
+                let server = tokio::spawn(run_media_listener(listener, state.clone()));
+
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if state.hls_cache.playback_session(&session.id).is_none() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("media listener should start deferred HLS reconciliation");
+
+                server.abort();
+                assert!(
+                    server
+                        .await
+                        .expect_err("aborted media listener should not complete normally")
+                        .is_cancelled()
+                );
+            });
     }
 
     #[test]

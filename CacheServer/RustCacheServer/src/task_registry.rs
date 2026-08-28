@@ -111,6 +111,7 @@ struct StagedTaskOutputResources<'a> {
 
 impl<'a> StagedTaskOutputResources<'a> {
     fn new(registry: &'a BilibiliTaskRegistry, resource_ids: HashSet<String>) -> Self {
+        registry.register_staged_task_output_resources(&resource_ids);
         Self {
             registry,
             resource_ids: Some(resource_ids),
@@ -118,7 +119,10 @@ impl<'a> StagedTaskOutputResources<'a> {
     }
 
     fn disarm(mut self) {
-        self.resource_ids = None;
+        if let Some(resource_ids) = self.resource_ids.take() {
+            self.registry
+                .release_staged_task_output_resources(&resource_ids);
+        }
     }
 }
 
@@ -126,7 +130,7 @@ impl Drop for StagedTaskOutputResources<'_> {
     fn drop(&mut self) {
         if let Some(resource_ids) = self.resource_ids.take() {
             self.registry
-                .reserve_rejected_staged_resource_cleanup(resource_ids);
+                .reject_staged_task_output_resources(resource_ids);
         }
     }
 }
@@ -465,8 +469,8 @@ impl BilibiliTaskRegistry {
             .iter()
             .map(|resource| resource.resource.id.clone())
             .collect::<HashSet<_>>();
-        self.retire_expired_task_resources_except(&candidate_resource_ids);
         let staged_resources = StagedTaskOutputResources::new(self, candidate_resource_ids.clone());
+        self.retire_expired_task_resources_except(&candidate_resource_ids);
         if !self
             .resource_storage_available
             .load(AtomicOrdering::Acquire)
@@ -511,7 +515,13 @@ impl BilibiliTaskRegistry {
         for resource in &resources {
             let resource_id = resource.resource.id.as_str();
             let current_task_owns_id = current_task_resource_ids.contains(resource_id);
-            if other_task_resource_ids.contains(resource_id)
+            let staged_owner_count = inner
+                .staged_resource_owner_counts
+                .get(resource_id)
+                .copied()
+                .unwrap_or_default();
+            if staged_owner_count > 1
+                || other_task_resource_ids.contains(resource_id)
                 || (!current_task_owns_id
                     && (visible_resource_ids.contains(resource_id)
                         || retained_resource_ids.contains(resource_id)
@@ -544,6 +554,7 @@ impl BilibiliTaskRegistry {
         );
         projected_resource_ids.extend(inner.pending_resource_cleanup_ids.iter().cloned());
         projected_resource_ids.extend(inner.durable_resource_cleanup_ids.iter().cloned());
+        projected_resource_ids.extend(inner.staged_resource_owner_counts.keys().cloned());
         projected_resource_ids.extend(candidate_resource_ids.iter().cloned());
         if projected_resource_ids.len() > MAX_REGISTERED_TASK_RESOURCES {
             return Err(Status::resource_exhausted(format!(
@@ -603,7 +614,6 @@ impl BilibiliTaskRegistry {
             .get(&normalized_id)
             .expect("known task must exist")
             .clone();
-        staged_resources.disarm();
         let outcome = if requires_persistence {
             Self::stage_publication_locked(&mut inner, task.clone());
             self.persist_and_publish_pending(inner, true, Some(checkpoint))
@@ -616,6 +626,7 @@ impl BilibiliTaskRegistry {
                 "Task output could not be persisted durably.",
             ));
         }
+        staged_resources.disarm();
         Ok(task)
     }
 
@@ -2824,9 +2835,28 @@ impl BilibiliTaskRegistry {
             .expect("task registry mutation lock poisoned")
     }
 
-    fn reserve_rejected_staged_resource_cleanup(&self, resource_ids: HashSet<String>) {
+    fn register_staged_task_output_resources(&self, resource_ids: &HashSet<String>) {
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        for resource_id in resource_ids {
+            let count = inner
+                .staged_resource_owner_counts
+                .entry(resource_id.clone())
+                .or_default();
+            *count = count
+                .checked_add(1)
+                .expect("staged task resource owner count must not overflow");
+        }
+    }
+
+    fn release_staged_task_output_resources(&self, resource_ids: &HashSet<String>) {
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        release_staged_resource_owners_locked(&mut inner, resource_ids);
+    }
+
+    fn reject_staged_task_output_resources(&self, resource_ids: HashSet<String>) {
         let cleanup_needed = {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            release_staged_resource_owners_locked(&mut inner, &resource_ids);
             reserve_unowned_resource_cleanup_locked(&mut inner, resource_ids)
         };
         if cleanup_needed
@@ -3430,6 +3460,7 @@ struct RegistryInner {
     planning_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     watchers: HashMap<Uuid, TaskWatcher>,
     retained_resource_snapshots: HashMap<String, RetainedTaskResourceSnapshot>,
+    staged_resource_owner_counts: HashMap<String, usize>,
     pending_resource_cleanup_ids: HashSet<String>,
     durable_resource_cleanup_ids: HashSet<String>,
     resource_storage_revalidation_ids: HashSet<String>,
@@ -4320,6 +4351,12 @@ fn resource_body_owner_ids_locked<'a>(
                 })
                 .map(|resource| resource.resource.id.as_str()),
         )
+        .chain(
+            inner
+                .staged_resource_owner_counts
+                .keys()
+                .map(String::as_str),
+        )
         .collect()
 }
 
@@ -4408,7 +4445,29 @@ fn reserved_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
         .chain(inner.pending_resource_cleanup_ids.iter().cloned())
         .chain(inner.durable_resource_cleanup_ids.iter().cloned())
         .chain(inner.resource_storage_revalidation_ids.iter().cloned())
+        .chain(inner.staged_resource_owner_counts.keys().cloned())
         .collect()
+}
+
+fn release_staged_resource_owners_locked(
+    inner: &mut RegistryInner,
+    resource_ids: &HashSet<String>,
+) {
+    for resource_id in resource_ids {
+        let remove_owner = {
+            let count = inner
+                .staged_resource_owner_counts
+                .get_mut(resource_id)
+                .expect("staged task resource owner must be registered");
+            *count = count
+                .checked_sub(1)
+                .expect("staged task resource owner count must remain positive");
+            *count == 0
+        };
+        if remove_owner {
+            inner.staged_resource_owner_counts.remove(resource_id);
+        }
+    }
 }
 
 fn reserve_unowned_resource_cleanup_locked(
@@ -8439,6 +8498,69 @@ mod tests {
             registry
                 .open_task_resource("unavailable-owned-resource")
                 .expect("unavailable resource storage should remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn replacement_stages_resource_ownership_before_startup_scan_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let mut expired = test_task_resource("expired-before-replacement", 7);
+        expired.resource.expires_at = Some(Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        let expired_path = write_task_resource_body(&root_path, &expired, b"expired");
+
+        let mut record = persisted_task_record("staged-resource-task", "BV1staged-resource");
+        record.output = TaskOutputRecord::replace(
+            Some(&record.output),
+            vec![test_task_result_with_resources(
+                "expired-result",
+                std::slice::from_ref(&expired),
+            )],
+            vec![expired],
+        )
+        .expect("persisted output should be valid");
+        TaskStateStore::new(&state_path)
+            .save(&[record])
+            .expect("fixture should persist");
+        let rewrite_blocker = state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&rewrite_blocker).expect("directory should block startup rewrite");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        assert!(!registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
+        assert!(expired_path.exists());
+
+        std::fs::remove_dir(&rewrite_blocker).expect("startup rewrite blocker should be removable");
+        let replacement = test_task_resource("staged-during-startup-scan", 5);
+        let replacement_path = write_task_resource_body(&root_path, &replacement, b"fresh");
+        registry
+            .replace_task_output(
+                "staged-resource-task",
+                vec![test_task_result_with_resources(
+                    "replacement-result",
+                    std::slice::from_ref(&replacement),
+                )],
+                vec![replacement],
+            )
+            .expect("replacement should recover persistence without deleting its staged body");
+
+        assert!(registry.persistence_available());
+        assert!(registry.task_output_v2_available());
+        assert!(!expired_path.exists());
+        assert!(replacement_path.exists());
+        assert!(
+            registry
+                .open_task_resource("staged-during-startup-scan")
+                .expect("replacement resource storage should remain readable")
                 .is_some()
         );
     }
