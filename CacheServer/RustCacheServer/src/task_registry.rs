@@ -2833,11 +2833,11 @@ impl BilibiliTaskRegistry {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
             prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
             let now = current_timestamp();
-            let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
+            let resource_body_owner_ids = resource_body_owner_ids_locked(&inner, &now);
             inner
                 .durable_resource_cleanup_ids
                 .iter()
-                .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
+                .filter(|resource_id| !resource_body_owner_ids.contains(resource_id.as_str()))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -2891,10 +2891,10 @@ impl BilibiliTaskRegistry {
         if !cleaned.is_empty() {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
             let now = current_timestamp();
-            let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
+            let resource_body_owner_ids = resource_body_owner_ids_locked(&inner, &now);
             let cleaned = cleaned
                 .into_iter()
-                .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
+                .filter(|resource_id| !resource_body_owner_ids.contains(resource_id.as_str()))
                 .collect::<Vec<_>>();
             for resource_id in cleaned {
                 inner.durable_resource_cleanup_ids.remove(&resource_id);
@@ -2959,12 +2959,11 @@ impl BilibiliTaskRegistry {
         }
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let now = current_timestamp();
-        let authorized_resource_ids = authorized_resource_ids_locked(&inner, &now);
+        let resource_body_owner_ids = resource_body_owner_ids_locked(&inner, &now);
         let orphaned_resource_ids = resource_ids
             .into_iter()
-            .filter(|resource_id| !authorized_resource_ids.contains(resource_id.as_str()))
+            .filter(|resource_id| !resource_body_owner_ids.contains(resource_id.as_str()))
             .collect::<Vec<_>>();
-        drop(authorized_resource_ids);
         for resource_id in orphaned_resource_ids {
             inner.durable_resource_cleanup_ids.insert(resource_id);
         }
@@ -4158,22 +4157,22 @@ fn prune_expired_resource_snapshots_locked(inner: &mut RegistryInner, now: Insta
         .retain(|_, snapshot| snapshot.expires_at > now);
 }
 
-fn authorized_resource_ids_locked<'a>(
+fn resource_body_owner_ids_locked<'a>(
     inner: &'a RegistryInner,
     now: &Timestamp,
 ) -> HashSet<&'a str> {
     inner
-        .visible_outputs_by_task_id
+        .outputs_by_task_id
         .values()
-        .flat_map(|output| output.available_resources_by_id.values())
-        .filter(|resource| {
-            resource
-                .resource
-                .expires_at
-                .as_ref()
-                .is_none_or(|expires_at| timestamp_nanos(expires_at) > timestamp_nanos(now))
-        })
+        .flat_map(|output| &output.resources)
         .map(|resource| resource.resource.id.as_str())
+        .chain(
+            inner
+                .visible_outputs_by_task_id
+                .values()
+                .flat_map(|output| &output.record.resources)
+                .map(|resource| resource.resource.id.as_str()),
+        )
         .chain(
             inner
                 .retained_resource_snapshots
@@ -7943,6 +7942,158 @@ mod tests {
         assert!(registry.task_output_v2_available());
         assert!(!resource_path.exists());
         assert!(!resource_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn startup_scan_preserves_owned_resources_until_their_transition_is_durable() {
+        use crate::generated::tvos_net_player::v1::{
+            TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let pending = test_task_resource("pending-owned-resource", 7);
+        let unavailable = test_task_resource("unavailable-owned-resource", 11);
+        let mut expired = test_task_resource("expired-owned-resource", 7);
+        expired.resource.expires_at = Some(Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        let pending_path = write_task_resource_body(&root_path, &pending, b"pending");
+        let unavailable_path = write_task_resource_body(&root_path, &unavailable, b"unavailable");
+        let expired_path = write_task_resource_body(&root_path, &expired, b"expired");
+
+        let mut record = persisted_task_record("owned-resource-task", "BV1owned-resource");
+        record.output = TaskOutputRecord::replace(
+            Some(&record.output),
+            vec![TaskResult {
+                id: "owned-resource-result".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![
+                    TaskArtifact {
+                        id: "pending-artifact".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Pending.into(),
+                        resource: Some(pending.resource.clone()),
+                        ..Default::default()
+                    },
+                    TaskArtifact {
+                        id: "unavailable-artifact".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Unavailable.into(),
+                        resource: Some(unavailable.resource.clone()),
+                        ..Default::default()
+                    },
+                    TaskArtifact {
+                        id: "expired-artifact".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(expired.resource.clone()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            vec![pending.clone(), unavailable.clone(), expired],
+        )
+        .expect("persisted output should be valid");
+        TaskStateStore::new(&state_path)
+            .save(&[record])
+            .expect("fixture should persist");
+        std::fs::create_dir(state_path.with_file_name("tasks.json.tmp"))
+            .expect("directory should block startup rewrite");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert!(!registry.persistence_available());
+        assert_eq!(
+            3,
+            registry
+                .task_output_snapshot("owned-resource-task")
+                .expect("owned output should restore")
+                .output
+                .record
+                .resources
+                .len()
+        );
+        assert!(pending_path.exists());
+        assert!(unavailable_path.exists());
+        assert!(expired_path.exists());
+
+        std::fs::remove_dir(state_path.with_file_name("tasks.json.tmp"))
+            .expect("startup rewrite blocker should be removable");
+        assert!(registry.retry_pending_persistence());
+        assert!(registry.task_output_v2_available());
+        assert_eq!(
+            3,
+            registry
+                .task_output_snapshot("owned-resource-task")
+                .expect("durable output should remain visible")
+                .output
+                .record
+                .resources
+                .len()
+        );
+        assert!(pending_path.exists());
+        assert!(unavailable_path.exists());
+        assert!(
+            expired_path.exists(),
+            "startup cleanup must not precede durable expiry retirement"
+        );
+
+        let retired = registry
+            .retain_task_output_snapshot(
+                "owned-resource-task",
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("expired resource retirement should become durable");
+        assert_eq!(2, retired.output.record.resources.len());
+        assert!(!expired_path.exists());
+        assert!(pending_path.exists());
+        assert!(unavailable_path.exists());
+
+        registry
+            .replace_task_output(
+                "owned-resource-task",
+                vec![TaskResult {
+                    id: "owned-resource-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![
+                        TaskArtifact {
+                            id: "pending-artifact".to_owned(),
+                            kind: TaskArtifactKind::Subtitle.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(pending.resource.clone()),
+                            ..Default::default()
+                        },
+                        TaskArtifact {
+                            id: "unavailable-artifact".to_owned(),
+                            kind: TaskArtifactKind::Subtitle.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(unavailable.resource.clone()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                vec![pending, unavailable],
+            )
+            .expect("owned bodies should survive a later availability transition");
+        assert!(
+            registry
+                .open_task_resource("pending-owned-resource")
+                .is_some()
+        );
+        assert!(
+            registry
+                .open_task_resource("unavailable-owned-resource")
+                .is_some()
+        );
     }
 
     #[test]

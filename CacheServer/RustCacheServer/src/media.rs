@@ -1037,6 +1037,7 @@ fn resource_range_not_satisfiable_response(
 }
 
 fn apply_resource_headers(headers: &mut HeaderMap, supports_byte_ranges: bool, etag: &str) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     headers.insert(
         ACCEPT_RANGES,
         if supports_byte_ranges {
@@ -1664,6 +1665,16 @@ mod tests {
         assert!(body.is_empty());
     }
 
+    fn assert_resource_requires_revalidation(response: &Response<Body>) {
+        assert_eq!(
+            Some("private, no-cache"),
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+        );
+    }
+
     #[test]
     fn parses_standard_ranges() {
         assert_eq!(Some(ByteRange { start: 0, end: 3 }), parse("bytes=0-3", 16));
@@ -1698,6 +1709,7 @@ mod tests {
         assert_eq!("16", response.headers()[CONTENT_LENGTH]);
         assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
         assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+        assert_resource_requires_revalidation(&response);
         assert_eq!(
             Some("nosniff"),
             response
@@ -1771,6 +1783,7 @@ mod tests {
             assert_eq!("bytes", response.headers()[ACCEPT_RANGES]);
             assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
             assert!(!response.headers().contains_key(CONTENT_RANGE));
+            assert_resource_requires_revalidation(&response);
             assert!(
                 to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -1802,6 +1815,7 @@ mod tests {
             assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
             assert_eq!(expected_range, response.headers()[CONTENT_RANGE]);
             assert_eq!("4", response.headers()[CONTENT_LENGTH]);
+            assert_resource_requires_revalidation(&response);
             assert_eq!(
                 expected_body,
                 &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
@@ -1892,6 +1906,7 @@ mod tests {
 
             assert_eq!(StatusCode::NOT_MODIFIED, response.status());
             assert_eq!("\"resource-v1\"", response.headers()[ETAG]);
+            assert_resource_requires_revalidation(&response);
             assert!(
                 to_bytes(response.into_body(), usize::MAX)
                     .await

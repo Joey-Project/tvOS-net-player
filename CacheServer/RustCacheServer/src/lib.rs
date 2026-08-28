@@ -628,6 +628,10 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return Ok(Some(false));
         }
+        let _quota_guard = self
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("HLS cache quota enforcement lock poisoned");
         let _deletion_guard = self
             .completed_hls_deletion_lock
             .lock()
@@ -2420,6 +2424,101 @@ mod tests {
             std::fs::read(&task_state_path)
                 .expect("malformed task snapshot should be preserved")
                 .as_slice()
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_hls_deletion_waits_for_the_quota_snapshot_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let session_id = "manual-delete-quota-lock";
+        let mut session = sample_hls_session(session_id);
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        let item_id = state
+            .hls_cache
+            .cache_session_resources(&reqwest::Client::new(), &session)
+            .await
+            .expect("raw completed HLS item should be cached");
+        let quota_guard = state
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("quota lock should be acquired for test");
+        let delete_state = state.clone();
+        let delete_item_id = item_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let deletion = thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test should observe deletion start");
+            let result = delete_state.delete_completed_hls_library_item(&delete_item_id);
+            finished_tx
+                .send(result)
+                .expect("test should observe deletion result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deletion thread should start");
+
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "manual deletion must wait until the quota snapshot is released"
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+
+        drop(quota_guard);
+        assert_eq!(
+            Some(true),
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("deletion should finish after quota unlock")
+                .expect("manual deletion should succeed")
+        );
+        deletion.join().expect("deletion thread should not panic");
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_none()
         );
         upstream_task.abort();
     }
