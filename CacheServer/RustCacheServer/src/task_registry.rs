@@ -283,7 +283,7 @@ impl BilibiliTaskRegistry {
     }
 
     #[cfg(test)]
-    fn block_next_persistence_save(
+    pub(crate) fn block_next_persistence_save(
         &self,
         entered: Arc<std::sync::Barrier>,
         resume: Arc<std::sync::Barrier>,
@@ -1437,7 +1437,7 @@ impl BilibiliTaskRegistry {
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         if self.persistence.is_some() && !self.persistence_available() {
             let outcome = self.persist_and_publish_pending(inner, true, None);
-            if !outcome.is_committed() {
+            if !outcome.is_durable() {
                 return Err(Status::unavailable(
                     "Pending task state could not be persisted before HLS cache completion.",
                 ));
@@ -7650,6 +7650,13 @@ mod tests {
             .expect("the installed completion should remain visible while durability retries");
         assert_eq!(TaskState::Completed, installed.state());
         assert_eq!(library_item_id, installed.library_item_id);
+
+        registry.fail_next_persistence_directory_sync();
+        let error = registry
+            .complete_playback_cached(&created.task.id, library_item_id.clone())
+            .expect_err("another directory sync failure must keep the finalizer queued");
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(!registry.persistence_available());
 
         let completed = registry
             .complete_playback_cached(&created.task.id, library_item_id.clone())

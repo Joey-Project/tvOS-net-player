@@ -963,8 +963,13 @@ impl TaskResultPageStore {
         bool,
         Option<TaskResultPageRegistration>,
     ) {
-        let (snapshot_id, mut released_resource_lease_ids, inserted_new_snapshot) =
-            self.insert(snapshot, now);
+        let (insertion, mut released_resource_lease_ids) = self.insert(snapshot, now);
+        let (snapshot_id, inserted_new_snapshot) = match insertion {
+            Ok(insertion) => insertion,
+            Err(error) => {
+                return (Err(error), released_resource_lease_ids, false, None);
+            }
+        };
         let mut registration = self.register_first_page(&snapshot_id);
         let page = self.page(&snapshot_id, 0, page_size);
         if page.is_err()
@@ -999,7 +1004,7 @@ impl TaskResultPageStore {
         &mut self,
         snapshot: crate::task_registry::TaskOutputSnapshot,
         now: Instant,
-    ) -> (String, Vec<String>, bool) {
+    ) -> (Result<(String, bool), Status>, Vec<String>) {
         let mut released_resource_lease_ids = self.prune(now);
         let resource_lease_expires_at = Instant::from_std(snapshot.resource_lease_expires_at);
         if let Some(existing) = self.snapshots_by_id.get_mut(&snapshot.snapshot_id)
@@ -1016,9 +1021,8 @@ impl TaskResultPageStore {
                 .retain(|candidate| candidate != &existing.snapshot_id);
             self.snapshot_order.push_back(existing.snapshot_id.clone());
             return (
-                existing.snapshot_id.clone(),
+                Ok((existing.snapshot_id.clone(), false)),
                 released_resource_lease_ids,
-                false,
             );
         }
 
@@ -1029,59 +1033,18 @@ impl TaskResultPageStore {
             .iter()
             .map(|result| result.artifacts.len())
             .fold(0_usize, usize::saturating_add);
-
-        while self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS {
-            let Some(oldest_id) = self.snapshot_order.pop_front() else {
-                break;
+        let result_count = snapshot.output.record.results.len();
+        while self.snapshot_budget_exceeded(artifact_count, result_count, snapshot.encoded_bytes) {
+            let Some(resource_lease_id) = self.evict_oldest_published_snapshot() else {
+                released_resource_lease_ids.push(snapshot.resource_lease_id);
+                return (
+                    Err(Status::resource_exhausted(
+                        "Task result snapshot capacity is busy; retry the request shortly.",
+                    )),
+                    released_resource_lease_ids,
+                );
             };
-            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
-                released_resource_lease_ids.push(resource_lease_id);
-            }
-        }
-        while self
-            .snapshots_by_id
-            .values()
-            .map(|snapshot| snapshot.artifact_count)
-            .sum::<usize>()
-            .saturating_add(artifact_count)
-            > MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
-        {
-            let Some(oldest_id) = self.snapshot_order.pop_front() else {
-                break;
-            };
-            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
-                released_resource_lease_ids.push(resource_lease_id);
-            }
-        }
-        while self
-            .snapshots_by_id
-            .values()
-            .map(|snapshot| snapshot.output.record.results.len())
-            .sum::<usize>()
-            .saturating_add(snapshot.output.record.results.len())
-            > MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS
-        {
-            let Some(oldest_id) = self.snapshot_order.pop_front() else {
-                break;
-            };
-            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
-                released_resource_lease_ids.push(resource_lease_id);
-            }
-        }
-        while self
-            .snapshots_by_id
-            .values()
-            .map(|snapshot| snapshot.encoded_bytes)
-            .sum::<usize>()
-            .saturating_add(snapshot.encoded_bytes)
-            > MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES
-        {
-            let Some(oldest_id) = self.snapshot_order.pop_front() else {
-                break;
-            };
-            if let Some(resource_lease_id) = self.remove_snapshot(&oldest_id) {
-                released_resource_lease_ids.push(resource_lease_id);
-            }
+            released_resource_lease_ids.push(resource_lease_id);
         }
 
         let snapshot_id = if self.snapshots_by_id.contains_key(&snapshot.snapshot_id) {
@@ -1106,7 +1069,47 @@ impl TaskResultPageStore {
                 pending_first_page_registrations: HashSet::new(),
             },
         );
-        (snapshot_id, released_resource_lease_ids, true)
+        (Ok((snapshot_id, true)), released_resource_lease_ids)
+    }
+
+    fn snapshot_budget_exceeded(
+        &self,
+        incoming_artifact_count: usize,
+        incoming_result_count: usize,
+        incoming_encoded_bytes: usize,
+    ) -> bool {
+        self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.artifact_count)
+                .sum::<usize>()
+                .saturating_add(incoming_artifact_count)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.output.record.results.len())
+                .sum::<usize>()
+                .saturating_add(incoming_result_count)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.encoded_bytes)
+                .sum::<usize>()
+                .saturating_add(incoming_encoded_bytes)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES
+    }
+
+    fn evict_oldest_published_snapshot(&mut self) -> Option<String> {
+        let oldest_id = self.snapshot_order.iter().find_map(|snapshot_id| {
+            self.snapshots_by_id
+                .get(snapshot_id)
+                .is_some_and(|snapshot| snapshot.published)
+                .then(|| snapshot_id.clone())
+        })?;
+        self.remove_snapshot(&oldest_id)
     }
 
     fn register_first_page(&mut self, snapshot_id: &str) -> Option<TaskResultPageRegistration> {
@@ -2273,13 +2276,26 @@ async fn complete_playback_planning_terminal(
     hls_session_ids.dedup();
 
     loop {
-        let completion = match terminal_state {
+        let tasks = Arc::clone(&state.tasks);
+        let owned_task_id = task_id.to_owned();
+        let owned_message = message.clone();
+        let completion = match tokio::task::spawn_blocking(move || match terminal_state {
             PlaybackPlanningTerminalState::Failed => {
-                state.tasks.complete_task_failed(task_id, message.clone())
+                tasks.complete_task_failed(&owned_task_id, owned_message)
             }
-            PlaybackPlanningTerminalState::Cancelled => state
-                .tasks
-                .complete_task_cancelled(task_id, message.clone()),
+            PlaybackPlanningTerminalState::Cancelled => {
+                tasks.complete_task_cancelled(&owned_task_id, owned_message)
+            }
+        })
+        .await
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                eprintln!(
+                    "Failed to join Bilibili playback planning completion for task {task_id}: {error}"
+                );
+                return false;
+            }
         };
         match completion {
             Ok(_)
@@ -4284,15 +4300,71 @@ mod tests {
         };
         let mut pages = TaskResultPageStore::default();
 
-        let (_, released, inserted, _) = pages.first_page(snapshot("one", "lease-one"), now, 1);
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("one", "lease-one"), now, 1);
         assert!(inserted);
         assert!(released.is_empty());
+        pages.publish_first_page(
+            &registration.expect("the first snapshot should await publication"),
+        );
         let (_, released, inserted, _) = pages.first_page(snapshot("two", "lease-two"), now, 1);
 
         assert!(inserted);
         assert_eq!(vec!["lease-one"], released);
         assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
         assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
+    }
+
+    #[test]
+    fn task_result_page_store_rejects_eviction_of_an_unpublished_snapshot() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                vec![
+                    task_result(&format!("result-{id}-one"), TaskState::Completed),
+                    task_result(&format!("result-{id}-two"), TaskState::Completed),
+                ],
+                MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (first_page, released, inserted, first_registration) =
+            pages.first_page(snapshot("one", "lease-one"), now, 1);
+        let first_page = first_page.expect("the first page should be created");
+        let continuation_token = first_page.1.next_page_token;
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert!(!continuation_token.is_empty());
+
+        let (second_page, released, inserted, second_registration) =
+            pages.first_page(snapshot("two", "lease-two"), now, 1);
+
+        assert_eq!(
+            tonic::Code::ResourceExhausted,
+            second_page
+                .expect_err("capacity must not evict a page awaiting RPC publication")
+                .code()
+        );
+        assert_eq!(vec!["lease-two"], released);
+        assert!(!inserted);
+        assert!(second_registration.is_none());
+        assert!(pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.cursors_by_token.contains_key(&continuation_token));
+
+        pages.publish_first_page(
+            &first_registration.expect("the retained first page should remain publishable"),
+        );
+        let (continuation, released) =
+            pages.continuation_page(&continuation_token, "task-one", now, 1);
+        let continuation = continuation.expect("the published continuation should remain valid");
+        assert!(released.is_empty());
+        assert_eq!("result-one-two", continuation.0[0].id);
     }
 
     #[test]
@@ -4314,16 +4386,23 @@ mod tests {
         };
         let mut pages = TaskResultPageStore::default();
 
-        let (_, released, inserted) =
-            pages.insert(snapshot("one", "lease-one", MAX_TASK_ARTIFACTS), now);
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("one", "lease-one", MAX_TASK_ARTIFACTS), now, 1);
         assert!(inserted);
         assert!(released.is_empty());
-        let (_, released, inserted) =
-            pages.insert(snapshot("two", "lease-two", MAX_TASK_ARTIFACTS), now);
+        pages.publish_first_page(
+            &registration.expect("the first snapshot should await publication"),
+        );
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("two", "lease-two", MAX_TASK_ARTIFACTS), now, 1);
         assert!(inserted);
         assert!(released.is_empty());
+        pages.publish_first_page(
+            &registration.expect("the second snapshot should await publication"),
+        );
 
-        let (_, released, inserted) = pages.insert(snapshot("three", "lease-three", 1), now);
+        let (_, released, inserted, _) =
+            pages.first_page(snapshot("three", "lease-three", 1), now, 1);
 
         assert!(inserted);
         assert_eq!(vec!["lease-one"], released);
@@ -8467,6 +8546,13 @@ mod tests {
             .expect("test should send playback plan");
 
         let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled planning cleanup should finish");
 
         assert!(cancelled.playback_source.is_none());
         assert!(cancelled.playback_session.is_none());
@@ -14544,6 +14630,93 @@ mod tests {
         .await
         .expect("planning cleanup should finish after persistence recovers");
         assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn playback_planning_terminal_persistence_does_not_block_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-blocking-persistence", None, None)
+            .expect("playback task should be created durably");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        state
+            .tasks
+            .block_next_persistence_save(Arc::clone(&entered), Arc::clone(&resume));
+
+        let persistence_entered = Arc::new(AtomicBool::new(false));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_entered = Arc::clone(&entered);
+        let observer_resume = Arc::clone(&resume);
+        let observer_persistence_entered = Arc::clone(&persistence_entered);
+        let observer_runtime_progressed = Arc::clone(&runtime_progressed);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            observer_persistence_entered.store(true, AtomicOrdering::Release);
+            let progress_deadline = StdInstant::now() + Duration::from_millis(500);
+            while !observer_runtime_progressed.load(AtomicOrdering::Acquire)
+                && StdInstant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release =
+                observer_runtime_progressed.load(AtomicOrdering::Acquire);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_persistence_entered = Arc::clone(&persistence_entered);
+        let heartbeat_runtime_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            while !heartbeat_persistence_entered.load(AtomicOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            heartbeat_runtime_progressed.store(true, AtomicOrdering::Release);
+        });
+        let completion_state = state.clone();
+        let task_id = creation.task.id.clone();
+        let completion = tokio::spawn(async move {
+            complete_playback_planning_terminal(
+                &completion_state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed.".to_owned(),
+                Vec::new(),
+            )
+            .await
+        });
+
+        let completed = timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("terminal persistence should finish after the test releases storage")
+            .expect("terminal persistence task should not panic");
+        heartbeat.await.expect("runtime heartbeat should not panic");
+        let progressed_before_release =
+            observer.join().expect("persistence observer should finish");
+
+        assert!(
+            progressed_before_release,
+            "the single Tokio worker must progress while task persistence is blocked"
+        );
+        assert!(completed);
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
     }
 
     #[tokio::test]
