@@ -80,6 +80,7 @@ use crate::{
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
 const HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS: usize = 1;
+const TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS: usize = 32;
 const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -109,6 +110,7 @@ pub struct AppState {
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) task_resource_open_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
@@ -313,6 +315,8 @@ impl AppState {
         let playback_planning_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
+        let task_resource_open_permits =
+            Arc::new(Semaphore::new(TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS));
         let lan_transcoding_permits = Arc::new(Semaphore::new(
             options.lan_transcoding_max_concurrent_jobs.max(1),
         ));
@@ -333,6 +337,7 @@ impl AppState {
             playback_planning_permits,
             playback_planning_active_jobs,
             hls_cache_finalization_permits,
+            task_resource_open_permits,
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
             hls_fill_scheduler,
@@ -742,19 +747,24 @@ impl AppState {
         self.completed_hls_task_cleanup_item(session_id, library_item_id)
     }
 
-    fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
-        let (_, first_error) = self.remove_hls_sessions_collecting_failures(session_ids);
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
     fn remove_hls_sessions_for_library_item(
         &self,
         library_item_id: &str,
         session_ids: &[String],
     ) -> Result<(), Status> {
+        self.remove_hls_sessions_tracking_failures(library_item_id, session_ids)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "Failed to delete completed HLS cache item: {error}"
+                ))
+            })
+    }
+
+    fn remove_hls_sessions_tracking_failures(
+        &self,
+        cleanup_key: &str,
+        session_ids: &[String],
+    ) -> io::Result<()> {
         let (failed_session_ids, first_error) =
             self.remove_hls_sessions_collecting_failures(session_ids);
         let mut pending = self
@@ -762,15 +772,33 @@ impl AppState {
             .lock()
             .expect("pending HLS cleanup lock poisoned");
         if failed_session_ids.is_empty() {
-            pending.remove(library_item_id);
+            pending.remove(cleanup_key);
         } else {
-            pending.insert(library_item_id.to_owned(), failed_session_ids);
+            pending.insert(cleanup_key.to_owned(), failed_session_ids);
         }
         drop(pending);
         if let Some(error) = first_error {
-            return Err(Status::internal(format!(
-                "Failed to delete completed HLS cache item: {error}"
-            )));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn retry_pending_hls_session_cleanups(&self) -> io::Result<()> {
+        let pending = self
+            .pending_hls_session_cleanup_by_library_item
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .clone();
+        let mut first_error = None;
+        for (cleanup_key, session_ids) in pending {
+            if let Err(error) =
+                self.remove_hls_sessions_tracking_failures(&cleanup_key, &session_ids)
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -1160,6 +1188,16 @@ impl AppState {
         if should_cancel() {
             return Ok(None);
         }
+        {
+            let _deletion_guard = self.completed_hls_mutation_guard();
+            if should_cancel() {
+                return Ok(None);
+            }
+            self.retry_pending_hls_session_cleanups()?;
+        }
+        if should_cancel() {
+            return Ok(None);
+        }
         let entries = self.hls_cache.completed_cache_entries()?;
         let partial_entries = self.hls_cache.partial_cache_entries()?;
         let completed_entry_sizes_by_session_id = entries
@@ -1259,7 +1297,7 @@ impl AppState {
             if !self.remove_evicted_completed_hls_task(&entry)? {
                 continue;
             }
-            self.remove_hls_sessions(&session_ids)?;
+            self.remove_hls_sessions_tracking_failures(&entry.library_item_id, &session_ids)?;
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(
                     completed_entry_sizes_by_session_id

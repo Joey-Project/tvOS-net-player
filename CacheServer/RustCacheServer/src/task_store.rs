@@ -27,7 +27,8 @@ use crate::generated::tvos_net_player::v1::{
 };
 use crate::playback_policy::PlaybackPolicy;
 use crate::task_output::{
-    MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS, TaskOutputRecord, TaskResourceRecord,
+    MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS,
+    TaskOutputRecord, TaskResourceRecord,
 };
 
 const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
@@ -105,14 +106,17 @@ impl TaskStateStore {
         }
 
         let schema_version = snapshot.schema_version;
-        snapshot
+        let records = snapshot
             .tasks
             .into_iter()
             .map(|file| file.into_record(schema_version))
-            .collect()
+            .collect::<io::Result<Vec<_>>>()?;
+        validate_registered_task_resource_count(&records)?;
+        Ok(records)
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
+        validate_registered_task_resource_count(records)?;
         let snapshot = PersistedTaskSnapshot {
             schema_version: TASK_STATE_SCHEMA_VERSION,
             tasks: records
@@ -201,6 +205,24 @@ impl TaskStateStore {
             .expect("task state directory sync lock poisoned")
             .clone()
     }
+}
+
+fn validate_registered_task_resource_count(records: &[PersistedTaskRecord]) -> io::Result<()> {
+    let resource_count = records
+        .iter()
+        .try_fold(0_usize, |total, record| {
+            total.checked_add(record.output.resources.len())
+        })
+        .unwrap_or(usize::MAX);
+    if resource_count > MAX_REGISTERED_TASK_RESOURCES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "task state cannot contain more than {MAX_REGISTERED_TASK_RESOURCES} registered resources"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 struct BoundedSnapshotWriter {
@@ -1451,6 +1473,45 @@ mod tests {
 
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn persisted_resource_total_stays_below_the_startup_scan_headroom() {
+        let task = Task {
+            id: "task-resource-limit".to_owned(),
+            source: "BV1resource-limit".to_owned(),
+            ..Default::default()
+        };
+        let mut output = TaskOutputRecord::from_legacy_task(&task);
+        output.resources = (0..MAX_REGISTERED_TASK_RESOURCES)
+            .map(|index| {
+                TaskResourceRecord::new(CacheResourceRef {
+                    id: format!("resource-{index}"),
+                    ..Default::default()
+                })
+                .unwrap()
+            })
+            .collect();
+        let mut record = PersistedTaskRecord {
+            output,
+            task,
+            options: None,
+            playback_options: None,
+        };
+
+        validate_registered_task_resource_count(std::slice::from_ref(&record))
+            .expect("the registered resource limit should be accepted");
+        record.output.resources.push(
+            TaskResourceRecord::new(CacheResourceRef {
+                id: "resource-over-limit".to_owned(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let error = validate_registered_task_resource_count(std::slice::from_ref(&record))
+            .expect_err("one additional registered resource must be rejected");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
     }
 
     #[test]

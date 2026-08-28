@@ -119,10 +119,13 @@ async fn run_one_bilibili_task(
     {
         Ok(result) => result,
         Err(_) => {
-            let _ = registry.complete_task_failed(
-                &work_item.task_id,
-                "Bilibili download adapter panicked.".to_owned(),
-            );
+            complete_terminal_task(&registry, || {
+                registry.complete_task_failed(
+                    &work_item.task_id,
+                    "Bilibili download adapter panicked.".to_owned(),
+                )
+            })
+            .await;
             return;
         }
     };
@@ -134,27 +137,55 @@ async fn run_one_bilibili_task(
             }
             _ => "Cancelled by request.".to_owned(),
         };
-        let _ = registry.complete_task_cancelled(&work_item.task_id, message);
+        complete_terminal_task(&registry, || {
+            registry.complete_task_cancelled(&work_item.task_id, message.clone())
+        })
+        .await;
         return;
     }
 
     match result {
         Ok(output) => {
-            let _ = registry.complete_task_succeeded(
-                &work_item.task_id,
-                output.library_item_id,
-                output.message,
-            );
+            complete_terminal_task(&registry, || {
+                registry.complete_task_succeeded(
+                    &work_item.task_id,
+                    output.library_item_id.clone(),
+                    output.message.clone(),
+                )
+            })
+            .await;
         }
         Err(BilibiliDownloadError::Cancelled(message)) => {
             let message =
                 crate::credential_safe_client_cancellation(credentials_configured, &message);
-            let _ = registry.complete_task_cancelled(&work_item.task_id, message);
+            complete_terminal_task(&registry, || {
+                registry.complete_task_cancelled(&work_item.task_id, message.clone())
+            })
+            .await;
         }
         Err(error @ BilibiliDownloadError::Failed(_)) => {
             let detail = error.message();
             let message = crate::credential_safe_client_error(credentials_configured, &detail);
-            let _ = registry.complete_task_failed(&work_item.task_id, message);
+            complete_terminal_task(&registry, || {
+                registry.complete_task_failed(&work_item.task_id, message.clone())
+            })
+            .await;
+        }
+    }
+}
+
+async fn complete_terminal_task(
+    registry: &BilibiliTaskRegistry,
+    mut complete: impl FnMut() -> Result<crate::generated::tvos_net_player::v1::Task, tonic::Status>,
+) {
+    loop {
+        match complete() {
+            Ok(_) => return,
+            Err(error) if error.code() == tonic::Code::Unavailable => {}
+            Err(_) => return,
+        }
+        while !registry.retry_pending_persistence() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 }
@@ -208,6 +239,58 @@ mod tests {
 
         worker.abort();
         assert_eq!("adapter failed", completed.message);
+    }
+
+    #[tokio::test]
+    async fn worker_waits_for_terminal_state_persistence_to_recover() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&path));
+        let task = registry
+            .create_bilibili_task("BV1worker-persistence", None)
+            .expect("task should be created durably");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("task should start running");
+
+        std::fs::remove_file(&path).expect("task state should be removable");
+        std::fs::create_dir(&path).expect("directory should block snapshot replacement");
+        let completion_registry = Arc::clone(&registry);
+        let completion = tokio::spawn(run_one_bilibili_task(
+            completion_registry,
+            Arc::new(SuccessAdapter),
+            work_item,
+            false,
+        ));
+        for _ in 0..100 {
+            if !registry.persistence_available() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(!registry.persistence_available());
+        assert!(!completion.is_finished());
+        assert_eq!(
+            TaskState::Running,
+            registry.get_task(&task.id).unwrap().state()
+        );
+
+        std::fs::remove_dir(&path).expect("blocking directory should be removable");
+        tokio::time::timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("worker should retry after persistence recovers")
+            .expect("worker task should finish cleanly");
+
+        let completed = registry.get_task(&task.id).unwrap();
+        assert_eq!(TaskState::Succeeded, completed.state());
+        assert!(registry.persistence_available());
+        drop(registry);
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        assert_eq!(
+            TaskState::Succeeded,
+            restored.get_task(&task.id).unwrap().state()
+        );
     }
 
     #[tokio::test]

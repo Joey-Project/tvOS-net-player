@@ -2619,6 +2619,9 @@ async fn run_hls_cache_finalization_inner(
                         state.register_completed_hls_runtime_session(&completion.session);
                         true
                     }
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        return HlsCacheFinalizationOutcome::PersistencePending;
+                    }
                     Ok(_) | Err(_) => false,
                 }
             };
@@ -8861,11 +8864,12 @@ mod tests {
         std::fs::remove_file(&task_state_path).expect("task state should be removable");
         std::fs::create_dir(&task_state_path)
             .expect("a directory should reject the next snapshot replacement");
-        state
+        let error = state
             .tasks
             .complete_task_failed(&creation.task.id, "Hidden failure.".to_owned())
-            .expect("legacy mutation should remain staged in memory");
+            .expect_err("an unpersisted terminal state must not be acknowledged");
 
+        assert_eq!(tonic::Code::Unavailable, error.code());
         assert_eq!(
             TaskState::Playable,
             state.tasks.get_task(&creation.task.id).unwrap().state()
@@ -8889,7 +8893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_cache_quota_accounts_for_grouped_completed_result_sessions() {
+    async fn hls_cache_quota_retries_failed_group_member_below_high_watermark() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -9021,21 +9025,14 @@ mod tests {
         state
             .hls_sessions
             .insert(sanitized_completed_session(&primary_metadata.hls_session));
+        state
+            .hls_cache
+            .fail_next_remove_session(child_session_id.clone());
 
-        let summary = state
+        state
             .enforce_hls_cache_quota("test", Vec::new(), 0)
-            .expect("eviction should scan cache")
-            .expect("quota should trigger eviction");
+            .expect_err("a failed grouped cleanup should remain retryable");
 
-        assert_eq!(2 * session_size, summary.started_used_bytes);
-        assert_eq!(0, summary.finished_used_bytes);
-        assert_eq!(0, summary.target_used_bytes);
-        assert_eq!(2 * session_size, summary.evicted_bytes);
-        assert_eq!(
-            vec![creation.task.id.clone(), child_session_id.clone()],
-            summary.evicted_session_ids
-        );
-        assert!(summary.target_reached);
         assert!(
             state
                 .hls_cache
@@ -9046,9 +9043,25 @@ mod tests {
             state
                 .hls_cache
                 .get_completed_library_item(&child_library_item_id)
-                .is_none()
+                .is_some()
         );
         assert!(state.tasks.get_task(&creation.task.id).is_err());
+
+        let retry = state
+            .enforce_hls_cache_quota("test-retry", Vec::new(), 0)
+            .expect("the retained cleanup should retry before the watermark check");
+
+        assert!(
+            retry.is_none(),
+            "the remaining child session is already below the high watermark"
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&child_library_item_id)
+                .is_none()
+        );
+        assert!(state.hls_sessions.get(&child_session_id).is_none());
     }
 
     #[tokio::test]
@@ -12434,6 +12447,108 @@ mod tests {
             state.tasks.get_task(&creation.task.id).unwrap().state()
         );
         assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_keeps_completed_media_until_terminal_state_persists() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1pending-terminal-fill", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("playable task state should persist");
+        let library_item_id =
+            crate::hls_cache::HlsCacheStore::completed_library_item_id(&creation.task.id);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            creation.task.id.clone(),
+            metadata.hls_session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some(),
+            "completed media must survive a rejected terminal task snapshot"
+        );
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            creation.task.id.clone(),
+            metadata.hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
+        assert!(state.hls_sessions.get(&creation.task.id).is_some());
     }
 
     #[cfg(unix)]

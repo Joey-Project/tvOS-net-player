@@ -8,7 +8,7 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE,
+            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE, RETRY_AFTER,
         },
     },
 };
@@ -146,9 +146,16 @@ async fn resource_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
+    let permit = match Arc::clone(&state.state.task_resource_open_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return resource_open_busy_response(),
+    };
     let tasks = Arc::clone(&state.state.tasks);
-    let opened_resource =
-        tokio::task::spawn_blocking(move || tasks.open_task_resource(&resource_id)).await;
+    let opened_resource = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        tasks.open_task_resource(&resource_id)
+    })
+    .await;
     let Some(opened_resource) = (match opened_resource {
         Ok(opened_resource) => opened_resource,
         Err(error) => {
@@ -999,6 +1006,17 @@ fn resource_not_found_response() -> Response<Body> {
     response
 }
 
+fn resource_open_busy_response() -> Response<Body> {
+    let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 fn resource_range_not_satisfiable_response(
     size: u64,
     content_type: &str,
@@ -1789,6 +1807,32 @@ mod tests {
                 &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn task_resource_open_fails_fast_when_blocking_jobs_are_saturated() {
+        let body = b"bounded";
+        let fixture = task_resource_fixture(test_resource("resource-busy", body), Some(body));
+        let permits = Arc::clone(&fixture.state.state.task_resource_open_permits);
+        let permit_count: u32 = permits
+            .available_permits()
+            .try_into()
+            .expect("permit count should fit in u32");
+        let _held_permits = permits
+            .acquire_many_owned(permit_count)
+            .await
+            .expect("all test permits should be available");
+
+        let response = resource_get(
+            State(fixture.state.clone()),
+            Path(fixture.resource_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!("no-store", response.headers()[CACHE_CONTROL]);
+        assert_eq!("1", response.headers()[RETRY_AFTER]);
     }
 
     #[tokio::test]

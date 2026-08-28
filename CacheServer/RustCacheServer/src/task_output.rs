@@ -11,6 +11,7 @@ use uuid::Uuid;
 const MAX_RESOURCE_ID_BYTES: usize = 200;
 pub(crate) const MAX_TASK_RESULTS: usize = 10_000;
 pub(crate) const MAX_TASK_RESOURCES: usize = 50_000;
+pub(crate) const MAX_REGISTERED_TASK_RESOURCES: usize = 50_000;
 pub(crate) const MAX_TASK_ARTIFACTS: usize = 50_000;
 pub(crate) const MAX_TASK_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TASK_RESOURCE_BASE_URI_BYTES: usize = 2 * 1024;
@@ -257,12 +258,13 @@ impl TaskOutputRecord {
         session_id: &str,
         library_item_id: &str,
         message: &str,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, TaskOutputValidationError> {
         if self.legacy_managed {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let mut updated = self.clone();
         let mut changed = false;
-        for result in &mut self.results {
+        for result in &mut updated.results {
             let matches_cache = (!library_item_id.is_empty()
                 && result.library_item_id == library_item_id)
                 || result.id == session_id
@@ -300,10 +302,10 @@ impl TaskOutputRecord {
             changed = true;
         }
         if !changed {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let referenced_ids = self
+        let referenced_ids = updated
             .results
             .iter()
             .flat_map(|result| &result.artifacts)
@@ -311,17 +313,28 @@ impl TaskOutputRecord {
             .map(|resource| resource.id.as_str())
             .collect::<HashSet<_>>();
         let mut retired_ids = Vec::new();
-        self.resources.retain(|resource| {
+        updated.resources.retain(|resource| {
             let retained = referenced_ids.contains(resource.resource.id.as_str());
             if !retained {
                 retired_ids.push(resource.resource.id.clone());
             }
             retained
         });
-        self.primary_result_id = inferred_primary_result_id(&self.results);
-        self.revision = self.revision.saturating_add(1).max(1);
-        self.snapshot_id = new_snapshot_id();
-        retired_ids
+        if !updated
+            .results
+            .iter()
+            .any(|result| result.id == updated.primary_result_id)
+        {
+            updated.primary_result_id = inferred_primary_result_id(&updated.results);
+        }
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_and_bind_resources(&mut updated.results, &updated.resources)?;
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_result_ids(&updated.results)?;
+        updated.revision = updated.revision.saturating_add(1).max(1);
+        updated.snapshot_id = new_snapshot_id();
+        *self = updated;
+        Ok(retired_ids)
     }
 }
 
@@ -1173,6 +1186,67 @@ mod tests {
         .expect_err("public resource URI projection must stay within the result limit");
 
         assert!(error.to_string().contains("client projection"));
+    }
+
+    #[test]
+    fn cache_deletion_preserves_an_existing_primary_result() {
+        let primary = TaskResult {
+            id: "result-two".to_owned(),
+            state: TaskState::Completed.into(),
+            ..Default::default()
+        };
+        let previous = TaskOutputRecord::replace(None, vec![primary.clone()], Vec::new()).unwrap();
+        let mut output = TaskOutputRecord::replace(
+            Some(&previous),
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                },
+                primary,
+                TaskResult {
+                    id: "result-three".to_owned(),
+                    state: TaskState::Completed.into(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        output
+            .mark_playback_cache_deleted("result-three", "library-result-three", "Cache deleted.")
+            .unwrap();
+
+        assert_eq!("result-two", output.primary_result_id);
+        assert_eq!(TaskState::Failed, output.results[2].state());
+    }
+
+    #[test]
+    fn cache_deletion_rejects_an_oversized_mutation_without_changing_output() {
+        let mut output = TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                ..Default::default()
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let original = output.clone();
+
+        let error = output
+            .mark_playback_cache_deleted(
+                "result-one",
+                "library-result-one",
+                &"x".repeat(MAX_TASK_RESULT_ENCODED_BYTES + 1),
+            )
+            .expect_err("cache deletion must preserve persisted output limits");
+
+        assert!(error.to_string().contains("task result cannot exceed"));
+        assert_eq!(original, output);
     }
 
     #[test]
