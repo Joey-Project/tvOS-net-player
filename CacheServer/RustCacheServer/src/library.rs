@@ -1101,11 +1101,15 @@ pub(crate) fn remove_empty_directory_no_follow(
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
     )?;
     for segment in &segments[..segments.len() - 1] {
-        directory = open_at(
+        directory = match open_at(
             directory.as_raw_fd(),
             segment,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-        )?;
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     }
 
     // Protect path containment and no-follow access policy, not continuity of the leaf's
@@ -1553,6 +1557,23 @@ mod tests {
 
         assert!(!resource_dir.exists());
         assert!(root_path.join(".tvos-net-player/resources").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_treats_a_missing_intermediate_directory_as_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        fs::create_dir_all(resources_dir.join("resource-1")).unwrap();
+        fs::remove_dir_all(&resources_dir)
+            .expect("validated resource namespace should be removable");
+        let root_path = root_path.canonicalize().unwrap();
+
+        assert!(
+            !remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+                .expect("a raced namespace deletion should remain idempotent")
+        );
     }
 
     #[cfg(unix)]

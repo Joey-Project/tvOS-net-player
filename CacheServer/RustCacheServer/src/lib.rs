@@ -1277,18 +1277,7 @@ impl AppState {
     fn hls_cleanup_overflow_decision(&self, session_id: &str) -> HlsCleanupOverflowDecision {
         if self
             .tasks
-            .playback_task_for_any_hls_session(session_id)
-            .is_some()
-            || self.tasks.get_task(session_id).is_ok_and(|task| {
-                task.kind() == TaskKind::BilibiliProgressivePlayback
-                    && matches!(
-                        task.state(),
-                        TaskState::Queued
-                            | TaskState::Running
-                            | TaskState::Preparing
-                            | TaskState::CancelRequested
-                    )
-            })
+            .task_authorizes_hls_session_for_cleanup(session_id)
         {
             return HlsCleanupOverflowDecision::Authorized;
         }
@@ -2764,7 +2753,9 @@ mod tests {
         },
         bilibili_playback::{BilibiliPlaybackPlanner, BilibiliPlaybackPlanningRequest},
         bilibili_worker::BilibiliDownloadError,
-        generated::tvos_net_player::v1::{BilibiliPlaybackSession, BilibiliPlaybackVariant},
+        generated::tvos_net_player::v1::{
+            BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
+        },
         hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
         transcoding::HlsTranscodingPlan,
     };
@@ -3400,6 +3391,86 @@ mod tests {
             state.tasks.get_task(&task_id).unwrap().state()
         );
         assert!(state.hls_cache.playback_session(&session.id).is_some());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_preserves_preparing_child_result_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1overflow-preparing-child", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let child_session = sample_hls_session(&child_session_id);
+        state
+            .hls_cache
+            .save_session(&child_session)
+            .expect("child HLS session should persist");
+        state.hls_sessions.insert(child_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: child_session.variant.id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .update_playback_results(
+                &task_id,
+                None,
+                "Preparing remaining results.".to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: child_session_id.clone(),
+                    selection_id: "page:2".to_owned(),
+                    title: "Part 2".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    state: TaskState::Playable.into(),
+                    message: "Playable".to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(playback_source),
+                    playback_session: Some(sample_playback_session(&child_session_id)),
+                }],
+            )
+            .expect("preparing task should publish its planned child result");
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_preparing_child", Vec::new(), 0)
+            .expect("bounded overflow cleanup should preserve a persisted child session");
+
+        assert_eq!(
+            TaskState::Preparing,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
         let pending = state
             .pending_hls_session_cleanups
             .lock()

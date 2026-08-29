@@ -1639,6 +1639,31 @@ impl BilibiliTaskRegistry {
         })
     }
 
+    pub(crate) fn task_authorizes_hls_session_for_cleanup(&self, session_id: &str) -> bool {
+        let normalized_id = normalize(session_id);
+        if normalized_id.is_empty() {
+            return false;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner.visible_tasks_by_id.values().any(|task| {
+            if task.kind() != TaskKind::BilibiliProgressivePlayback {
+                return false;
+            }
+            match task.state() {
+                TaskState::Queued
+                | TaskState::Running
+                | TaskState::Preparing
+                | TaskState::CancelRequested => {
+                    task.id == normalized_id || task_uses_hls_session(task, &normalized_id)
+                }
+                TaskState::Playable | TaskState::Completed => {
+                    task_uses_hls_session(task, &normalized_id)
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub fn completed_playback_task_matches_hls_cache_item(
         &self,
         task: &Task,
@@ -8098,6 +8123,41 @@ mod tests {
         assert_eq!(tonic::Code::NotFound, error.code());
         assert!(!first_path.exists());
         assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn dropping_staged_output_before_body_creation_keeps_v2_available() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1drop-before-body", None)
+            .expect("task should be created");
+        let resource = test_task_resource("drop-before-body-resource", 4);
+        let body_path = root_path.join(resource.relative_path());
+
+        {
+            let staged = registry
+                .stage_task_output_replacement(&task.id, vec![resource.clone()])
+                .expect("new resource should acquire staged ownership");
+            assert_eq!(1, staged.resources_requiring_body_creation().count());
+        }
+
+        assert!(registry.task_output_v2_available());
+        assert!(!body_path.exists());
+        assert!(!body_path.parent().unwrap().exists());
+
+        let retry = registry
+            .stage_task_output_replacement(&task.id, vec![resource])
+            .expect("a never-created body should remain claimable");
+        assert_eq!(1, retry.resources_requiring_body_creation().count());
+        drop(retry);
+        assert!(registry.task_output_v2_available());
     }
 
     #[test]
