@@ -38,13 +38,16 @@ pub struct BilibiliDownloadOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BilibiliDownloadError {
     Failed(String),
+    ResourceExhausted(String),
     Cancelled(String),
 }
 
 impl BilibiliDownloadError {
     fn message(self) -> String {
         match self {
-            Self::Failed(message) | Self::Cancelled(message) => message,
+            Self::Failed(message) | Self::ResourceExhausted(message) | Self::Cancelled(message) => {
+                message
+            }
         }
     }
 }
@@ -168,7 +171,10 @@ async fn run_one_bilibili_task(
             })
             .await;
         }
-        Err(error @ BilibiliDownloadError::Failed(_)) => {
+        Err(
+            error
+            @ (BilibiliDownloadError::Failed(_) | BilibiliDownloadError::ResourceExhausted(_)),
+        ) => {
             let detail = error.message();
             let message = crate::credential_safe_client_error(credentials_configured, &detail);
             let task_id = work_item.task_id.clone();

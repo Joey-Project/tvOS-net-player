@@ -16,6 +16,10 @@ pub(crate) type BilibiliInputResolveFuture<'a> = Pin<
     Box<dyn Future<Output = Result<BilibiliInputResolution, BilibiliDownloadError>> + Send + 'a>,
 >;
 
+pub(crate) const MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 10_000;
+pub(crate) const MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BILIBILI_RESOLUTION_STRING_BYTES: usize = 64 * 1024;
+
 pub(crate) trait BilibiliPlaybackPlanner: Send + Sync + 'static {
     fn resolve_input<'a>(
         &'a self,
@@ -38,6 +42,8 @@ pub(crate) trait BilibiliPlaybackPlanner: Send + Sync + 'static {
 pub(crate) struct BilibiliInputResolveRequest {
     pub source: String,
     pub options: Option<BilibiliPlaybackOptions>,
+    pub candidate_limit: usize,
+    pub include_candidate_cover_uri: bool,
     pub cancellation: BilibiliTaskCancellation,
 }
 
@@ -51,6 +57,64 @@ pub(crate) struct BilibiliInputResolution {
     pub candidates_truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum BilibiliContentKind {
+    VideoPage,
+    SeasonEpisode,
+    CollectionItem,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct BilibiliContentIdentity {
+    pub kind: BilibiliContentKind,
+    pub aid: Option<u64>,
+    pub bvid: Option<String>,
+    pub cid: Option<u64>,
+    pub epid: Option<u64>,
+}
+
+impl BilibiliContentIdentity {
+    pub(crate) fn is_complete(&self) -> bool {
+        if self.aid == Some(0)
+            || self.cid == Some(0)
+            || self.epid == Some(0)
+            || self
+                .bvid
+                .as_deref()
+                .is_some_and(|bvid| bvid.trim().is_empty())
+        {
+            return false;
+        }
+
+        let aid_or_bvid = self.aid.is_some()
+            || self
+                .bvid
+                .as_deref()
+                .is_some_and(|bvid| !bvid.trim().is_empty());
+        match self.kind {
+            BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => {
+                self.cid.is_some() && aid_or_bvid && self.epid.is_none()
+            }
+            BilibiliContentKind::SeasonEpisode => self.epid.is_some(),
+        }
+    }
+
+    pub(crate) fn matches_content_id(&self, content_id: &str) -> bool {
+        match self.kind {
+            BilibiliContentKind::VideoPage => {
+                self.cid.is_some_and(|cid| content_id == cid.to_string())
+            }
+            BilibiliContentKind::SeasonEpisode => {
+                self.epid.is_some_and(|epid| content_id == epid.to_string())
+            }
+            BilibiliContentKind::CollectionItem => {
+                self.bvid.as_deref().is_some_and(|bvid| content_id == bvid)
+                    || self.aid.is_some_and(|aid| content_id == format!("av{aid}"))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BilibiliResolvedCandidate {
     pub selection_id: String,
@@ -58,6 +122,7 @@ pub(crate) struct BilibiliResolvedCandidate {
     pub subtitle: String,
     pub source_kind: String,
     pub content_id: String,
+    pub identity: BilibiliContentIdentity,
     pub index: u32,
     pub duration_seconds: Option<u32>,
     pub cover_uri: String,
@@ -80,9 +145,13 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
             PlaybackPolicy::from_playback_options(request.options.as_ref())
                 .map_err(|error| BilibiliDownloadError::Failed(error.to_string()))?;
             let download_options = request.options.as_ref().map(playback_to_download_options);
-            self.resolve_playback_input(&request.source, download_options.as_ref(), || {
-                request.cancellation.is_cancel_requested()
-            })
+            self.resolve_playback_input(
+                &request.source,
+                download_options.as_ref(),
+                request.candidate_limit,
+                request.include_candidate_cover_uri,
+                || request.cancellation.is_cancel_requested(),
+            )
             .await
         })
     }

@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fmt::Display,
     future::Future,
+    mem,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
@@ -29,7 +30,11 @@ use tokio::{
 };
 
 use crate::{
-    bilibili_playback::{BilibiliInputResolution, BilibiliResolvedCandidate},
+    bilibili_playback::{
+        BilibiliContentIdentity, BilibiliContentKind, BilibiliInputResolution,
+        BilibiliResolvedCandidate, MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES,
+        MAX_BILIBILI_RESOLUTION_STRING_BYTES, MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+    },
     bilibili_worker::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadRequest,
@@ -48,9 +53,6 @@ use crate::{
     task_registry::BilibiliTaskProgress,
 };
 
-const BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
-const BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT as u32;
-const BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32: u32 = BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1;
 const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
 const ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP: f64 = 0.50;
@@ -58,6 +60,35 @@ const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BilibiliResolveCandidateWindow {
+    candidate_limit: usize,
+    truncation_probe_limit: u32,
+}
+
+impl BilibiliResolveCandidateWindow {
+    fn new(candidate_limit: usize) -> Result<Self, BilibiliDownloadError> {
+        if !(1..=MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT).contains(&candidate_limit) {
+            return Err(invalid_resolve_candidate_limit(candidate_limit));
+        }
+        let candidate_limit_u32 = u32::try_from(candidate_limit)
+            .map_err(|_| invalid_resolve_candidate_limit(candidate_limit))?;
+        let truncation_probe_limit = candidate_limit_u32
+            .checked_add(1)
+            .ok_or_else(|| invalid_resolve_candidate_limit(candidate_limit))?;
+        Ok(Self {
+            candidate_limit,
+            truncation_probe_limit,
+        })
+    }
+}
+
+fn invalid_resolve_candidate_limit(candidate_limit: usize) -> BilibiliDownloadError {
+    BilibiliDownloadError::Failed(format!(
+        "Bilibili resolve candidate limit must be between 1 and {MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT}; received {candidate_limit}."
+    ))
+}
 
 pub struct BbdownBilibiliAdapter {
     client: BiliClient,
@@ -396,11 +427,14 @@ impl BbdownBilibiliAdapter {
         &self,
         source: &str,
         options: Option<&BilibiliDownloadOptions>,
+        candidate_limit: usize,
+        include_candidate_cover_uri: bool,
         is_cancel_requested: impl Fn() -> bool,
     ) -> Result<BilibiliInputResolution, BilibiliDownloadError> {
+        let candidate_window = BilibiliResolveCandidateWindow::new(candidate_limit)?;
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
-        let selection = resolve_selection_for_input(&input)?;
+        let selection = resolve_selection_for_input(&input, candidate_window)?;
         let client = self.client_for_options(options);
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
@@ -416,17 +450,20 @@ impl BbdownBilibiliAdapter {
                     input.clone(),
                     error,
                     &client,
+                    candidate_window,
                     &is_cancel_requested,
                 )
                 .await?
             }
             Err(error) => return Err(failed(error)),
         };
-        Ok(BilibiliInputResolution::from_resolved_content(
+        BilibiliInputResolution::from_resolved_content(
             source.trim().to_owned(),
             &input,
             resolved,
-        ))
+            candidate_window.candidate_limit,
+            include_candidate_cover_uri,
+        )
     }
 
     async fn retry_resolve_with_largest_bounded_prefix(
@@ -434,11 +471,12 @@ impl BbdownBilibiliAdapter {
         input: Input,
         initial_error: BbdownError,
         client: &BiliClient,
+        candidate_window: BilibiliResolveCandidateWindow,
         is_cancel_requested: &impl Fn() -> bool,
     ) -> Result<ResolvedContent, BilibiliDownloadError> {
         let mut last_error = initial_error;
         let mut search =
-            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32);
+            BoundedPrefixSearch::after_failed_limit(candidate_window.truncation_probe_limit);
         let mut best_resolved = None;
 
         while let Some(limit) = search.next_limit() {
@@ -1220,17 +1258,10 @@ fn bounded_resolve_selection(limit: u32) -> Result<Selection, BilibiliDownloadEr
         .map_err(failed)
 }
 
-#[cfg(test)]
-fn resolve_selection() -> Result<Selection, BilibiliDownloadError> {
-    bounded_resolve_selection(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
-}
-
-#[cfg(test)]
-fn resolve_truncation_probe_selection() -> Result<Selection, BilibiliDownloadError> {
-    bounded_resolve_selection(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32)
-}
-
-fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, BilibiliDownloadError> {
+fn resolve_selection_for_input(
+    input: &Input,
+    candidate_window: BilibiliResolveCandidateWindow,
+) -> Result<Option<Selection>, BilibiliDownloadError> {
     match input {
         Input::Aid(_) | Input::Bvid(_) => Ok(None),
         Input::Episode(_) | Input::CheeseEpisode(_) | Input::IntlEpisode(_) => {
@@ -1248,7 +1279,7 @@ fn resolve_selection_for_input(input: &Input) -> Result<Option<Selection>, Bilib
         | Input::SpaceDynamic(_)
         | Input::History
         | Input::WatchLater => {
-            bounded_resolve_selection(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32).map(Some)
+            bounded_resolve_selection(candidate_window.truncation_probe_limit).map(Some)
         }
         Input::ShortLink(_) => Ok(None),
     }
@@ -1274,9 +1305,7 @@ impl BoundedPrefixSearch {
     fn after_failed_limit(failed_limit: u32) -> Self {
         Self {
             next_low: 1,
-            next_high: failed_limit
-                .saturating_sub(1)
-                .min(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32),
+            next_high: failed_limit.saturating_sub(1),
             best_success: None,
         }
     }
@@ -1572,6 +1601,13 @@ pub(crate) fn recover_stable_collection_candidate(
                 subtitle: "Resolved Bilibili collection item".to_owned(),
                 source_kind: source_kind.to_owned(),
                 content_id,
+                identity: BilibiliContentIdentity {
+                    kind: BilibiliContentKind::CollectionItem,
+                    aid: parsed.expected_identity.aid,
+                    bvid: parsed.expected_identity.bvid.clone(),
+                    cid: parsed.expected_identity.cid,
+                    epid: None,
+                },
                 index: parsed.index,
                 duration_seconds: None,
                 cover_uri: String::new(),
@@ -1630,7 +1666,9 @@ fn playback_selection_parts_from_parts<'a>(
 
 fn parse_selection_index(text: &str, selection_id: &str) -> Result<u32, BilibiliDownloadError> {
     let index = parse_selection_u32(text, selection_id)?;
-    if index == 0 || index > BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 {
+    let maximum_index = u32::try_from(MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+        .map_err(|_| invalid_selection_id(selection_id))?;
+    if index == 0 || index > maximum_index {
         return Err(invalid_selection_id(selection_id));
     }
     Ok(index)
@@ -1648,6 +1686,250 @@ fn parse_selection_u64(text: &str, selection_id: &str) -> Result<u64, BilibiliDo
 
 fn invalid_selection_id(selection_id: &str) -> BilibiliDownloadError {
     BilibiliDownloadError::Failed(format!("Invalid selection_id: {selection_id}"))
+}
+
+const MAX_U32_DECIMAL_BYTES: usize = 10;
+const MAX_U64_DECIMAL_BYTES: usize = 20;
+const COLLECTION_OWNER_SEPARATOR_BYTES: usize = 4;
+
+#[derive(Default)]
+struct BilibiliResolutionMaterializationBudget {
+    bytes: usize,
+}
+
+impl BilibiliResolutionMaterializationBudget {
+    fn charge_allocation(&mut self, bytes: usize) -> Result<(), BilibiliDownloadError> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(resolution_materialization_overflow)?;
+        if self.bytes > MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES {
+            return Err(resolution_materialization_limit_exceeded());
+        }
+        Ok(())
+    }
+
+    fn charge_string(&mut self, label: &str, bytes: usize) -> Result<(), BilibiliDownloadError> {
+        if bytes > MAX_BILIBILI_RESOLUTION_STRING_BYTES {
+            return Err(BilibiliDownloadError::ResourceExhausted(format!(
+                "{label} exceeds the resolution-session limit."
+            )));
+        }
+        self.charge_allocation(bytes)
+    }
+
+    fn charge_candidate_buffer(
+        &mut self,
+        candidate_count: usize,
+    ) -> Result<(), BilibiliDownloadError> {
+        let bytes = mem::size_of::<BilibiliResolvedCandidate>()
+            .checked_mul(candidate_count)
+            .ok_or_else(resolution_materialization_overflow)?;
+        self.charge_allocation(bytes)
+    }
+}
+
+fn resolution_materialization_limit_exceeded() -> BilibiliDownloadError {
+    BilibiliDownloadError::ResourceExhausted(
+        "Bilibili resolution snapshot exceeds the server byte limit.".to_owned(),
+    )
+}
+
+fn resolution_materialization_overflow() -> BilibiliDownloadError {
+    BilibiliDownloadError::ResourceExhausted(
+        "Bilibili resolution snapshot byte accounting overflowed.".to_owned(),
+    )
+}
+
+fn checked_materialized_string_bytes<const N: usize>(
+    parts: [usize; N],
+) -> Result<usize, BilibiliDownloadError> {
+    parts.into_iter().try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(resolution_materialization_overflow)
+    })
+}
+
+fn normalized_string(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn non_empty_or_ref<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    }
+}
+
+fn ensure_resolution_materialization_budget(
+    source: &str,
+    input: &Input,
+    resolved: &ResolvedContent,
+    candidate_limit: usize,
+    include_candidate_cover_uri: bool,
+) -> Result<(), BilibiliDownloadError> {
+    let mut budget = BilibiliResolutionMaterializationBudget::default();
+    budget.charge_allocation(mem::size_of::<BilibiliInputResolution>())?;
+    budget.charge_string("Bilibili resolution source", source.len())?;
+
+    match resolved {
+        ResolvedContent::Video(video) => {
+            let candidate_count = video.pages.len().min(candidate_limit);
+            let bvid = normalized_string(video.bvid.as_deref());
+            let cover_uri_bytes = if include_candidate_cover_uri {
+                video.cover_url.as_deref().map_or(0, str::len)
+            } else {
+                0
+            };
+            budget.charge_string("Bilibili resolution title", video.title.len())?;
+            budget.charge_string("Bilibili resolution source kind", "video".len())?;
+            budget.charge_candidate_buffer(candidate_count)?;
+
+            for page in video.pages.iter().take(candidate_limit) {
+                let selection_bytes = checked_materialized_string_bytes([
+                    "page:".len(),
+                    MAX_U32_DECIMAL_BYTES,
+                    ":cid:".len(),
+                    MAX_U64_DECIMAL_BYTES,
+                    if bvid.is_some() { ":bvid:".len() } else { 0 },
+                    bvid.map_or(0, str::len),
+                    ":aid:".len(),
+                    MAX_U64_DECIMAL_BYTES,
+                ])?;
+                budget.charge_string("Bilibili candidate selection id", selection_bytes)?;
+                budget.charge_string(
+                    "Bilibili candidate title",
+                    non_empty_or_ref(&page.title, &video.title).len(),
+                )?;
+                budget.charge_string(
+                    "Bilibili candidate subtitle",
+                    "Page ".len() + MAX_U32_DECIMAL_BYTES,
+                )?;
+                budget.charge_string("Bilibili candidate source kind", "video_page".len())?;
+                budget.charge_string("Bilibili candidate content id", MAX_U64_DECIMAL_BYTES)?;
+                budget.charge_string("Bilibili candidate bvid", bvid.map_or(0, str::len))?;
+                budget.charge_string("Bilibili candidate cover URI", cover_uri_bytes)?;
+                if candidate_count == 1 {
+                    budget.charge_string(
+                        "Bilibili default candidate selection id",
+                        selection_bytes,
+                    )?;
+                }
+            }
+        }
+        ResolvedContent::Season(season) => {
+            let episodes = if resolve_should_use_full_episode_list(input) {
+                &season.season.episodes
+            } else {
+                &season.selected_episodes
+            };
+            let candidate_count = episodes.len().min(candidate_limit);
+            let cover_uri_bytes = if include_candidate_cover_uri {
+                season.season.cover_url.as_deref().map_or(0, str::len)
+            } else {
+                0
+            };
+            budget.charge_string("Bilibili resolution title", season.season.title.len())?;
+            budget.charge_string("Bilibili resolution source kind", "season".len())?;
+            budget.charge_candidate_buffer(candidate_count)?;
+
+            for episode in episodes.iter().take(candidate_limit) {
+                let selection_bytes = "episode:".len() + MAX_U64_DECIMAL_BYTES;
+                let bvid = normalized_string(episode.bvid.as_deref());
+                let subtitle_bytes = episode
+                    .long_title
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map_or("Episode ".len() + MAX_U32_DECIMAL_BYTES, str::len);
+                budget.charge_string("Bilibili candidate selection id", selection_bytes)?;
+                budget.charge_string(
+                    "Bilibili candidate title",
+                    non_empty_or_ref(&episode.title, &season.season.title).len(),
+                )?;
+                budget.charge_string("Bilibili candidate subtitle", subtitle_bytes)?;
+                budget.charge_string("Bilibili candidate source kind", "season_episode".len())?;
+                budget.charge_string("Bilibili candidate content id", MAX_U64_DECIMAL_BYTES)?;
+                budget.charge_string("Bilibili candidate bvid", bvid.map_or(0, str::len))?;
+                budget.charge_string("Bilibili candidate cover URI", cover_uri_bytes)?;
+                if candidate_count == 1 {
+                    budget.charge_string(
+                        "Bilibili default candidate selection id",
+                        selection_bytes,
+                    )?;
+                }
+            }
+        }
+        ResolvedContent::Collection(collection) => {
+            let source_kind = collection_kind_name(&collection.collection.kind);
+            let source_token = collection_source_token(input).ok_or_else(|| {
+                BilibiliDownloadError::Failed(
+                    "Resolved Bilibili collection is missing a stable source token.".to_owned(),
+                )
+            })?;
+            let candidate_count = collection.selected_items.len().min(candidate_limit);
+            budget.charge_string(
+                "Bilibili resolution title",
+                collection.collection.title.len(),
+            )?;
+            budget.charge_string("Bilibili resolution source kind", source_kind.len())?;
+            budget.charge_candidate_buffer(candidate_count)?;
+
+            for item in collection.selected_items.iter().take(candidate_limit) {
+                let bvid = normalized_string(item.bvid.as_deref());
+                let selection_bytes = checked_materialized_string_bytes([
+                    "item:".len(),
+                    MAX_U32_DECIMAL_BYTES,
+                    ":source:".len(),
+                    source_token.len(),
+                    ":cid:".len(),
+                    MAX_U64_DECIMAL_BYTES,
+                    if bvid.is_some() { ":bvid:".len() } else { 0 },
+                    bvid.map_or(0, str::len),
+                    ":aid:".len(),
+                    MAX_U64_DECIMAL_BYTES,
+                ])?;
+                let owner_bytes = item
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map_or(0, |name| COLLECTION_OWNER_SEPARATOR_BYTES + name.len());
+                let subtitle_bytes = checked_materialized_string_bytes([
+                    source_kind.len(),
+                    " #".len(),
+                    MAX_U32_DECIMAL_BYTES,
+                    owner_bytes,
+                ])?;
+                let content_id_bytes = item
+                    .bvid
+                    .as_deref()
+                    .map_or("av".len() + MAX_U64_DECIMAL_BYTES, str::len);
+                let cover_uri_bytes = if include_candidate_cover_uri {
+                    item.cover_url.as_deref().map_or(0, str::len)
+                } else {
+                    0
+                };
+                budget.charge_string("Bilibili candidate selection id", selection_bytes)?;
+                budget.charge_string("Bilibili candidate title", item.title.len())?;
+                budget.charge_string("Bilibili candidate subtitle", subtitle_bytes)?;
+                budget.charge_string("Bilibili candidate source kind", source_kind.len())?;
+                budget.charge_string("Bilibili candidate content id", content_id_bytes)?;
+                budget.charge_string("Bilibili candidate bvid", bvid.map_or(0, str::len))?;
+                budget.charge_string("Bilibili candidate cover URI", cover_uri_bytes)?;
+                if candidate_count == 1 {
+                    budget.charge_string(
+                        "Bilibili default candidate selection id",
+                        selection_bytes,
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1693,23 +1975,47 @@ impl BilibiliPlaybackPlan {
 }
 
 impl BilibiliInputResolution {
-    fn from_resolved_content(source: String, input: &Input, resolved: ResolvedContent) -> Self {
-        match resolved {
+    fn from_resolved_content(
+        source: String,
+        input: &Input,
+        resolved: ResolvedContent,
+        candidate_limit: usize,
+        include_candidate_cover_uri: bool,
+    ) -> Result<Self, BilibiliDownloadError> {
+        ensure_resolution_materialization_budget(
+            &source,
+            input,
+            &resolved,
+            candidate_limit,
+            include_candidate_cover_uri,
+        )?;
+        Ok(match resolved {
             ResolvedContent::Video(video) => {
-                let candidates_truncated = video.pages.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
+                let candidates_truncated = video.pages.len() > candidate_limit;
                 let candidates = video
                     .pages
                     .iter()
-                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .take(candidate_limit)
                     .map(|page| BilibiliResolvedCandidate {
                         selection_id: page_selection_id(page, video.bvid.as_deref()),
                         title: non_empty_or(&page.title, &video.title),
                         subtitle: format!("Page {}", page.index),
                         source_kind: "video_page".to_owned(),
                         content_id: page.cid.to_string(),
+                        identity: BilibiliContentIdentity {
+                            kind: BilibiliContentKind::VideoPage,
+                            aid: Some(page.aid),
+                            bvid: normalized_bvid(video.bvid.as_deref()),
+                            cid: Some(page.cid),
+                            epid: None,
+                        },
                         index: page.index,
                         duration_seconds: page.duration_seconds,
-                        cover_uri: video.cover_url.clone().unwrap_or_default(),
+                        cover_uri: if include_candidate_cover_uri {
+                            video.cover_url.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
                     })
                     .collect::<Vec<_>>();
                 Self::with_candidates(
@@ -1726,10 +2032,10 @@ impl BilibiliInputResolution {
                 } else {
                     &season.selected_episodes
                 };
-                let candidates_truncated = episodes.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
+                let candidates_truncated = episodes.len() > candidate_limit;
                 let candidates = episodes
                     .iter()
-                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .take(candidate_limit)
                     .map(|episode| {
                         let subtitle = episode
                             .long_title
@@ -1743,9 +2049,20 @@ impl BilibiliInputResolution {
                             subtitle,
                             source_kind: "season_episode".to_owned(),
                             content_id: episode.epid.to_string(),
+                            identity: BilibiliContentIdentity {
+                                kind: BilibiliContentKind::SeasonEpisode,
+                                aid: Some(episode.aid),
+                                bvid: normalized_bvid(episode.bvid.as_deref()),
+                                cid: Some(episode.cid),
+                                epid: Some(episode.epid),
+                            },
                             index: episode.index,
                             duration_seconds: None,
-                            cover_uri: season.season.cover_url.clone().unwrap_or_default(),
+                            cover_uri: if include_candidate_cover_uri {
+                                season.season.cover_url.clone().unwrap_or_default()
+                            } else {
+                                String::new()
+                            },
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1759,12 +2076,11 @@ impl BilibiliInputResolution {
             }
             ResolvedContent::Collection(collection) => {
                 let source_kind = collection_kind_name(&collection.collection.kind);
-                let candidates_truncated =
-                    collection.selected_items.len() > BILIBILI_RESOLVE_CANDIDATE_LIMIT;
+                let candidates_truncated = collection.selected_items.len() > candidate_limit;
                 let candidates = collection
                     .selected_items
                     .iter()
-                    .take(BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+                    .take(candidate_limit)
                     .map(|item| BilibiliResolvedCandidate {
                         selection_id: collection_item_selection_id(input, item),
                         title: item.title.clone(),
@@ -1774,9 +2090,20 @@ impl BilibiliInputResolution {
                             .bvid
                             .clone()
                             .unwrap_or_else(|| format!("av{}", item.aid)),
+                        identity: BilibiliContentIdentity {
+                            kind: BilibiliContentKind::CollectionItem,
+                            aid: Some(item.aid),
+                            bvid: normalized_bvid(item.bvid.as_deref()),
+                            cid: Some(item.cid),
+                            epid: None,
+                        },
                         index: item.index,
                         duration_seconds: item.duration_seconds,
-                        cover_uri: item.cover_url.clone().unwrap_or_default(),
+                        cover_uri: if include_candidate_cover_uri {
+                            item.cover_url.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
                     })
                     .collect::<Vec<_>>();
                 Self::with_candidates(
@@ -1787,7 +2114,7 @@ impl BilibiliInputResolution {
                     candidates_truncated,
                 )
             }
-        }
+        })
     }
 
     fn with_candidates(
@@ -1821,6 +2148,10 @@ fn resolve_should_use_full_episode_list(input: &Input) -> bool {
         input,
         Input::Season(_) | Input::Media(_) | Input::CheeseSeason(_)
     )
+}
+
+fn normalized_bvid(bvid: Option<&str>) -> Option<String> {
+    normalized_string(bvid).map(str::to_owned)
 }
 
 fn page_selection_id(page: &bbdown_core::PageMetadata, video_bvid: Option<&str>) -> String {
@@ -1898,12 +2229,7 @@ fn episode_selection_id(epid: u64) -> String {
 }
 
 fn non_empty_or(value: &str, fallback: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        fallback.to_owned()
-    } else {
-        trimmed.to_owned()
-    }
+    non_empty_or_ref(value, fallback).to_owned()
 }
 
 fn collection_kind_name(kind: &VideoCollectionKind) -> &'static str {
@@ -2958,6 +3284,8 @@ mod tests {
     use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
     use std::fs as std_fs;
 
+    const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+
     fn assert_progress_near(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("progress should be set");
         assert!(
@@ -3403,67 +3731,93 @@ mod tests {
     }
 
     #[test]
-    fn bounded_resolve_selection_limits_candidates_to_first_page_window() {
-        let selection = resolve_selection().expect("resolve selection should be valid");
+    fn bounded_resolve_selection_uses_requested_limit() {
+        let selection = bounded_resolve_selection(37).expect("resolve selection should be valid");
 
         let Selection::Indices(indices) = selection else {
             panic!("resolve selection should use bounded indices");
         };
         assert!(indices.contains(1));
-        assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
-        assert!(!indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32 + 1));
+        assert!(indices.contains(37));
+        assert!(!indices.contains(38));
     }
 
     #[test]
-    fn resolve_truncation_probe_selection_reads_one_extra_item() {
-        let selection =
-            resolve_truncation_probe_selection().expect("probe selection should be valid");
+    fn legacy_resolve_window_probes_one_item_beyond_100() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(LEGACY_RESOLVE_CANDIDATE_LIMIT)
+            .expect("legacy candidate limit should be valid");
+        let selection = resolve_selection_for_input(&Input::History, candidate_window)
+            .expect("probe selection should be valid")
+            .expect("collection inputs should use a bounded selection");
 
         let Selection::Indices(indices) = selection else {
             panic!("probe selection should use bounded indices");
         };
-        assert!(indices.contains(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32));
-        assert!(indices.contains(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32));
-        assert!(!indices.contains(BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32 + 1));
+        assert!(indices.contains(100));
+        assert!(indices.contains(101));
+        assert!(!indices.contains(102));
+    }
+
+    #[test]
+    fn resolve_candidate_window_rejects_zero_oversized_and_overflowing_limits() {
+        for candidate_limit in [0, MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT + 1, usize::MAX] {
+            assert!(matches!(
+                BilibiliResolveCandidateWindow::new(candidate_limit),
+                Err(BilibiliDownloadError::Failed(message))
+                    if message.contains("candidate limit")
+            ));
+        }
+
+        let maximum = BilibiliResolveCandidateWindow::new(MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT)
+            .expect("v2 maximum candidate limit should be valid");
+        assert_eq!(10_000, maximum.candidate_limit);
+        assert_eq!(10_001, maximum.truncation_probe_limit);
     }
 
     #[test]
     fn resolve_selection_preserves_current_episode_inputs() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(7).unwrap();
         assert_eq!(
-            resolve_selection_for_input(&Input::Episode(123)).unwrap(),
+            resolve_selection_for_input(&Input::Episode(123), candidate_window).unwrap(),
             Some(Selection::Current)
         );
         assert_eq!(
-            resolve_selection_for_input(&Input::CheeseEpisode(456)).unwrap(),
+            resolve_selection_for_input(&Input::CheeseEpisode(456), candidate_window).unwrap(),
             Some(Selection::Current)
         );
         assert_eq!(
-            resolve_selection_for_input(&Input::IntlEpisode(789)).unwrap(),
+            resolve_selection_for_input(&Input::IntlEpisode(789), candidate_window).unwrap(),
             Some(Selection::Current)
         );
     }
 
     #[test]
     fn resolve_selection_uses_full_video_metadata_for_common_video_inputs() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(7).unwrap();
         assert_eq!(
-            resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned())).unwrap(),
+            resolve_selection_for_input(&Input::Bvid("BV1qt4y1X7TW".to_owned()), candidate_window,)
+                .unwrap(),
             None
         );
-        assert_eq!(resolve_selection_for_input(&Input::Aid(123)).unwrap(), None);
+        assert_eq!(
+            resolve_selection_for_input(&Input::Aid(123), candidate_window).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn resolve_selection_uses_bounded_windows_for_list_inputs() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(37).unwrap();
         assert_eq!(
-            resolve_selection_for_input(&Input::Season(123)).unwrap(),
+            resolve_selection_for_input(&Input::Season(123), candidate_window).unwrap(),
             Some(Selection::Page(1))
         );
         assert_eq!(
-            resolve_selection_for_input(&Input::Media(456)).unwrap(),
+            resolve_selection_for_input(&Input::Media(456), candidate_window).unwrap(),
             Some(Selection::Page(1))
         );
         assert_eq!(
-            resolve_selection_for_input(&Input::CheeseSeason(789)).unwrap(),
+            resolve_selection_for_input(&Input::CheeseSeason(789), candidate_window).unwrap(),
             Some(Selection::Page(1))
         );
 
@@ -3489,11 +3843,12 @@ mod tests {
             Input::History,
             Input::WatchLater,
         ];
-        let bounded_selection = Some(resolve_truncation_probe_selection().unwrap());
+        let bounded_selection =
+            Some(bounded_resolve_selection(candidate_window.truncation_probe_limit).unwrap());
 
         for input in list_inputs {
             assert_eq!(
-                resolve_selection_for_input(&input).unwrap(),
+                resolve_selection_for_input(&input, candidate_window).unwrap(),
                 bounded_selection
             );
         }
@@ -3600,6 +3955,13 @@ mod tests {
             subtitle: "Current owner".to_owned(),
             source_kind: "recommendation".to_owned(),
             content_id: "BV1xx411c7mD".to_owned(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::CollectionItem,
+                aid: Some(170_001),
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                cid: Some(270_001),
+                epid: None,
+            },
             index: 1,
             duration_seconds: Some(120),
             cover_uri: "https://example.invalid/cover.jpg".to_owned(),
@@ -3617,6 +3979,16 @@ mod tests {
         assert_eq!(recovered.index, 7);
         assert_eq!(recovered.title, "Current recommendation title");
         assert_eq!(recovered.duration_seconds, Some(120));
+        assert_eq!(
+            recovered.identity,
+            BilibiliContentIdentity {
+                kind: BilibiliContentKind::CollectionItem,
+                aid: Some(170_001),
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                cid: Some(270_001),
+                epid: None,
+            }
+        );
     }
 
     #[test]
@@ -3636,6 +4008,16 @@ mod tests {
         assert_eq!(recovered.title, "BV1xx411c7mD");
         assert_eq!(recovered.content_id, "BV1xx411c7mD");
         assert_eq!(recovered.source_kind, "recommendation");
+        assert_eq!(
+            recovered.identity,
+            BilibiliContentIdentity {
+                kind: BilibiliContentKind::CollectionItem,
+                aid: Some(170_001),
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                cid: Some(270_001),
+                epid: None,
+            }
+        );
     }
 
     #[test]
@@ -3775,12 +4157,18 @@ mod tests {
             (Input::History, "item:1"),
             (Input::History, "item:1:cid:270001"),
             (Input::History, "item:0:aid:170001"),
-            (Input::History, "item:101:aid:170001"),
+            (
+                Input::History,
+                "item:10001:source:history:cid:270001:aid:170001",
+            ),
             (Input::History, "item:1:aid:170001"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:1"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:1:cid:270001"),
             (Input::Bvid("BV1xx411c7mD".to_owned()), "page:0"),
-            (Input::Bvid("BV1xx411c7mD".to_owned()), "page:101"),
+            (
+                Input::Bvid("BV1xx411c7mD".to_owned()),
+                "page:10001:cid:270001:aid:170001",
+            ),
         ] {
             assert!(
                 matches!(
@@ -3791,6 +4179,23 @@ mod tests {
                 "expected {selection_id:?} to be rejected for {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_selection_indices_through_v2_candidate_limit() {
+        let page = playback_selection_from_id(
+            &Input::Bvid("BV1xx411c7mD".to_owned()),
+            Some("page:10000:cid:270001:aid:170001"),
+        )
+        .expect("v2 maximum page index should be valid");
+        assert_eq!(page.selection, Some(Selection::Page(10_000)));
+
+        let item = playback_selection_from_id(
+            &Input::History,
+            Some("item:10000:source:history:cid:270001:aid:170001"),
+        )
+        .expect("v2 maximum collection index should be valid");
+        assert_eq!(item.input_override, Some(Input::Aid(170_001)));
     }
 
     #[test]
@@ -3814,9 +4219,11 @@ mod tests {
 
     #[test]
     fn bounded_resolve_probe_finds_largest_valid_prefix() {
-        for available_count in [1, 2, 4, 9, 24, 49, 99] {
+        let candidate_window = BilibiliResolveCandidateWindow::new(37).unwrap();
+        let candidate_limit_u32 = u32::try_from(candidate_window.candidate_limit).unwrap();
+        for available_count in [1, 2, 4, 9, 24, 36, 37] {
             let mut search =
-                BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+                BoundedPrefixSearch::after_failed_limit(candidate_window.truncation_probe_limit);
             let mut attempts = Vec::new();
 
             while let Some(limit) = search.next_limit() {
@@ -3830,18 +4237,15 @@ mod tests {
 
             assert_eq!(search.best_success(), Some(available_count));
             assert!(attempts.iter().all(|limit| *limit > 0));
-            assert!(
-                attempts
-                    .iter()
-                    .all(|limit| *limit < BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
-            );
+            assert!(attempts.iter().all(|limit| *limit <= candidate_limit_u32));
         }
     }
 
     #[test]
     fn bounded_resolve_probe_returns_no_success_when_no_prefix_exists() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(37).unwrap();
         let mut search =
-            BoundedPrefixSearch::after_failed_limit(BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32);
+            BoundedPrefixSearch::after_failed_limit(candidate_window.truncation_probe_limit);
 
         while let Some(limit) = search.next_limit() {
             search.record_missing(limit);
@@ -3883,7 +4287,10 @@ mod tests {
                     },
                 ],
             }),
-        );
+            LEGACY_RESOLVE_CANDIDATE_LIMIT,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(resolution.source_kind, "video");
         assert_eq!(
@@ -3898,6 +4305,16 @@ mod tests {
             ]
         );
         assert_eq!(resolution.default_selection_id, "");
+        assert_eq!(
+            resolution.candidates[1].identity,
+            BilibiliContentIdentity {
+                kind: BilibiliContentKind::VideoPage,
+                aid: Some(170_001),
+                bvid: Some("BV1multi".to_owned()),
+                cid: Some(270_002),
+                epid: None,
+            }
+        );
 
         let input_selection = playback_selection_from_id(
             &Input::Bvid("BV1multi".to_owned()),
@@ -3912,6 +4329,133 @@ mod tests {
                 aid: Some(170_001),
                 cid: Some(270_002),
             })
+        );
+    }
+
+    #[test]
+    fn v2_resolution_omits_cover_allocations_while_materializing_candidates() {
+        let pages = (1..=u32::try_from(MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT).unwrap())
+            .map(|index| bbdown_core::PageMetadata {
+                index,
+                aid: 170_001,
+                cid: 270_000 + u64::from(index),
+                epid: None,
+                title: format!("Part {index}"),
+                duration_seconds: Some(60),
+            })
+            .collect();
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "BV1bounded-cover".to_owned(),
+            &Input::Bvid("BV1bounded-cover".to_owned()),
+            ResolvedContent::Video(bbdown_core::VideoMetadata {
+                aid: 170_001,
+                bvid: Some("BV1bounded-cover".to_owned()),
+                title: "Large paginated video".to_owned(),
+                description: String::new(),
+                cover_url: Some("x".repeat(64 * 1024)),
+                pub_time: None,
+                owner: None,
+                tags: Vec::new(),
+                pages,
+            }),
+            MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            resolution.candidates.len()
+        );
+        assert!(
+            resolution
+                .candidates
+                .iter()
+                .all(|candidate| candidate.cover_uri.capacity() == 0)
+        );
+    }
+
+    #[test]
+    fn resolution_rejects_repeated_fallback_title_before_candidate_materialization() {
+        let pages = (1..=u32::try_from(MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT).unwrap())
+            .map(|index| bbdown_core::PageMetadata {
+                index,
+                aid: 170_001,
+                cid: 270_000 + u64::from(index),
+                epid: None,
+                title: String::new(),
+                duration_seconds: Some(60),
+            })
+            .collect();
+        let result = BilibiliInputResolution::from_resolved_content(
+            "BV1oversized-title".to_owned(),
+            &Input::Bvid("BV1oversized-title".to_owned()),
+            ResolvedContent::Video(bbdown_core::VideoMetadata {
+                aid: 170_001,
+                bvid: Some("BV1oversized-title".to_owned()),
+                title: "x".repeat(MAX_BILIBILI_RESOLUTION_STRING_BYTES),
+                description: String::new(),
+                cover_url: None,
+                pub_time: None,
+                owner: None,
+                tags: Vec::new(),
+                pages,
+            }),
+            MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::ResourceExhausted(message))
+                if message.contains("server byte limit")
+        ));
+    }
+
+    #[test]
+    fn season_resolution_candidates_include_typed_episode_identity() {
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 2,
+            aid: 170_002,
+            bvid: Some("BV1episode".to_owned()),
+            cid: 270_002,
+            epid: 370_002,
+            title: "Episode 2".to_owned(),
+            long_title: Some("A typed identity".to_owned()),
+            pub_time: None,
+        };
+        let resolution = BilibiliInputResolution::from_resolved_content(
+            "season:123".to_owned(),
+            &Input::Season(123),
+            ResolvedContent::Season(bbdown_core::SeasonResolution {
+                season: bbdown_core::SeasonMetadata {
+                    season_id: Some(123),
+                    media_id: Some(456),
+                    title: "Example season".to_owned(),
+                    description: String::new(),
+                    cover_url: None,
+                    main_episode_count: 1,
+                    areas: Vec::new(),
+                    tags: Vec::new(),
+                    episodes: vec![episode.clone()],
+                },
+                selected_episodes: vec![episode],
+            }),
+            LEGACY_RESOLVE_CANDIDATE_LIMIT,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolution.candidates.len(), 1);
+        assert_eq!(
+            resolution.candidates[0].identity,
+            BilibiliContentIdentity {
+                kind: BilibiliContentKind::SeasonEpisode,
+                aid: Some(170_002),
+                bvid: Some("BV1episode".to_owned()),
+                cid: Some(270_002),
+                epid: Some(370_002),
+            }
         );
     }
 
@@ -3964,7 +4508,10 @@ mod tests {
                 },
                 selected_items: vec![selected_item, unselected_item],
             }),
-        );
+            LEGACY_RESOLVE_CANDIDATE_LIMIT,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(resolution.source_kind, "favorite");
         assert_eq!(resolution.candidates.len(), 2);
@@ -3975,6 +4522,16 @@ mod tests {
         );
         assert_eq!(candidate.title, "Selected Item");
         assert_eq!(candidate.index, 3);
+        assert_eq!(
+            candidate.identity,
+            BilibiliContentIdentity {
+                kind: BilibiliContentKind::CollectionItem,
+                aid: Some(170_001),
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                cid: Some(270_001),
+                epid: None,
+            }
+        );
 
         let input_selection = playback_selection_from_id(
             &Input::FavoriteList {
@@ -4053,7 +4610,10 @@ mod tests {
                     },
                     selected_items: vec![selected_item],
                 }),
-            );
+                LEGACY_RESOLVE_CANDIDATE_LIMIT,
+                true,
+            )
+            .unwrap();
 
             assert_eq!(resolution.source_kind, expected_source_kind);
             assert_eq!(resolution.candidates.len(), 1);
@@ -4064,11 +4624,13 @@ mod tests {
 
     #[test]
     fn collection_resolution_does_not_mark_exact_candidate_limit_truncated() {
+        let candidate_limit = 3_usize;
+        let candidate_limit_u32 = u32::try_from(candidate_limit).unwrap();
         let owner = bbdown_core::Owner {
             mid: 123,
             name: "Owner".to_owned(),
         };
-        let selected_items = (1..=BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32)
+        let selected_items = (1..=candidate_limit_u32)
             .map(|index| test_collection_item(index, &format!("Item {index}"), Some(owner.clone())))
             .collect::<Vec<_>>();
         let resolution = BilibiliInputResolution::from_resolved_content(
@@ -4087,22 +4649,25 @@ mod tests {
                 },
                 selected_items,
             }),
-        );
+            candidate_limit,
+            true,
+        )
+        .unwrap();
 
-        assert_eq!(
-            BILIBILI_RESOLVE_CANDIDATE_LIMIT,
-            resolution.candidates.len()
-        );
+        assert_eq!(candidate_limit, resolution.candidates.len());
         assert!(!resolution.candidates_truncated);
     }
 
     #[test]
     fn collection_resolution_marks_over_limit_candidate_window_truncated() {
+        let candidate_limit = 3_usize;
+        let candidate_limit_u32 = u32::try_from(candidate_limit).unwrap();
+        let truncation_probe_limit = candidate_limit_u32.checked_add(1).unwrap();
         let owner = bbdown_core::Owner {
             mid: 123,
             name: "Owner".to_owned(),
         };
-        let selected_items = (1..=BILIBILI_RESOLVE_TRUNCATION_PROBE_LIMIT_U32)
+        let selected_items = (1..=truncation_probe_limit)
             .map(|index| test_collection_item(index, &format!("Item {index}"), Some(owner.clone())))
             .collect::<Vec<_>>();
         let resolution = BilibiliInputResolution::from_resolved_content(
@@ -4121,14 +4686,14 @@ mod tests {
                 },
                 selected_items,
             }),
-        );
+            candidate_limit,
+            true,
+        )
+        .unwrap();
 
+        assert_eq!(candidate_limit, resolution.candidates.len());
         assert_eq!(
-            BILIBILI_RESOLVE_CANDIDATE_LIMIT,
-            resolution.candidates.len()
-        );
-        assert_eq!(
-            BILIBILI_RESOLVE_CANDIDATE_LIMIT_U32,
+            candidate_limit_u32,
             resolution
                 .candidates
                 .last()

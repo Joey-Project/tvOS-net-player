@@ -1,5 +1,6 @@
 mod bbdown_adapter;
 mod bilibili_playback;
+mod bilibili_resolution;
 pub mod bilibili_worker;
 mod bonjour;
 mod codecs;
@@ -35,6 +36,7 @@ use std::{
 
 use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
+use bilibili_resolution::{BilibiliResolutionStore, MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS};
 use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
 use generated::tvos_net_player::v1::{
     BilibiliLoginSession, LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
@@ -120,6 +122,8 @@ pub struct AppState {
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login_sessions: Arc<Mutex<VecDeque<BilibiliLoginSession>>>,
+    pub(crate) bilibili_resolutions: Arc<Mutex<BilibiliResolutionStore>>,
+    pub(crate) bilibili_resolution_blocking_permits: Arc<Semaphore>,
     pub(crate) task_result_pages: Arc<Mutex<TaskResultPageStore>>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
@@ -531,6 +535,10 @@ impl AppState {
             hls_network_policy,
             hls_playback_progress,
             bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            bilibili_resolutions: Arc::new(Mutex::new(BilibiliResolutionStore::default())),
+            bilibili_resolution_blocking_permits: Arc::new(Semaphore::new(
+                MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS,
+            )),
             task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),

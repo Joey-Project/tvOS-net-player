@@ -28,8 +28,11 @@ service LibraryService {
 
 service TaskService {
   rpc ResolveBilibiliInput(ResolveBilibiliInputRequest) returns (BilibiliResolveResult);
+  rpc StartBilibiliResolution(StartBilibiliResolutionRequest) returns (BilibiliResolutionPage);
+  rpc ListBilibiliResolutionCandidates(ListBilibiliResolutionCandidatesRequest) returns (BilibiliResolutionPage);
   rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
   rpc CreateBilibiliPlaybackTask(CreateBilibiliPlaybackTaskRequest) returns (Task);
+  rpc CreateBilibiliPlaybackTaskV2(CreateBilibiliPlaybackTaskV2Request) returns (Task);
   rpc GetTask(GetTaskRequest) returns (Task);
   rpc ListTaskResults(ListTaskResultsRequest) returns (ListTaskResultsResponse);
   rpc WatchTasks(WatchTasksRequest) returns (stream TaskEvent);
@@ -68,6 +71,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_LOGIN_SESSIONS = 11;
   SERVER_CAPABILITY_BILIBILI_PLAYBACK_POLICY = 12;
   SERVER_CAPABILITY_TASK_OUTPUT_V2 = 13;
+  SERVER_CAPABILITY_BILIBILI_RESOLUTION_V2 = 14;
 }
 
 message CheckHealthRequest {}
@@ -339,6 +343,78 @@ message BilibiliResolvedCandidate {
   uint32 index = 6;
   int64 duration_seconds = 7;
   string cover_uri = 8;
+}
+
+message StartBilibiliResolutionRequest {
+  string url_or_id = 1;
+  BilibiliPlaybackOptions options = 2;
+  PageRequest page = 3;
+}
+
+message ListBilibiliResolutionCandidatesRequest {
+  string session_id = 1;
+  PageRequest page = 2;
+}
+
+message BilibiliResolutionPage {
+  BilibiliResolutionSession session = 1;
+  repeated BilibiliResolutionCandidate candidates = 2;
+  PageInfo page_info = 3;
+}
+
+message BilibiliResolutionSession {
+  string id = 1;
+  string source = 2;
+  string title = 3;
+  string source_kind = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  string default_candidate_token = 7;
+}
+
+message BilibiliResolutionCandidate {
+  string candidate_token = 1;
+  string title = 2;
+  string subtitle = 3;
+  string source_kind = 4;
+  BilibiliContentIdentity identity = 5;
+  uint32 index = 6;
+  int64 duration_seconds = 7;
+}
+
+message BilibiliContentIdentity {
+  BilibiliContentKind kind = 1;
+  uint64 aid = 2;
+  string bvid = 3;
+  uint64 cid = 4;
+  uint64 epid = 5;
+}
+
+enum BilibiliContentKind {
+  BILIBILI_CONTENT_KIND_UNSPECIFIED = 0;
+  BILIBILI_CONTENT_KIND_VIDEO_PAGE = 1;
+  BILIBILI_CONTENT_KIND_SEASON_EPISODE = 2;
+  BILIBILI_CONTENT_KIND_COLLECTION_ITEM = 3;
+}
+
+message CreateBilibiliPlaybackTaskV2Request {
+  string session_id = 1;
+  BilibiliResolutionSelection selection = 2;
+}
+
+message BilibiliResolutionSelection {
+  BilibiliResolutionSelectionMode mode = 1;
+  repeated string candidate_tokens = 2;
+  string range_start_candidate_token = 3;
+  string range_end_candidate_token = 4;
+}
+
+enum BilibiliResolutionSelectionMode {
+  BILIBILI_RESOLUTION_SELECTION_MODE_UNSPECIFIED = 0;
+  BILIBILI_RESOLUTION_SELECTION_MODE_SINGLE = 1;
+  BILIBILI_RESOLUTION_SELECTION_MODE_MULTIPLE = 2;
+  BILIBILI_RESOLUTION_SELECTION_MODE_RANGE = 3;
+  BILIBILI_RESOLUTION_SELECTION_MODE_ALL = 4;
 }
 
 message BilibiliTaskSelection {

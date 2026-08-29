@@ -25,7 +25,7 @@ use serde::{
 use crate::generated::tvos_net_player::v1::{
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
     BilibiliPlaybackVariant, BilibiliTaskResultItem, BilibiliTaskSelection, CacheResourceRef,
-    LanTranscodingPlan, PlaybackSource, Task, TaskArtifact, TaskProblem, TaskResult,
+    LanTranscodingPlan, PlaybackSource, Task, TaskArtifact, TaskKind, TaskProblem, TaskResult,
     TaskResultProgress,
 };
 use crate::playback_policy::PlaybackPolicy;
@@ -33,9 +33,14 @@ use crate::task_output::{
     MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS,
     TaskOutputRecord, TaskResourceRecord,
 };
+use crate::{
+    bilibili_playback::{BilibiliContentIdentity, BilibiliContentKind},
+    bilibili_resolution::{BilibiliTaskCandidateRecord, MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES},
+};
 
 const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
-const TASK_STATE_SCHEMA_VERSION: u32 = 2;
+const GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION: u32 = 2;
+const TASK_STATE_SCHEMA_VERSION: u32 = 3;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 const MAX_PERSISTED_BILIBILI_VARIANTS: usize = 10_000;
@@ -273,7 +278,9 @@ impl TaskStateStore {
         let snapshot = deserialize_task_snapshot(&bytes)?;
         if !matches!(
             snapshot.schema_version,
-            LEGACY_TASK_STATE_SCHEMA_VERSION | TASK_STATE_SCHEMA_VERSION
+            LEGACY_TASK_STATE_SCHEMA_VERSION
+                | GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION
+                | TASK_STATE_SCHEMA_VERSION
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -521,6 +528,15 @@ impl<'a> PersistedTaskSequenceValidator<'a> {
     fn validate(&mut self, record: &'a PersistedTaskRecord) -> io::Result<()> {
         self.task_count = self.task_count.saturating_add(1);
         validate_collection_len("persisted tasks", self.task_count, MAX_PERSISTED_TASKS)?;
+        validate_collection_len(
+            "Bilibili accepted task candidates",
+            record.bilibili_candidates.len(),
+            MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES,
+        )?;
+        validate_bilibili_task_candidate_alignment(&record.task, &record.bilibili_candidates)?;
+        for candidate in &record.bilibili_candidates {
+            validate_bilibili_task_candidate(candidate)?;
+        }
         self.resource_count = self
             .resource_count
             .saturating_add(record.output.resources.len());
@@ -666,6 +682,19 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec(deserializer, MAX_TASK_RESULTS, "Bilibili task result items")
+}
+
+fn deserialize_bilibili_task_candidates<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedBilibiliTaskCandidate>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES,
+        "Bilibili accepted task candidates",
+    )
 }
 
 fn deserialize_task_results<'de, D>(deserializer: D) -> Result<Vec<PersistedTaskResult>, D::Error>
@@ -962,6 +991,7 @@ pub(crate) struct PersistedTaskRecord {
     pub(crate) task: Task,
     pub(crate) options: Option<BilibiliDownloadOptions>,
     pub(crate) playback_options: Option<BilibiliPlaybackOptions>,
+    pub(crate) bilibili_candidates: Vec<BilibiliTaskCandidateRecord>,
     pub(crate) output: TaskOutputRecord,
 }
 
@@ -1007,6 +1037,8 @@ struct PersistedTaskFile {
     bilibili_playback_options: Option<PersistedBilibiliPlaybackOptions>,
     #[serde(default)]
     bilibili_selection: Option<PersistedBilibiliTaskSelection>,
+    #[serde(default, deserialize_with = "deserialize_bilibili_task_candidates")]
+    bilibili_candidates: Vec<PersistedBilibiliTaskCandidate>,
     #[serde(default, deserialize_with = "deserialize_bilibili_result_items")]
     result_items: Vec<PersistedBilibiliTaskResultItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1027,6 +1059,11 @@ impl PersistedTaskFile {
                 MAX_TASK_RESULTS,
             )?;
         }
+        validate_collection_len(
+            "Bilibili accepted task candidates",
+            self.bilibili_candidates.len(),
+            MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES,
+        )?;
         if let Some(options) = self.bilibili_options.as_ref() {
             validate_collection_len(
                 "Bilibili danmaku formats",
@@ -1094,6 +1131,11 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
             bilibili_selection: task
                 .bilibili_selection
                 .map(PersistedBilibiliTaskSelection::from),
+            bilibili_candidates: record
+                .bilibili_candidates
+                .into_iter()
+                .map(PersistedBilibiliTaskCandidate::from)
+                .collect(),
             result_items: task
                 .result_items
                 .into_iter()
@@ -1116,6 +1158,12 @@ impl From<&PersistedTaskRecord> for PersistedTaskFile {
 
 impl PersistedTaskFile {
     fn into_record(self, schema_version: u32) -> io::Result<PersistedTaskRecord> {
+        if schema_version < TASK_STATE_SCHEMA_VERSION && !self.bilibili_candidates.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state schemas before v3 cannot contain accepted Bilibili candidates",
+            ));
+        }
         let task = Task {
             id: self.id,
             kind: self.kind,
@@ -1140,6 +1188,12 @@ impl PersistedTaskFile {
                 .collect(),
             output_summary: None,
         };
+        let bilibili_candidates = self
+            .bilibili_candidates
+            .into_iter()
+            .map(BilibiliTaskCandidateRecord::try_from)
+            .collect::<io::Result<Vec<_>>>()?;
+        validate_bilibili_task_candidate_alignment(&task, &bilibili_candidates)?;
         let output = match schema_version {
             LEGACY_TASK_STATE_SCHEMA_VERSION => {
                 let legacy = TaskOutputRecord::from_legacy_task(&task);
@@ -1153,12 +1207,12 @@ impl PersistedTaskFile {
                 )
                 .map_err(invalid_data)?
             }
-            TASK_STATE_SCHEMA_VERSION => self
+            GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION | TASK_STATE_SCHEMA_VERSION => self
                 .output
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "task state schema v2 task is missing output",
+                        format!("task state schema v{schema_version} task is missing output"),
                     )
                 })?
                 .into_output(&task)?,
@@ -1171,6 +1225,7 @@ impl PersistedTaskFile {
             playback_options: self
                 .bilibili_playback_options
                 .map(BilibiliPlaybackOptions::from),
+            bilibili_candidates,
             output,
         })
     }
@@ -1515,6 +1570,158 @@ impl From<PersistedBilibiliTaskSelection> for BilibiliTaskSelection {
             range_end_index: selection.range_end_index,
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliTaskCandidate {
+    selection_id: String,
+    title: String,
+    subtitle: String,
+    source_kind: String,
+    content_id: String,
+    identity: PersistedBilibiliContentIdentity,
+    index: u32,
+    duration_seconds: Option<u32>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedBilibiliContentKind {
+    VideoPage,
+    SeasonEpisode,
+    CollectionItem,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedBilibiliContentIdentity {
+    kind: PersistedBilibiliContentKind,
+    aid: Option<u64>,
+    bvid: Option<String>,
+    cid: Option<u64>,
+    epid: Option<u64>,
+}
+
+impl From<BilibiliTaskCandidateRecord> for PersistedBilibiliTaskCandidate {
+    fn from(candidate: BilibiliTaskCandidateRecord) -> Self {
+        Self {
+            selection_id: candidate.selection_id,
+            title: candidate.title,
+            subtitle: candidate.subtitle,
+            source_kind: candidate.source_kind,
+            content_id: candidate.content_id,
+            identity: PersistedBilibiliContentIdentity {
+                kind: match candidate.identity.kind {
+                    BilibiliContentKind::VideoPage => PersistedBilibiliContentKind::VideoPage,
+                    BilibiliContentKind::SeasonEpisode => {
+                        PersistedBilibiliContentKind::SeasonEpisode
+                    }
+                    BilibiliContentKind::CollectionItem => {
+                        PersistedBilibiliContentKind::CollectionItem
+                    }
+                },
+                aid: candidate.identity.aid,
+                bvid: candidate.identity.bvid,
+                cid: candidate.identity.cid,
+                epid: candidate.identity.epid,
+            },
+            index: candidate.index,
+            duration_seconds: candidate.duration_seconds,
+        }
+    }
+}
+
+impl TryFrom<PersistedBilibiliTaskCandidate> for BilibiliTaskCandidateRecord {
+    type Error = io::Error;
+
+    fn try_from(candidate: PersistedBilibiliTaskCandidate) -> Result<Self, Self::Error> {
+        let identity = BilibiliContentIdentity {
+            kind: match candidate.identity.kind {
+                PersistedBilibiliContentKind::VideoPage => BilibiliContentKind::VideoPage,
+                PersistedBilibiliContentKind::SeasonEpisode => BilibiliContentKind::SeasonEpisode,
+                PersistedBilibiliContentKind::CollectionItem => BilibiliContentKind::CollectionItem,
+            },
+            aid: candidate.identity.aid,
+            bvid: candidate.identity.bvid,
+            cid: candidate.identity.cid,
+            epid: candidate.identity.epid,
+        };
+        let candidate = Self {
+            selection_id: candidate.selection_id,
+            title: candidate.title,
+            subtitle: candidate.subtitle,
+            source_kind: candidate.source_kind,
+            content_id: candidate.content_id,
+            identity,
+            index: candidate.index,
+            duration_seconds: candidate.duration_seconds,
+        };
+        validate_bilibili_task_candidate(&candidate)?;
+        Ok(candidate)
+    }
+}
+
+fn validate_bilibili_task_candidate(candidate: &BilibiliTaskCandidateRecord) -> io::Result<()> {
+    if candidate.selection_id.trim().is_empty()
+        || candidate.title.trim().is_empty()
+        || candidate.source_kind.trim().is_empty()
+        || candidate.content_id.trim().is_empty()
+        || candidate.index == 0
+        || !candidate.identity.is_complete()
+        || !candidate.identity.matches_content_id(&candidate.content_id)
+        || candidate
+            .identity
+            .bvid
+            .as_deref()
+            .is_some_and(|bvid| bvid != bvid.trim())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted Bilibili task candidate contains an invalid required field",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_bilibili_task_candidate_alignment(
+    task: &Task,
+    candidates: &[BilibiliTaskCandidateRecord],
+) -> io::Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    if task.kind() != TaskKind::BilibiliProgressivePlayback || task.bilibili_selection.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted Bilibili v2 candidates belong only to v2 progressive playback tasks",
+        ));
+    }
+    if candidates.len() != task.result_items.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted Bilibili task candidates do not match task result count",
+        ));
+    }
+    let mut selection_ids = HashSet::with_capacity(candidates.len());
+    for (candidate, result) in candidates.iter().zip(&task.result_items) {
+        if !selection_ids.insert(candidate.selection_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted Bilibili task candidates contain duplicate selection identities",
+            ));
+        }
+        if !result.selection_id.is_empty()
+            || candidate.source_kind != result.source_kind
+            || candidate.content_id != result.content_id
+            || candidate.index != result.index
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted Bilibili task candidate does not match its task result plan",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1951,6 +2158,7 @@ mod tests {
             task,
             options: None,
             playback_options: None,
+            bilibili_candidates: Vec::new(),
         };
         let polled = Cell::new(0_usize);
         let records = std::iter::from_fn(|| {
@@ -1988,6 +2196,7 @@ mod tests {
                 ..Default::default()
             }),
             playback_options: None,
+            bilibili_candidates: Vec::new(),
         };
 
         let error = TaskStateStore::new(&path)
@@ -2036,6 +2245,7 @@ mod tests {
                 task,
                 options: None,
                 playback_options: None,
+                bilibili_candidates: Vec::new(),
                 output,
             }
         };
@@ -2113,6 +2323,7 @@ mod tests {
             task,
             options: None,
             playback_options: None,
+            bilibili_candidates: Vec::new(),
         };
 
         validate_registered_task_resource_count(std::slice::from_ref(&record))
@@ -2153,6 +2364,7 @@ mod tests {
                 task,
                 options: None,
                 playback_options: None,
+                bilibili_candidates: Vec::new(),
                 output,
             })
         };
@@ -2529,12 +2741,12 @@ mod tests {
         let expected_output = output.clone();
         TaskStateStore::new(path.clone())
             .save(&records)
-            .expect("migrated task state should write back as schema v2");
+            .expect("migrated task state should write back as schema v3");
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &fs::read(&path).expect("migrated task state should remain readable"),
         )
         .expect("migrated task state should remain valid JSON");
-        assert_eq!(2, persisted["schema_version"]);
+        assert_eq!(3, persisted["schema_version"]);
         assert_eq!(
             0,
             persisted["tasks"][0]["output"]["results"]
@@ -2549,6 +2761,12 @@ mod tests {
             .expect("compact legacy-managed output should reload");
         assert_eq!(expected_output, reloaded[0].output);
 
+        persisted["schema_version"] =
+            serde_json::Value::from(GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION);
+        persisted["tasks"][0]
+            .as_object_mut()
+            .expect("persisted task should be an object")
+            .remove("bilibili_candidates");
         persisted["tasks"][0]["output"]["results"] = serde_json::to_value(
             expected_output
                 .results
@@ -2566,6 +2784,16 @@ mod tests {
             .load()
             .expect("the previous duplicated v2 representation should remain compatible");
         assert_eq!(expected_output, duplicated[0].output);
+        assert!(duplicated[0].bilibili_candidates.is_empty());
+
+        TaskStateStore::new(path.clone())
+            .save(&duplicated)
+            .expect("schema v2 task state should migrate to schema v3");
+        let migrated_v2: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("migrated v2 task state should remain readable"),
+        )
+        .expect("migrated v2 task state should remain valid JSON");
+        assert_eq!(3, migrated_v2["schema_version"]);
 
         persisted["tasks"][0]["output"]["results"][0]["title"] =
             serde_json::Value::String("Tampered result".to_owned());
@@ -2738,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_nested_v2_task_output_without_persisting_resource_locations() {
+    fn round_trips_nested_task_output_without_persisting_resource_locations() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
         let subtitle_resource = TaskResourceRecord::new(CacheResourceRef {
@@ -2873,15 +3101,16 @@ mod tests {
                 task,
                 options: None,
                 playback_options: None,
+                bilibili_candidates: Vec::new(),
                 output: output.clone(),
             }])
-            .expect("v2 task output should persist");
+            .expect("task output should persist as schema v3");
 
         let mut snapshot: serde_json::Value = serde_json::from_slice(
             &fs::read(&path).expect("persisted snapshot should be readable"),
         )
         .expect("persisted snapshot should be valid JSON");
-        assert_eq!(Some(2), snapshot["schema_version"].as_u64());
+        assert_eq!(Some(3), snapshot["schema_version"].as_u64());
         let resource_json = snapshot["tasks"][0]["output"]["resources"][0]
             .as_object()
             .expect("persisted output resource should be an object");
@@ -2918,7 +3147,7 @@ mod tests {
 
         let records = TaskStateStore::new(path.clone())
             .load()
-            .expect("v2 task output should reload");
+            .expect("task output should reload");
         assert_eq!(output, records[0].output);
         assert_eq!("result-a", records[0].output.primary_result_id);
         assert_eq!(
@@ -2975,6 +3204,269 @@ mod tests {
                 .output
                 .snapshot_id
                 .starts_with("task-output-")
+        );
+    }
+
+    #[test]
+    fn round_trips_accepted_bilibili_v2_candidates_and_rejects_tampering() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let result_item = BilibiliTaskResultItem {
+            id: "bilibili-v2-task".to_owned(),
+            selection_id: String::new(),
+            title: "Part 1".to_owned(),
+            subtitle: "Page 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            index: 1,
+            state: TaskState::Preparing.into(),
+            message: "Queued for playback planning.".to_owned(),
+            library_item_id: String::new(),
+            playback_source: None,
+            playback_session: None,
+        };
+        let task = Task {
+            id: "bilibili-v2-task".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Preparing.into(),
+            source: "BV1stable".to_owned(),
+            title: "Stable video".to_owned(),
+            result_items: vec![result_item],
+            ..Default::default()
+        };
+        let candidate = BilibiliTaskCandidateRecord {
+            selection_id: "page:1:cid:2001:bvid:BV1stable:aid:1001".to_owned(),
+            title: "Part 1".to_owned(),
+            subtitle: "Page 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::VideoPage,
+                aid: Some(1_001),
+                bvid: Some("BV1stable".to_owned()),
+                cid: Some(2_001),
+                epid: None,
+            },
+            index: 1,
+            duration_seconds: Some(60),
+        };
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        TaskStateStore::new(path.clone())
+            .save(&[PersistedTaskRecord {
+                task,
+                options: None,
+                playback_options: Some(BilibiliPlaybackOptions::default()),
+                bilibili_candidates: vec![candidate.clone()],
+                output,
+            }])
+            .expect("accepted candidate should persist before planning");
+
+        let snapshot_bytes = fs::read(&path).expect("task snapshot should be readable");
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&snapshot_bytes).expect("task snapshot should be valid JSON");
+        let persisted_candidate = snapshot["tasks"][0]["bilibili_candidates"][0]
+            .as_object()
+            .expect("persisted candidate should be an object");
+        assert!(!persisted_candidate.contains_key("cover_uri"));
+        assert_eq!(
+            Some("video_page"),
+            persisted_candidate["identity"]["kind"].as_str()
+        );
+        assert_eq!(Some(2_001), persisted_candidate["identity"]["cid"].as_u64());
+
+        let records = TaskStateStore::new(&path)
+            .load()
+            .expect("accepted candidate should reload");
+        assert_eq!(vec![candidate], records[0].bilibili_candidates);
+        assert!(records[0].task.result_items[0].selection_id.is_empty());
+
+        let mut invalid_identity = snapshot.clone();
+        invalid_identity["tasks"][0]["bilibili_candidates"][0]["identity"]["cid"] =
+            serde_json::Value::from(0_u64);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&invalid_identity)
+                .expect("invalid identity fixture should serialize"),
+        )
+        .expect("invalid identity fixture should be written");
+        let error = match TaskStateStore::new(&path).load() {
+            Ok(_) => panic!("an incomplete stable identity must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut mismatched_identity = snapshot.clone();
+        mismatched_identity["tasks"][0]["bilibili_candidates"][0]["identity"]["cid"] =
+            serde_json::Value::from(2_002_u64);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&mismatched_identity)
+                .expect("mismatched identity fixture should serialize"),
+        )
+        .expect("mismatched identity fixture should be written");
+        let error = match TaskStateStore::new(&path).load() {
+            Ok(_) => panic!("a stable identity must match the accepted content id"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut old_schema_with_candidates = snapshot.clone();
+        old_schema_with_candidates["schema_version"] =
+            serde_json::Value::from(GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&old_schema_with_candidates)
+                .expect("old schema fixture should serialize"),
+        )
+        .expect("old schema fixture should be written");
+        let error = match TaskStateStore::new(&path).load() {
+            Ok(_) => panic!("schemas before v3 must not accept durable candidate identities"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut wrong_task_kind = snapshot.clone();
+        wrong_task_kind["tasks"][0]["kind"] =
+            serde_json::Value::from(i32::from(TaskKind::BilibiliDownload));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&wrong_task_kind)
+                .expect("wrong task kind fixture should serialize"),
+        )
+        .expect("wrong task kind fixture should be written");
+        let error = match TaskStateStore::new(&path).load() {
+            Ok(_) => panic!("v2 candidates must remain bound to progressive playback tasks"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut misaligned = snapshot;
+        misaligned["tasks"][0]["result_items"][0]["content_id"] =
+            serde_json::Value::String("tampered-content-id".to_owned());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&misaligned)
+                .expect("misaligned candidate fixture should serialize"),
+        )
+        .expect("misaligned candidate fixture should be written");
+        let error = match TaskStateStore::new(path).load() {
+            Ok(_) => panic!("candidate and task result plans must stay aligned"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn bounds_accepted_bilibili_v2_candidates_on_save_and_load() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let store = TaskStateStore::new(&path);
+        let candidate = |index: u32| {
+            let aid = 1_000 + u64::from(index);
+            let cid = 2_000 + u64::from(index);
+            let bvid = format!("BV1stable{index}");
+            BilibiliTaskCandidateRecord {
+                selection_id: format!("page:{index}:cid:{cid}:bvid:{bvid}:aid:{aid}"),
+                title: format!("Part {index}"),
+                subtitle: format!("Page {index}"),
+                source_kind: "video_page".to_owned(),
+                content_id: cid.to_string(),
+                identity: BilibiliContentIdentity {
+                    kind: BilibiliContentKind::VideoPage,
+                    aid: Some(aid),
+                    bvid: Some(bvid),
+                    cid: Some(cid),
+                    epid: None,
+                },
+                index,
+                duration_seconds: Some(60),
+            }
+        };
+        let result_item = |index: u32| BilibiliTaskResultItem {
+            id: format!("bilibili-v2-task-{index}"),
+            selection_id: String::new(),
+            title: format!("Part {index}"),
+            subtitle: format!("Page {index}"),
+            source_kind: "video_page".to_owned(),
+            content_id: (2_000 + u64::from(index)).to_string(),
+            index,
+            state: TaskState::Preparing.into(),
+            message: "Queued for playback planning.".to_owned(),
+            library_item_id: String::new(),
+            playback_source: None,
+            playback_session: None,
+        };
+        let task = Task {
+            id: "bilibili-v2-task".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Preparing.into(),
+            source: "BV1stable".to_owned(),
+            title: "Stable video".to_owned(),
+            result_items: vec![result_item(1)],
+            ..Default::default()
+        };
+        store
+            .save(&[PersistedTaskRecord {
+                output: TaskOutputRecord::from_legacy_task(&task),
+                task,
+                options: None,
+                playback_options: Some(BilibiliPlaybackOptions::default()),
+                bilibili_candidates: vec![candidate(1)],
+            }])
+            .expect("a bounded v2 task should persist");
+
+        let overflow_count = MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES + 1;
+        let overflow_indices =
+            1..=u32::try_from(overflow_count).expect("test candidate count should fit u32");
+        let overflow_candidates = overflow_indices.clone().map(candidate).collect::<Vec<_>>();
+        let overflow_task = Task {
+            id: "oversized-bilibili-v2-task".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Preparing.into(),
+            source: "BV1oversized".to_owned(),
+            title: "Oversized video".to_owned(),
+            result_items: overflow_indices.map(result_item).collect(),
+            ..Default::default()
+        };
+        let error = store
+            .save(&[PersistedTaskRecord {
+                output: TaskOutputRecord::from_legacy_task(&overflow_task),
+                task: overflow_task,
+                options: None,
+                playback_options: Some(BilibiliPlaybackOptions::default()),
+                bilibili_candidates: overflow_candidates,
+            }])
+            .expect_err("save must reject a v2 task above the execution cap");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili accepted task candidates cannot exceed 100 entries")
+        );
+
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("the bounded snapshot should remain readable"),
+        )
+        .expect("the bounded snapshot should remain valid JSON");
+        let persisted_candidate = snapshot["tasks"][0]["bilibili_candidates"][0].clone();
+        snapshot["tasks"][0]["bilibili_candidates"] =
+            serde_json::Value::Array(vec![persisted_candidate; overflow_count]);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&snapshot)
+                .expect("oversized candidate fixture should serialize"),
+        )
+        .expect("oversized candidate fixture should be written");
+
+        let error = match store.load() {
+            Ok(_) => panic!("load must reject a v2 task above the execution cap"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("Bilibili accepted task candidates cannot exceed 100 entries")
         );
     }
 
@@ -3095,6 +3587,7 @@ mod tests {
                     audio_language: "ja-jp".to_owned(),
                     playback_policy: Some(playback_policy),
                 }),
+                bilibili_candidates: Vec::new(),
                 output: output.clone(),
             }])
             .expect("task state should persist");

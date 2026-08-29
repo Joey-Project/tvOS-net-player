@@ -41,6 +41,16 @@ public protocol CacheControlClient: Sendable {
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage
+    func listBilibiliResolutionCandidates(
+        sessionID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage
     func createBilibiliTask(
         urlOrID: String,
         options: BilibiliDownloadTaskOptions
@@ -59,6 +69,10 @@ public protocol CacheControlClient: Sendable {
         selection: BilibiliTaskSelection?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask
+    func createBilibiliPlaybackTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection
+    ) async throws -> CacheTask
 }
 
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
@@ -68,10 +82,17 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case bilibiliCredentialProfiles
     case bilibiliLoginSessions
     case bilibiliResolve
+    case bilibiliResolutionV2
     case bilibiliDownloadTask
     case bilibiliTaskSelection
     case bilibiliPlaybackPolicy
     case playbackProgressReporting
+}
+
+public enum CacheControlClientInvalidRequest: Error, Equatable, Sendable {
+    case bilibiliResolutionInputRequired
+    case bilibiliResolutionSessionIDRequired
+    case invalidBilibiliResolutionSelection
 }
 
 public extension CacheControlClient {
@@ -111,6 +132,22 @@ public extension CacheControlClient {
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult {
         throw CacheControlClientUnsupportedFeature.bilibiliResolve
+    }
+
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions(),
+        pageSize: Int = 50
+    ) async throws -> BilibiliResolutionPage {
+        throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
+    }
+
+    func listBilibiliResolutionCandidates(
+        sessionID: String,
+        pageToken: String = "",
+        pageSize: Int = 50
+    ) async throws -> BilibiliResolutionPage {
+        throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
     }
 
     func createBilibiliTask(
@@ -165,6 +202,13 @@ public extension CacheControlClient {
         )
     }
 
+    func createBilibiliPlaybackTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection
+    ) async throws -> CacheTask {
+        throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
+    }
+
     func watchTask(id: String) async -> AsyncThrowingStream<CacheTask, Error> {
         await watchTasks(ids: [id])
     }
@@ -185,6 +229,8 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "Bilibili login sessions are not supported by this cache server."
         case .bilibiliResolve:
             return "Bilibili resolve is not supported by this cache server."
+        case .bilibiliResolutionV2:
+            return "Paginated Bilibili resolution is not supported by this cache server."
         case .bilibiliDownloadTask:
             return "Bilibili download tasks are not supported by this cache server."
         case .bilibiliTaskSelection:
@@ -193,6 +239,19 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "Bilibili playback policy controls are not supported by this cache server."
         case .playbackProgressReporting:
             return "Playback progress reporting is not supported by this cache server."
+        }
+    }
+}
+
+extension CacheControlClientInvalidRequest: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .bilibiliResolutionInputRequired:
+            return "A Bilibili URL or ID is required to start resolution."
+        case .bilibiliResolutionSessionIDRequired:
+            return "A Bilibili resolution session ID is required."
+        case .invalidBilibiliResolutionSelection:
+            return "The Bilibili resolution selection is structurally invalid."
         }
     }
 }
