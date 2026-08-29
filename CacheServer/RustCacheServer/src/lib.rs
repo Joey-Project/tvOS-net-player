@@ -126,6 +126,7 @@ pub struct AppState {
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
     hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
     hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
+    hls_task_lifecycle_lock: Arc<Mutex<()>>,
     completed_hls_deletion_lock: Arc<Mutex<()>>,
     pending_hls_session_cleanups: Arc<Mutex<PendingHlsSessionCleanups>>,
     hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
@@ -531,6 +532,7 @@ impl AppState {
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
             hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
             hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
+            hls_task_lifecycle_lock: Arc::new(Mutex::new(())),
             completed_hls_deletion_lock: Arc::new(Mutex::new(())),
             pending_hls_session_cleanups: Arc::new(
                 Mutex::new(PendingHlsSessionCleanups::default()),
@@ -759,69 +761,98 @@ impl AppState {
             }
             owned_session_ids.insert(session.id.clone());
             if completed_session_ids.contains(&session.id) && self.tasks.persistence_available() {
-                self.hls_sessions
-                    .insert(sanitized_completed_session(session));
-                match self.hls_cache.save_completed_session(session) {
-                    Ok(()) => {
-                        let completed_playback_session =
-                            playback_session_from_hls_cache_session(session);
-                        let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
-                        let completion = {
+                let completion = {
+                    let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                    if self
+                        .tasks
+                        .playable_task_id_for_hls_session(&session.id)
+                        .as_deref()
+                        != Some(task_id.as_str())
+                    {
+                        owned_session_ids.remove(&session.id);
+                        continue;
+                    }
+                    self.hls_sessions
+                        .insert(sanitized_completed_session(session));
+                    match self.hls_cache.save_completed_session(session) {
+                        Ok(()) => {
+                            let completed_playback_session =
+                                playback_session_from_hls_cache_session(session);
+                            let library_item_id =
+                                HlsCacheStore::completed_library_item_id(&session.id);
                             let _deletion_guard = self.completed_hls_mutation_guard();
-                            self.tasks
-                                .complete_playback_hls_session_cached_with_metadata(
-                                    &task_id,
-                                    &session.id,
-                                    library_item_id.clone(),
-                                    completed_playback_session,
-                                )
-                        };
-                        match completion {
-                            Ok(task)
-                                if self.tasks.playback_task_has_completed_hls_cache_item(
-                                    &task,
-                                    &session.id,
-                                    &library_item_id,
-                                ) =>
-                            {
-                                if let Err(error) = self.enforce_hls_cache_quota(
-                                    "after_hls_finalization",
-                                    [session.id.clone()],
-                                    0,
-                                ) {
-                                    eprintln!(
-                                        "Failed to run HLS cache eviction after startup finalization for task {}: {error}",
-                                        session.id
-                                    );
-                                }
-                                continue;
-                            }
-                            Ok(_) => continue,
-                            Err(status) => {
-                                eprintln!(
-                                    "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
-                                    session.id
-                                );
-                                if status.code() != tonic::Code::Unavailable {
-                                    continue;
-                                }
-                            }
+                            Some((
+                                self.tasks
+                                    .complete_playback_hls_session_cached_with_metadata(
+                                        &task_id,
+                                        &session.id,
+                                        library_item_id.clone(),
+                                        completed_playback_session,
+                                    ),
+                                library_item_id,
+                            ))
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
+                                session.id
+                            );
+                            None
                         }
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
-                            session.id
-                        );
+                };
+                if let Some((completion, library_item_id)) = completion {
+                    match completion {
+                        Ok(task)
+                            if self.tasks.playback_task_has_completed_hls_cache_item(
+                                &task,
+                                &session.id,
+                                &library_item_id,
+                            ) =>
+                        {
+                            if let Err(error) = self.enforce_hls_cache_quota(
+                                "after_hls_finalization",
+                                [session.id.clone()],
+                                0,
+                            ) {
+                                eprintln!(
+                                    "Failed to run HLS cache eviction after startup finalization for task {}: {error}",
+                                    session.id
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(_) => continue,
+                        Err(status) => {
+                            eprintln!(
+                                "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
+                                session.id
+                            );
+                            if status.code() != tonic::Code::Unavailable {
+                                continue;
+                            }
+                        }
                     }
                 }
             }
 
-            self.enqueue_hls_cache_fill_demoted(
-                task_id,
-                session.clone(),
-                HlsCacheFinalizationFailureMode::FailRestoredTask,
-            );
+            {
+                let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                if self
+                    .tasks
+                    .playable_task_id_for_hls_session(&session.id)
+                    .as_deref()
+                    != Some(task_id.as_str())
+                {
+                    owned_session_ids.remove(&session.id);
+                    continue;
+                }
+                self.enqueue_hls_cache_fill_demoted(
+                    task_id,
+                    session.clone(),
+                    HlsCacheFinalizationFailureMode::FailRestoredTask,
+                );
+            }
         }
         owned_session_ids
     }
@@ -1075,6 +1106,12 @@ impl AppState {
         self.completed_hls_deletion_lock
             .lock()
             .expect("completed HLS deletion lock poisoned")
+    }
+
+    pub(crate) fn hls_task_lifecycle_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.hls_task_lifecycle_lock
+            .lock()
+            .expect("HLS task lifecycle lock poisoned")
     }
 
     fn completed_hls_delete_session_ids(

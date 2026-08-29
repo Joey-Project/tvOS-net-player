@@ -1761,10 +1761,18 @@ impl TaskService for TaskGrpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        let cancellation = self
-            .state
-            .tasks
-            .cancel_task_with_hls_session_ids(&request.id)?;
+        let cancellation = {
+            let _lifecycle_guard = self.state.hls_task_lifecycle_guard();
+            let cancellation = self
+                .state
+                .tasks
+                .cancel_task_with_hls_session_ids(&request.id)?;
+            if cancellation.task.kind() == TaskKind::BilibiliProgressivePlayback {
+                self.state
+                    .cancel_hls_fill_work_for_task(&cancellation.task.id);
+            }
+            cancellation
+        };
         let task = cancellation.task;
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
@@ -2506,12 +2514,12 @@ async fn run_single_bilibili_playback_planning(
         uri: playback_source_uri,
         expires_at: None,
     };
-    state.register_hls_playback_session(metadata.hls_session.clone());
-    match state.tasks.complete_playback_playable(
+    match publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+        &state,
         &task_id,
-        metadata.title,
+        metadata,
         playback_source,
-        metadata.playback_session,
+        || {},
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
@@ -2524,17 +2532,6 @@ async fn run_single_bilibili_playback_planning(
                 )
                 .await
             } else {
-                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
-                    eprintln!(
-                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                }
-                state.enqueue_hls_cache_fill_foreground(
-                    task_id.clone(),
-                    metadata.hls_session,
-                    HlsCacheFinalizationFailureMode::KeepPlayable,
-                );
                 true
             }
         }
@@ -2553,6 +2550,45 @@ async fn run_single_bilibili_playback_planning(
             .await
         }
     }
+}
+
+fn publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+    state: &AppState,
+    task_id: &str,
+    metadata: PlaybackTaskMetadata,
+    playback_source: PlaybackSource,
+    pre_enqueue_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
+
+    state.register_hls_playback_session(metadata.hls_session.clone());
+    let task = state.tasks.complete_playback_playable(
+        task_id,
+        metadata.title,
+        playback_source,
+        metadata.playback_session,
+    )?;
+    if task.state() != TaskState::Playable {
+        return Ok(task);
+    }
+
+    pre_enqueue_hook();
+    if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
+        eprintln!(
+            "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
+            state.error_detail_for_log(&error)
+        );
+    }
+    state.enqueue_hls_cache_fill_foreground(
+        task_id.to_owned(),
+        metadata.hls_session,
+        HlsCacheFinalizationFailureMode::KeepPlayable,
+    );
+    Ok(task)
 }
 
 async fn run_explicit_bilibili_playback_planning(
@@ -2799,13 +2835,17 @@ async fn run_explicit_bilibili_playback_planning(
         first_item.message = final_message.clone();
     }
 
-    match state.tasks.complete_playback_results_playable(
+    match complete_explicit_bilibili_playback_with_pre_enqueue_hook(
+        &state,
         &task_id,
         primary_title,
         final_message,
         primary_source,
         primary_session,
         result_items,
+        primary_hls_session,
+        planned_sessions,
+        || {},
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
@@ -2818,22 +2858,6 @@ async fn run_explicit_bilibili_playback_planning(
                 )
                 .await
             } else {
-                let primary_session_id = primary_hls_session.id.clone();
-                state.enqueue_hls_cache_fill_foreground(
-                    task_id.clone(),
-                    primary_hls_session,
-                    HlsCacheFinalizationFailureMode::KeepPlayable,
-                );
-                for session in planned_sessions {
-                    if session.id == primary_session_id {
-                        continue;
-                    }
-                    state.enqueue_hls_cache_fill_demoted(
-                        task_id.clone(),
-                        session,
-                        HlsCacheFinalizationFailureMode::KeepPlayable,
-                    );
-                }
                 true
             }
         }
@@ -2852,6 +2876,57 @@ async fn run_explicit_bilibili_playback_planning(
             .await
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_explicit_bilibili_playback_with_pre_enqueue_hook(
+    state: &AppState,
+    task_id: &str,
+    primary_title: String,
+    final_message: String,
+    primary_source: PlaybackSource,
+    primary_session: BilibiliPlaybackSession,
+    result_items: Vec<BilibiliTaskResultItem>,
+    primary_hls_session: HlsPlaybackSession,
+    planned_sessions: Vec<HlsPlaybackSession>,
+    pre_enqueue_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
+
+    let task = state.tasks.complete_playback_results_playable(
+        task_id,
+        primary_title,
+        final_message,
+        primary_source,
+        primary_session,
+        result_items,
+    )?;
+    if task.state() != TaskState::Playable {
+        return Ok(task);
+    }
+
+    pre_enqueue_hook();
+    let primary_session_id = primary_hls_session.id.clone();
+    state.enqueue_hls_cache_fill_foreground(
+        task_id.to_owned(),
+        primary_hls_session,
+        HlsCacheFinalizationFailureMode::KeepPlayable,
+    );
+    for session in planned_sessions {
+        if session.id == primary_session_id {
+            continue;
+        }
+        state.enqueue_hls_cache_fill_demoted(
+            task_id.to_owned(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        );
+    }
+    Ok(task)
 }
 
 struct ExplicitBilibiliHlsResultPublication {
@@ -2884,6 +2959,11 @@ fn publish_explicit_bilibili_hls_result_with_post_save_hook(
     publication: ExplicitBilibiliHlsResultPublication,
     post_save_hook: impl FnOnce(),
 ) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(&publication.task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
     let _deletion_guard = state.completed_hls_mutation_guard();
     state.register_hls_playback_session(publication.hls_session.clone());
     if let Err(error) = state.hls_cache.save_session(&publication.hls_session) {
@@ -7197,6 +7277,91 @@ mod tests {
                 .hls_cache
                 .playback_session(&child_session_id)
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_rejects_late_explicit_hls_result_publication() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1late-explicit-publication", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let metadata = playback_task_metadata(&child_session_id, sample_playback_plan())
+            .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let result_items = vec![BilibiliTaskResultItem {
+            id: child_session_id.clone(),
+            selection_id: "page:2".to_owned(),
+            title: "Part 2".to_owned(),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-2".to_owned(),
+            index: 2,
+            state: TaskState::Playable.into(),
+            message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            playback_source: Some(playback_source),
+            playback_session: Some(metadata.playback_session),
+        }];
+
+        let cancelled = TaskGrpcService::new(state.clone())
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("preparing task should accept cancellation")
+            .into_inner();
+        assert_eq!(TaskState::CancelRequested, cancelled.state());
+
+        let post_save_called = Arc::new(AtomicBool::new(false));
+        let post_save_called_for_hook = Arc::clone(&post_save_called);
+        let publication = publish_explicit_bilibili_hls_result_with_post_save_hook(
+            &state,
+            ExplicitBilibiliHlsResultPublication {
+                task_id: task_id.clone(),
+                title: "Collection".to_owned(),
+                message: "Planned 1/2 Bilibili playback result(s).".to_owned(),
+                progress: 0.5,
+                result_items,
+                hls_session: metadata.hls_session,
+            },
+            move || post_save_called_for_hook.store(true, AtomicOrdering::Release),
+        )
+        .expect("late publication should return the cancelled task");
+
+        assert_eq!(TaskState::CancelRequested, publication.state());
+        assert!(!post_save_called.load(AtomicOrdering::Acquire));
+        assert!(publication.result_items.is_empty());
+        assert!(state.hls_sessions.get(&child_session_id).is_none());
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_none()
+        );
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&child_session_id)
+                .exists()
         );
     }
 
@@ -16605,6 +16770,114 @@ mod tests {
         assert_eq!(TaskState::Cancelled, cancelled.state());
         assert!(!session_manifest.exists());
         assert!(state.hls_fill_scheduler.is_idle());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cancel_waits_for_single_hls_publication_before_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1publication-cancel", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let metadata = playback_task_metadata(
+            &task_id,
+            sample_playback_plan_with_video_url("http://upstream.example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: task_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let (publication_entered_sender, publication_entered_receiver) = oneshot::channel();
+        let (publication_release_sender, publication_release_receiver) = std::sync::mpsc::channel();
+        let publisher_state = state.clone();
+        let publisher_task_id = task_id.clone();
+        let publisher = tokio::spawn(async move {
+            publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+                &publisher_state,
+                &publisher_task_id,
+                metadata,
+                playback_source,
+                || {
+                    publication_entered_sender
+                        .send(())
+                        .expect("test should observe the publication boundary");
+                    publication_release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release HLS publication");
+                },
+            )
+        });
+        publication_entered_receiver
+            .await
+            .expect("publication should reach the pre-enqueue boundary");
+
+        let (cancellation_started_sender, cancellation_started_receiver) = oneshot::channel();
+        let cancellation_service = TaskGrpcService::new(state.clone());
+        let cancellation_task_id = task_id.clone();
+        let cancellation = tokio::spawn(async move {
+            cancellation_started_sender
+                .send(())
+                .expect("test should observe cancellation start");
+            cancellation_service
+                .cancel_task(Request::new(CancelTaskRequest {
+                    id: cancellation_task_id,
+                }))
+                .await
+                .expect("playable task should cancel")
+                .into_inner()
+        });
+        cancellation_started_receiver
+            .await
+            .expect("cancellation should start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cancellation.is_finished(),
+            "cancellation must wait until manifest publication and enqueue are fenced"
+        );
+
+        publication_release_sender
+            .send(())
+            .expect("test should release HLS publication");
+        let published = timeout(Duration::from_secs(2), publisher)
+            .await
+            .expect("publication should finish")
+            .expect("publication task should not panic")
+            .expect("publication should succeed");
+        assert_eq!(TaskState::Playable, published.state());
+        let cancelled = timeout(Duration::from_secs(2), cancellation)
+            .await
+            .expect("cancellation should finish after publication")
+            .expect("cancellation task should not panic");
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&task_id)
+                .exists()
+        );
+        state.shutdown_hls_fill_worker().await;
     }
 
     #[tokio::test]
