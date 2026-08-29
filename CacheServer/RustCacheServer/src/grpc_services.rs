@@ -79,7 +79,7 @@ use crate::{
     task_registry::{
         BilibiliTaskProgress, BilibiliTaskRegistry, HlsSessionPublicationState,
         PLAYBACK_PLANNING_CANCELLED_MESSAGE, PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
-        current_timestamp,
+        TaskPersistenceRecoveryOutcome, current_timestamp,
     },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
@@ -2263,13 +2263,20 @@ impl Drop for PlaybackPlanningCleanup {
 pub(crate) async fn retry_pending_task_persistence(
     tasks: &Arc<BilibiliTaskRegistry>,
     context: &str,
-) -> bool {
+) -> TaskPersistenceRecoveryOutcome {
     let tasks = Arc::clone(tasks);
-    match tokio::task::spawn_blocking(move || tasks.retry_pending_persistence()).await {
-        Ok(persisted) => persisted,
+    match tokio::task::spawn_blocking(move || tasks.retry_pending_persistence_outcome()).await {
+        Ok(outcome) => {
+            if outcome == TaskPersistenceRecoveryOutcome::PermanentFailure {
+                eprintln!(
+                    "Task persistence recovery was rejected permanently for {context}; releasing background ownership"
+                );
+            }
+            outcome
+        }
         Err(error) => {
             eprintln!("Failed to join task persistence retry for {context}: {error}");
-            false
+            TaskPersistenceRecoveryOutcome::PermanentFailure
         }
     }
 }
@@ -2328,8 +2335,12 @@ async fn complete_playback_planning_terminal(
             }
         }
 
-        if !retry_pending_task_persistence(&state.tasks, "Bilibili playback planning").await {
-            sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+        match retry_pending_task_persistence(&state.tasks, "Bilibili playback planning").await {
+            TaskPersistenceRecoveryOutcome::Durable => {}
+            TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+            }
+            TaskPersistenceRecoveryOutcome::PermanentFailure => return false,
         }
     }
 }
@@ -3151,6 +3162,12 @@ enum HlsCacheFinalizationOutcome {
     PersistencePending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HlsSessionPublicationRecoveryOutcome {
+    State(HlsSessionPublicationState),
+    PermanentFailure,
+}
+
 fn hls_cache_fill_should_requeue(
     state: &AppState,
     job: &crate::hls_fill_scheduler::HlsFillJob,
@@ -3174,18 +3191,27 @@ async fn retry_pending_hls_session_publication(
     state: &AppState,
     task_id: &str,
     session_id: &str,
-) -> HlsSessionPublicationState {
+) -> HlsSessionPublicationRecoveryOutcome {
     let publication = state
         .tasks
         .hls_session_publication_state(task_id, session_id);
     if publication != HlsSessionPublicationState::Pending {
-        return publication;
+        return HlsSessionPublicationRecoveryOutcome::State(publication);
     }
 
-    retry_pending_task_persistence(&state.tasks, "HLS cache fill").await;
-    state
-        .tasks
-        .hls_session_publication_state(task_id, session_id)
+    match retry_pending_task_persistence(&state.tasks, "HLS cache fill").await {
+        TaskPersistenceRecoveryOutcome::PermanentFailure => {
+            HlsSessionPublicationRecoveryOutcome::PermanentFailure
+        }
+        TaskPersistenceRecoveryOutcome::Durable
+        | TaskPersistenceRecoveryOutcome::RetryableFailure => {
+            HlsSessionPublicationRecoveryOutcome::State(
+                state
+                    .tasks
+                    .hls_session_publication_state(task_id, session_id),
+            )
+        }
+    }
 }
 
 async fn run_hls_cache_finalization_inner(
@@ -3204,8 +3230,12 @@ async fn run_hls_cache_finalization_inner(
             .tasks
             .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session_id)
     {
-        if state.tasks.persistence_recovery_supported() && !state.tasks.persistence_available() {
-            retry_pending_task_persistence(&state.tasks, "HLS cache fill failure").await;
+        if state.tasks.persistence_recovery_supported()
+            && !state.tasks.persistence_available()
+            && retry_pending_task_persistence(&state.tasks, "HLS cache fill failure").await
+                == TaskPersistenceRecoveryOutcome::PermanentFailure
+        {
+            return HlsCacheFinalizationOutcome::Finished;
         }
         return if !state.tasks.persistence_recovery_supported()
             || state.tasks.persistence_available()
@@ -3222,11 +3252,12 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Finished;
         }
         match retry_pending_hls_session_publication(&state, &task_id, &session_id).await {
-            HlsSessionPublicationState::Published => {}
-            HlsSessionPublicationState::Pending => {
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Published) => {}
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Pending) => {
                 return HlsCacheFinalizationOutcome::PersistencePending;
             }
-            HlsSessionPublicationState::Absent => {
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Absent)
+            | HlsSessionPublicationRecoveryOutcome::PermanentFailure => {
                 return HlsCacheFinalizationOutcome::Finished;
             }
         }
@@ -15214,6 +15245,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_fill_releases_ownership_after_permanent_publication_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-permanent-rejection",
+            "https://example.test/video.m4s",
+        );
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+
+        state.tasks.fail_next_persistence_directory_sync();
+        let outcome =
+            publish_completed_hls_cache(&state, &job.task_id, &job.session.id, &job.session).await;
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        state.hls_fill_scheduler.finish_current(&job, true);
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        state
+            .tasks
+            .inject_permanently_invalid_playback_result_for_test(&task_id);
+        let retry_outcome = timeout(
+            Duration::from_secs(1),
+            run_hls_cache_finalization_inner(
+                state.clone(),
+                retry.task_id.clone(),
+                retry.session.clone(),
+                retry.failure_mode,
+                retry.token.clone(),
+            ),
+        )
+        .await
+        .expect("permanent publication rejection must not retry forever");
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert!(!hls_cache_fill_should_requeue(
+            &state,
+            &retry,
+            retry_outcome
+        ));
+        state.hls_fill_scheduler.finish_current(&retry, false);
+        assert!(!state.tasks.persistence_available());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(!state.hls_fill_scheduler.owns_session(&session.id));
+    }
+
+    #[tokio::test]
+    async fn playback_planning_terminal_returns_on_permanent_persistence_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-permanent-rejection", None, None)
+            .expect("playback task should be created durably");
+        state
+            .tasks
+            .inject_permanently_invalid_playback_result_for_test(&creation.task.id);
+
+        let completed = timeout(
+            Duration::from_secs(1),
+            complete_playback_planning_terminal(
+                &state,
+                &creation.task.id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed.".to_owned(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("permanent task-state rejection must not retry forever");
+
+        assert!(!completed);
+        assert!(!state.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Preparing,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+    }
+
+    #[tokio::test]
     async fn playback_planning_terminal_returns_when_malformed_store_requires_restart() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -15343,7 +15483,7 @@ mod tests {
 
         fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
         assert_eq!(
-            HlsSessionPublicationState::Published,
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Published),
             retry_pending_hls_session_publication(&state, &creation.task.id, &creation.task.id)
                 .await
         );

@@ -609,12 +609,22 @@ impl AppState {
                 let Some(tasks) = tasks.upgrade() else {
                     return;
                 };
-                if tasks.persistence_available()
-                    || crate::grpc_services::retry_pending_task_persistence(
+                let persistence_recovery = if tasks.persistence_available() {
+                    crate::task_registry::TaskPersistenceRecoveryOutcome::Durable
+                } else {
+                    crate::grpc_services::retry_pending_task_persistence(
                         &tasks,
                         "HLS startup reconciliation",
                     )
                     .await
+                };
+                if persistence_recovery
+                    == crate::task_registry::TaskPersistenceRecoveryOutcome::PermanentFailure
+                {
+                    return;
+                }
+                if persistence_recovery
+                    == crate::task_registry::TaskPersistenceRecoveryOutcome::Durable
                 {
                     let mut retry_sessions = Vec::new();
                     for session in pending_sessions {

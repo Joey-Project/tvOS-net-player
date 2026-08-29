@@ -298,6 +298,30 @@ impl BilibiliTaskRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_permanently_invalid_playback_result_for_test(&self, id: &str) {
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = inner
+            .tasks_by_id
+            .get_mut(id)
+            .expect("test playback task should exist");
+        task.result_items = vec![BilibiliTaskResultItem {
+            id: "invalid-result".to_owned(),
+            selection_id: "page:1".to_owned(),
+            title: "x".repeat(crate::task_output::MAX_TASK_RESULT_ENCODED_BYTES + 1),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-invalid".to_owned(),
+            index: 1,
+            state: TaskState::Preparing.into(),
+            message: String::new(),
+            library_item_id: String::new(),
+            playback_source: None,
+            playback_session: None,
+        }];
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_resource_storage_for_revalidation_for_test(&self, resource_id: &str) {
         self.resource_storage_available
             .store(false, AtomicOrdering::Release);
@@ -1327,6 +1351,11 @@ impl BilibiliTaskRegistry {
             if is_terminal(task.state()) {
                 return Ok(task.clone());
             }
+            let checkpoint = TaskRecordMutationCheckpoint::capture(&inner, &normalized_id);
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_id)
+                .expect("validated playback task should remain present");
             if let Some(title) = title {
                 task.title = title;
             }
@@ -1336,9 +1365,17 @@ impl BilibiliTaskRegistry {
             }
             task.result_items = result_items;
             task.updated_at = Some(current_timestamp());
-            task.clone()
+            (task.clone(), checkpoint)
         };
-        self.persist_task_and_publish(inner, task.clone(), false, None);
+        let (task, checkpoint) = task;
+        let outcome = self.persist_task_and_publish(inner, task.clone(), false, None);
+        if outcome.is_permanent_failure() {
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            checkpoint.restore(&mut inner);
+            return Err(Status::failed_precondition(
+                "Playback result update cannot be persisted safely.",
+            ));
+        }
         Ok(task)
     }
 
@@ -3618,6 +3655,47 @@ struct RegistryMutationCheckpoint {
     pending_publications_by_id: HashMap<String, Task>,
 }
 
+struct TaskRecordMutationCheckpoint {
+    task: Task,
+    output: Option<TaskOutputRecord>,
+    pending_publication: Option<Task>,
+}
+
+impl TaskRecordMutationCheckpoint {
+    fn capture(inner: &RegistryInner, task_id: &str) -> Self {
+        Self {
+            task: inner
+                .tasks_by_id
+                .get(task_id)
+                .expect("task mutation checkpoint requires an existing task")
+                .clone(),
+            output: inner.outputs_by_task_id.get(task_id).cloned(),
+            pending_publication: inner.pending_publications_by_id.get(task_id).cloned(),
+        }
+    }
+
+    fn restore(self, inner: &mut RegistryInner) {
+        let task_id = self.task.id.clone();
+        inner.tasks_by_id.insert(task_id.clone(), self.task);
+        match self.output {
+            Some(output) => {
+                inner.outputs_by_task_id.insert(task_id.clone(), output);
+            }
+            None => {
+                inner.outputs_by_task_id.remove(&task_id);
+            }
+        }
+        match self.pending_publication {
+            Some(task) => {
+                inner.pending_publications_by_id.insert(task_id, task);
+            }
+            None => {
+                inner.pending_publications_by_id.remove(&task_id);
+            }
+        }
+    }
+}
+
 impl RegistryMutationCheckpoint {
     fn capture(inner: &RegistryInner) -> Self {
         Self {
@@ -3763,6 +3841,10 @@ impl PersistenceCommitOutcome {
 
     fn is_durable(self) -> bool {
         self == Self::Durable
+    }
+
+    fn is_permanent_failure(self) -> bool {
+        self == Self::Rejected(PersistenceFailureRetryability::Permanent)
     }
 }
 
@@ -9957,7 +10039,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_legacy_reconciliation_never_replaces_durable_snapshot() {
+    fn oversized_playback_result_update_rolls_back_without_poisoning_persistence() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
         let registry = BilibiliTaskRegistry::with_persistence_path(&path);
@@ -9965,6 +10047,14 @@ mod tests {
             .create_bilibili_playback_task("BV1oversized-legacy", None, None)
             .expect("playback task should be created");
         let durable_task = registry.get_task(&creation.task.id).unwrap();
+        let durable_output = registry
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .outputs_by_task_id
+            .get(&creation.task.id)
+            .expect("durable output should exist")
+            .clone();
         let durable_snapshot = std::fs::read(&path).expect("durable snapshot should be readable");
         let oversized_result = BilibiliTaskResultItem {
             id: "result-one".to_owned(),
@@ -9981,7 +10071,7 @@ mod tests {
             playback_session: None,
         };
 
-        registry
+        let error = registry
             .update_playback_results(
                 &creation.task.id,
                 None,
@@ -9989,15 +10079,39 @@ mod tests {
                 0.5,
                 vec![oversized_result],
             )
-            .expect("legacy mutation remains staged in memory");
+            .expect_err("an unpersistable result update must be rejected");
 
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
         assert_eq!(durable_task, registry.get_task(&creation.task.id).unwrap());
+        {
+            let inner = registry.inner.lock().expect("task registry lock poisoned");
+            assert_eq!(
+                &durable_task,
+                inner
+                    .tasks_by_id
+                    .get(&creation.task.id)
+                    .expect("working task should be restored")
+            );
+            assert_eq!(
+                &durable_output,
+                inner
+                    .outputs_by_task_id
+                    .get(&creation.task.id)
+                    .expect("working output should be restored")
+            );
+        }
         assert_eq!(
             durable_snapshot,
             std::fs::read(&path).expect("durable snapshot should remain readable")
         );
         assert!(!registry.persistence_available());
         assert!(!registry.task_output_v2_available());
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::Durable,
+            registry.retry_pending_persistence_outcome()
+        );
+        assert!(registry.persistence_available());
+        assert!(registry.task_output_v2_available());
         drop(registry);
 
         let restored = BilibiliTaskRegistry::with_persistence_path(&path);

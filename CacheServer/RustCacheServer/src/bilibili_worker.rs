@@ -262,7 +262,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::generated::tvos_net_player::v1::{BilibiliTaskResultItem, TaskState};
+    use crate::generated::tvos_net_player::v1::TaskState;
     use tokio::sync::Notify;
 
     use super::*;
@@ -535,28 +535,11 @@ mod tests {
         registry
             .create_bilibili_task("BV1queued-two", None)
             .expect("second download should be queued durably");
-        registry
-            .update_playback_results(
-                &creation.task.id,
-                None,
-                "Planning result.".to_owned(),
-                0.5,
-                vec![BilibiliTaskResultItem {
-                    id: "result-one".to_owned(),
-                    selection_id: "page:1".to_owned(),
-                    title: "x".repeat(crate::task_output::MAX_TASK_RESULT_ENCODED_BYTES + 1),
-                    subtitle: String::new(),
-                    source_kind: "video_page".to_owned(),
-                    content_id: "cid-1".to_owned(),
-                    index: 1,
-                    state: TaskState::Preparing.into(),
-                    message: String::new(),
-                    library_item_id: String::new(),
-                    playback_source: None,
-                    playback_session: None,
-                }],
-            )
-            .expect("legacy mutation should remain staged in memory");
+        registry.inject_permanently_invalid_playback_result_for_test(&creation.task.id);
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::PermanentFailure,
+            registry.retry_pending_persistence_outcome()
+        );
         assert!(!registry.persistence_available());
         let adapter = Arc::new(StartCountingAdapter::default());
         let worker = tokio::spawn(run_bilibili_task_worker(
