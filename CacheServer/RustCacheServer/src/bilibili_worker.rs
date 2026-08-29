@@ -3,6 +3,7 @@ use std::{
     future::Future,
     io,
     panic::AssertUnwindSafe,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
 };
@@ -56,6 +57,7 @@ pub struct BilibiliDownloadOutputV2 {
     pub(crate) resources: Vec<TaskResourceRecord>,
     pub resource_bodies: Vec<BilibiliTaskResourceBody>,
     pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
+    pub(crate) unpublished_output_paths: Vec<PathBuf>,
 }
 
 pub struct BilibiliTaskResourceBody {
@@ -163,6 +165,7 @@ async fn run_one_bilibili_task(
     work_item: BilibiliTaskWorkItem,
     credentials_configured: bool,
 ) {
+    let is_v2 = !work_item.accepted_candidates.is_empty();
     let request = BilibiliDownloadRequest {
         task_id: work_item.task_id.clone(),
         source: work_item.source,
@@ -203,7 +206,13 @@ async fn run_one_bilibili_task(
                     .is_some_and(|output| output.terminal_state == TaskState::Cancelled)
         )
     {
+        if let Ok(output) = &result
+            && let Some(output_v2) = output.v2.as_ref()
+        {
+            cleanup_unpublished_output_paths(&output_v2.unpublished_output_paths).await;
+        }
         let message = match result {
+            Err(BilibiliDownloadError::Cancelled(_)) if is_v2 => "Cancelled by request.".to_owned(),
             Err(BilibiliDownloadError::Cancelled(message)) => {
                 crate::credential_safe_client_cancellation(credentials_configured, &message)
             }
@@ -242,8 +251,11 @@ async fn run_one_bilibili_task(
             .await;
         }
         Err(BilibiliDownloadError::Cancelled(message)) => {
-            let message =
-                crate::credential_safe_client_cancellation(credentials_configured, &message);
+            let message = if is_v2 {
+                "Cancelled by request.".to_owned()
+            } else {
+                crate::credential_safe_client_cancellation(credentials_configured, &message)
+            };
             let task_id = work_item.task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_cancelled(&task_id, message.clone())
@@ -255,7 +267,15 @@ async fn run_one_bilibili_task(
             @ (BilibiliDownloadError::Failed(_) | BilibiliDownloadError::ResourceExhausted(_)),
         ) => {
             let detail = error.message();
-            let message = crate::credential_safe_client_error(credentials_configured, &detail);
+            let message = if is_v2 {
+                eprintln!(
+                    "Bilibili v2 task {} failed before result publication: {detail}",
+                    work_item.task_id
+                );
+                "The Bilibili download failed.".to_owned()
+            } else {
+                crate::credential_safe_client_error(credentials_configured, &detail)
+            };
             let task_id = work_item.task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_failed(&task_id, message.clone())
@@ -331,6 +351,7 @@ async fn complete_v2_terminal_task(
     .await;
 
     if let Err(error) = publication {
+        cleanup_unpublished_output_paths(&output.unpublished_output_paths).await;
         if error.code() == tonic::Code::Cancelled {
             complete_terminal_task(registry, move |registry| {
                 registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
@@ -346,6 +367,25 @@ async fn complete_v2_terminal_task(
             )
         })
         .await;
+    }
+}
+
+pub(crate) async fn cleanup_unpublished_output_paths(paths: &[PathBuf]) {
+    let mut removed = HashSet::with_capacity(paths.len());
+    for path in paths {
+        if !removed.insert(path) {
+            continue;
+        }
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "Failed to remove unpublished Bilibili output {}: {error}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -756,6 +796,9 @@ mod tests {
     async fn worker_rejects_v2_success_returned_after_cancellation() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
+        let unpublished_output_path = temp.path().join("late-success.mp4");
+        std::fs::write(&unpublished_output_path, b"late success")
+            .expect("unpublished output should be written");
         let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&state_path));
         let task = registry
             .create_bilibili_download_task_v2(
@@ -768,7 +811,9 @@ mod tests {
             .expect("v2 task should be created durably");
         let worker = tokio::spawn(run_bilibili_task_worker(
             Arc::clone(&registry),
-            Arc::new(LateSuccessAfterCancellationV2Adapter),
+            Arc::new(LateSuccessAfterCancellationV2Adapter {
+                output_path: unpublished_output_path.clone(),
+            }),
             1,
             true,
         ));
@@ -789,6 +834,10 @@ mod tests {
             output.output.record.results[0].state()
         );
         assert!(output.output.record.resources.is_empty());
+        assert!(
+            !unpublished_output_path.exists(),
+            "a late v2 success rejected by cancellation must remove its output"
+        );
     }
 
     #[tokio::test]
@@ -1245,6 +1294,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_omits_v2_adapter_failure_detail_without_credentials() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(
+            temp.path().join("state").join("tasks.json"),
+        ));
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(FailureAdapter),
+            1,
+            false,
+        ));
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1v2-safe-failure",
+                None,
+                None,
+                "Safe failure".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+
+        let completed = wait_for_state(&registry, &task.id, TaskState::Failed).await;
+
+        worker.abort();
+        assert_eq!("The Bilibili download failed.", completed.message);
+        assert!(!completed.message.contains("adapter failed"));
+    }
+
+    #[tokio::test]
     async fn worker_marks_adapter_panic_as_failure_and_allows_requeue() {
         let registry = Arc::new(BilibiliTaskRegistry::default());
         let worker = tokio::spawn(run_bilibili_task_worker(
@@ -1321,7 +1399,9 @@ mod tests {
 
     struct PartialV2Adapter;
 
-    struct LateSuccessAfterCancellationV2Adapter;
+    struct LateSuccessAfterCancellationV2Adapter {
+        output_path: PathBuf,
+    }
 
     impl BilibiliDownloadAdapter for LateSuccessAfterCancellationV2Adapter {
         fn run<'a>(
@@ -1329,6 +1409,7 @@ mod tests {
             request: BilibiliDownloadRequest,
             context: BilibiliDownloadContext,
         ) -> BilibiliDownloadFuture<'a> {
+            let output_path = self.output_path.clone();
             Box::pin(async move {
                 context
                     .registry
@@ -1356,6 +1437,7 @@ mod tests {
                         resources: Vec::new(),
                         resource_bodies: Vec::new(),
                         library_item_leases: Vec::new(),
+                        unpublished_output_paths: vec![output_path],
                     }),
                 })
             })
@@ -1415,6 +1497,7 @@ mod tests {
                             source: BilibiliTaskResourceBodySource::Bytes(body),
                         }],
                         library_item_leases: Vec::new(),
+                        unpublished_output_paths: Vec::new(),
                     }),
                 })
             })

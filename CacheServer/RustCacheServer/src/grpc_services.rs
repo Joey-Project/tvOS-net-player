@@ -119,6 +119,7 @@ const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 const LEGACY_BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
 const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback planning.";
 const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
+const BILIBILI_RESULT_FAILED_MESSAGE: &str = "Bilibili playback planning failed.";
 const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
 const MAX_TASK_RESULT_PAGE_SIZE: usize = 200;
 const MAX_TASK_RESULT_PAGE_ENCODED_BYTES: usize = 4 * 1024 * 1024;
@@ -1710,7 +1711,11 @@ impl TaskService for TaskGrpcService {
         PlaybackPolicy::from_playback_options(request.options.as_ref())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         normalize_bilibili_request_context(request.context.as_mut())?;
-        freeze_bilibili_resolution_api_mode(&mut request.context, request.options.as_ref());
+        freeze_bilibili_resolution_context(
+            &mut request.context,
+            request.options.as_ref(),
+            &self.state.options,
+        )?;
 
         let _permit = Arc::clone(&self.state.playback_planning_permits)
             .acquire_owned()
@@ -2143,7 +2148,7 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
     }
     for item in &mut task.result_items {
         match item.state() {
-            TaskState::Failed => {
+            TaskState::Failed if item.message != BILIBILI_RESULT_FAILED_MESSAGE => {
                 item.message = crate::credential_safe_client_error(true, &item.message);
             }
             TaskState::Cancelled => {
@@ -2839,10 +2844,11 @@ fn normalize_bilibili_request_context(
     Ok(())
 }
 
-fn freeze_bilibili_resolution_api_mode(
+fn freeze_bilibili_resolution_context(
     context: &mut Option<BilibiliRequestContext>,
     options: Option<&BilibiliPlaybackOptions>,
-) {
+    server_options: &crate::config::CacheServerOptions,
+) -> Result<(), Status> {
     let context = context.get_or_insert_with(BilibiliRequestContext::default);
     if context.api_mode() == BilibiliApiMode::Unspecified {
         context.api_mode = if options.is_some_and(|options| options.prefer_tv_api) {
@@ -2851,6 +2857,37 @@ fn freeze_bilibili_resolution_api_mode(
             BilibiliApiMode::Web.into()
         };
     }
+    if context.credential_profile_id.is_empty() {
+        context.credential_profile_id = frozen_bilibili_credential_profile_id(server_options)?;
+    }
+    Ok(())
+}
+
+fn frozen_bilibili_credential_profile_id(
+    options: &crate::config::CacheServerOptions,
+) -> Result<String, Status> {
+    if let Some(profile_id) = options.bbdown_credential_profile.as_deref() {
+        let profile_id = profile_id.trim();
+        if profile_id.len() > MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES {
+            return Err(Status::failed_precondition(
+                "Configured Bilibili credential profile id is too long.",
+            ));
+        }
+        return Ok(profile_id.to_owned());
+    }
+
+    let Some(path) = options.bbdown_credential_path.as_ref() else {
+        return Ok(String::new());
+    };
+    let profiles = CredentialStore::new(path.clone())
+        .load_profiles()
+        .map_err(|_| Status::failed_precondition("Failed to load BBDown credential file."))?;
+    if profiles.default_profile.len() > MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES {
+        return Err(Status::failed_precondition(
+            "Default Bilibili credential profile id is too long.",
+        ));
+    }
+    Ok(profiles.default_profile)
 }
 
 fn create_accepted_bilibili_playback_task_v2<T>(
@@ -3441,7 +3478,11 @@ async fn run_selected_bilibili_playback_planning(
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
                 let message = playback_error_message(error);
-                result_items[index].message = state.error_detail_for_client(&message);
+                eprintln!(
+                    "Bilibili playback planning for task {task_id} candidate {session_id} failed: {}",
+                    state.error_detail_for_log(&message)
+                );
+                result_items[index].message = BILIBILI_RESULT_FAILED_MESSAGE.to_owned();
                 None
             }
         };
@@ -8120,6 +8161,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_bilibili_resolution_freezes_the_default_credential_profile() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let task_state_path = root_path.join("state").join("tasks.json");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "profile-a",
+                "profiles": {
+                    "profile-a": { "cookie": "SESSDATA=profile-a" },
+                    "profile-b": { "cookie": "SESSDATA=profile-b" }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let resolve_contexts = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: task_state_path.clone(),
+                root_path,
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credentials_path.clone()),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(ContextRecordingResolvePlanner {
+                contexts: Arc::clone(&resolve_contexts),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let service = TaskGrpcService::new(state);
+
+        let page = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1freeze-default-profile".to_owned(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("resolution should freeze the active profile")
+            .into_inner();
+        let session = page.session.expect("resolution should include its session");
+        let expected_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Web.into(),
+            credential_profile_id: "profile-a".to_owned(),
+        };
+        assert_eq!(Some(expected_context.clone()), session.context);
+        assert_eq!(
+            vec![Some(expected_context.clone())],
+            *resolve_contexts
+                .lock()
+                .expect("resolve context log should not be poisoned")
+        );
+
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "profile-b",
+                "profiles": {
+                    "profile-a": { "cookie": "SESSDATA=profile-a" },
+                    "profile-b": { "cookie": "SESSDATA=profile-b" }
+                }
+            }"#,
+        )
+        .expect("credential default should be changed after resolution");
+        let created = service
+            .create_bilibili_task_v2(Request::new(bilibili_execution_v2_request(
+                &session.id,
+                &page.candidates[0].candidate_token,
+                Some(BilibiliExecutionV2::Download(BilibiliDownloadSpec {
+                    mode: BilibiliDownloadMode::All.into(),
+                    ..Default::default()
+                })),
+            )))
+            .await
+            .expect("task creation should retain the resolution context")
+            .into_inner();
+
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(task_state_path).expect("task state should be durable"),
+        )
+        .expect("task state should be valid JSON");
+        let persisted = persisted_task_json(&snapshot, &created.id);
+        assert_eq!(
+            Some("profile-a"),
+            persisted["request_context"]["credential_profile_id"].as_str()
+        );
+    }
+
+    #[tokio::test]
     async fn create_bilibili_task_v2_rejects_invalid_execution_before_accepting_selection() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -10078,13 +10215,8 @@ mod tests {
             .into_inner();
         assert_eq!(1, snapshot.result_items.len());
         assert_eq!(
-            crate::credential_safe_client_error(true, &sensitive_detail),
+            BILIBILI_RESULT_FAILED_MESSAGE,
             snapshot.result_items[0].message
-        );
-        assert!(
-            snapshot.result_items[0]
-                .message
-                .contains("[bilibili_failure_class=restricted_proxy]")
         );
         assert!(
             !snapshot.result_items[0]
@@ -10481,6 +10613,11 @@ mod tests {
         );
         assert_eq!(2, playable.result_items.len());
         assert_eq!(i32::from(TaskState::Failed), playable.result_items[0].state);
+        assert_eq!(
+            BILIBILI_RESULT_FAILED_MESSAGE,
+            playable.result_items[0].message
+        );
+        assert!(!playable.result_items[0].message.contains("page 1"));
         assert!(playable.result_items[0].playback_source.is_none());
         assert!(playable.result_items[0].playback_session.is_none());
         assert_eq!(

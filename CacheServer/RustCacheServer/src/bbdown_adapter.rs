@@ -40,6 +40,7 @@ use crate::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadOutputV2,
         BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
+        cleanup_unpublished_output_paths,
     },
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
@@ -437,9 +438,7 @@ impl BbdownBilibiliAdapter {
         let download_mode = download_mode_from_options(request.options.as_ref())?;
         let input = playback_input_for_planning(&request.source)?;
         let mut results = Vec::with_capacity(request.candidates.len());
-        let mut resources = Vec::new();
-        let mut resource_bodies = Vec::new();
-        let mut library_item_leases = Vec::new();
+        let mut retained_backing = RetainedV2DownloadBacking::default();
         let mut primary_library_item_id = String::new();
         let mut successful_results = 0_usize;
         let mut cancelled = false;
@@ -554,18 +553,21 @@ impl BbdownBilibiliAdapter {
                 )),
             });
 
-            let report = match mux_download_report(report, &self.ffmpeg_path, &|| {
+            let mut report = report;
+            match mux_download_report_in_place(&mut report, &self.ffmpeg_path, &|| {
                 context.is_cancel_requested()
             })
             .await
             {
-                Ok(report) => report,
+                Ok(()) => {}
                 Err(BilibiliDownloadError::Cancelled(_)) => {
+                    cleanup_unpublished_download_report(&report).await;
                     cancelled = true;
                     results.push(cancelled_download_result(result_id, candidate));
                     continue;
                 }
                 Err(error) => {
+                    cleanup_unpublished_download_report(&report).await;
                     log_v2_candidate_error(&request.task_id, &result_id, &error);
                     results.push(failed_download_result(result_id, candidate, &error));
                     report_v2_candidate_finished(
@@ -579,14 +581,15 @@ impl BbdownBilibiliAdapter {
                 }
             };
 
-            if context.is_cancel_requested() {
-                cancelled = true;
-                results.push(cancelled_download_result(result_id, candidate));
-                continue;
-            }
-
             let mapped = self
-                .map_v2_download_result(result_id.clone(), candidate, &plan, &report, download_mode)
+                .finalize_v2_download_result(
+                    result_id.clone(),
+                    candidate,
+                    &plan,
+                    report,
+                    download_mode,
+                    context.is_cancel_requested(),
+                )
                 .await;
             match mapped {
                 Ok(mapped) => {
@@ -595,14 +598,16 @@ impl BbdownBilibiliAdapter {
                         &mut primary_library_item_id,
                         &mut successful_results,
                         &mut results,
-                        &mut resources,
-                        &mut resource_bodies,
-                        &mut library_item_leases,
+                        &mut retained_backing,
                     );
                     if let Err(error) = self.save_archive(&archive) {
                         log_v2_candidate_error(&request.task_id, &result_id, &error);
                         archive_failure = Some(error);
                     }
+                }
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    cancelled = true;
+                    results.push(cancelled_download_result(result_id, candidate));
                 }
                 Err(error) => {
                     log_v2_candidate_error(&request.task_id, &result_id, &error);
@@ -660,9 +665,10 @@ impl BbdownBilibiliAdapter {
             v2: Some(BilibiliDownloadOutputV2 {
                 terminal_state,
                 results,
-                resources,
-                resource_bodies,
-                library_item_leases,
+                resources: retained_backing.resources,
+                resource_bodies: retained_backing.resource_bodies,
+                library_item_leases: retained_backing.library_item_leases,
+                unpublished_output_paths: retained_backing.unpublished_output_paths,
             }),
         })
     }
@@ -738,6 +744,34 @@ impl BbdownBilibiliAdapter {
         })
     }
 
+    async fn finalize_v2_download_result(
+        &self,
+        result_id: String,
+        candidate: &BilibiliTaskCandidateRecord,
+        plan: &DownloadPlan,
+        report: DownloadReport,
+        download_mode: DownloadMode,
+        cancel_requested: bool,
+    ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
+        if cancel_requested {
+            cleanup_unpublished_download_report(&report).await;
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled after BBDown finished downloading.".to_owned(),
+            ));
+        }
+
+        match self
+            .map_v2_download_result(result_id, candidate, plan, &report, download_mode)
+            .await
+        {
+            Ok(mapped) => Ok(mapped),
+            Err(error) => {
+                cleanup_unpublished_download_report(&report).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn map_v2_download_result(
         &self,
         result_id: String,
@@ -800,6 +834,15 @@ impl BbdownBilibiliAdapter {
             artifacts.push(mapped.artifact);
             resources.push(mapped.resource);
             resource_bodies.push(mapped.body);
+        }
+        if let Some(required_kind) = sidecar_only_required_artifact_kind(download_mode)
+            && !artifacts
+                .iter()
+                .any(|artifact| artifact.kind() == required_kind)
+        {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown finished but did not produce the requested sidecar artifact.".to_owned(),
+            ));
         }
         if !plan_entry.chapters.is_empty() {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -866,6 +909,7 @@ impl BbdownBilibiliAdapter {
             resources,
             resource_bodies,
             library_item_lease,
+            unpublished_output_paths: download_report_output_paths(report),
         })
     }
 
@@ -1108,7 +1152,7 @@ fn bbdown_client_config_for_request(
         })?
         .filter(|mode| *mode != BilibiliApiMode::Unspecified);
 
-    if explicit_profile.is_none() && explicit_mode.is_none() {
+    if request_context.is_none() && explicit_profile.is_none() && explicit_mode.is_none() {
         return Ok(None);
     }
 
@@ -1120,8 +1164,22 @@ fn bbdown_client_config_for_request(
         None if options.is_some_and(|options| options.prefer_tv_api) => PlayurlMode::Tv,
         None => PlayurlMode::Web,
     };
-    let profile = explicit_profile.or(server_options.bbdown_credential_profile.as_deref());
-    bbdown_client_config_with_profile(server_options, playurl_mode, profile).map(Some)
+    let credentials = match explicit_profile {
+        Some(profile) => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            Some(profile),
+        )?,
+        None if request_context.is_some() => Credentials::default(),
+        None => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            server_options.bbdown_credential_profile.as_deref(),
+        )?,
+    };
+    Ok(Some(bbdown_client_config_with_credentials(
+        server_options,
+        playurl_mode,
+        credentials,
+    )))
 }
 
 fn bbdown_client_config_with_profile(
@@ -1129,13 +1187,26 @@ fn bbdown_client_config_with_profile(
     playurl_mode: PlayurlMode,
     credential_profile: Option<&str>,
 ) -> Result<ClientConfig, BilibiliDownloadError> {
-    Ok(ClientConfig::default()
-        .with_credentials(bbdown_credentials(
-            options.bbdown_credential_path.as_deref(),
-            credential_profile,
-        )?)
+    let credentials = bbdown_credentials(
+        options.bbdown_credential_path.as_deref(),
+        credential_profile,
+    )?;
+    Ok(bbdown_client_config_with_credentials(
+        options,
+        playurl_mode,
+        credentials,
+    ))
+}
+
+fn bbdown_client_config_with_credentials(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+    credentials: Credentials,
+) -> ClientConfig {
+    ClientConfig::default()
+        .with_credentials(credentials)
         .with_restricted_area(bbdown_restricted_area_config(options))
-        .with_playurl_mode(playurl_mode))
+        .with_playurl_mode(playurl_mode)
 }
 
 fn bbdown_credentials(
@@ -3501,6 +3572,15 @@ struct MappedV2DownloadResult {
     resources: Vec<TaskResourceRecord>,
     resource_bodies: Vec<BilibiliTaskResourceBody>,
     library_item_lease: Option<LibraryItemPublicationLease>,
+    unpublished_output_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct RetainedV2DownloadBacking {
+    resources: Vec<TaskResourceRecord>,
+    resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_leases: Vec<LibraryItemPublicationLease>,
+    unpublished_output_paths: Vec<PathBuf>,
 }
 
 struct MappedV2Artifact {
@@ -3514,17 +3594,22 @@ fn retain_v2_success(
     primary_library_item_id: &mut String,
     successful_results: &mut usize,
     results: &mut Vec<TaskResult>,
-    resources: &mut Vec<TaskResourceRecord>,
-    resource_bodies: &mut Vec<BilibiliTaskResourceBody>,
-    library_item_leases: &mut Vec<LibraryItemPublicationLease>,
+    retained_backing: &mut RetainedV2DownloadBacking,
 ) {
     if primary_library_item_id.is_empty() && !mapped.library_item_id.is_empty() {
         *primary_library_item_id = mapped.library_item_id.clone();
     }
     *successful_results = successful_results.saturating_add(1);
-    resources.extend(mapped.resources);
-    resource_bodies.extend(mapped.resource_bodies);
-    library_item_leases.extend(mapped.library_item_lease);
+    retained_backing.resources.extend(mapped.resources);
+    retained_backing
+        .resource_bodies
+        .extend(mapped.resource_bodies);
+    retained_backing
+        .library_item_leases
+        .extend(mapped.library_item_lease);
+    retained_backing
+        .unpublished_output_paths
+        .extend(mapped.unpublished_output_paths);
     results.push(mapped.result);
 }
 
@@ -3604,6 +3689,28 @@ fn playable_entry_output_candidates(entry: &EntryDownloadReport) -> Vec<PathBuf>
             .map(|file| file.path.clone()),
     );
     candidates
+}
+
+fn download_report_output_paths(report: &DownloadReport) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &report.entries {
+        for path in entry
+            .mux
+            .iter()
+            .map(|mux| &mux.output_path)
+            .chain(entry.files.iter().map(|file| &file.path))
+        {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
+async fn cleanup_unpublished_download_report(report: &DownloadReport) {
+    cleanup_unpublished_output_paths(&download_report_output_paths(report)).await;
 }
 
 fn successful_download_result(
@@ -3966,6 +4073,15 @@ fn download_mode_requires_media(mode: DownloadMode) -> bool {
     )
 }
 
+fn sidecar_only_required_artifact_kind(mode: DownloadMode) -> Option<TaskArtifactKind> {
+    match mode {
+        DownloadMode::SubtitleOnly => Some(TaskArtifactKind::Subtitle),
+        DownloadMode::DanmakuOnly => Some(TaskArtifactKind::TimedComments),
+        DownloadMode::CoverOnly => Some(TaskArtifactKind::CoverImage),
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly | _ => None,
+    }
+}
+
 fn download_mode_from_options(
     options: Option<&BilibiliDownloadOptions>,
 ) -> Result<DownloadMode, BilibiliDownloadError> {
@@ -4023,6 +4139,18 @@ async fn mux_download_report<F>(
 where
     F: Fn() -> bool,
 {
+    mux_download_report_in_place(&mut report, ffmpeg_path, is_cancel_requested).await?;
+    Ok(report)
+}
+
+async fn mux_download_report_in_place<F>(
+    report: &mut DownloadReport,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+) -> Result<(), BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
     for entry in &mut report.entries {
         if entry.mux.is_some() {
             continue;
@@ -4036,7 +4164,7 @@ where
             entry.mux = Some(mux);
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 async fn mux_entry_media<F>(
@@ -4868,16 +4996,15 @@ mod tests {
         }
 
         let legacy_context = BilibiliRequestContext::default();
-        assert!(
-            bbdown_client_config_for_request(
-                &server_options,
-                Some(&legacy_options),
-                Some(&legacy_context),
-            )
-            .unwrap()
-            .is_none(),
-            "an empty context should keep the cached legacy client"
-        );
+        let frozen_context_config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&legacy_context),
+        )
+        .unwrap()
+        .expect("a persisted request context should build an isolated client");
+        assert_eq!(PlayurlMode::Tv, frozen_context_config.playurl_mode);
+        assert_eq!(Credentials::default(), frozen_context_config.credentials);
 
         let invalid_context = BilibiliRequestContext {
             api_mode: i32::MAX,
@@ -4892,6 +5019,40 @@ mod tests {
             Err(BilibiliDownloadError::Failed(message))
                 if message.contains("API mode is unknown")
         ));
+    }
+
+    #[test]
+    fn pr6d_empty_frozen_profile_does_not_adopt_a_later_server_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server_options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        };
+        let context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Web.into(),
+            credential_profile_id: String::new(),
+        };
+
+        let config = bbdown_client_config_for_request(&server_options, None, Some(&context))
+            .expect("frozen no-profile context should be valid")
+            .expect("an explicit API mode should build a request client");
+
+        assert_eq!(PlayurlMode::Web, config.playurl_mode);
+        assert_eq!(Credentials::default(), config.credentials);
     }
 
     #[test]
@@ -5155,9 +5316,7 @@ mod tests {
             .expect("an absent archive should load as empty");
         let candidate = v2_test_candidate();
         let mut results = Vec::new();
-        let mut resources = Vec::new();
-        let mut resource_bodies = Vec::new();
-        let mut library_item_leases = Vec::new();
+        let mut retained_backing = RetainedV2DownloadBacking::default();
         let mut primary_library_item_id = String::new();
         let mut successful_results = 0;
 
@@ -5175,13 +5334,12 @@ mod tests {
                     resources: Vec::new(),
                     resource_bodies: Vec::new(),
                     library_item_lease: None,
+                    unpublished_output_paths: Vec::new(),
                 },
                 &mut primary_library_item_id,
                 &mut successful_results,
                 &mut results,
-                &mut resources,
-                &mut resource_bodies,
-                &mut library_item_leases,
+                &mut retained_backing,
             );
             let save = adapter.save_archive(&archive);
             if offset == 0 {
@@ -5321,6 +5479,159 @@ mod tests {
             &media_artifact,
             "https://upstream.invalid/private/media"
         ));
+    }
+
+    #[tokio::test]
+    async fn v2_sidecar_only_modes_require_the_requested_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        for (offset, mode) in [
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let report = DownloadReport {
+                title: "Season".to_owned(),
+                output_dir: temp.path().join(format!("empty-sidecar-{offset}")),
+                entries: vec![EntryDownloadReport {
+                    index: 2,
+                    title: "Episode 2".to_owned(),
+                    directory: temp.path().join(format!("empty-entry-{offset}")),
+                    files: Vec::new(),
+                    mux: None,
+                }],
+            };
+
+            let error = match adapter
+                .map_v2_download_result(
+                    format!("task-sidecar-{offset}"),
+                    &candidate,
+                    &plan,
+                    &report,
+                    mode,
+                )
+                .await
+            {
+                Ok(_) => panic!("an empty sidecar-only result must fail"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, BilibiliDownloadError::Failed(message) if message.contains("requested sidecar artifact"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_finalization_removes_outputs_after_cancellation_or_mapping_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        let cancelled_media = temp.path().join("cancelled.mp4");
+        let cancelled_sidecar = temp.path().join("cancelled.srt");
+        std_fs::write(&cancelled_media, b"media").expect("media should be written");
+        std_fs::write(&cancelled_sidecar, b"subtitle").expect("sidecar should be written");
+        let cancelled_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("cancelled-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("cancelled-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: cancelled_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: cancelled_media.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+        let cancelled = adapter
+            .finalize_v2_download_result(
+                "task-cancelled".to_owned(),
+                &candidate,
+                &plan,
+                cancelled_report,
+                DownloadMode::All,
+                true,
+            )
+            .await;
+        assert!(matches!(
+            cancelled,
+            Err(BilibiliDownloadError::Cancelled(_))
+        ));
+        assert!(!cancelled_media.exists());
+        assert!(!cancelled_sidecar.exists());
+
+        let failed_sidecar = temp.path().join("mapping-failed.srt");
+        std_fs::write(&failed_sidecar, b"subtitle").expect("sidecar should be written");
+        let failed_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("failed-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("failed-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: failed_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let failed = adapter
+            .finalize_v2_download_result(
+                "task-failed".to_owned(),
+                &candidate,
+                &plan,
+                failed_report,
+                DownloadMode::VideoOnly,
+                false,
+            )
+            .await;
+        assert!(matches!(failed, Err(BilibiliDownloadError::Failed(_))));
+        assert!(
+            !failed_sidecar.exists(),
+            "mapping failures must remove unpublished BBDown files"
+        );
     }
 
     #[test]
