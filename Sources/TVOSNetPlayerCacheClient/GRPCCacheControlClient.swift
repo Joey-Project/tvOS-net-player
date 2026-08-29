@@ -310,15 +310,36 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions(),
         pageSize: Int = 50
     ) async throws -> BilibiliResolutionPage {
+        try await startBilibiliResolution(
+            urlOrID: urlOrID,
+            options: options,
+            context: .default,
+            pageSize: pageSize
+        )
+    }
+
+    public func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage {
         let request = try Self.startBilibiliResolutionRequest(
             urlOrID: urlOrID,
             options: options,
+            context: context,
             pageSize: pageSize
         )
-        if let requiredCapability = Self.requiredCapabilityForBilibiliPlaybackPolicy(options: options) {
+        let requiredCapabilities = Self.requiredCapabilitiesForBilibiliResolution(
+            options: options,
+            context: context
+        )
+        if !requiredCapabilities.isEmpty {
             let serverInfo = try await getServerInfo()
-            guard serverInfo.capabilities.contains(requiredCapability) else {
-                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+            for requiredCapability in requiredCapabilities {
+                guard serverInfo.capabilities.contains(requiredCapability) else {
+                    throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+                }
             }
         }
 
@@ -468,6 +489,37 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func createBilibiliTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution
+    ) async throws -> CacheTask {
+        let request = try Self.createBilibiliTaskV2Request(
+            sessionID: sessionID,
+            selection: selection,
+            execution: execution
+        )
+        let serverInfo = try await getServerInfo()
+        guard serverInfo.supportsBilibiliExecutionV2 else {
+            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+        }
+
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                let response = try await service.createBilibiliTaskV2(request, options: callOptions)
+                return CacheTask(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+        }
+    }
+
     public func createBilibiliTask(
         urlOrID: String,
         options: BilibiliDownloadTaskOptions = BilibiliDownloadTaskOptions()
@@ -525,6 +577,20 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options.playbackPolicy.isDefault ? nil : CacheServerCapability.bilibiliPlaybackPolicy
     }
 
+    static func requiredCapabilitiesForBilibiliResolution(
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext
+    ) -> [String] {
+        var capabilities: [String] = []
+        if let policyCapability = requiredCapabilityForBilibiliPlaybackPolicy(options: options) {
+            capabilities.append(policyCapability)
+        }
+        if !context.isDefault {
+            capabilities.append(CacheServerCapability.bilibiliExecutionV2)
+        }
+        return capabilities
+    }
+
     private static func unsupportedFeature(forMissingCapability capability: String)
         -> CacheControlClientUnsupportedFeature
     {
@@ -536,6 +602,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
         if capability == CacheServerCapability.bilibiliPlaybackPolicy {
             return .bilibiliPlaybackPolicy
+        }
+        if capability == CacheServerCapability.bilibiliExecutionV2 {
+            return .bilibiliExecutionV2
         }
         return .bilibiliResolve
     }
@@ -616,6 +685,20 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliPlaybackTaskOptions,
         pageSize: Int
     ) throws -> TvosNetPlayer_V1_StartBilibiliResolutionRequest {
+        try startBilibiliResolutionRequest(
+            urlOrID: urlOrID,
+            options: options,
+            context: .default,
+            pageSize: pageSize
+        )
+    }
+
+    static func startBilibiliResolutionRequest(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
+        pageSize: Int
+    ) throws -> TvosNetPlayer_V1_StartBilibiliResolutionRequest {
         let normalizedURLOrID = urlOrID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedURLOrID.isEmpty else {
             throw CacheControlClientInvalidRequest.bilibiliResolutionInputRequired
@@ -625,6 +708,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
         request.urlOrID = normalizedURLOrID
         request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
         request.page = bilibiliResolutionPageRequest(pageToken: "", pageSize: pageSize)
+        if !context.isDefault {
+            request.context = TvosNetPlayer_V1_BilibiliRequestContext(context)
+        }
         return request
     }
 
@@ -654,6 +740,27 @@ public final class GRPCCacheControlClient: CacheControlClient {
         var request = TvosNetPlayer_V1_CreateBilibiliPlaybackTaskV2Request()
         request.sessionID = sessionID
         request.selection = try TvosNetPlayer_V1_BilibiliResolutionSelection(selection)
+        return request
+    }
+
+    static func createBilibiliTaskV2Request(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution
+    ) throws -> TvosNetPlayer_V1_CreateBilibiliTaskV2Request {
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CacheControlClientInvalidRequest.bilibiliResolutionSessionIDRequired
+        }
+
+        var request = TvosNetPlayer_V1_CreateBilibiliTaskV2Request()
+        request.sessionID = sessionID
+        request.selection = try TvosNetPlayer_V1_BilibiliResolutionSelection(selection)
+        switch execution {
+        case .playback(let spec):
+            request.playback = TvosNetPlayer_V1_BilibiliPlaybackSpec(spec)
+        case .download(let spec):
+            request.download = TvosNetPlayer_V1_BilibiliDownloadSpec(spec)
+        }
         return request
     }
 
@@ -1059,7 +1166,8 @@ extension BilibiliResolutionSession {
             sourceKind: proto.sourceKind,
             createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
             expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil,
-            defaultCandidateToken: proto.defaultCandidateToken
+            defaultCandidateToken: proto.defaultCandidateToken,
+            context: proto.hasContext ? BilibiliRequestContext(proto.context) : .default
         )
     }
 }
@@ -1206,7 +1314,8 @@ extension BilibiliTaskResultItem {
             message: proto.message,
             libraryItemID: proto.libraryItemID,
             playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
-            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil
+            playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil,
+            identity: proto.hasIdentity ? BilibiliContentIdentity(proto.identity) : nil
         )
     }
 }
@@ -1276,8 +1385,42 @@ extension CacheTaskArtifact {
             languageTag: proto.languageTag,
             isAIGenerated: proto.isAiGenerated,
             resource: proto.hasResource ? CacheResourceReference(proto.resource) : nil,
-            problem: proto.hasProblem ? CacheTaskProblem(proto.problem) : nil
+            problem: proto.hasProblem ? CacheTaskProblem(proto.problem) : nil,
+            libraryItemID: proto.libraryItemID
         )
+    }
+}
+
+extension CacheTaskResultSubject {
+    fileprivate init(_ proto: TvosNetPlayer_V1_TaskResultSubject) {
+        self.init(
+            provider: proto.provider,
+            kind: proto.kind,
+            id: proto.id,
+            index: proto.index
+        )
+    }
+}
+
+extension BilibiliTaskResultDetails {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliTaskResultDetails) {
+        self.init(
+            identity: proto.hasIdentity ? BilibiliContentIdentity(proto.identity) : nil,
+            playbackSession: proto.hasPlaybackSession
+                ? CacheBilibiliPlaybackSession(proto.playbackSession)
+                : nil
+        )
+    }
+}
+
+extension CacheTaskResultProviderDetails {
+    fileprivate init?(_ proto: TvosNetPlayer_V1_TaskResultProviderDetails) {
+        switch proto.details {
+        case .bilibili(let details):
+            self = .bilibili(BilibiliTaskResultDetails(details))
+        case nil:
+            return nil
+        }
     }
 }
 
@@ -1294,7 +1437,11 @@ extension CacheTaskResult {
             playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
             artifacts: proto.artifacts.map(CacheTaskArtifact.init),
             createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
-            updatedAt: proto.hasUpdatedAt ? Date(proto.updatedAt) : nil
+            updatedAt: proto.hasUpdatedAt ? Date(proto.updatedAt) : nil,
+            subject: proto.hasSubject ? CacheTaskResultSubject(proto.subject) : nil,
+            providerDetails: proto.hasProviderDetails
+                ? CacheTaskResultProviderDetails(proto.providerDetails)
+                : nil
         )
     }
 }
@@ -1395,6 +1542,123 @@ extension CacheBilibiliPlaybackVariant {
             bitrate: proto.bitrate,
             sizeBytes: proto.sizeBytes
         )
+    }
+}
+
+extension BilibiliRequestContext {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliRequestContext) {
+        self.init(
+            apiMode: BilibiliAPIMode(proto.apiMode),
+            credentialProfileID: proto.credentialProfileID
+        )
+    }
+}
+
+extension BilibiliAPIMode {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliApiMode) {
+        switch proto {
+        case .unspecified:
+            self = .unspecified
+        case .web:
+            self = .web
+        case .tv:
+            self = .tv
+        case .app:
+            self = .app
+        case .UNRECOGNIZED(let rawValue):
+            self = .unknown(rawValue)
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliRequestContext {
+    init(_ context: BilibiliRequestContext) {
+        self.init()
+        apiMode = TvosNetPlayer_V1_BilibiliApiMode(context.apiMode)
+        credentialProfileID = context.credentialProfileID
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliApiMode {
+    init(_ mode: BilibiliAPIMode) {
+        switch mode {
+        case .unspecified:
+            self = .unspecified
+        case .web:
+            self = .web
+        case .tv:
+            self = .tv
+        case .app:
+            self = .app
+        case .unknown(let rawValue):
+            self = .UNRECOGNIZED(rawValue)
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliPlaybackSpec {
+    init(_ spec: BilibiliPlaybackSpec) {
+        self.init()
+        qualityQn = spec.qualityQN
+        codec = TvosNetPlayer_V1_BilibiliVideoCodec(spec.codec)
+        audioLanguage = spec.audioLanguage
+        policy = TvosNetPlayer_V1_BilibiliPlaybackPolicy(spec.policy)
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliVideoCodec {
+    init(_ codec: BilibiliVideoCodec) {
+        switch codec {
+        case .unspecified:
+            self = .unspecified
+        case .auto:
+            self = .auto
+        case .h264:
+            self = .h264
+        case .hevc:
+            self = .hevc
+        case .av1:
+            self = .av1
+        case .unknown(let rawValue):
+            self = .UNRECOGNIZED(rawValue)
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliDownloadSpec {
+    init(_ spec: BilibiliDownloadSpec) {
+        self.init()
+        qualityQn = spec.qualityQN
+        audioLanguage = spec.audioLanguage
+        mode = TvosNetPlayer_V1_BilibiliDownloadMode(spec.mode)
+        downloadSubtitles = spec.downloadSubtitles
+        subtitleAiPolicy = TvosNetPlayer_V1_BilibiliSubtitleAiPolicy(spec.subtitleAIPolicy)
+        downloadDanmaku = spec.downloadDanmaku
+        danmakuFormats = spec.danmakuFormats.map(TvosNetPlayer_V1_BilibiliDanmakuFormat.init)
+        downloadCover = spec.downloadCover
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliDownloadMode {
+    init(_ mode: BilibiliDownloadMode) {
+        switch mode {
+        case .unspecified:
+            self = .unspecified
+        case .all:
+            self = .all
+        case .videoOnly:
+            self = .videoOnly
+        case .audioOnly:
+            self = .audioOnly
+        case .subtitleOnly:
+            self = .subtitleOnly
+        case .danmakuOnly:
+            self = .danmakuOnly
+        case .coverOnly:
+            self = .coverOnly
+        case .unknown(let rawValue):
+            self = .UNRECOGNIZED(rawValue)
+        }
     }
 }
 
@@ -1522,6 +1786,7 @@ extension TvosNetPlayer_V1_BilibiliDownloadOptions {
         downloadCover = options.downloadCover
         subtitleAiPolicy = TvosNetPlayer_V1_BilibiliSubtitleAiPolicy(options.subtitleAIPolicy)
         danmakuFormats = options.danmakuFormats.map(TvosNetPlayer_V1_BilibiliDanmakuFormat.init)
+        downloadMode = TvosNetPlayer_V1_BilibiliDownloadMode(options.downloadMode)
     }
 }
 

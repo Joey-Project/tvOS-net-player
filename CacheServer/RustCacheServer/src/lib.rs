@@ -3536,6 +3536,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source),
                     playback_session: Some(sample_playback_session(&child_session_id)),
+                    identity: None,
                 }],
             )
             .expect("preparing task should publish its planned child result");

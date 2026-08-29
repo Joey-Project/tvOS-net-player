@@ -33,6 +33,7 @@ service TaskService {
   rpc CreateBilibiliTask(CreateBilibiliTaskRequest) returns (Task);
   rpc CreateBilibiliPlaybackTask(CreateBilibiliPlaybackTaskRequest) returns (Task);
   rpc CreateBilibiliPlaybackTaskV2(CreateBilibiliPlaybackTaskV2Request) returns (Task);
+  rpc CreateBilibiliTaskV2(CreateBilibiliTaskV2Request) returns (Task);
   rpc GetTask(GetTaskRequest) returns (Task);
   rpc ListTaskResults(ListTaskResultsRequest) returns (ListTaskResultsResponse);
   rpc WatchTasks(WatchTasksRequest) returns (stream TaskEvent);
@@ -72,6 +73,7 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_PLAYBACK_POLICY = 12;
   SERVER_CAPABILITY_TASK_OUTPUT_V2 = 13;
   SERVER_CAPABILITY_BILIBILI_RESOLUTION_V2 = 14;
+  SERVER_CAPABILITY_BILIBILI_EXECUTION_V2 = 15;
 }
 
 message CheckHealthRequest {}
@@ -263,6 +265,7 @@ message BilibiliDownloadOptions {
   BilibiliSubtitleAiPolicy subtitle_ai_policy = 7;
   bool download_cover = 8;
   repeated BilibiliDanmakuFormat danmaku_formats = 9;
+  BilibiliDownloadMode download_mode = 10;
 }
 
 enum BilibiliSubtitleAiPolicy {
@@ -349,6 +352,7 @@ message StartBilibiliResolutionRequest {
   string url_or_id = 1;
   BilibiliPlaybackOptions options = 2;
   PageRequest page = 3;
+  BilibiliRequestContext context = 4;
 }
 
 message ListBilibiliResolutionCandidatesRequest {
@@ -370,6 +374,7 @@ message BilibiliResolutionSession {
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp expires_at = 6;
   string default_candidate_token = 7;
+  BilibiliRequestContext context = 8;
 }
 
 message BilibiliResolutionCandidate {
@@ -400,6 +405,66 @@ enum BilibiliContentKind {
 message CreateBilibiliPlaybackTaskV2Request {
   string session_id = 1;
   BilibiliResolutionSelection selection = 2;
+}
+
+message CreateBilibiliTaskV2Request {
+  string session_id = 1;
+  BilibiliResolutionSelection selection = 2;
+  oneof execution {
+    BilibiliPlaybackSpec playback = 3;
+    BilibiliDownloadSpec download = 4;
+  }
+}
+
+message BilibiliRequestContext {
+  BilibiliApiMode api_mode = 1;
+  // Selects a server-owned profile by ID. Empty keeps the configured profile.
+  string credential_profile_id = 2;
+}
+
+enum BilibiliApiMode {
+  BILIBILI_API_MODE_UNSPECIFIED = 0;
+  BILIBILI_API_MODE_WEB = 1;
+  BILIBILI_API_MODE_TV = 2;
+  BILIBILI_API_MODE_APP = 3;
+}
+
+message BilibiliPlaybackSpec {
+  // Bilibili qn value. Zero lets the server choose.
+  uint32 quality_qn = 1;
+  BilibiliVideoCodec codec = 2;
+  string audio_language = 3;
+  BilibiliPlaybackPolicy policy = 4;
+}
+
+enum BilibiliVideoCodec {
+  BILIBILI_VIDEO_CODEC_UNSPECIFIED = 0;
+  BILIBILI_VIDEO_CODEC_AUTO = 1;
+  BILIBILI_VIDEO_CODEC_H264 = 2;
+  BILIBILI_VIDEO_CODEC_HEVC = 3;
+  BILIBILI_VIDEO_CODEC_AV1 = 4;
+}
+
+message BilibiliDownloadSpec {
+  // Bilibili qn value. Zero lets the server choose.
+  uint32 quality_qn = 1;
+  string audio_language = 2;
+  BilibiliDownloadMode mode = 3;
+  bool download_subtitles = 4;
+  BilibiliSubtitleAiPolicy subtitle_ai_policy = 5;
+  bool download_danmaku = 6;
+  repeated BilibiliDanmakuFormat danmaku_formats = 7;
+  bool download_cover = 8;
+}
+
+enum BilibiliDownloadMode {
+  BILIBILI_DOWNLOAD_MODE_UNSPECIFIED = 0;
+  BILIBILI_DOWNLOAD_MODE_ALL = 1;
+  BILIBILI_DOWNLOAD_MODE_VIDEO_ONLY = 2;
+  BILIBILI_DOWNLOAD_MODE_AUDIO_ONLY = 3;
+  BILIBILI_DOWNLOAD_MODE_SUBTITLE_ONLY = 4;
+  BILIBILI_DOWNLOAD_MODE_DANMAKU_ONLY = 5;
+  BILIBILI_DOWNLOAD_MODE_COVER_ONLY = 6;
 }
 
 message BilibiliResolutionSelection {
@@ -549,6 +614,26 @@ message TaskResult {
   repeated TaskArtifact artifacts = 9;
   google.protobuf.Timestamp created_at = 10;
   google.protobuf.Timestamp updated_at = 11;
+  TaskResultSubject subject = 12;
+  TaskResultProviderDetails provider_details = 13;
+}
+
+message TaskResultSubject {
+  string provider = 1;
+  string kind = 2;
+  string id = 3;
+  uint32 index = 4;
+}
+
+message TaskResultProviderDetails {
+  oneof details {
+    BilibiliTaskResultDetails bilibili = 1;
+  }
+}
+
+message BilibiliTaskResultDetails {
+  BilibiliContentIdentity identity = 1;
+  BilibiliPlaybackSession playback_session = 2;
 }
 
 message TaskResultProgress {
@@ -597,6 +682,8 @@ message TaskArtifact {
   bool is_ai_generated = 7;
   CacheResourceRef resource = 8;
   TaskProblem problem = 9;
+  // Media can be handed off through the cache library without duplicating bytes.
+  string library_item_id = 10;
 }
 
 enum TaskArtifactKind {
@@ -645,6 +732,7 @@ message BilibiliTaskResultItem {
   string library_item_id = 10;
   PlaybackSource playback_source = 11;
   BilibiliPlaybackSession playback_session = 12;
+  BilibiliContentIdentity identity = 13;
 }
 
 message BilibiliPlaybackSession {
