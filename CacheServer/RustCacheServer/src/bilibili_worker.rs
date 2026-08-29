@@ -58,6 +58,7 @@ pub struct BilibiliDownloadOutputV2 {
     pub resource_bodies: Vec<BilibiliTaskResourceBody>,
     pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
     pub(crate) unpublished_output_paths: Vec<PathBuf>,
+    pub(crate) transient_output_paths: Vec<PathBuf>,
 }
 
 pub struct BilibiliTaskResourceBody {
@@ -350,23 +351,26 @@ async fn complete_v2_terminal_task(
     })
     .await;
 
-    if let Err(error) = publication {
-        cleanup_unpublished_output_paths(&output.unpublished_output_paths).await;
-        if error.code() == tonic::Code::Cancelled {
+    match publication {
+        Ok(()) => cleanup_unpublished_output_paths(&output.transient_output_paths).await,
+        Err(error) => {
+            cleanup_unpublished_output_paths(&output.unpublished_output_paths).await;
+            if error.code() == tonic::Code::Cancelled {
+                complete_terminal_task(registry, move |registry| {
+                    registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
+                })
+                .await;
+                return;
+            }
+            eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {error}");
             complete_terminal_task(registry, move |registry| {
-                registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
+                registry.complete_task_failed(
+                    &task_id,
+                    "Bilibili download output could not be published.".to_owned(),
+                )
             })
             .await;
-            return;
         }
-        eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {error}");
-        complete_terminal_task(registry, move |registry| {
-            registry.complete_task_failed(
-                &task_id,
-                "Bilibili download output could not be published.".to_owned(),
-            )
-        })
-        .await;
     }
 }
 
@@ -684,7 +688,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let resource_root = temp.path().join("library");
+        let transient_output_path = temp.path().join("worker-subtitle-source.srt");
         std::fs::create_dir_all(&resource_root).expect("resource root should be created");
+        std::fs::write(&transient_output_path, b"worker subtitle\n")
+            .expect("transient subtitle should be written");
         let registry = Arc::new(
             BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
                 &state_path,
@@ -704,7 +711,9 @@ mod tests {
             .expect("v2 task should be created durably");
         let worker = tokio::spawn(run_bilibili_task_worker(
             Arc::clone(&registry),
-            Arc::new(PartialV2Adapter),
+            Arc::new(PartialV2Adapter {
+                transient_output_path: transient_output_path.clone(),
+            }),
             1,
             false,
         ));
@@ -760,6 +769,10 @@ mod tests {
         assert_eq!(
             b"worker subtitle\n".to_vec(),
             std::fs::read(&resource_path).expect("resource body should be durable")
+        );
+        assert!(
+            !transient_output_path.exists(),
+            "a sidecar source copied into durable resource storage should be removed"
         );
         drop(snapshot);
         drop(registry);
@@ -1397,7 +1410,9 @@ mod tests {
 
     struct SuccessAdapter;
 
-    struct PartialV2Adapter;
+    struct PartialV2Adapter {
+        transient_output_path: PathBuf,
+    }
 
     struct LateSuccessAfterCancellationV2Adapter {
         output_path: PathBuf,
@@ -1438,6 +1453,7 @@ mod tests {
                         resource_bodies: Vec::new(),
                         library_item_leases: Vec::new(),
                         unpublished_output_paths: vec![output_path],
+                        transient_output_paths: Vec::new(),
                     }),
                 })
             })
@@ -1450,6 +1466,7 @@ mod tests {
             request: BilibiliDownloadRequest,
             _context: BilibiliDownloadContext,
         ) -> BilibiliDownloadFuture<'a> {
+            let transient_output_path = self.transient_output_path.clone();
             Box::pin(async move {
                 let body = b"worker subtitle\n".to_vec();
                 let resource = TaskResourceRecord::new(CacheResourceRef {
@@ -1497,7 +1514,8 @@ mod tests {
                             source: BilibiliTaskResourceBodySource::Bytes(body),
                         }],
                         library_item_leases: Vec::new(),
-                        unpublished_output_paths: Vec::new(),
+                        unpublished_output_paths: vec![transient_output_path.clone()],
+                        transient_output_paths: vec![transient_output_path],
                     }),
                 })
             })

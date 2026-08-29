@@ -113,6 +113,21 @@ pub struct BbdownBilibiliAdapter {
     archive_save_fail_after: StdMutex<Option<usize>>,
 }
 
+#[derive(Default)]
+struct V2TaskArchive {
+    accepted: DownloadArchive,
+}
+
+impl V2TaskArchive {
+    fn stage_candidate(&self) -> DownloadArchive {
+        self.accepted.clone()
+    }
+
+    fn accept_candidate(&mut self, candidate: DownloadArchive) {
+        self.accepted = candidate;
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BilibiliPlaybackPlan {
@@ -444,10 +459,11 @@ impl BbdownBilibiliAdapter {
         let mut cancelled = false;
         let mut completed_downloaded_bytes = 0_u64;
         let mut total_bytes_floor = 0_u64;
-        let mut archive_failure = None;
 
         let _archive_guard = self.archive_lock.lock().await;
-        let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
+        // V2 task output is the durable authority. This task-local archive only coordinates
+        // duplicate names between candidates and is never committed ahead of terminal output.
+        let mut archive = V2TaskArchive::default();
 
         for (offset, candidate) in request.candidates.iter().enumerate() {
             let result_id = bilibili_v2_result_id(&request.task_id, offset);
@@ -493,11 +509,12 @@ impl BbdownBilibiliAdapter {
                 completed_downloaded_bytes,
                 total_bytes_floor,
             );
+            let mut candidate_archive = archive.stage_candidate();
             let report = match run_bbdown_download_until_cancelled(
                 client.download_plan_with_archive_decision_with_progress_and_cancellation(
                     &plan,
                     download_options,
-                    &mut archive,
+                    &mut candidate_archive,
                     DuplicateDecision::KeepBoth,
                     &download_progress,
                     &download_cancellation,
@@ -593,6 +610,7 @@ impl BbdownBilibiliAdapter {
                 .await;
             match mapped {
                 Ok(mapped) => {
+                    archive.accept_candidate(candidate_archive);
                     retain_v2_success(
                         mapped,
                         &mut primary_library_item_id,
@@ -600,10 +618,6 @@ impl BbdownBilibiliAdapter {
                         &mut results,
                         &mut retained_backing,
                     );
-                    if let Err(error) = self.save_archive(&archive) {
-                        log_v2_candidate_error(&request.task_id, &result_id, &error);
-                        archive_failure = Some(error);
-                    }
                 }
                 Err(BilibiliDownloadError::Cancelled(_)) => {
                     cancelled = true;
@@ -621,20 +635,6 @@ impl BbdownBilibiliAdapter {
                 completed_downloaded_bytes,
                 total_bytes_floor,
             );
-            if archive_failure.is_some() {
-                for (remaining_offset, remaining_candidate) in
-                    request.candidates.iter().enumerate().skip(offset + 1)
-                {
-                    results.push(failed_download_result(
-                        bilibili_v2_result_id(&request.task_id, remaining_offset),
-                        remaining_candidate,
-                        &BilibiliDownloadError::Failed(
-                            "The BBDown archive could not be persisted.".to_owned(),
-                        ),
-                    ));
-                }
-                break;
-            }
         }
 
         let total = request.candidates.len();
@@ -669,6 +669,7 @@ impl BbdownBilibiliAdapter {
                 resource_bodies: retained_backing.resource_bodies,
                 library_item_leases: retained_backing.library_item_leases,
                 unpublished_output_paths: retained_backing.unpublished_output_paths,
+                transient_output_paths: retained_backing.transient_output_paths,
             }),
         })
     }
@@ -799,6 +800,7 @@ impl BbdownBilibiliAdapter {
 
         let mut library_item_id = String::new();
         let mut library_item_lease = None;
+        let mut library_output_path = None;
         for candidate_path in playable_entry_output_candidates(entry) {
             if let Some(lease) = self
                 .library
@@ -807,6 +809,7 @@ impl BbdownBilibiliAdapter {
             {
                 library_item_id = lease.item_id.clone();
                 library_item_lease = Some(lease);
+                library_output_path = Some(candidate_path);
                 break;
             }
         }
@@ -897,6 +900,11 @@ impl BbdownBilibiliAdapter {
         resources.push(metadata.resource);
         resource_bodies.push(metadata.body);
 
+        let unpublished_output_paths = download_report_output_paths(report);
+        let transient_output_paths = transient_download_output_paths(
+            &unpublished_output_paths,
+            library_output_path.as_deref(),
+        );
         Ok(MappedV2DownloadResult {
             library_item_id: library_item_id.clone(),
             result: successful_download_result(
@@ -909,7 +917,8 @@ impl BbdownBilibiliAdapter {
             resources,
             resource_bodies,
             library_item_lease,
-            unpublished_output_paths: download_report_output_paths(report),
+            unpublished_output_paths,
+            transient_output_paths,
         })
     }
 
@@ -3573,6 +3582,7 @@ struct MappedV2DownloadResult {
     resource_bodies: Vec<BilibiliTaskResourceBody>,
     library_item_lease: Option<LibraryItemPublicationLease>,
     unpublished_output_paths: Vec<PathBuf>,
+    transient_output_paths: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -3581,6 +3591,7 @@ struct RetainedV2DownloadBacking {
     resource_bodies: Vec<BilibiliTaskResourceBody>,
     library_item_leases: Vec<LibraryItemPublicationLease>,
     unpublished_output_paths: Vec<PathBuf>,
+    transient_output_paths: Vec<PathBuf>,
 }
 
 struct MappedV2Artifact {
@@ -3610,6 +3621,9 @@ fn retain_v2_success(
     retained_backing
         .unpublished_output_paths
         .extend(mapped.unpublished_output_paths);
+    retained_backing
+        .transient_output_paths
+        .extend(mapped.transient_output_paths);
     results.push(mapped.result);
 }
 
@@ -3707,6 +3721,17 @@ fn download_report_output_paths(report: &DownloadReport) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn transient_download_output_paths(
+    output_paths: &[PathBuf],
+    library_output_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    output_paths
+        .iter()
+        .filter(|path| Some(path.as_path()) != library_output_path)
+        .cloned()
+        .collect()
 }
 
 async fn cleanup_unpublished_download_report(report: &DownloadReport) {
@@ -4513,7 +4538,10 @@ fn success_message(report: &DownloadReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
+    use bbdown_core::{
+        DownloadArchiveRecord, DownloadedFile, EntryDownloadReport, MuxReport,
+        RestrictedAreaProxyKind,
+    };
     use std::fs as std_fs;
 
     const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
@@ -5297,23 +5325,53 @@ mod tests {
     }
 
     #[test]
-    fn v2_archive_failure_retains_all_successes_recorded_before_the_failure() {
-        let temp = tempfile::tempdir().expect("temp dir should be created");
-        let options = Arc::new(CacheServerOptions {
-            root_path: temp.path().join("library"),
-            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
-            ..CacheServerOptions::default()
-        });
-        let adapter = BbdownBilibiliAdapter::new(
-            Arc::clone(&options),
-            Arc::new(LocalMediaLibrary::new(options)),
+    fn v2_task_archive_only_accepts_successful_candidate_state() {
+        let archive_record = |content_key: &str| DownloadArchiveRecord {
+            content_key: content_key.to_owned(),
+            title: content_key.to_owned(),
+            output_dir: PathBuf::from(content_key),
+            completed_at_unix: 1,
+            entries: Vec::new(),
+        };
+        let mut task_archive = V2TaskArchive::default();
+
+        let mut rejected_candidate = task_archive.stage_candidate();
+        rejected_candidate.records.push(archive_record("rejected"));
+        drop(rejected_candidate);
+        assert!(task_archive.stage_candidate().records.is_empty());
+
+        let mut accepted_candidate = task_archive.stage_candidate();
+        accepted_candidate.records.push(archive_record("accepted"));
+        task_archive.accept_candidate(accepted_candidate);
+        assert_eq!(
+            vec!["accepted"],
+            task_archive
+                .stage_candidate()
+                .records
+                .iter()
+                .map(|record| record.content_key.as_str())
+                .collect::<Vec<_>>()
         );
-        *adapter
-            .archive_save_fail_after
-            .lock()
-            .expect("archive save failure hook lock should not be poisoned") = Some(1);
-        let archive = DownloadArchive::load(&adapter.archive_path)
-            .expect("an absent archive should load as empty");
+    }
+
+    #[test]
+    fn v2_transient_outputs_exclude_the_retained_library_media() {
+        let media_path = PathBuf::from("library/video.mp4");
+        let sidecar_path = PathBuf::from("output/video.srt");
+        let output_paths = vec![media_path.clone(), sidecar_path.clone()];
+
+        assert_eq!(
+            vec![sidecar_path],
+            transient_download_output_paths(&output_paths, Some(&media_path))
+        );
+        assert_eq!(
+            output_paths,
+            transient_download_output_paths(&output_paths, None)
+        );
+    }
+
+    #[test]
+    fn v2_retained_backing_preserves_all_successes() {
         let candidate = v2_test_candidate();
         let mut results = Vec::new();
         let mut retained_backing = RetainedV2DownloadBacking::default();
@@ -5335,18 +5393,13 @@ mod tests {
                     resource_bodies: Vec::new(),
                     library_item_lease: None,
                     unpublished_output_paths: Vec::new(),
+                    transient_output_paths: Vec::new(),
                 },
                 &mut primary_library_item_id,
                 &mut successful_results,
                 &mut results,
                 &mut retained_backing,
             );
-            let save = adapter.save_archive(&archive);
-            if offset == 0 {
-                save.expect("the first archive save should succeed");
-            } else {
-                assert!(save.is_err(), "the second archive save should fail");
-            }
         }
 
         assert_eq!(2, successful_results);
@@ -5409,6 +5462,8 @@ mod tests {
             .expect("sidecar-only result should map without media or network access");
 
         assert!(mapped.library_item_id.is_empty());
+        assert_eq!(vec![sidecar_path.clone()], mapped.unpublished_output_paths);
+        assert_eq!(vec![sidecar_path.clone()], mapped.transient_output_paths);
         assert_eq!(mapped.result.state(), TaskState::Succeeded);
         assert_eq!(mapped.result.artifacts.len(), 3);
         assert_eq!(mapped.resources.len(), 3);

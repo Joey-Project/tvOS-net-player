@@ -2735,6 +2735,10 @@ fn download_options_from_v2_spec(
     validate_bilibili_quality_qn(spec.quality_qn)?;
     let mode = BilibiliDownloadMode::try_from(spec.mode)
         .map_err(|_| Status::invalid_argument("Unknown Bilibili download mode."))?;
+    let mode = match mode {
+        BilibiliDownloadMode::Unspecified => BilibiliDownloadMode::All,
+        mode => mode,
+    };
     let subtitle_ai_policy = BilibiliSubtitleAiPolicy::try_from(spec.subtitle_ai_policy)
         .map_err(|_| Status::invalid_argument("Unknown Bilibili subtitle AI policy."))?;
     if !spec.download_subtitles

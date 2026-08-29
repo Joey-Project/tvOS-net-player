@@ -19,10 +19,10 @@ use uuid::Uuid;
 use crate::{
     bilibili_resolution::{BilibiliTaskCandidateRecord, MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES},
     generated::tvos_net_player::v1::{
-        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliPlaybackOptions,
-        BilibiliPlaybackSession, BilibiliRequestContext, BilibiliSubtitleAiPolicy,
-        BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource, Task, TaskArtifactState,
-        TaskKind, TaskResult, TaskState,
+        BilibiliApiMode, BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
+        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliRequestContext,
+        BilibiliSubtitleAiPolicy, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource,
+        Task, TaskArtifactState, TaskKind, TaskResult, TaskState,
     },
     hls_cache::HlsCacheStore,
     library::{
@@ -656,13 +656,15 @@ impl BilibiliTaskRegistry {
         if normalized_source.is_empty() {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
         }
+        let options = concrete_bilibili_v2_download_options(options)?;
+        let request_context = concrete_bilibili_v2_request_context(request_context)?;
 
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let active_key = ActiveBilibiliTaskKey::download(
             &normalized_source,
-            options.as_ref(),
-            request_context.as_ref(),
+            Some(&options),
+            Some(&request_context),
             &candidates,
         );
         if let Some(active_task_id) = inner.active_task_ids_by_key.get(&active_key)
@@ -707,10 +709,10 @@ impl BilibiliTaskRegistry {
             .insert(active_key, task.id.clone());
         inner
             .download_options_by_id
-            .insert(task.id.clone(), options);
+            .insert(task.id.clone(), Some(options));
         inner
             .request_context_by_id
-            .insert(task.id.clone(), request_context);
+            .insert(task.id.clone(), Some(request_context));
         inner
             .bilibili_candidates_by_id
             .insert(task.id.clone(), candidates);
@@ -5060,6 +5062,31 @@ fn normalize_danmaku_format_keys(values: &[i32]) -> Vec<i32> {
     normalized.sort_unstable();
     normalized.dedup();
     normalized
+}
+
+fn concrete_bilibili_v2_download_options(
+    options: Option<BilibiliDownloadOptions>,
+) -> Result<BilibiliDownloadOptions, Status> {
+    let mut options = options.unwrap_or_default();
+    let mode = BilibiliDownloadMode::try_from(options.download_mode)
+        .map_err(|_| Status::invalid_argument("Unknown Bilibili download mode."))?;
+    if mode == BilibiliDownloadMode::Unspecified {
+        options.download_mode = BilibiliDownloadMode::All.into();
+    }
+    Ok(options)
+}
+
+fn concrete_bilibili_v2_request_context(
+    request_context: Option<BilibiliRequestContext>,
+) -> Result<BilibiliRequestContext, Status> {
+    let mut request_context = request_context.unwrap_or_default();
+    let api_mode = BilibiliApiMode::try_from(request_context.api_mode)
+        .map_err(|_| Status::invalid_argument("Unknown Bilibili API mode."))?;
+    if api_mode == BilibiliApiMode::Unspecified {
+        request_context.api_mode = BilibiliApiMode::Web.into();
+    }
+    request_context.credential_profile_id = request_context.credential_profile_id.trim().to_owned();
+    Ok(request_context)
 }
 
 fn validate_v2_candidate_batch(
@@ -9648,6 +9675,51 @@ mod tests {
                 .options
                 .as_ref()
                 .map(|options| options.quality_preference.as_str())
+        );
+    }
+
+    #[test]
+    fn bilibili_v2_download_defaults_are_frozen_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1frozen-defaults",
+                None,
+                None,
+                "Frozen defaults".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 download should freeze defaults before persistence");
+
+        let records = TaskStateStore::new(state_path)
+            .load()
+            .expect("frozen v2 download should reload");
+        let record = records
+            .iter()
+            .find(|record| record.task.id == task.id)
+            .expect("created task should persist");
+        assert_eq!(
+            Some(BilibiliDownloadMode::All),
+            record
+                .options
+                .as_ref()
+                .map(BilibiliDownloadOptions::download_mode)
+        );
+        assert_eq!(
+            Some(BilibiliApiMode::Web),
+            record
+                .request_context
+                .as_ref()
+                .map(BilibiliRequestContext::api_mode)
+        );
+        assert_eq!(
+            Some(""),
+            record
+                .request_context
+                .as_ref()
+                .map(|context| context.credential_profile_id.as_str())
         );
     }
 

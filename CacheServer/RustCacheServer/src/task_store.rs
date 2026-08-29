@@ -23,12 +23,12 @@ use serde::{
 };
 
 use crate::generated::tvos_net_player::v1::{
-    BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity,
+    BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity, BilibiliDownloadMode,
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
     BilibiliPlaybackVariant, BilibiliRequestContext, BilibiliTaskResultDetails,
     BilibiliTaskResultItem, BilibiliTaskSelection, CacheResourceRef, LanTranscodingPlan,
     PlaybackSource, Task, TaskArtifact, TaskKind, TaskProblem, TaskResult, TaskResultProgress,
-    TaskResultProviderDetails, TaskResultSubject, task_result_provider_details,
+    TaskResultProviderDetails, TaskResultSubject, TaskState, task_result_provider_details,
 };
 use crate::playback_policy::PlaybackPolicy;
 use crate::task_output::{
@@ -539,6 +539,13 @@ impl<'a> PersistedTaskSequenceValidator<'a> {
             MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES,
         )?;
         validate_bilibili_request_context(record.request_context.as_ref())?;
+        validate_executable_bilibili_v2_download_state(
+            TASK_STATE_SCHEMA_VERSION,
+            &record.task,
+            record.options.as_ref(),
+            record.request_context.as_ref(),
+            &record.bilibili_candidates,
+        )?;
         validate_bilibili_task_candidate_alignment(&record.task, &record.bilibili_candidates)?;
         for candidate in &record.bilibili_candidates {
             validate_bilibili_task_candidate(candidate)?;
@@ -1227,8 +1234,23 @@ impl PersistedTaskFile {
             .into_iter()
             .map(BilibiliTaskCandidateRecord::try_from)
             .collect::<io::Result<Vec<_>>>()?;
-        let request_context = self.request_context.map(BilibiliRequestContext::from);
+        let mut options = self.bilibili_options.map(BilibiliDownloadOptions::from);
+        let mut request_context = self.request_context.map(BilibiliRequestContext::from);
+        migrate_legacy_executable_bilibili_v2_download_state(
+            schema_version,
+            &task,
+            &mut options,
+            &mut request_context,
+            &bilibili_candidates,
+        )?;
         validate_bilibili_request_context(request_context.as_ref())?;
+        validate_executable_bilibili_v2_download_state(
+            schema_version,
+            &task,
+            options.as_ref(),
+            request_context.as_ref(),
+            &bilibili_candidates,
+        )?;
         validate_bilibili_task_candidate_alignment(&task, &bilibili_candidates)?;
         let output = match schema_version {
             LEGACY_TASK_STATE_SCHEMA_VERSION => {
@@ -1259,7 +1281,7 @@ impl PersistedTaskFile {
 
         Ok(PersistedTaskRecord {
             task,
-            options: self.bilibili_options.map(BilibiliDownloadOptions::from),
+            options,
             playback_options: self
                 .bilibili_playback_options
                 .map(BilibiliPlaybackOptions::from),
@@ -1883,6 +1905,88 @@ fn validate_bilibili_request_context(context: Option<&BilibiliRequestContext>) -
             "persisted Bilibili request context is invalid",
         ));
     }
+    Ok(())
+}
+
+fn validate_executable_bilibili_v2_download_state(
+    schema_version: u32,
+    task: &Task,
+    options: Option<&BilibiliDownloadOptions>,
+    request_context: Option<&BilibiliRequestContext>,
+    candidates: &[BilibiliTaskCandidateRecord],
+) -> io::Result<()> {
+    if schema_version < TASK_STATE_SCHEMA_VERSION
+        || candidates.is_empty()
+        || task.kind() != TaskKind::BilibiliDownload
+        || !matches!(task.state(), TaskState::Queued | TaskState::Running)
+    {
+        return Ok(());
+    }
+
+    let download_mode = options
+        .map(|options| BilibiliDownloadMode::try_from(options.download_mode))
+        .transpose()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted executable Bilibili v2 download mode is invalid",
+            )
+        })?;
+    let api_mode = request_context
+        .map(|context| BilibiliApiMode::try_from(context.api_mode))
+        .transpose()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted executable Bilibili v2 API mode is invalid",
+            )
+        })?;
+    if matches!(
+        download_mode,
+        None | Some(BilibiliDownloadMode::Unspecified)
+    ) || matches!(api_mode, None | Some(BilibiliApiMode::Unspecified))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted executable Bilibili v2 download is missing concrete frozen execution state",
+        ));
+    }
+    Ok(())
+}
+
+fn migrate_legacy_executable_bilibili_v2_download_state(
+    schema_version: u32,
+    task: &Task,
+    options: &mut Option<BilibiliDownloadOptions>,
+    request_context: &mut Option<BilibiliRequestContext>,
+    candidates: &[BilibiliTaskCandidateRecord],
+) -> io::Result<()> {
+    if schema_version >= TASK_STATE_SCHEMA_VERSION
+        || candidates.is_empty()
+        || task.kind() != TaskKind::BilibiliDownload
+        || !matches!(task.state(), TaskState::Queued | TaskState::Running)
+    {
+        return Ok(());
+    }
+
+    let options = options.get_or_insert_default();
+    let mode = BilibiliDownloadMode::try_from(options.download_mode).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted legacy Bilibili v2 download mode is invalid",
+        )
+    })?;
+    if mode == BilibiliDownloadMode::Unspecified {
+        options.download_mode = BilibiliDownloadMode::All.into();
+    }
+    *request_context = Some(BilibiliRequestContext {
+        api_mode: if options.prefer_tv_api {
+            BilibiliApiMode::Tv.into()
+        } else {
+            BilibiliApiMode::Web.into()
+        },
+        credential_profile_id: String::new(),
+    });
     Ok(())
 }
 
@@ -3773,6 +3877,157 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn executable_bilibili_v2_download_requires_concrete_frozen_execution_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let result_item = BilibiliTaskResultItem {
+            id: "bilibili-v2-download".to_owned(),
+            title: "Part 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            index: 1,
+            state: TaskState::Queued.into(),
+            identity: Some(ProtoBilibiliContentIdentity {
+                kind: crate::generated::tvos_net_player::v1::BilibiliContentKind::VideoPage.into(),
+                aid: 1_001,
+                bvid: "BV1frozen".to_owned(),
+                cid: 2_001,
+                epid: 0,
+            }),
+            ..Default::default()
+        };
+        let task = Task {
+            id: "bilibili-v2-download".to_owned(),
+            kind: TaskKind::BilibiliDownload.into(),
+            state: TaskState::Queued.into(),
+            source: "BV1frozen".to_owned(),
+            result_items: vec![result_item],
+            ..Default::default()
+        };
+        let candidate = BilibiliTaskCandidateRecord {
+            selection_id: "page:1:cid:2001:bvid:BV1frozen:aid:1001".to_owned(),
+            title: "Part 1".to_owned(),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::VideoPage,
+                aid: Some(1_001),
+                bvid: Some("BV1frozen".to_owned()),
+                cid: Some(2_001),
+                epid: None,
+            },
+            index: 1,
+            duration_seconds: Some(60),
+        };
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        TaskStateStore::new(&path)
+            .save(&[PersistedTaskRecord {
+                task,
+                options: Some(BilibiliDownloadOptions {
+                    download_mode: BilibiliDownloadMode::All.into(),
+                    ..Default::default()
+                }),
+                playback_options: None,
+                request_context: Some(BilibiliRequestContext {
+                    api_mode: BilibiliApiMode::Web.into(),
+                    credential_profile_id: String::new(),
+                }),
+                bilibili_candidates: vec![candidate],
+                output,
+            }])
+            .expect("concrete v2 execution state should persist");
+
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("task snapshot should be readable"))
+                .expect("task snapshot should be valid JSON");
+        let assert_rejected = |fixture: serde_json::Value, label: &str| {
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&fixture).expect("fixture should serialize"),
+            )
+            .expect("fixture should be written");
+            let error = match TaskStateStore::new(&path).load() {
+                Ok(_) => panic!("{label}"),
+                Err(error) => error,
+            };
+            assert_eq!(io::ErrorKind::InvalidData, error.kind(), "{label}");
+            assert!(
+                error.to_string().contains("frozen execution state"),
+                "{label}"
+            );
+        };
+
+        let mut missing_options = snapshot.clone();
+        missing_options["tasks"][0]
+            .as_object_mut()
+            .expect("task should be an object")
+            .remove("bilibili_options");
+        assert_rejected(missing_options, "missing options must fail closed");
+
+        let mut missing_context = snapshot.clone();
+        missing_context["tasks"][0]
+            .as_object_mut()
+            .expect("task should be an object")
+            .remove("request_context");
+        assert_rejected(missing_context, "missing context must fail closed");
+
+        let mut unspecified_download_mode = snapshot.clone();
+        unspecified_download_mode["tasks"][0]["bilibili_options"]["download_mode"] =
+            serde_json::Value::from(i32::from(BilibiliDownloadMode::Unspecified));
+        assert_rejected(
+            unspecified_download_mode,
+            "unspecified download mode must fail closed",
+        );
+
+        let mut unspecified_api_mode = snapshot.clone();
+        unspecified_api_mode["tasks"][0]["request_context"]["api_mode"] =
+            serde_json::Value::from(i32::from(BilibiliApiMode::Unspecified));
+        assert_rejected(
+            unspecified_api_mode,
+            "unspecified API mode must fail closed",
+        );
+
+        let mut legacy = snapshot;
+        legacy["schema_version"] =
+            serde_json::Value::from(BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION);
+        let legacy_task = legacy["tasks"][0]
+            .as_object_mut()
+            .expect("legacy task should be an object");
+        legacy_task.remove("bilibili_options");
+        legacy_task.remove("request_context");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy fixture should serialize"),
+        )
+        .expect("legacy fixture should be written");
+        let legacy_records = TaskStateStore::new(path)
+            .load()
+            .expect("schema v3 candidate downloads remain explicitly legacy-compatible");
+        assert_eq!(
+            Some(BilibiliDownloadMode::All),
+            legacy_records[0]
+                .options
+                .as_ref()
+                .map(BilibiliDownloadOptions::download_mode)
+        );
+        assert_eq!(
+            Some(BilibiliApiMode::Web),
+            legacy_records[0]
+                .request_context
+                .as_ref()
+                .map(BilibiliRequestContext::api_mode)
+        );
+        assert_eq!(
+            Some(""),
+            legacy_records[0]
+                .request_context
+                .as_ref()
+                .map(|context| context.credential_profile_id.as_str())
+        );
     }
 
     #[test]
