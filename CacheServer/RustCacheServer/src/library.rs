@@ -1,11 +1,12 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     ffi::{CString, OsStr},
     fs::{self, File},
     io,
     path::{Component, Components, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -13,7 +14,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost_types::Timestamp;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore};
 
 use crate::{
     config::CacheServerOptions,
@@ -32,6 +33,7 @@ const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 pub struct LocalMediaLibrary {
     options: Arc<CacheServerOptions>,
     blocking_jobs: Arc<Semaphore>,
+    item_mutation_locks: Arc<StdMutex<HashMap<String, Weak<RwLock<()>>>>>,
 }
 
 impl LocalMediaLibrary {
@@ -39,6 +41,7 @@ impl LocalMediaLibrary {
         Self {
             options,
             blocking_jobs: Arc::new(Semaphore::new(MAX_BLOCKING_LIBRARY_JOBS)),
+            item_mutation_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -75,6 +78,21 @@ impl LocalMediaLibrary {
             .await
     }
 
+    pub async fn reserve_media_path_for_publication(
+        &self,
+        path: impl Into<PathBuf>,
+    ) -> Option<LibraryItemPublicationLease> {
+        let path = path.into();
+        let item_id = self.item_id_for_media_path(path.clone()).await?;
+        let guard = self.acquire_item_publication_guard(&item_id).await;
+        (self.item_id_for_media_path(path).await.as_deref() == Some(item_id.as_str())).then_some(
+            LibraryItemPublicationLease {
+                item_id,
+                _guard: guard,
+            },
+        )
+    }
+
     pub async fn get_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
         let item_id = item_id.to_owned();
         let variant_id = variant_id.to_owned();
@@ -99,9 +117,28 @@ impl LocalMediaLibrary {
     }
 
     pub async fn delete_item(&self, id: &str) -> io::Result<bool> {
-        let id = id.to_owned();
-        self.run_blocking(move |library, _| library.delete_item_blocking(&id))
-            .await
+        let Some(deletion) = self.prepare_item_deletion(id).await? else {
+            return Ok(false);
+        };
+        deletion.delete().await
+    }
+
+    pub async fn prepare_item_deletion(&self, id: &str) -> io::Result<Option<LibraryItemDeletion>> {
+        let requested_id = id.to_owned();
+        let Some(item_id) = self
+            .run_blocking(move |library, _| {
+                library.canonical_deletable_item_id_blocking(&requested_id)
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        let guard = self.acquire_item_deletion_guard(&item_id).await;
+        Ok(Some(LibraryItemDeletion {
+            library: self.clone(),
+            item_id,
+            _guard: guard,
+        }))
     }
 
     pub async fn is_root_available(&self) -> bool {
@@ -136,6 +173,31 @@ impl LocalMediaLibrary {
         .expect("library blocking task panicked");
         drop(cancellation_guard);
         result
+    }
+
+    async fn acquire_item_publication_guard(&self, item_id: &str) -> OwnedRwLockReadGuard<()> {
+        self.item_mutation_lock(item_id).read_owned().await
+    }
+
+    async fn acquire_item_deletion_guard(&self, item_id: &str) -> OwnedRwLockWriteGuard<()> {
+        self.item_mutation_lock(item_id).write_owned().await
+    }
+
+    fn item_mutation_lock(&self, item_id: &str) -> Arc<RwLock<()>> {
+        {
+            let mut locks = self
+                .item_mutation_locks
+                .lock()
+                .expect("library item mutation lock map poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(item_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(RwLock::new(()));
+                locks.insert(item_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     fn list_items_page_blocking(
@@ -403,6 +465,40 @@ impl LocalMediaLibrary {
         }))
     }
 
+    fn canonical_deletable_item_id_blocking(&self, item_id: &str) -> io::Result<Option<String>> {
+        let root_path = self.root_path();
+        ensure_deletable_root(&root_path)?;
+        let Some(relative_path) = decode_item_id(item_id) else {
+            return Ok(None);
+        };
+        let relative_path = relative_path.components().collect::<PathBuf>();
+        if relative_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let full_candidate_path = absolute_path(&root_path.join(&relative_path));
+        if !is_within_root(&root_path, &full_candidate_path)
+            || is_internal_cache_components(relative_path.components())
+            || !self
+                .allowed_extensions()
+                .contains(&extension_with_dot(&full_candidate_path))
+        {
+            return Ok(None);
+        }
+        // Existing parents must preserve directory-only, no-follow access policy. Missing
+        // descendants are allowed so durable task references can still be tombstoned after an
+        // out-of-process removal; the later unlink path performs its own no-follow validation.
+        if existing_relative_parent_has_unsafe_component(&root_path, &relative_path)? {
+            return Ok(None);
+        }
+        let relative_path = relative_path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library item id is not valid UTF-8",
+            )
+        })?;
+        Ok(Some(create_item_id(relative_path)))
+    }
+
     fn try_create_library_item(&self, root_path: &Path, path: &Path) -> Option<LibraryItem> {
         let media_file = self.try_create_media_file(root_path, path)?;
         Some(self.create_library_item(&media_file))
@@ -507,6 +603,33 @@ impl LocalMediaLibrary {
                 }
             })
             .collect()
+    }
+}
+
+/// Keeps API-owned deletion from invalidating a canonical library item during publication.
+/// The lease protects logical availability, not content or filesystem object identity against
+/// out-of-process replacement; serving still uses the existing no-follow validation.
+pub struct LibraryItemPublicationLease {
+    pub item_id: String,
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+pub struct LibraryItemDeletion {
+    library: LocalMediaLibrary,
+    item_id: String,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+impl LibraryItemDeletion {
+    pub fn item_id(&self) -> &str {
+        &self.item_id
+    }
+
+    pub async fn delete(self) -> io::Result<bool> {
+        let item_id = self.item_id.clone();
+        self.library
+            .run_blocking(move |library, _| library.delete_item_blocking(&item_id))
+            .await
     }
 }
 
@@ -826,6 +949,32 @@ fn path_contains_link(root_path: &Path, candidate_path: &Path) -> bool {
     }
 
     false
+}
+
+fn existing_relative_parent_has_unsafe_component(
+    root_path: &Path,
+    relative_path: &Path,
+) -> io::Result<bool> {
+    let Some(parent) = relative_path.parent() else {
+        return Ok(false);
+    };
+    let mut current = root_path.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return Ok(true);
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn path_has_link_component(path: &Path) -> bool {
@@ -1268,6 +1417,65 @@ mod tests {
     }
 
     #[test]
+    fn deletion_lock_keys_canonicalize_equivalent_item_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(root_path.join("Movies")).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            ..CacheServerOptions::default()
+        }));
+        let canonical = create_item_id("Movies/Sample.mp4");
+        let alias = create_item_id("Movies//Sample.mp4");
+
+        assert_ne!(canonical, alias);
+        assert_eq!(
+            Some(canonical.clone()),
+            library
+                .canonical_deletable_item_id_blocking(&alias)
+                .expect("equivalent item path should validate")
+        );
+        fs::remove_dir_all(root_path.join("Movies"))
+            .expect("external directory removal should succeed");
+        assert_eq!(
+            Some(canonical),
+            library
+                .canonical_deletable_item_id_blocking(&alias)
+                .expect("missing parent should still identify the logical item")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_lock_keys_reject_an_existing_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let outside_path = temp.path().join("outside");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        fs::create_dir_all(&outside_path).expect("outside directory should be created");
+        symlink(&outside_path, root_path.join("Movies")).expect("symlink should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+
+        assert_eq!(
+            None,
+            library
+                .canonical_deletable_item_id_blocking(&create_item_id("Movies/Sample.mp4"))
+                .expect("symlink parent should be rejected")
+        );
+    }
+
+    #[test]
     fn media_paths_map_to_validated_item_ids() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
@@ -1473,6 +1681,54 @@ mod tests {
                 .delete_item_blocking(&item_id)
                 .expect("second delete should be idempotent")
         );
+    }
+
+    #[tokio::test]
+    async fn publication_lease_blocks_deletion_until_the_artifact_is_committed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_path = root_path.join("leased.mp4");
+        fs::write(&media_path, b"leased media").expect("media should be written");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+        let lease = library
+            .reserve_media_path_for_publication(media_path.clone())
+            .await
+            .expect("media should be reservable for publication");
+        let second_lease = library
+            .reserve_media_path_for_publication(media_path.clone())
+            .await
+            .expect("the same media should allow concurrent publication leases");
+        let item_id = lease.item_id.clone();
+        let deleting_library = library.clone();
+        let deletion = tokio::spawn(async move { deleting_library.delete_item(&item_id).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !deletion.is_finished(),
+            "deletion must wait for the publication lease"
+        );
+        drop(lease);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !deletion.is_finished(),
+            "deletion must wait for every publication lease"
+        );
+        drop(second_lease);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), deletion)
+                .await
+                .expect("deletion should finish after publication")
+                .expect("deletion task should not panic")
+                .expect("deletion should succeed")
+        );
+        assert!(!media_path.exists());
     }
 
     #[test]

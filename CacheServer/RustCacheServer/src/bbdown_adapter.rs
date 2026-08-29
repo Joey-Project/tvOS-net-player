@@ -53,7 +53,7 @@ use crate::{
         TaskProblemCategory, TaskResult, TaskResultProgress, TaskResultProviderDetails,
         TaskResultSubject, TaskState,
     },
-    library::LocalMediaLibrary,
+    library::{LibraryItemPublicationLease, LocalMediaLibrary},
     playback_policy::{
         CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
     },
@@ -108,6 +108,8 @@ pub struct BbdownBilibiliAdapter {
     archive_path: PathBuf,
     ffmpeg_path: PathBuf,
     archive_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    archive_save_fail_after: StdMutex<Option<usize>>,
 }
 
 #[allow(dead_code)]
@@ -292,6 +294,8 @@ impl BbdownBilibiliAdapter {
             archive_path: options.bbdown_archive_path(),
             ffmpeg_path: options.bbdown_ffmpeg_path.clone(),
             archive_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            archive_save_fail_after: StdMutex::new(None),
             options,
         }
     }
@@ -408,7 +412,7 @@ impl BbdownBilibiliAdapter {
                         "Cancelled before committing the BBDown archive.".to_owned(),
                     ));
                 }
-                archive.save(&self.archive_path).map_err(failed)?;
+                self.save_archive(&archive)?;
                 return Ok(BilibiliDownloadOutput {
                     library_item_id,
                     message: success_message(&report),
@@ -435,9 +439,13 @@ impl BbdownBilibiliAdapter {
         let mut results = Vec::with_capacity(request.candidates.len());
         let mut resources = Vec::new();
         let mut resource_bodies = Vec::new();
+        let mut library_item_leases = Vec::new();
         let mut primary_library_item_id = String::new();
         let mut successful_results = 0_usize;
         let mut cancelled = false;
+        let mut completed_downloaded_bytes = 0_u64;
+        let mut total_bytes_floor = 0_u64;
+        let mut archive_failure = None;
 
         let _archive_guard = self.archive_lock.lock().await;
         let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
@@ -479,7 +487,13 @@ impl BbdownBilibiliAdapter {
 
             let download_options = self.download_options(request.options.as_ref())?;
             let download_cancellation = DownloadCancellationToken::new();
-            let download_progress = BilibiliBbdownProgressSink::new(context.clone());
+            let download_progress = BilibiliBbdownProgressSink::for_v2_candidate(
+                context.clone(),
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
             let report = match run_bbdown_download_until_cancelled(
                 client.download_plan_with_archive_decision_with_progress_and_cancellation(
                     &plan,
@@ -497,15 +511,48 @@ impl BbdownBilibiliAdapter {
             {
                 Ok(report) => report,
                 Err(BilibiliDownloadError::Cancelled(_)) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
                     cancelled = true;
                     results.push(cancelled_download_result(result_id, candidate));
                     continue;
                 }
                 Err(error) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
+                    log_v2_candidate_error(&request.task_id, &result_id, &error);
                     results.push(failed_download_result(result_id, candidate, &error));
+                    report_v2_candidate_finished(
+                        &context,
+                        offset,
+                        request.candidates.len(),
+                        completed_downloaded_bytes,
+                        total_bytes_floor,
+                    );
                     continue;
                 }
             };
+            let snapshot = download_progress.v2_progress_snapshot();
+            completed_downloaded_bytes =
+                snapshot.downloaded_bytes.max(report.summary().total_bytes);
+            total_bytes_floor = snapshot.total_bytes.max(completed_downloaded_bytes);
+
+            context.report_progress(BilibiliTaskProgress {
+                progress: Some(v2_candidate_progress(
+                    offset,
+                    request.candidates.len(),
+                    0.85,
+                )),
+                downloaded_bytes: Some(to_i64_saturating(completed_downloaded_bytes)),
+                total_bytes: Some(to_i64_saturating(total_bytes_floor)),
+                message: Some(format!(
+                    "Muxing Bilibili download {}/{}.",
+                    offset + 1,
+                    request.candidates.len()
+                )),
+            });
 
             let report = match mux_download_report(report, &self.ffmpeg_path, &|| {
                 context.is_cancel_requested()
@@ -519,7 +566,15 @@ impl BbdownBilibiliAdapter {
                     continue;
                 }
                 Err(error) => {
+                    log_v2_candidate_error(&request.task_id, &result_id, &error);
                     results.push(failed_download_result(result_id, candidate, &error));
+                    report_v2_candidate_finished(
+                        &context,
+                        offset,
+                        request.candidates.len(),
+                        completed_downloaded_bytes,
+                        total_bytes_floor,
+                    );
                     continue;
                 }
             };
@@ -535,18 +590,45 @@ impl BbdownBilibiliAdapter {
                 .await;
             match mapped {
                 Ok(mapped) => {
-                    if primary_library_item_id.is_empty() && !mapped.library_item_id.is_empty() {
-                        primary_library_item_id = mapped.library_item_id.clone();
+                    retain_v2_success(
+                        mapped,
+                        &mut primary_library_item_id,
+                        &mut successful_results,
+                        &mut results,
+                        &mut resources,
+                        &mut resource_bodies,
+                        &mut library_item_leases,
+                    );
+                    if let Err(error) = self.save_archive(&archive) {
+                        log_v2_candidate_error(&request.task_id, &result_id, &error);
+                        archive_failure = Some(error);
                     }
-                    successful_results += 1;
-                    resources.extend(mapped.resources);
-                    resource_bodies.extend(mapped.resource_bodies);
-                    results.push(mapped.result);
-                    archive.save(&self.archive_path).map_err(failed)?;
                 }
                 Err(error) => {
+                    log_v2_candidate_error(&request.task_id, &result_id, &error);
                     results.push(failed_download_result(result_id, candidate, &error));
                 }
+            }
+            report_v2_candidate_finished(
+                &context,
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
+            if archive_failure.is_some() {
+                for (remaining_offset, remaining_candidate) in
+                    request.candidates.iter().enumerate().skip(offset + 1)
+                {
+                    results.push(failed_download_result(
+                        bilibili_v2_result_id(&request.task_id, remaining_offset),
+                        remaining_candidate,
+                        &BilibiliDownloadError::Failed(
+                            "The BBDown archive could not be persisted.".to_owned(),
+                        ),
+                    ));
+                }
+                break;
             }
         }
 
@@ -580,8 +662,28 @@ impl BbdownBilibiliAdapter {
                 results,
                 resources,
                 resource_bodies,
+                library_item_leases,
             }),
         })
+    }
+
+    fn save_archive(&self, archive: &DownloadArchive) -> Result<(), BilibiliDownloadError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .archive_save_fail_after
+                .lock()
+                .expect("archive save failure hook lock poisoned");
+            if let Some(remaining) = remaining.as_mut() {
+                if *remaining == 0 {
+                    return Err(BilibiliDownloadError::Failed(
+                        "Injected BBDown archive persistence failure.".to_owned(),
+                    ));
+                }
+                *remaining -= 1;
+            }
+        }
+        archive.save(&self.archive_path).map_err(failed)
     }
 
     async fn plan_download_candidate(
@@ -662,13 +764,15 @@ impl BbdownBilibiliAdapter {
         })?;
 
         let mut library_item_id = String::new();
+        let mut library_item_lease = None;
         for candidate_path in playable_entry_output_candidates(entry) {
-            if let Some(item_id) = self
+            if let Some(lease) = self
                 .library
-                .item_id_for_media_path(candidate_path.clone())
+                .reserve_media_path_for_publication(candidate_path.clone())
                 .await
             {
-                library_item_id = item_id;
+                library_item_id = lease.item_id.clone();
+                library_item_lease = Some(lease);
                 break;
             }
         }
@@ -761,6 +865,7 @@ impl BbdownBilibiliAdapter {
             ),
             resources,
             resource_bodies,
+            library_item_lease,
         })
     }
 
@@ -1240,6 +1345,7 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
 struct BilibiliBbdownProgressSink {
     context: BilibiliDownloadContext,
     accumulator: StdMutex<BilibiliBbdownProgressAccumulator>,
+    v2_window: Option<BilibiliV2ProgressWindow>,
 }
 
 impl BilibiliBbdownProgressSink {
@@ -1247,6 +1353,47 @@ impl BilibiliBbdownProgressSink {
         Self {
             context,
             accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: None,
+        }
+    }
+
+    fn for_v2_candidate(
+        context: BilibiliDownloadContext,
+        offset: usize,
+        total: usize,
+        completed_downloaded_bytes: u64,
+        total_bytes_floor: u64,
+    ) -> Self {
+        Self {
+            context,
+            accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: Some(BilibiliV2ProgressWindow {
+                offset,
+                total,
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            }),
+        }
+    }
+
+    fn v2_progress_snapshot(&self) -> BilibiliV2ProgressSnapshot {
+        let Some(window) = self.v2_window else {
+            return BilibiliV2ProgressSnapshot::default();
+        };
+        let accumulator = self
+            .accumulator
+            .lock()
+            .expect("BBDown progress accumulator lock poisoned");
+        let (downloaded_bytes, total_bytes) = accumulator.known_bytes_snapshot();
+        BilibiliV2ProgressSnapshot {
+            downloaded_bytes: window
+                .completed_downloaded_bytes
+                .saturating_add(downloaded_bytes),
+            total_bytes: window.total_bytes_floor.max(
+                window
+                    .completed_downloaded_bytes
+                    .saturating_add(total_bytes.unwrap_or(downloaded_bytes)),
+            ),
         }
     }
 }
@@ -1258,10 +1405,49 @@ impl DownloadProgressSink for BilibiliBbdownProgressSink {
             .lock()
             .ok()
             .and_then(|mut accumulator| accumulator.record(event));
-        if let Some(progress) = progress {
+        if let Some(mut progress) = progress {
+            if let Some(window) = self.v2_window {
+                window.map(&mut progress);
+            }
             self.context.report_progress(progress);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct BilibiliV2ProgressWindow {
+    offset: usize,
+    total: usize,
+    completed_downloaded_bytes: u64,
+    total_bytes_floor: u64,
+}
+
+impl BilibiliV2ProgressWindow {
+    fn map(self, progress: &mut BilibiliTaskProgress) {
+        if let Some(fraction) = progress.progress.as_mut() {
+            *fraction = v2_candidate_progress(self.offset, self.total, *fraction);
+        }
+        if let Some(downloaded_bytes) = progress.downloaded_bytes.as_mut() {
+            *downloaded_bytes = to_i64_saturating(
+                self.completed_downloaded_bytes
+                    .saturating_add(nonnegative_i64_to_u64(*downloaded_bytes)),
+            );
+        }
+        if let Some(total_bytes) = progress.total_bytes.as_mut() {
+            *total_bytes = to_i64_saturating(
+                self.total_bytes_floor.max(
+                    self.completed_downloaded_bytes
+                        .saturating_add(nonnegative_i64_to_u64(*total_bytes)),
+                ),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BilibiliV2ProgressSnapshot {
+    downloaded_bytes: u64,
+    total_bytes: u64,
 }
 
 #[derive(Default)]
@@ -3314,12 +3500,58 @@ struct MappedV2DownloadResult {
     library_item_id: String,
     resources: Vec<TaskResourceRecord>,
     resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_lease: Option<LibraryItemPublicationLease>,
 }
 
 struct MappedV2Artifact {
     artifact: TaskArtifact,
     resource: TaskResourceRecord,
     body: BilibiliTaskResourceBody,
+}
+
+fn retain_v2_success(
+    mapped: MappedV2DownloadResult,
+    primary_library_item_id: &mut String,
+    successful_results: &mut usize,
+    results: &mut Vec<TaskResult>,
+    resources: &mut Vec<TaskResourceRecord>,
+    resource_bodies: &mut Vec<BilibiliTaskResourceBody>,
+    library_item_leases: &mut Vec<LibraryItemPublicationLease>,
+) {
+    if primary_library_item_id.is_empty() && !mapped.library_item_id.is_empty() {
+        *primary_library_item_id = mapped.library_item_id.clone();
+    }
+    *successful_results = successful_results.saturating_add(1);
+    resources.extend(mapped.resources);
+    resource_bodies.extend(mapped.resource_bodies);
+    library_item_leases.extend(mapped.library_item_lease);
+    results.push(mapped.result);
+}
+
+fn log_v2_candidate_error(task_id: &str, result_id: &str, error: &BilibiliDownloadError) {
+    eprintln!(
+        "Bilibili v2 task {task_id} candidate {result_id} failed: {}",
+        download_error_detail(error)
+    );
+}
+
+fn report_v2_candidate_finished(
+    context: &BilibiliDownloadContext,
+    offset: usize,
+    total: usize,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+) {
+    context.report_progress(BilibiliTaskProgress {
+        progress: Some(v2_candidate_progress(offset, total, 1.0)),
+        downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
+        total_bytes: Some(to_i64_saturating(total_bytes.max(downloaded_bytes))),
+        message: Some(format!(
+            "Finished Bilibili download {}/{}.",
+            offset + 1,
+            total
+        )),
+    });
 }
 
 fn bilibili_v2_result_id(task_id: &str, offset: usize) -> String {
@@ -3410,18 +3642,23 @@ fn failed_download_result(
     candidate: &BilibiliTaskCandidateRecord,
     error: &BilibiliDownloadError,
 ) -> TaskResult {
-    let (category, code, retryable) = match error {
+    let (category, code, message, retryable) = match error {
         BilibiliDownloadError::ResourceExhausted(_) => (
             TaskProblemCategory::ResourceLimit,
             "bilibili.resource_limit",
+            "The Bilibili download exceeded a server resource limit.",
             true,
         ),
-        BilibiliDownloadError::Cancelled(_) => {
-            (TaskProblemCategory::Cancelled, "task.cancelled", false)
-        }
+        BilibiliDownloadError::Cancelled(_) => (
+            TaskProblemCategory::Cancelled,
+            "task.cancelled",
+            "Cancelled by request.",
+            false,
+        ),
         BilibiliDownloadError::Failed(_) => (
             TaskProblemCategory::Upstream,
             "bilibili.download_failed",
+            "The Bilibili download failed.",
             true,
         ),
     };
@@ -3441,7 +3678,7 @@ fn failed_download_result(
         problem: Some(TaskProblem {
             category: category.into(),
             code: code.to_owned(),
-            message: download_error_detail(error).to_owned(),
+            message: message.to_owned(),
             retryable,
         }),
         library_item_id: String::new(),
@@ -4130,6 +4367,10 @@ async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError>
 
 fn to_i64_saturating(value: u64) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    value.try_into().unwrap_or_default()
 }
 
 fn success_message(report: &DownloadReport) -> String {
@@ -4846,6 +5087,118 @@ mod tests {
                 .iter()
                 .all(|result| result.provider_details.is_some())
         );
+        assert_eq!(
+            "The Bilibili download failed.",
+            results[1]
+                .problem
+                .as_ref()
+                .expect("failed result should include a problem")
+                .message
+        );
+        assert!(!encoded_message_contains(&results[1], "offline failure"));
+    }
+
+    #[test]
+    fn v2_candidate_progress_scales_fraction_and_preserves_aggregate_bytes() {
+        let mut first = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_END),
+            downloaded_bytes: Some(100),
+            total_bytes: Some(120),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 0,
+            total: 2,
+            completed_downloaded_bytes: 0,
+            total_bytes_floor: 0,
+        }
+        .map(&mut first);
+        assert_progress_near(first.progress, 0.40);
+        assert_eq!(Some(100), first.downloaded_bytes);
+        assert_eq!(Some(120), first.total_bytes);
+
+        let mut second = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_START),
+            downloaded_bytes: Some(0),
+            total_bytes: Some(0),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 1,
+            total: 2,
+            completed_downloaded_bytes: 100,
+            total_bytes_floor: 120,
+        }
+        .map(&mut second);
+        assert_progress_near(second.progress, 0.55);
+        assert_eq!(Some(100), second.downloaded_bytes);
+        assert_eq!(Some(120), second.total_bytes);
+    }
+
+    #[test]
+    fn v2_archive_failure_retains_all_successes_recorded_before_the_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+        );
+        *adapter
+            .archive_save_fail_after
+            .lock()
+            .expect("archive save failure hook lock should not be poisoned") = Some(1);
+        let archive = DownloadArchive::load(&adapter.archive_path)
+            .expect("an absent archive should load as empty");
+        let candidate = v2_test_candidate();
+        let mut results = Vec::new();
+        let mut resources = Vec::new();
+        let mut resource_bodies = Vec::new();
+        let mut library_item_leases = Vec::new();
+        let mut primary_library_item_id = String::new();
+        let mut successful_results = 0;
+
+        for (offset, library_item_id) in ["library-one", "library-two"].into_iter().enumerate() {
+            retain_v2_success(
+                MappedV2DownloadResult {
+                    result: successful_download_result(
+                        bilibili_v2_result_id("task", offset),
+                        &candidate,
+                        library_item_id.to_owned(),
+                        Vec::new(),
+                        100,
+                    ),
+                    library_item_id: library_item_id.to_owned(),
+                    resources: Vec::new(),
+                    resource_bodies: Vec::new(),
+                    library_item_lease: None,
+                },
+                &mut primary_library_item_id,
+                &mut successful_results,
+                &mut results,
+                &mut resources,
+                &mut resource_bodies,
+                &mut library_item_leases,
+            );
+            let save = adapter.save_archive(&archive);
+            if offset == 0 {
+                save.expect("the first archive save should succeed");
+            } else {
+                assert!(save.is_err(), "the second archive save should fail");
+            }
+        }
+
+        assert_eq!(2, successful_results);
+        assert_eq!(2, results.len());
+        assert!(
+            results
+                .iter()
+                .all(|result| result.state() == TaskState::Succeeded)
+        );
+        assert_eq!("library-one", primary_library_item_id);
     }
 
     #[tokio::test]

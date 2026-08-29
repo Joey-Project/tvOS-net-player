@@ -35,6 +35,11 @@ public protocol CacheControlClient: Sendable {
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource
     func deleteLibraryItem(id: String) async throws -> Bool
     func getTask(id: String) async throws -> CacheTask
+    func listTaskResults(
+        taskID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> CacheTaskResultsPage
     func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error>
     func cancelTask(id: String) async throws -> CacheTask
     func resolveBilibiliInput(
@@ -98,6 +103,7 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case bilibiliDownloadTask
     case bilibiliTaskSelection
     case bilibiliPlaybackPolicy
+    case taskOutputV2
     case playbackProgressReporting
 }
 
@@ -183,6 +189,14 @@ public extension CacheControlClient {
         options: BilibiliDownloadTaskOptions
     ) async throws -> CacheTask {
         throw CacheControlClientUnsupportedFeature.bilibiliDownloadTask
+    }
+
+    func listTaskResults(
+        taskID: String,
+        pageToken: String = "",
+        pageSize: Int = 50
+    ) async throws -> CacheTaskResultsPage {
+        throw CacheControlClientUnsupportedFeature.taskOutputV2
     }
 
     func listLibraryItemsPage(
@@ -275,6 +289,8 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "Bilibili task selection is not supported by this cache server."
         case .bilibiliPlaybackPolicy:
             return "Bilibili playback policy controls are not supported by this cache server."
+        case .taskOutputV2:
+            return "Paginated task results are not supported by this cache server."
         case .playbackProgressReporting:
             return "Playback progress reporting is not supported by this cache server."
         }

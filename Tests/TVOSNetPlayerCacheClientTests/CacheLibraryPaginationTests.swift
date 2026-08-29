@@ -499,6 +499,25 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(request.page.pageSize, 0)
     }
 
+    func testTaskResultsRequestPreservesOpaqueValuesAndClampsPageSize() {
+        let maximum = GRPCCacheControlClient.listTaskResultsRequest(
+            taskID: " task-1 ",
+            pageToken: " opaque-page-token ",
+            pageSize: 500
+        )
+
+        XCTAssertEqual(maximum.taskID, " task-1 ")
+        XCTAssertEqual(maximum.page.pageToken, " opaque-page-token ")
+        XCTAssertEqual(maximum.page.pageSize, 200)
+
+        let serverDefault = GRPCCacheControlClient.listTaskResultsRequest(
+            taskID: "task-1",
+            pageToken: "",
+            pageSize: -1
+        )
+        XCTAssertEqual(serverDefault.page.pageSize, 0)
+    }
+
     func testCreateBilibiliPlaybackTaskV2RequestMapsEveryTokenSelectionMode() throws {
         let single = try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
             sessionID: "session-1",
@@ -917,6 +936,33 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(page.hasMoreItems)
     }
 
+    func testCacheControlClientTaskResultsContractExposesPagination() async throws {
+        let client: any CacheControlClient = FakePagedCacheControlClient()
+
+        let page = try await client.listTaskResults(
+            taskID: "task-1",
+            pageToken: "result-page-1",
+            pageSize: 25
+        )
+
+        XCTAssertEqual(page.results.map(\.id), ["result-1"])
+        XCTAssertEqual(page.nextPageToken, "result-page-2")
+        XCTAssertEqual(page.snapshotID, "snapshot-1")
+        XCTAssertEqual(page.outputRevision, 7)
+        XCTAssertTrue(page.hasMoreResults)
+    }
+
+    func testLegacyConformerReportsTaskOutputV2AsUnsupported() async {
+        let client: any CacheControlClient = LegacyBilibiliPlaybackCacheControlClient()
+
+        do {
+            _ = try await client.listTaskResults(taskID: "task-1")
+            XCTFail("Expected ListTaskResults to be unsupported.")
+        } catch {
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .taskOutputV2)
+        }
+    }
+
     func testDefaultHLSCacheStatusImplementationReportsUnsupportedFeature() async {
         let client: any CacheControlClient = FakePagedCacheControlClient()
 
@@ -1063,6 +1109,39 @@ private actor FakePagedCacheControlClient: CacheControlClient {
 
     func getTask(id: String) async throws -> CacheTask {
         throw FakePagedCacheControlClientError.notImplemented
+    }
+
+    func listTaskResults(
+        taskID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> CacheTaskResultsPage {
+        XCTAssertEqual(taskID, "task-1")
+        XCTAssertEqual(pageToken, "result-page-1")
+        XCTAssertEqual(pageSize, 25)
+        return CacheTaskResultsPage(
+            results: [
+                CacheTaskResult(
+                    id: "result-1",
+                    state: "completed",
+                    title: "Result 1",
+                    subtitle: "",
+                    progress: nil,
+                    problem: nil,
+                    libraryItemID: "",
+                    playbackSource: nil,
+                    artifacts: [],
+                    createdAt: nil,
+                    updatedAt: nil
+                )
+            ],
+            pageInfo: CachePageInfo(
+                totalSize: 2,
+                nextPageToken: "result-page-2",
+                snapshotID: "snapshot-1"
+            ),
+            outputRevision: 7
+        )
     }
 
     func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error> {

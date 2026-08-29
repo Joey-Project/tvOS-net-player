@@ -99,8 +99,17 @@ impl TaskOutputRecord {
 
     pub(crate) fn replace(
         previous: Option<&Self>,
+        results: Vec<TaskResult>,
+        resources: Vec<TaskResourceRecord>,
+    ) -> Result<Self, TaskOutputValidationError> {
+        Self::replace_with_primary_result(previous, results, resources, None)
+    }
+
+    pub(crate) fn replace_with_primary_result(
+        previous: Option<&Self>,
         mut results: Vec<TaskResult>,
         resources: Vec<TaskResourceRecord>,
+        preferred_primary_result_id: Option<&str>,
     ) -> Result<Self, TaskOutputValidationError> {
         validate_collection_sizes(&results, &resources)?;
         validate_and_bind_resources(&mut results, &resources)?;
@@ -108,9 +117,41 @@ impl TaskOutputRecord {
         validate_result_ids(&results)?;
         validate_resource_representations(previous, &resources)?;
 
+        let primary_result_id = match preferred_primary_result_id {
+            Some(primary_result_id)
+                if results.iter().any(|result| result.id == primary_result_id) =>
+            {
+                primary_result_id.to_owned()
+            }
+            Some(_) => {
+                return Err(TaskOutputValidationError::new(
+                    "preferred task output primary result is missing",
+                ));
+            }
+            None => {
+                let has_successful_result = results.iter().any(|result| {
+                    matches!(result.state(), TaskState::Succeeded | TaskState::Completed)
+                });
+                previous
+                    .map(|output| output.primary_result_id.as_str())
+                    .filter(|primary_result_id| {
+                        results.iter().any(|result| {
+                            result.id.as_str() == *primary_result_id
+                                && (!has_successful_result
+                                    || matches!(
+                                        result.state(),
+                                        TaskState::Succeeded | TaskState::Completed
+                                    ))
+                        })
+                    })
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| inferred_primary_result_id(&results))
+            }
+        };
         let unchanged = previous.is_some_and(|previous| {
             previous.results == results
                 && previous.resources == resources
+                && previous.primary_result_id == primary_result_id
                 && !previous.legacy_managed
         });
         let revision = match previous {
@@ -118,15 +159,6 @@ impl TaskOutputRecord {
             Some(previous) => previous.revision.saturating_add(1).max(1),
             None => 1,
         };
-        let primary_result_id = previous
-            .map(|output| output.primary_result_id.as_str())
-            .filter(|primary_result_id| {
-                results
-                    .iter()
-                    .any(|result| result.id.as_str() == *primary_result_id)
-            })
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| inferred_primary_result_id(&results));
         Ok(Self {
             revision,
             snapshot_id: if unchanged {
@@ -412,6 +444,94 @@ impl TaskOutputRecord {
         updated.snapshot_id = new_snapshot_id();
         *self = updated;
         Ok(retired_ids)
+    }
+
+    pub(crate) fn mark_library_item_deleted(
+        &mut self,
+        library_item_id: &str,
+        message: &str,
+    ) -> Result<Option<Vec<String>>, TaskOutputValidationError> {
+        if self.legacy_managed {
+            return Ok(None);
+        }
+        let mut updated = self.clone();
+        let mut changed = false;
+        for result in &mut updated.results {
+            let result_matches = result.library_item_id == library_item_id
+                || result
+                    .playback_source
+                    .as_ref()
+                    .is_some_and(|source| source.item_id == library_item_id);
+            let mut artifact_matches = false;
+            for artifact in &mut result.artifacts {
+                if artifact.library_item_id != library_item_id {
+                    continue;
+                }
+                artifact_matches = true;
+                artifact.state = TaskArtifactState::Deleted.into();
+                artifact.resource = None;
+                artifact.library_item_id.clear();
+                artifact.problem = Some(TaskProblem {
+                    category: TaskProblemCategory::NotFound.into(),
+                    code: "cache.library_item_deleted".to_owned(),
+                    message: message.to_owned(),
+                    retryable: false,
+                });
+            }
+            if !result_matches && !artifact_matches {
+                continue;
+            }
+            result.state = TaskState::Failed.into();
+            if result.library_item_id == library_item_id {
+                result.library_item_id.clear();
+            }
+            if result
+                .playback_source
+                .as_ref()
+                .is_some_and(|source| source.item_id == library_item_id)
+            {
+                result.playback_source = None;
+            }
+            result.problem = Some(TaskProblem {
+                category: TaskProblemCategory::NotFound.into(),
+                code: "cache.library_item_deleted".to_owned(),
+                message: message.to_owned(),
+                retryable: false,
+            });
+            if let Some(progress) = result.progress.as_mut() {
+                progress.phase = "deleted".to_owned();
+                progress.message = message.to_owned();
+            }
+            changed = true;
+        }
+        if !changed {
+            return Ok(None);
+        }
+
+        let referenced_ids = updated
+            .results
+            .iter()
+            .flat_map(|result| &result.artifacts)
+            .filter_map(|artifact| artifact.resource.as_ref())
+            .map(|resource| resource.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut retired_ids = Vec::new();
+        updated.resources.retain(|resource| {
+            let retained = referenced_ids.contains(resource.resource.id.as_str());
+            if !retained {
+                retired_ids.push(resource.resource.id.clone());
+            }
+            retained
+        });
+        updated.primary_result_id = inferred_primary_result_id(&updated.results);
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_and_bind_resources(&mut updated.results, &updated.resources)?;
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_result_ids(&updated.results)?;
+        updated.revision = updated.revision.saturating_add(1).max(1);
+        updated.snapshot_id = new_snapshot_id();
+        *self = updated;
+        Ok(Some(retired_ids))
     }
 }
 
@@ -1341,6 +1461,50 @@ mod tests {
     }
 
     #[test]
+    fn preferred_primary_result_replaces_an_existing_queued_primary() {
+        let previous = TaskOutputRecord::replace(
+            None,
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Queued.into(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Queued.into(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let output = TaskOutputRecord::replace_with_primary_result(
+            Some(&previous),
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Failed.into(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "local.default.result-two".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+            Some("result-two"),
+        )
+        .unwrap();
+
+        assert_eq!("result-two", output.primary_result_id);
+        assert!(output.revision > previous.revision);
+    }
+
+    #[test]
     fn retiring_expired_resources_updates_artifacts_and_revision() {
         let resource = TaskResourceRecord::new(CacheResourceRef {
             id: "expired-subtitle".to_owned(),
@@ -1758,6 +1922,58 @@ mod tests {
 
         assert_eq!("result-two", output.primary_result_id);
         assert_eq!(TaskState::Failed, output.results[2].state());
+    }
+
+    #[test]
+    fn library_deletion_tombstones_media_and_promotes_a_surviving_primary() {
+        let mut output = TaskOutputRecord::replace(
+            None,
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-one".to_owned(),
+                    artifacts: vec![TaskArtifact {
+                        id: "media-one".to_owned(),
+                        kind: TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: "library-one".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-two".to_owned(),
+                    artifacts: vec![TaskArtifact {
+                        id: "media-two".to_owned(),
+                        kind: TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: "library-two".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("task output should be valid");
+
+        let update = output
+            .mark_library_item_deleted("library-one", "Cached media was deleted.")
+            .expect("library deletion should preserve output validity");
+
+        assert_eq!(Some(Vec::new()), update);
+        assert_eq!(TaskState::Failed, output.results[0].state());
+        assert!(output.results[0].library_item_id.is_empty());
+        assert_eq!(
+            TaskArtifactState::Deleted,
+            output.results[0].artifacts[0].state()
+        );
+        assert!(output.results[0].artifacts[0].library_item_id.is_empty());
+        assert_eq!(TaskState::Succeeded, output.results[1].state());
+        assert_eq!("result-two", output.primary_result_id);
     }
 
     #[test]

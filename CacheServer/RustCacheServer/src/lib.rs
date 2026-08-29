@@ -1043,6 +1043,36 @@ impl AppState {
         }
     }
 
+    pub(crate) async fn delete_local_library_item(&self, item_id: &str) -> Result<bool, Status> {
+        let Some(deletion) =
+            self.library
+                .prepare_item_deletion(item_id)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("Failed to prepare library item deletion: {error}"))
+                })?
+        else {
+            return Ok(false);
+        };
+        let updated_task_ids = self
+            .tasks
+            .tombstone_library_item_before_delete(deletion.item_id())?;
+        if !updated_task_ids.is_empty() {
+            let task_ids = updated_task_ids.into_iter().collect::<HashSet<_>>();
+            let released_resource_lease_ids = self
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .invalidate_tasks(&task_ids);
+            self.tasks
+                .release_task_output_snapshots(&released_resource_lease_ids);
+        }
+        deletion
+            .delete()
+            .await
+            .map_err(|error| Status::internal(format!("Failed to delete library item: {error}")))
+    }
+
     pub(crate) async fn delete_completed_hls_library_item(
         &self,
         item_id: &str,

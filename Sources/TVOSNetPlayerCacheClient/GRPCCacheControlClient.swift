@@ -624,6 +624,32 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func listTaskResults(
+        taskID: String,
+        pageToken: String = "",
+        pageSize: Int = 50
+    ) async throws -> CacheTaskResultsPage {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                let request = Self.listTaskResultsRequest(
+                    taskID: taskID,
+                    pageToken: pageToken,
+                    pageSize: pageSize
+                )
+                let response = try await service.listTaskResults(request, options: callOptions)
+                return CacheTaskResultsPage(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.taskOutputV2
+        }
+    }
+
     public func cancelTask(id: String) async throws -> CacheTask {
         try await withGRPCClient(
             transport: .http2NIOTS(
@@ -761,6 +787,17 @@ public final class GRPCCacheControlClient: CacheControlClient {
         case .download(let spec):
             request.download = TvosNetPlayer_V1_BilibiliDownloadSpec(spec)
         }
+        return request
+    }
+
+    static func listTaskResultsRequest(
+        taskID: String,
+        pageToken: String,
+        pageSize: Int
+    ) -> TvosNetPlayer_V1_ListTaskResultsRequest {
+        var request = TvosNetPlayer_V1_ListTaskResultsRequest()
+        request.taskID = taskID
+        request.page = bilibiliResolutionPageRequest(pageToken: pageToken, pageSize: pageSize)
         return request
     }
 

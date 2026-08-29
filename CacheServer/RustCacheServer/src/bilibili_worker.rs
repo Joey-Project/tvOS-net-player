@@ -15,6 +15,7 @@ use crate::{
     generated::tvos_net_player::v1::{
         BilibiliDownloadOptions, BilibiliRequestContext, Task, TaskResult, TaskState,
     },
+    library::LibraryItemPublicationLease,
     task_output::TaskResourceRecord,
     task_registry::{
         BilibiliTaskCancellation, BilibiliTaskProgress, BilibiliTaskRegistry, BilibiliTaskWorkItem,
@@ -54,6 +55,7 @@ pub struct BilibiliDownloadOutputV2 {
     pub results: Vec<TaskResult>,
     pub(crate) resources: Vec<TaskResourceRecord>,
     pub resource_bodies: Vec<BilibiliTaskResourceBody>,
+    pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
 }
 
 pub struct BilibiliTaskResourceBody {
@@ -192,7 +194,14 @@ async fn run_one_bilibili_task(
     };
 
     if work_item.cancellation.is_cancel_requested()
-        && !matches!(&result, Ok(output) if output.v2.is_some())
+        && !matches!(
+            &result,
+            Ok(output)
+                if output
+                    .v2
+                    .as_ref()
+                    .is_some_and(|output| output.terminal_state == TaskState::Cancelled)
+        )
     {
         let message = match result {
             Err(BilibiliDownloadError::Cancelled(message)) => {
@@ -211,7 +220,7 @@ async fn run_one_bilibili_task(
     match result {
         Ok(mut output) => {
             if let Some(mut output_v2) = output.v2.take() {
-                redact_download_output_v2(&mut output_v2, credentials_configured);
+                sanitize_download_output_v2(&mut output_v2);
                 complete_v2_terminal_task(
                     &registry,
                     work_item.task_id.clone(),
@@ -256,35 +265,30 @@ async fn run_one_bilibili_task(
     }
 }
 
-fn redact_download_output_v2(output: &mut BilibiliDownloadOutputV2, credentials_configured: bool) {
-    if !credentials_configured {
-        return;
-    }
+fn sanitize_download_output_v2(output: &mut BilibiliDownloadOutputV2) {
     for result in &mut output.results {
         match result.state() {
             TaskState::Failed => {
                 if let Some(problem) = result.problem.as_mut() {
-                    problem.message = crate::credential_safe_client_error(true, &problem.message);
+                    problem.message = "The Bilibili download failed.".to_owned();
                 }
                 if let Some(progress) = result.progress.as_mut() {
-                    progress.message = crate::credential_safe_client_error(true, &progress.message);
+                    progress.message = "Bilibili download failed.".to_owned();
                 }
             }
             TaskState::Cancelled => {
                 if let Some(problem) = result.problem.as_mut() {
-                    problem.message =
-                        crate::credential_safe_client_cancellation(true, &problem.message);
+                    problem.message = "Cancelled by request.".to_owned();
                 }
                 if let Some(progress) = result.progress.as_mut() {
-                    progress.message =
-                        crate::credential_safe_client_cancellation(true, &progress.message);
+                    progress.message = "Cancelled by request.".to_owned();
                 }
             }
             _ => {}
         }
         for artifact in &mut result.artifacts {
             if let Some(problem) = artifact.problem.as_mut() {
-                problem.message = crate::credential_safe_client_error(true, &problem.message);
+                problem.message = "Task artifact is unavailable.".to_owned();
             }
         }
     }
@@ -304,6 +308,12 @@ async fn complete_v2_terminal_task(
         let message = message.clone();
         let output = Arc::clone(&output);
         move |registry| {
+            validate_library_item_publication_leases(
+                &library_item_id,
+                &output.results,
+                &output.library_item_leases,
+            )
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
             validate_resource_body_descriptors(&output.resources, &output.resource_bodies)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
             let staged =
@@ -321,6 +331,13 @@ async fn complete_v2_terminal_task(
     .await;
 
     if let Err(error) = publication {
+        if error.code() == tonic::Code::Cancelled {
+            complete_terminal_task(registry, move |registry| {
+                registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
+            })
+            .await;
+            return;
+        }
         eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {error}");
         complete_terminal_task(registry, move |registry| {
             registry.complete_task_failed(
@@ -330,6 +347,39 @@ async fn complete_v2_terminal_task(
         })
         .await;
     }
+}
+
+fn validate_library_item_publication_leases(
+    primary_library_item_id: &str,
+    results: &[TaskResult],
+    leases: &[LibraryItemPublicationLease],
+) -> io::Result<()> {
+    let mut expected = results
+        .iter()
+        .flat_map(|result| {
+            std::iter::once(result.library_item_id.as_str()).chain(
+                result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.library_item_id.as_str()),
+            )
+        })
+        .filter(|item_id| !item_id.is_empty())
+        .collect::<HashSet<_>>();
+    if !primary_library_item_id.is_empty() {
+        expected.insert(primary_library_item_id);
+    }
+    let leased = leases
+        .iter()
+        .map(|lease| lease.item_id.as_str())
+        .collect::<HashSet<_>>();
+    if leased != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bilibili task output library backing is not covered by publication leases",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_resource_body_descriptors(
@@ -495,10 +545,12 @@ mod tests {
 
     use crate::{
         bilibili_playback::{BilibiliContentIdentity, BilibiliContentKind},
+        config::CacheServerOptions,
         generated::tvos_net_player::v1::{
             CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState, TaskProblem,
             TaskProblemCategory, TaskResult,
         },
+        library::LocalMediaLibrary,
         task_registry::TaskRetentionPolicy,
     };
     use tokio::sync::Notify;
@@ -529,6 +581,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_terminal_output_requires_a_lease_for_every_library_backing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_path = root_path.join("leased.mp4");
+        std::fs::write(&media_path, b"leased media").expect("media should be written");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+        let lease = library
+            .reserve_media_path_for_publication(media_path)
+            .await
+            .expect("media should be reservable");
+        let item_id = lease.item_id.clone();
+        let results = vec![TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Succeeded.into(),
+            library_item_id: item_id.clone(),
+            artifacts: vec![TaskArtifact {
+                id: "media-one".to_owned(),
+                kind: TaskArtifactKind::Media.into(),
+                state: TaskArtifactState::Available.into(),
+                library_item_id: item_id.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        validate_library_item_publication_leases(&item_id, &results, &[lease])
+            .expect("matching library backing should be leased");
+        let error = validate_library_item_publication_leases(&item_id, &results, &[])
+            .expect_err("unleased library backing must be rejected");
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+    }
+
+    #[tokio::test]
     async fn worker_marks_adapter_failure() {
         let registry = Arc::new(BilibiliTaskRegistry::default());
         let worker = tokio::spawn(run_bilibili_task_worker(
@@ -548,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_publishes_partial_v2_results_resources_and_redacted_errors_durably() {
+    async fn worker_publishes_partial_v2_results_with_client_safe_errors_durably() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let resource_root = temp.path().join("library");
@@ -574,19 +666,28 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(PartialV2Adapter),
             1,
-            true,
+            false,
         ));
 
         let completed = wait_for_state(&registry, &task.id, TaskState::Succeeded).await;
         worker.abort();
         let _ = worker.await;
+        let successful_result_id = format!("{}-result-2", task.id);
 
-        assert_eq!("local.default.worker-v2", completed.library_item_id);
+        assert!(completed.library_item_id.is_empty());
         assert_eq!(2, completed.result_items.len());
-        assert_eq!(TaskState::Succeeded, completed.result_items[0].state());
-        assert_eq!(TaskState::Failed, completed.result_items[1].state());
+        assert_eq!(TaskState::Failed, completed.result_items[0].state());
+        assert_eq!(TaskState::Succeeded, completed.result_items[1].state());
+        assert_eq!(
+            successful_result_id,
+            completed
+                .output_summary
+                .as_ref()
+                .expect("v2 output summary should be present")
+                .primary_result_id
+        );
         assert!(
-            !completed.result_items[1]
+            !completed.result_items[0]
                 .message
                 .contains("sensitive-marker")
         );
@@ -596,13 +697,17 @@ mod tests {
             .expect("v2 output should be visible");
         assert_eq!(2, snapshot.output.record.results.len());
         assert_eq!(1, snapshot.output.record.resources.len());
-        let failed = &snapshot.output.record.results[1];
+        assert_eq!(
+            successful_result_id,
+            snapshot.output.record.primary_result_id
+        );
+        let failed = &snapshot.output.record.results[0];
         assert_eq!(TaskState::Failed, failed.state());
         assert!(
             failed
                 .problem
                 .as_ref()
-                .is_some_and(|problem| problem.message.contains("detail omitted"))
+                .is_some_and(|problem| problem.message == "The Bilibili download failed.")
         );
         assert!(
             !failed
@@ -631,8 +736,59 @@ mod tests {
             .task_output_snapshot(&task.id)
             .expect("v2 output should survive restart");
         assert_eq!(TaskState::Succeeded, restored_task.state());
+        assert_eq!(
+            successful_result_id,
+            restored_task
+                .output_summary
+                .as_ref()
+                .expect("restored v2 output summary should be present")
+                .primary_result_id
+        );
+        assert_eq!(
+            successful_result_id,
+            restored_output.output.record.primary_result_id
+        );
         assert_eq!(2, restored_output.output.record.results.len());
         assert_eq!(1, restored_output.output.record.resources.len());
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_v2_success_returned_after_cancellation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&state_path));
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1worker-cancel-race-v2",
+                None,
+                None,
+                "Worker cancellation race".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created durably");
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(LateSuccessAfterCancellationV2Adapter),
+            1,
+            true,
+        ));
+
+        let cancelled = wait_for_state(&registry, &task.id, TaskState::Cancelled).await;
+        worker.abort();
+        let _ = worker.await;
+        let output = registry
+            .task_output_snapshot(&task.id)
+            .expect("cancelled v2 output should remain visible");
+
+        assert!(cancelled.library_item_id.is_empty());
+        assert_eq!(1, cancelled.result_items.len());
+        assert_eq!(TaskState::Cancelled, cancelled.result_items[0].state());
+        assert_eq!(1, output.output.record.results.len());
+        assert_eq!(
+            TaskState::Cancelled,
+            output.output.record.results[0].state()
+        );
+        assert!(output.output.record.resources.is_empty());
     }
 
     #[tokio::test]
@@ -1165,6 +1321,47 @@ mod tests {
 
     struct PartialV2Adapter;
 
+    struct LateSuccessAfterCancellationV2Adapter;
+
+    impl BilibiliDownloadAdapter for LateSuccessAfterCancellationV2Adapter {
+        fn run<'a>(
+            &'a self,
+            request: BilibiliDownloadRequest,
+            context: BilibiliDownloadContext,
+        ) -> BilibiliDownloadFuture<'a> {
+            Box::pin(async move {
+                context
+                    .registry
+                    .cancel_task(&request.task_id)
+                    .expect("test adapter should request cancellation");
+                let library_item_id = "local.default.cancel-race-v2".to_owned();
+                Ok(BilibiliDownloadOutput {
+                    library_item_id: library_item_id.clone(),
+                    message: "Late success".to_owned(),
+                    v2: Some(BilibiliDownloadOutputV2 {
+                        terminal_state: TaskState::Succeeded,
+                        results: vec![TaskResult {
+                            id: request.task_id,
+                            state: TaskState::Succeeded.into(),
+                            library_item_id: library_item_id.clone(),
+                            artifacts: vec![TaskArtifact {
+                                id: "cancel-race-media".to_owned(),
+                                kind: TaskArtifactKind::Media.into(),
+                                state: TaskArtifactState::Available.into(),
+                                library_item_id,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        resources: Vec::new(),
+                        resource_bodies: Vec::new(),
+                        library_item_leases: Vec::new(),
+                    }),
+                })
+            })
+        }
+    }
+
     impl BilibiliDownloadAdapter for PartialV2Adapter {
         fn run<'a>(
             &'a self,
@@ -1182,32 +1379,22 @@ mod tests {
                 })
                 .expect("test resource should be valid");
                 let successful_result = TaskResult {
-                    id: request.task_id.clone(),
+                    id: format!("{}-result-2", request.task_id),
                     state: TaskState::Succeeded.into(),
-                    title: request.candidates[0].title.clone(),
-                    library_item_id: "local.default.worker-v2".to_owned(),
-                    artifacts: vec![
-                        TaskArtifact {
-                            id: "worker-v2-media".to_owned(),
-                            kind: TaskArtifactKind::Media.into(),
-                            state: TaskArtifactState::Available.into(),
-                            library_item_id: "local.default.worker-v2".to_owned(),
-                            ..Default::default()
-                        },
-                        TaskArtifact {
-                            id: "worker-v2-subtitle".to_owned(),
-                            kind: TaskArtifactKind::Subtitle.into(),
-                            state: TaskArtifactState::Available.into(),
-                            resource: Some(resource.resource.clone()),
-                            ..Default::default()
-                        },
-                    ],
+                    title: request.candidates[1].title.clone(),
+                    artifacts: vec![TaskArtifact {
+                        id: "worker-v2-subtitle".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 };
                 let failed_result = TaskResult {
-                    id: format!("{}-result-2", request.task_id),
+                    id: request.task_id.clone(),
                     state: TaskState::Failed.into(),
-                    title: request.candidates[1].title.clone(),
+                    title: request.candidates[0].title.clone(),
                     problem: Some(TaskProblem {
                         category: TaskProblemCategory::Upstream.into(),
                         code: "bilibili.download_failed".to_owned(),
@@ -1217,16 +1404,17 @@ mod tests {
                     ..Default::default()
                 };
                 Ok(BilibiliDownloadOutput {
-                    library_item_id: "local.default.worker-v2".to_owned(),
+                    library_item_id: String::new(),
                     message: "Downloaded 1/2 Bilibili result(s).".to_owned(),
                     v2: Some(BilibiliDownloadOutputV2 {
                         terminal_state: TaskState::Succeeded,
-                        results: vec![successful_result, failed_result],
+                        results: vec![failed_result, successful_result],
                         resources: vec![resource],
                         resource_bodies: vec![BilibiliTaskResourceBody {
                             resource_id: "worker-v2-subtitle".to_owned(),
                             source: BilibiliTaskResourceBodySource::Bytes(body),
                         }],
+                        library_item_leases: Vec::new(),
                     }),
                 })
             })

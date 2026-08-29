@@ -1045,6 +1045,19 @@ type TaskResultPagePayload = (
 type TaskResultPageResult = Result<TaskResultPagePayload, Status>;
 
 impl TaskResultPageStore {
+    pub(crate) fn invalidate_tasks(&mut self, task_ids: &HashSet<String>) -> Vec<String> {
+        let snapshot_ids = self
+            .snapshots_by_id
+            .iter()
+            .filter(|(_, snapshot)| task_ids.contains(&snapshot.task_id))
+            .map(|(snapshot_id, _)| snapshot_id.clone())
+            .collect::<Vec<_>>();
+        snapshot_ids
+            .into_iter()
+            .filter_map(|snapshot_id| self.remove_snapshot(&snapshot_id))
+            .collect()
+    }
+
     fn mark_reaper_started(&mut self) -> bool {
         if self.reaper_started {
             return false;
@@ -1228,17 +1241,22 @@ impl TaskResultPageStore {
         })
     }
 
-    fn publish_first_page(&mut self, registration: &TaskResultPageRegistration) {
+    fn publish_first_page(&mut self, registration: &TaskResultPageRegistration) -> bool {
         let Some(snapshot) = self.snapshots_by_id.get_mut(&registration.snapshot_id) else {
-            return;
+            return false;
         };
+        if snapshot.published {
+            return true;
+        }
         if snapshot
             .pending_first_page_registrations
             .remove(&registration.registration_id)
         {
             snapshot.published = true;
             snapshot.pending_first_page_registrations.clear();
+            return true;
         }
+        false
     }
 
     fn cancel_first_page(&mut self, registration: &TaskResultPageRegistration) -> Option<String> {
@@ -1393,9 +1411,9 @@ struct FirstTaskResultPage {
 }
 
 impl FirstTaskResultPage {
-    fn publish(mut self) -> TaskResultPagePayload {
-        self.publication.publish();
-        self.payload
+    fn publish(mut self) -> Result<TaskResultPagePayload, Status> {
+        self.publication.publish()?;
+        Ok(self.payload)
     }
 }
 
@@ -1418,9 +1436,9 @@ impl TaskResultPagePublicationGuard {
         }
     }
 
-    fn publish(&mut self) {
+    fn publish(&mut self) -> Result<(), Status> {
         let Some(registration) = self.registration.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut pages = match self.result_pages.lock() {
             Ok(pages) => pages,
@@ -1429,8 +1447,13 @@ impl TaskResultPagePublicationGuard {
                 poisoned.into_inner()
             }
         };
-        pages.publish_first_page(registration);
+        if !pages.publish_first_page(registration) {
+            return Err(Status::aborted(
+                "Task output changed before pagination was published; retry the first page.",
+            ));
+        }
         self.registration = None;
+        Ok(())
     }
 }
 
@@ -1482,6 +1505,13 @@ fn first_task_result_page_blocking(
         drop(pages);
         tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
         return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+    if !tasks.task_output_snapshot_is_current(&snapshot) {
+        drop(pages);
+        tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        return Err(Status::aborted(
+            "Task output changed before pagination started; retry the first page.",
+        ));
     }
     let (page, released_resource_lease_ids, registration) =
         first_task_result_page_after_lock(&mut pages, snapshot, page_size);
@@ -1680,6 +1710,7 @@ impl TaskService for TaskGrpcService {
         PlaybackPolicy::from_playback_options(request.options.as_ref())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         normalize_bilibili_request_context(request.context.as_mut())?;
+        freeze_bilibili_resolution_api_mode(&mut request.context, request.options.as_ref());
 
         let _permit = Arc::clone(&self.state.playback_planning_permits)
             .acquire_owned()
@@ -1969,7 +2000,7 @@ impl TaskService for TaskGrpcService {
                     )
                 })
                 .await?;
-            let page = page.publish();
+            let page = page.publish()?;
             cancellation.complete();
             page
         } else {
@@ -2311,10 +2342,7 @@ impl CacheService for CacheGrpcService {
             return Ok(Response::new(DeleteLibraryItemResponse { deleted }));
         }
 
-        let deleted =
-            self.state.library.delete_item(id).await.map_err(|error| {
-                Status::internal(format!("Failed to delete library item: {error}"))
-            })?;
+        let deleted = self.state.delete_local_library_item(id).await?;
         Ok(Response::new(DeleteLibraryItemResponse { deleted }))
     }
 }
@@ -2809,6 +2837,20 @@ fn normalize_bilibili_request_context(
     }
     context.credential_profile_id = profile.to_owned();
     Ok(())
+}
+
+fn freeze_bilibili_resolution_api_mode(
+    context: &mut Option<BilibiliRequestContext>,
+    options: Option<&BilibiliPlaybackOptions>,
+) {
+    let context = context.get_or_insert_with(BilibiliRequestContext::default);
+    if context.api_mode() == BilibiliApiMode::Unspecified {
+        context.api_mode = if options.is_some_and(|options| options.prefer_tv_api) {
+            BilibiliApiMode::Tv.into()
+        } else {
+            BilibiliApiMode::Web.into()
+        };
+    }
 }
 
 fn create_accepted_bilibili_playback_task_v2<T>(
@@ -5170,6 +5212,34 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_unpublished_task_result_page_cannot_publish() {
+        let now = Instant::now();
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-invalidated",
+            2,
+            "snapshot-invalidated",
+            "lease-invalidated",
+            (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+            vec![task_result("result-invalidated", TaskState::Completed)],
+            1024,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted, registration) = pages.first_page(snapshot, now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        let registration = registration.expect("unpublished page should be registered");
+
+        assert_eq!(
+            vec!["lease-invalidated"],
+            pages.invalidate_tasks(&HashSet::from(["task-invalidated".to_owned()]))
+        );
+        assert!(!pages.publish_first_page(&registration));
+        assert!(pages.snapshots_by_id.is_empty());
+        assert!(pages.cursors_by_token.is_empty());
+    }
+
+    #[test]
     fn published_first_page_survives_a_concurrent_request_cancellation() {
         let now = Instant::now();
         let snapshot = |resource_lease_id: &str| {
@@ -7516,6 +7586,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_library_item_persists_v2_tombstone_and_repairs_missing_local_media() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_directory = root_path.join("downloads");
+        fs::create_dir_all(&media_directory).expect("media directory should be created");
+        let media_path = media_directory.join("task-output.mp4");
+        fs::write(&media_path, b"task output").expect("media file should be written");
+        let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            root_path: root_path.clone(),
+            allow_library_item_delete: true,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let library_item_id = state
+            .library
+            .item_id_for_media_path(media_path.clone())
+            .await
+            .expect("media should have a library item id");
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1local-delete-v2", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .try_claim_next_bilibili_task()
+            .expect("task should become running");
+        state
+            .tasks
+            .complete_task_succeeded(
+                &task.id,
+                library_item_id.clone(),
+                "Downloaded media.".to_owned(),
+            )
+            .expect("task should complete");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: task.id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: library_item_id.clone(),
+                    artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
+                        id: "local-delete-media".to_owned(),
+                        kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
+                        state: crate::generated::tvos_net_player::v1::TaskArtifactState::Available
+                            .into(),
+                        library_item_id: library_item_id.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("v2 task output should be installed");
+        let service = CacheGrpcService::new(state.clone());
+
+        state.tasks.fail_next_persistence_directory_sync();
+        let error = service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: library_item_id.clone(),
+            }))
+            .await
+            .expect_err("media deletion must wait for durable task tombstones");
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(media_path.exists());
+        assert!(state.tasks.retry_pending_persistence());
+        fs::remove_dir_all(&media_directory)
+            .expect("external media directory removal should succeed");
+
+        let deleted = service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: library_item_id,
+            }))
+            .await
+            .expect("durable retry should delete the media")
+            .into_inner();
+        assert!(!deleted.deleted);
+        assert!(!media_path.exists());
+        let updated_task = state
+            .tasks
+            .get_task(&task.id)
+            .expect("tombstoned task should remain visible");
+        let updated_output = state
+            .tasks
+            .task_output_snapshot(&task.id)
+            .expect("tombstoned output should remain visible");
+        assert_eq!(TaskState::Failed, updated_task.state());
+        assert!(updated_task.library_item_id.is_empty());
+        assert_eq!(
+            crate::generated::tvos_net_player::v1::TaskArtifactState::Deleted,
+            updated_output.output.record.results[0].artifacts[0].state()
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_bilibili_input_returns_selectable_candidates() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -7906,6 +8077,45 @@ mod tests {
             *resolve_contexts
                 .lock()
                 .expect("resolve context log should not be poisoned")
+        );
+
+        let inferred_tv_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Tv.into(),
+            credential_profile_id: "tv-profile".to_owned(),
+        };
+        let page = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1inferred-tv-context".to_owned(),
+                options: Some(BilibiliPlaybackOptions {
+                    prefer_tv_api: true,
+                    ..BilibiliPlaybackOptions::default()
+                }),
+                context: Some(BilibiliRequestContext {
+                    api_mode: BilibiliApiMode::Unspecified.into(),
+                    credential_profile_id: "tv-profile".to_owned(),
+                }),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("profile-only TV context should resolve")
+            .into_inner();
+
+        assert_eq!(
+            Some(inferred_tv_context.clone()),
+            page.session
+                .expect("resolution should include its session")
+                .context
+        );
+        assert_eq!(
+            Some(Some(inferred_tv_context)),
+            resolve_contexts
+                .lock()
+                .expect("resolve context log should not be poisoned")
+                .last()
+                .cloned()
         );
     }
 
