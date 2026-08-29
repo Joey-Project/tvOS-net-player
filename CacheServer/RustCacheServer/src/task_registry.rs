@@ -1245,6 +1245,11 @@ impl BilibiliTaskRegistry {
             if is_terminal(task.state()) {
                 return Ok(task.clone());
             }
+            let checkpoint = TaskRecordMutationCheckpoint::capture(&inner, &normalized_id);
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_id)
+                .expect("validated playback task should remain present");
             if task.state() == TaskState::CancelRequested {
                 let finished_at = current_timestamp();
                 task.state = TaskState::Cancelled.into();
@@ -1261,18 +1266,10 @@ impl BilibiliTaskRegistry {
                 task.updated_at = Some(current_timestamp());
             }
 
-            task.clone()
+            (task.clone(), checkpoint)
         };
-        if task.state() == TaskState::Planned {
-            inner.planning_cancellations_by_id.remove(&normalized_id);
-        }
-        if is_terminal(task.state()) {
-            let terminal_task = Self::terminal_task_locked(&inner, &task);
-            Self::clear_active_task_locked(&mut inner, &terminal_task);
-        }
-
-        self.persist_task_and_publish(inner, task.clone(), false, None);
-        Ok(task)
+        let (task, checkpoint) = task;
+        self.persist_playback_publication(inner, task, checkpoint)
     }
 
     pub fn complete_playback_playable(
@@ -1297,6 +1294,11 @@ impl BilibiliTaskRegistry {
             if is_terminal(task.state()) {
                 return Ok(task.clone());
             }
+            let checkpoint = TaskRecordMutationCheckpoint::capture(&inner, &normalized_id);
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_id)
+                .expect("validated playback task should remain present");
             if task.state() == TaskState::CancelRequested {
                 let finished_at = current_timestamp();
                 task.state = TaskState::Cancelled.into();
@@ -1313,19 +1315,10 @@ impl BilibiliTaskRegistry {
                 task.updated_at = Some(current_timestamp());
             }
 
-            task.clone()
+            (task.clone(), checkpoint)
         };
-        if task.state() == TaskState::Playable {
-            inner.planning_cancellations_by_id.remove(&normalized_id);
-            Self::clear_active_duplicate_key_locked(&mut inner, &task);
-        }
-        if is_terminal(task.state()) {
-            let terminal_task = Self::terminal_task_locked(&inner, &task);
-            Self::clear_active_task_locked(&mut inner, &terminal_task);
-        }
-
-        self.persist_task_and_publish(inner, task.clone(), false, None);
-        Ok(task)
+        let (task, checkpoint) = task;
+        self.persist_playback_publication(inner, task, checkpoint)
     }
 
     pub fn update_playback_results(
@@ -1403,6 +1396,11 @@ impl BilibiliTaskRegistry {
             if is_terminal(task.state()) {
                 return Ok(task.clone());
             }
+            let checkpoint = TaskRecordMutationCheckpoint::capture(&inner, &normalized_id);
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_id)
+                .expect("validated playback task should remain present");
             if task.state() == TaskState::CancelRequested {
                 let finished_at = current_timestamp();
                 task.state = TaskState::Cancelled.into();
@@ -1427,18 +1425,38 @@ impl BilibiliTaskRegistry {
                 task.updated_at = Some(current_timestamp());
             }
 
-            task.clone()
+            (task.clone(), checkpoint)
         };
+        let (task, checkpoint) = task;
+        self.persist_playback_publication(inner, task, checkpoint)
+    }
+
+    fn persist_playback_publication(
+        &self,
+        inner: MutexGuard<'_, RegistryInner>,
+        task: Task,
+        checkpoint: TaskRecordMutationCheckpoint,
+    ) -> Result<Task, Status> {
+        let outcome = self.persist_task_and_publish(inner, task.clone(), false, None);
+        if outcome.is_permanent_failure() {
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            checkpoint.restore(&mut inner);
+            return Err(Status::failed_precondition(
+                "Playback publication cannot be persisted safely.",
+            ));
+        }
+
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        if matches!(task.state(), TaskState::Planned | TaskState::Playable) {
+            inner.planning_cancellations_by_id.remove(&task.id);
+        }
         if task.state() == TaskState::Playable {
-            inner.planning_cancellations_by_id.remove(&normalized_id);
             Self::clear_active_duplicate_key_locked(&mut inner, &task);
         }
         if is_terminal(task.state()) {
             let terminal_task = Self::terminal_task_locked(&inner, &task);
             Self::clear_active_task_locked(&mut inner, &terminal_task);
         }
-
-        self.persist_task_and_publish(inner, task.clone(), false, None);
         Ok(task)
     }
 
@@ -10128,6 +10146,94 @@ mod tests {
                     result.title.len() <= crate::task_output::MAX_TASK_RESULT_ENCODED_BYTES
                 })
         );
+    }
+
+    #[test]
+    fn playback_result_publication_rolls_back_after_permanent_persistence_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let creation = registry
+            .create_bilibili_playback_task("BV1publication-rollback", None, None)
+            .expect("playback task should be created");
+        let durable_task = registry.get_task(&creation.task.id).unwrap();
+        let durable_output = registry
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .outputs_by_task_id
+            .get(&creation.task.id)
+            .expect("durable output should exist")
+            .clone();
+        let durable_snapshot = std::fs::read(&path).expect("durable snapshot should be readable");
+        let child_session_id = format!("{}-result-2", creation.task.id);
+
+        let error = registry
+            .complete_playback_results_playable(
+                &creation.task.id,
+                "Playable results".to_owned(),
+                "All results are playable.".to_owned(),
+                playback_source(&creation.task.id),
+                playback_session(&creation.task.id),
+                vec![BilibiliTaskResultItem {
+                    id: child_session_id.clone(),
+                    selection_id: "page:2".to_owned(),
+                    title: "x".repeat(crate::task_output::MAX_TASK_RESULT_ENCODED_BYTES + 1),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    state: TaskState::Playable.into(),
+                    message: "Playable".to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(playback_source(&child_session_id)),
+                    playback_session: Some(playback_session(&child_session_id)),
+                }],
+            )
+            .expect_err("an unpersistable playback publication must be rejected");
+
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
+        assert_eq!(durable_task, registry.get_task(&creation.task.id).unwrap());
+        {
+            let inner = registry.inner.lock().expect("task registry lock poisoned");
+            assert_eq!(
+                &durable_task,
+                inner
+                    .tasks_by_id
+                    .get(&creation.task.id)
+                    .expect("working task should be restored")
+            );
+            assert_eq!(
+                &durable_output,
+                inner
+                    .outputs_by_task_id
+                    .get(&creation.task.id)
+                    .expect("working output should be restored")
+            );
+            assert!(
+                inner
+                    .planning_cancellations_by_id
+                    .contains_key(&creation.task.id)
+            );
+            assert!(inner.playback_options_by_id.contains_key(&creation.task.id));
+            assert!(
+                !inner
+                    .pending_publications_by_id
+                    .contains_key(&creation.task.id)
+            );
+        }
+        assert_eq!(
+            durable_snapshot,
+            std::fs::read(&path).expect("durable snapshot should remain readable")
+        );
+        assert!(!registry.persistence_available());
+        assert!(!registry.task_output_v2_available());
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::Durable,
+            registry.retry_pending_persistence_outcome()
+        );
+        assert!(registry.persistence_available());
+        assert!(registry.task_output_v2_available());
     }
 
     #[test]

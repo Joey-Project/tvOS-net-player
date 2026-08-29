@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -174,6 +174,24 @@ impl HlsFillScheduler {
         }
     }
 
+    pub(crate) fn cancel_sessions(&self, session_ids: &HashSet<String>) -> bool {
+        let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+        inner
+            .foreground
+            .retain(|job| !session_ids.contains(&job.session.id));
+        inner
+            .demoted
+            .retain(|job| !session_ids.contains(&job.session.id));
+        let matching_current = inner.current.as_ref().is_some_and(|current| {
+            if !session_ids.contains(&current.job.session.id) {
+                return false;
+            }
+            current.job.token.cancel();
+            true
+        });
+        !matching_current || !inner.worker_started
+    }
+
     pub(crate) async fn cancel_task_and_wait(&self, task_id: &str) {
         loop {
             let current_finished = self.current_finished.notified();
@@ -185,6 +203,34 @@ impl HlsFillScheduler {
                 inner.demoted.retain(|job| job.task_id != task_id);
                 inner.current.as_ref().is_some_and(|current| {
                     if current.job.task_id != task_id {
+                        return false;
+                    }
+                    current.job.token.cancel();
+                    inner.worker_started
+                })
+            };
+            if !should_wait {
+                return;
+            }
+            current_finished.await;
+        }
+    }
+
+    pub(crate) async fn cancel_sessions_and_wait(&self, session_ids: &HashSet<String>) {
+        loop {
+            let current_finished = self.current_finished.notified();
+            tokio::pin!(current_finished);
+            current_finished.as_mut().enable();
+            let should_wait = {
+                let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+                inner
+                    .foreground
+                    .retain(|job| !session_ids.contains(&job.session.id));
+                inner
+                    .demoted
+                    .retain(|job| !session_ids.contains(&job.session.id));
+                inner.current.as_ref().is_some_and(|current| {
+                    if !session_ids.contains(&current.job.session.id) {
                         return false;
                     }
                     current.job.token.cancel();
@@ -546,6 +592,48 @@ mod tests {
             .expect("task cancellation waiter should not panic");
         let remaining = scheduler.next_job().await;
         assert_eq!("task-b", remaining.task_id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_sessions_preserves_unselected_siblings_for_the_same_task() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_foreground(
+            "shared-task".to_owned(),
+            sample_session("session-delete"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current = scheduler.next_job().await;
+        assert!(!scheduler.enqueue_demoted(
+            "shared-task".to_owned(),
+            sample_session("session-keep"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let session_ids = HashSet::from(["session-delete".to_owned()]);
+
+        let cancelling_scheduler = scheduler.clone();
+        let cancellation_session_ids = session_ids.clone();
+        let cancellation = tokio::spawn(async move {
+            cancelling_scheduler
+                .cancel_sessions_and_wait(&cancellation_session_ids)
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !current.token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session cancellation should reach the active fill");
+
+        assert_eq!(1, scheduler.queued_session_count_for_tests("session-keep"));
+        assert!(!cancellation.is_finished());
+        scheduler.finish_current(&current, true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation)
+            .await
+            .expect("session cancellation should finish after the active fill exits")
+            .expect("session cancellation waiter should not panic");
+        let remaining = scheduler.next_job().await;
+        assert_eq!("session-keep", remaining.session.id);
     }
 
     #[tokio::test]

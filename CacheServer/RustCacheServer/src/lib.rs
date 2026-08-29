@@ -146,6 +146,11 @@ struct PendingHlsCleanupOverflowScan {
     retry_required: bool,
 }
 
+struct CompletedHlsDeletionPlan {
+    session_ids: Vec<String>,
+    task_cleanup: Option<(String, String)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HlsCleanupOverflowDecision {
     Remove,
@@ -1030,7 +1035,7 @@ impl AppState {
         }
     }
 
-    pub(crate) fn delete_completed_hls_library_item(
+    pub(crate) async fn delete_completed_hls_library_item(
         &self,
         item_id: &str,
     ) -> Result<Option<bool>, Status> {
@@ -1040,54 +1045,83 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return Ok(Some(false));
         }
-        let _quota_guard = self
-            .hls_cache_quota_enforcement_lock
-            .lock()
-            .expect("HLS cache quota enforcement lock poisoned");
-        let _deletion_guard = self
-            .completed_hls_deletion_lock
-            .lock()
-            .expect("completed HLS deletion lock poisoned");
-        self.ensure_task_state_durable_for_hls_deletion()?;
-        let pending_session_ids = self
-            .pending_hls_session_cleanups
-            .lock()
-            .expect("pending HLS cleanup lock poisoned")
-            .get(item_id);
-        if let Some(pending_session_ids) = pending_session_ids {
-            self.remove_hls_sessions_for_library_item(item_id, &pending_session_ids)?;
-            return Ok(Some(true));
-        }
-        let authorized = self.get_completed_hls_library_item(item_id).is_some();
-        if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
-            return Ok(Some(false));
-        }
-        if !authorized
-            && self
-                .tasks
-                .playback_task_for_any_hls_session(&session_id)
-                .is_some()
-        {
-            return Ok(Some(false));
-        }
-        let session_ids = if authorized {
-            let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
-            let (task_cleanup_session_id, task_cleanup_library_item_id) = self
-                .completed_hls_task_cleanup_item(&session_id, item_id)
-                .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
-            if !self.tasks.remove_completed_playback_task(
-                &task_cleanup_session_id,
-                &task_cleanup_library_item_id,
-            )? {
-                return Ok(Some(false));
-            }
-            session_ids
-        } else {
-            vec![session_id]
-        };
 
-        self.remove_hls_sessions_for_library_item(item_id, &session_ids)?;
-        Ok(Some(true))
+        loop {
+            let sessions_to_wait_for = {
+                let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                let _quota_guard = self
+                    .hls_cache_quota_enforcement_lock
+                    .lock()
+                    .expect("HLS cache quota enforcement lock poisoned");
+                let _deletion_guard = self
+                    .completed_hls_deletion_lock
+                    .lock()
+                    .expect("completed HLS deletion lock poisoned");
+                self.ensure_task_state_durable_for_hls_deletion()?;
+
+                let pending_session_ids = self
+                    .pending_hls_session_cleanups
+                    .lock()
+                    .expect("pending HLS cleanup lock poisoned")
+                    .get(item_id);
+                let plan = if let Some(pending_session_ids) = pending_session_ids {
+                    CompletedHlsDeletionPlan {
+                        session_ids: pending_session_ids,
+                        task_cleanup: None,
+                    }
+                } else {
+                    let authorized = self.get_completed_hls_library_item(item_id).is_some();
+                    if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
+                        return Ok(Some(false));
+                    }
+                    if !authorized
+                        && self
+                            .tasks
+                            .playback_task_for_any_hls_session(&session_id)
+                            .is_some()
+                    {
+                        return Ok(Some(false));
+                    }
+                    if authorized {
+                        let session_ids =
+                            self.completed_hls_delete_session_ids(&session_id, item_id);
+                        let task_cleanup = self
+                            .completed_hls_task_cleanup_item(&session_id, item_id)
+                            .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
+                        CompletedHlsDeletionPlan {
+                            session_ids,
+                            task_cleanup: Some(task_cleanup),
+                        }
+                    } else {
+                        CompletedHlsDeletionPlan {
+                            session_ids: vec![session_id.clone()],
+                            task_cleanup: None,
+                        }
+                    }
+                };
+
+                let session_ids = plan.session_ids.iter().cloned().collect::<HashSet<_>>();
+                if !self.hls_fill_scheduler.cancel_sessions(&session_ids) {
+                    session_ids
+                } else {
+                    if let Some((task_cleanup_session_id, task_cleanup_library_item_id)) =
+                        plan.task_cleanup
+                        && !self.tasks.remove_completed_playback_task(
+                            &task_cleanup_session_id,
+                            &task_cleanup_library_item_id,
+                        )?
+                    {
+                        return Ok(Some(false));
+                    }
+                    self.remove_hls_sessions_for_library_item(item_id, &plan.session_ids)?;
+                    return Ok(Some(true));
+                }
+            };
+
+            self.hls_fill_scheduler
+                .cancel_sessions_and_wait(&sessions_to_wait_for)
+                .await;
+        }
     }
 
     fn ensure_task_state_durable_for_hls_deletion(&self) -> Result<(), Status> {
@@ -3743,6 +3777,7 @@ mod tests {
 
         let error = state
             .delete_completed_hls_library_item(&item_id)
+            .await
             .expect_err("raw HLS deletion must fail while configured persistence is unavailable");
 
         assert_eq!(tonic::Code::Unavailable, error.code());
@@ -3810,13 +3845,15 @@ mod tests {
             .expect("quota lock should be acquired for test");
         let delete_state = state.clone();
         let delete_item_id = item_id.clone();
+        let runtime = tokio::runtime::Handle::current();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let deletion = thread::spawn(move || {
             started_tx
                 .send(())
                 .expect("test should observe deletion start");
-            let result = delete_state.delete_completed_hls_library_item(&delete_item_id);
+            let result =
+                runtime.block_on(delete_state.delete_completed_hls_library_item(&delete_item_id));
             finished_tx
                 .send(result)
                 .expect("test should observe deletion result");

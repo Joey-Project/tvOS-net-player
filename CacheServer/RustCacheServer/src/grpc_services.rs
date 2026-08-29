@@ -2011,7 +2011,7 @@ impl CacheService for CacheGrpcService {
             ));
         }
 
-        if let Some(deleted) = self.state.delete_completed_hls_library_item(id)? {
+        if let Some(deleted) = self.state.delete_completed_hls_library_item(id).await? {
             return Ok(Response::new(DeleteLibraryItemResponse { deleted }));
         }
 
@@ -9816,6 +9816,7 @@ mod tests {
 
         let error = state
             .delete_completed_hls_library_item(&completed.library_item_id)
+            .await
             .expect_err("an installed but non-durable tombstone must not delete HLS bytes");
 
         assert_eq!(tonic::Code::Unavailable, error.code());
@@ -9834,6 +9835,7 @@ mod tests {
 
         let deleted = state
             .delete_completed_hls_library_item(&completed.library_item_id)
+            .await
             .expect("the retry should first make the tombstone durable");
 
         assert_eq!(Some(true), deleted);
@@ -10128,6 +10130,13 @@ mod tests {
         state
             .hls_sessions
             .insert(sanitized_completed_session(&primary_metadata.hls_session));
+        assert!(state.hls_fill_scheduler.enqueue_demoted(
+            creation.task.id.clone(),
+            child_metadata.hls_session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_child_fill = state.hls_fill_scheduler.next_job().await;
+        assert_eq!(child_session_id, active_child_fill.session.id);
         assert!(state.hls_sessions.get(&child_session_id).is_some());
         assert!(
             state
@@ -10139,11 +10148,45 @@ mod tests {
             .hls_cache
             .fail_next_remove_session(child_session_id.clone());
 
-        let error = cache_service
-            .delete_library_item(Request::new(DeleteLibraryItemRequest {
-                id: library_item_id.clone(),
-            }))
+        let deletion_service = cache_service.clone();
+        let deletion_item_id = library_item_id.clone();
+        let deletion = tokio::spawn(async move {
+            deletion_service
+                .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                    id: deletion_item_id,
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_child_fill.token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed HLS deletion should cancel the active sibling fill");
+        assert!(!deletion.is_finished());
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&creation.task.id)
+                .exists()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&child_session_id)
+                .exists()
+        );
+        state
+            .hls_fill_scheduler
+            .finish_current(&active_child_fill, false);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), deletion)
             .await
+            .expect("completed HLS deletion should finish after the active fill exits")
+            .expect("completed HLS deletion task should not panic")
             .expect_err("partial HLS cache cleanup should be retryable");
 
         assert_eq!(tonic::Code::Internal, error.code());
@@ -11477,6 +11520,7 @@ mod tests {
             .fail_next_remove_session(pending.task_id.clone());
         state
             .delete_completed_hls_library_item(&pending.library_item_id)
+            .await
             .expect_err("the first physical cleanup should remain pending");
         state
             .hls_cache
@@ -12247,6 +12291,7 @@ mod tests {
             .fail_next_remove_session(cached.task_id.clone());
         state
             .delete_completed_hls_library_item(&cached.library_item_id)
+            .await
             .expect_err("the first physical cleanup should remain pending");
         assert!(
             state
