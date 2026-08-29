@@ -8018,6 +8018,13 @@ mod tests {
         ));
 
         let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled result planning cleanup should finish");
 
         assert!(cancelled.playback_source.is_none());
         assert!(cancelled.playback_session.is_none());

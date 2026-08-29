@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use prost::Message;
 use prost_types::Timestamp;
 use tokio::sync::{Notify, mpsc};
 use tonic::Status;
@@ -32,7 +33,7 @@ use crate::{
         resource_id_is_canonical,
     },
     task_store::{
-        PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore,
+        MAX_PERSISTED_TASKS, PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore,
         validate_unique_task_record_identities,
     },
 };
@@ -64,6 +65,7 @@ const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 
 // Bound startup allocation from an untrusted resource directory. Exceeding the bound leaves
 // bodies untouched and disables v2 resource serving until the namespace is repaired.
 const MAX_TASK_RESOURCE_DIRECTORY_NAMES: usize = MAX_REGISTERED_TASK_RESOURCES + MAX_TASK_RESOURCES;
+const MAX_TASK_PERSISTENCE_CLONE_BYTES: usize = 128 * 1024 * 1024;
 
 pub(crate) fn is_known_safe_cancellation_message(message: &str) -> bool {
     matches!(
@@ -2252,7 +2254,24 @@ impl BilibiliTaskRegistry {
     }
 
     pub(crate) fn retry_pending_persistence(&self) -> bool {
-        self.persist_current_state()
+        self.retry_pending_persistence_outcome() == TaskPersistenceRecoveryOutcome::Durable
+    }
+
+    pub(crate) fn retry_pending_persistence_outcome(&self) -> TaskPersistenceRecoveryOutcome {
+        match self.persist_current_state_outcome() {
+            PersistenceCommitOutcome::Durable => TaskPersistenceRecoveryOutcome::Durable,
+            PersistenceCommitOutcome::InstalledButNotDurable
+            | PersistenceCommitOutcome::Superseded => {
+                TaskPersistenceRecoveryOutcome::RetryableFailure
+            }
+            PersistenceCommitOutcome::Rejected(PersistenceFailureRetryability::Retryable) => {
+                TaskPersistenceRecoveryOutcome::RetryableFailure
+            }
+            PersistenceCommitOutcome::Rejected(PersistenceFailureRetryability::Permanent)
+            | PersistenceCommitOutcome::Volatile => {
+                TaskPersistenceRecoveryOutcome::PermanentFailure
+            }
+        }
     }
 
     pub(crate) fn recover_task_output_v2_for_read(&self) -> bool {
@@ -2664,10 +2683,13 @@ impl BilibiliTaskRegistry {
     }
 
     fn persist_current_state(&self) -> bool {
+        self.persist_current_state_outcome().is_durable()
+    }
+
+    fn persist_current_state_outcome(&self) -> PersistenceCommitOutcome {
         let _mutation_guard = self.mutation_guard();
         let inner = self.inner.lock().expect("task registry lock poisoned");
         self.persist_and_publish_pending(inner, true, None)
-            .is_durable()
     }
 
     fn retire_expired_task_resources(&self) -> bool {
@@ -2729,9 +2751,9 @@ impl BilibiliTaskRegistry {
     fn persistence_snapshot_locked(
         &self,
         inner: &mut RegistryInner,
-    ) -> Result<Option<TaskPersistenceSnapshot>, crate::task_output::TaskOutputValidationError>
-    {
-        reconcile_all_task_outputs_locked(inner)?;
+    ) -> io::Result<Option<TaskPersistenceSnapshot>> {
+        reconcile_all_task_outputs_locked(inner)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if self.persistence.is_none() {
             return Ok(None);
         }
@@ -2749,12 +2771,14 @@ impl BilibiliTaskRegistry {
             }
         }
         inner.persistence_generation += 1;
+        let pruned_task_id_set = pruned_task_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let records = persisted_records_locked(inner, &pruned_task_id_set)?;
         Ok(Some(TaskPersistenceSnapshot {
             generation: inner.persistence_generation,
-            records: persisted_records_locked(inner)
-                .into_iter()
-                .filter(|record| !pruned_task_ids.contains(&record.task.id))
-                .collect(),
+            records,
             resource_cleanup_ids: resource_cleanup_ids.into_iter().collect(),
             pruned_task_ids,
         }))
@@ -2781,29 +2805,28 @@ impl BilibiliTaskRegistry {
         rollback_checkpoint: Option<RegistryMutationCheckpoint>,
         require_durable_commit: bool,
     ) -> PersistenceCommitOutcome {
-        let (snapshot, snapshot_validation_failed) =
-            match self.persistence_snapshot_locked(&mut inner) {
-                Ok(snapshot) => (snapshot, false),
-                Err(error) => {
-                    if let Some(persistence) = self.persistence.as_ref() {
-                        persistence.mark_unavailable();
-                    }
-                    eprintln!("Rejected invalid legacy task output snapshot: {error}");
-                    (None, true)
+        let (snapshot, snapshot_failure) = match self.persistence_snapshot_locked(&mut inner) {
+            Ok(snapshot) => (snapshot, None),
+            Err(error) => {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    persistence.mark_unavailable();
                 }
-            };
+                eprintln!("Rejected invalid Bilibili task state snapshot: {error}");
+                (None, Some(PersistenceFailureRetryability::Permanent))
+            }
+        };
         Self::refresh_pending_publications_locked(&mut inner);
         drop(inner);
 
         let outcome = match (
-            snapshot_validation_failed,
+            snapshot_failure,
             snapshot.as_ref(),
             self.persistence.as_ref(),
         ) {
-            (true, _, _) => PersistenceCommitOutcome::Rejected,
-            (false, Some(snapshot), Some(persistence)) => persistence.save_snapshot(snapshot),
-            (false, None, _) if !durability_required => PersistenceCommitOutcome::Volatile,
-            _ => PersistenceCommitOutcome::Rejected,
+            (Some(retryability), _, _) => PersistenceCommitOutcome::Rejected(retryability),
+            (None, Some(snapshot), Some(persistence)) => persistence.save_snapshot(snapshot),
+            (None, None, _) if !durability_required => PersistenceCommitOutcome::Volatile,
+            _ => PersistenceCommitOutcome::Rejected(PersistenceFailureRetryability::Permanent),
         };
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let mut rejected_resources_need_cleanup = false;
@@ -2823,7 +2846,7 @@ impl BilibiliTaskRegistry {
                 inner
                     .pending_resource_cleanup_ids
                     .extend(snapshot.resource_cleanup_ids.iter().cloned());
-                Self::install_visible_snapshot_locked(&mut inner, &snapshot.records);
+                Self::install_visible_live_state_locked(&mut inner);
                 if outcome.is_durable() {
                     Self::mark_resource_cleanup_durable_locked(
                         &mut inner,
@@ -2838,7 +2861,7 @@ impl BilibiliTaskRegistry {
                 Self::refresh_pending_publications_locked(&mut inner);
                 Self::publish_pending_locked(&mut inner);
             }
-            PersistenceCommitOutcome::Rejected => {
+            PersistenceCommitOutcome::Rejected(_) => {
                 if let Some(checkpoint) = rollback_checkpoint {
                     let rejected_resource_candidates = self
                         .resource_root_path
@@ -2989,24 +3012,6 @@ impl BilibiliTaskRegistry {
         {
             self.cleanup_durable_resource_bodies();
         }
-    }
-
-    fn install_visible_snapshot_locked(inner: &mut RegistryInner, records: &[PersistedTaskRecord]) {
-        let previous_outputs = std::mem::take(&mut inner.visible_outputs_by_task_id);
-        inner.visible_tasks_by_id = records
-            .iter()
-            .map(|record| (record.task.id.clone(), record.task.clone()))
-            .collect();
-        inner.visible_outputs_by_task_id = records
-            .iter()
-            .map(|record| {
-                let output = shared_visible_task_output(
-                    previous_outputs.get(&record.task.id),
-                    &record.output,
-                );
-                (record.task.id.clone(), output)
-            })
-            .collect();
     }
 
     fn install_visible_live_state_locked(inner: &mut RegistryInner) {
@@ -3705,15 +3710,38 @@ impl TaskStatePersistence {
                 PersistenceCommitOutcome::InstalledButNotDurable
             }
             Err(error) => {
+                let retryability = persistence_error_retryability(&error);
                 self.available.store(false, AtomicOrdering::Release);
                 eprintln!(
                     "Failed to persist Bilibili task state to {}: {error}",
                     self.path().display()
                 );
-                PersistenceCommitOutcome::Rejected
+                PersistenceCommitOutcome::Rejected(retryability)
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceFailureRetryability {
+    Retryable,
+    Permanent,
+}
+
+fn persistence_error_retryability(error: &io::Error) -> PersistenceFailureRetryability {
+    match error.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported => {
+            PersistenceFailureRetryability::Permanent
+        }
+        _ => PersistenceFailureRetryability::Retryable,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskPersistenceRecoveryOutcome {
+    Durable,
+    RetryableFailure,
+    PermanentFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3721,7 +3749,7 @@ enum PersistenceCommitOutcome {
     Durable,
     InstalledButNotDurable,
     Volatile,
-    Rejected,
+    Rejected(PersistenceFailureRetryability),
     Superseded,
 }
 
@@ -4789,22 +4817,72 @@ fn mark_output_playback_cache_deleted_locked(
     Ok(())
 }
 
-fn persisted_records_locked(inner: &RegistryInner) -> Vec<PersistedTaskRecord> {
-    let mut tasks = inner.tasks_by_id.values().cloned().collect::<Vec<_>>();
+fn persisted_records_locked(
+    inner: &RegistryInner,
+    excluded_task_ids: &HashSet<&str>,
+) -> io::Result<Vec<PersistedTaskRecord>> {
+    persisted_records_locked_with_clone_limit(
+        inner,
+        excluded_task_ids,
+        MAX_TASK_PERSISTENCE_CLONE_BYTES,
+    )
+}
+
+fn persisted_records_locked_with_clone_limit(
+    inner: &RegistryInner,
+    excluded_task_ids: &HashSet<&str>,
+    clone_limit: usize,
+) -> io::Result<Vec<PersistedTaskRecord>> {
+    let task_count = inner
+        .tasks_by_id
+        .values()
+        .filter(|task| !excluded_task_ids.contains(task.id.as_str()))
+        .count();
+    if task_count > MAX_PERSISTED_TASKS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("task state cannot contain more than {MAX_PERSISTED_TASKS} persisted tasks"),
+        ));
+    }
+    let mut tasks = inner
+        .tasks_by_id
+        .values()
+        .filter(|task| !excluded_task_ids.contains(task.id.as_str()))
+        .collect::<Vec<_>>();
     tasks.sort_by(|left, right| {
         timestamp_sort_key(left.created_at.as_ref())
             .cmp(&timestamp_sort_key(right.created_at.as_ref()))
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    tasks
+    let mut clone_estimate = PersistenceSnapshotCloneEstimate::default();
+    for task in &tasks {
+        let output = inner.outputs_by_task_id.get(&task.id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("task {} is missing its reconciled output", task.id),
+            )
+        })?;
+        let options = inner
+            .download_options_by_id
+            .get(&task.id)
+            .and_then(Option::as_ref);
+        let playback_options = inner
+            .playback_options_by_id
+            .get(&task.id)
+            .and_then(Option::as_ref);
+        clone_estimate.add_record(task, options, playback_options, output)?;
+    }
+    clone_estimate.validate_limit(clone_limit)?;
+
+    Ok(tasks
         .into_iter()
         .map(|task| PersistedTaskRecord {
             output: inner
                 .outputs_by_task_id
                 .get(&task.id)
-                .cloned()
-                .unwrap_or_else(|| TaskOutputRecord::from_legacy_task(&task)),
+                .expect("preflighted task output must remain present while locked")
+                .clone(),
             options: inner
                 .download_options_by_id
                 .get(&task.id)
@@ -4815,9 +4893,95 @@ fn persisted_records_locked(inner: &RegistryInner) -> Vec<PersistedTaskRecord> {
                 .get(&task.id)
                 .cloned()
                 .flatten(),
-            task,
+            task: task.clone(),
         })
-        .collect()
+        .collect())
+}
+
+#[derive(Default)]
+struct PersistenceSnapshotCloneEstimate {
+    bytes: usize,
+}
+
+impl PersistenceSnapshotCloneEstimate {
+    fn add_record(
+        &mut self,
+        task: &Task,
+        options: Option<&BilibiliDownloadOptions>,
+        playback_options: Option<&BilibiliPlaybackOptions>,
+        output: &TaskOutputRecord,
+    ) -> io::Result<()> {
+        self.add_bytes(std::mem::size_of::<PersistedTaskRecord>())?;
+        self.add_message(task)?;
+        self.add_vec_allocation(&task.result_items)?;
+        if let Some(selection) = task.bilibili_selection.as_ref() {
+            self.add_vec_allocation(&selection.selection_ids)?;
+        }
+        if let Some(session) = task.playback_session.as_ref() {
+            self.add_vec_allocation(&session.variants)?;
+        }
+        for item in &task.result_items {
+            if let Some(session) = item.playback_session.as_ref() {
+                self.add_vec_allocation(&session.variants)?;
+            }
+        }
+        if let Some(options) = options {
+            self.add_message(options)?;
+            self.add_vec_allocation(&options.danmaku_formats)?;
+        }
+        if let Some(playback_options) = playback_options {
+            self.add_message(playback_options)?;
+        }
+
+        self.add_bytes(output.snapshot_id.len())?;
+        self.add_bytes(output.primary_result_id.len())?;
+        self.add_vec_allocation(&output.results)?;
+        for result in &output.results {
+            self.add_message(result)?;
+            self.add_vec_allocation(&result.artifacts)?;
+        }
+        self.add_vec_allocation(&output.resources)?;
+        for resource in &output.resources {
+            self.add_message(&resource.resource)?;
+        }
+        Ok(())
+    }
+
+    fn add_message(&mut self, message: &impl Message) -> io::Result<()> {
+        self.add_bytes(message.encoded_len())
+    }
+
+    fn add_vec_allocation<T>(&mut self, values: &[T]) -> io::Result<()> {
+        let bytes = values
+            .len()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(snapshot_clone_size_error)?;
+        self.add_bytes(bytes)
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> io::Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(snapshot_clone_size_error)?;
+        Ok(())
+    }
+
+    fn validate_limit(&self, limit: usize) -> io::Result<()> {
+        if self.bytes > limit {
+            return Err(snapshot_clone_size_error());
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_clone_size_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "task state in-memory clone cannot exceed {MAX_TASK_PERSISTENCE_CLONE_BYTES} bytes"
+        ),
+    )
 }
 
 fn terminal_task_ids_to_prune_locked(
@@ -4956,6 +5120,77 @@ mod tests {
             HashSet::from(["existing-resource".to_owned()]),
             inner.pending_resource_cleanup_ids
         );
+    }
+
+    #[test]
+    fn persistence_clone_budget_is_aggregate_and_excludes_pruned_tasks() {
+        let mut inner = RegistryInner::default();
+        for id in ["task-one", "task-two"] {
+            let task = Task {
+                id: id.to_owned(),
+                source: format!("BV1{id}"),
+                message: "x".repeat(4 * 1024),
+                ..Default::default()
+            };
+            inner
+                .outputs_by_task_id
+                .insert(id.to_owned(), TaskOutputRecord::from_legacy_task(&task));
+            inner.tasks_by_id.insert(id.to_owned(), task);
+        }
+
+        let estimated_bytes = inner
+            .tasks_by_id
+            .values()
+            .map(|task| {
+                let mut estimate = PersistenceSnapshotCloneEstimate::default();
+                estimate
+                    .add_record(
+                        task,
+                        None,
+                        None,
+                        inner
+                            .outputs_by_task_id
+                            .get(&task.id)
+                            .expect("fixture output should exist"),
+                    )
+                    .expect("fixture estimate should not overflow");
+                estimate.bytes
+            })
+            .sum::<usize>();
+        let no_exclusions = HashSet::new();
+
+        assert_eq!(
+            2,
+            persisted_records_locked_with_clone_limit(&inner, &no_exclusions, estimated_bytes)
+                .expect("an exact aggregate clone budget should be accepted")
+                .len()
+        );
+        let error = match persisted_records_locked_with_clone_limit(
+            &inner,
+            &no_exclusions,
+            estimated_bytes - 1,
+        ) {
+            Ok(_) => panic!("one byte below the aggregate estimate must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let excluded = HashSet::from(["task-two"]);
+        let first_task = inner.tasks_by_id.get("task-one").unwrap();
+        let mut first_estimate = PersistenceSnapshotCloneEstimate::default();
+        first_estimate
+            .add_record(
+                first_task,
+                None,
+                None,
+                inner.outputs_by_task_id.get("task-one").unwrap(),
+            )
+            .unwrap();
+        let records =
+            persisted_records_locked_with_clone_limit(&inner, &excluded, first_estimate.bytes)
+                .expect("a pruned task must not consume clone budget");
+        assert_eq!(1, records.len());
+        assert_eq!("task-one", records[0].task.id);
     }
 
     #[test]

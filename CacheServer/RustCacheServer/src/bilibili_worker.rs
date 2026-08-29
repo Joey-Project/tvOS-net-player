@@ -7,6 +7,7 @@ use crate::{
     generated::tvos_net_player::v1::{BilibiliDownloadOptions, Task},
     task_registry::{
         BilibiliTaskCancellation, BilibiliTaskProgress, BilibiliTaskRegistry, BilibiliTaskWorkItem,
+        TaskPersistenceRecoveryOutcome,
     },
 };
 
@@ -206,19 +207,32 @@ where
             Err(error) if error.code() == tonic::Code::Unavailable => {}
             Err(_) => return,
         }
-        while !retry_pending_task_persistence(registry).await {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        loop {
+            match retry_pending_task_persistence(registry).await {
+                TaskPersistenceRecoveryOutcome::Durable => break,
+                TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                TaskPersistenceRecoveryOutcome::PermanentFailure => {
+                    eprintln!(
+                        "Bilibili task persistence recovery was rejected permanently; releasing the worker slot"
+                    );
+                    return;
+                }
+            }
         }
     }
 }
 
-async fn retry_pending_task_persistence(registry: &Arc<BilibiliTaskRegistry>) -> bool {
+async fn retry_pending_task_persistence(
+    registry: &Arc<BilibiliTaskRegistry>,
+) -> TaskPersistenceRecoveryOutcome {
     let registry = Arc::clone(registry);
     run_blocking_terminal_persistence_attempt("Bilibili task persistence retry", move || {
-        registry.retry_pending_persistence()
+        registry.retry_pending_persistence_outcome()
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(TaskPersistenceRecoveryOutcome::PermanentFailure)
 }
 
 async fn run_blocking_terminal_persistence_attempt<T>(
@@ -248,7 +262,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::generated::tvos_net_player::v1::TaskState;
+    use crate::generated::tvos_net_player::v1::{BilibiliTaskResultItem, TaskState};
     use tokio::sync::Notify;
 
     use super::*;
@@ -508,6 +522,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_persistence_rejection_releases_the_worker_permit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&path));
+        let creation = registry
+            .create_bilibili_playback_task("BV1permanent-persistence", None, None)
+            .expect("playback task should be created durably");
+        registry
+            .create_bilibili_task("BV1queued-one", None)
+            .expect("first download should be queued durably");
+        registry
+            .create_bilibili_task("BV1queued-two", None)
+            .expect("second download should be queued durably");
+        registry
+            .update_playback_results(
+                &creation.task.id,
+                None,
+                "Planning result.".to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: "result-one".to_owned(),
+                    selection_id: "page:1".to_owned(),
+                    title: "x".repeat(crate::task_output::MAX_TASK_RESULT_ENCODED_BYTES + 1),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-1".to_owned(),
+                    index: 1,
+                    state: TaskState::Preparing.into(),
+                    message: String::new(),
+                    library_item_id: String::new(),
+                    playback_source: None,
+                    playback_session: None,
+                }],
+            )
+            .expect("legacy mutation should remain staged in memory");
+        assert!(!registry.persistence_available());
+        let adapter = Arc::new(StartCountingAdapter::default());
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::clone(&adapter) as Arc<dyn BilibiliDownloadAdapter>,
+            1,
+            false,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let started = adapter.started.notified();
+                if adapter.start_count.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                started.await;
+            }
+        })
+        .await
+        .expect("the second task should start after the first permanent rejection");
+
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(2, adapter.start_count.load(Ordering::SeqCst));
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::PermanentFailure,
+            registry.retry_pending_persistence_outcome()
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_completion_keeps_worker_ownership_until_directory_sync_repair() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
@@ -734,6 +813,29 @@ mod tests {
                     total_bytes: Some(1024),
                     message: Some("Downloading media.".to_owned()),
                 });
+                Ok(BilibiliDownloadOutput {
+                    library_item_id: "local.default.sample".to_owned(),
+                    message: "Downloaded into the cache library.".to_owned(),
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct StartCountingAdapter {
+        start_count: AtomicUsize,
+        started: Notify,
+    }
+
+    impl BilibiliDownloadAdapter for StartCountingAdapter {
+        fn run<'a>(
+            &'a self,
+            _request: BilibiliDownloadRequest,
+            _context: BilibiliDownloadContext,
+        ) -> BilibiliDownloadFuture<'a> {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_waiters();
+            Box::pin(async {
                 Ok(BilibiliDownloadOutput {
                     library_item_id: "local.default.sample".to_owned(),
                     message: "Downloaded into the cache library.".to_owned(),

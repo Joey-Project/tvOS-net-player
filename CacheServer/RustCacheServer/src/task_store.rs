@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     fmt,
     fs::{self, File},
@@ -19,6 +19,7 @@ use prost_types::Timestamp;
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, SeqAccess, Visitor},
+    ser::{Error as SerializeError, SerializeSeq, SerializeStruct},
 };
 
 use crate::generated::tvos_net_player::v1::{
@@ -36,7 +37,7 @@ use crate::task_output::{
 const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
 const TASK_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
-const MAX_PERSISTED_TASKS: usize = 10_000;
+pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 const MAX_PERSISTED_BILIBILI_VARIANTS: usize = 10_000;
 const MAX_PERSISTED_DANMAKU_FORMATS: usize = 16;
 
@@ -295,17 +296,7 @@ impl TaskStateStore {
     }
 
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
-        validate_registered_task_resource_count(records)?;
-        validate_unique_task_record_identities(records)?;
-        let snapshot = PersistedTaskSnapshot {
-            schema_version: TASK_STATE_SCHEMA_VERSION,
-            tasks: records
-                .iter()
-                .cloned()
-                .map(PersistedTaskFile::from)
-                .collect(),
-        };
-        snapshot.validate_collection_limits()?;
+        let snapshot = serialize_task_snapshot_with_limit(records, MAX_TASK_STATE_SNAPSHOT_BYTES)?;
         let directories_to_sync = parent_directories_requiring_sync(self.path())?;
         self.remember_pending_directory_syncs(&directories_to_sync);
         create_parent_directory(self.path())?;
@@ -320,13 +311,9 @@ impl TaskStateStore {
             resume.wait();
         }
 
-        let mut serialized = BoundedSnapshotWriter::new(MAX_TASK_STATE_SNAPSHOT_BYTES);
-        serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
-        serialized.write_all(b"\n")?;
-        let bytes = serialized.into_inner();
         let temp_path = temp_path_for(self.path());
         let mut temp_file = File::create(&temp_path)?;
-        temp_file.write_all(&bytes)?;
+        temp_file.write_all(&snapshot)?;
         temp_file.sync_all()?;
         drop(temp_file);
         fs::rename(temp_path, self.path())?;
@@ -446,6 +433,127 @@ pub(crate) fn validate_unique_task_record_identities(
         }
     }
     Ok(())
+}
+
+fn serialize_task_snapshot_with_limit<'a, I>(records: I, limit: usize) -> io::Result<Vec<u8>>
+where
+    I: IntoIterator<Item = &'a PersistedTaskRecord>,
+{
+    let snapshot = PersistedTaskSnapshotForSave {
+        schema_version: TASK_STATE_SCHEMA_VERSION,
+        tasks: PersistedTaskSequence::new(records.into_iter()),
+    };
+    let mut serialized = BoundedSnapshotWriter::new(limit);
+    serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
+    serialized.write_all(b"\n")?;
+    Ok(serialized.into_inner())
+}
+
+struct PersistedTaskSnapshotForSave<I> {
+    schema_version: u32,
+    tasks: PersistedTaskSequence<I>,
+}
+
+impl<'a, I> Serialize for PersistedTaskSnapshotForSave<I>
+where
+    I: Iterator<Item = &'a PersistedTaskRecord>,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut snapshot = serializer.serialize_struct("PersistedTaskSnapshot", 2)?;
+        snapshot.serialize_field("schema_version", &self.schema_version)?;
+        snapshot.serialize_field("tasks", &self.tasks)?;
+        snapshot.end()
+    }
+}
+
+struct PersistedTaskSequence<I> {
+    records: RefCell<Option<I>>,
+}
+
+impl<I> PersistedTaskSequence<I> {
+    fn new(records: I) -> Self {
+        Self {
+            records: RefCell::new(Some(records)),
+        }
+    }
+}
+
+impl<'a, I> Serialize for PersistedTaskSequence<I>
+where
+    I: Iterator<Item = &'a PersistedTaskRecord>,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let records = self
+            .records
+            .try_borrow_mut()
+            .map_err(S::Error::custom)?
+            .take()
+            .ok_or_else(|| S::Error::custom("task state records were serialized more than once"))?;
+        let mut validator = PersistedTaskSequenceValidator::default();
+        let mut sequence = serializer.serialize_seq(None)?;
+        for record in records {
+            validator.validate(record).map_err(S::Error::custom)?;
+            let file = PersistedTaskFile::from(record);
+            file.validate_collection_limits()
+                .map_err(S::Error::custom)?;
+            sequence.serialize_element(&file)?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Default)]
+struct PersistedTaskSequenceValidator<'a> {
+    task_count: usize,
+    resource_count: usize,
+    task_ids: HashSet<&'a str>,
+    snapshot_ids: HashSet<&'a str>,
+    resource_ids: HashSet<&'a str>,
+}
+
+impl<'a> PersistedTaskSequenceValidator<'a> {
+    fn validate(&mut self, record: &'a PersistedTaskRecord) -> io::Result<()> {
+        self.task_count = self.task_count.saturating_add(1);
+        validate_collection_len("persisted tasks", self.task_count, MAX_PERSISTED_TASKS)?;
+        self.resource_count = self
+            .resource_count
+            .saturating_add(record.output.resources.len());
+        if self.resource_count > MAX_REGISTERED_TASK_RESOURCES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "task state cannot contain more than {MAX_REGISTERED_TASK_RESOURCES} registered resources"
+                ),
+            ));
+        }
+        if !self.task_ids.insert(record.task.id.trim()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state contains a duplicate task id",
+            ));
+        }
+        if !self.snapshot_ids.insert(record.output.snapshot_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state contains a duplicate task output snapshot id",
+            ));
+        }
+        for resource in &record.output.resources {
+            if !self.resource_ids.insert(resource.resource.id.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "task state contains a duplicate task output resource id",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct BoundedSnapshotWriter {
@@ -864,70 +972,6 @@ struct PersistedTaskSnapshot {
     tasks: Vec<PersistedTaskFile>,
 }
 
-impl PersistedTaskSnapshot {
-    fn validate_collection_limits(&self) -> io::Result<()> {
-        validate_collection_len("persisted tasks", self.tasks.len(), MAX_PERSISTED_TASKS)?;
-        for task in &self.tasks {
-            validate_collection_len(
-                "Bilibili task result items",
-                task.result_items.len(),
-                MAX_TASK_RESULTS,
-            )?;
-            if let Some(selection) = task.bilibili_selection.as_ref() {
-                validate_collection_len(
-                    "Bilibili selection ids",
-                    selection.selection_ids.len(),
-                    MAX_TASK_RESULTS,
-                )?;
-            }
-            if let Some(options) = task.bilibili_options.as_ref() {
-                validate_collection_len(
-                    "Bilibili danmaku formats",
-                    options.danmaku_formats.len(),
-                    MAX_PERSISTED_DANMAKU_FORMATS,
-                )?;
-            }
-            if let Some(session) = task.playback_session.as_ref() {
-                validate_collection_len(
-                    "Bilibili playback variants",
-                    session.variants.len(),
-                    MAX_PERSISTED_BILIBILI_VARIANTS,
-                )?;
-            }
-            for item in &task.result_items {
-                if let Some(session) = item.playback_session.as_ref() {
-                    validate_collection_len(
-                        "Bilibili playback variants",
-                        session.variants.len(),
-                        MAX_PERSISTED_BILIBILI_VARIANTS,
-                    )?;
-                }
-            }
-            if let Some(output) = task.output.as_ref() {
-                validate_collection_len(
-                    "task output results",
-                    output.results.len(),
-                    MAX_TASK_RESULTS,
-                )?;
-                validate_collection_len(
-                    "task output resources",
-                    output.resources.len(),
-                    MAX_TASK_RESOURCES,
-                )?;
-                let artifact_count = output.results.iter().fold(0_usize, |count, result| {
-                    count.saturating_add(result.artifacts.len())
-                });
-                validate_collection_len(
-                    "task output artifacts",
-                    artifact_count,
-                    MAX_TASK_ARTIFACTS,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn validate_collection_len(label: &str, len: usize, limit: usize) -> io::Result<()> {
     if len > limit {
         return Err(io::Error::new(
@@ -969,6 +1013,63 @@ struct PersistedTaskFile {
     output: Option<PersistedTaskOutput>,
 }
 
+impl PersistedTaskFile {
+    fn validate_collection_limits(&self) -> io::Result<()> {
+        validate_collection_len(
+            "Bilibili task result items",
+            self.result_items.len(),
+            MAX_TASK_RESULTS,
+        )?;
+        if let Some(selection) = self.bilibili_selection.as_ref() {
+            validate_collection_len(
+                "Bilibili selection ids",
+                selection.selection_ids.len(),
+                MAX_TASK_RESULTS,
+            )?;
+        }
+        if let Some(options) = self.bilibili_options.as_ref() {
+            validate_collection_len(
+                "Bilibili danmaku formats",
+                options.danmaku_formats.len(),
+                MAX_PERSISTED_DANMAKU_FORMATS,
+            )?;
+        }
+        if let Some(session) = self.playback_session.as_ref() {
+            validate_collection_len(
+                "Bilibili playback variants",
+                session.variants.len(),
+                MAX_PERSISTED_BILIBILI_VARIANTS,
+            )?;
+        }
+        for item in &self.result_items {
+            if let Some(session) = item.playback_session.as_ref() {
+                validate_collection_len(
+                    "Bilibili playback variants",
+                    session.variants.len(),
+                    MAX_PERSISTED_BILIBILI_VARIANTS,
+                )?;
+            }
+        }
+        if let Some(output) = self.output.as_ref() {
+            validate_collection_len(
+                "task output results",
+                output.results.len(),
+                MAX_TASK_RESULTS,
+            )?;
+            validate_collection_len(
+                "task output resources",
+                output.resources.len(),
+                MAX_TASK_RESOURCES,
+            )?;
+            let artifact_count = output.results.iter().fold(0_usize, |count, result| {
+                count.saturating_add(result.artifacts.len())
+            });
+            validate_collection_len("task output artifacts", artifact_count, MAX_TASK_ARTIFACTS)?;
+        }
+        Ok(())
+    }
+}
+
 impl From<PersistedTaskRecord> for PersistedTaskFile {
     fn from(record: PersistedTaskRecord) -> Self {
         let task = record.task;
@@ -1004,6 +1105,12 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
                 .map(PersistedBilibiliPlaybackOptions::from),
             output: Some(PersistedTaskOutput::from(record.output)),
         }
+    }
+}
+
+impl From<&PersistedTaskRecord> for PersistedTaskFile {
+    fn from(record: &PersistedTaskRecord) -> Self {
+        Self::from(record.clone())
     }
 }
 
@@ -1829,6 +1936,39 @@ mod tests {
             .write_all(b"\n")
             .expect_err("the trailing newline must stay inside the snapshot limit");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn bounded_snapshot_serialization_stops_before_polling_later_records() {
+        let task = Task {
+            id: "streamed-task".to_owned(),
+            source: "BV1streamed".to_owned(),
+            message: "x".repeat(4 * 1024),
+            ..Default::default()
+        };
+        let first = PersistedTaskRecord {
+            output: TaskOutputRecord::from_legacy_task(&task),
+            task,
+            options: None,
+            playback_options: None,
+        };
+        let polled = Cell::new(0_usize);
+        let records = std::iter::from_fn(|| {
+            let next = polled.get().saturating_add(1);
+            polled.set(next);
+            match next {
+                1 => Some(&first),
+                _ => panic!("serialization must stop before polling another record"),
+            }
+        });
+
+        let error = match serialize_task_snapshot_with_limit(records, 512) {
+            Ok(_) => panic!("the first record must exceed the test snapshot budget"),
+            Err(error) => error,
+        };
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(1, polled.get());
     }
 
     #[test]
