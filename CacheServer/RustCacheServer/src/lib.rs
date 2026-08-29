@@ -142,7 +142,14 @@ struct PendingHlsSessionCleanups {
 
 struct PendingHlsCleanupOverflowScan {
     directories: HlsCacheSessionDirectoryScan,
-    deletion_failed: bool,
+    retry_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HlsCleanupOverflowDecision {
+    Remove,
+    Authorized,
+    RetryLater,
 }
 
 impl PendingHlsSessionCleanups {
@@ -210,12 +217,12 @@ impl PendingHlsSessionCleanups {
         self.overflow_scan_dirty = false;
         Ok(Some(PendingHlsCleanupOverflowScan {
             directories,
-            deletion_failed: false,
+            retry_required: false,
         }))
     }
 
-    fn finish_overflow_scan(&mut self, deletion_failed: bool) {
-        self.overflow_scan_required = deletion_failed || self.overflow_scan_dirty;
+    fn finish_overflow_scan(&mut self, retry_required: bool) {
+        self.overflow_scan_required = retry_required || self.overflow_scan_dirty;
         self.overflow_scan_dirty = false;
         self.overflow_scan = None;
     }
@@ -1228,7 +1235,7 @@ impl AppState {
                 Some(Ok(Some(session_id))) => session_id,
                 Some(Ok(None)) => continue,
                 Some(Err(error)) => {
-                    scan.deletion_failed = true;
+                    scan.retry_required = true;
                     eprintln!("Failed to read an HLS cleanup overflow directory entry: {error}");
                     continue;
                 }
@@ -1237,16 +1244,21 @@ impl AppState {
                     break;
                 }
             };
-            if self.hls_cleanup_overflow_session_is_protected(&session_id) {
-                continue;
+            match self.hls_cleanup_overflow_decision(&session_id) {
+                HlsCleanupOverflowDecision::Authorized => continue,
+                HlsCleanupOverflowDecision::RetryLater => {
+                    scan.retry_required = true;
+                    continue;
+                }
+                HlsCleanupOverflowDecision::Remove => {}
             }
             if self.tasks.persistence_configured() && !self.tasks.persistence_available() {
-                scan.deletion_failed = true;
+                scan.retry_required = true;
                 break;
             }
             self.remove_hls_playback_session(&session_id);
             if let Err(error) = self.hls_cache.remove_session(&session_id) {
-                scan.deletion_failed = true;
+                scan.retry_required = true;
                 eprintln!("Failed to retry overflow HLS cache cleanup for {session_id}: {error}");
             }
         }
@@ -1256,33 +1268,37 @@ impl AppState {
             .lock()
             .expect("pending HLS cleanup lock poisoned");
         if exhausted {
-            pending.finish_overflow_scan(scan.deletion_failed);
+            pending.finish_overflow_scan(scan.retry_required);
         } else {
             pending.overflow_scan = Some(scan);
         }
     }
 
-    fn hls_cleanup_overflow_session_is_protected(&self, session_id: &str) -> bool {
+    fn hls_cleanup_overflow_decision(&self, session_id: &str) -> HlsCleanupOverflowDecision {
+        if self
+            .tasks
+            .playback_task_for_any_hls_session(session_id)
+            .is_some()
+            || self.tasks.get_task(session_id).is_ok_and(|task| {
+                task.kind() == TaskKind::BilibiliProgressivePlayback
+                    && matches!(
+                        task.state(),
+                        TaskState::Queued
+                            | TaskState::Running
+                            | TaskState::Preparing
+                            | TaskState::CancelRequested
+                    )
+            })
+        {
+            return HlsCleanupOverflowDecision::Authorized;
+        }
         if self.hls_session_is_quarantined_during_startup_reconciliation(session_id)
             || self.hls_cache_session_has_finalization_protection(session_id)
             || self.hls_fill_scheduler.owns_session(session_id)
-            || self
-                .tasks
-                .playback_task_for_any_hls_session(session_id)
-                .is_some()
         {
-            return true;
+            return HlsCleanupOverflowDecision::RetryLater;
         }
-        self.tasks.get_task(session_id).is_ok_and(|task| {
-            task.kind() == TaskKind::BilibiliProgressivePlayback
-                && matches!(
-                    task.state(),
-                    TaskState::Queued
-                        | TaskState::Running
-                        | TaskState::Preparing
-                        | TaskState::CancelRequested
-                )
-        })
+        HlsCleanupOverflowDecision::Remove
     }
 
     fn remove_hls_sessions_collecting_failures(
@@ -3384,6 +3400,56 @@ mod tests {
             state.tasks.get_task(&task_id).unwrap().state()
         );
         assert!(state.hls_cache.playback_session(&session.id).is_some());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_retries_after_transient_protection_releases() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let orphan = sample_hls_session("overflow-transiently-protected");
+        state
+            .hls_cache
+            .save_session(&orphan)
+            .expect("orphan HLS session should persist");
+        let protection = state.protect_hls_cache_session_from_eviction(&orphan.id);
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_protected", Vec::new(), 0)
+            .expect("transient protection should defer overflow cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_some());
+        {
+            let pending = state
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock should be available");
+            assert!(pending.overflow_scan_required);
+            assert!(pending.overflow_scan.is_none());
+        }
+
+        drop(protection);
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_released", Vec::new(), 0)
+            .expect("released transient protection should allow overflow cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_none());
         let pending = state
             .pending_hls_session_cleanups
             .lock()
