@@ -14,6 +14,7 @@ use crate::{grpc_services::HlsCacheFinalizationFailureMode, hls::HlsPlaybackSess
 pub(crate) struct HlsFillScheduler {
     inner: Arc<Mutex<HlsFillSchedulerInner>>,
     notify: Arc<Notify>,
+    current_finished: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -142,6 +143,7 @@ impl HlsFillScheduler {
             inner.demoted.push(job);
         }
         drop(inner);
+        self.current_finished.notify_waiters();
         if should_requeue {
             self.notify.notify_one();
         }
@@ -169,6 +171,30 @@ impl HlsFillScheduler {
             && current.job.task_id == task_id
         {
             current.job.token.cancel();
+        }
+    }
+
+    pub(crate) async fn cancel_task_and_wait(&self, task_id: &str) {
+        loop {
+            let current_finished = self.current_finished.notified();
+            tokio::pin!(current_finished);
+            current_finished.as_mut().enable();
+            let should_wait = {
+                let mut inner = self.inner.lock().expect("HLS fill scheduler lock poisoned");
+                inner.foreground.retain(|job| job.task_id != task_id);
+                inner.demoted.retain(|job| job.task_id != task_id);
+                inner.current.as_ref().is_some_and(|current| {
+                    if current.job.task_id != task_id {
+                        return false;
+                    }
+                    current.job.token.cancel();
+                    inner.worker_started
+                })
+            };
+            if !should_wait {
+                return;
+            }
+            current_finished.await;
         }
     }
 
@@ -307,6 +333,7 @@ impl HlsFillScheduler {
             .lock()
             .expect("HLS fill scheduler lock poisoned")
             .worker_started = false;
+        self.current_finished.notify_waiters();
         self.notify.notify_one();
     }
 }
@@ -473,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_task_removes_queued_jobs_and_cancels_current_without_requeue() {
+    async fn cancelling_task_waits_for_current_and_removes_queued_jobs_without_requeue() {
         let scheduler = HlsFillScheduler::default();
         assert!(scheduler.enqueue_foreground(
             "task-a".to_owned(),
@@ -492,14 +519,31 @@ mod tests {
             HlsCacheFinalizationFailureMode::KeepPlayable,
         ));
 
-        scheduler.cancel_task("task-a");
+        let cancelling_scheduler = scheduler.clone();
+        let cancellation = tokio::spawn(async move {
+            cancelling_scheduler.cancel_task_and_wait("task-a").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !current.token.is_cancelled()
+                || scheduler.queued_session_count_for_tests("session-a-queued") != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task cancellation should reach the active and queued fills");
 
         assert!(current.token.is_cancelled());
         assert_eq!(
             0,
             scheduler.queued_session_count_for_tests("session-a-queued")
         );
+        assert!(!cancellation.is_finished());
         scheduler.finish_current(&current, true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation)
+            .await
+            .expect("task cancellation should finish after the active fill exits")
+            .expect("task cancellation waiter should not panic");
         let remaining = scheduler.next_job().await;
         assert_eq!("task-b", remaining.task_id);
     }

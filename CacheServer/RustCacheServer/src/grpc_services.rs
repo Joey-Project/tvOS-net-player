@@ -1769,6 +1769,9 @@ impl TaskService for TaskGrpcService {
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
+            self.state
+                .cancel_hls_fill_work_for_task_and_wait(&task.id)
+                .await;
             remove_task_hls_sessions(&self.state, &task.id, &cancellation.hls_session_ids);
         }
         let task = self.state.tasks.get_task(&task.id)?;
@@ -16268,6 +16271,99 @@ mod tests {
                 .is_none()
         );
         assert!(state.hls_sessions.get(&creation.task.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_waits_for_scheduled_fill_before_removing_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1cancel-fill", None, None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("http://upstream.example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            creation.task.id.clone(),
+            metadata.hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_job = state.hls_fill_scheduler.next_job().await;
+        let session_manifest = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&creation.task.id)
+            .join("session.json");
+        assert!(session_manifest.exists());
+
+        let service = TaskGrpcService::new(state.clone());
+        let task_id = creation.task.id.clone();
+        let cancellation = tokio::spawn(async move {
+            service
+                .cancel_task(Request::new(CancelTaskRequest { id: task_id }))
+                .await
+                .expect("playable task should cancel")
+                .into_inner()
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_job.token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC cancellation should reach the active fill");
+
+        assert!(!cancellation.is_finished());
+        assert!(session_manifest.exists());
+        state.hls_fill_scheduler.finish_current(&active_job, false);
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), cancellation)
+            .await
+            .expect("RPC cancellation should finish after the active fill exits")
+            .expect("RPC cancellation task should not panic");
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(!session_manifest.exists());
+        assert!(state.hls_fill_scheduler.is_idle());
     }
 
     #[tokio::test]

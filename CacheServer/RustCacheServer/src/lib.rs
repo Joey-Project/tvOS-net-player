@@ -1422,6 +1422,11 @@ impl AppState {
     }
 
     #[doc(hidden)]
+    pub async fn cancel_hls_fill_work_for_task_and_wait(&self, task_id: &str) {
+        self.hls_fill_scheduler.cancel_task_and_wait(task_id).await;
+    }
+
+    #[doc(hidden)]
     pub async fn shutdown_hls_fill_worker(&self) {
         self.hls_fill_scheduler.shutdown_and_wait_for_worker().await;
     }
