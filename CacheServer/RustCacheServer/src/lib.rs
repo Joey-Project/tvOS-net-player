@@ -16,6 +16,7 @@ pub mod media;
 mod mp4_segments;
 pub mod playback;
 mod playback_policy;
+mod task_output;
 pub mod task_registry;
 mod task_store;
 mod transcoding;
@@ -52,13 +53,13 @@ use crate::{
     config::CacheServerOptions,
     grpc_services::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
-        TaskGrpcService, playback_session_from_hls_cache_session,
+        TaskGrpcService, TaskResultPageStore, playback_session_from_hls_cache_session,
     },
     hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
-        HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
-        completed_runtime_session, sanitized_completed_session,
+        HlsCacheSessionDirectoryScan, HlsCacheStatusSnapshot, HlsCacheStore,
+        HlsTranscodingExecutionConfig, completed_runtime_session, sanitized_completed_session,
         source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
@@ -70,7 +71,7 @@ use crate::{
     library::LocalMediaLibrary,
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
-        hls_segment_head, media_get, media_head,
+        hls_segment_head, media_get, media_head, resource_get, resource_head,
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
@@ -79,12 +80,16 @@ use crate::{
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
 const HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS: usize = 1;
+const TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS: usize = 32;
 const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
 const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const MAX_PENDING_HLS_CLEANUP_KEYS: usize = 1_024;
+const MAX_PENDING_HLS_CLEANUP_SESSION_IDS: usize = 4_096;
+const HLS_CLEANUP_OVERFLOW_SCAN_BATCH_ENTRIES: usize = 1_024;
 const CREDENTIAL_SAFE_LOG_DETAIL: &str =
     "detail omitted because Bilibili credential material is configured";
 pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
@@ -108,17 +113,153 @@ pub struct AppState {
     pub(crate) playback_planning_permits: Arc<Semaphore>,
     playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
+    pub(crate) task_resource_open_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login_sessions: Arc<Mutex<VecDeque<BilibiliLoginSession>>>,
+    pub(crate) task_result_pages: Arc<Mutex<TaskResultPageStore>>,
     pub(crate) completed_hls_cache_playback_supported: bool,
     pub(crate) last_hls_cache_eviction: Arc<Mutex<Option<HlsCacheEvictionSummary>>>,
     hls_cache_quota_enforcement_lock: Arc<Mutex<()>>,
     hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
     hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
+    hls_task_lifecycle_lock: Arc<Mutex<()>>,
+    completed_hls_deletion_lock: Arc<Mutex<()>>,
+    pending_hls_session_cleanups: Arc<Mutex<PendingHlsSessionCleanups>>,
+    hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
+}
+
+#[derive(Default)]
+struct PendingHlsSessionCleanups {
+    by_cleanup_key: HashMap<String, Vec<String>>,
+    retained_session_id_count: usize,
+    overflow_scan_required: bool,
+    overflow_scan_dirty: bool,
+    overflow_scan: Option<PendingHlsCleanupOverflowScan>,
+}
+
+struct PendingHlsCleanupOverflowScan {
+    directories: HlsCacheSessionDirectoryScan,
+    retry_required: bool,
+}
+
+struct CompletedHlsDeletionPlan {
+    session_ids: Vec<String>,
+    task_cleanup: Option<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HlsCleanupOverflowDecision {
+    Remove,
+    Authorized,
+    RetryLater,
+}
+
+impl PendingHlsSessionCleanups {
+    fn get(&self, cleanup_key: &str) -> Option<Vec<String>> {
+        self.by_cleanup_key.get(cleanup_key).cloned()
+    }
+
+    fn entries(&self) -> Vec<(String, Vec<String>)> {
+        self.by_cleanup_key
+            .iter()
+            .map(|(key, session_ids)| (key.clone(), session_ids.clone()))
+            .collect()
+    }
+
+    fn retained_session_ids(&self) -> HashSet<String> {
+        self.by_cleanup_key.values().flatten().cloned().collect()
+    }
+
+    fn record(&mut self, cleanup_key: String, failed_session_ids: Vec<String>) {
+        if let Some(previous) = self.by_cleanup_key.remove(&cleanup_key) {
+            self.retained_session_id_count = self
+                .retained_session_id_count
+                .saturating_sub(previous.len());
+        }
+        if failed_session_ids.is_empty() {
+            return;
+        }
+
+        let available_session_slots =
+            MAX_PENDING_HLS_CLEANUP_SESSION_IDS.saturating_sub(self.retained_session_id_count);
+        let retained_count = if self.by_cleanup_key.len() < MAX_PENDING_HLS_CLEANUP_KEYS {
+            failed_session_ids.len().min(available_session_slots)
+        } else {
+            0
+        };
+        let overflowed = retained_count < failed_session_ids.len();
+        if retained_count > 0 {
+            let retained_session_ids = failed_session_ids
+                .into_iter()
+                .take(retained_count)
+                .collect::<Vec<_>>();
+            self.retained_session_id_count = self
+                .retained_session_id_count
+                .saturating_add(retained_session_ids.len());
+            self.by_cleanup_key
+                .insert(cleanup_key, retained_session_ids);
+        }
+        if overflowed {
+            self.overflow_scan_required = true;
+            self.overflow_scan_dirty = true;
+        }
+    }
+
+    fn take_or_start_overflow_scan(
+        &mut self,
+        hls_cache: &HlsCacheStore,
+    ) -> io::Result<Option<PendingHlsCleanupOverflowScan>> {
+        if let Some(scan) = self.overflow_scan.take() {
+            return Ok(Some(scan));
+        }
+        if !self.overflow_scan_required {
+            return Ok(None);
+        }
+        let directories = hls_cache.session_directory_scan()?;
+        self.overflow_scan_dirty = false;
+        Ok(Some(PendingHlsCleanupOverflowScan {
+            directories,
+            retry_required: false,
+        }))
+    }
+
+    fn finish_overflow_scan(&mut self, retry_required: bool) {
+        self.overflow_scan_required = retry_required || self.overflow_scan_dirty;
+        self.overflow_scan_dirty = false;
+        self.overflow_scan = None;
+    }
+}
+
+#[derive(Clone)]
+struct PendingHlsRuntimeStartup {
+    finalizer_restore_sessions: Option<Vec<HlsPlaybackSession>>,
+    completed_cache_session_ids: Arc<HashSet<String>>,
+    reconciliation_sessions: Vec<HlsPlaybackSession>,
+    reconciliation_session_ids: HashSet<String>,
+    restorable_completed_session_ids: Arc<HashSet<String>>,
+    finalizer_owned_session_ids: Arc<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct HlsRuntimeStartupState {
+    pending: Option<PendingHlsRuntimeStartup>,
+    worker_running: bool,
+}
+
+struct HlsRuntimeStartupWorkerGuard {
+    startup: Arc<Mutex<HlsRuntimeStartupState>>,
+}
+
+impl Drop for HlsRuntimeStartupWorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut startup) = self.startup.lock() {
+            startup.worker_running = false;
+        }
+    }
 }
 
 pub(crate) struct HlsCacheEvictionProtectionGuard {
@@ -167,12 +308,40 @@ impl AppState {
         Self::new_with_playback_planner_factory(options, |_options, _library| playback_planner)
     }
 
+    #[cfg(test)]
+    fn new_with_playback_planner_and_hls_cache(
+        options: CacheServerOptions,
+        playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
+        hls_cache: HlsCacheStore,
+    ) -> Self {
+        Self::new_with_playback_planner_factory_and_hls_cache(
+            options,
+            |_options, _library| playback_planner,
+            Some(hls_cache),
+        )
+    }
+
     fn new_with_playback_planner_factory(
         options: CacheServerOptions,
         playback_planner_factory: impl FnOnce(
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
+    ) -> Self {
+        Self::new_with_playback_planner_factory_and_hls_cache(
+            options,
+            playback_planner_factory,
+            None,
+        )
+    }
+
+    fn new_with_playback_planner_factory_and_hls_cache(
+        options: CacheServerOptions,
+        playback_planner_factory: impl FnOnce(
+            Arc<CacheServerOptions>,
+            Arc<LocalMediaLibrary>,
+        ) -> Arc<dyn BilibiliPlaybackPlanner>,
+        hls_cache_override: Option<HlsCacheStore>,
     ) -> Self {
         options.validate().expect("invalid cache server options");
         let options = options.normalized_for_runtime();
@@ -182,12 +351,16 @@ impl AppState {
         let options = Arc::new(options);
         let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
-        let tasks = Arc::new(BilibiliTaskRegistry::with_persistence_path_and_retention(
-            task_state_path,
-            task_retention_policy,
-        ));
+        let tasks = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                task_state_path,
+                task_retention_policy,
+                Some(options.root_path.clone()),
+            ),
+        );
         let hls_sessions = HlsPlaybackRegistry::default();
-        let hls_cache = HlsCacheStore::new(library.root_path());
+        let hls_cache =
+            hls_cache_override.unwrap_or_else(|| HlsCacheStore::new(library.root_path()));
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
         {
             Ok(sessions) => (sessions, true),
@@ -266,31 +439,24 @@ impl AppState {
                 &restorable_completed_session_ids,
             );
         }
-        let interrupted_planning_result_session_ids = if hls_cache_scan_succeeded {
-            tasks.interrupted_planning_result_session_ids()
+        let persistence_pending_hls_sessions = if !tasks.persistence_available()
+            && tasks.persistence_recovery_supported()
+            && hls_cache_scan_succeeded
+        {
+            restored_hls_sessions.clone()
         } else {
-            HashSet::new()
+            Vec::new()
         };
+        let mut failed_startup_hls_deletion_sessions = Vec::new();
         if tasks.persistence_available() && hls_cache_scan_succeeded {
-            restored_hls_sessions.retain(|session| {
-                let authorized = restored_hls_session_is_authorized(
+            (restored_hls_sessions, failed_startup_hls_deletion_sessions) =
+                filter_authorized_restored_hls_sessions(
                     &tasks,
-                    &session.id,
+                    &hls_cache,
+                    restored_hls_sessions,
                     &restorable_completed_session_ids,
                     completed_hls_cache_playback_supported,
                 );
-                if !authorized
-                    && interrupted_planning_result_session_ids.contains(&session.id)
-                    && !completed_cache_session_ids.contains(&session.id)
-                    && let Err(error) = hls_cache.remove_session(&session.id)
-                {
-                    eprintln!(
-                        "Failed to remove unauthorized restored HLS session {}: {error}",
-                        session.id
-                    );
-                }
-                authorized
-            });
         } else {
             restored_hls_sessions.clear();
         }
@@ -315,6 +481,8 @@ impl AppState {
         let playback_planning_active_jobs = Arc::new(AtomicUsize::new(0));
         let hls_cache_finalization_permits =
             Arc::new(Semaphore::new(HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS));
+        let task_resource_open_permits =
+            Arc::new(Semaphore::new(TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS));
         let lan_transcoding_permits = Arc::new(Semaphore::new(
             options.lan_transcoding_max_concurrent_jobs.max(1),
         ));
@@ -322,6 +490,27 @@ impl AppState {
         let hls_fill_scheduler = HlsFillScheduler::default();
         let hls_network_policy = HlsNetworkPolicy::default();
         let hls_playback_progress = HlsPlaybackProgressTracker::default();
+        let hls_finalizer_restore_sessions = if persistence_pending_hls_sessions.is_empty() {
+            restored_hls_sessions
+        } else {
+            persistence_pending_hls_sessions.clone()
+        };
+        let mut startup_reconciliation_sessions = persistence_pending_hls_sessions;
+        startup_reconciliation_sessions.extend(failed_startup_hls_deletion_sessions);
+        let startup_reconciliation_session_ids = startup_reconciliation_sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        let pending_hls_runtime_startup = (!hls_finalizer_restore_sessions.is_empty()
+            || !startup_reconciliation_sessions.is_empty())
+        .then(|| PendingHlsRuntimeStartup {
+            finalizer_restore_sessions: Some(hls_finalizer_restore_sessions),
+            completed_cache_session_ids: Arc::new(completed_cache_session_ids),
+            reconciliation_sessions: startup_reconciliation_sessions,
+            reconciliation_session_ids: startup_reconciliation_session_ids,
+            restorable_completed_session_ids: Arc::new(restorable_completed_session_ids),
+            finalizer_owned_session_ids: Arc::new(HashSet::new()),
+        });
 
         let state = Self {
             options,
@@ -335,35 +524,229 @@ impl AppState {
             playback_planning_permits,
             playback_planning_active_jobs,
             hls_cache_finalization_permits,
+            task_resource_open_permits,
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
             hls_fill_scheduler,
             hls_network_policy,
             hls_playback_progress,
             bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
             hls_cache_quota_enforcement_lock: Arc::new(Mutex::new(())),
             hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
             hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
+            hls_task_lifecycle_lock: Arc::new(Mutex::new(())),
+            completed_hls_deletion_lock: Arc::new(Mutex::new(())),
+            pending_hls_session_cleanups: Arc::new(
+                Mutex::new(PendingHlsSessionCleanups::default()),
+            ),
+            hls_runtime_startup: Arc::new(Mutex::new(HlsRuntimeStartupState {
+                pending: pending_hls_runtime_startup,
+                worker_running: false,
+            })),
         };
-        state.resume_incomplete_hls_cache_finalizers(
-            &restored_hls_sessions,
-            &completed_cache_session_ids,
-        );
+        state.ensure_hls_runtime_startup();
         state
+    }
+
+    fn ensure_hls_runtime_startup(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut pending = {
+            let mut startup = self
+                .hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned");
+            if startup.worker_running {
+                return;
+            }
+            let Some(pending) = startup.pending.clone() else {
+                return;
+            };
+            startup.worker_running = true;
+            pending
+        };
+        let worker_guard = HlsRuntimeStartupWorkerGuard {
+            startup: Arc::clone(&self.hls_runtime_startup),
+        };
+
+        if let Some(finalizer_restore_sessions) = pending.finalizer_restore_sessions.take() {
+            let finalizer_owned_session_ids =
+                Arc::new(self.resume_incomplete_hls_cache_finalizers(
+                    &finalizer_restore_sessions,
+                    &pending.completed_cache_session_ids,
+                ));
+            pending.finalizer_owned_session_ids = Arc::clone(&finalizer_owned_session_ids);
+            let mut startup = self
+                .hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned");
+            if let Some(shared_pending) = startup.pending.as_mut() {
+                shared_pending.finalizer_restore_sessions = None;
+                shared_pending.finalizer_owned_session_ids = finalizer_owned_session_ids;
+            }
+        }
+
+        if pending.reconciliation_sessions.is_empty() {
+            self.hls_runtime_startup
+                .lock()
+                .expect("HLS runtime startup lock poisoned")
+                .pending = None;
+            drop(worker_guard);
+            return;
+        }
+
+        let tasks = Arc::downgrade(&self.tasks);
+        let hls_sessions = self.hls_sessions.clone();
+        let hls_cache = self.hls_cache.clone();
+        let hls_fill_scheduler = self.hls_fill_scheduler.clone();
+        let hls_network_policy = self.hls_network_policy.clone();
+        let hls_playback_progress = self.hls_playback_progress.clone();
+        let hls_cache_quota_enforcement_lock = Arc::clone(&self.hls_cache_quota_enforcement_lock);
+        let completed_hls_deletion_lock = Arc::clone(&self.completed_hls_deletion_lock);
+        let completed_hls_cache_playback_supported = self.completed_hls_cache_playback_supported;
+        let startup = Arc::clone(&self.hls_runtime_startup);
+        handle.spawn(async move {
+            let _worker_guard = worker_guard;
+            let mut pending_sessions = pending.reconciliation_sessions;
+            loop {
+                let Some(tasks) = tasks.upgrade() else {
+                    return;
+                };
+                let persistence_recovery = if tasks.persistence_available() {
+                    crate::task_registry::TaskPersistenceRecoveryOutcome::Durable
+                } else {
+                    crate::grpc_services::retry_pending_task_persistence(
+                        &tasks,
+                        "HLS startup reconciliation",
+                    )
+                    .await
+                };
+                if persistence_recovery
+                    == crate::task_registry::TaskPersistenceRecoveryOutcome::PermanentFailure
+                {
+                    return;
+                }
+                if persistence_recovery
+                    == crate::task_registry::TaskPersistenceRecoveryOutcome::Durable
+                {
+                    let mut retry_sessions = Vec::new();
+                    for session in pending_sessions {
+                        if pending.finalizer_owned_session_ids.contains(&session.id)
+                            && hls_fill_scheduler.owns_session(&session.id)
+                        {
+                            retry_sessions.push(session);
+                            continue;
+                        }
+
+                        let _quota_guard = hls_cache_quota_enforcement_lock
+                            .lock()
+                            .expect("HLS cache quota enforcement lock poisoned");
+                        let _deletion_guard = completed_hls_deletion_lock
+                            .lock()
+                            .expect("completed HLS deletion lock poisoned");
+                        if pending.finalizer_owned_session_ids.contains(&session.id)
+                            && hls_fill_scheduler.owns_session(&session.id)
+                        {
+                            retry_sessions.push(session);
+                            continue;
+                        }
+                        let completed_session_is_available = pending
+                            .restorable_completed_session_ids
+                            .contains(&session.id)
+                            || hls_cache.completed_session(&session.id).is_some();
+                        if restored_hls_session_is_authorized(
+                            &tasks,
+                            &session.id,
+                            completed_session_is_available,
+                            completed_hls_cache_playback_supported,
+                        ) {
+                            continue;
+                        }
+
+                        match hls_cache.remove_session(&session.id) {
+                            Ok(()) => {
+                                hls_sessions.remove_with_generation_update(
+                                    &session.id,
+                                    |generation| {
+                                        hls_network_policy
+                                            .remove_session_generation(&session.id, generation);
+                                    },
+                                );
+                                hls_playback_progress.remove_session(&session.id);
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to remove unauthorized HLS session {} during startup reconciliation; retrying: {error}",
+                                    session.id
+                                );
+                                retry_sessions.push(session);
+                            }
+                        }
+                    }
+                    let mut startup = startup.lock().expect("HLS runtime startup lock poisoned");
+                    if retry_sessions.is_empty() {
+                        startup.pending = None;
+                        return;
+                    }
+                    if let Some(shared_pending) = startup.pending.as_mut() {
+                        shared_pending.reconciliation_sessions = retry_sessions.clone();
+                        shared_pending.reconciliation_session_ids = retry_sessions
+                            .iter()
+                            .map(|session| session.id.clone())
+                            .collect();
+                    }
+                    drop(startup);
+                    pending_sessions = retry_sessions;
+                }
+                drop(tasks);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn resume_pending_hls_startup_reconciliation(
+        &self,
+        restored_sessions: Vec<HlsPlaybackSession>,
+        completed_session_ids: HashSet<String>,
+        finalizer_owned_session_ids: HashSet<String>,
+    ) {
+        let mut startup = self
+            .hls_runtime_startup
+            .lock()
+            .expect("HLS runtime startup lock poisoned");
+        assert!(!startup.worker_running);
+        assert!(startup.pending.is_none());
+        startup.pending = Some(PendingHlsRuntimeStartup {
+            finalizer_restore_sessions: None,
+            completed_cache_session_ids: Arc::new(HashSet::new()),
+            reconciliation_session_ids: restored_sessions
+                .iter()
+                .map(|session| session.id.clone())
+                .collect(),
+            reconciliation_sessions: restored_sessions,
+            restorable_completed_session_ids: Arc::new(completed_session_ids),
+            finalizer_owned_session_ids: Arc::new(finalizer_owned_session_ids),
+        });
+        drop(startup);
+        self.ensure_hls_runtime_startup();
     }
 
     fn resume_incomplete_hls_cache_finalizers(
         &self,
         restored_sessions: &[crate::hls::HlsPlaybackSession],
         completed_session_ids: &HashSet<String>,
-    ) {
+    ) -> HashSet<String> {
+        let mut owned_session_ids = HashSet::new();
         if !self.supports_completed_hls_cache_playback() {
-            return;
+            return owned_session_ids;
         }
         if tokio::runtime::Handle::try_current().is_err() {
-            return;
+            return owned_session_ids;
         }
 
         for session in restored_sessions {
@@ -381,65 +764,102 @@ impl AppState {
             {
                 continue;
             }
-            if completed_session_ids.contains(&session.id) {
-                self.hls_sessions
-                    .insert(sanitized_completed_session(session));
-                match self.hls_cache.save_completed_session(session) {
-                    Ok(()) => {
-                        let completed_playback_session =
-                            playback_session_from_hls_cache_session(session);
-                        let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
-                        match self
-                            .tasks
-                            .complete_playback_hls_session_cached_with_metadata(
-                                &task_id,
+            owned_session_ids.insert(session.id.clone());
+            if completed_session_ids.contains(&session.id) && self.tasks.persistence_available() {
+                let completion = {
+                    let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                    if self
+                        .tasks
+                        .playable_task_id_for_hls_session(&session.id)
+                        .as_deref()
+                        != Some(task_id.as_str())
+                    {
+                        owned_session_ids.remove(&session.id);
+                        continue;
+                    }
+                    self.hls_sessions
+                        .insert(sanitized_completed_session(session));
+                    match self.hls_cache.save_completed_session(session) {
+                        Ok(()) => {
+                            let completed_playback_session =
+                                playback_session_from_hls_cache_session(session);
+                            let library_item_id =
+                                HlsCacheStore::completed_library_item_id(&session.id);
+                            let _deletion_guard = self.completed_hls_mutation_guard();
+                            Some((
+                                self.tasks
+                                    .complete_playback_hls_session_cached_with_metadata(
+                                        &task_id,
+                                        &session.id,
+                                        library_item_id.clone(),
+                                        completed_playback_session,
+                                    ),
+                                library_item_id,
+                            ))
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
+                                session.id
+                            );
+                            None
+                        }
+                    }
+                };
+                if let Some((completion, library_item_id)) = completion {
+                    match completion {
+                        Ok(task)
+                            if self.tasks.playback_task_has_completed_hls_cache_item(
+                                &task,
                                 &session.id,
-                                library_item_id.clone(),
-                                completed_playback_session,
+                                &library_item_id,
+                            ) =>
+                        {
+                            if let Err(error) = self.enforce_hls_cache_quota(
+                                "after_hls_finalization",
+                                [session.id.clone()],
+                                0,
                             ) {
-                            Ok(task)
-                                if self.tasks.playback_task_has_completed_hls_cache_item(
-                                    &task,
-                                    &session.id,
-                                    &library_item_id,
-                                ) =>
-                            {
-                                if let Err(error) = self.enforce_hls_cache_quota(
-                                    "after_hls_finalization",
-                                    [session.id.clone()],
-                                    0,
-                                ) {
-                                    eprintln!(
-                                        "Failed to run HLS cache eviction after startup finalization for task {}: {error}",
-                                        session.id
-                                    );
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(status) => {
                                 eprintln!(
-                                    "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
+                                    "Failed to run HLS cache eviction after startup finalization for task {}: {error}",
                                     session.id
                                 );
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
-                            session.id
-                        );
+                        Ok(_) => continue,
+                        Err(status) => {
+                            eprintln!(
+                                "Failed to mark restored HLS playback task {} cached during startup restore: {status}",
+                                session.id
+                            );
+                            if status.code() != tonic::Code::Unavailable {
+                                continue;
+                            }
+                        }
                     }
                 }
             }
 
-            self.enqueue_hls_cache_fill_demoted(
-                task_id,
-                session.clone(),
-                HlsCacheFinalizationFailureMode::FailRestoredTask,
-            );
+            {
+                let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                if self
+                    .tasks
+                    .playable_task_id_for_hls_session(&session.id)
+                    .as_deref()
+                    != Some(task_id.as_str())
+                {
+                    owned_session_ids.remove(&session.id);
+                    continue;
+                }
+                self.enqueue_hls_cache_fill_demoted(
+                    task_id,
+                    session.clone(),
+                    HlsCacheFinalizationFailureMode::FailRestoredTask,
+                );
+            }
         }
+        owned_session_ids
     }
 
     pub(crate) fn enqueue_hls_cache_fill_foreground(
@@ -559,6 +979,9 @@ impl AppState {
         &self,
         session_id: &str,
     ) -> Option<HlsPlaybackSessionHandle> {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return None;
+        }
         let _quota_lock = self
             .hls_cache_quota_enforcement_lock
             .lock()
@@ -586,6 +1009,9 @@ impl AppState {
     }
 
     fn registered_hls_session_is_authorized_for_serving(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.completed_hls_task_is_authorized(session_id) {
             return true;
         }
@@ -609,7 +1035,7 @@ impl AppState {
         }
     }
 
-    pub(crate) fn delete_completed_hls_library_item(
+    pub(crate) async fn delete_completed_hls_library_item(
         &self,
         item_id: &str,
     ) -> Result<Option<bool>, Status> {
@@ -619,24 +1045,107 @@ impl AppState {
         if !self.supports_completed_hls_cache_playback() {
             return Ok(Some(false));
         }
-        if self.get_completed_hls_library_item(item_id).is_none() {
-            return Ok(Some(false));
-        }
-        let session_ids = self.completed_hls_delete_session_ids(&session_id, item_id);
-        let (task_cleanup_session_id, task_cleanup_library_item_id) = self
-            .completed_hls_task_cleanup_item(&session_id, item_id)
-            .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
 
-        self.remove_hls_sessions(&session_ids).map_err(|error| {
-            Status::internal(format!(
-                "Failed to delete completed HLS cache item: {error}"
-            ))
-        })?;
-        self.tasks.remove_completed_playback_task(
-            &task_cleanup_session_id,
-            &task_cleanup_library_item_id,
-        )?;
-        Ok(Some(true))
+        loop {
+            let sessions_to_wait_for = {
+                let _lifecycle_guard = self.hls_task_lifecycle_guard();
+                let _quota_guard = self
+                    .hls_cache_quota_enforcement_lock
+                    .lock()
+                    .expect("HLS cache quota enforcement lock poisoned");
+                let _deletion_guard = self
+                    .completed_hls_deletion_lock
+                    .lock()
+                    .expect("completed HLS deletion lock poisoned");
+                self.ensure_task_state_durable_for_hls_deletion()?;
+
+                let pending_session_ids = self
+                    .pending_hls_session_cleanups
+                    .lock()
+                    .expect("pending HLS cleanup lock poisoned")
+                    .get(item_id);
+                let plan = if let Some(pending_session_ids) = pending_session_ids {
+                    CompletedHlsDeletionPlan {
+                        session_ids: pending_session_ids,
+                        task_cleanup: None,
+                    }
+                } else {
+                    let authorized = self.get_completed_hls_library_item(item_id).is_some();
+                    if !authorized && self.hls_cache.get_completed_library_item(item_id).is_none() {
+                        return Ok(Some(false));
+                    }
+                    if !authorized
+                        && self
+                            .tasks
+                            .playback_task_for_any_hls_session(&session_id)
+                            .is_some()
+                    {
+                        return Ok(Some(false));
+                    }
+                    if authorized {
+                        let session_ids =
+                            self.completed_hls_delete_session_ids(&session_id, item_id);
+                        let task_cleanup = self
+                            .completed_hls_task_cleanup_item(&session_id, item_id)
+                            .unwrap_or_else(|| (session_id.clone(), item_id.to_owned()));
+                        CompletedHlsDeletionPlan {
+                            session_ids,
+                            task_cleanup: Some(task_cleanup),
+                        }
+                    } else {
+                        CompletedHlsDeletionPlan {
+                            session_ids: vec![session_id.clone()],
+                            task_cleanup: None,
+                        }
+                    }
+                };
+
+                let session_ids = plan.session_ids.iter().cloned().collect::<HashSet<_>>();
+                if !self.hls_fill_scheduler.cancel_sessions(&session_ids) {
+                    session_ids
+                } else {
+                    if let Some((task_cleanup_session_id, task_cleanup_library_item_id)) =
+                        plan.task_cleanup
+                        && !self.tasks.remove_completed_playback_task(
+                            &task_cleanup_session_id,
+                            &task_cleanup_library_item_id,
+                        )?
+                    {
+                        return Ok(Some(false));
+                    }
+                    self.remove_hls_sessions_for_library_item(item_id, &plan.session_ids)?;
+                    return Ok(Some(true));
+                }
+            };
+
+            self.hls_fill_scheduler
+                .cancel_sessions_and_wait(&sessions_to_wait_for)
+                .await;
+        }
+    }
+
+    fn ensure_task_state_durable_for_hls_deletion(&self) -> Result<(), Status> {
+        if !self.tasks.persistence_configured()
+            || self.tasks.persistence_available()
+            || self.tasks.retry_pending_persistence()
+        {
+            return Ok(());
+        }
+        Err(Status::unavailable(
+            "Task state is not durable enough to delete HLS cache data.",
+        ))
+    }
+
+    pub(crate) fn completed_hls_mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.completed_hls_deletion_lock
+            .lock()
+            .expect("completed HLS deletion lock poisoned")
+    }
+
+    pub(crate) fn hls_task_lifecycle_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.hls_task_lifecycle_lock
+            .lock()
+            .expect("HLS task lifecycle lock poisoned")
     }
 
     fn completed_hls_delete_session_ids(
@@ -706,16 +1215,182 @@ impl AppState {
         self.completed_hls_task_cleanup_item(session_id, library_item_id)
     }
 
-    fn remove_hls_sessions(&self, session_ids: &[String]) -> io::Result<()> {
+    fn remove_hls_sessions_for_library_item(
+        &self,
+        library_item_id: &str,
+        session_ids: &[String],
+    ) -> Result<(), Status> {
+        self.remove_hls_sessions_tracking_failures(library_item_id, session_ids)
+            .map_err(|error| {
+                Status::internal(format!(
+                    "Failed to delete completed HLS cache item: {error}"
+                ))
+            })
+    }
+
+    pub(crate) fn remove_task_hls_sessions_tracking_failures(
+        &self,
+        task_id: &str,
+        session_ids: &[String],
+    ) -> io::Result<()> {
+        let mut visited = HashSet::new();
+        let mut first_error = None;
+        for session_id in session_ids {
+            if !visited.insert(session_id.as_str()) {
+                continue;
+            }
+            self.remove_hls_playback_session(session_id);
+            let cleanup_key = format!("task-terminal:{task_id}:{session_id}");
+            if let Err(error) = self.remove_hls_sessions_tracking_failures(
+                &cleanup_key,
+                std::slice::from_ref(session_id),
+            ) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn remove_hls_sessions_tracking_failures(
+        &self,
+        cleanup_key: &str,
+        session_ids: &[String],
+    ) -> io::Result<()> {
+        let (failed_session_ids, first_error) =
+            self.remove_hls_sessions_collecting_failures(session_ids);
+        self.pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .record(cleanup_key.to_owned(), failed_session_ids);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn retry_pending_hls_session_cleanups(&self) -> HashSet<String> {
+        let pending = self
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .entries();
+        for (cleanup_key, session_ids) in pending {
+            if let Err(error) =
+                self.remove_hls_sessions_tracking_failures(&cleanup_key, &session_ids)
+            {
+                eprintln!("Failed to retry pending HLS cache cleanup for {cleanup_key}: {error}");
+            }
+        }
+        self.retry_hls_cleanup_overflow_scan_batch();
+        self.pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .retained_session_ids()
+    }
+
+    fn retry_hls_cleanup_overflow_scan_batch(&self) {
+        if self.tasks.persistence_configured() && !self.tasks.persistence_available() {
+            return;
+        }
+        let mut scan = {
+            let mut pending = self
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock poisoned");
+            match pending.take_or_start_overflow_scan(&self.hls_cache) {
+                Ok(Some(scan)) => scan,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("Failed to start bounded HLS cleanup overflow scan: {error}");
+                    return;
+                }
+            }
+        };
+
+        let mut exhausted = false;
+        for _ in 0..HLS_CLEANUP_OVERFLOW_SCAN_BATCH_ENTRIES {
+            let session_id = match scan.directories.next_session_id() {
+                Some(Ok(Some(session_id))) => session_id,
+                Some(Ok(None)) => continue,
+                Some(Err(error)) => {
+                    scan.retry_required = true;
+                    eprintln!("Failed to read an HLS cleanup overflow directory entry: {error}");
+                    continue;
+                }
+                None => {
+                    exhausted = true;
+                    break;
+                }
+            };
+            match self.hls_cleanup_overflow_decision(&session_id) {
+                HlsCleanupOverflowDecision::Authorized => continue,
+                HlsCleanupOverflowDecision::RetryLater => {
+                    scan.retry_required = true;
+                    continue;
+                }
+                HlsCleanupOverflowDecision::Remove => {}
+            }
+            if self.tasks.persistence_configured() && !self.tasks.persistence_available() {
+                scan.retry_required = true;
+                break;
+            }
+            self.remove_hls_playback_session(&session_id);
+            if let Err(error) = self.hls_cache.remove_session(&session_id) {
+                scan.retry_required = true;
+                eprintln!("Failed to retry overflow HLS cache cleanup for {session_id}: {error}");
+            }
+        }
+
+        let mut pending = self
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned");
+        if exhausted {
+            pending.finish_overflow_scan(scan.retry_required);
+        } else {
+            pending.overflow_scan = Some(scan);
+        }
+    }
+
+    fn hls_cleanup_overflow_decision(&self, session_id: &str) -> HlsCleanupOverflowDecision {
+        if self
+            .tasks
+            .task_authorizes_hls_session_for_cleanup(session_id)
+        {
+            return HlsCleanupOverflowDecision::Authorized;
+        }
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id)
+            || self.hls_cache_session_has_finalization_protection(session_id)
+            || self.hls_fill_scheduler.owns_session(session_id)
+        {
+            return HlsCleanupOverflowDecision::RetryLater;
+        }
+        HlsCleanupOverflowDecision::Remove
+    }
+
+    fn remove_hls_sessions_collecting_failures(
+        &self,
+        session_ids: &[String],
+    ) -> (Vec<String>, Option<io::Error>) {
         let mut removed = HashSet::new();
+        let mut failed_session_ids = Vec::new();
+        let mut first_error = None;
         for session_id in session_ids {
             if !removed.insert(session_id) {
                 continue;
             }
-            self.hls_cache.remove_session(session_id)?;
-            self.remove_hls_playback_session(session_id);
+            match self.hls_cache.remove_session(session_id) {
+                Ok(()) => self.remove_hls_playback_session(session_id),
+                Err(error) => {
+                    failed_session_ids.push(session_id.clone());
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Ok(())
+        (failed_session_ids, first_error)
     }
 
     pub(crate) fn register_hls_playback_session(&self, session: HlsPlaybackSession) -> u64 {
@@ -825,6 +1500,11 @@ impl AppState {
     #[doc(hidden)]
     pub fn cancel_hls_fill_work_for_task(&self, task_id: &str) {
         self.hls_fill_scheduler.cancel_task(task_id);
+    }
+
+    #[doc(hidden)]
+    pub async fn cancel_hls_fill_work_for_task_and_wait(&self, task_id: &str) {
+        self.hls_fill_scheduler.cancel_task_and_wait(task_id).await;
     }
 
     #[doc(hidden)]
@@ -996,6 +1676,8 @@ impl AppState {
         session_id: &str,
     ) -> HlsCacheEvictionProtectionGuard {
         let session_id = session_id.to_owned();
+        // Protection registration and physical deletion share this linearization point.
+        let _deletion_guard = self.completed_hls_mutation_guard();
         {
             let mut protected_session_ids = self
                 .hls_cache_eviction_protected_session_ids
@@ -1067,9 +1749,6 @@ impl AppState {
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<Option<HlsCacheEvictionSummary>> {
         let policy = self.hls_cache_policy();
-        if !policy.eviction_enabled() {
-            return Ok(None);
-        }
         if should_cancel() {
             return Ok(None);
         }
@@ -1079,6 +1758,19 @@ impl AppState {
             .lock()
             .expect("HLS cache quota enforcement lock poisoned");
         if should_cancel() {
+            return Ok(None);
+        }
+        let pending_cleanup_session_ids = {
+            let _deletion_guard = self.completed_hls_mutation_guard();
+            if should_cancel() {
+                return Ok(None);
+            }
+            self.retry_pending_hls_session_cleanups()
+        };
+        if should_cancel() {
+            return Ok(None);
+        }
+        if !policy.eviction_enabled() {
             return Ok(None);
         }
         let entries = self.hls_cache.completed_cache_entries()?;
@@ -1103,6 +1795,7 @@ impl AppState {
         let recent_playback_session_ids = self.recently_used_hls_cache_session_ids();
         let mut completed_group_protected_session_ids = explicitly_protected_session_ids;
         completed_group_protected_session_ids.extend(recent_playback_session_ids.iter().cloned());
+        completed_group_protected_session_ids.extend(pending_cleanup_session_ids);
         let mut stable_protected_session_ids = completed_group_protected_session_ids.clone();
         stable_protected_session_ids.extend(self.tasks.protected_hls_cache_session_ids());
         let partial_protected_session_ids = completed_group_protected_session_ids.clone();
@@ -1163,8 +1856,24 @@ impl AppState {
             }) {
                 continue;
             }
-            self.remove_hls_sessions(&session_ids)?;
-            self.remove_evicted_completed_hls_task(&entry);
+            let _deletion_guard = self.completed_hls_mutation_guard();
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+            if session_ids.iter().any(|session_id| {
+                self.hls_cache_session_is_currently_protected_from_eviction(
+                    session_id,
+                    protected_session_ids_for_completed_entry,
+                )
+            }) || !self.completed_hls_cache_entry_is_evictable(&entry)
+            {
+                continue;
+            }
+            if !self.remove_evicted_completed_hls_task(&entry)? {
+                continue;
+            }
+            self.remove_hls_sessions_tracking_failures(&entry.library_item_id, &session_ids)?;
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(
                     completed_entry_sizes_by_session_id
@@ -1189,6 +1898,17 @@ impl AppState {
             if evicted_session_id_set.contains(&entry.session_id) {
                 continue;
             }
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+            if self.hls_cache_session_is_currently_protected_from_eviction(
+                &entry.session_id,
+                &partial_protected_session_ids,
+            ) {
+                continue;
+            }
+            let _deletion_guard = self.completed_hls_mutation_guard();
             if should_cancel() {
                 cancelled = true;
                 break;
@@ -1358,32 +2078,37 @@ impl AppState {
             })
     }
 
-    fn remove_evicted_completed_hls_task(&self, entry: &HlsCacheCompletedEntry) {
+    fn remove_evicted_completed_hls_task(
+        &self,
+        entry: &HlsCacheCompletedEntry,
+    ) -> io::Result<bool> {
         let Some((removal_session_id, removal_library_item_id)) =
             self.completed_hls_task_cleanup_item(&entry.session_id, &entry.library_item_id)
         else {
-            return;
+            return Ok(true);
         };
-        if let Err(status) = self
-            .tasks
+        self.tasks
             .remove_completed_playback_task(&removal_session_id, &removal_library_item_id)
-        {
-            eprintln!(
-                "Failed to remove evicted HLS playback task {} after cache eviction: {status}",
-                entry.session_id
-            );
-        }
+            .map_err(|status| {
+                io::Error::other(format!(
+                    "failed to persist HLS playback task removal before evicting {}: {status}",
+                    entry.session_id
+                ))
+            })
     }
 
     pub fn spawn_hls_cache_quota_monitor(&self) -> Option<JoinHandle<()>> {
-        if !self.hls_cache_policy().eviction_enabled() {
-            return None;
-        }
+        Some(self.spawn_hls_cache_quota_monitor_at_interval(HLS_CACHE_EVICTION_CHECK_INTERVAL))
+    }
 
+    fn spawn_hls_cache_quota_monitor_at_interval(
+        &self,
+        check_interval: Duration,
+    ) -> JoinHandle<()> {
         let state = self.clone();
-        Some(tokio::spawn(async move {
-            let start = tokio::time::Instant::now() + HLS_CACHE_EVICTION_CHECK_INTERVAL;
-            let mut interval = tokio::time::interval_at(start, HLS_CACHE_EVICTION_CHECK_INTERVAL);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + check_interval;
+            let mut interval = tokio::time::interval_at(start, check_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
@@ -1391,10 +2116,21 @@ impl AppState {
                     eprintln!("Failed to run periodic HLS cache eviction: {error}");
                 }
             }
-        }))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_hls_cache_quota_monitor_for_tests(
+        &self,
+        check_interval: Duration,
+    ) -> JoinHandle<()> {
+        self.spawn_hls_cache_quota_monitor_at_interval(check_interval)
     }
 
     pub(crate) fn hls_playback_session(&self, session_id: &str) -> Option<HlsPlaybackSession> {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return None;
+        }
         if let Some(session) = self.hls_sessions.get(session_id) {
             return Some(session);
         }
@@ -1404,6 +2140,9 @@ impl AppState {
     }
 
     fn ensure_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.hls_sessions.get(session_id).is_some() {
             return true;
         }
@@ -1461,6 +2200,9 @@ impl AppState {
     }
 
     fn ensure_completed_hls_session_registered(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id) {
+            return false;
+        }
         if self.hls_sessions.get(session_id).is_some() {
             return true;
         }
@@ -1469,6 +2211,15 @@ impl AppState {
         };
         self.register_hls_playback_session(sanitized_completed_session(&session));
         true
+    }
+
+    fn hls_session_is_quarantined_during_startup_reconciliation(&self, session_id: &str) -> bool {
+        self.hls_runtime_startup
+            .lock()
+            .expect("HLS runtime startup lock poisoned")
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.reconciliation_session_ids.contains(session_id))
     }
 
     fn restored_hls_playback_source_needs_refresh(&self, session: &HlsPlaybackSession) -> bool {
@@ -1755,7 +2506,7 @@ fn refresh_restored_hls_playback_source_for_session(
 fn restored_hls_session_is_authorized(
     tasks: &BilibiliTaskRegistry,
     session_id: &str,
-    completed_session_ids: &HashSet<String>,
+    completed_session_is_available: bool,
     completed_hls_cache_playback_supported: bool,
 ) -> bool {
     let Ok(task) = tasks.get_task(session_id) else {
@@ -1771,11 +2522,42 @@ fn restored_hls_session_is_authorized(
     match task.state() {
         TaskState::Playable => tasks.is_hls_session_playable_for_task(&task.id, session_id),
         TaskState::Completed => {
-            completed_session_ids.contains(session_id)
+            completed_session_is_available
                 && task.library_item_id == HlsCacheStore::completed_library_item_id(session_id)
         }
         _ => false,
     }
+}
+
+fn filter_authorized_restored_hls_sessions(
+    tasks: &BilibiliTaskRegistry,
+    hls_cache: &HlsCacheStore,
+    restored_sessions: Vec<HlsPlaybackSession>,
+    completed_session_ids: &HashSet<String>,
+    completed_hls_cache_playback_supported: bool,
+) -> (Vec<HlsPlaybackSession>, Vec<HlsPlaybackSession>) {
+    let mut authorized_sessions = Vec::new();
+    let mut retry_deletion_sessions = Vec::new();
+    for session in restored_sessions {
+        if restored_hls_session_is_authorized(
+            tasks,
+            &session.id,
+            completed_session_ids.contains(&session.id),
+            completed_hls_cache_playback_supported,
+        ) {
+            authorized_sessions.push(session);
+            continue;
+        }
+
+        if let Err(error) = hls_cache.remove_session(&session.id) {
+            eprintln!(
+                "Failed to remove unauthorized restored HLS session {}; retrying: {error}",
+                session.id
+            );
+            retry_deletion_sessions.push(session);
+        }
+    }
+    (authorized_sessions, retry_deletion_sessions)
 }
 
 fn build_hls_upstream_client() -> reqwest::Client {
@@ -1799,6 +2581,7 @@ pub async fn run(
 pub async fn run_with_state(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let grpc_addrs = state.options.grpc_listen_addrs()?;
     let media_addrs = state.options.media_listen_addrs()?;
     let grpc_listeners = bind_listener_group(grpc_addrs).await?;
@@ -1829,6 +2612,7 @@ pub async fn run_grpc_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_grpc_listener).await
 }
@@ -1837,6 +2621,7 @@ pub async fn run_grpc_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listener = bind_tcp_listener(addr).await?;
     run_grpc_listener(listener, state).await
 }
@@ -1846,6 +2631,7 @@ pub async fn run_grpc_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     Server::builder()
         .add_service(ServerServiceServer::new(ServerGrpcService::new(
             state.clone(),
@@ -1864,6 +2650,7 @@ pub async fn run_media_servers(
     addrs: Vec<SocketAddr>,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_media_listener).await
 }
@@ -1872,6 +2659,7 @@ pub async fn run_media_server(
     addr: SocketAddr,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let listener = bind_tcp_listener(addr).await?;
     run_media_listener(listener, state).await
 }
@@ -1881,11 +2669,16 @@ pub async fn run_media_listener(
     listener: TcpListener,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    state.ensure_hls_runtime_startup();
     let router = Router::new()
         .route("/", get(root))
         .route(
             "/media/{item_id}/{variant_id}",
             get(media_get).head(media_head),
+        )
+        .route(
+            "/resources/{resource_id}",
+            get(resource_get).head(resource_head),
         )
         .route(
             "/hls/{session_id}/master.m3u8",
@@ -2033,6 +2826,7 @@ mod tests {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
         pin::Pin,
+        sync::atomic::AtomicBool,
         thread,
         time::Instant,
     };
@@ -2045,7 +2839,9 @@ mod tests {
         },
         bilibili_playback::{BilibiliPlaybackPlanner, BilibiliPlaybackPlanningRequest},
         bilibili_worker::BilibiliDownloadError,
-        generated::tvos_net_player::v1::{BilibiliPlaybackSession, BilibiliPlaybackVariant},
+        generated::tvos_net_player::v1::{
+            BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
+        },
         hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
         transcoding::HlsTranscodingPlan,
     };
@@ -2178,6 +2974,923 @@ mod tests {
         }
 
         drop(ipv4_listener);
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_preserves_incomplete_hls_finalizer_ownership() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+        let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
+        let release_upstream = Arc::new(tokio::sync::Notify::new());
+        let upstream_released = Arc::new(AtomicBool::new(false));
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get({
+                let request_started_tx = Arc::clone(&request_started_tx);
+                let release_upstream = Arc::clone(&release_upstream);
+                let upstream_released = Arc::clone(&upstream_released);
+                move || {
+                    let response_body = response_body.clone();
+                    let request_started_tx = Arc::clone(&request_started_tx);
+                    let release_upstream = Arc::clone(&release_upstream);
+                    let upstream_released = Arc::clone(&upstream_released);
+                    async move {
+                        if let Some(sender) = request_started_tx
+                            .lock()
+                            .expect("request-start lock poisoned")
+                            .take()
+                        {
+                            let _ = sender.send(());
+                        }
+                        while !upstream_released.load(Ordering::Acquire) {
+                            release_upstream.notified().await;
+                        }
+                        response_body
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, mut session) =
+            create_playable_hls_task(&initial, "BV1startup-finalizer-pending");
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        initial
+            .hls_cache
+            .save_session(&session)
+            .expect("updated HLS session should persist");
+        initial.hls_sessions.insert(session);
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        tokio::time::timeout(Duration::from_secs(2), request_started_rx)
+            .await
+            .expect("restored finalizer should retain and start the incomplete HLS session")
+            .expect("request-start sender should remain available");
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "recovery ownership must not publish the restored session while persistence is unavailable"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        upstream_released.store(true, Ordering::Release);
+        release_upstream.notify_waiters();
+        let completed = wait_for_test_task_state(&restored, &task_id, TaskState::Completed).await;
+
+        assert_eq!(
+            HlsCacheStore::completed_library_item_id(&task_id),
+            completed.library_item_id
+        );
+        assert!(restored.tasks.persistence_available());
+        restored.shutdown_hls_fill_worker().await;
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_requeues_completed_hls_finalization() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: task_state_path.clone(),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, mut session) =
+            create_playable_hls_task(&initial, "BV1startup-finalizer-completed");
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        initial
+            .hls_cache
+            .save_session(&session)
+            .expect("updated HLS session should persist");
+        initial.hls_sessions.insert(session.clone());
+        let expected_item_id = initial
+            .hls_cache
+            .cache_session_resources(&initial.hls_upstream_client, &session)
+            .await
+            .expect("HLS resources should finish before restart");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            !restored.hls_fill_scheduler.is_idle(),
+            "failed startup finalization must retain a queued retry"
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "completed recovery ownership must not publish a session while persistence is unavailable"
+        );
+        assert!(
+            restored
+                .hls_playback_session_for_serving(&task_id)
+                .is_none(),
+            "lazy serving must not reload a quarantined recovery session from disk"
+        );
+        assert!(
+            restored.hls_sessions.get(&task_id).is_none(),
+            "a rejected lazy lookup must leave the runtime registry empty"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        let completed = wait_for_test_task_state(&restored, &task_id, TaskState::Completed).await;
+
+        assert_eq!(expected_item_id, completed.library_item_id);
+        assert!(restored.tasks.persistence_available());
+        assert!(
+            restored
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+        restored.shutdown_hls_fill_worker().await;
+        upstream_task.abort();
+    }
+
+    #[test]
+    fn persistence_pending_hls_session_is_quarantined_from_lazy_serving() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let options = CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let (task_id, _) = create_playable_hls_task(&initial, "BV1startup-quarantine");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(restored.hls_cache.playback_session(&task_id).is_some());
+        assert!(restored.hls_sessions.get(&task_id).is_none());
+        assert!(
+            !restored.registered_hls_session_is_authorized_for_serving(&task_id),
+            "playback progress authorization must honor startup quarantine"
+        );
+        assert!(
+            restored
+                .hls_playback_session_for_serving(&task_id)
+                .is_none(),
+            "startup quarantine must reject lazy disk registration"
+        );
+        assert!(restored.hls_sessions.get(&task_id).is_none());
+        assert!(restored.hls_cache.playback_session(&task_id).is_some());
+        assert_eq!(
+            TaskState::Playable,
+            restored.tasks.get_task(&task_id).unwrap().state(),
+            "a quarantined lookup must not fail the persisted playable task"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+    }
+
+    #[tokio::test]
+    async fn initial_task_rewrite_failure_removes_orphan_hls_after_recovery() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let options = CacheServerOptions {
+            root_path,
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let orphan_session = sample_hls_session("orphan-startup-session");
+        let initial =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        initial
+            .hls_cache
+            .save_session(&orphan_session)
+            .expect("orphan HLS session should persist");
+        drop(initial);
+
+        let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
+        std::fs::create_dir(&task_state_temp_path)
+            .expect("temporary-path directory should block the initial rewrite");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+
+        assert!(!restored.tasks.persistence_available());
+        assert!(restored.hls_sessions.get(&orphan_session.id).is_none());
+        assert!(
+            restored
+                .hls_cache
+                .playback_session(&orphan_session.id)
+                .is_some(),
+            "orphan media must remain while task persistence is unavailable"
+        );
+
+        std::fs::remove_dir(&task_state_temp_path)
+            .expect("task persistence blocker should be removable");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if restored.tasks.persistence_available()
+                    && restored
+                        .hls_cache
+                        .playback_session(&orphan_session.id)
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("orphan HLS session should be removed after persistence recovers");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_rechecks_finalizer_owned_session_after_release() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let session = sample_hls_session("released-startup-finalizer-session");
+        state
+            .hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        assert!(state.hls_fill_scheduler.enqueue_demoted(
+            "missing-task".to_owned(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+        ));
+        let worker_guard = state.hls_fill_scheduler.worker_guard();
+
+        state.resume_pending_hls_startup_reconciliation(
+            vec![session.clone()],
+            HashSet::new(),
+            HashSet::from([session.id.clone()]),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "startup cleanup must wait while the finalizer owns the session"
+        );
+
+        let job = state.hls_fill_scheduler.next_job().await;
+        state.hls_fill_scheduler.finish_current(&job, false);
+        drop(worker_guard);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.hls_cache.playback_session(&session.id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("released unauthorized HLS session should be reconciled");
+    }
+
+    #[tokio::test]
+    async fn startup_routes_failed_hls_deletion_to_reconciliation_without_quota() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let session = sample_hls_session("retry-startup-hls-deletion");
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        hls_cache.fail_next_remove_session(session.id.clone());
+
+        let state = AppState::new_with_playback_planner_and_hls_cache(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                hls_cache_max_bytes: 0,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+            hls_cache,
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(!state.hls_cache_policy().eviction_enabled());
+        assert!(state.hls_sessions.get(&session.id).is_none());
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "failed startup deletion must remain visible to the retry owner"
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.hls_cache.playback_session(&session.id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed startup HLS deletion should retry without quota activity");
+    }
+
+    #[test]
+    fn pending_hls_cleanup_tracker_bounds_keys_and_session_ids() {
+        let mut pending = PendingHlsSessionCleanups::default();
+        pending.record(
+            "oversized-group".to_owned(),
+            (0..=MAX_PENDING_HLS_CLEANUP_SESSION_IDS)
+                .map(|index| format!("session-{index}"))
+                .collect(),
+        );
+
+        assert_eq!(
+            MAX_PENDING_HLS_CLEANUP_SESSION_IDS,
+            pending.retained_session_id_count
+        );
+        assert_eq!(1, pending.by_cleanup_key.len());
+        assert!(pending.overflow_scan_required);
+
+        let mut pending = PendingHlsSessionCleanups::default();
+        for index in 0..=MAX_PENDING_HLS_CLEANUP_KEYS {
+            pending.record(format!("cleanup-{index}"), vec![format!("session-{index}")]);
+        }
+
+        assert_eq!(MAX_PENDING_HLS_CLEANUP_KEYS, pending.by_cleanup_key.len());
+        assert_eq!(
+            MAX_PENDING_HLS_CLEANUP_KEYS,
+            pending.retained_session_id_count
+        );
+        assert!(pending.overflow_scan_required);
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_retries_unretained_orphan_without_quota_pressure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let orphan = sample_hls_session("overflow-cleanup-orphan");
+        state
+            .hls_cache
+            .save_session(&orphan)
+            .expect("orphan HLS session should persist");
+        state.hls_cache.fail_next_remove_session(orphan.id.clone());
+        let mut failed_session_ids =
+            vec!["retained-missing-session".to_owned(); MAX_PENDING_HLS_CLEANUP_SESSION_IDS];
+        failed_session_ids.push(orphan.id.clone());
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record("oversized-cleanup".to_owned(), failed_session_ids);
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_first_retry", Vec::new(), 0)
+            .expect("overflow cleanup failure should remain process-local retry state");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_some());
+        {
+            let pending = state
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock should be available");
+            assert!(pending.by_cleanup_key.is_empty());
+            assert_eq!(0, pending.retained_session_id_count);
+            assert!(pending.overflow_scan_required);
+            assert!(pending.overflow_scan.is_none());
+        }
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_second_retry", Vec::new(), 0)
+            .expect("a later bounded scan should retry the orphan cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_none());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_preserves_task_authorized_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (task_id, session) = create_playable_hls_task(&state, "BV1overflow-authorized");
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_authorized", Vec::new(), 0)
+            .expect("bounded overflow cleanup should preserve authorized sessions");
+
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(state.hls_cache.playback_session(&session.id).is_some());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_preserves_preparing_child_result_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1overflow-preparing-child", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let child_session = sample_hls_session(&child_session_id);
+        state
+            .hls_cache
+            .save_session(&child_session)
+            .expect("child HLS session should persist");
+        state.hls_sessions.insert(child_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: child_session.variant.id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .update_playback_results(
+                &task_id,
+                None,
+                "Preparing remaining results.".to_owned(),
+                0.5,
+                vec![BilibiliTaskResultItem {
+                    id: child_session_id.clone(),
+                    selection_id: "page:2".to_owned(),
+                    title: "Part 2".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "cid-2".to_owned(),
+                    index: 2,
+                    state: TaskState::Playable.into(),
+                    message: "Playable".to_owned(),
+                    library_item_id: String::new(),
+                    playback_source: Some(playback_source),
+                    playback_session: Some(sample_playback_session(&child_session_id)),
+                }],
+            )
+            .expect("preparing task should publish its planned child result");
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_preparing_child", Vec::new(), 0)
+            .expect("bounded overflow cleanup should preserve a persisted child session");
+
+        assert_eq!(
+            TaskState::Preparing,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_retries_after_transient_protection_releases() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let orphan = sample_hls_session("overflow-transiently-protected");
+        state
+            .hls_cache
+            .save_session(&orphan)
+            .expect("orphan HLS session should persist");
+        let protection = state.protect_hls_cache_session_from_eviction(&orphan.id);
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_protected", Vec::new(), 0)
+            .expect("transient protection should defer overflow cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_some());
+        {
+            let pending = state
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock should be available");
+            assert!(pending.overflow_scan_required);
+            assert!(pending.overflow_scan.is_none());
+        }
+
+        drop(protection);
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_released", Vec::new(), 0)
+            .expect("released transient protection should allow overflow cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_none());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn media_listener_starts_deferred_hls_startup_reconciliation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let session = sample_hls_session("runtime-deferred-startup-reconciliation");
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        hls_cache
+            .save_session(&session)
+            .expect("orphan HLS session should persist");
+        hls_cache.fail_next_remove_session(session.id.clone());
+
+        let state = AppState::new_with_playback_planner_and_hls_cache(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                hls_cache_max_bytes: 0,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+            hls_cache,
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state.hls_cache.playback_session(&session.id).is_some(),
+            "runtime-free construction must retain failed startup cleanup work"
+        );
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime should build")
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("media listener should bind");
+                let server = tokio::spawn(run_media_listener(listener, state.clone()));
+
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if state.hls_cache.playback_session(&session.id).is_none() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("media listener should start deferred HLS reconciliation");
+
+                server.abort();
+                assert!(
+                    server
+                        .await
+                        .expect_err("aborted media listener should not complete normally")
+                        .is_cancelled()
+                );
+            });
+    }
+
+    #[test]
+    fn eviction_protection_registration_waits_for_hls_deletion_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let deletion_guard = state.completed_hls_mutation_guard();
+        let worker_state = state.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_sender
+                .send(())
+                .expect("registration start should be observable");
+            let protection =
+                worker_state.protect_hls_cache_session_from_eviction("serialized-session");
+            acquired_sender
+                .send(())
+                .expect("registration completion should be observable");
+            protection
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration worker should start");
+        assert!(
+            acquired_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "protection registration must not cross an active HLS deletion mutation"
+        );
+
+        drop(deletion_guard);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration should finish after HLS deletion mutation releases");
+        let protection = worker.join().expect("registration worker should finish");
+        assert!(state.hls_cache_session_has_finalization_protection("serialized-session"));
+        drop(protection);
+        assert!(!state.hls_cache_session_has_finalization_protection("serialized-session"));
+    }
+
+    #[tokio::test]
+    async fn malformed_task_snapshot_blocks_raw_completed_hls_deletion() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let session_id = "malformed-state-raw-hls";
+        let mut session = sample_hls_session(session_id);
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        let hls_cache = HlsCacheStore::new(root_path.clone());
+        let item_id = hls_cache
+            .cache_session_resources(&reqwest::Client::new(), &session)
+            .await
+            .expect("raw completed HLS item should be cached");
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        std::fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state directory should be created");
+        std::fs::write(&task_state_path, b"{ malformed task snapshot")
+            .expect("malformed task snapshot should be written");
+
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+
+        let error = state
+            .delete_completed_hls_library_item(&item_id)
+            .await
+            .expect_err("raw HLS deletion must fail while configured persistence is unavailable");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+        assert_eq!(
+            b"{ malformed task snapshot",
+            std::fs::read(&task_state_path)
+                .expect("malformed task snapshot should be preserved")
+                .as_slice()
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_hls_deletion_waits_for_the_quota_snapshot_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let response_size = response_body.len() as u64;
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let session_id = "manual-delete-quota-lock";
+        let mut session = sample_hls_session(session_id);
+        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
+        session.variant.video.request.size = Some(response_size);
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        let item_id = state
+            .hls_cache
+            .cache_session_resources(&reqwest::Client::new(), &session)
+            .await
+            .expect("raw completed HLS item should be cached");
+        let quota_guard = state
+            .hls_cache_quota_enforcement_lock
+            .lock()
+            .expect("quota lock should be acquired for test");
+        let delete_state = state.clone();
+        let delete_item_id = item_id.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let deletion = thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test should observe deletion start");
+            let result =
+                runtime.block_on(delete_state.delete_completed_hls_library_item(&delete_item_id));
+            finished_tx
+                .send(result)
+                .expect("test should observe deletion result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deletion thread should start");
+
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "manual deletion must wait until the quota snapshot is released"
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_some()
+        );
+
+        drop(quota_guard);
+        assert_eq!(
+            Some(true),
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("deletion should finish after quota unlock")
+                .expect("manual deletion should succeed")
+        );
+        deletion.join().expect("deletion thread should not panic");
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&item_id)
+                .is_none()
+        );
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -2592,6 +4305,27 @@ mod tests {
         )
     }
 
+    async fn wait_for_test_task_state(
+        state: &AppState,
+        task_id: &str,
+        expected_state: TaskState,
+    ) -> Task {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let task = state
+                    .tasks
+                    .get_task(task_id)
+                    .expect("test task should remain readable");
+                if task.state() == expected_state {
+                    return task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test task should reach the expected state")
+    }
+
     fn create_playable_hls_task(state: &AppState, source: &str) -> (String, HlsPlaybackSession) {
         let creation = state
             .tasks
@@ -2694,6 +4428,24 @@ mod tests {
             transcoding: HlsTranscodingPlan::default(),
             effective_policy: crate::playback_policy::PlaybackPolicy::default(),
         }
+    }
+
+    fn test_fake_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(test_mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(test_mp4_box(*b"moov", b"metadata"));
+        bytes.extend(test_mp4_box(*b"moof", b"frag"));
+        bytes.extend(test_mp4_box(*b"mdat", b"media-data"));
+        bytes
+    }
+
+    fn test_mp4_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + payload.len()).expect("test MP4 box should fit");
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend(size.to_be_bytes());
+        bytes.extend(kind);
+        bytes.extend(payload);
+        bytes
     }
 
     fn free_port() -> io::Result<u16> {

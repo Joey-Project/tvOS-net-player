@@ -1,8 +1,11 @@
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
-    time::{Duration, SystemTime},
+    sync::{
+        Arc, Mutex as StdMutex, Weak,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
+    time::{Duration, Instant as StdInstant, SystemTime},
 };
 
 use bbdown_core::{
@@ -10,7 +13,11 @@ use bbdown_core::{
     DEFAULT_CREDENTIAL_PROFILE,
 };
 use futures_core::Stream;
-use tokio::{sync::mpsc, time::sleep};
+use prost::Message;
+use tokio::{
+    sync::{Semaphore, mpsc, watch},
+    time::{Instant, sleep, timeout},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -43,7 +50,7 @@ use crate::{
         LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
         ListBilibiliCredentialProfilesResponse, ListCacheRootsRequest, ListCacheRootsResponse,
         ListLibraryItemsRequest, ListLibraryItemsResponse, ListTaskResultsRequest,
-        ListTaskResultsResponse, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
+        ListTaskResultsResponse, PageInfo, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
         PlaybackProtocol, PlaybackSource, ReportPlaybackProgressRequest,
         ReportPlaybackProgressResponse, RescanLibraryRequest, RescanLibraryResponse,
         ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
@@ -66,19 +73,25 @@ use crate::{
     },
     library::ROOT_ID,
     playback_policy::PlaybackPolicy,
+    task_output::{
+        MAX_TASK_ARTIFACTS, MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes,
+    },
     task_registry::{
-        BilibiliTaskProgress, BilibiliTaskRegistry, PLAYBACK_PLANNING_CANCELLED_MESSAGE,
-        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE, current_timestamp,
+        BilibiliTaskProgress, BilibiliTaskRegistry, HlsSessionPublicationState,
+        PLAYBACK_PLANNING_CANCELLED_MESSAGE, PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE,
+        TaskPersistenceRecoveryOutcome, current_timestamp,
     },
     transcoding::{
         HlsTranscodingPlan, HlsTranscodingPlanState, LanTranscodingRuntimeState,
         LanTranscodingStatusSnapshot,
     },
 };
+use uuid::Uuid;
 
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
 const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
+const HLS_CACHE_PERSISTENCE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED: i32 = 0;
 const BILIBILI_TASK_SELECTION_MODE_DEFAULT: i32 = 1;
 const BILIBILI_TASK_SELECTION_MODE_CURRENT: i32 = 2;
@@ -88,6 +101,23 @@ const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
 const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback planning.";
 const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
+const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
+const MAX_TASK_RESULT_PAGE_SIZE: usize = 200;
+const MAX_TASK_RESULT_PAGE_ENCODED_BYTES: usize = 4 * 1024 * 1024;
+const TASK_RESULT_PAGE_METADATA_RESERVE_BYTES: usize = 64 * 1024;
+const MAX_TASK_RESULT_PAGE_SNAPSHOTS: usize = 32;
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS: usize = 50_000;
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS: usize = MAX_TASK_ARTIFACTS;
+// Preserve one immutable maximum-size revision while admitting its replacement.
+const MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS: usize = MAX_TASK_ARTIFACTS * 2;
+const MAX_TASK_RESULT_PAGE_TOKEN_BYTES: usize = 256;
+const TASK_RESULT_PAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
+const TASK_RESULT_PAGE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_TASK_RESULT_BLOCKING_OPERATIONS: usize = 4;
+const TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -120,6 +150,7 @@ impl ServerService for ServerGrpcService {
         &self,
         _request: Request<GetServerInfoRequest>,
     ) -> Result<Response<ServerInfo>, Status> {
+        recover_task_output_v2_for_read(&self.state).await;
         let mut info = ServerInfo {
             id: self.state.options.server_id.clone(),
             name: self.state.options.server_name.clone(),
@@ -138,6 +169,10 @@ impl ServerService for ServerGrpcService {
 
         if self.state.library.supports_http_range_playback() {
             info.capabilities.push(ServerCapability::HttpRange.into());
+            if self.state.tasks.task_output_v2_available() {
+                info.capabilities
+                    .push(ServerCapability::TaskOutputV2.into());
+            }
             if let Some(base_uri) = self
                 .state
                 .options
@@ -661,12 +696,812 @@ impl LibraryService for LibraryGrpcService {
 #[derive(Clone)]
 pub struct TaskGrpcService {
     state: AppState,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    result_page_blocking_permits: Arc<Semaphore>,
 }
 
 impl TaskGrpcService {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        let result_pages = Arc::clone(&state.task_result_pages);
+        let result_page_blocking_permits = Arc::clone(
+            &result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .blocking_operation_permits,
+        );
+        Self {
+            state,
+            result_pages,
+            result_page_blocking_permits,
+        }
     }
+
+    fn ensure_result_page_reaper_started(&self) -> bool {
+        let should_start = {
+            let mut pages = self
+                .result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            pages.mark_reaper_started()
+        };
+        if should_start {
+            spawn_task_result_page_reaper(
+                Arc::downgrade(&self.result_pages),
+                Arc::downgrade(&self.state.tasks),
+                Arc::downgrade(&self.result_page_blocking_permits),
+                TASK_RESULT_PAGE_REAPER_INTERVAL,
+            );
+        }
+        should_start
+    }
+
+    async fn run_task_result_blocking<T, F>(&self, operation: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                Arc<BilibiliTaskRegistry>,
+                Arc<StdMutex<TaskResultPageStore>>,
+            ) -> Result<T, Status>
+            + Send
+            + 'static,
+    {
+        let permit = timeout(
+            TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT,
+            Arc::clone(&self.result_page_blocking_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            Status::resource_exhausted("Task result pagination is busy; retry the request shortly.")
+        })?
+        .map_err(|_| Status::unavailable("Task result pagination is shutting down."))?;
+        let tasks = Arc::clone(&self.state.tasks);
+        let result_pages = Arc::clone(&self.result_pages);
+
+        tokio::task::spawn_blocking(move || {
+            // Keep the admission slot until detached work finishes after RPC cancellation.
+            let _permit = permit;
+            operation(tasks, result_pages)
+        })
+        .await
+        .map_err(task_result_blocking_join_status)?
+    }
+}
+
+struct TaskResultRequestCancellation {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TaskResultRequestCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            armed: true,
+        }
+    }
+
+    fn signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskResultRequestCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, AtomicOrdering::Release);
+        }
+    }
+}
+
+fn task_result_blocking_join_status(error: tokio::task::JoinError) -> Status {
+    eprintln!("Failed to join task result pagination blocking operation: {error}");
+    if error.is_cancelled() {
+        Status::unavailable("Task result pagination was interrupted.")
+    } else {
+        Status::internal("Task result pagination failed unexpectedly.")
+    }
+}
+
+async fn recover_task_output_v2_for_read(state: &AppState) {
+    if state.tasks.task_output_v2_available() {
+        return;
+    }
+
+    let now = Instant::now();
+    let Some((mut completion, completion_sender)) = ({
+        let mut pages = state
+            .task_result_pages
+            .lock()
+            .expect("task result page store lock poisoned");
+        let recovery = &mut pages.task_output_read_recovery;
+        if let Some(completion) = recovery.in_flight.as_ref() {
+            Some((completion.clone(), None))
+        } else if !state.tasks.persistence_recovery_supported()
+            || recovery
+                .retry_not_before
+                .is_some_and(|retry_not_before| retry_not_before > now)
+        {
+            None
+        } else {
+            let (completion_sender, completion) = watch::channel(false);
+            recovery.in_flight = Some(completion.clone());
+            #[cfg(test)]
+            {
+                recovery.attempts_started = recovery.attempts_started.saturating_add(1);
+            }
+            Some((completion, Some(completion_sender)))
+        }
+    }) else {
+        return;
+    };
+
+    if let Some(completion_sender) = completion_sender {
+        spawn_task_output_v2_read_recovery(
+            Arc::downgrade(&state.task_result_pages),
+            Arc::downgrade(&state.tasks),
+            completion_sender,
+        );
+    }
+    let completed = *completion.borrow();
+    if !completed {
+        let _ = timeout(TASK_OUTPUT_READ_RECOVERY_WAIT, completion.changed()).await;
+    }
+}
+
+fn spawn_task_output_v2_read_recovery(
+    result_pages: Weak<StdMutex<TaskResultPageStore>>,
+    tasks: Weak<BilibiliTaskRegistry>,
+    completion: watch::Sender<bool>,
+) {
+    tokio::spawn(async move {
+        let recovered = if let Some(tasks) = tasks.upgrade() {
+            match tokio::task::spawn_blocking(move || tasks.recover_task_output_v2_for_read()).await
+            {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    eprintln!(
+                        "Failed to join TaskOutputV2 read recovery persistence retry: {error}"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(result_pages) = result_pages.upgrade() {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            pages.task_output_read_recovery.in_flight = None;
+            pages.task_output_read_recovery.retry_not_before =
+                (!recovered).then(|| Instant::now() + TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY);
+        }
+        let _ = completion.send(true);
+    });
+}
+
+pub(crate) struct TaskResultPageStore {
+    snapshots_by_id: HashMap<String, TaskResultPageSnapshot>,
+    snapshot_order: VecDeque<String>,
+    cursors_by_token: HashMap<String, TaskResultPageCursor>,
+    blocking_operation_permits: Arc<Semaphore>,
+    reaper_started: bool,
+    task_output_read_recovery: TaskOutputReadRecovery,
+}
+
+impl Default for TaskResultPageStore {
+    fn default() -> Self {
+        Self {
+            snapshots_by_id: HashMap::new(),
+            snapshot_order: VecDeque::new(),
+            cursors_by_token: HashMap::new(),
+            blocking_operation_permits: Arc::new(Semaphore::new(
+                MAX_TASK_RESULT_BLOCKING_OPERATIONS,
+            )),
+            reaper_started: false,
+            task_output_read_recovery: TaskOutputReadRecovery::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskOutputReadRecovery {
+    in_flight: Option<watch::Receiver<bool>>,
+    retry_not_before: Option<Instant>,
+    #[cfg(test)]
+    attempts_started: usize,
+}
+
+#[derive(Clone)]
+struct TaskResultPageSnapshot {
+    task_id: String,
+    revision: u64,
+    snapshot_id: String,
+    resource_lease_id: String,
+    output: Arc<crate::task_registry::VisibleTaskOutput>,
+    encoded_bytes: usize,
+    artifact_count: usize,
+    expires_at: Instant,
+    tokens_by_offset: HashMap<usize, String>,
+    published: bool,
+    pending_first_page_registrations: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct TaskResultPageCursor {
+    snapshot_id: String,
+    task_id: String,
+    offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskResultPageRegistration {
+    snapshot_id: String,
+    registration_id: String,
+}
+
+type TaskResultPagePayload = (
+    Vec<crate::generated::tvos_net_player::v1::TaskResult>,
+    PageInfo,
+    u64,
+);
+type TaskResultPageResult = Result<TaskResultPagePayload, Status>;
+
+impl TaskResultPageStore {
+    fn mark_reaper_started(&mut self) -> bool {
+        if self.reaper_started {
+            return false;
+        }
+        self.reaper_started = true;
+        true
+    }
+
+    fn first_page(
+        &mut self,
+        snapshot: crate::task_registry::TaskOutputSnapshot,
+        now: Instant,
+        page_size: usize,
+    ) -> (
+        TaskResultPageResult,
+        Vec<String>,
+        bool,
+        Option<TaskResultPageRegistration>,
+    ) {
+        let (insertion, mut released_resource_lease_ids) = self.insert(snapshot, now);
+        let (snapshot_id, inserted_new_snapshot) = match insertion {
+            Ok(insertion) => insertion,
+            Err(error) => {
+                return (Err(error), released_resource_lease_ids, false, None);
+            }
+        };
+        let mut registration = self.register_first_page(&snapshot_id);
+        let page = self.page(&snapshot_id, 0, page_size);
+        if page.is_err()
+            && let Some(registration) = registration.take()
+            && let Some(resource_lease_id) = self.cancel_first_page(&registration)
+        {
+            released_resource_lease_ids.push(resource_lease_id);
+        }
+        (
+            page,
+            released_resource_lease_ids,
+            inserted_new_snapshot,
+            registration,
+        )
+    }
+
+    fn continuation_page(
+        &mut self,
+        token: &str,
+        task_id: &str,
+        now: Instant,
+        page_size: usize,
+    ) -> (TaskResultPageResult, Vec<String>) {
+        let released_resource_lease_ids = self.prune(now);
+        let page = self
+            .resolve_token(token, task_id)
+            .and_then(|(snapshot_id, offset)| self.page(&snapshot_id, offset, page_size));
+        (page, released_resource_lease_ids)
+    }
+
+    fn insert(
+        &mut self,
+        snapshot: crate::task_registry::TaskOutputSnapshot,
+        now: Instant,
+    ) -> (Result<(String, bool), Status>, Vec<String>) {
+        let mut released_resource_lease_ids = self.prune(now);
+        let resource_lease_expires_at = Instant::from_std(snapshot.resource_lease_expires_at);
+        if let Some(existing) = self.snapshots_by_id.get_mut(&snapshot.snapshot_id)
+            && existing.task_id == snapshot.task_id
+            && existing.revision == snapshot.revision
+        {
+            released_resource_lease_ids.push(std::mem::replace(
+                &mut existing.resource_lease_id,
+                snapshot.resource_lease_id,
+            ));
+            existing.encoded_bytes = snapshot.encoded_bytes;
+            existing.expires_at = resource_lease_expires_at;
+            self.snapshot_order
+                .retain(|candidate| candidate != &existing.snapshot_id);
+            self.snapshot_order.push_back(existing.snapshot_id.clone());
+            return (
+                Ok((existing.snapshot_id.clone(), false)),
+                released_resource_lease_ids,
+            );
+        }
+
+        let artifact_count = snapshot
+            .output
+            .record
+            .results
+            .iter()
+            .map(|result| result.artifacts.len())
+            .fold(0_usize, usize::saturating_add);
+        let result_count = snapshot.output.record.results.len();
+        while self.snapshot_budget_exceeded(artifact_count, result_count, snapshot.encoded_bytes) {
+            let Some(resource_lease_id) = self.evict_oldest_published_snapshot() else {
+                released_resource_lease_ids.push(snapshot.resource_lease_id);
+                return (
+                    Err(Status::resource_exhausted(
+                        "Task result snapshot capacity is busy; retry the request shortly.",
+                    )),
+                    released_resource_lease_ids,
+                );
+            };
+            released_resource_lease_ids.push(resource_lease_id);
+        }
+
+        let snapshot_id = if self.snapshots_by_id.contains_key(&snapshot.snapshot_id) {
+            format!("task-output-page-{}", Uuid::new_v4().simple())
+        } else {
+            snapshot.snapshot_id
+        };
+        self.snapshot_order.push_back(snapshot_id.clone());
+        self.snapshots_by_id.insert(
+            snapshot_id.clone(),
+            TaskResultPageSnapshot {
+                task_id: snapshot.task_id,
+                revision: snapshot.revision,
+                snapshot_id: snapshot_id.clone(),
+                resource_lease_id: snapshot.resource_lease_id,
+                output: snapshot.output,
+                encoded_bytes: snapshot.encoded_bytes,
+                artifact_count,
+                expires_at: resource_lease_expires_at,
+                tokens_by_offset: HashMap::new(),
+                published: false,
+                pending_first_page_registrations: HashSet::new(),
+            },
+        );
+        (Ok((snapshot_id, true)), released_resource_lease_ids)
+    }
+
+    fn snapshot_budget_exceeded(
+        &self,
+        incoming_artifact_count: usize,
+        incoming_result_count: usize,
+        incoming_encoded_bytes: usize,
+    ) -> bool {
+        self.snapshots_by_id.len() >= MAX_TASK_RESULT_PAGE_SNAPSHOTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.artifact_count)
+                .sum::<usize>()
+                .saturating_add(incoming_artifact_count)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.output.record.results.len())
+                .sum::<usize>()
+                .saturating_add(incoming_result_count)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_RESULTS
+            || self
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.encoded_bytes)
+                .sum::<usize>()
+                .saturating_add(incoming_encoded_bytes)
+                > MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES
+    }
+
+    fn evict_oldest_published_snapshot(&mut self) -> Option<String> {
+        let oldest_id = self.snapshot_order.iter().find_map(|snapshot_id| {
+            self.snapshots_by_id
+                .get(snapshot_id)
+                .is_some_and(|snapshot| snapshot.published)
+                .then(|| snapshot_id.clone())
+        })?;
+        self.remove_snapshot(&oldest_id)
+    }
+
+    fn register_first_page(&mut self, snapshot_id: &str) -> Option<TaskResultPageRegistration> {
+        let snapshot = self.snapshots_by_id.get_mut(snapshot_id)?;
+        if snapshot.published {
+            return None;
+        }
+        let registration_id = format!("task-result-publication-{}", Uuid::new_v4().simple());
+        snapshot
+            .pending_first_page_registrations
+            .insert(registration_id.clone());
+        Some(TaskResultPageRegistration {
+            snapshot_id: snapshot_id.to_owned(),
+            registration_id,
+        })
+    }
+
+    fn publish_first_page(&mut self, registration: &TaskResultPageRegistration) {
+        let Some(snapshot) = self.snapshots_by_id.get_mut(&registration.snapshot_id) else {
+            return;
+        };
+        if snapshot
+            .pending_first_page_registrations
+            .remove(&registration.registration_id)
+        {
+            snapshot.published = true;
+            snapshot.pending_first_page_registrations.clear();
+        }
+    }
+
+    fn cancel_first_page(&mut self, registration: &TaskResultPageRegistration) -> Option<String> {
+        let should_remove = self
+            .snapshots_by_id
+            .get_mut(&registration.snapshot_id)
+            .is_some_and(|snapshot| {
+                !snapshot.published
+                    && snapshot
+                        .pending_first_page_registrations
+                        .remove(&registration.registration_id)
+                    && snapshot.pending_first_page_registrations.is_empty()
+            });
+        should_remove
+            .then(|| self.remove_snapshot(&registration.snapshot_id))
+            .flatten()
+    }
+
+    fn resolve_token(&mut self, token: &str, task_id: &str) -> Result<(String, usize), Status> {
+        let cursor = self
+            .cursors_by_token
+            .get(token)
+            .ok_or_else(|| {
+                Status::invalid_argument("Task result page token is invalid or expired.")
+            })?
+            .clone();
+        if cursor.task_id != task_id {
+            return Err(Status::invalid_argument(
+                "Task result page token does not belong to this task.",
+            ));
+        }
+        if !self.snapshots_by_id.contains_key(&cursor.snapshot_id) {
+            return Err(Status::invalid_argument(
+                "Task result page token is invalid or expired.",
+            ));
+        }
+        Ok((cursor.snapshot_id, cursor.offset))
+    }
+
+    fn page(&mut self, snapshot_id: &str, offset: usize, page_size: usize) -> TaskResultPageResult {
+        let snapshot = self.snapshots_by_id.get_mut(snapshot_id).ok_or_else(|| {
+            Status::invalid_argument("Task result snapshot is no longer available.")
+        })?;
+        if offset > snapshot.output.record.results.len() {
+            return Err(Status::invalid_argument(
+                "Task result page token offset is invalid.",
+            ));
+        }
+        let requested_end = offset
+            .saturating_add(page_size.max(1))
+            .min(snapshot.output.record.results.len());
+        let mut end = offset;
+        let mut encoded_bytes = TASK_RESULT_PAGE_METADATA_RESERVE_BYTES;
+        let mut artifact_count = 0_usize;
+        while end < requested_end {
+            let result = &snapshot.output.record.results[end];
+            let next_artifact_count = artifact_count.saturating_add(result.artifacts.len());
+            if next_artifact_count > MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS && end == offset {
+                return Err(Status::resource_exhausted(
+                    "A task result exceeds the response page artifact budget.",
+                ));
+            }
+            if end > offset && next_artifact_count > MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS {
+                break;
+            }
+            let result_bytes = projected_task_result_encoded_bytes(result);
+            let entry_bytes = result_bytes
+                .saturating_add(prost::length_delimiter_len(result_bytes))
+                .saturating_add(1);
+            if encoded_bytes.saturating_add(entry_bytes) > MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+                && end == offset
+            {
+                return Err(Status::resource_exhausted(
+                    "A task result exceeds the response page byte budget.",
+                ));
+            }
+            if end > offset
+                && encoded_bytes.saturating_add(entry_bytes) > MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+            {
+                break;
+            }
+            encoded_bytes = encoded_bytes.saturating_add(entry_bytes);
+            artifact_count = next_artifact_count;
+            end += 1;
+        }
+        let results = snapshot.output.record.results[offset..end].to_vec();
+        let next_page_token = if end < snapshot.output.record.results.len() {
+            if let Some(token) = snapshot.tokens_by_offset.get(&end) {
+                token.clone()
+            } else {
+                let token = format!("task-results-{}", Uuid::new_v4().simple());
+                snapshot.tokens_by_offset.insert(end, token.clone());
+                self.cursors_by_token.insert(
+                    token.clone(),
+                    TaskResultPageCursor {
+                        snapshot_id: snapshot.snapshot_id.clone(),
+                        task_id: snapshot.task_id.clone(),
+                        offset: end,
+                    },
+                );
+                token
+            }
+        } else {
+            String::new()
+        };
+        Ok((
+            results,
+            PageInfo {
+                total_size: snapshot
+                    .output
+                    .record
+                    .results
+                    .len()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                next_page_token,
+                snapshot_id: snapshot.snapshot_id.clone(),
+            },
+            snapshot.revision,
+        ))
+    }
+
+    fn prune(&mut self, now: Instant) -> Vec<String> {
+        let expired_ids = self
+            .snapshots_by_id
+            .iter()
+            .filter(|(_, snapshot)| snapshot.expires_at <= now)
+            .map(|(snapshot_id, _)| snapshot_id.clone())
+            .collect::<Vec<_>>();
+        expired_ids
+            .into_iter()
+            .filter_map(|snapshot_id| self.remove_snapshot(&snapshot_id))
+            .collect()
+    }
+
+    fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<String> {
+        let resource_lease_id = self
+            .snapshots_by_id
+            .remove(snapshot_id)
+            .map(|snapshot| snapshot.resource_lease_id);
+        self.snapshot_order
+            .retain(|candidate| candidate != snapshot_id);
+        self.cursors_by_token
+            .retain(|_, cursor| cursor.snapshot_id != snapshot_id);
+        resource_lease_id
+    }
+}
+
+struct FirstTaskResultPage {
+    payload: TaskResultPagePayload,
+    publication: TaskResultPagePublicationGuard,
+}
+
+impl FirstTaskResultPage {
+    fn publish(mut self) -> TaskResultPagePayload {
+        self.publication.publish();
+        self.payload
+    }
+}
+
+struct TaskResultPagePublicationGuard {
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    registration: Option<TaskResultPageRegistration>,
+}
+
+impl TaskResultPagePublicationGuard {
+    fn new(
+        tasks: Arc<BilibiliTaskRegistry>,
+        result_pages: Arc<StdMutex<TaskResultPageStore>>,
+        registration: Option<TaskResultPageRegistration>,
+    ) -> Self {
+        Self {
+            tasks,
+            result_pages,
+            registration,
+        }
+    }
+
+    fn publish(&mut self) {
+        let Some(registration) = self.registration.as_ref() else {
+            return;
+        };
+        let mut pages = match self.result_pages.lock() {
+            Ok(pages) => pages,
+            Err(poisoned) => {
+                eprintln!("Task result page store was poisoned while publishing a first page.");
+                poisoned.into_inner()
+            }
+        };
+        pages.publish_first_page(registration);
+        self.registration = None;
+    }
+}
+
+impl Drop for TaskResultPagePublicationGuard {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let resource_lease_id = {
+            let mut pages = match self.result_pages.lock() {
+                Ok(pages) => pages,
+                Err(poisoned) => {
+                    eprintln!("Task result page store was poisoned while cancelling a first page.");
+                    poisoned.into_inner()
+                }
+            };
+            pages.cancel_first_page(&registration)
+        };
+        if let Some(resource_lease_id) = resource_lease_id {
+            self.tasks
+                .release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        }
+    }
+}
+
+fn first_task_result_page_blocking(
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    task_id: String,
+    page_size: usize,
+    cancelled: Arc<AtomicBool>,
+) -> Result<FirstTaskResultPage, Status> {
+    let snapshot = tasks
+        .retain_task_output_snapshot(&task_id, StdInstant::now() + TASK_RESULT_PAGE_SNAPSHOT_TTL)?;
+    let resource_lease_id = snapshot.resource_lease_id.clone();
+    if cancelled.load(AtomicOrdering::Acquire) {
+        tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+
+    let mut pages = match result_pages.lock() {
+        Ok(pages) => pages,
+        Err(_) => {
+            tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+            return Err(Status::internal("Task result pagination is unavailable."));
+        }
+    };
+    if cancelled.load(AtomicOrdering::Acquire) {
+        drop(pages);
+        tasks.release_task_output_snapshots(std::slice::from_ref(&resource_lease_id));
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+    let (page, released_resource_lease_ids, registration) =
+        first_task_result_page_after_lock(&mut pages, snapshot, page_size);
+    drop(pages);
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    let publication = TaskResultPagePublicationGuard::new(
+        Arc::clone(&tasks),
+        Arc::clone(&result_pages),
+        registration,
+    );
+    if cancelled.load(AtomicOrdering::Acquire) {
+        return Err(Status::cancelled("Task result pagination was cancelled."));
+    }
+    Ok(FirstTaskResultPage {
+        payload: page?,
+        publication,
+    })
+}
+
+fn first_task_result_page_after_lock(
+    pages: &mut TaskResultPageStore,
+    snapshot: crate::task_registry::TaskOutputSnapshot,
+    page_size: usize,
+) -> (
+    TaskResultPageResult,
+    Vec<String>,
+    Option<TaskResultPageRegistration>,
+) {
+    let now = Instant::now();
+    if Instant::from_std(snapshot.resource_lease_expires_at) <= now {
+        return (
+            Err(Status::deadline_exceeded(
+                "Task result snapshot expired before it could be published.",
+            )),
+            vec![snapshot.resource_lease_id],
+            None,
+        );
+    }
+    let (page, released_resource_lease_ids, _, registration) =
+        pages.first_page(snapshot, now, page_size);
+    (page, released_resource_lease_ids, registration)
+}
+
+fn continuation_task_result_page_blocking(
+    tasks: Arc<BilibiliTaskRegistry>,
+    result_pages: Arc<StdMutex<TaskResultPageStore>>,
+    page_token: String,
+    task_id: String,
+    page_size: usize,
+) -> TaskResultPageResult {
+    let (page, released_resource_lease_ids) = {
+        let mut pages = result_pages
+            .lock()
+            .map_err(|_| Status::internal("Task result pagination is unavailable."))?;
+        pages.continuation_page(&page_token, &task_id, Instant::now(), page_size)
+    };
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    page
+}
+
+fn spawn_task_result_page_reaper(
+    result_pages: Weak<StdMutex<TaskResultPageStore>>,
+    tasks: Weak<BilibiliTaskRegistry>,
+    blocking_operation_permits: Weak<Semaphore>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Some(blocking_operation_permits) = blocking_operation_permits.upgrade() else {
+                return;
+            };
+            let Ok(permit) = blocking_operation_permits.acquire_owned().await else {
+                return;
+            };
+            let result_pages = result_pages.clone();
+            let tasks = tasks.clone();
+            let keep_running = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                prune_task_result_pages_once(&result_pages, &tasks, Instant::now())
+            })
+            .await;
+            match keep_running {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    eprintln!("Failed to join task result page reaper blocking operation: {error}");
+                    return;
+                }
+            }
+            sleep(interval).await;
+        }
+    });
+}
+
+fn prune_task_result_pages_once(
+    result_pages: &Weak<StdMutex<TaskResultPageStore>>,
+    tasks: &Weak<BilibiliTaskRegistry>,
+    now: Instant,
+) -> bool {
+    let Some(result_pages) = result_pages.upgrade() else {
+        return false;
+    };
+    let Some(tasks) = tasks.upgrade() else {
+        return false;
+    };
+    let released_resource_lease_ids = {
+        let mut pages = result_pages
+            .lock()
+            .expect("task result page store lock poisoned");
+        pages.prune(now)
+    };
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+    true
 }
 
 #[tonic::async_trait]
@@ -788,11 +1623,86 @@ impl TaskService for TaskGrpcService {
 
     async fn list_task_results(
         &self,
-        _request: Request<ListTaskResultsRequest>,
+        request: Request<ListTaskResultsRequest>,
     ) -> Result<Response<ListTaskResultsResponse>, Status> {
-        Err(Status::unimplemented(
-            "Paginated task results are not enabled by this server version.",
-        ))
+        recover_task_output_v2_for_read(&self.state).await;
+        if !self.state.tasks.task_output_v2_available()
+            || !self.state.library.supports_http_range_playback()
+        {
+            return Err(Status::failed_precondition(
+                "Durable task output is unavailable on this cache server.",
+            ));
+        }
+
+        let request_body = request.get_ref();
+        let task_id = request_body.task_id.trim().to_owned();
+        if task_id.is_empty() {
+            return Err(Status::invalid_argument("Task id is required."));
+        }
+        let page_size = request_body
+            .page
+            .as_ref()
+            .map(|page| page.page_size as usize)
+            .filter(|page_size| *page_size > 0)
+            .unwrap_or(DEFAULT_TASK_RESULT_PAGE_SIZE)
+            .min(MAX_TASK_RESULT_PAGE_SIZE);
+        let page_token = request_body
+            .page
+            .as_ref()
+            .map(|page| page.page_token.trim())
+            .unwrap_or_default()
+            .to_owned();
+        if page_token.len() > MAX_TASK_RESULT_PAGE_TOKEN_BYTES {
+            return Err(Status::invalid_argument(
+                "Task result page token is too long.",
+            ));
+        }
+        self.ensure_result_page_reaper_started();
+
+        let (results, page_info, output_revision) = if page_token.is_empty() {
+            let mut cancellation = TaskResultRequestCancellation::new();
+            let cancellation_signal = cancellation.signal();
+            let page = self
+                .run_task_result_blocking(move |tasks, result_pages| {
+                    first_task_result_page_blocking(
+                        tasks,
+                        result_pages,
+                        task_id,
+                        page_size,
+                        cancellation_signal,
+                    )
+                })
+                .await?;
+            let page = page.publish();
+            cancellation.complete();
+            page
+        } else {
+            self.run_task_result_blocking(move |tasks, result_pages| {
+                continuation_task_result_page_blocking(
+                    tasks,
+                    result_pages,
+                    page_token,
+                    task_id,
+                    page_size,
+                )
+            })
+            .await?
+        };
+        let redact_error_details = self.state.bilibili_error_details_are_sensitive();
+        Ok(Response::new(ListTaskResultsResponse {
+            results: results
+                .into_iter()
+                .map(|result| {
+                    task_result_for_client(result, redact_error_details, |resource_id| {
+                        self.state
+                            .playback_uri_factory
+                            .create_task_resource(&request, resource_id)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            page_info: Some(page_info),
+            output_revision,
+        }))
     }
 
     async fn watch_tasks(
@@ -851,16 +1761,28 @@ impl TaskService for TaskGrpcService {
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<Task>, Status> {
         let request = request.into_inner();
-        let hls_session_ids = self.state.tasks.playback_hls_session_ids(&request.id);
-        let task = self.state.tasks.cancel_task(&request.id)?;
+        let cancellation = {
+            let _lifecycle_guard = self.state.hls_task_lifecycle_guard();
+            let cancellation = self
+                .state
+                .tasks
+                .cancel_task_with_hls_session_ids(&request.id)?;
+            if cancellation.task.kind() == TaskKind::BilibiliProgressivePlayback {
+                self.state
+                    .cancel_hls_fill_work_for_task(&cancellation.task.id);
+            }
+            cancellation
+        };
+        let task = cancellation.task;
         if task.kind() == TaskKind::BilibiliProgressivePlayback
             && matches!(task.state(), TaskState::Cancelled | TaskState::Failed)
         {
-            for session_id in hls_session_ids {
-                self.state.remove_hls_playback_session(&session_id);
-                let _ = self.state.hls_cache.remove_session(&session_id);
-            }
+            self.state
+                .cancel_hls_fill_work_for_task_and_wait(&task.id)
+                .await;
+            remove_task_hls_sessions(&self.state, &task.id, &cancellation.hls_session_ids);
         }
+        let task = self.state.tasks.get_task(&task.id)?;
         Ok(Response::new(task_for_client(
             task,
             self.state.bilibili_error_details_are_sensitive(),
@@ -904,6 +1826,81 @@ fn task_for_client(mut task: Task, redact_error_details: bool) -> Task {
         }
     }
     task
+}
+
+fn task_result_for_client(
+    mut result: crate::generated::tvos_net_player::v1::TaskResult,
+    redact_error_details: bool,
+    resource_uri: impl Fn(&str) -> String,
+) -> Result<crate::generated::tvos_net_player::v1::TaskResult, Status> {
+    let now = current_timestamp();
+    for artifact in &mut result.artifacts {
+        if let Some(resource) = artifact.resource.as_mut() {
+            if resource.expires_at.as_ref().is_some_and(|expires_at| {
+                (expires_at.seconds, expires_at.nanos) <= (now.seconds, now.nanos)
+            }) {
+                artifact.resource = None;
+                if artifact.state()
+                    == crate::generated::tvos_net_player::v1::TaskArtifactState::Available
+                {
+                    artifact.state =
+                        crate::generated::tvos_net_player::v1::TaskArtifactState::Unavailable
+                            .into();
+                    artifact.problem = Some(crate::generated::tvos_net_player::v1::TaskProblem {
+                        category:
+                            crate::generated::tvos_net_player::v1::TaskProblemCategory::NotFound
+                                .into(),
+                        code: "cache.resource_expired".to_owned(),
+                        message: "Task resource expired.".to_owned(),
+                        retryable: false,
+                    });
+                }
+                continue;
+            }
+            resource.uri = resource_uri(&resource.id);
+        }
+    }
+    if !redact_error_details {
+        return bounded_client_task_result(result);
+    }
+    match result.state() {
+        TaskState::Failed => {
+            if let Some(problem) = result.problem.as_mut() {
+                problem.message = crate::credential_safe_client_error(true, &problem.message);
+            }
+            if let Some(progress) = result.progress.as_mut() {
+                progress.message = crate::credential_safe_client_error(true, &progress.message);
+            }
+        }
+        TaskState::Cancelled => {
+            if let Some(problem) = result.problem.as_mut() {
+                problem.message =
+                    crate::credential_safe_client_cancellation(true, &problem.message);
+            }
+            if let Some(progress) = result.progress.as_mut() {
+                progress.message =
+                    crate::credential_safe_client_cancellation(true, &progress.message);
+            }
+        }
+        _ => {}
+    }
+    for artifact in &mut result.artifacts {
+        if let Some(problem) = artifact.problem.as_mut() {
+            problem.message = crate::credential_safe_client_error(true, &problem.message);
+        }
+    }
+    bounded_client_task_result(result)
+}
+
+fn bounded_client_task_result(
+    result: crate::generated::tvos_net_player::v1::TaskResult,
+) -> Result<crate::generated::tvos_net_player::v1::TaskResult, Status> {
+    if result.encoded_len() > MAX_TASK_RESULT_ENCODED_BYTES {
+        return Err(Status::resource_exhausted(
+            "A task result exceeds the encoded response limit.",
+        ));
+    }
+    Ok(result)
 }
 
 #[derive(Clone)]
@@ -1014,7 +2011,7 @@ impl CacheService for CacheGrpcService {
             ));
         }
 
-        if let Some(deleted) = self.state.delete_completed_hls_library_item(id)? {
+        if let Some(deleted) = self.state.delete_completed_hls_library_item(id).await? {
             return Ok(Response::new(DeleteLibraryItemResponse { deleted }));
         }
 
@@ -1217,16 +2214,22 @@ fn filter_hls_library_items(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum PlaybackPlanningTerminalState {
+    Failed,
+    Cancelled,
+}
+
 struct PlaybackPlanningCleanup {
-    tasks: Arc<BilibiliTaskRegistry>,
+    state: AppState,
     task_id: String,
     armed: bool,
 }
 
 impl PlaybackPlanningCleanup {
-    fn new(tasks: Arc<BilibiliTaskRegistry>, task_id: String) -> Self {
+    fn new(state: AppState, task_id: String) -> Self {
         Self {
-            tasks,
+            state,
             task_id,
             armed: true,
         }
@@ -1239,11 +2242,113 @@ impl PlaybackPlanningCleanup {
 
 impl Drop for PlaybackPlanningCleanup {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.tasks.complete_task_failed(
+        if !self.armed {
+            return;
+        }
+
+        let state = self.state.clone();
+        let task_id = self.task_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Failed,
+                    PLAYBACK_PLANNING_INTERRUPTED_MESSAGE.to_owned(),
+                    Vec::new(),
+                )
+                .await;
+            });
+        } else {
+            let _ = self.state.tasks.complete_task_failed(
                 &self.task_id,
                 PLAYBACK_PLANNING_INTERRUPTED_MESSAGE.to_owned(),
             );
+        }
+    }
+}
+
+pub(crate) async fn retry_pending_task_persistence(
+    tasks: &Arc<BilibiliTaskRegistry>,
+    context: &str,
+) -> TaskPersistenceRecoveryOutcome {
+    let tasks = Arc::clone(tasks);
+    match tokio::task::spawn_blocking(move || tasks.retry_pending_persistence_outcome()).await {
+        Ok(outcome) => {
+            if outcome == TaskPersistenceRecoveryOutcome::PermanentFailure {
+                eprintln!(
+                    "Task persistence recovery was rejected permanently for {context}; releasing background ownership"
+                );
+            }
+            outcome
+        }
+        Err(error) => {
+            eprintln!("Failed to join task persistence retry for {context}: {error}");
+            TaskPersistenceRecoveryOutcome::PermanentFailure
+        }
+    }
+}
+
+async fn complete_playback_planning_terminal(
+    state: &AppState,
+    task_id: &str,
+    terminal_state: PlaybackPlanningTerminalState,
+    message: String,
+    additional_hls_session_ids: Vec<String>,
+) -> bool {
+    let mut hls_session_ids = state.tasks.playback_hls_session_ids(task_id);
+    hls_session_ids.extend(additional_hls_session_ids);
+    hls_session_ids.sort();
+    hls_session_ids.dedup();
+
+    loop {
+        let tasks = Arc::clone(&state.tasks);
+        let owned_task_id = task_id.to_owned();
+        let owned_message = message.clone();
+        let completion = match tokio::task::spawn_blocking(move || match terminal_state {
+            PlaybackPlanningTerminalState::Failed => {
+                tasks.complete_task_failed(&owned_task_id, owned_message)
+            }
+            PlaybackPlanningTerminalState::Cancelled => {
+                tasks.complete_task_cancelled(&owned_task_id, owned_message)
+            }
+        })
+        .await
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                eprintln!(
+                    "Failed to join Bilibili playback planning completion for task {task_id}: {error}"
+                );
+                return false;
+            }
+        };
+        match completion {
+            Ok(_)
+                if !state.tasks.persistence_recovery_supported()
+                    || state.tasks.persistence_available() =>
+            {
+                let _deletion_guard = state.completed_hls_mutation_guard();
+                remove_task_hls_sessions(state, task_id, &hls_session_ids);
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) if error.code() == tonic::Code::Unavailable => {}
+            Err(error) => {
+                eprintln!(
+                    "Failed to complete Bilibili playback planning task {task_id}: {}",
+                    state.error_detail_for_log(&error)
+                );
+                return false;
+            }
+        }
+
+        match retry_pending_task_persistence(&state.tasks, "Bilibili playback planning").await {
+            TaskPersistenceRecoveryOutcome::Durable => {}
+            TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+            }
+            TaskPersistenceRecoveryOutcome::PermanentFailure => return false,
         }
     }
 }
@@ -1262,15 +2367,19 @@ async fn run_bilibili_playback_planning(
     playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) {
-    let mut cleanup = PlaybackPlanningCleanup::new(Arc::clone(&state.tasks), task_id.clone());
+    let mut cleanup = PlaybackPlanningCleanup::new(state.clone(), task_id.clone());
     let permit_request = Arc::clone(&state.playback_planning_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
         if cancellation.is_cancel_requested() {
-            if state
-                .tasks
-                .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
-                .is_ok()
+            if complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Cancelled,
+                PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                Vec::new(),
+            )
+            .await
             {
                 cleanup.disarm();
             }
@@ -1282,13 +2391,14 @@ async fn run_bilibili_playback_planning(
                 match permit {
                     Ok(permit) => break permit,
                     Err(_) => {
-                        if state
-                            .tasks
-                            .complete_task_failed(
-                                &task_id,
-                                "Playback planning concurrency limiter is unavailable.".to_owned(),
-                            )
-                            .is_ok()
+                        if complete_playback_planning_terminal(
+                            &state,
+                            &task_id,
+                            PlaybackPlanningTerminalState::Failed,
+                            "Playback planning concurrency limiter is unavailable.".to_owned(),
+                            Vec::new(),
+                        )
+                        .await
                         {
                             cleanup.disarm();
                         }
@@ -1300,10 +2410,14 @@ async fn run_bilibili_playback_planning(
         }
     };
     if cancellation.is_cancel_requested() {
-        if state
-            .tasks
-            .complete_task_cancelled(&task_id, PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned())
-            .is_ok()
+        if complete_playback_planning_terminal(
+            &state,
+            &task_id,
+            PlaybackPlanningTerminalState::Cancelled,
+            PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+            Vec::new(),
+        )
+        .await
         {
             cleanup.disarm();
         }
@@ -1357,26 +2471,39 @@ async fn run_single_bilibili_playback_planning(
         source,
         options,
         selection_id,
-        cancellation,
+        cancellation: cancellation.clone(),
     };
     let plan = match state.playback_planner.plan(planning_request).await {
         Ok(plan) => plan,
         Err(error) => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
-                .is_ok();
+            let terminal_state = if cancellation.is_cancel_requested() {
+                PlaybackPlanningTerminalState::Cancelled
+            } else {
+                PlaybackPlanningTerminalState::Failed
+            };
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                terminal_state,
+                state.error_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
     };
     let metadata =
         match playback_task_metadata_with_policy(&task_id, plan, &state.options, playback_policy) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return state
-                    .tasks
-                    .complete_task_failed(&task_id, state.error_detail_for_client(&error.message()))
-                    .is_ok();
+                return complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Failed,
+                    state.error_detail_for_client(&error.message()),
+                    Vec::new(),
+                )
+                .await;
             }
         };
 
@@ -1387,38 +2514,81 @@ async fn run_single_bilibili_playback_planning(
         uri: playback_source_uri,
         expires_at: None,
     };
-    state.register_hls_playback_session(metadata.hls_session.clone());
-    match state.tasks.complete_playback_playable(
+    match publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+        &state,
         &task_id,
-        metadata.title,
+        metadata,
         playback_source,
-        metadata.playback_session,
+        || {},
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                state.remove_hls_playback_session(&task_id);
-                let _ = state.hls_cache.remove_session(&task_id);
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Cancelled,
+                    PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    vec![task_id.clone()],
+                )
+                .await
             } else {
-                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
-                    eprintln!(
-                        "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                }
-                state.enqueue_hls_cache_fill_foreground(
-                    task_id.clone(),
-                    metadata.hls_session,
-                    HlsCacheFinalizationFailureMode::KeepPlayable,
-                );
+                true
             }
-            true
         }
-        Err(_) => {
-            state.remove_hls_playback_session(&task_id);
-            let _ = state.hls_cache.remove_session(&task_id);
-            false
+        Err(error) => {
+            complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                if cancellation.is_cancel_requested() {
+                    PlaybackPlanningTerminalState::Cancelled
+                } else {
+                    PlaybackPlanningTerminalState::Failed
+                },
+                state.error_detail_for_client(&error.message()),
+                vec![task_id.clone()],
+            )
+            .await
         }
     }
+}
+
+fn publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+    state: &AppState,
+    task_id: &str,
+    metadata: PlaybackTaskMetadata,
+    playback_source: PlaybackSource,
+    pre_enqueue_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
+
+    state.register_hls_playback_session(metadata.hls_session.clone());
+    let task = state.tasks.complete_playback_playable(
+        task_id,
+        metadata.title,
+        playback_source,
+        metadata.playback_session,
+    )?;
+    if task.state() != TaskState::Playable {
+        return Ok(task);
+    }
+
+    pre_enqueue_hook();
+    if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
+        eprintln!(
+            "Failed to persist HLS playback manifest for task {task_id}; keeping runtime playback source available: {}",
+            state.error_detail_for_log(&error)
+        );
+    }
+    state.enqueue_hls_cache_fill_foreground(
+        task_id.to_owned(),
+        metadata.hls_session,
+        HlsCacheFinalizationFailureMode::KeepPlayable,
+    );
+    Ok(task)
 }
 
 async fn run_explicit_bilibili_playback_planning(
@@ -1446,23 +2616,38 @@ async fn run_explicit_bilibili_playback_planning(
         Ok(resolution) => resolution,
         Err(error) if cancellation.is_cancel_requested() => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_cancelled(&task_id, state.cancellation_detail_for_client(&message))
-                .is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Cancelled,
+                state.cancellation_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
         Err(error) => {
             let message = playback_error_message(error);
-            return state
-                .tasks
-                .complete_task_failed(&task_id, state.error_detail_for_client(&message))
-                .is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                state.error_detail_for_client(&message),
+                Vec::new(),
+            )
+            .await;
         }
     };
     let candidates = match selected_bilibili_candidates(&resolution, &selection_plan.mode) {
         Ok(candidates) => candidates,
         Err(message) => {
-            return state.tasks.complete_task_failed(&task_id, message).is_ok();
+            return complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                message,
+                Vec::new(),
+            )
+            .await;
         }
     };
     let total = candidates.len();
@@ -1504,7 +2689,8 @@ async fn run_explicit_bilibili_playback_planning(
                 &resolution.title,
                 &mut result_items,
                 &planned_session_ids,
-            );
+            )
+            .await;
         }
 
         let session_id = result_items[index].id.clone();
@@ -1525,7 +2711,7 @@ async fn run_explicit_bilibili_playback_planning(
             Err(error) => Err(error),
         };
 
-        match item_outcome {
+        let planned_hls_session = match item_outcome {
             Ok(metadata) => {
                 let playback_source_uri = if index == 0 {
                     primary_playback_source_uri.clone()
@@ -1548,26 +2734,20 @@ async fn run_explicit_bilibili_playback_planning(
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
                 result_items[index].playback_session = Some(metadata.playback_session.clone());
-                state.register_hls_playback_session(metadata.hls_session.clone());
                 planned_session_ids.push(session_id.clone());
                 planned_sessions.push(metadata.hls_session.clone());
-                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
-                    eprintln!(
-                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                }
                 if primary.is_none() {
                     let mut primary_playback_source = playback_source.clone();
                     primary_playback_source.item_id = task_id.clone();
                     primary = Some((
                         primary_playback_source,
                         metadata.playback_session,
-                        metadata.hls_session,
+                        metadata.hls_session.clone(),
                         metadata.title,
                     ));
                 }
                 successful_results += 1;
+                Some(metadata.hls_session)
             }
             Err(error) if cancellation.is_cancel_requested() => {
                 eprintln!(
@@ -1580,38 +2760,57 @@ async fn run_explicit_bilibili_playback_planning(
                     &resolution.title,
                     &mut result_items,
                     &planned_session_ids,
-                );
+                )
+                .await;
             }
             Err(error) => {
                 result_items[index].state = TaskState::Failed.into();
                 let message = playback_error_message(error);
                 result_items[index].message = state.error_detail_for_client(&message);
+                None
             }
-        }
+        };
 
         let message = format!(
             "Planned {}/{} Bilibili playback result(s).",
             index + 1,
             total
         );
-        let _ = state.tasks.update_playback_results(
-            &task_id,
-            Some(resolution.title.clone()),
-            message,
-            result_items_progress(&result_items),
-            result_items.clone(),
-        );
+        let progress = result_items_progress(&result_items);
+        if let Some(planned_hls_session) = planned_hls_session {
+            let _ = publish_explicit_bilibili_hls_result(
+                &state,
+                ExplicitBilibiliHlsResultPublication {
+                    task_id: task_id.clone(),
+                    title: resolution.title.clone(),
+                    message,
+                    progress,
+                    result_items: result_items.clone(),
+                    hls_session: planned_hls_session,
+                },
+            )
+            .await;
+        } else {
+            let _ = state.tasks.update_playback_results(
+                &task_id,
+                Some(resolution.title.clone()),
+                message,
+                progress,
+                result_items.clone(),
+            );
+        }
     }
 
     let Some((primary_source, primary_session, primary_hls_session, primary_title)) = primary
     else {
-        return state
-            .tasks
-            .complete_task_failed(
-                &task_id,
-                "Failed to plan any selected Bilibili playback result.".to_owned(),
-            )
-            .is_ok();
+        return complete_playback_planning_terminal(
+            &state,
+            &task_id,
+            PlaybackPlanningTerminalState::Failed,
+            "Failed to plan any selected Bilibili playback result.".to_owned(),
+            planned_session_ids,
+        )
+        .await;
     };
     if cancellation.is_cancel_requested() {
         return complete_cancelled_explicit_bilibili_playback(
@@ -1620,7 +2819,8 @@ async fn run_explicit_bilibili_playback_planning(
             &resolution.title,
             &mut result_items,
             &planned_session_ids,
-        );
+        )
+        .await;
     }
 
     let final_message = if successful_results == total {
@@ -1635,45 +2835,155 @@ async fn run_explicit_bilibili_playback_planning(
         first_item.message = final_message.clone();
     }
 
-    match state.tasks.complete_playback_results_playable(
+    match complete_explicit_bilibili_playback_with_pre_enqueue_hook(
+        &state,
         &task_id,
         primary_title,
         final_message,
         primary_source,
         primary_session,
         result_items,
+        primary_hls_session,
+        planned_sessions,
+        || {},
     ) {
         Ok(task) => {
             if task.state() != TaskState::Playable {
-                remove_hls_sessions(&state, &planned_session_ids);
+                complete_playback_planning_terminal(
+                    &state,
+                    &task_id,
+                    PlaybackPlanningTerminalState::Cancelled,
+                    PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                    planned_session_ids,
+                )
+                .await
             } else {
-                let primary_session_id = primary_hls_session.id.clone();
-                state.enqueue_hls_cache_fill_foreground(
-                    task_id.clone(),
-                    primary_hls_session,
-                    HlsCacheFinalizationFailureMode::KeepPlayable,
-                );
-                for session in planned_sessions {
-                    if session.id == primary_session_id {
-                        continue;
-                    }
-                    state.enqueue_hls_cache_fill_demoted(
-                        task_id.clone(),
-                        session,
-                        HlsCacheFinalizationFailureMode::KeepPlayable,
-                    );
-                }
+                true
             }
-            true
         }
-        Err(_) => {
-            remove_hls_sessions(&state, &planned_session_ids);
-            false
+        Err(error) => {
+            complete_playback_planning_terminal(
+                &state,
+                &task_id,
+                if cancellation.is_cancel_requested() {
+                    PlaybackPlanningTerminalState::Cancelled
+                } else {
+                    PlaybackPlanningTerminalState::Failed
+                },
+                state.error_detail_for_client(&error.message()),
+                planned_session_ids,
+            )
+            .await
         }
     }
 }
 
-fn complete_cancelled_explicit_bilibili_playback(
+#[allow(clippy::too_many_arguments)]
+fn complete_explicit_bilibili_playback_with_pre_enqueue_hook(
+    state: &AppState,
+    task_id: &str,
+    primary_title: String,
+    final_message: String,
+    primary_source: PlaybackSource,
+    primary_session: BilibiliPlaybackSession,
+    result_items: Vec<BilibiliTaskResultItem>,
+    primary_hls_session: HlsPlaybackSession,
+    planned_sessions: Vec<HlsPlaybackSession>,
+    pre_enqueue_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
+
+    let task = state.tasks.complete_playback_results_playable(
+        task_id,
+        primary_title,
+        final_message,
+        primary_source,
+        primary_session,
+        result_items,
+    )?;
+    if task.state() != TaskState::Playable {
+        return Ok(task);
+    }
+
+    pre_enqueue_hook();
+    let primary_session_id = primary_hls_session.id.clone();
+    state.enqueue_hls_cache_fill_foreground(
+        task_id.to_owned(),
+        primary_hls_session,
+        HlsCacheFinalizationFailureMode::KeepPlayable,
+    );
+    for session in planned_sessions {
+        if session.id == primary_session_id {
+            continue;
+        }
+        state.enqueue_hls_cache_fill_demoted(
+            task_id.to_owned(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        );
+    }
+    Ok(task)
+}
+
+struct ExplicitBilibiliHlsResultPublication {
+    task_id: String,
+    title: String,
+    message: String,
+    progress: f64,
+    result_items: Vec<BilibiliTaskResultItem>,
+    hls_session: HlsPlaybackSession,
+}
+
+async fn publish_explicit_bilibili_hls_result(
+    state: &AppState,
+    publication: ExplicitBilibiliHlsResultPublication,
+) -> Result<Task, Status> {
+    let state = state.clone();
+    let join_task_id = publication.task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        publish_explicit_bilibili_hls_result_with_post_save_hook(&state, publication, || {})
+    })
+    .await
+    .map_err(|error| {
+        eprintln!("Failed to join Bilibili result publication for task {join_task_id}: {error}");
+        Status::internal("Bilibili playback result publication failed unexpectedly.")
+    })?
+}
+
+fn publish_explicit_bilibili_hls_result_with_post_save_hook(
+    state: &AppState,
+    publication: ExplicitBilibiliHlsResultPublication,
+    post_save_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _lifecycle_guard = state.hls_task_lifecycle_guard();
+    let current_task = state.tasks.get_task(&publication.task_id)?;
+    if current_task.state() != TaskState::Preparing {
+        return Ok(current_task);
+    }
+    let _deletion_guard = state.completed_hls_mutation_guard();
+    state.register_hls_playback_session(publication.hls_session.clone());
+    if let Err(error) = state.hls_cache.save_session(&publication.hls_session) {
+        eprintln!(
+            "Failed to persist HLS playback manifest for result {}; keeping runtime playback source available: {}",
+            publication.hls_session.id,
+            state.error_detail_for_log(&error)
+        );
+    }
+    post_save_hook();
+    state.tasks.update_playback_results(
+        &publication.task_id,
+        Some(publication.title),
+        publication.message,
+        publication.progress,
+        publication.result_items,
+    )
+}
+
+async fn complete_cancelled_explicit_bilibili_playback(
     state: &AppState,
     task_id: &str,
     title: &str,
@@ -1681,7 +2991,6 @@ fn complete_cancelled_explicit_bilibili_playback(
     planned_session_ids: &[String],
 ) -> bool {
     mark_results_cancelled(result_items);
-    remove_hls_sessions(state, planned_session_ids);
     let _ = state.tasks.update_playback_results(
         task_id,
         Some(title.to_owned()),
@@ -1689,13 +2998,14 @@ fn complete_cancelled_explicit_bilibili_playback(
         result_items_progress(result_items),
         result_items.to_vec(),
     );
-    state
-        .tasks
-        .complete_task_cancelled(
-            task_id,
-            PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
-        )
-        .is_ok()
+    complete_playback_planning_terminal(
+        state,
+        task_id,
+        PlaybackPlanningTerminalState::Cancelled,
+        PLAYBACK_RESULTS_PLANNING_CANCELLED_MESSAGE.to_owned(),
+        planned_session_ids.to_vec(),
+    )
+    .await
 }
 
 fn selected_bilibili_candidates(
@@ -1799,10 +3109,12 @@ fn bilibili_result_item(
     }
 }
 
-fn remove_hls_sessions(state: &AppState, session_ids: &[String]) {
-    for session_id in session_ids {
-        state.remove_hls_playback_session(session_id);
-        let _ = state.hls_cache.remove_session(session_id);
+fn remove_task_hls_sessions(state: &AppState, task_id: &str, session_ids: &[String]) {
+    if let Err(error) = state.remove_task_hls_sessions_tracking_failures(task_id, session_ids) {
+        eprintln!(
+            "Failed to remove terminal HLS cache sessions for task {task_id}; physical cleanup remains queued: {}",
+            state.error_detail_for_log(&error)
+        );
     }
 }
 
@@ -1874,7 +3186,6 @@ pub(crate) async fn run_hls_cache_finalization(
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
     let _worker_guard = state.hls_fill_scheduler.worker_guard();
     while let Some(job) = state.hls_fill_scheduler.next_job_until_shutdown().await {
-        let session_id = job.session.id.clone();
         let outcome = run_hls_cache_finalization_inner(
             state.clone(),
             job.task_id.clone(),
@@ -1883,16 +3194,27 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
             job.token.clone(),
         )
         .await;
-        let should_requeue = outcome == HlsCacheFinalizationOutcome::Preempted
+        let mut should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
+        let degraded_failure_persistence_pending = outcome
+            == HlsCacheFinalizationOutcome::PersistencePending
             && state
                 .tasks
-                .is_hls_session_playable_for_task(&job.task_id, &session_id);
-        if should_requeue {
-            let message = match job.priority {
-                crate::hls_fill_scheduler::HlsFillPriority::Foreground => {
+                .hls_session_has_online_playback_after_cache_fill_failure(
+                    &job.task_id,
+                    &job.session.id,
+                );
+        if should_requeue && !degraded_failure_persistence_pending {
+            let message = match (outcome, job.priority) {
+                (HlsCacheFinalizationOutcome::PersistencePending, _) => {
+                    "Playable publication is pending durable task-state recovery; offline cache fill will retry."
+                }
+                (HlsCacheFinalizationOutcome::QuotaPending, _) => {
+                    "Playable online; offline cache fill is waiting for quota enforcement to recover."
+                }
+                (_, crate::hls_fill_scheduler::HlsFillPriority::Foreground) => {
                     "Playable online; offline cache fill paused behind newer playback."
                 }
-                crate::hls_fill_scheduler::HlsFillPriority::Demoted => {
+                (_, crate::hls_fill_scheduler::HlsFillPriority::Demoted) => {
                     "Playable online; offline cache fill remains queued behind newer playback."
                 }
             };
@@ -1906,6 +3228,15 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                 },
             );
         }
+        if matches!(
+            outcome,
+            HlsCacheFinalizationOutcome::PersistencePending
+                | HlsCacheFinalizationOutcome::QuotaPending
+        ) && should_requeue
+        {
+            sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+            should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
+        }
         state
             .hls_fill_scheduler
             .finish_current(&job, should_requeue);
@@ -1916,6 +3247,61 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
 enum HlsCacheFinalizationOutcome {
     Finished,
     Preempted,
+    PersistencePending,
+    QuotaPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HlsSessionPublicationRecoveryOutcome {
+    State(HlsSessionPublicationState),
+    PermanentFailure,
+}
+
+fn hls_cache_fill_should_requeue(
+    state: &AppState,
+    job: &crate::hls_fill_scheduler::HlsFillJob,
+    outcome: HlsCacheFinalizationOutcome,
+) -> bool {
+    let publication = state
+        .tasks
+        .hls_session_publication_state(&job.task_id, &job.session.id);
+    match outcome {
+        HlsCacheFinalizationOutcome::Preempted => {
+            publication == HlsSessionPublicationState::Published
+        }
+        HlsCacheFinalizationOutcome::PersistencePending
+        | HlsCacheFinalizationOutcome::QuotaPending => {
+            publication != HlsSessionPublicationState::Absent
+        }
+        HlsCacheFinalizationOutcome::Finished => false,
+    }
+}
+
+async fn retry_pending_hls_session_publication(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+) -> HlsSessionPublicationRecoveryOutcome {
+    let publication = state
+        .tasks
+        .hls_session_publication_state(task_id, session_id);
+    if publication != HlsSessionPublicationState::Pending {
+        return HlsSessionPublicationRecoveryOutcome::State(publication);
+    }
+
+    match retry_pending_task_persistence(&state.tasks, "HLS cache fill").await {
+        TaskPersistenceRecoveryOutcome::PermanentFailure => {
+            HlsSessionPublicationRecoveryOutcome::PermanentFailure
+        }
+        TaskPersistenceRecoveryOutcome::Durable
+        | TaskPersistenceRecoveryOutcome::RetryableFailure => {
+            HlsSessionPublicationRecoveryOutcome::State(
+                state
+                    .tasks
+                    .hls_session_publication_state(task_id, session_id),
+            )
+        }
+    }
 }
 
 async fn run_hls_cache_finalization_inner(
@@ -1929,17 +3315,41 @@ async fn run_hls_cache_finalization_inner(
         return HlsCacheFinalizationOutcome::Finished;
     }
     let session_id = session.id.clone();
+    if failure_mode == HlsCacheFinalizationFailureMode::KeepPlayable
+        && state
+            .tasks
+            .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &session_id)
+    {
+        if state.tasks.persistence_recovery_supported()
+            && !state.tasks.persistence_available()
+            && retry_pending_task_persistence(&state.tasks, "HLS cache fill failure").await
+                == TaskPersistenceRecoveryOutcome::PermanentFailure
+        {
+            return HlsCacheFinalizationOutcome::Finished;
+        }
+        return if !state.tasks.persistence_recovery_supported()
+            || state.tasks.persistence_available()
+        {
+            HlsCacheFinalizationOutcome::Finished
+        } else {
+            HlsCacheFinalizationOutcome::PersistencePending
+        };
+    }
     let permit_request = Arc::clone(&state.hls_cache_finalization_permits).acquire_owned();
     tokio::pin!(permit_request);
     let _permit = loop {
         if preemption.is_cancelled() {
             return HlsCacheFinalizationOutcome::Finished;
         }
-        if !state
-            .tasks
-            .is_hls_session_playable_for_task(&task_id, &session_id)
-        {
-            return HlsCacheFinalizationOutcome::Finished;
+        match retry_pending_hls_session_publication(&state, &task_id, &session_id).await {
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Published) => {}
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Pending) => {
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Absent)
+            | HlsSessionPublicationRecoveryOutcome::PermanentFailure => {
+                return HlsCacheFinalizationOutcome::Finished;
+            }
         }
         if preemption.is_preempted() {
             return HlsCacheFinalizationOutcome::Preempted;
@@ -1979,6 +3389,10 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
+    if let Some(completed_session) = state.hls_cache.completed_session(&session_id) {
+        return publish_completed_hls_cache(&state, &task_id, &session_id, &completed_session)
+            .await;
+    }
     let playback_progress = state.hls_playback_progress_for_session(&session_id);
     let _ = state.tasks.update_playback_cache_progress(
         &task_id,
@@ -2007,8 +3421,7 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.remove_hls_playback_session(&session_id);
-            let _ = state.hls_cache.remove_session(&session_id);
+            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
             return HlsCacheFinalizationOutcome::Finished;
         }
         Err(error) => {
@@ -2035,9 +3448,10 @@ async fn run_hls_cache_finalization_inner(
         || control() != HlsCacheFillControl::Continue,
     ) {
         eprintln!(
-            "Failed to run HLS cache eviction before finalization for task {task_id}: {}",
+            "Failed to run HLS cache eviction before finalization for task {task_id}; deferring full cache fill: {}",
             state.error_detail_for_log(&error)
         );
+        return HlsCacheFinalizationOutcome::QuotaPending;
     }
     if control() == HlsCacheFillControl::Preempt {
         return HlsCacheFinalizationOutcome::Preempted;
@@ -2058,46 +3472,11 @@ async fn run_hls_cache_finalization_inner(
         .await
     {
         Ok(completion) => {
-            let completed_playback_session =
-                playback_session_from_hls_cache_session(&completion.session);
-            let library_item_id = completion.library_item_id.clone();
-            let finalized = state
-                .tasks
-                .complete_playback_hls_session_cached_with_metadata(
-                    &task_id,
-                    &session_id,
-                    library_item_id.clone(),
-                    completed_playback_session,
-                );
-            match finalized {
-                Ok(task)
-                    if state.tasks.playback_task_has_completed_hls_cache_item(
-                        &task,
-                        &session_id,
-                        &library_item_id,
-                    ) =>
-                {
-                    state.register_completed_hls_runtime_session(&completion.session);
-                    if let Err(error) = state.enforce_hls_cache_quota(
-                        "after_hls_finalization",
-                        [session_id.clone()],
-                        0,
-                    ) {
-                        eprintln!(
-                            "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
-                            state.error_detail_for_log(&error)
-                        );
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    state.remove_hls_playback_session(&session_id);
-                    let _ = state.hls_cache.remove_session(&session_id);
-                }
-            }
+            return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session)
+                .await;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            state.remove_hls_playback_session(&session_id);
-            let _ = state.hls_cache.remove_session(&session_id);
+            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
         }
         Err(crate::hls_cache::HlsCacheError::Preempted) => {
             return HlsCacheFinalizationOutcome::Preempted;
@@ -2123,6 +3502,9 @@ async fn run_hls_cache_finalization_inner(
                             &error,
                         ),
                     ) {
+                        if status.code() == tonic::Code::Unavailable {
+                            return HlsCacheFinalizationOutcome::PersistencePending;
+                        }
                         eprintln!(
                             "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
                             state.error_detail_for_log(&status)
@@ -2130,18 +3512,30 @@ async fn run_hls_cache_finalization_inner(
                     }
                 }
                 HlsCacheFinalizationFailureMode::FailRestoredTask => {
-                    state.remove_hls_playback_session(&session_id);
-                    let _ = state.hls_cache.remove_session(&session_id);
-                    if let Err(status) = state
-                        .tasks
-                        .fail_unrestorable_playback_session_after_cache_restore(
-                            &session_id,
-                            state.error_with_context_for_client(
-                                "Failed to restore offline HLS cache after restart",
-                                &error,
-                            ),
-                        )
-                    {
+                    let failure = {
+                        let _deletion_guard = state.completed_hls_mutation_guard();
+                        let failure = state
+                            .tasks
+                            .fail_unrestorable_playback_session_after_cache_restore(
+                                &session_id,
+                                state.error_with_context_for_client(
+                                    "Failed to restore offline HLS cache after restart",
+                                    &error,
+                                ),
+                            );
+                        if failure.is_ok() {
+                            remove_task_hls_sessions(
+                                &state,
+                                &task_id,
+                                std::slice::from_ref(&session_id),
+                            );
+                        }
+                        failure
+                    };
+                    if let Err(status) = failure {
+                        if status.code() == tonic::Code::Unavailable {
+                            return HlsCacheFinalizationOutcome::PersistencePending;
+                        }
                         eprintln!(
                             "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {}",
                             state.error_detail_for_log(&status)
@@ -2151,6 +3545,87 @@ async fn run_hls_cache_finalization_inner(
             }
         }
     }
+    HlsCacheFinalizationOutcome::Finished
+}
+
+async fn publish_completed_hls_cache(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+    completed_session: &HlsPlaybackSession,
+) -> HlsCacheFinalizationOutcome {
+    let state = state.clone();
+    let task_id = task_id.to_owned();
+    let join_task_id = task_id.clone();
+    let session_id = session_id.to_owned();
+    let completed_session = completed_session.clone();
+    match tokio::task::spawn_blocking(move || {
+        publish_completed_hls_cache_blocking(&state, &task_id, &session_id, &completed_session)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!(
+                "Failed to join completed HLS cache publication for task {join_task_id}: {error}"
+            );
+            HlsCacheFinalizationOutcome::PersistencePending
+        }
+    }
+}
+
+fn publish_completed_hls_cache_blocking(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+    completed_session: &HlsPlaybackSession,
+) -> HlsCacheFinalizationOutcome {
+    let completed_playback_session = playback_session_from_hls_cache_session(completed_session);
+    let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
+    let finalized = {
+        let _deletion_guard = state.completed_hls_mutation_guard();
+        match state
+            .tasks
+            .complete_playback_hls_session_cached_with_metadata(
+                task_id,
+                session_id,
+                library_item_id.clone(),
+                completed_playback_session,
+            ) {
+            Ok(task)
+                if state.tasks.playback_task_has_completed_hls_cache_item(
+                    &task,
+                    session_id,
+                    &library_item_id,
+                ) =>
+            {
+                state.register_completed_hls_runtime_session(completed_session);
+                true
+            }
+            Err(error) if error.code() == tonic::Code::Unavailable => {
+                // The media and completed manifest are already durable. Serve those files while
+                // the task snapshot retries so another successful persistence write cannot leave
+                // the stale online runtime installed after this job is dropped.
+                state.register_completed_hls_runtime_session(completed_session);
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+            Ok(_) | Err(_) => false,
+        }
+    };
+    if finalized {
+        if let Err(error) =
+            state.enforce_hls_cache_quota("after_hls_finalization", [session_id.to_owned()], 0)
+        {
+            eprintln!(
+                "Failed to run HLS cache eviction after finalization for task {task_id}: {}",
+                state.error_detail_for_log(&error)
+            );
+        }
+    } else {
+        let session_ids = [session_id.to_owned()];
+        remove_task_hls_sessions(state, task_id, &session_ids);
+    }
+
     HlsCacheFinalizationOutcome::Finished
 }
 
@@ -2808,7 +4283,10 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -2831,7 +4309,8 @@ mod tests {
             BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
             GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
             GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
-            ListTaskResultsRequest, ResolveBilibiliInputRequest, TaskKind, TaskState,
+            ListTaskResultsRequest, PageRequest, ResolveBilibiliInputRequest, TaskKind, TaskResult,
+            TaskState,
         },
         hls_cache::sanitized_completed_session,
         hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
@@ -2851,6 +4330,523 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn duplicate_task_result_first_page_renews_snapshot_and_resource_lease() {
+        let now = Instant::now();
+        let refresh_at = now + Duration::from_secs(1);
+        let initial_deadline = now + Duration::from_secs(10);
+        let refreshed_deadline = refresh_at + Duration::from_secs(20);
+        let results = vec![
+            task_result("result-1", TaskState::Completed),
+            task_result("result-2", TaskState::Completed),
+        ];
+        let snapshot = |resource_lease_id: &str, expires_at: Instant| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-one",
+                7,
+                "snapshot-one",
+                resource_lease_id,
+                expires_at.into_std(),
+                results.clone(),
+                1024,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (first_page, released, inserted, first_registration) =
+            pages.first_page(snapshot("lease-old", initial_deadline), now, 1);
+        let first_page = first_page.expect("first page should be inserted");
+        let first_token = first_page.1.next_page_token;
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert!(first_registration.is_some());
+        assert!(!first_token.is_empty());
+
+        let (refreshed_page, released, inserted, refreshed_registration) =
+            pages.first_page(snapshot("lease-new", refreshed_deadline), refresh_at, 1);
+        let refreshed_page = refreshed_page.expect("duplicate first page should be served");
+        assert!(!inserted);
+        assert_eq!(vec!["lease-old"], released);
+        pages.publish_first_page(
+            &refreshed_registration.expect("unpublished duplicate should retain a registration"),
+        );
+        assert_eq!(first_token, refreshed_page.1.next_page_token);
+        assert_eq!(
+            refreshed_deadline,
+            pages
+                .snapshots_by_id
+                .get("snapshot-one")
+                .expect("refreshed snapshot should remain stored")
+                .expires_at
+        );
+
+        assert!(
+            pages
+                .prune(initial_deadline + Duration::from_millis(1))
+                .is_empty(),
+            "the refreshed snapshot must outlive its original expiry"
+        );
+        assert_eq!(vec!["lease-new"], pages.prune(refreshed_deadline));
+    }
+
+    #[test]
+    fn concurrent_cancelled_first_pages_release_the_last_unpublished_lease() {
+        let now = Instant::now();
+        let results = vec![
+            task_result("result-1", TaskState::Completed),
+            task_result("result-2", TaskState::Completed),
+        ];
+        let snapshot = |resource_lease_id: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-concurrent-cancel",
+                7,
+                "snapshot-concurrent-cancel",
+                resource_lease_id,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                results.clone(),
+                1024,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted, first_registration) =
+            pages.first_page(snapshot("lease-first"), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        let first_registration =
+            first_registration.expect("first unpublished page should be registered");
+
+        let (_, released, inserted, second_registration) =
+            pages.first_page(snapshot("lease-second"), now, 1);
+        assert!(!inserted);
+        assert_eq!(vec!["lease-first"], released);
+        let second_registration =
+            second_registration.expect("concurrent unpublished page should be registered");
+
+        assert_eq!(None, pages.cancel_first_page(&first_registration));
+        assert!(
+            pages
+                .snapshots_by_id
+                .contains_key("snapshot-concurrent-cancel")
+        );
+        assert_eq!(
+            Some("lease-second".to_owned()),
+            pages.cancel_first_page(&second_registration)
+        );
+        assert!(pages.snapshots_by_id.is_empty());
+        assert!(pages.cursors_by_token.is_empty());
+    }
+
+    #[test]
+    fn published_first_page_survives_a_concurrent_request_cancellation() {
+        let now = Instant::now();
+        let snapshot = |resource_lease_id: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                "task-concurrent-publish",
+                3,
+                "snapshot-concurrent-publish",
+                resource_lease_id,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                vec![task_result("result", TaskState::Completed)],
+                1024,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, _, _, first_registration) = pages.first_page(snapshot("lease-first"), now, 1);
+        let (_, released, inserted, second_registration) =
+            pages.first_page(snapshot("lease-second"), now, 1);
+        assert!(!inserted);
+        assert_eq!(vec!["lease-first"], released);
+        let first_registration =
+            first_registration.expect("first unpublished page should be registered");
+        let second_registration =
+            second_registration.expect("concurrent unpublished page should be registered");
+
+        pages.publish_first_page(&first_registration);
+        assert_eq!(None, pages.cancel_first_page(&second_registration));
+
+        let snapshot = pages
+            .snapshots_by_id
+            .get("snapshot-concurrent-publish")
+            .expect("a published page snapshot must remain available");
+        assert!(snapshot.published);
+        assert!(snapshot.pending_first_page_registrations.is_empty());
+        assert_eq!("lease-second", snapshot.resource_lease_id);
+    }
+
+    #[test]
+    fn expired_task_result_lease_is_released_without_publishing_page() {
+        let expired_at = StdInstant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired lease deadline should be representable");
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-expired",
+            1,
+            "snapshot-expired",
+            "lease-expired",
+            expired_at,
+            vec![task_result("result-expired", TaskState::Completed)],
+            1024,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (page, released, registration) =
+            first_task_result_page_after_lock(&mut pages, snapshot, 1);
+
+        assert_eq!(
+            tonic::Code::DeadlineExceeded,
+            page.expect_err("expired snapshot must not be published")
+                .code()
+        );
+        assert_eq!(vec!["lease-expired"], released);
+        assert!(registration.is_none());
+        assert!(pages.snapshots_by_id.is_empty());
+        assert!(pages.cursors_by_token.is_empty());
+    }
+
+    #[test]
+    fn task_result_page_store_evicts_snapshots_by_encoded_bytes() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                Vec::new(),
+                MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("one", "lease-one"), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        pages.publish_first_page(
+            &registration.expect("the first snapshot should await publication"),
+        );
+        let (_, released, inserted, _) = pages.first_page(snapshot("two", "lease-two"), now, 1);
+
+        assert!(inserted);
+        assert_eq!(vec!["lease-one"], released);
+        assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
+    }
+
+    #[test]
+    fn task_result_page_store_rejects_eviction_of_an_unpublished_snapshot() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                vec![
+                    task_result(&format!("result-{id}-one"), TaskState::Completed),
+                    task_result(&format!("result-{id}-two"), TaskState::Completed),
+                ],
+                MAX_TASK_RESULT_PAGE_SNAPSHOT_BYTES / 2 + 1,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (first_page, released, inserted, first_registration) =
+            pages.first_page(snapshot("one", "lease-one"), now, 1);
+        let first_page = first_page.expect("the first page should be created");
+        let continuation_token = first_page.1.next_page_token;
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert!(!continuation_token.is_empty());
+
+        let (second_page, released, inserted, second_registration) =
+            pages.first_page(snapshot("two", "lease-two"), now, 1);
+
+        assert_eq!(
+            tonic::Code::ResourceExhausted,
+            second_page
+                .expect_err("capacity must not evict a page awaiting RPC publication")
+                .code()
+        );
+        assert_eq!(vec!["lease-two"], released);
+        assert!(!inserted);
+        assert!(second_registration.is_none());
+        assert!(pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.cursors_by_token.contains_key(&continuation_token));
+
+        pages.publish_first_page(
+            &first_registration.expect("the retained first page should remain publishable"),
+        );
+        let (continuation, released) =
+            pages.continuation_page(&continuation_token, "task-one", now, 1);
+        let continuation = continuation.expect("the published continuation should remain valid");
+        assert!(released.is_empty());
+        assert_eq!("result-one-two", continuation.0[0].id);
+    }
+
+    #[test]
+    fn task_result_page_store_evicts_snapshots_by_aggregate_artifacts() {
+        let now = Instant::now();
+        let snapshot = |id: &str, lease: &str, artifact_count: usize| {
+            crate::task_registry::TaskOutputSnapshot::for_tests(
+                format!("task-{id}"),
+                1,
+                format!("snapshot-{id}"),
+                lease,
+                (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+                vec![task_result_with_artifacts(
+                    &format!("result-{id}"),
+                    artifact_count,
+                )],
+                artifact_count,
+            )
+        };
+        let mut pages = TaskResultPageStore::default();
+
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("one", "lease-one", MAX_TASK_ARTIFACTS), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        pages.publish_first_page(
+            &registration.expect("the first snapshot should await publication"),
+        );
+        let (_, released, inserted, registration) =
+            pages.first_page(snapshot("two", "lease-two", MAX_TASK_ARTIFACTS), now, 1);
+        assert!(inserted);
+        assert!(released.is_empty());
+        pages.publish_first_page(
+            &registration.expect("the second snapshot should await publication"),
+        );
+
+        let (_, released, inserted, _) =
+            pages.first_page(snapshot("three", "lease-three", 1), now, 1);
+
+        assert!(inserted);
+        assert_eq!(vec!["lease-one"], released);
+        assert!(!pages.snapshots_by_id.contains_key("snapshot-one"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-two"));
+        assert!(pages.snapshots_by_id.contains_key("snapshot-three"));
+        assert!(
+            pages
+                .snapshots_by_id
+                .values()
+                .map(|snapshot| snapshot.artifact_count)
+                .sum::<usize>()
+                <= MAX_TASK_RESULT_PAGE_SNAPSHOT_ARTIFACTS
+        );
+    }
+
+    #[test]
+    fn task_result_pages_serve_a_maximum_artifact_result_with_a_bounded_copy() {
+        let now = Instant::now();
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-max-artifacts",
+            1,
+            "snapshot-max-artifacts",
+            "lease-max-artifacts",
+            (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+            vec![task_result_with_artifacts(
+                "result-max-artifacts",
+                MAX_TASK_ARTIFACTS,
+            )],
+            MAX_TASK_ARTIFACTS,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (page, released, inserted, _) = pages.first_page(snapshot, now, 1);
+        let page = page.expect("maximum valid artifact result should remain pageable");
+
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert_eq!(1, page.0.len());
+        assert_eq!(
+            MAX_TASK_RESULT_PAGE_COPY_ARTIFACTS,
+            page.0[0].artifacts.len()
+        );
+        assert!(page.1.next_page_token.is_empty());
+    }
+
+    #[test]
+    fn task_result_pages_respect_encoded_byte_budget_before_count_limit() {
+        let now = Instant::now();
+        let results = (0..8)
+            .map(|index| TaskResult {
+                id: format!("result-{index}"),
+                state: TaskState::Completed.into(),
+                title: "x".repeat(900_000),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let encoded_bytes = results
+            .iter()
+            .map(Message::encoded_len)
+            .fold(0_usize, usize::saturating_add);
+        let snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "task-large-page",
+            3,
+            "snapshot-large-page",
+            "lease-large-page",
+            (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std(),
+            results,
+            encoded_bytes,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (first, released, inserted, _) = pages.first_page(snapshot, now, 50);
+        let first = first.expect("first byte-bounded page should be available");
+        assert!(inserted);
+        assert!(released.is_empty());
+        assert_eq!(4, first.0.len());
+        assert_eq!(8, first.1.total_size);
+        assert!(!first.1.next_page_token.is_empty());
+        assert!(
+            ListTaskResultsResponse {
+                results: first.0.clone(),
+                page_info: Some(first.1.clone()),
+                output_revision: first.2,
+            }
+            .encoded_len()
+                <= MAX_TASK_RESULT_PAGE_ENCODED_BYTES
+        );
+
+        let (second, released) =
+            pages.continuation_page(&first.1.next_page_token, "task-large-page", now, 50);
+        let second = second.expect("continuation page should use the byte-derived offset");
+        assert!(released.is_empty());
+        assert_eq!(4, second.0.len());
+        assert!(second.1.next_page_token.is_empty());
+        assert_eq!(8, second.1.total_size);
+    }
+
+    #[tokio::test]
+    async fn task_result_page_reaper_starts_once_for_a_shared_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first_listener_service = TaskGrpcService::new(state.clone());
+        let second_listener_service = TaskGrpcService::new(state);
+
+        assert!(first_listener_service.ensure_result_page_reaper_started());
+        assert!(!second_listener_service.ensure_result_page_reaper_started());
+    }
+
+    #[tokio::test]
+    async fn task_result_page_reaper_prunes_idle_snapshots_and_releases_resource_leases() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1idle-snapshot", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "idle-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 42,
+            size_known: true,
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, vec![0_u8; 42]).expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    TaskResult {
+                        id: "result-2".to_owned(),
+                        state: TaskState::Completed.into(),
+                        artifacts: vec![TaskArtifact {
+                            id: "cover".to_owned(),
+                            kind: TaskArtifactKind::CoverImage.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(resource.resource.clone()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let mut snapshot = state
+            .tasks
+            .retain_task_output_snapshot(&task.id, StdInstant::now() + Duration::from_secs(60 * 60))
+            .expect("snapshot should be retained");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("latest task output should remove the resource");
+
+        let result_pages = Arc::clone(&state.task_result_pages);
+        snapshot.resource_lease_expires_at = StdInstant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired lease deadline should be representable");
+        let continuation_token = {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock should be available");
+            let (page, released_resource_lease_ids, inserted, _) =
+                pages.first_page(snapshot, Instant::now(), 1);
+            assert!(inserted);
+            assert!(released_resource_lease_ids.is_empty());
+            let page = page.expect("expired snapshot should still be inserted before reaping");
+            page.1.next_page_token
+        };
+        assert!(!continuation_token.is_empty());
+        assert!(state.tasks.task_resource("idle-cover").is_some());
+
+        assert!(prune_task_result_pages_once(
+            &Arc::downgrade(&result_pages),
+            &Arc::downgrade(&state.tasks),
+            Instant::now(),
+        ));
+
+        assert!(state.tasks.task_resource("idle-cover").is_none());
+        let (page, released_resource_lease_ids) = {
+            let mut pages = result_pages
+                .lock()
+                .expect("task result page store lock should be available");
+            assert!(pages.snapshots_by_id.is_empty());
+            assert!(pages.cursors_by_token.is_empty());
+            pages.continuation_page(&continuation_token, &task.id, Instant::now(), 1)
+        };
+        assert!(released_resource_lease_ids.is_empty());
+        let status = page.expect_err("reaped continuation token should be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, status.code());
+    }
+
     #[tokio::test]
     async fn get_server_info_advertises_bilibili_resolve_capability() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -2860,6 +4856,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
@@ -2906,14 +4903,724 @@ mod tests {
                 .contains(&(ServerCapability::LanTranscoding as i32))
         );
         assert!(
-            !info
-                .capabilities
+            info.capabilities
                 .contains(&(ServerCapability::TaskOutputV2 as i32))
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_task_output_recovery_is_shared_and_nonblocking() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1read-recovery", None)
+            .expect("task should persist while its resource root is unavailable");
+        assert!(!state.tasks.task_output_v2_available());
+        fs::create_dir_all(&root_path).expect("resource root should recover");
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let server_service = ServerGrpcService::new(state.clone());
+        let task_service = TaskGrpcService::new(state.clone());
+        let info_request = tokio::spawn(async move {
+            server_service
+                .get_server_info(Request::new(GetServerInfoRequest {}))
+                .await
+        });
+        let results_request = tokio::spawn(async move {
+            task_service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: task.id,
+                    page: None,
+                }))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let attempts_started = state
+                    .task_result_pages
+                    .lock()
+                    .expect("task result page store lock should be available")
+                    .task_output_read_recovery
+                    .attempts_started;
+                if attempts_started == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a read should start one background recovery attempt");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started,
+            "concurrent read paths should share the same recovery"
+        );
+        assert!(!info_request.is_finished());
+        assert!(!results_request.is_finished());
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        let info = timeout(Duration::from_secs(2), info_request)
+            .await
+            .expect("server info should finish after cleanup recovers")
+            .expect("server info task should join")
+            .expect("server info should succeed")
+            .into_inner();
+        let results = timeout(Duration::from_secs(2), results_request)
+            .await
+            .expect("task results should finish after cleanup recovers")
+            .expect("task results task should join")
+            .expect("task results should succeed")
+            .into_inner();
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert!(!results.results.is_empty());
+        assert!(state.tasks.task_output_v2_available());
+    }
+
     #[tokio::test]
-    async fn list_task_results_remains_unimplemented_until_v2_output_is_available() {
+    async fn read_only_task_output_recovery_repairs_transient_persistence_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.task_output_v2_available());
+        state.tasks.fail_next_persistence_directory_sync();
+        state
+            .tasks
+            .create_bilibili_task("BV1read-persistence-recovery", None)
+            .expect("installed task snapshot should remain usable");
+        assert!(state.tasks.persistence_recovery_supported());
+        assert!(!state.tasks.persistence_available());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should recover transient persistence")
+            .into_inner();
+
+        assert!(state.tasks.persistence_available());
+        assert!(state.tasks.task_output_v2_available());
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_retires_expired_missing_resource() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1read-expired-resource", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "read-expired-resource".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 5,
+            size_known: true,
+            etag: "v1".to_owned(),
+            expires_at: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = root_path.join(resource.relative_path());
+        fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "read-expired-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should persist");
+        fs::remove_file(&resource_path).expect("resource body should become unavailable");
+        state
+            .tasks
+            .mark_resource_storage_for_revalidation_for_test("read-expired-resource");
+        assert!(!state.tasks.task_output_v2_available());
+
+        let response = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .expect("read-only traffic should retire the expired resource and recover")
+            .into_inner();
+
+        assert!(state.tasks.task_output_v2_available());
+        assert_eq!(1, response.results.len());
+        let artifact = response.results[0]
+            .artifacts
+            .first()
+            .expect("retired artifact should remain projected");
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert!(
+            !resource_path
+                .parent()
+                .expect("resource body should have a parent")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_skips_detached_malformed_store() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let task_state_path = temp.path().join("state").join("tasks.json");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state parent should be created");
+        fs::write(&task_state_path, b"{ invalid task state")
+            .expect("invalid task state should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_recovery_supported());
+        assert!(!state.tasks.task_output_v2_available());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("degraded server info should remain readable")
+            .into_inner();
+
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            0,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_throttles_failed_resource_scans() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("missing-cache"),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(state.tasks.persistence_available());
+        assert!(!state.tasks.task_output_v2_available());
+        let service = ServerGrpcService::new(state.clone());
+
+        let first = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("degraded server info should remain readable")
+            .into_inner();
+        let second = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("repeated degraded server info should remain readable")
+            .into_inner();
+
+        assert!(
+            !first
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert!(
+            !second
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        assert_eq!(
+            1,
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock should be available")
+                .task_output_read_recovery
+                .attempts_started,
+            "failed read recovery should be throttled during its retry delay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_task_results_retention_runs_off_the_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1blocking-retention", None)
+            .expect("task should be created");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let request = tokio::spawn(async move {
+            service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: task.id,
+                    page: None,
+                }))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task-result retention should enter the bounded blocking pool");
+        timeout(Duration::from_millis(500), sleep(Duration::from_millis(10)))
+            .await
+            .expect("the current-thread runtime must stay responsive during cleanup");
+        assert!(!request.is_finished());
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        let response = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("task-result request should finish after cleanup is released")
+            .expect("task-result request should join")
+            .expect("task-result request should succeed")
+            .into_inner();
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(!response.results.is_empty());
+        assert_eq!(
+            MAX_TASK_RESULT_BLOCKING_OPERATIONS,
+            permits.available_permits()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_list_task_results_releases_an_unpublished_resource_lease() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1cancelled-retention", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cancelled-retention-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "cancelled-retention-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let task_id = task.id.clone();
+
+        let (cleanup_ready_sender, cleanup_ready_receiver) = std::sync::mpsc::channel();
+        let (cleanup_release_sender, cleanup_release_receiver) = std::sync::mpsc::channel();
+        let cleanup_tasks = Arc::clone(&state.tasks);
+        let cleanup_blocker = std::thread::spawn(move || {
+            cleanup_tasks
+                .block_resource_cleanup_for_test(cleanup_ready_sender, cleanup_release_receiver);
+        });
+        cleanup_ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("test should hold the synchronous cleanup lock");
+
+        let request_task_id = task_id.clone();
+        let request = tokio::spawn(async move {
+            service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: request_task_id,
+                    page: None,
+                }))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task-result retention should enter the bounded blocking pool");
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("aborted request should not complete")
+                .is_cancelled()
+        );
+
+        cleanup_release_sender
+            .send(())
+            .expect("test should release synchronous cleanup");
+        timeout(Duration::from_secs(2), async {
+            while permits.available_permits() != MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached retention should release its lease and admission permit");
+        cleanup_blocker
+            .join()
+            .expect("cleanup blocker should finish");
+
+        assert!(
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store should be available")
+                .snapshots_by_id
+                .is_empty(),
+            "a cancelled request must not publish its retained snapshot"
+        );
+        state
+            .tasks
+            .replace_task_output(
+                &task_id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should discard the old resource");
+        assert!(
+            state
+                .tasks
+                .task_resource("cancelled-retention-cover")
+                .is_none(),
+            "the cancelled request must not leak a resource lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_detached_first_page_releases_an_inserted_snapshot_and_lease() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1cancelled-after-insertion", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cancelled-after-insertion-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = state.options.root_path.join(resource.relative_path());
+        std::fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "cancelled-after-insertion-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let task_id = task.id.clone();
+        let request_task_id = task_id.clone();
+        let (inserted_sender, inserted_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        let request = tokio::spawn(async move {
+            service
+                .run_task_result_blocking(move |tasks, result_pages| {
+                    let page = first_task_result_page_blocking(
+                        tasks,
+                        result_pages,
+                        request_task_id,
+                        1,
+                        Arc::new(AtomicBool::new(false)),
+                    )?;
+                    let _ = inserted_sender.send(());
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release the detached first-page worker");
+                    Ok(page)
+                })
+                .await
+        });
+        inserted_receiver
+            .await
+            .expect("first page should be inserted before cancellation");
+        {
+            let pages = state
+                .task_result_pages
+                .lock()
+                .expect("task result page store should be available");
+            let snapshot = pages
+                .snapshots_by_id
+                .values()
+                .next()
+                .expect("the unpublished snapshot should be registered");
+            assert!(!snapshot.published);
+            assert_eq!(1, snapshot.pending_first_page_registrations.len());
+        }
+
+        request.abort();
+        let join_error = match request.await {
+            Ok(_) => panic!("aborted request should not complete"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+        release_sender
+            .send(())
+            .expect("test should release the detached first-page worker");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .task_result_pages
+                    .lock()
+                    .expect("task result page store should be available")
+                    .snapshots_by_id
+                    .is_empty()
+                    && permits.available_permits() == MAX_TASK_RESULT_BLOCKING_OPERATIONS
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached first-page cleanup should finish");
+
+        state
+            .tasks
+            .replace_task_output(
+                &task_id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should discard the old resource");
+        assert!(
+            state
+                .tasks
+                .task_resource("cancelled-after-insertion-cover")
+                .is_none(),
+            "the detached request must release its retained resource lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_task_results_bounds_blocking_pool_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1bounded-retention", None)
+            .expect("task should be created");
+        let service = TaskGrpcService::new(state);
+        let permits = Arc::clone(&service.result_page_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 0..MAX_TASK_RESULT_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking admission should remain open"),
+            );
+        }
+
+        let status = timeout(
+            TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT + Duration::from_secs(1),
+            service.list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: None,
+            })),
+        )
+        .await
+        .expect("blocking admission wait should be bounded")
+        .expect_err("saturated blocking admission should reject the request");
+        assert_eq!(tonic::Code::ResourceExhausted, status.code());
+
+        drop(held_permits);
+        let response = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .expect("task results should recover after admission is released")
+            .into_inner();
+        assert!(!response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_task_results_keeps_an_immutable_snapshot_across_output_updates() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -2921,20 +5628,540 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
             root_path,
+            task_state_path: temp.path().join("state").join("tasks.json"),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let service = TaskGrpcService::new(state);
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1task-output", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Failed),
+                    task_result("result-3", TaskState::Running),
+                ],
+                Vec::new(),
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state.clone());
 
-        let status = service
+        let first_page = service
             .list_task_results(Request::new(ListTaskResultsRequest {
-                task_id: "task-1".to_owned(),
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 2,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("first task-result page should load")
+            .into_inner();
+        let first_page_info = first_page
+            .page_info
+            .clone()
+            .expect("first page should include page info");
+        assert_eq!(
+            vec!["result-1", "result-2"],
+            result_ids(&first_page.results)
+        );
+        assert_eq!(3, first_page_info.total_size);
+        assert!(!first_page_info.next_page_token.is_empty());
+        assert!(first_page.output_revision > 0);
+
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .expect("task output should advance");
+
+        let reconnected_service = TaskGrpcService::new(state.clone());
+        let second_page = reconnected_service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: first_page_info.next_page_token,
+                }),
+            }))
+            .await
+            .expect("old snapshot should remain pageable")
+            .into_inner();
+        assert_eq!(vec!["result-3"], result_ids(&second_page.results));
+        assert_eq!(first_page.output_revision, second_page.output_revision);
+        assert_eq!(
+            first_page_info.snapshot_id,
+            second_page.page_info.unwrap().snapshot_id
+        );
+
+        let latest_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
                 page: None,
             }))
             .await
-            .expect_err("v2 task output should remain capability-gated");
+            .expect("latest task-result snapshot should load")
+            .into_inner();
+        assert_eq!(vec!["replacement"], result_ids(&latest_page.results));
+        assert!(latest_page.output_revision > first_page.output_revision);
+        assert_ne!(
+            first_page_info.snapshot_id,
+            latest_page.page_info.unwrap().snapshot_id
+        );
+    }
 
-        assert_eq!(tonic::Code::Unimplemented, status.code());
+    #[tokio::test]
+    async fn list_task_results_continuation_survives_task_retention() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            task_retention_max_terminal_tasks: 1,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first = state
+            .tasks
+            .create_bilibili_task("BV1retained-page", None)
+            .expect("first task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &first.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Completed),
+                ],
+                Vec::new(),
+            )
+            .expect("first task output should be replaced");
+        state
+            .tasks
+            .complete_task_failed(&first.id, "First task finished.".to_owned())
+            .expect("first task should become terminal");
+        let service = TaskGrpcService::new(state.clone());
+        let first_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("first page should load")
+            .into_inner();
+        let continuation = first_page
+            .page_info
+            .expect("first page should have page info")
+            .next_page_token;
+
+        sleep(Duration::from_millis(2)).await;
+        let second = state
+            .tasks
+            .create_bilibili_task("BV1newer-terminal", None)
+            .expect("second task should be created");
+        state
+            .tasks
+            .complete_task_failed(&second.id, "Second task finished.".to_owned())
+            .expect("second task should become terminal");
+        assert!(state.tasks.get_task(&first.id).is_err());
+
+        let second_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: continuation,
+                }),
+            }))
+            .await
+            .expect("retained snapshot should outlive task metadata")
+            .into_inner();
+        assert_eq!(vec!["result-2"], result_ids(&second_page.results));
+    }
+
+    #[tokio::test]
+    async fn list_task_results_rejects_unknown_and_cross_task_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let first = state
+            .tasks
+            .create_bilibili_task("BV1first", None)
+            .expect("first task should be created");
+        let second = state
+            .tasks
+            .create_bilibili_task("BV1second", None)
+            .expect("second task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &first.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Completed),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let service = TaskGrpcService::new(state);
+        let first_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: first.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let token = first_page.page_info.unwrap().next_page_token;
+
+        let cross_task = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: second.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: token,
+                }),
+            }))
+            .await
+            .expect_err("page token must be bound to its task");
+        assert_eq!(tonic::Code::InvalidArgument, cross_task.code());
+
+        let unknown = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "missing".to_owned(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: "edited-token".to_owned(),
+                }),
+            }))
+            .await
+            .expect_err("unknown token must be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, unknown.code());
+    }
+
+    #[tokio::test]
+    async fn task_output_v2_is_not_advertised_when_durable_state_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let task_state_path = temp.path().join("tasks.json");
+        fs::write(&task_state_path, "{ invalid json")
+            .expect("invalid task state should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should remain available")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+
+        let status = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "task-one".to_owned(),
+                page: None,
+            }))
+            .await
+            .expect_err("durable task output should remain gated");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+    }
+
+    #[tokio::test]
+    async fn task_output_v2_capability_drops_after_a_snapshot_save_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let task_state_path = temp.path().join("state").join("tasks.json");
+        let state = AppState::new(CacheServerOptions {
+            root_path: temp.path().join("cache"),
+            task_state_path: task_state_path.clone(),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        fs::remove_file(&task_state_path).expect("startup should probe task persistence");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let error = state
+            .tasks
+            .create_bilibili_task("BV1save-failure", None)
+            .expect_err("task creation must reject an uncommitted snapshot");
+        assert_eq!(tonic::Code::Unavailable, error.code());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should remain available")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::TaskOutputV2 as i32))
+        );
+        let status = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: "missing".to_owned(),
+                page: None,
+            }))
+            .await
+            .expect_err("v2 result reads must fail after persistence degrades");
+        assert_eq!(tonic::Code::FailedPrecondition, status.code());
+    }
+
+    #[tokio::test]
+    async fn list_task_results_enforces_default_and_maximum_page_sizes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1page-size", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                (0..201)
+                    .map(|index| task_result(&format!("result-{index:03}"), TaskState::Completed))
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        let service = TaskGrpcService::new(state);
+
+        let default_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 0,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(DEFAULT_TASK_RESULT_PAGE_SIZE, default_page.results.len());
+        assert!(!default_page.page_info.unwrap().next_page_token.is_empty());
+
+        let maximum_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: Some(PageRequest {
+                    page_size: u32::MAX,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(MAX_TASK_RESULT_PAGE_SIZE, maximum_page.results.len());
+        assert!(!maximum_page.page_info.unwrap().next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_task_results_projects_resource_uris_through_public_media_base() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1resource-uri", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "cover_one".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 42,
+            size_known: true,
+            ..Default::default()
+        })
+        .unwrap();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover-artifact".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .unwrap();
+
+        let page = TaskGrpcService::new(state)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let uri = &page.results[0].artifacts[0]
+            .resource
+            .as_ref()
+            .expect("artifact should include resource")
+            .uri;
+        assert_eq!("https://atri.ink/cache/resources/cover_one", uri);
+        assert!(!uri.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn immutable_result_snapshot_keeps_its_resources_authorized() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1snapshot-resource", None)
+            .unwrap();
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "snapshot-cover".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    TaskResult {
+                        id: "result-2".to_owned(),
+                        state: TaskState::Completed.into(),
+                        artifacts: vec![TaskArtifact {
+                            id: "cover".to_owned(),
+                            kind: TaskArtifactKind::CoverImage.into(),
+                            state: TaskArtifactState::Available.into(),
+                            resource: Some(resource.resource.clone()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                vec![resource],
+            )
+            .unwrap();
+        let first = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![task_result("replacement", TaskState::Completed)],
+                Vec::new(),
+            )
+            .unwrap();
+
+        let old_second_page = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: first.page_info.unwrap().next_page_token,
+                }),
+            }))
+            .await
+            .expect("a reconnected client should finish the immutable snapshot")
+            .into_inner();
+        let returned_resource = old_second_page.results[0].artifacts[0]
+            .resource
+            .as_ref()
+            .expect("old snapshot resource should remain projected");
+        assert_eq!("snapshot-cover", returned_resource.id);
+        assert!(state.tasks.task_resource("snapshot-cover").is_some());
+    }
+
+    fn initialized_cache_root(temp: &tempfile::TempDir) -> PathBuf {
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        root_path
+    }
+
+    fn task_result(id: &str, state: TaskState) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    fn task_result_with_artifacts(id: &str, artifact_count: usize) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![
+                crate::generated::tvos_net_player::v1::TaskArtifact::default();
+                artifact_count
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn result_ids(results: &[TaskResult]) -> Vec<&str> {
+        results.iter().map(|result| result.id.as_str()).collect()
     }
 
     #[test]
@@ -2949,6 +6176,46 @@ mod tests {
         assert_eq!(13, ServerCapability::TaskOutputV2 as i32);
     }
 
+    #[test]
+    fn task_result_projection_revokes_an_expired_resource() {
+        use crate::generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let result = TaskResult {
+            id: "expired-result".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "expired-artifact".to_owned(),
+                kind: TaskArtifactKind::Subtitle.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(CacheResourceRef {
+                    id: "expired-resource".to_owned(),
+                    expires_at: Some(prost_types::Timestamp {
+                        seconds: 0,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let projected = task_result_for_client(result, false, |_| {
+            panic!("an expired resource must not receive a public URI")
+        })
+        .expect("expired result should remain representable");
+
+        let artifact = &projected.artifacts[0];
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert_eq!(
+            "cache.resource_expired",
+            artifact.problem.as_ref().unwrap().code
+        );
+    }
+
     #[tokio::test]
     async fn get_server_info_advertises_lan_transcoding_when_enabled() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -2957,6 +6224,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             lan_transcoding_enabled: true,
@@ -2984,6 +6252,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3028,6 +6297,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path.clone()),
@@ -3096,6 +6366,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -3160,6 +6431,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -3221,6 +6493,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -3264,6 +6537,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3289,6 +6563,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3334,6 +6609,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3383,6 +6659,7 @@ mod tests {
         fs::create_dir_all(&root_path).expect("cache root should be created");
         let credentials_path = temp.path().join("missing-credentials.json");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path.clone()),
@@ -3415,6 +6692,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         fs::write(root_path.join("sample.mp4"), b"sample").expect("media file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path: root_path.clone(),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -3474,6 +6752,7 @@ mod tests {
         };
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -3587,6 +6866,7 @@ mod tests {
         };
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -3637,6 +6917,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -3691,6 +6972,8 @@ mod tests {
             },
             Arc::new(EmptyPlaybackPlanner),
         );
+        let initial_snapshot = fs::read(&task_state_path)
+            .expect("startup persistence probe should write an empty snapshot");
         let service = TaskGrpcService::new(state);
         let cases = [
             (
@@ -3736,7 +7019,7 @@ mod tests {
             assert_eq!(tonic::Code::InvalidArgument, error.code());
             assert!(error.message().contains(field));
         }
-        assert!(!task_state_path.exists());
+        assert_eq!(initial_snapshot, fs::read(task_state_path).unwrap());
     }
 
     #[tokio::test]
@@ -3749,6 +7032,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -3793,6 +7077,7 @@ mod tests {
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
+                task_state_path: temp.path().join("state").join("tasks.json"),
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -3804,7 +7089,7 @@ mod tests {
             }),
         );
         let tasks = Arc::clone(&state.tasks);
-        let service = TaskGrpcService::new(state);
+        let service = TaskGrpcService::new(state.clone());
 
         let created = service
             .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
@@ -3852,6 +7137,12 @@ mod tests {
                 && item.playback_source.is_some()
                 && item.playback_session.is_some()
         }));
+        assert!(playable.result_items.iter().all(|item| {
+            state.hls_cache.playback_session(&item.id).is_some()
+                && state
+                    .tasks
+                    .task_authorizes_hls_session_for_cleanup(&item.id)
+        }));
         assert_eq!(
             vec![("BV1range".to_owned(), None)],
             *resolve_requests
@@ -3869,6 +7160,226 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_hls_result_publication_serializes_with_overflow_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1publication-overflow", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let metadata = playback_task_metadata(&child_session_id, sample_playback_plan())
+            .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let result_items = vec![BilibiliTaskResultItem {
+            id: child_session_id.clone(),
+            selection_id: "page:2".to_owned(),
+            title: "Part 2".to_owned(),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-2".to_owned(),
+            index: 2,
+            state: TaskState::Playable.into(),
+            message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            playback_source: Some(playback_source),
+            playback_session: Some(metadata.playback_session),
+        }];
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-publication-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    crate::MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        let (manifest_saved_sender, manifest_saved_receiver) = std::sync::mpsc::channel();
+        let (publication_release_sender, publication_release_receiver) = std::sync::mpsc::channel();
+        let publisher_state = state.clone();
+        let publisher_task_id = task_id.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_explicit_bilibili_hls_result_with_post_save_hook(
+                &publisher_state,
+                ExplicitBilibiliHlsResultPublication {
+                    task_id: publisher_task_id,
+                    title: "Collection".to_owned(),
+                    message: "Planned 1/2 Bilibili playback result(s).".to_owned(),
+                    progress: 0.5,
+                    result_items,
+                    hls_session: metadata.hls_session,
+                },
+                || {
+                    manifest_saved_sender
+                        .send(())
+                        .expect("test should observe the saved child manifest");
+                    publication_release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release result publication");
+                },
+            )
+        });
+        manifest_saved_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("result publication should reach the manifest boundary");
+
+        let (cleanup_started_sender, cleanup_started_receiver) = std::sync::mpsc::channel();
+        let (cleanup_finished_sender, cleanup_finished_receiver) = std::sync::mpsc::channel();
+        let cleanup_state = state.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_started_sender
+                .send(())
+                .expect("test should observe overflow cleanup start");
+            cleanup_state
+                .enforce_hls_cache_quota("publication_overflow_cleanup", Vec::new(), 0)
+                .expect("overflow cleanup should complete");
+            cleanup_finished_sender
+                .send(())
+                .expect("test should observe overflow cleanup completion");
+        });
+        cleanup_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("overflow cleanup should start");
+        assert!(
+            matches!(
+                cleanup_finished_receiver.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "overflow cleanup must wait for the task result publication"
+        );
+
+        publication_release_sender
+            .send(())
+            .expect("test should release result publication");
+        publisher
+            .join()
+            .expect("result publisher should not panic")
+            .expect("result publication should succeed");
+        cleanup_finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("overflow cleanup should finish after publication");
+        cleanup.join().expect("overflow cleanup should not panic");
+
+        let task = state
+            .tasks
+            .get_task(&task_id)
+            .expect("preparing task should remain visible");
+        assert_eq!(TaskState::Preparing, task.state());
+        assert!(
+            task.result_items
+                .iter()
+                .any(|item| { item.id == child_session_id && item.state() == TaskState::Playable })
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_rejects_late_explicit_hls_result_publication() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1late-explicit-publication", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let metadata = playback_task_metadata(&child_session_id, sample_playback_plan())
+            .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let result_items = vec![BilibiliTaskResultItem {
+            id: child_session_id.clone(),
+            selection_id: "page:2".to_owned(),
+            title: "Part 2".to_owned(),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-2".to_owned(),
+            index: 2,
+            state: TaskState::Playable.into(),
+            message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            playback_source: Some(playback_source),
+            playback_session: Some(metadata.playback_session),
+        }];
+
+        let cancelled = TaskGrpcService::new(state.clone())
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("preparing task should accept cancellation")
+            .into_inner();
+        assert_eq!(TaskState::CancelRequested, cancelled.state());
+
+        let post_save_called = Arc::new(AtomicBool::new(false));
+        let post_save_called_for_hook = Arc::clone(&post_save_called);
+        let publication = publish_explicit_bilibili_hls_result_with_post_save_hook(
+            &state,
+            ExplicitBilibiliHlsResultPublication {
+                task_id: task_id.clone(),
+                title: "Collection".to_owned(),
+                message: "Planned 1/2 Bilibili playback result(s).".to_owned(),
+                progress: 0.5,
+                result_items,
+                hls_session: metadata.hls_session,
+            },
+            move || post_save_called_for_hook.store(true, AtomicOrdering::Release),
+        )
+        .expect("late publication should return the cancelled task");
+
+        assert_eq!(TaskState::CancelRequested, publication.state());
+        assert!(!post_save_called.load(AtomicOrdering::Acquire));
+        assert!(publication.result_items.is_empty());
+        assert!(state.hls_sessions.get(&child_session_id).is_none());
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_none()
+        );
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&child_session_id)
+                .exists()
+        );
+    }
+
     #[tokio::test]
     async fn create_bilibili_playback_task_executes_all_selection_results() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -3880,6 +7391,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -3976,6 +7488,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -4474,6 +7987,7 @@ mod tests {
         let sensitive_detail = "restricted proxy rejected playurl at https://example.test/playurl?access_key=result-sensitive-marker";
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -4617,6 +8131,7 @@ mod tests {
         resolution.candidates_truncated = true;
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -4729,6 +8244,13 @@ mod tests {
         ));
 
         let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled result planning cleanup should finish");
 
         assert!(cancelled.playback_source.is_none());
         assert!(cancelled.playback_session.is_none());
@@ -4778,6 +8300,7 @@ mod tests {
         let (resolve_started_sender, resolve_started) = oneshot::channel();
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -4848,6 +8371,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -4951,6 +8475,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -5033,6 +8558,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -5117,6 +8643,7 @@ mod tests {
         let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -5212,6 +8739,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -5590,6 +9118,13 @@ mod tests {
             .expect("test should send playback plan");
 
         let cancelled = wait_for_task_state(&tasks, &created.id, TaskState::Cancelled).await;
+        timeout(Duration::from_secs(1), async {
+            while !state.background_work_is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled planning cleanup should finish");
 
         assert!(cancelled.playback_source.is_none());
         assert!(cancelled.playback_session.is_none());
@@ -6050,7 +9585,7 @@ mod tests {
                 .get_completed_library_item(&expected_item_id)
                 .is_none()
         );
-        assert!(hls_session_dir.exists());
+        assert!(!hls_session_dir.exists());
 
         let second_corrupted_restore =
             AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
@@ -6065,7 +9600,62 @@ mod tests {
                 .get(&completed.id)
                 .is_none()
         );
-        assert!(hls_session_dir.exists());
+        assert!(!hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_library_item_refuses_a_completed_manifest_owned_by_a_playable_task() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                allow_library_item_delete: true,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, hls_session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1finalization-delete-race", &upstream_url);
+        let completed_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &hls_session)
+            .await
+            .expect("cache fill should install its completed manifest");
+        assert_eq!(library_item_id, completed_item_id);
+
+        let deleted = CacheGrpcService::new(state.clone())
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: library_item_id.clone(),
+            }))
+            .await
+            .expect("the in-flight finalization item should be refused without an error")
+            .into_inner();
+
+        assert!(!deleted.deleted);
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(task_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -6109,6 +9699,7 @@ mod tests {
 
         let completed = wait_for_task_state(&state.tasks, &created.id, TaskState::Completed).await;
         let expected_item_id = format!("bilibili.hls.{}", completed.id);
+        let task_state_path = options.task_state_path.clone();
         assert!(
             state
                 .hls_cache
@@ -6130,6 +9721,36 @@ mod tests {
             RuntimeTestHlsWeakNetworkState::UpstreamFailed,
             state.hls_weak_network_status().state
         );
+
+        let durable_state = fs::read(&task_state_path).expect("task state should be readable");
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let failed_delete = cache_service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: expected_item_id.clone(),
+            }))
+            .await
+            .expect_err("cache bytes must remain when the deletion tombstone is rejected");
+        assert_eq!(tonic::Code::Unavailable, failed_delete.code());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&expected_item_id)
+                .is_some()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&completed.id)
+                .exists()
+        );
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&completed.id).unwrap().state()
+        );
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        fs::write(&task_state_path, durable_state).expect("task state should be restored");
 
         let deleted = cache_service
             .delete_library_item(Request::new(DeleteLibraryItemRequest {
@@ -6193,7 +9814,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_library_item_removes_sibling_result_hls_sessions() {
+    async fn delete_library_item_waits_for_a_durable_task_tombstone() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let completed =
+            create_completed_hls_playback_task(&state, "BV1durable-delete", &upstream_url).await;
+        let session_path = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&completed.task_id);
+        state.tasks.fail_next_persistence_directory_sync();
+
+        let error = state
+            .delete_completed_hls_library_item(&completed.library_item_id)
+            .await
+            .expect_err("an installed but non-durable tombstone must not delete HLS bytes");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(!state.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&completed.task_id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&completed.library_item_id)
+                .is_some()
+        );
+        assert!(session_path.exists());
+
+        let deleted = state
+            .delete_completed_hls_library_item(&completed.library_item_id)
+            .await
+            .expect("the retry should first make the tombstone durable");
+
+        assert_eq!(Some(true), deleted);
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&completed.library_item_id)
+                .is_none()
+        );
+        assert!(!session_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_keeps_cache_when_state_commit_is_rejected() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-persist", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        assert!(hls_session_dir.exists());
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let error = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect_err("HLS cleanup must wait for a committed cancellation");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        let task = state
+            .tasks
+            .get_task(&task_id)
+            .expect("rejected cancellation should preserve the task");
+        assert_eq!(TaskState::Playable, task.state());
+        assert!(task.playback_source.is_some());
+        assert!(task.playback_session.is_some());
+        assert!(state.hls_sessions.get(&task_id).is_some());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_waits_for_durable_state_before_removing_cache() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-durable", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        state.tasks.fail_next_persistence_directory_sync();
+
+        let error = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect_err("non-durable cancellation must not remove HLS cache data");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(state.hls_sessions.get(&task_id).is_some());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
+
+        let cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("retry should make cancellation durable before cleanup")
+            .into_inner();
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.tasks.persistence_available());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_none());
+        assert!(!hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_retries_failed_physical_cleanup() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                hls_cache_max_bytes: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, _hls_session, _library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1cancel-cleanup-retry", &upstream_url);
+        let service = TaskGrpcService::new(state.clone());
+        let hls_session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+        state.hls_cache.fail_next_remove_session(task_id.clone());
+
+        let cancelled = service
+            .cancel_task(Request::new(CancelTaskRequest {
+                id: task_id.clone(),
+            }))
+            .await
+            .expect("durable cancellation should remain successful")
+            .into_inner();
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_some());
+        assert!(hls_session_dir.exists());
+
+        let summary = state
+            .enforce_hls_cache_quota("cancelled_task_cleanup_retry", Vec::new(), 0)
+            .expect("maintenance should retry cleanup even when quota eviction is disabled");
+
+        assert!(summary.is_none());
+        assert!(state.hls_cache.playback_session(&task_id).is_none());
+        assert!(!hls_session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_library_item_retries_failed_sibling_result_hls_cleanup() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -6318,7 +10155,75 @@ mod tests {
         state
             .hls_sessions
             .insert(sanitized_completed_session(&primary_metadata.hls_session));
+        assert!(state.hls_fill_scheduler.enqueue_demoted(
+            creation.task.id.clone(),
+            child_metadata.hls_session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_child_fill = state.hls_fill_scheduler.next_job().await;
+        assert_eq!(child_session_id, active_child_fill.session.id);
         assert!(state.hls_sessions.get(&child_session_id).is_some());
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
+        );
+        state
+            .hls_cache
+            .fail_next_remove_session(child_session_id.clone());
+
+        let deletion_service = cache_service.clone();
+        let deletion_item_id = library_item_id.clone();
+        let deletion = tokio::spawn(async move {
+            deletion_service
+                .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                    id: deletion_item_id,
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_child_fill.token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed HLS deletion should cancel the active sibling fill");
+        assert!(!deletion.is_finished());
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&creation.task.id)
+                .exists()
+        );
+        assert!(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&child_session_id)
+                .exists()
+        );
+        state
+            .hls_fill_scheduler
+            .finish_current(&active_child_fill, false);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), deletion)
+            .await
+            .expect("completed HLS deletion should finish after the active fill exits")
+            .expect("completed HLS deletion task should not panic")
+            .expect_err("partial HLS cache cleanup should be retryable");
+
+        assert_eq!(tonic::Code::Internal, error.code());
+        assert!(state.tasks.get_task(&creation.task.id).is_err());
+        assert!(state.hls_sessions.get(&creation.task.id).is_none());
+        assert!(state.hls_sessions.get(&child_session_id).is_some());
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&creation.task.id)
+                .is_none()
+        );
         assert!(
             state
                 .hls_cache
@@ -6331,7 +10236,7 @@ mod tests {
                 id: library_item_id,
             }))
             .await
-            .expect("completed HLS cache item should delete")
+            .expect("retry should finish the remaining HLS cache cleanup")
             .into_inner();
 
         assert!(deleted.deleted);
@@ -7289,16 +11194,17 @@ mod tests {
     }
 
     #[test]
-    fn completed_hls_cleanup_item_accepts_playable_secondary_result_cache() {
+    fn completed_hls_cleanup_item_preserves_committed_secondary_after_failed_save() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = temp.path().join(".state").join("tasks.json");
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
-                task_state_path: temp.path().join(".state").join("tasks.json"),
+                task_state_path: task_state_path.clone(),
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -7402,10 +11308,40 @@ mod tests {
                 &child_library_item_id,
             )
         );
+
+        std::fs::remove_file(&task_state_path).expect("task state should be removable");
+        std::fs::create_dir(&task_state_path)
+            .expect("a directory should reject the next snapshot replacement");
+        let error = state
+            .tasks
+            .complete_task_failed(&creation.task.id, "Hidden failure.".to_owned())
+            .expect_err("an unpersisted terminal state must not be acknowledged");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(
+            state
+                .tasks
+                .protected_hls_cache_session_ids()
+                .contains(&child_session_id)
+        );
+        assert!(
+            !state
+                .remove_evicted_completed_hls_task(&crate::hls_cache::HlsCacheCompletedEntry {
+                    session_id: child_session_id,
+                    library_item_id: child_library_item_id,
+                    size_bytes: 1,
+                    updated_at: SystemTime::now(),
+                })
+                .expect("a rejected task mutation should skip physical eviction")
+        );
     }
 
     #[tokio::test]
-    async fn hls_cache_quota_accounts_for_grouped_completed_result_sessions() {
+    async fn hls_cache_quota_retries_failed_group_member_below_high_watermark() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -7537,21 +11473,14 @@ mod tests {
         state
             .hls_sessions
             .insert(sanitized_completed_session(&primary_metadata.hls_session));
+        state
+            .hls_cache
+            .fail_next_remove_session(child_session_id.clone());
 
-        let summary = state
+        state
             .enforce_hls_cache_quota("test", Vec::new(), 0)
-            .expect("eviction should scan cache")
-            .expect("quota should trigger eviction");
+            .expect_err("a failed grouped cleanup should remain retryable");
 
-        assert_eq!(2 * session_size, summary.started_used_bytes);
-        assert_eq!(0, summary.finished_used_bytes);
-        assert_eq!(0, summary.target_used_bytes);
-        assert_eq!(2 * session_size, summary.evicted_bytes);
-        assert_eq!(
-            vec![creation.task.id.clone(), child_session_id.clone()],
-            summary.evicted_session_ids
-        );
-        assert!(summary.target_reached);
         assert!(
             state
                 .hls_cache
@@ -7562,9 +11491,88 @@ mod tests {
             state
                 .hls_cache
                 .get_completed_library_item(&child_library_item_id)
-                .is_none()
+                .is_some()
         );
         assert!(state.tasks.get_task(&creation.task.id).is_err());
+
+        let retry = state
+            .enforce_hls_cache_quota("test-retry", Vec::new(), 0)
+            .expect("the retained cleanup should retry before the watermark check");
+
+        assert!(
+            retry.is_none(),
+            "the remaining child session is already below the high watermark"
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&child_library_item_id)
+                .is_none()
+        );
+        assert!(state.hls_sessions.get(&child_session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_quota_evicts_independent_entries_while_pending_cleanup_still_fails() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                hls_cache_max_bytes: session_size * 3,
+                hls_cache_high_watermark_percent: 50,
+                hls_cache_low_watermark_percent: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let pending =
+            create_completed_hls_playback_task(&state, "BV1pending-cleanup", &upstream_url).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let independent =
+            create_completed_hls_playback_task(&state, "BV1independent-eviction", &upstream_url)
+                .await;
+        state
+            .hls_cache
+            .fail_next_remove_session(pending.task_id.clone());
+        state
+            .delete_completed_hls_library_item(&pending.library_item_id)
+            .await
+            .expect_err("the first physical cleanup should remain pending");
+        state
+            .hls_cache
+            .fail_next_remove_session(pending.task_id.clone());
+
+        let summary = state
+            .enforce_hls_cache_quota("pending-cleanup", Vec::new(), 0)
+            .expect("one undeletable pending session must not abort quota eviction")
+            .expect("the independent completed entry should trigger eviction");
+
+        assert_eq!(
+            vec![independent.task_id.clone()],
+            summary.evicted_session_ids
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&pending.library_item_id)
+                .is_some()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&independent.library_item_id)
+                .is_none()
+        );
+        assert!(state.tasks.get_task(&independent.task_id).is_err());
     }
 
     #[tokio::test]
@@ -7625,6 +11633,50 @@ mod tests {
         );
         assert!(state.tasks.get_task(&just_used.task_id).is_ok());
         assert!(state.tasks.get_task(&evictable.task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_quota_rechecks_cancellation_after_deletion_lock() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let cached =
+            create_completed_hls_playback_task(&state, "BV1cancel-after-lock", &upstream_url).await;
+        let should_cancel_calls = std::cell::Cell::new(0_usize);
+
+        let summary = state
+            .enforce_hls_cache_quota_until_cancelled("test", Vec::new(), 0, || {
+                let call = should_cancel_calls.get();
+                should_cancel_calls.set(call + 1);
+                call == 4
+            })
+            .expect("eviction scan should remain valid");
+
+        assert!(summary.is_none(), "late cancellation must stop eviction");
+        assert!(should_cancel_calls.get() >= 5);
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&cached.library_item_id)
+                .is_some()
+        );
+        assert!(state.tasks.get_task(&cached.task_id).is_ok());
     }
 
     #[tokio::test]
@@ -7957,6 +12009,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_finalization_waits_for_quota_enforcement_recovery() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 2,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let older =
+            create_completed_hls_playback_task(&state, "BV1quota-failure-older", &upstream_url)
+                .await;
+        let (task_id, mut session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1quota-failure-current", &upstream_url);
+        session.variant.video.request.size = Some(session_size);
+        state.hls_sessions.insert(session.clone());
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+        state
+            .hls_cache
+            .fail_next_remove_session(older.task_id.clone());
+
+        let outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            job.task_id.clone(),
+            job.session.clone(),
+            job.failure_mode,
+            job.token.clone(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::QuotaPending, outcome);
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&task_id, "video.m4s")
+                .is_none()
+        );
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert!(state.hls_fill_scheduler.owns_session(&task_id));
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        assert_eq!(
+            crate::hls_fill_scheduler::HlsFillPriority::Demoted,
+            retry.priority
+        );
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            retry.task_id.clone(),
+            retry.session.clone(),
+            retry.failure_mode,
+            retry.token.clone(),
+        )
+        .await;
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        state.hls_fill_scheduler.finish_current(&retry, false);
+
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn hls_cache_finalization_enforces_quota_after_unknown_projected_size() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -8153,6 +12288,62 @@ mod tests {
                 .is_some()
         );
         assert!(state.tasks.get_task(&cached.task_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_hls_cache_quota_monitor_retries_pending_physical_cleanup() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                hls_cache_max_bytes: 0,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let cached =
+            create_completed_hls_playback_task(&state, "BV1disabled-cleanup", &upstream_url).await;
+        state
+            .hls_cache
+            .fail_next_remove_session(cached.task_id.clone());
+        state
+            .delete_completed_hls_library_item(&cached.library_item_id)
+            .await
+            .expect_err("the first physical cleanup should remain pending");
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&cached.library_item_id)
+                .is_some()
+        );
+
+        let monitor = state.spawn_hls_cache_quota_monitor_for_tests(Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .hls_cache
+                    .get_completed_library_item(&cached.library_item_id)
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the maintenance monitor should retry pending cleanup");
+        monitor.abort();
+        let _ = monitor.await;
+
+        assert!(state.tasks.get_task(&cached.task_id).is_err());
     }
 
     #[tokio::test]
@@ -9776,6 +13967,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hls_cache_fill_failure_directory_sync_retry_does_not_repeat_cache_work() {
+        let (upstream_url, _upstream_task, upstream_requests) =
+            start_counted_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1cache-fill-directory-sync-retry",
+            &upstream_url,
+        );
+        state.tasks.fail_next_persistence_directory_sync();
+
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let worker = tokio::spawn(run_hls_cache_fill_worker(state.clone()));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.tasks.persistence_available()
+                    && state
+                        .tasks
+                        .hls_session_has_online_playback_after_cache_fill_failure(
+                            &task_id, &task_id,
+                        )
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cache failure marker should become visible before it is durable");
+        let requests_after_failure = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_failure > 0);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if state.tasks.persistence_available() && state.hls_fill_scheduler.is_idle() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued failure marker should become durable");
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must not repeat the failed download"
+        );
+
+        state
+            .hls_fill_scheduler
+            .shutdown_and_wait_for_worker()
+            .await;
+        worker.await.expect("HLS cache fill worker should stop");
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        assert!(
+            restored
+                .tasks
+                .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &task_id),
+            "the failure marker should survive restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_failure_requeues_until_failure_state_is_durable() {
+        let (upstream_url, _upstream_task, upstream_requests) =
+            start_counted_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1cache-fill-state-retry", &upstream_url);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        let pending = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, pending.state());
+        assert!(!pending.message.contains("offline cache fill failed"));
+        assert!(!state.tasks.persistence_available());
+        let requests_after_failure = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_failure > 0);
+
+        let blocked_retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            blocked_retry_outcome
+        );
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "a rejected failure marker must be retried before repeating cache work"
+        );
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        let playable = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.message.contains("offline cache fill failed"));
+        assert!(state.tasks.persistence_available());
+        assert_eq!(
+            requests_after_failure,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must not repeat the failed download"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_hls_failure_keeps_media_until_task_state_is_durable() {
+        let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1restore-state-retry", &upstream_url);
+        let session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&task_id);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(session_dir.exists());
+        assert!(state.hls_sessions.get(&task_id).is_some());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::FailRestoredTask,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(!session_dir.exists());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test]
     async fn app_state_fails_restored_hls_task_when_cache_finalization_fails() {
         let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -10813,6 +15237,723 @@ mod tests {
         assert!(runtime_session.variant.video.request.headers.is_empty());
     }
 
+    #[tokio::test]
+    async fn playback_planning_cleanup_retries_persistence_before_removing_hls_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-cleanup-retry", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                PlaybackSource {
+                    item_id: creation.task.id.clone(),
+                    variant_id: metadata.playback_session.selected_variant_id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{}/master.m3u8",
+                        creation.task.id
+                    ),
+                    expires_at: None,
+                },
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        let session_dir = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&creation.task.id);
+        assert!(session_dir.exists());
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        drop(PlaybackPlanningCleanup::new(
+            state.clone(),
+            creation.task.id.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.tasks.persistence_available() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("planning cleanup should attempt terminal persistence");
+
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(session_dir.exists());
+        assert!(state.hls_sessions.get(&creation.task.id).is_some());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let task = state.tasks.get_task(&creation.task.id).unwrap();
+                if task.state() == TaskState::Failed
+                    && !session_dir.exists()
+                    && state.hls_sessions.get(&creation.task.id).is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("planning cleanup should finish after persistence recovers");
+        assert!(state.tasks.persistence_available());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn playback_planning_terminal_persistence_does_not_block_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-blocking-persistence", None, None)
+            .expect("playback task should be created durably");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        state
+            .tasks
+            .block_next_persistence_save(Arc::clone(&entered), Arc::clone(&resume));
+
+        let persistence_entered = Arc::new(AtomicBool::new(false));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_entered = Arc::clone(&entered);
+        let observer_resume = Arc::clone(&resume);
+        let observer_persistence_entered = Arc::clone(&persistence_entered);
+        let observer_runtime_progressed = Arc::clone(&runtime_progressed);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            observer_persistence_entered.store(true, AtomicOrdering::Release);
+            let progress_deadline = StdInstant::now() + Duration::from_millis(500);
+            while !observer_runtime_progressed.load(AtomicOrdering::Acquire)
+                && StdInstant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release =
+                observer_runtime_progressed.load(AtomicOrdering::Acquire);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_persistence_entered = Arc::clone(&persistence_entered);
+        let heartbeat_runtime_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            while !heartbeat_persistence_entered.load(AtomicOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            heartbeat_runtime_progressed.store(true, AtomicOrdering::Release);
+        });
+        let completion_state = state.clone();
+        let task_id = creation.task.id.clone();
+        let completion = tokio::spawn(async move {
+            complete_playback_planning_terminal(
+                &completion_state,
+                &task_id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed.".to_owned(),
+                Vec::new(),
+            )
+            .await
+        });
+
+        let completed = timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("terminal persistence should finish after the test releases storage")
+            .expect("terminal persistence task should not panic");
+        heartbeat.await.expect("runtime heartbeat should not panic");
+        let progressed_before_release =
+            observer.join().expect("persistence observer should finish");
+
+        assert!(
+            progressed_before_release,
+            "the single Tokio worker must progress while task persistence is blocked"
+        );
+        assert!(completed);
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hls_completion_persistence_does_not_block_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, library_item_id) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-blocking-persistence",
+            "https://example.test/video.m4s",
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        state
+            .tasks
+            .block_next_persistence_save(Arc::clone(&entered), Arc::clone(&resume));
+
+        let persistence_entered = Arc::new(AtomicBool::new(false));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_entered = Arc::clone(&entered);
+        let observer_resume = Arc::clone(&resume);
+        let observer_persistence_entered = Arc::clone(&persistence_entered);
+        let observer_runtime_progressed = Arc::clone(&runtime_progressed);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            observer_persistence_entered.store(true, AtomicOrdering::Release);
+            let progress_deadline = StdInstant::now() + Duration::from_millis(500);
+            while !observer_runtime_progressed.load(AtomicOrdering::Acquire)
+                && StdInstant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release =
+                observer_runtime_progressed.load(AtomicOrdering::Acquire);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_persistence_entered = Arc::clone(&persistence_entered);
+        let heartbeat_runtime_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            while !heartbeat_persistence_entered.load(AtomicOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            heartbeat_runtime_progressed.store(true, AtomicOrdering::Release);
+        });
+        let completion_state = state.clone();
+        let completion_task_id = task_id.clone();
+        let completion_session = session.clone();
+        let completion = tokio::spawn(async move {
+            publish_completed_hls_cache(
+                &completion_state,
+                &completion_task_id,
+                &completion_session.id,
+                &completion_session,
+            )
+            .await
+        });
+
+        let outcome = timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("HLS completion should finish after the test releases storage")
+            .expect("HLS completion task should not panic");
+        heartbeat.await.expect("runtime heartbeat should not panic");
+        let progressed_before_release =
+            observer.join().expect("persistence observer should finish");
+
+        assert!(
+            progressed_before_release,
+            "the single Tokio worker must progress while HLS completion persistence is blocked"
+        );
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, outcome);
+        let completed = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(library_item_id, completed.library_item_id);
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_retains_ownership_until_installed_completion_is_durable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-directory-sync-retry",
+            "https://example.test/video.m4s",
+        );
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+
+        state.tasks.fail_next_persistence_directory_sync();
+        let outcome =
+            publish_completed_hls_cache(&state, &job.task_id, &job.session.id, &job.session).await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            state
+                .tasks
+                .hls_session_publication_state(&task_id, &session.id)
+        );
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert!(state.hls_fill_scheduler.owns_session(&session.id));
+        assert_eq!(
+            1,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&session.id)
+        );
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        let retry_outcome =
+            publish_completed_hls_cache(&state, &retry.task_id, &retry.session.id, &retry.session)
+                .await;
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        state.hls_fill_scheduler.finish_current(&retry, false);
+
+        assert!(state.tasks.persistence_available());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(!state.hls_fill_scheduler.owns_session(&session.id));
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_releases_ownership_after_permanent_publication_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-permanent-rejection",
+            "https://example.test/video.m4s",
+        );
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+
+        state.tasks.fail_next_persistence_directory_sync();
+        let outcome =
+            publish_completed_hls_cache(&state, &job.task_id, &job.session.id, &job.session).await;
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        state.hls_fill_scheduler.finish_current(&job, true);
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        state
+            .tasks
+            .inject_permanently_invalid_playback_result_for_test(&task_id);
+        let retry_outcome = timeout(
+            Duration::from_secs(1),
+            run_hls_cache_finalization_inner(
+                state.clone(),
+                retry.task_id.clone(),
+                retry.session.clone(),
+                retry.failure_mode,
+                retry.token.clone(),
+            ),
+        )
+        .await
+        .expect("permanent publication rejection must not retry forever");
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert!(!hls_cache_fill_should_requeue(
+            &state,
+            &retry,
+            retry_outcome
+        ));
+        state.hls_fill_scheduler.finish_current(&retry, false);
+        assert!(!state.tasks.persistence_available());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(!state.hls_fill_scheduler.owns_session(&session.id));
+    }
+
+    #[tokio::test]
+    async fn playback_planning_terminal_returns_on_permanent_persistence_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-permanent-rejection", None, None)
+            .expect("playback task should be created durably");
+        state
+            .tasks
+            .inject_permanently_invalid_playback_result_for_test(&creation.task.id);
+
+        let completed = timeout(
+            Duration::from_secs(1),
+            complete_playback_planning_terminal(
+                &state,
+                &creation.task.id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed.".to_owned(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("permanent task-state rejection must not retry forever");
+
+        assert!(!completed);
+        assert!(!state.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Preparing,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_planning_terminal_returns_when_malformed_store_requires_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state parent should be created");
+        fs::write(&task_state_path, b"{ invalid task state")
+            .expect("invalid task state should be written");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1planning-detached-store", None, None)
+            .expect("registry should remain usable in memory");
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_playback_planning_terminal(
+                &state,
+                &creation.task.id,
+                PlaybackPlanningTerminalState::Failed,
+                "Planning failed in volatile mode.".to_owned(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("a detached malformed store cannot recover before restart");
+
+        assert!(completed);
+        assert!(state.tasks.persistence_configured());
+        assert!(!state.tasks.persistence_recovery_supported());
+        assert_eq!(
+            TaskState::Failed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_requeues_pending_playable_until_persistence_recovers() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1pending-fill", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("https://example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("legacy playable mutation should remain staged in memory");
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            state
+                .tasks
+                .hls_session_publication_state(&creation.task.id, &creation.task.id)
+        );
+
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            creation.task.id.clone(),
+            metadata.hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+        let outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            job.task_id.clone(),
+            job.session.clone(),
+            job.failure_mode,
+            job.token.clone(),
+        )
+        .await;
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert_eq!(
+            1,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&creation.task.id)
+        );
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        assert_eq!(
+            HlsSessionPublicationRecoveryOutcome::State(HlsSessionPublicationState::Published),
+            retry_pending_hls_session_publication(&state, &creation.task.id, &creation.task.id)
+                .await
+        );
+        let retried = state.hls_fill_scheduler.next_job().await;
+        state.hls_fill_scheduler.finish_current(&retried, false);
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(state.tasks.persistence_available());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_cache_fill_reuses_completed_transcode_until_terminal_state_persists() {
+        let (upstream_url, _upstream_task, upstream_requests) = start_counted_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                lan_transcoding_enabled: true,
+                lan_transcoding_ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1pending-terminal-fill", None, None)
+            .expect("playback task should be created durably");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url(&upstream_url),
+        )
+        .expect("playback metadata should map");
+        let mut hls_session = metadata.hls_session.clone();
+        mark_hls_session_transcoding_ready(&mut hls_session);
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("transcoding-ready session should persist");
+        state.hls_sessions.insert(hls_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("playable task state should persist");
+        let library_item_id =
+            crate::hls_cache::HlsCacheStore::completed_library_item_id(&creation.task.id);
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            creation.task.id.clone(),
+            hls_session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some(),
+            "completed media must survive a rejected terminal task snapshot"
+        );
+        let requests_after_completion = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_after_completion > 0);
+        let completed_session = state
+            .hls_cache
+            .completed_session(&creation.task.id)
+            .expect("completed transcoded session should be durable");
+        let runtime_session = state
+            .hls_sessions
+            .get(&creation.task.id)
+            .expect("completed media should replace the online runtime immediately");
+        assert_eq!(completed_session.variant, runtime_session.variant);
+        assert!(runtime_session.variant.video.request.url.is_empty());
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            creation.task.id.clone(),
+            hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&creation.task.id).unwrap().state()
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
+        assert!(state.hls_sessions.get(&creation.task.id).is_some());
+        assert_eq!(
+            requests_after_completion,
+            upstream_requests.load(Ordering::Relaxed),
+            "durability recovery must reuse the completed transcode without another download"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn hls_cache_finalizer_transcodes_ready_session_to_generated_runtime() {
@@ -11253,7 +16394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_state_hides_cancelled_hls_cache_session_after_restart() {
+    async fn app_state_removes_cancelled_hls_cache_session_after_restart() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -11333,7 +16474,7 @@ mod tests {
             restored
                 .hls_cache
                 .get_completed_library_item(&expected_item_id)
-                .is_some()
+                .is_none()
         );
         let restored_library = LibraryGrpcService::new(restored.clone())
             .list_library_items(Request::new(ListLibraryItemsRequest {
@@ -11349,7 +16490,7 @@ mod tests {
             .into_inner();
         assert!(restored_library.items.is_empty());
         assert!(
-            root_path
+            !root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)
@@ -11606,6 +16747,207 @@ mod tests {
                 .is_none()
         );
         assert!(state.hls_sessions.get(&creation.task.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_playable_hls_task_waits_for_scheduled_fill_before_removing_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1cancel-fill", None, None)
+            .expect("playback task should be created");
+        let metadata = playback_task_metadata(
+            &creation.task.id,
+            sample_playback_plan_with_video_url("http://upstream.example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        state
+            .hls_cache
+            .save_session(&metadata.hls_session)
+            .expect("planning should persist HLS session");
+        state.hls_sessions.insert(metadata.hls_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("task should become playable");
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            creation.task.id.clone(),
+            metadata.hls_session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let active_job = state.hls_fill_scheduler.next_job().await;
+        let session_manifest = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&creation.task.id)
+            .join("session.json");
+        assert!(session_manifest.exists());
+
+        let service = TaskGrpcService::new(state.clone());
+        let task_id = creation.task.id.clone();
+        let cancellation = tokio::spawn(async move {
+            service
+                .cancel_task(Request::new(CancelTaskRequest { id: task_id }))
+                .await
+                .expect("playable task should cancel")
+                .into_inner()
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_job.token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC cancellation should reach the active fill");
+
+        assert!(!cancellation.is_finished());
+        assert!(session_manifest.exists());
+        state.hls_fill_scheduler.finish_current(&active_job, false);
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), cancellation)
+            .await
+            .expect("RPC cancellation should finish after the active fill exits")
+            .expect("RPC cancellation task should not panic");
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(!session_manifest.exists());
+        assert!(state.hls_fill_scheduler.is_idle());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cancel_waits_for_single_hls_publication_before_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1publication-cancel", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let metadata = playback_task_metadata(
+            &task_id,
+            sample_playback_plan_with_video_url("http://upstream.example.test/video.m4s"),
+        )
+        .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: task_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let (publication_entered_sender, publication_entered_receiver) = oneshot::channel();
+        let (publication_release_sender, publication_release_receiver) = std::sync::mpsc::channel();
+        let publisher_state = state.clone();
+        let publisher_task_id = task_id.clone();
+        let publisher = tokio::spawn(async move {
+            publish_single_bilibili_hls_playback_with_pre_enqueue_hook(
+                &publisher_state,
+                &publisher_task_id,
+                metadata,
+                playback_source,
+                || {
+                    publication_entered_sender
+                        .send(())
+                        .expect("test should observe the publication boundary");
+                    publication_release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release HLS publication");
+                },
+            )
+        });
+        publication_entered_receiver
+            .await
+            .expect("publication should reach the pre-enqueue boundary");
+
+        let (cancellation_started_sender, cancellation_started_receiver) = oneshot::channel();
+        let cancellation_service = TaskGrpcService::new(state.clone());
+        let cancellation_task_id = task_id.clone();
+        let cancellation = tokio::spawn(async move {
+            cancellation_started_sender
+                .send(())
+                .expect("test should observe cancellation start");
+            cancellation_service
+                .cancel_task(Request::new(CancelTaskRequest {
+                    id: cancellation_task_id,
+                }))
+                .await
+                .expect("playable task should cancel")
+                .into_inner()
+        });
+        cancellation_started_receiver
+            .await
+            .expect("cancellation should start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cancellation.is_finished(),
+            "cancellation must wait until manifest publication and enqueue are fenced"
+        );
+
+        publication_release_sender
+            .send(())
+            .expect("test should release HLS publication");
+        let published = timeout(Duration::from_secs(2), publisher)
+            .await
+            .expect("publication should finish")
+            .expect("publication task should not panic")
+            .expect("publication should succeed");
+        assert_eq!(TaskState::Playable, published.state());
+        let cancelled = timeout(Duration::from_secs(2), cancellation)
+            .await
+            .expect("cancellation should finish after publication")
+            .expect("cancellation task should not panic");
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(
+            !root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&task_id)
+                .exists()
+        );
+        state.shutdown_hls_fill_worker().await;
     }
 
     #[tokio::test]
@@ -12785,37 +18127,77 @@ mod tests {
     }
 
     async fn start_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let (url, task, _) = start_counted_mp4_upstream().await;
+        (url, task)
+    }
+
+    async fn start_counted_mp4_upstream() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener should bind");
         let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let upstream_request_count = Arc::clone(&request_count);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/video.m4s", get(upstream_mp4)),
+                Router::new().route(
+                    "/video.m4s",
+                    get({
+                        let request_count = Arc::clone(&upstream_request_count);
+                        move |headers: HeaderMap| {
+                            let request_count = Arc::clone(&request_count);
+                            async move {
+                                request_count.fetch_add(1, Ordering::Relaxed);
+                                upstream_mp4(headers).await
+                            }
+                        }
+                    }),
+                ),
             )
             .await
             .expect("upstream should run");
         });
 
-        (format!("http://{addr}/video.m4s"), task)
+        (format!("http://{addr}/video.m4s"), task, request_count)
     }
 
     async fn start_failing_mp4_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let (url, task, _) = start_counted_failing_mp4_upstream().await;
+        (url, task)
+    }
+
+    async fn start_counted_failing_mp4_upstream()
+    -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener should bind");
         let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let upstream_request_count = Arc::clone(&request_count);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/video.m4s", get(upstream_unavailable)),
+                Router::new().route(
+                    "/video.m4s",
+                    get({
+                        let request_count = Arc::clone(&upstream_request_count);
+                        move |headers: HeaderMap| {
+                            let request_count = Arc::clone(&request_count);
+                            async move {
+                                request_count.fetch_add(1, Ordering::Relaxed);
+                                upstream_unavailable(headers).await
+                            }
+                        }
+                    }),
+                ),
             )
             .await
             .expect("upstream should run");
         });
 
-        (format!("http://{addr}/video.m4s"), task)
+        (format!("http://{addr}/video.m4s"), task, request_count)
     }
 
     async fn start_blocked_mp4_upstream()

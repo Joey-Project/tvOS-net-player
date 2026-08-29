@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    ffi::CString,
+    ffi::{CString, OsStr},
     fs::{self, File},
     io,
     path::{Component, Components, Path, PathBuf},
@@ -27,7 +27,6 @@ pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
 const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
-const INTERNAL_HLS_CACHE_DIR: &str = "hls";
 
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
@@ -248,11 +247,7 @@ impl LocalMediaLibrary {
             return Ok(false);
         };
 
-        match remove_file_no_follow(&self.root_path(), &media_file.relative_path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        remove_file_no_follow(&self.root_path(), &media_file.relative_path)
     }
 
     fn is_root_available_blocking(&self) -> bool {
@@ -373,7 +368,7 @@ impl LocalMediaLibrary {
         let Some(relative_path) = relative_path(&root_path, &full_candidate_path) else {
             return Ok(None);
         };
-        if is_internal_hls_cache_path(&relative_path) {
+        if is_internal_cache_path(&relative_path) {
             return Ok(None);
         }
         let media_content_type = content_type(&full_candidate_path).to_owned();
@@ -436,7 +431,7 @@ impl LocalMediaLibrary {
         }
 
         let relative_path = relative_path(root_path, &full_candidate_path)?;
-        if is_internal_hls_cache_path(&relative_path) {
+        if is_internal_cache_path(&relative_path) {
             return None;
         }
         if !self.supports_http_range_playback() {
@@ -647,7 +642,7 @@ fn collect_media_candidates(
         }
 
         if file_type.is_dir() {
-            if is_internal_hls_cache_dir(root_path, &path) {
+            if is_internal_cache_dir(root_path, &path) {
                 continue;
             }
             collect_media_candidates(
@@ -689,20 +684,23 @@ fn collect_media_candidates(
     Ok(())
 }
 
-fn is_internal_hls_cache_dir(root_path: &Path, path: &Path) -> bool {
+fn is_internal_cache_dir(root_path: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root_path) else {
         return false;
     };
-    is_internal_hls_cache_components(relative.components())
+    is_internal_cache_components(relative.components())
 }
 
-fn is_internal_hls_cache_path(relative_path: &str) -> bool {
-    is_internal_hls_cache_components(Path::new(relative_path).components())
+fn is_internal_cache_path(relative_path: &str) -> bool {
+    is_internal_cache_components(Path::new(relative_path).components())
 }
 
-fn is_internal_hls_cache_components(mut components: Components<'_>) -> bool {
-    matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_CACHE_DIR)
-        && matches!(components.next(), Some(Component::Normal(value)) if value == INTERNAL_HLS_CACHE_DIR)
+fn is_internal_cache_components(mut components: Components<'_>) -> bool {
+    matches!(
+        components.next(),
+        Some(Component::Normal(value))
+            if value.eq_ignore_ascii_case(OsStr::new(INTERNAL_CACHE_DIR))
+    )
 }
 
 fn create_item_id(relative_path: &str) -> String {
@@ -902,8 +900,146 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
     ))
 }
 
+#[cfg(all(unix, test))]
+pub(crate) fn list_directory_names_no_follow_bounded(
+    root_path: &Path,
+    relative_path: &str,
+    max_names: usize,
+) -> io::Result<Vec<String>> {
+    list_optional_directory_names_no_follow_bounded(root_path, relative_path, max_names)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "managed directory does not exist"))
+}
+
 #[cfg(unix)]
-fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+pub(crate) fn list_optional_directory_names_no_follow_bounded(
+    root_path: &Path,
+    relative_path: &str,
+    max_names: usize,
+) -> io::Result<Option<Vec<String>>> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+    )?;
+    for segment in &segments {
+        directory = match open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+
+    list_open_directory_names_bounded(directory, max_names).map(Some)
+}
+
+#[cfg(unix)]
+fn list_open_directory_names_bounded(directory: File, max_names: usize) -> io::Result<Vec<String>> {
+    use std::{ffi::CStr, os::fd::IntoRawFd};
+
+    let fd = directory.into_raw_fd();
+    // SAFETY: fd is a uniquely owned open directory descriptor transferred to fdopendir.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so ownership of fd was not transferred.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let stream = DirectoryStream { stream };
+
+    let mut names = Vec::new();
+    let mut entry_count = 0_usize;
+    loop {
+        set_errno(0);
+        // SAFETY: stream remains open and exclusively owned until closedir below.
+        let entry = unsafe { libc::readdir(stream.stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(0) {
+                Ok(names)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: readdir returns a live dirent whose d_name is NUL-terminated for this call.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > max_names {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory entry limit exceeded: {max_names}"),
+            ));
+        }
+        let name = std::str::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory contains a non-UTF-8 entry name",
+            )
+        })?;
+        names.push(name.to_owned());
+    }
+}
+
+#[cfg(unix)]
+struct DirectoryStream {
+    stream: *mut libc::DIR,
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: stream was returned by fdopendir and is owned by this wrapper.
+        unsafe { libc::closedir(self.stream) };
+    }
+}
+
+#[cfg(all(not(unix), test))]
+pub(crate) fn list_directory_names_no_follow_bounded(
+    _root_path: &Path,
+    _relative_path: &str,
+    _max_names: usize,
+) -> io::Result<Vec<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory listing is not implemented on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn list_optional_directory_names_no_follow_bounded(
+    _root_path: &Path,
+    _relative_path: &str,
+    _max_names: usize,
+) -> io::Result<Option<Vec<String>>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory listing is not implemented on this platform",
+    ))
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn set_errno(value: i32) {
+    // SAFETY: __error returns the calling thread's errno pointer on Apple platforms.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn set_errno(value: i32) {
+    // SAFETY: __errno_location returns the calling thread's errno pointer on supported Unix CI.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
@@ -912,11 +1048,15 @@ fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
     )?;
     for segment in &segments[..segments.len() - 1] {
-        directory = open_at(
+        directory = match open_at(
             directory.as_raw_fd(),
             segment,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-        )?;
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     }
 
     // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
@@ -928,15 +1068,82 @@ fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()
         )
     };
     if result != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(unix))]
-fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
-    fs::remove_file(root_path.join(relative_path))
+pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
+    match fs::remove_file(root_path.join(relative_path)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_empty_directory_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        directory = match open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+    }
+
+    // Protect path containment and no-follow access policy, not continuity of the leaf's
+    // identity across calls: every parent is verified, and unlinkat removes only its named empty
+    // child. A replacement that is not an empty directory fails instead of being traversed.
+    // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
+    let result = unsafe {
+        libc::unlinkat(
+            directory.as_raw_fd(),
+            segments.last().expect("segments is not empty").as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_empty_directory_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory removal is not implemented on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1109,13 +1316,19 @@ mod tests {
     }
 
     #[test]
-    fn local_scan_excludes_internal_hls_cache_files() {
+    fn local_scan_excludes_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
         fs::create_dir_all(root_path.join(".tvos-net-player/hls/session-1")).unwrap();
+        fs::create_dir_all(root_path.join(".tvos-net-player/resources/resource-1")).unwrap();
         fs::write(
             root_path.join(".tvos-net-player/hls/session-1/video.m4s"),
             b"hls",
+        )
+        .unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/resources/resource-1/body.m4s"),
+            b"resource",
         )
         .unwrap();
         fs::write(root_path.join("Visible.m4s"), b"media").unwrap();
@@ -1133,20 +1346,20 @@ mod tests {
     }
 
     #[test]
-    fn local_direct_lookup_excludes_internal_hls_cache_files() {
+    fn local_direct_lookup_excludes_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
-        fs::write(&internal_path, b"hls").unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
         let root_path = root_path.canonicalize().unwrap();
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
             root_path,
             allowed_extensions: vec![".m4s".to_owned()],
             ..CacheServerOptions::default()
         }));
-        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+        let item_id = create_item_id(".tvos-net-player/resources/resource-1/body.m4s");
 
         assert!(library.get_item_blocking(&item_id).is_none());
         assert!(
@@ -1159,6 +1372,76 @@ mod tests {
                 .item_id_for_media_path_blocking(&internal_path)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn local_operations_reject_case_aliased_internal_cache_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_relative_path = ".TVOS-NET-PLAYER/resources/resource-1/body.m4s";
+        let visible_relative_path = ".TVOS-NET-PLAYER-backup/visible.m4s";
+        let internal_path = root_path.join(internal_relative_path);
+        let visible_path = root_path.join(visible_relative_path);
+        fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(visible_path.parent().unwrap()).unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
+        fs::write(&visible_path, b"visible").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let internal_path = root_path.join(internal_relative_path);
+        let visible_path = root_path.join(visible_relative_path);
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            allowed_extensions: vec![".m4s".to_owned()],
+            ..CacheServerOptions::default()
+        }));
+
+        let page = library.list_items_page_blocking(None, 0, 50, BlockingCancellation::default());
+        assert_eq!(
+            vec![visible_relative_path],
+            page.items
+                .iter()
+                .map(|item| item.subtitle.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let internal_item_id = create_item_id(internal_relative_path);
+        assert!(library.get_item_blocking(&internal_item_id).is_none());
+        assert!(
+            library
+                .get_media_file_blocking(&internal_item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .open_media_file_blocking(&internal_item_id, VARIANT_ID)
+                .is_none()
+        );
+        assert!(
+            library
+                .item_id_for_media_path_blocking(&internal_path)
+                .is_none()
+        );
+        assert!(
+            !library
+                .delete_item_blocking(&internal_item_id)
+                .expect("case-aliased internal cache delete should be ignored")
+        );
+        assert!(internal_path.exists());
+
+        let visible_item_id = library
+            .item_id_for_media_path_blocking(&visible_path)
+            .expect("a longer first component should remain visible");
+        assert!(
+            library
+                .open_media_file_blocking(&visible_item_id, VARIANT_ID)
+                .is_some()
+        );
+        assert!(
+            library
+                .delete_item_blocking(&visible_item_id)
+                .expect("visible media delete should succeed")
+        );
+        assert!(!visible_path.exists());
     }
 
     #[test]
@@ -1218,28 +1501,194 @@ mod tests {
         assert_eq!(io::ErrorKind::NotFound, error.kind());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn delete_item_rejects_internal_hls_cache_files() {
+    fn remove_file_no_follow_treats_a_missing_intermediate_directory_as_absent() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let movie_dir = root_path.join("Movies/Series");
+        fs::create_dir_all(&movie_dir).unwrap();
+        fs::write(movie_dir.join("Episode.mp4"), b"sample").unwrap();
+        fs::remove_dir_all(root_path.join("Movies"))
+            .expect("validated nested media directory should be removable");
+
+        assert!(
+            !remove_file_no_follow(&root_path, "Movies/Series/Episode.mp4")
+                .expect("a raced nested deletion should remain idempotent")
+        );
+    }
+
+    #[test]
+    fn delete_item_rejects_all_internal_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         fs::create_dir_all(internal_path.parent().unwrap()).unwrap();
-        fs::write(&internal_path, b"hls").unwrap();
+        fs::write(&internal_path, b"resource").unwrap();
         let root_path = root_path.canonicalize().unwrap();
-        let internal_path = root_path.join(".tvos-net-player/hls/session-1/video.m4s");
+        let internal_path = root_path.join(".tvos-net-player/resources/resource-1/body.m4s");
         let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
             root_path,
             allowed_extensions: vec![".m4s".to_owned()],
             ..CacheServerOptions::default()
         }));
-        let item_id = create_item_id(".tvos-net-player/hls/session-1/video.m4s");
+        let item_id = create_item_id(".tvos-net-player/resources/resource-1/body.m4s");
 
         assert!(
             !library
                 .delete_item_blocking(&item_id)
-                .expect("internal HLS delete should be ignored")
+                .expect("internal cache delete should be ignored")
         );
         assert!(internal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_removes_empty_leaf_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+        fs::create_dir_all(&resource_dir).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect("empty resource directory should be removed");
+
+        assert!(!resource_dir.exists());
+        assert!(root_path.join(".tvos-net-player/resources").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_treats_a_missing_intermediate_directory_as_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        fs::create_dir_all(resources_dir.join("resource-1")).unwrap();
+        fs::remove_dir_all(&resources_dir)
+            .expect("validated resource namespace should be removable");
+        let root_path = root_path.canonicalize().unwrap();
+
+        assert!(
+            !remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+                .expect("a raced namespace deletion should remain idempotent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_rejects_non_empty_leaf_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+        fs::create_dir_all(&resource_dir).unwrap();
+        fs::write(resource_dir.join("body"), b"resource").unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+
+        let error =
+            remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+                .expect_err("non-empty resource directory must not be removed");
+
+        assert_eq!(io::ErrorKind::DirectoryNotEmpty, error.kind());
+        assert!(resource_dir.is_dir());
+        assert!(resource_dir.join("body").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_refuses_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        let outside_dir = temp.path().join("outside-resource");
+        fs::create_dir_all(&resources_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, resources_dir.join("resource-1")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        let link_path = root_path.join(".tvos-net-player/resources/resource-1");
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect_err("symlink leaf must not be followed or removed");
+
+        assert!(outside_dir.is_dir());
+        assert!(
+            fs::symlink_metadata(link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_refuses_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_dir = root_path.join(".tvos-net-player");
+        let outside_resources = temp.path().join("outside-resources");
+        let outside_resource_dir = outside_resources.join("resource-1");
+        fs::create_dir_all(&internal_dir).unwrap();
+        fs::create_dir_all(&outside_resource_dir).unwrap();
+        symlink(&outside_resources, internal_dir.join("resources")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        remove_empty_directory_no_follow(&root_path, ".tvos-net-player/resources/resource-1")
+            .expect_err("symlink parent must not be followed");
+
+        assert!(outside_resource_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_rejects_non_normal_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        for relative_path in [
+            "",
+            ".",
+            "../resource-1",
+            ".tvos-net-player/../resource-1",
+            "/resource-1",
+        ] {
+            let error = remove_empty_directory_no_follow(&root_path, relative_path)
+                .expect_err("non-normal directory path should be rejected");
+            assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_directory_names_no_follow_bounded_fails_when_limit_is_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resources_dir = root_path.join(".tvos-net-player/resources");
+        fs::create_dir_all(resources_dir.join("resource-a")).unwrap();
+        fs::create_dir_all(resources_dir.join("resource-b")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        let error =
+            list_directory_names_no_follow_bounded(&root_path, ".tvos-net-player/resources", 1)
+                .expect_err("directory listing should fail after the configured limit");
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+
+        let mut names =
+            list_directory_names_no_follow_bounded(&root_path, ".tvos-net-player/resources", 2)
+                .expect("directory listing should fit within the configured limit");
+        names.sort();
+        assert_eq!(
+            vec!["resource-a".to_owned(), "resource-b".to_owned()],
+            names
+        );
     }
 
     #[test]

@@ -3,7 +3,10 @@ use std::{net::IpAddr, sync::Arc};
 use tonic::Request;
 use url::Url;
 
-use crate::config::{CacheServerOptions, normalize_listen_host};
+use crate::{
+    config::{CacheServerOptions, normalize_listen_host},
+    task_output::MAX_TASK_RESOURCE_BASE_URI_BYTES,
+};
 
 #[derive(Clone)]
 pub struct PlaybackUriFactory {
@@ -29,6 +32,15 @@ impl PlaybackUriFactory {
     pub fn create_hls_master_playlist<T>(&self, request: &Request<T>, session_id: &str) -> String {
         let base_uri = self.create_base_uri(request);
         Self::hls_master_playlist_uri(&base_uri, session_id)
+    }
+
+    pub fn create_task_resource<T>(&self, request: &Request<T>, resource_id: &str) -> String {
+        let base_uri = self.create_base_uri(request);
+        format!(
+            "{}/resources/{}",
+            base_uri.trim_end_matches('/'),
+            urlencoding::encode(resource_id)
+        )
     }
 
     pub fn create_hls_master_playlist_for_runtime(&self, session_id: &str) -> String {
@@ -60,7 +72,8 @@ impl PlaybackUriFactory {
     }
 
     fn create_base_uri<T>(&self, request: &Request<T>) -> String {
-        self.options
+        let candidate = self
+            .options
             .public_media_base_uri
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -76,7 +89,12 @@ impl PlaybackUriFactory {
                     request.local_addr().map(|addr| addr.ip()),
                     &self.options.media_listen_url,
                 )
-            })
+            });
+        if candidate.len() <= MAX_TASK_RESOURCE_BASE_URI_BYTES {
+            candidate
+        } else {
+            Self::create_local_media_base_uri(&self.options.media_listen_url)
+        }
     }
 
     fn configured_base_uri(&self) -> String {
@@ -91,6 +109,14 @@ impl PlaybackUriFactory {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
+    }
+
+    fn create_local_media_base_uri(media_listen_url: &str) -> String {
+        let media_uri = Url::parse(media_listen_url).expect("media listen URL must be valid");
+        let port = media_uri
+            .port_or_known_default()
+            .expect("media listen URL must have a port");
+        format!("{}://localhost:{port}", media_uri.scheme())
     }
 
     pub fn create_media_base_uri(request_authority: &str, media_listen_url: &str) -> String {
@@ -214,6 +240,38 @@ mod tests {
         assert_eq!(
             "http://media.example.test:9090/hls/session-1/master.m3u8",
             uri
+        );
+    }
+
+    #[test]
+    fn creates_task_resource_uri_under_public_base_path() {
+        let factory = PlaybackUriFactory::new(Arc::new(CacheServerOptions {
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            ..CacheServerOptions::default()
+        }));
+        let request = Request::new(());
+
+        assert_eq!(
+            "https://atri.ink/cache/resources/subtitle_one",
+            factory.create_task_resource(&request, "subtitle_one")
+        );
+    }
+
+    #[test]
+    fn bounds_request_derived_resource_base_uri() {
+        let factory = PlaybackUriFactory::new(Arc::new(CacheServerOptions::default()));
+        let mut request = Request::new(());
+        let authority = format!(
+            "{}.example.test:50051",
+            "a".repeat(MAX_TASK_RESOURCE_BASE_URI_BYTES)
+        );
+        request
+            .metadata_mut()
+            .insert("host", authority.parse().unwrap());
+
+        assert_eq!(
+            "http://localhost:8080/resources/subtitle_one",
+            factory.create_task_resource(&request, "subtitle_one")
         );
     }
 

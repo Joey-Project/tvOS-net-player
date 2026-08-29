@@ -67,6 +67,12 @@ const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
+    #[cfg(test)]
+    remove_session_failures: Arc<Mutex<HashSet<String>>>,
+}
+
+pub(crate) struct HlsCacheSessionDirectoryScan {
+    entries: Option<fs::ReadDir>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +167,8 @@ impl HlsCacheStore {
     pub(crate) fn new(root_path: impl Into<PathBuf>) -> Self {
         Self {
             root_path: Arc::new(root_path.into()),
+            #[cfg(test)]
+            remove_session_failures: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -177,7 +185,39 @@ impl HlsCacheStore {
         self.save_session(&sanitized_completed_session(session))
     }
 
+    pub(crate) fn session_directory_scan(&self) -> io::Result<HlsCacheSessionDirectoryScan> {
+        self.reject_cache_path_symlink(self.root_path.as_ref())?;
+        match fs::metadata(self.root_path.as_ref()) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "HLS cache root path is not a directory",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+
+        let store_root = self.store_root();
+        self.reject_cache_path_symlink(&store_root)?;
+        let entries = match fs::read_dir(store_root) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(HlsCacheSessionDirectoryScan { entries })
+    }
+
     pub(crate) fn remove_session(&self, session_id: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .remove_session_failures
+            .lock()
+            .expect("HLS remove-session failure lock poisoned")
+            .remove(session_id)
+        {
+            return Err(io::Error::other("injected HLS session removal failure"));
+        }
         let session_dir = self.session_dir(session_id)?;
         self.reject_cache_path_symlink(&session_dir)?;
         match fs::remove_dir_all(session_dir) {
@@ -185,6 +225,14 @@ impl HlsCacheStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remove_session(&self, session_id: impl Into<String>) {
+        self.remove_session_failures
+            .lock()
+            .expect("HLS remove-session failure lock poisoned")
+            .insert(session_id.into());
     }
 
     #[cfg(test)]
@@ -1617,6 +1665,29 @@ impl HlsCacheStore {
     fn read_cache_file(&self, path: &Path) -> Option<Vec<u8>> {
         self.reject_cache_path_symlink(path).ok()?;
         fs::read(path).ok()
+    }
+}
+
+impl HlsCacheSessionDirectoryScan {
+    pub(crate) fn next_session_id(&mut self) -> Option<io::Result<Option<String>>> {
+        let entry = match self.entries.as_mut()?.next()? {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error)),
+        };
+        let Some(session_id) = entry.file_name().to_str().map(str::to_owned) else {
+            return Some(Ok(None));
+        };
+        if validate_cache_id(&session_id).is_err() {
+            return Some(Ok(None));
+        }
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => Some(Ok(Some(session_id))),
+            Ok(_) => Some(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("HLS cache session entry {session_id} is not a directory"),
+            ))),
+            Err(error) => Some(Err(error)),
+        }
     }
 }
 
@@ -3704,6 +3775,26 @@ mod tests {
         assert!(entries.is_empty());
         assert_eq!(0, usage.used_bytes);
         assert_eq!(0, usage.completed_session_count);
+    }
+
+    #[test]
+    fn session_directory_scan_rejects_valid_named_non_directory_entry() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let store_root = store.store_root();
+        fs::create_dir_all(&store_root).expect("HLS store root should be created");
+        fs::write(store_root.join("replaced-session"), b"not a directory")
+            .expect("replacement file should be created");
+
+        let mut scan = store
+            .session_directory_scan()
+            .expect("HLS session directory scan should start");
+        let error = scan
+            .next_session_id()
+            .expect("replacement entry should be observed")
+            .expect_err("valid session names must still resolve to directories");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
     }
 
     #[test]
