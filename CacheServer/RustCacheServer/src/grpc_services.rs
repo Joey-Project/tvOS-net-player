@@ -3128,6 +3128,9 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                 (HlsCacheFinalizationOutcome::PersistencePending, _) => {
                     "Playable publication is pending durable task-state recovery; offline cache fill will retry."
                 }
+                (HlsCacheFinalizationOutcome::QuotaPending, _) => {
+                    "Playable online; offline cache fill is waiting for quota enforcement to recover."
+                }
                 (_, crate::hls_fill_scheduler::HlsFillPriority::Foreground) => {
                     "Playable online; offline cache fill paused behind newer playback."
                 }
@@ -3145,7 +3148,12 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                 },
             );
         }
-        if outcome == HlsCacheFinalizationOutcome::PersistencePending && should_requeue {
+        if matches!(
+            outcome,
+            HlsCacheFinalizationOutcome::PersistencePending
+                | HlsCacheFinalizationOutcome::QuotaPending
+        ) && should_requeue
+        {
             sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
             should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
         }
@@ -3160,6 +3168,7 @@ enum HlsCacheFinalizationOutcome {
     Finished,
     Preempted,
     PersistencePending,
+    QuotaPending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3180,7 +3189,8 @@ fn hls_cache_fill_should_requeue(
         HlsCacheFinalizationOutcome::Preempted => {
             publication == HlsSessionPublicationState::Published
         }
-        HlsCacheFinalizationOutcome::PersistencePending => {
+        HlsCacheFinalizationOutcome::PersistencePending
+        | HlsCacheFinalizationOutcome::QuotaPending => {
             publication != HlsSessionPublicationState::Absent
         }
         HlsCacheFinalizationOutcome::Finished => false,
@@ -3358,9 +3368,10 @@ async fn run_hls_cache_finalization_inner(
         || control() != HlsCacheFillControl::Continue,
     ) {
         eprintln!(
-            "Failed to run HLS cache eviction before finalization for task {task_id}: {}",
+            "Failed to run HLS cache eviction before finalization for task {task_id}; deferring full cache fill: {}",
             state.error_detail_for_log(&error)
         );
+        return HlsCacheFinalizationOutcome::QuotaPending;
     }
     if control() == HlsCacheFillControl::Preempt {
         return HlsCacheFinalizationOutcome::Preempted;
@@ -11761,6 +11772,89 @@ mod tests {
             .expect("failed task should remain for retention policy");
         assert_eq!(TaskState::Failed, task.state());
         assert!(state.hls_sessions.get(&stale.task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn hls_cache_finalization_waits_for_quota_enforcement_recovery() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let session_size = fake_mp4().len() as u64;
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: temp.path().join(".state").join("tasks.json"),
+                hls_cache_max_bytes: session_size * 2,
+                hls_cache_high_watermark_percent: 90,
+                hls_cache_low_watermark_percent: 50,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let older =
+            create_completed_hls_playback_task(&state, "BV1quota-failure-older", &upstream_url)
+                .await;
+        let (task_id, mut session, library_item_id) =
+            create_playable_hls_playback_task(&state, "BV1quota-failure-current", &upstream_url);
+        session.variant.video.request.size = Some(session_size);
+        state.hls_sessions.insert(session.clone());
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+        state
+            .hls_cache
+            .fail_next_remove_session(older.task_id.clone());
+
+        let outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            job.task_id.clone(),
+            job.session.clone(),
+            job.failure_mode,
+            job.token.clone(),
+        )
+        .await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::QuotaPending, outcome);
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&task_id, "video.m4s")
+                .is_none()
+        );
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert!(state.hls_fill_scheduler.owns_session(&task_id));
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        assert_eq!(
+            crate::hls_fill_scheduler::HlsFillPriority::Demoted,
+            retry.priority
+        );
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            retry.task_id.clone(),
+            retry.session.clone(),
+            retry.failure_mode,
+            retry.token.clone(),
+        )
+        .await;
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        state.hls_fill_scheduler.finish_current(&retry, false);
+
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(
+            state
+                .hls_cache
+                .get_completed_library_item(&library_item_id)
+                .is_some()
+        );
     }
 
     #[tokio::test]
