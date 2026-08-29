@@ -6224,6 +6224,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             lan_transcoding_enabled: true,
@@ -6251,6 +6252,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -6295,6 +6297,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path.clone()),
@@ -6363,6 +6366,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -6427,6 +6431,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -6488,6 +6493,7 @@ mod tests {
         )
         .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path),
@@ -6531,6 +6537,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -6556,6 +6563,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -6601,6 +6609,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -6650,6 +6659,7 @@ mod tests {
         fs::create_dir_all(&root_path).expect("cache root should be created");
         let credentials_path = temp.path().join("missing-credentials.json");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path,
             bilibili_worker_enabled: false,
             bbdown_credential_path: Some(credentials_path.clone()),
@@ -6682,6 +6692,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         fs::write(root_path.join("sample.mp4"), b"sample").expect("media file should be written");
         let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
             root_path: root_path.clone(),
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
@@ -6741,6 +6752,7 @@ mod tests {
         };
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -6854,6 +6866,7 @@ mod tests {
         };
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -6904,6 +6917,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -7018,6 +7032,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -7376,6 +7391,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -7472,6 +7488,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -7970,6 +7987,7 @@ mod tests {
         let sensitive_detail = "restricted proxy rejected playurl at https://example.test/playurl?access_key=result-sensitive-marker";
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8113,6 +8131,7 @@ mod tests {
         resolution.candidates_truncated = true;
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8281,6 +8300,7 @@ mod tests {
         let (resolve_started_sender, resolve_started) = oneshot::channel();
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -8351,6 +8371,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8454,6 +8475,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8536,6 +8558,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8620,6 +8643,7 @@ mod tests {
         let (planner, planner_started, plan_sender) = DeferredPlaybackPlanner::new();
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
@@ -8715,6 +8739,7 @@ mod tests {
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
                 root_path,
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
