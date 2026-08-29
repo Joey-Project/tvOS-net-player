@@ -295,6 +295,17 @@ impl BilibiliTaskRegistry {
             .block_next_save(entered, resume);
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_resource_storage_for_revalidation_for_test(&self, resource_id: &str) {
+        self.resource_storage_available
+            .store(false, AtomicOrdering::Release);
+        self.inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .resource_storage_revalidation_ids
+            .insert(resource_id.to_owned());
+    }
+
     pub(crate) fn task_output_v2_available(&self) -> bool {
         self.resource_storage_available
             .load(AtomicOrdering::Acquire)
@@ -2207,18 +2218,33 @@ impl BilibiliTaskRegistry {
         if normalized_task_id.is_empty() || normalized_session_id.is_empty() {
             return HlsSessionPublicationState::Absent;
         }
+        let completed_library_item_id =
+            HlsCacheStore::completed_library_item_id(&normalized_session_id);
         let inner = self.inner.lock().expect("task registry lock poisoned");
         if inner
             .visible_tasks_by_id
             .get(&normalized_task_id)
             .is_some_and(|task| task_has_playable_hls_session(task, &normalized_session_id))
         {
-            HlsSessionPublicationState::Published
-        } else if inner
+            return HlsSessionPublicationState::Published;
+        }
+        let pending_playable = inner
             .tasks_by_id
             .get(&normalized_task_id)
-            .is_some_and(|task| task_has_playable_hls_session(task, &normalized_session_id))
-        {
+            .is_some_and(|task| task_has_playable_hls_session(task, &normalized_session_id));
+        let pending_completed = self.persistence_configured
+            && !self.persistence_available()
+            && inner
+                .tasks_by_id
+                .get(&normalized_task_id)
+                .is_some_and(|task| {
+                    playback_task_has_completed_hls_cache_item(
+                        task,
+                        &normalized_session_id,
+                        &completed_library_item_id,
+                    )
+                });
+        if pending_playable || pending_completed {
             HlsSessionPublicationState::Pending
         } else {
             HlsSessionPublicationState::Absent
@@ -2227,6 +2253,14 @@ impl BilibiliTaskRegistry {
 
     pub(crate) fn retry_pending_persistence(&self) -> bool {
         self.persist_current_state()
+    }
+
+    pub(crate) fn recover_task_output_v2_for_read(&self) -> bool {
+        self.retire_expired_task_resources();
+        if !self.task_output_v2_available() {
+            self.persist_current_state();
+        }
+        self.task_output_v2_available()
     }
 
     pub fn hls_session_has_online_playback_after_cache_fill_failure(
@@ -7675,6 +7709,10 @@ mod tests {
             .expect("the installed completion should remain visible while durability retries");
         assert_eq!(TaskState::Completed, installed.state());
         assert_eq!(library_item_id, installed.library_item_id);
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            registry.hls_session_publication_state(&created.task.id, &created.task.id)
+        );
 
         registry.fail_next_persistence_directory_sync();
         let error = registry
@@ -7682,6 +7720,10 @@ mod tests {
             .expect_err("another directory sync failure must keep the finalizer queued");
         assert_eq!(tonic::Code::Unavailable, error.code());
         assert!(!registry.persistence_available());
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            registry.hls_session_publication_state(&created.task.id, &created.task.id)
+        );
 
         let completed = registry
             .complete_playback_cached(&created.task.id, library_item_id.clone())
@@ -7689,6 +7731,11 @@ mod tests {
         assert_eq!(TaskState::Completed, completed.state());
         assert_eq!(library_item_id, completed.library_item_id);
         assert!(registry.persistence_available());
+        assert_eq!(
+            HlsSessionPublicationState::Absent,
+            registry.hls_session_publication_state(&created.task.id, &created.task.id),
+            "durable completed cache items must not broaden online playback authorization"
+        );
     }
 
     #[test]

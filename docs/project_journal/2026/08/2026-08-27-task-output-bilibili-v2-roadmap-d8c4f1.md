@@ -3,7 +3,7 @@ id: 20260827-d8c4f1
 title: Task Output And Bilibili Schema V2 Roadmap
 status: active
 created: 2026-08-27
-updated: 2026-08-28
+updated: 2026-08-29
 branch:
 pr:
 supersedes: []
@@ -150,6 +150,7 @@ superseded_by:
 - The twenty-fourth PR 6B independent-review follow-up bounds process-local HLS cleanup retry state to 1,024 keys and 4,096 retained session IDs. Overflow recovery keeps no unbounded collection: it incrementally scans at most 1,024 on-disk session-directory entries per maintenance pass, retries failed scans, protects task/finalizer/fill-owned sessions, and fails closed while durable task authorization is unavailable.
 - The twenty-fifth PR 6B independent-review follow-up distinguishes durable task authorization from transient startup/finalizer/fill ownership during bounded overflow cleanup. Authorized sessions do not keep a scan alive, while transiently protected sessions retain the recovery flag until their owner releases them and a later pass can safely delete an untracked orphan.
 - The twenty-sixth PR 6B independent-review follow-up protects child HLS sessions as soon as their result references are durably published by a still-preparing parent task. Dropping a staged output before any body exists now treats a concurrently absent internal resource namespace as already clean, while missing roots, symlinks, non-directories, unreadable paths, and other access-policy failures still disable resource v2 pending revalidation.
+- The twenty-seventh PR 6B independent-review follow-up lets read-only v2 recovery durably retire an expired resource before revalidating its missing body, serializes explicit child HLS runtime/manifest publication with overflow cleanup, moves completed-task snapshot persistence and runtime replacement onto Tokio's blocking pool, and retains scheduler ownership for an installed completed snapshot until parent-directory synchronization recovers.
 - Existing server/client Bilibili flows continue using the legacy RPCs until the later direct-v2 client slice lands.
 
 ## Next Steps
@@ -163,5 +164,5 @@ superseded_by:
 - Existing multi-result schema history: `docs/project_journal/2026/06/2026-06-19-bilibili-task-schema-roadmap-b7e3f1.md`
 - Current control-plane schema: `Sources/TVOSNetPlayerCacheClient/Protos/tvos_net_player/v1/cache_control.proto`
 - PR 6A compatibility coverage: `Tests/TVOSNetPlayerCacheClientTests/CacheLibraryPaginationTests.swift` and `CacheServer/RustCacheServer/src/grpc_services.rs`
-- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `hls_fill_scheduler.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite passes 675 unit tests, 34 live-e2e helper tests, and 6 integration tests, with 1 opt-in real-network case ignored.
+- PR 6B server coverage: `CacheServer/RustCacheServer/src/task_output.rs`, `task_store.rs`, `task_registry.rs`, `hls_fill_scheduler.rs`, `grpc_services.rs`, `library.rs`, and `media.rs`; the post-review Rust suite passes 679 unit tests, 34 live-e2e helper tests, and 6 integration tests, with 1 opt-in real-network case ignored.
 - PR 6B client compatibility coverage: Swift package tests pass 272 tests, the macOS app test passes its shared-AppCore integration test, and generic tvOS simulator build-for-testing succeeds. Local tvOS simulator test execution remains blocked by the host CoreSimulator `1051.54.0` being older than Xcode's required `1051.55.0`; GitHub CI remains the executable simulator gate.

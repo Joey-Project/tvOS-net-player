@@ -859,8 +859,16 @@ fn spawn_task_output_v2_read_recovery(
 ) {
     tokio::spawn(async move {
         let recovered = if let Some(tasks) = tasks.upgrade() {
-            retry_pending_task_persistence(&tasks, "TaskOutputV2 read recovery").await
-                && tasks.task_output_v2_available()
+            match tokio::task::spawn_blocking(move || tasks.recover_task_output_v2_for_read()).await
+            {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    eprintln!(
+                        "Failed to join TaskOutputV2 read recovery persistence retry: {error}"
+                    );
+                    false
+                }
+            }
         } else {
             false
         };
@@ -2653,7 +2661,7 @@ async fn run_explicit_bilibili_playback_planning(
             Err(error) => Err(error),
         };
 
-        match item_outcome {
+        let planned_hls_session = match item_outcome {
             Ok(metadata) => {
                 let playback_source_uri = if index == 0 {
                     primary_playback_source_uri.clone()
@@ -2676,26 +2684,20 @@ async fn run_explicit_bilibili_playback_planning(
                 result_items[index].message = BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned();
                 result_items[index].playback_source = Some(playback_source.clone());
                 result_items[index].playback_session = Some(metadata.playback_session.clone());
-                state.register_hls_playback_session(metadata.hls_session.clone());
                 planned_session_ids.push(session_id.clone());
                 planned_sessions.push(metadata.hls_session.clone());
-                if let Err(error) = state.hls_cache.save_session(&metadata.hls_session) {
-                    eprintln!(
-                        "Failed to persist HLS playback manifest for result {session_id}; keeping runtime playback source available: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                }
                 if primary.is_none() {
                     let mut primary_playback_source = playback_source.clone();
                     primary_playback_source.item_id = task_id.clone();
                     primary = Some((
                         primary_playback_source,
                         metadata.playback_session,
-                        metadata.hls_session,
+                        metadata.hls_session.clone(),
                         metadata.title,
                     ));
                 }
                 successful_results += 1;
+                Some(metadata.hls_session)
             }
             Err(error) if cancellation.is_cancel_requested() => {
                 eprintln!(
@@ -2715,21 +2717,38 @@ async fn run_explicit_bilibili_playback_planning(
                 result_items[index].state = TaskState::Failed.into();
                 let message = playback_error_message(error);
                 result_items[index].message = state.error_detail_for_client(&message);
+                None
             }
-        }
+        };
 
         let message = format!(
             "Planned {}/{} Bilibili playback result(s).",
             index + 1,
             total
         );
-        let _ = state.tasks.update_playback_results(
-            &task_id,
-            Some(resolution.title.clone()),
-            message,
-            result_items_progress(&result_items),
-            result_items.clone(),
-        );
+        let progress = result_items_progress(&result_items);
+        if let Some(planned_hls_session) = planned_hls_session {
+            let _ = publish_explicit_bilibili_hls_result(
+                &state,
+                ExplicitBilibiliHlsResultPublication {
+                    task_id: task_id.clone(),
+                    title: resolution.title.clone(),
+                    message,
+                    progress,
+                    result_items: result_items.clone(),
+                    hls_session: planned_hls_session,
+                },
+            )
+            .await;
+        } else {
+            let _ = state.tasks.update_playback_results(
+                &task_id,
+                Some(resolution.title.clone()),
+                message,
+                progress,
+                result_items.clone(),
+            );
+        }
     }
 
     let Some((primary_source, primary_session, primary_hls_session, primary_title)) = primary
@@ -2819,6 +2838,55 @@ async fn run_explicit_bilibili_playback_planning(
             .await
         }
     }
+}
+
+struct ExplicitBilibiliHlsResultPublication {
+    task_id: String,
+    title: String,
+    message: String,
+    progress: f64,
+    result_items: Vec<BilibiliTaskResultItem>,
+    hls_session: HlsPlaybackSession,
+}
+
+async fn publish_explicit_bilibili_hls_result(
+    state: &AppState,
+    publication: ExplicitBilibiliHlsResultPublication,
+) -> Result<Task, Status> {
+    let state = state.clone();
+    let join_task_id = publication.task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        publish_explicit_bilibili_hls_result_with_post_save_hook(&state, publication, || {})
+    })
+    .await
+    .map_err(|error| {
+        eprintln!("Failed to join Bilibili result publication for task {join_task_id}: {error}");
+        Status::internal("Bilibili playback result publication failed unexpectedly.")
+    })?
+}
+
+fn publish_explicit_bilibili_hls_result_with_post_save_hook(
+    state: &AppState,
+    publication: ExplicitBilibiliHlsResultPublication,
+    post_save_hook: impl FnOnce(),
+) -> Result<Task, Status> {
+    let _deletion_guard = state.completed_hls_mutation_guard();
+    state.register_hls_playback_session(publication.hls_session.clone());
+    if let Err(error) = state.hls_cache.save_session(&publication.hls_session) {
+        eprintln!(
+            "Failed to persist HLS playback manifest for result {}; keeping runtime playback source available: {}",
+            publication.hls_session.id,
+            state.error_detail_for_log(&error)
+        );
+    }
+    post_save_hook();
+    state.tasks.update_playback_results(
+        &publication.task_id,
+        Some(publication.title),
+        publication.message,
+        publication.progress,
+        publication.result_items,
+    )
 }
 
 async fn complete_cancelled_explicit_bilibili_playback(
@@ -3198,7 +3266,8 @@ async fn run_hls_cache_finalization_inner(
         return HlsCacheFinalizationOutcome::Finished;
     }
     if let Some(completed_session) = state.hls_cache.completed_session(&session_id) {
-        return publish_completed_hls_cache(&state, &task_id, &session_id, &completed_session);
+        return publish_completed_hls_cache(&state, &task_id, &session_id, &completed_session)
+            .await;
     }
     let playback_progress = state.hls_playback_progress_for_session(&session_id);
     let _ = state.tasks.update_playback_cache_progress(
@@ -3278,7 +3347,8 @@ async fn run_hls_cache_finalization_inner(
         .await
     {
         Ok(completion) => {
-            return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session);
+            return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session)
+                .await;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
             remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
@@ -3353,7 +3423,33 @@ async fn run_hls_cache_finalization_inner(
     HlsCacheFinalizationOutcome::Finished
 }
 
-fn publish_completed_hls_cache(
+async fn publish_completed_hls_cache(
+    state: &AppState,
+    task_id: &str,
+    session_id: &str,
+    completed_session: &HlsPlaybackSession,
+) -> HlsCacheFinalizationOutcome {
+    let state = state.clone();
+    let task_id = task_id.to_owned();
+    let join_task_id = task_id.clone();
+    let session_id = session_id.to_owned();
+    let completed_session = completed_session.clone();
+    match tokio::task::spawn_blocking(move || {
+        publish_completed_hls_cache_blocking(&state, &task_id, &session_id, &completed_session)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!(
+                "Failed to join completed HLS cache publication for task {join_task_id}: {error}"
+            );
+            HlsCacheFinalizationOutcome::PersistencePending
+        }
+    }
+}
+
+fn publish_completed_hls_cache_blocking(
     state: &AppState,
     task_id: &str,
     session_id: &str,
@@ -4828,6 +4924,98 @@ mod tests {
                 .expect("task result page store lock should be available")
                 .task_output_read_recovery
                 .attempts_started
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_task_output_recovery_retires_expired_missing_resource() {
+        use crate::{
+            generated::tvos_net_player::v1::{
+                CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState,
+            },
+            task_output::TaskResourceRecord,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1read-expired-resource", None)
+            .expect("task should be created");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "read-expired-resource".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 5,
+            size_known: true,
+            etag: "v1".to_owned(),
+            expires_at: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            ..Default::default()
+        })
+        .expect("resource record should be valid");
+        let resource_path = root_path.join(resource.relative_path());
+        fs::create_dir_all(
+            resource_path
+                .parent()
+                .expect("resource body should have a parent"),
+        )
+        .expect("resource directory should be created");
+        fs::write(&resource_path, b"cover").expect("resource body should be written");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![TaskResult {
+                    id: "read-expired-result".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                vec![resource],
+            )
+            .expect("task output should persist");
+        fs::remove_file(&resource_path).expect("resource body should become unavailable");
+        state
+            .tasks
+            .mark_resource_storage_for_revalidation_for_test("read-expired-resource");
+        assert!(!state.tasks.task_output_v2_available());
+
+        let response = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: None,
+            }))
+            .await
+            .expect("read-only traffic should retire the expired resource and recover")
+            .into_inner();
+
+        assert!(state.tasks.task_output_v2_available());
+        assert_eq!(1, response.results.len());
+        let artifact = response.results[0]
+            .artifacts
+            .first()
+            .expect("retired artifact should remain projected");
+        assert_eq!(TaskArtifactState::Unavailable, artifact.state());
+        assert!(artifact.resource.is_none());
+        assert!(
+            !resource_path
+                .parent()
+                .expect("resource body should have a parent")
+                .exists()
         );
     }
 
@@ -6749,6 +6937,7 @@ mod tests {
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
+                task_state_path: temp.path().join("state").join("tasks.json"),
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 ..CacheServerOptions::default()
@@ -6760,7 +6949,7 @@ mod tests {
             }),
         );
         let tasks = Arc::clone(&state.tasks);
-        let service = TaskGrpcService::new(state);
+        let service = TaskGrpcService::new(state.clone());
 
         let created = service
             .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
@@ -6808,6 +6997,12 @@ mod tests {
                 && item.playback_source.is_some()
                 && item.playback_session.is_some()
         }));
+        assert!(playable.result_items.iter().all(|item| {
+            state.hls_cache.playback_session(&item.id).is_some()
+                && state
+                    .tasks
+                    .task_authorizes_hls_session_for_cleanup(&item.id)
+        }));
         assert_eq!(
             vec![("BV1range".to_owned(), None)],
             *resolve_requests
@@ -6822,6 +7017,141 @@ mod tests {
             *playback_requests
                 .lock()
                 .expect("playback request log should not be poisoned")
+        );
+    }
+
+    #[test]
+    fn explicit_hls_result_publication_serializes_with_overflow_cleanup() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1publication-overflow", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let metadata = playback_task_metadata(&child_session_id, sample_playback_plan())
+            .expect("playback metadata should map");
+        let playback_source = PlaybackSource {
+            item_id: child_session_id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_session_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let result_items = vec![BilibiliTaskResultItem {
+            id: child_session_id.clone(),
+            selection_id: "page:2".to_owned(),
+            title: "Part 2".to_owned(),
+            subtitle: String::new(),
+            source_kind: "video_page".to_owned(),
+            content_id: "cid-2".to_owned(),
+            index: 2,
+            state: TaskState::Playable.into(),
+            message: BILIBILI_RESULT_PLAYABLE_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            playback_source: Some(playback_source),
+            playback_session: Some(metadata.playback_session),
+        }];
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-publication-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    crate::MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        let (manifest_saved_sender, manifest_saved_receiver) = std::sync::mpsc::channel();
+        let (publication_release_sender, publication_release_receiver) = std::sync::mpsc::channel();
+        let publisher_state = state.clone();
+        let publisher_task_id = task_id.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_explicit_bilibili_hls_result_with_post_save_hook(
+                &publisher_state,
+                ExplicitBilibiliHlsResultPublication {
+                    task_id: publisher_task_id,
+                    title: "Collection".to_owned(),
+                    message: "Planned 1/2 Bilibili playback result(s).".to_owned(),
+                    progress: 0.5,
+                    result_items,
+                    hls_session: metadata.hls_session,
+                },
+                || {
+                    manifest_saved_sender
+                        .send(())
+                        .expect("test should observe the saved child manifest");
+                    publication_release_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test should release result publication");
+                },
+            )
+        });
+        manifest_saved_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("result publication should reach the manifest boundary");
+
+        let (cleanup_started_sender, cleanup_started_receiver) = std::sync::mpsc::channel();
+        let (cleanup_finished_sender, cleanup_finished_receiver) = std::sync::mpsc::channel();
+        let cleanup_state = state.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_started_sender
+                .send(())
+                .expect("test should observe overflow cleanup start");
+            cleanup_state
+                .enforce_hls_cache_quota("publication_overflow_cleanup", Vec::new(), 0)
+                .expect("overflow cleanup should complete");
+            cleanup_finished_sender
+                .send(())
+                .expect("test should observe overflow cleanup completion");
+        });
+        cleanup_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("overflow cleanup should start");
+        assert!(
+            matches!(
+                cleanup_finished_receiver.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "overflow cleanup must wait for the task result publication"
+        );
+
+        publication_release_sender
+            .send(())
+            .expect("test should release result publication");
+        publisher
+            .join()
+            .expect("result publisher should not panic")
+            .expect("result publication should succeed");
+        cleanup_finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("overflow cleanup should finish after publication");
+        cleanup.join().expect("overflow cleanup should not panic");
+
+        let task = state
+            .tasks
+            .get_task(&task_id)
+            .expect("preparing task should remain visible");
+        assert_eq!(TaskState::Preparing, task.state());
+        assert!(
+            task.result_items
+                .iter()
+                .any(|item| { item.id == child_session_id && item.state() == TaskState::Playable })
+        );
+        assert!(
+            state
+                .hls_cache
+                .playback_session(&child_session_id)
+                .is_some()
         );
     }
 
@@ -14717,6 +15047,160 @@ mod tests {
             TaskState::Failed,
             state.tasks.get_task(&creation.task.id).unwrap().state()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hls_completion_persistence_does_not_block_runtime_worker() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, library_item_id) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-blocking-persistence",
+            "https://example.test/video.m4s",
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        state
+            .tasks
+            .block_next_persistence_save(Arc::clone(&entered), Arc::clone(&resume));
+
+        let persistence_entered = Arc::new(AtomicBool::new(false));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_entered = Arc::clone(&entered);
+        let observer_resume = Arc::clone(&resume);
+        let observer_persistence_entered = Arc::clone(&persistence_entered);
+        let observer_runtime_progressed = Arc::clone(&runtime_progressed);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            observer_persistence_entered.store(true, AtomicOrdering::Release);
+            let progress_deadline = StdInstant::now() + Duration::from_millis(500);
+            while !observer_runtime_progressed.load(AtomicOrdering::Acquire)
+                && StdInstant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release =
+                observer_runtime_progressed.load(AtomicOrdering::Acquire);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_persistence_entered = Arc::clone(&persistence_entered);
+        let heartbeat_runtime_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            while !heartbeat_persistence_entered.load(AtomicOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            heartbeat_runtime_progressed.store(true, AtomicOrdering::Release);
+        });
+        let completion_state = state.clone();
+        let completion_task_id = task_id.clone();
+        let completion_session = session.clone();
+        let completion = tokio::spawn(async move {
+            publish_completed_hls_cache(
+                &completion_state,
+                &completion_task_id,
+                &completion_session.id,
+                &completion_session,
+            )
+            .await
+        });
+
+        let outcome = timeout(Duration::from_secs(3), completion)
+            .await
+            .expect("HLS completion should finish after the test releases storage")
+            .expect("HLS completion task should not panic");
+        heartbeat.await.expect("runtime heartbeat should not panic");
+        let progressed_before_release =
+            observer.join().expect("persistence observer should finish");
+
+        assert!(
+            progressed_before_release,
+            "the single Tokio worker must progress while HLS completion persistence is blocked"
+        );
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, outcome);
+        let completed = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Completed, completed.state());
+        assert_eq!(library_item_id, completed.library_item_id);
+    }
+
+    #[tokio::test]
+    async fn hls_cache_fill_retains_ownership_until_installed_completion_is_durable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1hls-completion-directory-sync-retry",
+            "https://example.test/video.m4s",
+        );
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let job = state.hls_fill_scheduler.next_job().await;
+
+        state.tasks.fail_next_persistence_directory_sync();
+        let outcome =
+            publish_completed_hls_cache(&state, &job.task_id, &job.session.id, &job.session).await;
+
+        assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert_eq!(
+            HlsSessionPublicationState::Pending,
+            state
+                .tasks
+                .hls_session_publication_state(&task_id, &session.id)
+        );
+        assert!(hls_cache_fill_should_requeue(&state, &job, outcome));
+        state.hls_fill_scheduler.finish_current(&job, true);
+        assert!(state.hls_fill_scheduler.owns_session(&session.id));
+        assert_eq!(
+            1,
+            state
+                .hls_fill_scheduler
+                .queued_session_count_for_tests(&session.id)
+        );
+
+        let retry = state.hls_fill_scheduler.next_job().await;
+        let retry_outcome =
+            publish_completed_hls_cache(&state, &retry.task_id, &retry.session.id, &retry.session)
+                .await;
+        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        state.hls_fill_scheduler.finish_current(&retry, false);
+
+        assert!(state.tasks.persistence_available());
+        assert!(state.hls_fill_scheduler.is_idle());
+        assert!(!state.hls_fill_scheduler.owns_session(&session.id));
     }
 
     #[tokio::test]
