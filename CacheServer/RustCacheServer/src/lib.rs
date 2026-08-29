@@ -58,8 +58,8 @@ use crate::{
     hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
-        HlsCacheStatusSnapshot, HlsCacheStore, HlsTranscodingExecutionConfig,
-        completed_runtime_session, sanitized_completed_session,
+        HlsCacheSessionDirectoryScan, HlsCacheStatusSnapshot, HlsCacheStore,
+        HlsTranscodingExecutionConfig, completed_runtime_session, sanitized_completed_session,
         source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
@@ -87,6 +87,9 @@ const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
 const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const MAX_PENDING_HLS_CLEANUP_KEYS: usize = 1_024;
+const MAX_PENDING_HLS_CLEANUP_SESSION_IDS: usize = 4_096;
+const HLS_CLEANUP_OVERFLOW_SCAN_BATCH_ENTRIES: usize = 1_024;
 const CREDENTIAL_SAFE_LOG_DETAIL: &str =
     "detail omitted because Bilibili credential material is configured";
 pub(crate) const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
@@ -124,8 +127,98 @@ pub struct AppState {
     hls_cache_eviction_protected_session_ids: Arc<Mutex<HashMap<String, usize>>>,
     hls_cache_playback_leases: Arc<Mutex<HashMap<String, SystemTime>>>,
     completed_hls_deletion_lock: Arc<Mutex<()>>,
-    pending_hls_session_cleanup_by_library_item: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pending_hls_session_cleanups: Arc<Mutex<PendingHlsSessionCleanups>>,
     hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
+}
+
+#[derive(Default)]
+struct PendingHlsSessionCleanups {
+    by_cleanup_key: HashMap<String, Vec<String>>,
+    retained_session_id_count: usize,
+    overflow_scan_required: bool,
+    overflow_scan_dirty: bool,
+    overflow_scan: Option<PendingHlsCleanupOverflowScan>,
+}
+
+struct PendingHlsCleanupOverflowScan {
+    directories: HlsCacheSessionDirectoryScan,
+    deletion_failed: bool,
+}
+
+impl PendingHlsSessionCleanups {
+    fn get(&self, cleanup_key: &str) -> Option<Vec<String>> {
+        self.by_cleanup_key.get(cleanup_key).cloned()
+    }
+
+    fn entries(&self) -> Vec<(String, Vec<String>)> {
+        self.by_cleanup_key
+            .iter()
+            .map(|(key, session_ids)| (key.clone(), session_ids.clone()))
+            .collect()
+    }
+
+    fn retained_session_ids(&self) -> HashSet<String> {
+        self.by_cleanup_key.values().flatten().cloned().collect()
+    }
+
+    fn record(&mut self, cleanup_key: String, failed_session_ids: Vec<String>) {
+        if let Some(previous) = self.by_cleanup_key.remove(&cleanup_key) {
+            self.retained_session_id_count = self
+                .retained_session_id_count
+                .saturating_sub(previous.len());
+        }
+        if failed_session_ids.is_empty() {
+            return;
+        }
+
+        let available_session_slots =
+            MAX_PENDING_HLS_CLEANUP_SESSION_IDS.saturating_sub(self.retained_session_id_count);
+        let retained_count = if self.by_cleanup_key.len() < MAX_PENDING_HLS_CLEANUP_KEYS {
+            failed_session_ids.len().min(available_session_slots)
+        } else {
+            0
+        };
+        let overflowed = retained_count < failed_session_ids.len();
+        if retained_count > 0 {
+            let retained_session_ids = failed_session_ids
+                .into_iter()
+                .take(retained_count)
+                .collect::<Vec<_>>();
+            self.retained_session_id_count = self
+                .retained_session_id_count
+                .saturating_add(retained_session_ids.len());
+            self.by_cleanup_key
+                .insert(cleanup_key, retained_session_ids);
+        }
+        if overflowed {
+            self.overflow_scan_required = true;
+            self.overflow_scan_dirty = true;
+        }
+    }
+
+    fn take_or_start_overflow_scan(
+        &mut self,
+        hls_cache: &HlsCacheStore,
+    ) -> io::Result<Option<PendingHlsCleanupOverflowScan>> {
+        if let Some(scan) = self.overflow_scan.take() {
+            return Ok(Some(scan));
+        }
+        if !self.overflow_scan_required {
+            return Ok(None);
+        }
+        let directories = hls_cache.session_directory_scan()?;
+        self.overflow_scan_dirty = false;
+        Ok(Some(PendingHlsCleanupOverflowScan {
+            directories,
+            deletion_failed: false,
+        }))
+    }
+
+    fn finish_overflow_scan(&mut self, deletion_failed: bool) {
+        self.overflow_scan_required = deletion_failed || self.overflow_scan_dirty;
+        self.overflow_scan_dirty = false;
+        self.overflow_scan = None;
+    }
 }
 
 #[derive(Clone)]
@@ -432,7 +525,9 @@ impl AppState {
             hls_cache_eviction_protected_session_ids: Arc::new(Mutex::new(HashMap::new())),
             hls_cache_playback_leases: Arc::new(Mutex::new(HashMap::new())),
             completed_hls_deletion_lock: Arc::new(Mutex::new(())),
-            pending_hls_session_cleanup_by_library_item: Arc::new(Mutex::new(HashMap::new())),
+            pending_hls_session_cleanups: Arc::new(
+                Mutex::new(PendingHlsSessionCleanups::default()),
+            ),
             hls_runtime_startup: Arc::new(Mutex::new(HlsRuntimeStartupState {
                 pending: pending_hls_runtime_startup,
                 worker_running: false,
@@ -907,11 +1002,10 @@ impl AppState {
             .expect("completed HLS deletion lock poisoned");
         self.ensure_task_state_durable_for_hls_deletion()?;
         let pending_session_ids = self
-            .pending_hls_session_cleanup_by_library_item
+            .pending_hls_session_cleanups
             .lock()
             .expect("pending HLS cleanup lock poisoned")
-            .get(item_id)
-            .cloned();
+            .get(item_id);
         if let Some(pending_session_ids) = pending_session_ids {
             self.remove_hls_sessions_for_library_item(item_id, &pending_session_ids)?;
             return Ok(Some(true));
@@ -1079,16 +1173,10 @@ impl AppState {
     ) -> io::Result<()> {
         let (failed_session_ids, first_error) =
             self.remove_hls_sessions_collecting_failures(session_ids);
-        let mut pending = self
-            .pending_hls_session_cleanup_by_library_item
+        self.pending_hls_session_cleanups
             .lock()
-            .expect("pending HLS cleanup lock poisoned");
-        if failed_session_ids.is_empty() {
-            pending.remove(cleanup_key);
-        } else {
-            pending.insert(cleanup_key.to_owned(), failed_session_ids);
-        }
-        drop(pending);
+            .expect("pending HLS cleanup lock poisoned")
+            .record(cleanup_key.to_owned(), failed_session_ids);
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -1097,10 +1185,10 @@ impl AppState {
 
     fn retry_pending_hls_session_cleanups(&self) -> HashSet<String> {
         let pending = self
-            .pending_hls_session_cleanup_by_library_item
+            .pending_hls_session_cleanups
             .lock()
             .expect("pending HLS cleanup lock poisoned")
-            .clone();
+            .entries();
         for (cleanup_key, session_ids) in pending {
             if let Err(error) =
                 self.remove_hls_sessions_tracking_failures(&cleanup_key, &session_ids)
@@ -1108,13 +1196,93 @@ impl AppState {
                 eprintln!("Failed to retry pending HLS cache cleanup for {cleanup_key}: {error}");
             }
         }
-        self.pending_hls_session_cleanup_by_library_item
+        self.retry_hls_cleanup_overflow_scan_batch();
+        self.pending_hls_session_cleanups
             .lock()
             .expect("pending HLS cleanup lock poisoned")
-            .values()
-            .flatten()
-            .cloned()
-            .collect()
+            .retained_session_ids()
+    }
+
+    fn retry_hls_cleanup_overflow_scan_batch(&self) {
+        if self.tasks.persistence_configured() && !self.tasks.persistence_available() {
+            return;
+        }
+        let mut scan = {
+            let mut pending = self
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock poisoned");
+            match pending.take_or_start_overflow_scan(&self.hls_cache) {
+                Ok(Some(scan)) => scan,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("Failed to start bounded HLS cleanup overflow scan: {error}");
+                    return;
+                }
+            }
+        };
+
+        let mut exhausted = false;
+        for _ in 0..HLS_CLEANUP_OVERFLOW_SCAN_BATCH_ENTRIES {
+            let session_id = match scan.directories.next_session_id() {
+                Some(Ok(Some(session_id))) => session_id,
+                Some(Ok(None)) => continue,
+                Some(Err(error)) => {
+                    scan.deletion_failed = true;
+                    eprintln!("Failed to read an HLS cleanup overflow directory entry: {error}");
+                    continue;
+                }
+                None => {
+                    exhausted = true;
+                    break;
+                }
+            };
+            if self.hls_cleanup_overflow_session_is_protected(&session_id) {
+                continue;
+            }
+            if self.tasks.persistence_configured() && !self.tasks.persistence_available() {
+                scan.deletion_failed = true;
+                break;
+            }
+            self.remove_hls_playback_session(&session_id);
+            if let Err(error) = self.hls_cache.remove_session(&session_id) {
+                scan.deletion_failed = true;
+                eprintln!("Failed to retry overflow HLS cache cleanup for {session_id}: {error}");
+            }
+        }
+
+        let mut pending = self
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned");
+        if exhausted {
+            pending.finish_overflow_scan(scan.deletion_failed);
+        } else {
+            pending.overflow_scan = Some(scan);
+        }
+    }
+
+    fn hls_cleanup_overflow_session_is_protected(&self, session_id: &str) -> bool {
+        if self.hls_session_is_quarantined_during_startup_reconciliation(session_id)
+            || self.hls_cache_session_has_finalization_protection(session_id)
+            || self.hls_fill_scheduler.owns_session(session_id)
+            || self
+                .tasks
+                .playback_task_for_any_hls_session(session_id)
+                .is_some()
+        {
+            return true;
+        }
+        self.tasks.get_task(session_id).is_ok_and(|task| {
+            task.kind() == TaskKind::BilibiliProgressivePlayback
+                && matches!(
+                    task.state(),
+                    TaskState::Queued
+                        | TaskState::Running
+                        | TaskState::Preparing
+                        | TaskState::CancelRequested
+                )
+        })
     }
 
     fn remove_hls_sessions_collecting_failures(
@@ -3110,6 +3278,118 @@ mod tests {
         })
         .await
         .expect("failed startup HLS deletion should retry without quota activity");
+    }
+
+    #[test]
+    fn pending_hls_cleanup_tracker_bounds_keys_and_session_ids() {
+        let mut pending = PendingHlsSessionCleanups::default();
+        pending.record(
+            "oversized-group".to_owned(),
+            (0..=MAX_PENDING_HLS_CLEANUP_SESSION_IDS)
+                .map(|index| format!("session-{index}"))
+                .collect(),
+        );
+
+        assert_eq!(
+            MAX_PENDING_HLS_CLEANUP_SESSION_IDS,
+            pending.retained_session_id_count
+        );
+        assert_eq!(1, pending.by_cleanup_key.len());
+        assert!(pending.overflow_scan_required);
+
+        let mut pending = PendingHlsSessionCleanups::default();
+        for index in 0..=MAX_PENDING_HLS_CLEANUP_KEYS {
+            pending.record(format!("cleanup-{index}"), vec![format!("session-{index}")]);
+        }
+
+        assert_eq!(MAX_PENDING_HLS_CLEANUP_KEYS, pending.by_cleanup_key.len());
+        assert_eq!(
+            MAX_PENDING_HLS_CLEANUP_KEYS,
+            pending.retained_session_id_count
+        );
+        assert!(pending.overflow_scan_required);
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_retries_unretained_orphan_without_quota_pressure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let orphan = sample_hls_session("overflow-cleanup-orphan");
+        state
+            .hls_cache
+            .save_session(&orphan)
+            .expect("orphan HLS session should persist");
+        state.hls_cache.fail_next_remove_session(orphan.id.clone());
+        let mut failed_session_ids =
+            vec!["retained-missing-session".to_owned(); MAX_PENDING_HLS_CLEANUP_SESSION_IDS];
+        failed_session_ids.push(orphan.id.clone());
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record("oversized-cleanup".to_owned(), failed_session_ids);
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_first_retry", Vec::new(), 0)
+            .expect("overflow cleanup failure should remain process-local retry state");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_some());
+        {
+            let pending = state
+                .pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock should be available");
+            assert!(pending.by_cleanup_key.is_empty());
+            assert_eq!(0, pending.retained_session_id_count);
+            assert!(pending.overflow_scan_required);
+            assert!(pending.overflow_scan.is_none());
+        }
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_second_retry", Vec::new(), 0)
+            .expect("a later bounded scan should retry the orphan cleanup");
+
+        assert!(state.hls_cache.playback_session(&orphan.id).is_none());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
+    }
+
+    #[test]
+    fn hls_cleanup_overflow_scan_preserves_task_authorized_session() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (task_id, session) = create_playable_hls_task(&state, "BV1overflow-authorized");
+        state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available")
+            .record(
+                "oversized-cleanup".to_owned(),
+                vec![
+                    "retained-missing-session".to_owned();
+                    MAX_PENDING_HLS_CLEANUP_SESSION_IDS + 1
+                ],
+            );
+
+        state
+            .enforce_hls_cache_quota("overflow_cleanup_authorized", Vec::new(), 0)
+            .expect("bounded overflow cleanup should preserve authorized sessions");
+
+        assert_eq!(
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state()
+        );
+        assert!(state.hls_cache.playback_session(&session.id).is_some());
+        let pending = state
+            .pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock should be available");
+        assert!(!pending.overflow_scan_required);
+        assert!(pending.overflow_scan.is_none());
     }
 
     #[test]
