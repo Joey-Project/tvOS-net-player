@@ -305,6 +305,66 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions(),
+        pageSize: Int = 50
+    ) async throws -> BilibiliResolutionPage {
+        let request = try Self.startBilibiliResolutionRequest(
+            urlOrID: urlOrID,
+            options: options,
+            pageSize: pageSize
+        )
+        if let requiredCapability = Self.requiredCapabilityForBilibiliPlaybackPolicy(options: options) {
+            let serverInfo = try await getServerInfo()
+            guard serverInfo.capabilities.contains(requiredCapability) else {
+                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+            }
+        }
+
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                let response = try await service.startBilibiliResolution(request, options: callOptions)
+                return BilibiliResolutionPage(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
+        }
+    }
+
+    public func listBilibiliResolutionCandidates(
+        sessionID: String,
+        pageToken: String = "",
+        pageSize: Int = 50
+    ) async throws -> BilibiliResolutionPage {
+        let request = try Self.listBilibiliResolutionCandidatesRequest(
+            sessionID: sessionID,
+            pageToken: pageToken,
+            pageSize: pageSize
+        )
+
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                let response = try await service.listBilibiliResolutionCandidates(request, options: callOptions)
+                return BilibiliResolutionPage(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
+        }
+    }
+
     public func createBilibiliPlaybackTask(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions = BilibiliPlaybackTaskOptions()
@@ -383,6 +443,31 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func createBilibiliPlaybackTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection
+    ) async throws -> CacheTask {
+        let request = try Self.createBilibiliPlaybackTaskV2Request(
+            sessionID: sessionID,
+            selection: selection
+        )
+
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                let response = try await service.createBilibiliPlaybackTaskV2(request, options: callOptions)
+                return CacheTask(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
+        }
+    }
+
     public func createBilibiliTask(
         urlOrID: String,
         options: BilibiliDownloadTaskOptions = BilibiliDownloadTaskOptions()
@@ -445,6 +530,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
     {
         if capability == CacheServerCapability.bilibiliTaskSelection {
             return .bilibiliTaskSelection
+        }
+        if capability == CacheServerCapability.bilibiliResolutionV2 {
+            return .bilibiliResolutionV2
         }
         if capability == CacheServerCapability.bilibiliPlaybackPolicy {
             return .bilibiliPlaybackPolicy
@@ -521,6 +609,62 @@ public final class GRPCCacheControlClient: CacheControlClient {
 
     private var streamCallOptions: CallOptions {
         CallOptions.defaults
+    }
+
+    static func startBilibiliResolutionRequest(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        pageSize: Int
+    ) throws -> TvosNetPlayer_V1_StartBilibiliResolutionRequest {
+        let normalizedURLOrID = urlOrID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedURLOrID.isEmpty else {
+            throw CacheControlClientInvalidRequest.bilibiliResolutionInputRequired
+        }
+
+        var request = TvosNetPlayer_V1_StartBilibiliResolutionRequest()
+        request.urlOrID = normalizedURLOrID
+        request.options = TvosNetPlayer_V1_BilibiliPlaybackOptions(options)
+        request.page = bilibiliResolutionPageRequest(pageToken: "", pageSize: pageSize)
+        return request
+    }
+
+    static func listBilibiliResolutionCandidatesRequest(
+        sessionID: String,
+        pageToken: String,
+        pageSize: Int
+    ) throws -> TvosNetPlayer_V1_ListBilibiliResolutionCandidatesRequest {
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CacheControlClientInvalidRequest.bilibiliResolutionSessionIDRequired
+        }
+
+        var request = TvosNetPlayer_V1_ListBilibiliResolutionCandidatesRequest()
+        request.sessionID = sessionID
+        request.page = bilibiliResolutionPageRequest(pageToken: pageToken, pageSize: pageSize)
+        return request
+    }
+
+    static func createBilibiliPlaybackTaskV2Request(
+        sessionID: String,
+        selection: BilibiliResolutionSelection
+    ) throws -> TvosNetPlayer_V1_CreateBilibiliPlaybackTaskV2Request {
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CacheControlClientInvalidRequest.bilibiliResolutionSessionIDRequired
+        }
+
+        var request = TvosNetPlayer_V1_CreateBilibiliPlaybackTaskV2Request()
+        request.sessionID = sessionID
+        request.selection = try TvosNetPlayer_V1_BilibiliResolutionSelection(selection)
+        return request
+    }
+
+    private static func bilibiliResolutionPageRequest(
+        pageToken: String,
+        pageSize: Int
+    ) -> TvosNetPlayer_V1_PageRequest {
+        var page = TvosNetPlayer_V1_PageRequest()
+        page.pageSize = UInt32(clamping: max(0, min(pageSize, 200)))
+        page.pageToken = pageToken
+        return page
     }
 
     private static func listLibraryItemsRequest(
@@ -893,6 +1037,106 @@ extension BilibiliResolvedCandidate {
             durationSeconds: proto.durationSeconds,
             coverURI: proto.coverUri
         )
+    }
+}
+
+extension BilibiliResolutionPage {
+    init(_ proto: TvosNetPlayer_V1_BilibiliResolutionPage) {
+        self.init(
+            session: BilibiliResolutionSession(proto.session),
+            candidates: proto.candidates.map(BilibiliResolutionCandidate.init),
+            pageInfo: CachePageInfo(proto.pageInfo)
+        )
+    }
+}
+
+extension BilibiliResolutionSession {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliResolutionSession) {
+        self.init(
+            id: proto.id,
+            source: proto.source,
+            title: proto.title,
+            sourceKind: proto.sourceKind,
+            createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
+            expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil,
+            defaultCandidateToken: proto.defaultCandidateToken
+        )
+    }
+}
+
+extension BilibiliResolutionCandidate {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliResolutionCandidate) {
+        self.init(
+            candidateToken: proto.candidateToken,
+            title: proto.title,
+            subtitle: proto.subtitle,
+            sourceKind: proto.sourceKind,
+            identity: BilibiliContentIdentity(proto.identity),
+            index: Int(proto.index),
+            durationSeconds: proto.durationSeconds
+        )
+    }
+}
+
+extension BilibiliContentIdentity {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliContentIdentity) {
+        self.init(
+            kind: BilibiliContentKind(proto.kind),
+            aid: proto.aid,
+            bvid: proto.bvid,
+            cid: proto.cid,
+            epid: proto.epid
+        )
+    }
+}
+
+extension BilibiliContentKind {
+    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliContentKind) {
+        switch proto {
+        case .unspecified:
+            self = .unspecified
+        case .videoPage:
+            self = .videoPage
+        case .seasonEpisode:
+            self = .seasonEpisode
+        case .collectionItem:
+            self = .collectionItem
+        case .UNRECOGNIZED(let rawValue):
+            self = .unknown(rawValue)
+        }
+    }
+}
+
+extension TvosNetPlayer_V1_BilibiliResolutionSelection {
+    fileprivate init(_ selection: BilibiliResolutionSelection) throws {
+        self.init()
+
+        switch selection {
+        case .single(let candidateToken):
+            try validateBilibiliCandidateTokens([candidateToken])
+            mode = .single
+            candidateTokens = [candidateToken]
+        case .multiple(let candidateTokens):
+            guard !candidateTokens.isEmpty else {
+                throw CacheControlClientInvalidRequest.invalidBilibiliResolutionSelection
+            }
+            try validateBilibiliCandidateTokens(candidateTokens)
+            mode = .multiple
+            self.candidateTokens = candidateTokens
+        case .range(let startCandidateToken, let endCandidateToken):
+            try validateBilibiliCandidateTokens([startCandidateToken, endCandidateToken])
+            mode = .range
+            rangeStartCandidateToken = startCandidateToken
+            rangeEndCandidateToken = endCandidateToken
+        case .all:
+            mode = .all
+        }
+    }
+}
+
+private func validateBilibiliCandidateTokens(_ candidateTokens: [String]) throws {
+    guard candidateTokens.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+        throw CacheControlClientInvalidRequest.invalidBilibiliResolutionSelection
     }
 }
 

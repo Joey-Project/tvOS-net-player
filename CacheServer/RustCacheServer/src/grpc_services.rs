@@ -28,35 +28,49 @@ use crate::{
         BilibiliPlaybackVariantKind, recover_stable_collection_candidate,
     },
     bilibili_playback::{
-        BilibiliInputResolution, BilibiliInputResolveRequest, BilibiliPlaybackPlanningRequest,
+        BilibiliContentIdentity as AdapterBilibiliContentIdentity,
+        BilibiliContentKind as AdapterBilibiliContentKind, BilibiliInputResolution,
+        BilibiliInputResolveRequest, BilibiliPlaybackPlanningRequest,
         BilibiliResolvedCandidate as AdapterBilibiliResolvedCandidate,
+    },
+    bilibili_resolution::{
+        BILIBILI_RESOLUTION_REAPER_INTERVAL, BilibiliResolutionPageView,
+        BilibiliResolutionSessionView, BilibiliResolutionStore, BilibiliTaskCandidateRecord,
+        DEFAULT_BILIBILI_RESOLUTION_PAGE_SIZE, MAX_BILIBILI_RESOLUTION_CANDIDATES,
+        MAX_BILIBILI_RESOLUTION_PAGE_SIZE, TokenizedBilibiliCandidate,
+        validate_bilibili_resolution_selection,
     },
     bilibili_worker::BilibiliDownloadError,
     config::{BbdownRestrictedArea, CacheServerOptions},
     generated::tvos_net_player::v1::{
+        BilibiliContentIdentity as ProtoBilibiliContentIdentity, BilibiliContentKind,
         BilibiliCredentialProfile, BilibiliCredentialState, BilibiliCredentialStatus,
         BilibiliLoginMethod, BilibiliLoginSession, BilibiliLoginSessionState,
         BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackVariant,
-        BilibiliResolveResult, BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate,
-        BilibiliTaskResultItem, BilibiliTaskSelection, CacheRoot, CancelTaskRequest,
-        CheckHealthRequest, CreateBilibiliPlaybackTaskRequest, CreateBilibiliTaskRequest,
-        DeleteLibraryItemRequest, DeleteLibraryItemResponse, GetBilibiliCredentialStatusRequest,
-        GetBilibiliLoginSessionRequest, GetHlsCacheStatusRequest, GetLibraryItemRequest,
-        GetPlaybackSourceRequest, GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
+        BilibiliResolutionCandidate as ProtoBilibiliResolutionCandidate, BilibiliResolutionPage,
+        BilibiliResolutionSession, BilibiliResolveResult,
+        BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliTaskResultItem,
+        BilibiliTaskSelection, CacheRoot, CancelTaskRequest, CheckHealthRequest,
+        CreateBilibiliPlaybackTaskRequest, CreateBilibiliPlaybackTaskV2Request,
+        CreateBilibiliTaskRequest, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
+        GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
+        GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
+        GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
         HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus,
         HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackProgressStatus,
         HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan, LanTranscodingPlanState,
         LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
         LibraryItem, LibrarySource, ListBilibiliCredentialProfilesRequest,
-        ListBilibiliCredentialProfilesResponse, ListCacheRootsRequest, ListCacheRootsResponse,
-        ListLibraryItemsRequest, ListLibraryItemsResponse, ListTaskResultsRequest,
-        ListTaskResultsResponse, PageInfo, PlaybackProgressIntent as ProtoPlaybackProgressIntent,
-        PlaybackProtocol, PlaybackSource, ReportPlaybackProgressRequest,
-        ReportPlaybackProgressResponse, RescanLibraryRequest, RescanLibraryResponse,
-        ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
-        StartBilibiliLoginSessionRequest, Task, TaskEvent, TaskKind, TaskState, WatchTasksRequest,
-        cache_service_server::CacheService, library_service_server::LibraryService,
-        server_service_server::ServerService, task_service_server::TaskService,
+        ListBilibiliCredentialProfilesResponse, ListBilibiliResolutionCandidatesRequest,
+        ListCacheRootsRequest, ListCacheRootsResponse, ListLibraryItemsRequest,
+        ListLibraryItemsResponse, ListTaskResultsRequest, ListTaskResultsResponse, PageInfo,
+        PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
+        ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
+        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
+        StartBilibiliLoginSessionRequest, StartBilibiliResolutionRequest, Task, TaskEvent,
+        TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
+        library_service_server::LibraryService, server_service_server::ServerService,
+        task_service_server::TaskService,
     },
     hls::{HlsPlaybackSession, HlsVariant, HlsVariantMetadata},
     hls_cache::{
@@ -99,6 +113,7 @@ const BILIBILI_TASK_SELECTION_MODE_SINGLE: i32 = 3;
 const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
 const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
 const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
+const LEGACY_BILIBILI_RESOLVE_CANDIDATE_LIMIT: usize = 100;
 const BILIBILI_RESULT_PLANNING_MESSAGE: &str = "Queued for Bilibili playback planning.";
 const BILIBILI_RESULT_PLAYABLE_MESSAGE: &str = "Playable online.";
 const DEFAULT_TASK_RESULT_PAGE_SIZE: usize = 50;
@@ -118,6 +133,7 @@ const MAX_TASK_RESULT_BLOCKING_OPERATIONS: usize = 4;
 const TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
+const BILIBILI_RESOLUTION_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
@@ -167,6 +183,10 @@ impl ServerService for ServerGrpcService {
             ],
         };
 
+        if self.state.tasks.persistence_available() {
+            info.capabilities
+                .push(ServerCapability::BilibiliResolutionV2.into());
+        }
         if self.state.library.supports_http_range_playback() {
             info.capabilities.push(ServerCapability::HttpRange.into());
             if self.state.tasks.task_output_v2_available() {
@@ -733,6 +753,62 @@ impl TaskGrpcService {
             );
         }
         should_start
+    }
+
+    fn ensure_bilibili_resolution_reaper_started(&self) -> bool {
+        let should_start = {
+            let mut resolutions = self
+                .state
+                .bilibili_resolutions
+                .lock()
+                .expect("Bilibili resolution store lock poisoned");
+            resolutions.mark_reaper_started()
+        };
+        if should_start {
+            spawn_bilibili_resolution_reaper(
+                Arc::downgrade(&self.state.bilibili_resolutions),
+                BILIBILI_RESOLUTION_REAPER_INTERVAL,
+            );
+        }
+        should_start
+    }
+
+    fn require_bilibili_resolution_v2(&self) -> Result<(), Status> {
+        if !self.state.tasks.persistence_available() {
+            return Err(Status::failed_precondition(
+                "Durable task state is unavailable for Bilibili resolution v2.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn run_bilibili_resolution_blocking<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Status> + Send + 'static,
+    ) -> Result<T, Status>
+    where
+        T: Send + 'static,
+    {
+        let permit = timeout(
+            BILIBILI_RESOLUTION_BLOCKING_ADMISSION_TIMEOUT,
+            Arc::clone(&self.state.bilibili_resolution_blocking_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            Status::resource_exhausted(
+                "Bilibili resolution operations are busy; retry the request.",
+            )
+        })?
+        .map_err(|_| Status::unavailable("Bilibili resolution limiter is unavailable."))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to join Bilibili resolution operation: {error}");
+            Status::internal("Bilibili resolution operation failed unexpectedly.")
+        })?
     }
 
     async fn run_task_result_blocking<T, F>(&self, operation: F) -> Result<T, Status>
@@ -1504,6 +1580,31 @@ fn prune_task_result_pages_once(
     true
 }
 
+fn spawn_bilibili_resolution_reaper(
+    resolutions: Weak<StdMutex<BilibiliResolutionStore>>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+            let Some(resolutions) = resolutions.upgrade() else {
+                return;
+            };
+            if tokio::task::spawn_blocking(move || {
+                resolutions
+                    .lock()
+                    .expect("Bilibili resolution store lock poisoned")
+                    .prune(StdInstant::now());
+            })
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    });
+}
+
 #[tonic::async_trait]
 impl TaskService for TaskGrpcService {
     type WatchTasksStream = Pin<Box<dyn Stream<Item = Result<TaskEvent, Status>> + Send + 'static>>;
@@ -1533,10 +1634,95 @@ impl TaskService for TaskGrpcService {
                 source,
                 options: request.options,
                 cancellation: crate::task_registry::BilibiliTaskCancellation::default(),
+                candidate_limit: LEGACY_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+                include_candidate_cover_uri: true,
             })
             .await
             .map_err(|error| playback_status_from_error(&self.state, error))?;
         Ok(Response::new(BilibiliResolveResult::from(resolution)))
+    }
+
+    async fn start_bilibili_resolution(
+        &self,
+        request: Request<StartBilibiliResolutionRequest>,
+    ) -> Result<Response<BilibiliResolutionPage>, Status> {
+        self.require_bilibili_resolution_v2()?;
+        let request = request.into_inner();
+        let source = request.url_or_id.trim().to_owned();
+        if source.is_empty() {
+            return Err(Status::invalid_argument("Bilibili URL or id is required."));
+        }
+        let page = request.page.unwrap_or_default();
+        if !page.page_token.is_empty() {
+            return Err(Status::invalid_argument(
+                "A new Bilibili resolution cannot include a page token.",
+            ));
+        }
+        let page_size = bilibili_resolution_page_size(page.page_size)?;
+        PlaybackPolicy::from_playback_options(request.options.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        let _permit = Arc::clone(&self.state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                Status::unavailable("Playback planning concurrency limiter is unavailable.")
+            })?;
+        let resolution = self
+            .state
+            .playback_planner
+            .resolve_input(BilibiliInputResolveRequest {
+                source,
+                options: request.options.clone(),
+                cancellation: crate::task_registry::BilibiliTaskCancellation::default(),
+                candidate_limit: MAX_BILIBILI_RESOLUTION_CANDIDATES,
+                include_candidate_cover_uri: false,
+            })
+            .await
+            .map_err(|error| playback_status_from_error(&self.state, error))?;
+        self.ensure_bilibili_resolution_reaper_started();
+        let resolutions = Arc::clone(&self.state.bilibili_resolutions);
+        let page = self
+            .run_bilibili_resolution_blocking(move || {
+                resolutions
+                    .lock()
+                    .expect("Bilibili resolution store lock poisoned")
+                    .create_session(
+                        resolution,
+                        request.options,
+                        StdInstant::now(),
+                        SystemTime::now(),
+                        page_size,
+                    )
+            })
+            .await?;
+        Ok(Response::new(proto_bilibili_resolution_page(page)))
+    }
+
+    async fn list_bilibili_resolution_candidates(
+        &self,
+        request: Request<ListBilibiliResolutionCandidatesRequest>,
+    ) -> Result<Response<BilibiliResolutionPage>, Status> {
+        self.require_bilibili_resolution_v2()?;
+        let request = request.into_inner();
+        let page = request.page.unwrap_or_default();
+        let page_size = bilibili_resolution_page_size(page.page_size)?;
+        let resolutions = Arc::clone(&self.state.bilibili_resolutions);
+        let result = self
+            .run_bilibili_resolution_blocking(move || {
+                resolutions
+                    .lock()
+                    .expect("Bilibili resolution store lock poisoned")
+                    .page(
+                        &request.session_id,
+                        (!page.page_token.is_empty()).then_some(page.page_token.as_str()),
+                        StdInstant::now(),
+                        page_size,
+                    )
+            })
+            .await?;
+        self.ensure_bilibili_resolution_reaper_started();
+        Ok(Response::new(proto_bilibili_resolution_page(result)))
     }
 
     async fn create_bilibili_task(
@@ -1609,6 +1795,161 @@ impl TaskService for TaskGrpcService {
 
         Ok(Response::new(task_for_client(
             creation.task,
+            self.state.bilibili_error_details_are_sensitive(),
+        )))
+    }
+
+    async fn create_bilibili_playback_task_v2(
+        &self,
+        mut request: Request<CreateBilibiliPlaybackTaskV2Request>,
+    ) -> Result<Response<Task>, Status> {
+        self.require_bilibili_resolution_v2()?;
+        let session_id = std::mem::take(&mut request.get_mut().session_id);
+        let selection = request.get_mut().selection.take().ok_or_else(|| {
+            Status::invalid_argument("Bilibili resolution selection is required.")
+        })?;
+        validate_bilibili_resolution_selection(&selection)?;
+        let resolutions = Arc::clone(&self.state.bilibili_resolutions);
+        let tasks = Arc::clone(&self.state.tasks);
+        let state = self.state.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let task = self.run_bilibili_resolution_blocking(move || {
+            let accepted = resolutions
+                .lock()
+                .expect("Bilibili resolution store lock poisoned")
+                .accept_selection(&session_id, &selection, StdInstant::now())?;
+            let playback_policy = PlaybackPolicy::from_playback_options(accepted.options.as_ref())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let task_candidates = accepted
+                .candidates
+                .iter()
+                .map(BilibiliTaskCandidateRecord::from)
+                .collect();
+            let creation = tasks.create_bilibili_playback_task_v2(
+                &accepted.source,
+                accepted.options.clone(),
+                accepted.title.clone(),
+                task_candidates,
+            )?;
+            if creation.created {
+                let task_id = creation.task.id.clone();
+                let requires_persistence_recovery = creation.requires_persistence_recovery;
+                let playback_source_uri = state
+                    .playback_uri_factory
+                    .create_hls_master_playlist(&request, &task_id);
+                let cancellation = creation.cancellation.clone().expect(
+                    "new v2 playback task should include a planning cancellation token",
+                );
+                let planning_activity = state.begin_playback_planning();
+                let playback_configuration = ValidatedPlaybackConfiguration {
+                    options: accepted.options.clone(),
+                    policy: playback_policy,
+                };
+                let planning_state = state.clone();
+                runtime.spawn(async move {
+                    let _planning_activity = planning_activity;
+                    let mut cleanup =
+                        PlaybackPlanningCleanup::new(planning_state.clone(), task_id.clone());
+                    if requires_persistence_recovery {
+                        loop {
+                            if cancellation.is_cancel_requested() {
+                                if complete_playback_planning_terminal(
+                                    &planning_state,
+                                    &task_id,
+                                    PlaybackPlanningTerminalState::Cancelled,
+                                    PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                                    Vec::new(),
+                                )
+                                .await
+                                {
+                                    cleanup.disarm();
+                                }
+                                return;
+                            }
+                            match retry_pending_task_persistence(
+                                &planning_state.tasks,
+                                "Bilibili v2 task creation",
+                            )
+                            .await
+                            {
+                                TaskPersistenceRecoveryOutcome::Durable => break,
+                                TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                                    sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+                                }
+                                TaskPersistenceRecoveryOutcome::PermanentFailure => {
+                                    eprintln!(
+                                        "Bilibili v2 task {task_id} cannot begin playback planning because task persistence recovery failed permanently"
+                                    );
+                                    cleanup.disarm();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let permit_request = Arc::clone(&planning_state.playback_planning_permits)
+                        .acquire_owned();
+                    tokio::pin!(permit_request);
+                    let _permit = loop {
+                        if cancellation.is_cancel_requested() {
+                            if complete_playback_planning_terminal(
+                                &planning_state,
+                                &task_id,
+                                PlaybackPlanningTerminalState::Cancelled,
+                                PLAYBACK_PLANNING_CANCELLED_MESSAGE.to_owned(),
+                                Vec::new(),
+                            )
+                            .await
+                            {
+                                cleanup.disarm();
+                            }
+                            return;
+                        }
+                        tokio::select! {
+                            permit = &mut permit_request => {
+                                match permit {
+                                    Ok(permit) => break permit,
+                                    Err(_) => {
+                                        if complete_playback_planning_terminal(
+                                            &planning_state,
+                                            &task_id,
+                                            PlaybackPlanningTerminalState::Failed,
+                                            "Playback planning concurrency limiter is unavailable.".to_owned(),
+                                            Vec::new(),
+                                        )
+                                        .await
+                                        {
+                                            cleanup.disarm();
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            () = sleep(Duration::from_millis(100)) => {}
+                        }
+                    };
+                    let completed = run_selected_bilibili_playback_planning(
+                        planning_state,
+                        task_id,
+                        accepted.source,
+                        playback_configuration,
+                        accepted.title,
+                        accepted.candidates,
+                        playback_source_uri,
+                        cancellation,
+                        false,
+                    )
+                    .await;
+                    if completed {
+                        cleanup.disarm();
+                    }
+                });
+            }
+            Ok(creation.task)
+        })
+        .await?;
+
+        Ok(Response::new(task_for_client(
+            task,
             self.state.bilibili_error_details_are_sensitive(),
         )))
     }
@@ -2600,16 +2941,14 @@ async fn run_explicit_bilibili_playback_planning(
     primary_playback_source_uri: String,
     cancellation: crate::task_registry::BilibiliTaskCancellation,
 ) -> bool {
-    let ValidatedPlaybackConfiguration {
-        options,
-        policy: playback_policy,
-    } = playback_configuration;
     let resolution = match state
         .playback_planner
         .resolve_input(BilibiliInputResolveRequest {
             source: source.clone(),
-            options: options.clone(),
+            options: playback_configuration.options.clone(),
             cancellation: cancellation.clone(),
+            candidate_limit: LEGACY_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
+            include_candidate_cover_uri: false,
         })
         .await
     {
@@ -2650,6 +2989,36 @@ async fn run_explicit_bilibili_playback_planning(
             .await;
         }
     };
+    run_selected_bilibili_playback_planning(
+        state,
+        task_id,
+        source,
+        playback_configuration,
+        resolution.title,
+        candidates,
+        primary_playback_source_uri,
+        cancellation,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_selected_bilibili_playback_planning(
+    state: AppState,
+    task_id: String,
+    source: String,
+    playback_configuration: ValidatedPlaybackConfiguration,
+    resolution_title: String,
+    candidates: Vec<AdapterBilibiliResolvedCandidate>,
+    primary_playback_source_uri: String,
+    cancellation: crate::task_registry::BilibiliTaskCancellation,
+    expose_selection_ids: bool,
+) -> bool {
+    let ValidatedPlaybackConfiguration {
+        options,
+        policy: playback_policy,
+    } = playback_configuration;
     let total = candidates.len();
     let mut result_items = candidates
         .iter()
@@ -2660,12 +3029,13 @@ async fn run_explicit_bilibili_playback_planning(
                 candidate,
                 TaskState::Preparing,
                 BILIBILI_RESULT_PLANNING_MESSAGE.to_owned(),
+                expose_selection_ids,
             )
         })
         .collect::<Vec<_>>();
     let _ = state.tasks.update_playback_results(
         &task_id,
-        Some(resolution.title.clone()),
+        Some(resolution_title.clone()),
         format!("Planning {total} Bilibili playback result(s)."),
         0.0,
         result_items.clone(),
@@ -2686,7 +3056,7 @@ async fn run_explicit_bilibili_playback_planning(
             return complete_cancelled_explicit_bilibili_playback(
                 &state,
                 &task_id,
-                &resolution.title,
+                &resolution_title,
                 &mut result_items,
                 &planned_session_ids,
             )
@@ -2757,7 +3127,7 @@ async fn run_explicit_bilibili_playback_planning(
                 return complete_cancelled_explicit_bilibili_playback(
                     &state,
                     &task_id,
-                    &resolution.title,
+                    &resolution_title,
                     &mut result_items,
                     &planned_session_ids,
                 )
@@ -2782,7 +3152,7 @@ async fn run_explicit_bilibili_playback_planning(
                 &state,
                 ExplicitBilibiliHlsResultPublication {
                     task_id: task_id.clone(),
-                    title: resolution.title.clone(),
+                    title: resolution_title.clone(),
                     message,
                     progress,
                     result_items: result_items.clone(),
@@ -2793,7 +3163,7 @@ async fn run_explicit_bilibili_playback_planning(
         } else {
             let _ = state.tasks.update_playback_results(
                 &task_id,
-                Some(resolution.title.clone()),
+                Some(resolution_title.clone()),
                 message,
                 progress,
                 result_items.clone(),
@@ -2816,7 +3186,7 @@ async fn run_explicit_bilibili_playback_planning(
         return complete_cancelled_explicit_bilibili_playback(
             &state,
             &task_id,
-            &resolution.title,
+            &resolution_title,
             &mut result_items,
             &planned_session_ids,
         )
@@ -3092,10 +3462,15 @@ fn bilibili_result_item(
     candidate: &AdapterBilibiliResolvedCandidate,
     state: TaskState,
     message: String,
+    expose_selection_id: bool,
 ) -> BilibiliTaskResultItem {
     BilibiliTaskResultItem {
         id,
-        selection_id: candidate.selection_id.clone(),
+        selection_id: if expose_selection_id {
+            candidate.selection_id.clone()
+        } else {
+            String::new()
+        },
         title: candidate.title.clone(),
         subtitle: candidate.subtitle.clone(),
         source_kind: candidate.source_kind.clone(),
@@ -4038,9 +4413,9 @@ fn playback_variant_size_bytes(variant: &AdapterPlaybackVariant) -> Option<u64> 
 
 fn playback_error_message(error: BilibiliDownloadError) -> String {
     match error {
-        BilibiliDownloadError::Failed(message) | BilibiliDownloadError::Cancelled(message) => {
-            message
-        }
+        BilibiliDownloadError::Failed(message)
+        | BilibiliDownloadError::ResourceExhausted(message)
+        | BilibiliDownloadError::Cancelled(message) => message,
     }
 }
 
@@ -4048,6 +4423,9 @@ fn playback_status_from_error(state: &AppState, error: BilibiliDownloadError) ->
     match error {
         BilibiliDownloadError::Failed(message) => {
             Status::failed_precondition(state.error_detail_for_client(&message))
+        }
+        BilibiliDownloadError::ResourceExhausted(message) => {
+            Status::resource_exhausted(state.error_detail_for_client(&message))
         }
         BilibiliDownloadError::Cancelled(message) => {
             Status::cancelled(state.cancellation_detail_for_client(&message))
@@ -4277,6 +4655,88 @@ impl From<AdapterBilibiliResolvedCandidate> for ProtoBilibiliResolvedCandidate {
     }
 }
 
+fn bilibili_resolution_page_size(page_size: u32) -> Result<usize, Status> {
+    let page_size = if page_size == 0 {
+        DEFAULT_BILIBILI_RESOLUTION_PAGE_SIZE
+    } else {
+        usize::try_from(page_size).unwrap_or(usize::MAX)
+    };
+    if page_size > MAX_BILIBILI_RESOLUTION_PAGE_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "Bilibili resolution page size cannot exceed {MAX_BILIBILI_RESOLUTION_PAGE_SIZE}."
+        )));
+    }
+    Ok(page_size)
+}
+
+fn proto_bilibili_resolution_page(page: BilibiliResolutionPageView) -> BilibiliResolutionPage {
+    BilibiliResolutionPage {
+        session: Some(proto_bilibili_resolution_session(page.session)),
+        candidates: page
+            .candidates
+            .into_iter()
+            .map(proto_bilibili_resolution_candidate)
+            .collect(),
+        page_info: Some(PageInfo {
+            total_size: page.total_size as u64,
+            next_page_token: page.next_page_token,
+            snapshot_id: page.snapshot_id,
+        }),
+    }
+}
+
+fn proto_bilibili_resolution_session(
+    session: BilibiliResolutionSessionView,
+) -> BilibiliResolutionSession {
+    BilibiliResolutionSession {
+        id: session.id,
+        source: session.source,
+        title: session.title,
+        source_kind: session.source_kind,
+        created_at: Some(timestamp_from_system_time(session.created_at)),
+        expires_at: Some(timestamp_from_system_time(session.expires_at)),
+        default_candidate_token: session.default_candidate_token,
+    }
+}
+
+fn proto_bilibili_resolution_candidate(
+    candidate: TokenizedBilibiliCandidate,
+) -> ProtoBilibiliResolutionCandidate {
+    ProtoBilibiliResolutionCandidate {
+        candidate_token: candidate.token,
+        title: candidate.candidate.title,
+        subtitle: candidate.candidate.subtitle,
+        source_kind: candidate.candidate.source_kind,
+        identity: Some(proto_bilibili_content_identity(
+            &candidate.candidate.identity,
+        )),
+        index: candidate.candidate.index,
+        duration_seconds: candidate
+            .candidate
+            .duration_seconds
+            .unwrap_or_default()
+            .into(),
+    }
+}
+
+fn proto_bilibili_content_identity(
+    identity: &AdapterBilibiliContentIdentity,
+) -> ProtoBilibiliContentIdentity {
+    ProtoBilibiliContentIdentity {
+        kind: match identity.kind {
+            AdapterBilibiliContentKind::VideoPage => BilibiliContentKind::VideoPage.into(),
+            AdapterBilibiliContentKind::SeasonEpisode => BilibiliContentKind::SeasonEpisode.into(),
+            AdapterBilibiliContentKind::CollectionItem => {
+                BilibiliContentKind::CollectionItem.into()
+            }
+        },
+        aid: identity.aid.unwrap_or_default(),
+        bvid: identity.bvid.clone().unwrap_or_default(),
+        cid: identity.cid.unwrap_or_default(),
+        epid: identity.epid.unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -4284,7 +4744,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::{
-            Arc, Mutex,
+            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -4299,18 +4759,21 @@ mod tests {
             BilibiliSelectedPlaybackVariant,
         },
         bilibili_playback::{
-            BilibiliInputResolution, BilibiliInputResolveFuture, BilibiliInputResolveRequest,
-            BilibiliPlaybackPlanner, BilibiliPlaybackPlanningFuture,
-            BilibiliPlaybackPlanningRequest, BilibiliResolvedCandidate,
+            BilibiliContentIdentity, BilibiliContentKind, BilibiliInputResolution,
+            BilibiliInputResolveFuture, BilibiliInputResolveRequest, BilibiliPlaybackPlanner,
+            BilibiliPlaybackPlanningFuture, BilibiliPlaybackPlanningRequest,
+            BilibiliResolvedCandidate,
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
             BilibiliCredentialState, BilibiliPlaybackOptions, BilibiliPlaybackPolicy,
-            BilibiliTaskSelection, CreateBilibiliPlaybackTaskRequest, DeleteLibraryItemRequest,
-            GetBilibiliCredentialStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
-            GetServerInfoRequest, LibraryFilter, LibrarySource, ListLibraryItemsRequest,
-            ListTaskResultsRequest, PageRequest, ResolveBilibiliInputRequest, TaskKind, TaskResult,
-            TaskState,
+            BilibiliResolutionSelection, BilibiliResolutionSelectionMode, BilibiliTaskSelection,
+            CreateBilibiliPlaybackTaskRequest, CreateBilibiliPlaybackTaskV2Request,
+            DeleteLibraryItemRequest, GetBilibiliCredentialStatusRequest, GetLibraryItemRequest,
+            GetPlaybackSourceRequest, GetServerInfoRequest, LibraryFilter, LibrarySource,
+            ListBilibiliResolutionCandidatesRequest, ListLibraryItemsRequest,
+            ListTaskResultsRequest, PageRequest, ResolveBilibiliInputRequest,
+            StartBilibiliResolutionRequest, TaskKind, TaskResult, TaskState,
         },
         hls_cache::sanitized_completed_session,
         hls_network_policy::HlsWeakNetworkState as RuntimeTestHlsWeakNetworkState,
@@ -4848,7 +5311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_server_info_advertises_bilibili_resolve_capability() {
+    async fn get_server_info_advertises_bilibili_resolution_capabilities() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -4875,6 +5338,10 @@ mod tests {
         assert!(
             info.capabilities
                 .contains(&(ServerCapability::BilibiliResolve as i32))
+        );
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliResolutionV2 as i32))
         );
         assert!(
             info.capabilities
@@ -4906,6 +5373,46 @@ mod tests {
             info.capabilities
                 .contains(&(ServerCapability::TaskOutputV2 as i32))
         );
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_requires_durable_task_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let task_state_path = temp.path().join("state").join("tasks.json");
+        fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state directory should be created");
+        fs::write(&task_state_path, b"{ invalid task state")
+            .expect("malformed task state should be written");
+        let state = AppState::new(CacheServerOptions {
+            root_path,
+            task_state_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        assert!(!state.tasks.persistence_available());
+
+        let info = ServerGrpcService::new(state.clone())
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should remain available")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::BilibiliResolutionV2 as i32))
+        );
+
+        let error = TaskGrpcService::new(state)
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1durability-required".to_owned(),
+                options: None,
+                page: None,
+            }))
+            .await
+            .expect_err("v2 resolution must fail without durable task state");
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6733,6 +7240,7 @@ mod tests {
                         subtitle: "Page 1".to_owned(),
                         source_kind: "video_page".to_owned(),
                         content_id: "1001".to_owned(),
+                        identity: sample_video_candidate_identity(1),
                         index: 1,
                         duration_seconds: Some(60),
                         cover_uri: "https://example.test/cover.jpg".to_owned(),
@@ -6743,6 +7251,7 @@ mod tests {
                         subtitle: "Page 2".to_owned(),
                         source_kind: "video_page".to_owned(),
                         content_id: "1002".to_owned(),
+                        identity: sample_video_candidate_identity(2),
                         index: 2,
                         duration_seconds: Some(75),
                         cover_uri: "https://example.test/cover.jpg".to_owned(),
@@ -6858,6 +7367,7 @@ mod tests {
                     subtitle: "Page 1".to_owned(),
                     source_kind: "video_page".to_owned(),
                     content_id: "1001".to_owned(),
+                    identity: sample_video_candidate_identity(1),
                     index: 1,
                     duration_seconds: Some(60),
                     cover_uri: "https://example.test/cover.jpg".to_owned(),
@@ -6905,6 +7415,531 @@ mod tests {
             .into_inner();
 
         assert_eq!("page:1", resolved.default_selection_id);
+    }
+
+    #[tokio::test]
+    async fn start_bilibili_resolution_rejects_whitespace_opaque_page_token() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let service = TaskGrpcService::new(state);
+
+        let error = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1opaque-token".to_owned(),
+                options: None,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: "   ".to_owned(),
+                }),
+            }))
+            .await
+            .expect_err("a nonempty opaque token must not start a new resolution");
+
+        assert_eq!(tonic::Code::InvalidArgument, error.code());
+        assert!(error.message().contains("page token"));
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_validates_raw_selection_before_blocking_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join("state").join("tasks.json"),
+            root_path,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let permits = Arc::clone(&state.bilibili_resolution_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 0..crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking permit should be acquired"),
+            );
+        }
+        let service = TaskGrpcService::new(state);
+        let request = CreateBilibiliPlaybackTaskV2Request {
+            session_id: "missing-session".to_owned(),
+            selection: Some(BilibiliResolutionSelection {
+                mode: BilibiliResolutionSelectionMode::Multiple.into(),
+                candidate_tokens: vec![String::new(); MAX_BILIBILI_RESOLUTION_CANDIDATES + 1],
+                ..Default::default()
+            }),
+        };
+
+        let error = timeout(
+            Duration::from_millis(250),
+            service.create_bilibili_playback_task_v2(Request::new(request)),
+        )
+        .await
+        .expect("raw selection validation must precede blocking admission")
+        .expect_err("an oversized raw selection must be rejected");
+
+        assert_eq!(tonic::Code::ResourceExhausted, error.code());
+        assert_eq!(0, permits.available_permits());
+        drop(held_permits);
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_pages_and_creates_from_one_durable_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join("state").join("tasks.json");
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut resolution = sample_resolution_with_pages();
+        resolution.candidates[0].cover_uri =
+            "https://provider.invalid/private-cover?credential=must-not-persist".to_owned();
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests: Arc::clone(&resolve_requests),
+                playback_requests: Arc::clone(&playback_requests),
+                resolution,
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+
+        let first = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "  BV1v2-input  ".to_owned(),
+                options: None,
+                page: Some(PageRequest {
+                    page_size: 2,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("v2 resolution should start")
+            .into_inner();
+        let session = first
+            .session
+            .as_ref()
+            .expect("first page should include its session");
+        let first_page_info = first
+            .page_info
+            .as_ref()
+            .expect("first page should include page metadata");
+        assert_eq!("BV1range", session.source);
+        assert_eq!(3, first_page_info.total_size);
+        assert_eq!(2, first.candidates.len());
+        assert!(!first_page_info.next_page_token.is_empty());
+        assert!(!first_page_info.snapshot_id.is_empty());
+        assert!(first.candidates.iter().all(|candidate| {
+            !candidate.candidate_token.is_empty()
+                && candidate
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.cid > 0 && identity.epid == 0)
+        }));
+
+        let second = service
+            .list_bilibili_resolution_candidates(Request::new(
+                ListBilibiliResolutionCandidatesRequest {
+                    session_id: session.id.clone(),
+                    page: Some(PageRequest {
+                        page_size: 2,
+                        page_token: first_page_info.next_page_token.clone(),
+                    }),
+                },
+            ))
+            .await
+            .expect("continuation page should resolve")
+            .into_inner();
+        assert_eq!(
+            vec![3],
+            second
+                .candidates
+                .iter()
+                .map(|item| item.index)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first_page_info.snapshot_id,
+            second
+                .page_info
+                .as_ref()
+                .expect("continuation page should include metadata")
+                .snapshot_id
+        );
+
+        let created = service
+            .create_bilibili_playback_task_v2(Request::new(CreateBilibiliPlaybackTaskV2Request {
+                session_id: session.id.clone(),
+                selection: Some(BilibiliResolutionSelection {
+                    mode: BilibiliResolutionSelectionMode::Multiple.into(),
+                    candidate_tokens: vec![
+                        first.candidates[0].candidate_token.clone(),
+                        second.candidates[0].candidate_token.clone(),
+                    ],
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .expect("cross-page selection should create a task")
+            .into_inner();
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+
+        assert_eq!(2, playable.result_items.len());
+        assert!(playable.bilibili_selection.is_none());
+        assert!(
+            playable
+                .result_items
+                .iter()
+                .all(|item| item.selection_id.is_empty())
+        );
+        assert_eq!(
+            vec![("BV1v2-input".to_owned(), None)],
+            *resolve_requests
+                .lock()
+                .expect("resolve request log should not be poisoned")
+        );
+        assert_eq!(
+            vec![
+                ("BV1range".to_owned(), Some("page:1".to_owned())),
+                ("BV1range".to_owned(), Some("page:3".to_owned())),
+            ],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(task_state_path).expect("accepted task state should be durable"),
+        )
+        .expect("accepted task state should be valid JSON");
+        let persisted_task = snapshot["tasks"]
+            .as_array()
+            .expect("task state should contain a task array")
+            .iter()
+            .find(|task| task["id"].as_str() == Some(created.id.as_str()))
+            .expect("created task should be persisted");
+        let persisted_candidates = persisted_task["bilibili_candidates"]
+            .as_array()
+            .expect("v2 task should persist accepted candidates");
+        assert_eq!(2, persisted_candidates.len());
+        assert_eq!(
+            Some("page:1"),
+            persisted_candidates[0]["selection_id"].as_str()
+        );
+        assert_eq!(
+            Some(2_001),
+            persisted_candidates[0]["identity"]["cid"].as_u64()
+        );
+        assert_eq!(
+            Some("page:3"),
+            persisted_candidates[1]["selection_id"].as_str()
+        );
+        assert_eq!(
+            Some(2_003),
+            persisted_candidates[1]["identity"]["cid"].as_u64()
+        );
+        assert!(persisted_candidates.iter().all(|candidate| {
+            candidate
+                .as_object()
+                .is_some_and(|candidate| !candidate.contains_key("cover_uri"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_waits_for_task_durability_before_planning() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_registry = Arc::new(Mutex::new(None));
+        let persistence_available_at_plan = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join("state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(PersistenceCheckingPlaybackPlanner {
+                resolution: sample_resolution_with_pages(),
+                task_registry: Arc::clone(&task_registry),
+                persistence_available_at_plan: Arc::clone(&persistence_available_at_plan),
+            }),
+        );
+        *task_registry
+            .lock()
+            .expect("task registry slot should not be poisoned") = Some(Arc::clone(&state.tasks));
+        let tasks = Arc::clone(&state.tasks);
+        let service = TaskGrpcService::new(state);
+        let resolution = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1durability-gate".to_owned(),
+                options: None,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("v2 resolution should start")
+            .into_inner();
+        let session = resolution
+            .session
+            .expect("resolution should include its session");
+        let candidate_token = resolution.candidates[0].candidate_token.clone();
+
+        tasks.fail_next_persistence_directory_sync();
+        let created = service
+            .create_bilibili_playback_task_v2(Request::new(CreateBilibiliPlaybackTaskV2Request {
+                session_id: session.id,
+                selection: Some(BilibiliResolutionSelection {
+                    mode: BilibiliResolutionSelectionMode::Single.into(),
+                    candidate_tokens: vec![candidate_token],
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .expect("an installed task should remain accepted while durability recovers")
+            .into_inner();
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+
+        assert_eq!(created.id, playable.id);
+        assert!(tasks.persistence_available());
+        assert_eq!(
+            vec![true],
+            *persistence_available_at_plan
+                .lock()
+                .expect("persistence observation log should not be poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_keeps_planning_owner_after_rpc_cancellation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let resolve_requests = Arc::new(Mutex::new(Vec::new()));
+        let playback_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests,
+                playback_requests: Arc::clone(&playback_requests),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let tasks = Arc::clone(&state.tasks);
+        let blocking_permits = Arc::clone(&state.bilibili_resolution_blocking_permits);
+        let service = TaskGrpcService::new(state);
+        let resolution = service
+            .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1cancelled-rpc".to_owned(),
+                options: None,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("v2 resolution should start")
+            .into_inner();
+        let session = resolution
+            .session
+            .expect("resolution should include its session");
+        let candidate_token = resolution.candidates[0].candidate_token.clone();
+
+        let persistence_entered = Arc::new(Barrier::new(2));
+        let persistence_resume = Arc::new(Barrier::new(2));
+        tasks.block_next_persistence_save(
+            Arc::clone(&persistence_entered),
+            Arc::clone(&persistence_resume),
+        );
+        let create_service = service.clone();
+        let create_call = tokio::spawn(async move {
+            create_service
+                .create_bilibili_playback_task_v2(Request::new(
+                    CreateBilibiliPlaybackTaskV2Request {
+                        session_id: session.id,
+                        selection: Some(BilibiliResolutionSelection {
+                            mode: BilibiliResolutionSelectionMode::Single.into(),
+                            candidate_tokens: vec![candidate_token],
+                            ..Default::default()
+                        }),
+                    },
+                ))
+                .await
+        });
+        tokio::task::spawn_blocking(move || persistence_entered.wait())
+            .await
+            .expect("test should observe blocked task persistence");
+        assert_eq!(
+            crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS - 1,
+            blocking_permits.available_permits()
+        );
+        create_call.abort();
+        assert!(
+            create_call
+                .await
+                .expect_err("RPC task should be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS - 1,
+            blocking_permits.available_permits(),
+            "RPC cancellation must not release a permit while blocking work is still active"
+        );
+        tokio::task::spawn_blocking(move || persistence_resume.wait())
+            .await
+            .expect("test should release task persistence");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !playback_requests
+                    .lock()
+                    .expect("playback request log should not be poisoned")
+                    .is_empty()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached task creation should still start playback planning");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while blocking_permits.available_permits()
+                != crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocking operation permit should release after durable task creation");
+        assert_eq!(
+            vec![("BV1range".to_owned(), Some("page:1".to_owned()))],
+            *playback_requests
+                .lock()
+                .expect("playback request log should not be poisoned")
+        );
+
+        let subscription = tasks
+            .subscribe(&[])
+            .expect("task snapshot subscription should succeed");
+        let created = subscription
+            .snapshots()
+            .iter()
+            .find(|task| task.source == "BV1range")
+            .expect("cancelled RPC should leave an owned durable task");
+        let playable = wait_for_task_state(&tasks, &created.id, TaskState::Playable).await;
+        assert_eq!(TaskState::Playable, playable.state());
+    }
+
+    #[tokio::test]
+    async fn bilibili_resolution_v2_starts_reaper_before_detached_blocking_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(StaticResolveAndRecordingPlaybackPlanner {
+                resolve_requests: Arc::new(Mutex::new(Vec::new())),
+                playback_requests: Arc::new(Mutex::new(Vec::new())),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let resolutions = Arc::clone(&state.bilibili_resolutions);
+        let blocking_permits = Arc::clone(&state.bilibili_resolution_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 0..crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&blocking_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking permit should be acquired"),
+            );
+        }
+        let service = TaskGrpcService::new(state);
+        let request_service = service.clone();
+        let call = tokio::spawn(async move {
+            request_service
+                .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                    url_or_id: "BV1reaper-order".to_owned(),
+                    options: None,
+                    page: None,
+                }))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if resolutions
+                    .lock()
+                    .expect("resolution store lock should not be poisoned")
+                    .reaper_started()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaper ownership must be established before blocking admission");
+        assert_eq!(0, blocking_permits.available_permits());
+
+        call.abort();
+        assert!(
+            call.await
+                .expect_err("blocked start RPC should be cancelled")
+                .is_cancelled()
+        );
+        drop(held_permits);
+        assert!(
+            resolutions
+                .lock()
+                .expect("resolution store lock should not be poisoned")
+                .reaper_started()
+        );
+        assert!(service.state.bilibili_resolutions.lock().is_ok());
     }
 
     #[tokio::test]
@@ -8802,6 +9837,13 @@ mod tests {
                 subtitle: String::new(),
                 source_kind: "recommendation".to_owned(),
                 content_id: "BV1yy411c7mD".to_owned(),
+                identity: BilibiliContentIdentity {
+                    kind: BilibiliContentKind::CollectionItem,
+                    aid: Some(170_002),
+                    bvid: Some("BV1yy411c7mD".to_owned()),
+                    cid: Some(270_002),
+                    epid: None,
+                },
                 index: 1,
                 duration_seconds: Some(60),
                 cover_uri: String::new(),
@@ -17446,6 +18488,40 @@ mod tests {
         }
     }
 
+    struct PersistenceCheckingPlaybackPlanner {
+        resolution: BilibiliInputResolution,
+        task_registry: Arc<Mutex<Option<Arc<BilibiliTaskRegistry>>>>,
+        persistence_available_at_plan: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl BilibiliPlaybackPlanner for PersistenceCheckingPlaybackPlanner {
+        fn resolve_input<'a>(
+            &'a self,
+            _request: BilibiliInputResolveRequest,
+        ) -> BilibiliInputResolveFuture<'a> {
+            let resolution = self.resolution.clone();
+            Box::pin(async move { Ok(resolution) })
+        }
+
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let persistence_available = self
+                .task_registry
+                .lock()
+                .expect("task registry slot should not be poisoned")
+                .as_ref()
+                .expect("task registry should be installed before planning")
+                .persistence_available();
+            self.persistence_available_at_plan
+                .lock()
+                .expect("persistence observation log should not be poisoned")
+                .push(persistence_available);
+            Box::pin(async { Ok(sample_playback_plan()) })
+        }
+    }
+
     struct StaticResolveAndScriptedPlaybackPlanner {
         resolve_requests: ResolveRequestLog,
         playback_requests: PlaybackRequestLog,
@@ -17840,7 +18916,8 @@ mod tests {
                     title: "Part 1".to_owned(),
                     subtitle: "Page 1".to_owned(),
                     source_kind: "video_page".to_owned(),
-                    content_id: "cid-1".to_owned(),
+                    content_id: "2001".to_owned(),
+                    identity: sample_video_candidate_identity(1),
                     index: 1,
                     duration_seconds: Some(60),
                     cover_uri: String::new(),
@@ -17850,7 +18927,8 @@ mod tests {
                     title: "Part 2".to_owned(),
                     subtitle: "Page 2".to_owned(),
                     source_kind: "video_page".to_owned(),
-                    content_id: "cid-2".to_owned(),
+                    content_id: "2002".to_owned(),
+                    identity: sample_video_candidate_identity(2),
                     index: 2,
                     duration_seconds: Some(61),
                     cover_uri: String::new(),
@@ -17860,12 +18938,23 @@ mod tests {
                     title: "Part 3".to_owned(),
                     subtitle: "Page 3".to_owned(),
                     source_kind: "video_page".to_owned(),
-                    content_id: "cid-3".to_owned(),
+                    content_id: "2003".to_owned(),
+                    identity: sample_video_candidate_identity(3),
                     index: 3,
                     duration_seconds: Some(62),
                     cover_uri: String::new(),
                 },
             ],
+        }
+    }
+
+    fn sample_video_candidate_identity(index: u32) -> BilibiliContentIdentity {
+        BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(1_000 + u64::from(index)),
+            bvid: Some("BV1range".to_owned()),
+            cid: Some(2_000 + u64::from(index)),
+            epid: None,
         }
     }
 

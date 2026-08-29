@@ -235,6 +235,10 @@ public struct CacheServerSummary: Equatable, Sendable {
         capabilities.contains(CacheServerCapability.bilibiliTaskSelection)
     }
 
+    public var supportsBilibiliResolutionV2: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliResolutionV2)
+    }
+
     public var supportsBilibiliCredentialStatus: Bool {
         capabilities.contains(CacheServerCapability.bilibiliCredentialStatus)
     }
@@ -290,6 +294,7 @@ public enum CacheServerCapability {
     public static let bilibiliLoginSessions = "bilibiliLoginSessions"
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
+    public static let bilibiliResolutionV2 = "bilibiliResolutionV2"
     public static let bilibiliPlaybackPolicy = "bilibiliPlaybackPolicy"
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
@@ -1057,6 +1062,36 @@ public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
     }
 }
 
+public enum BilibiliContentKind: Equatable, Sendable {
+    case unspecified
+    case videoPage
+    case seasonEpisode
+    case collectionItem
+    case unknown(Int)
+}
+
+public struct BilibiliContentIdentity: Equatable, Sendable {
+    public let kind: BilibiliContentKind
+    public let aid: UInt64
+    public let bvid: String
+    public let cid: UInt64
+    public let epid: UInt64
+
+    public init(
+        kind: BilibiliContentKind,
+        aid: UInt64,
+        bvid: String,
+        cid: UInt64,
+        epid: UInt64
+    ) {
+        self.kind = kind
+        self.aid = aid
+        self.bvid = bvid
+        self.cid = cid
+        self.epid = epid
+    }
+}
+
 public struct BilibiliResolveResult: Equatable, Sendable {
     public let source: String
     public let title: String
@@ -1134,6 +1169,92 @@ public struct BilibiliResolvedCandidate: Identifiable, Equatable, Sendable {
         self.durationSeconds = durationSeconds
         self.coverURI = coverURI
     }
+}
+
+public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let source: String
+    public let title: String
+    public let sourceKind: String
+    public let createdAt: Date?
+    public let expiresAt: Date?
+    public let defaultCandidateToken: String
+
+    public init(
+        id: String,
+        source: String,
+        title: String,
+        sourceKind: String,
+        createdAt: Date?,
+        expiresAt: Date?,
+        defaultCandidateToken: String
+    ) {
+        self.id = id
+        self.source = source
+        self.title = title
+        self.sourceKind = sourceKind
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.defaultCandidateToken = defaultCandidateToken
+    }
+}
+
+public struct BilibiliResolutionCandidate: Identifiable, Equatable, Sendable {
+    public var id: String { candidateToken }
+
+    public let candidateToken: String
+    public let title: String
+    public let subtitle: String
+    public let sourceKind: String
+    public let identity: BilibiliContentIdentity
+    public let index: Int
+    public let durationSeconds: Int64
+
+    public init(
+        candidateToken: String,
+        title: String,
+        subtitle: String,
+        sourceKind: String,
+        identity: BilibiliContentIdentity,
+        index: Int,
+        durationSeconds: Int64
+    ) {
+        self.candidateToken = candidateToken
+        self.title = title
+        self.subtitle = subtitle
+        self.sourceKind = sourceKind
+        self.identity = identity
+        self.index = index
+        self.durationSeconds = durationSeconds
+    }
+}
+
+public struct BilibiliResolutionPage: Equatable, Sendable {
+    public let session: BilibiliResolutionSession
+    public let candidates: [BilibiliResolutionCandidate]
+    public let pageInfo: CachePageInfo
+
+    public init(
+        session: BilibiliResolutionSession,
+        candidates: [BilibiliResolutionCandidate],
+        pageInfo: CachePageInfo
+    ) {
+        self.session = session
+        self.candidates = candidates
+        self.pageInfo = pageInfo
+    }
+
+    public var totalSize: UInt64 { pageInfo.totalSize }
+    public var nextPageToken: String { pageInfo.nextPageToken }
+    public var snapshotID: String { pageInfo.snapshotID }
+    public var hasMoreCandidates: Bool { pageInfo.hasMoreItems }
+}
+
+public enum BilibiliResolutionSelection: Equatable, Sendable {
+    case single(candidateToken: String)
+    case multiple(candidateTokens: [String])
+    case range(startCandidateToken: String, endCandidateToken: String)
+    case all
 }
 
 public struct BilibiliTaskSelection: Equatable, Sendable {

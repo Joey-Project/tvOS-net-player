@@ -16,6 +16,13 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testGeneratedBilibiliResolutionV2CapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliResolutionV2),
+            CacheServerCapability.bilibiliResolutionV2
+        )
+    }
+
     func testGeneratedBilibiliCredentialStatusCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliCredentialStatus),
@@ -65,6 +72,71 @@ final class CacheLibraryPaginationTests: XCTestCase {
             capabilities: [CacheServerCapability.taskOutputV2]
         )
         XCTAssertTrue(summary.supportsTaskOutputV2)
+    }
+
+    func testBilibiliResolutionPageMapsSessionCandidatesIdentityAndPagination() {
+        var proto = TvosNetPlayer_V1_BilibiliResolutionPage()
+        proto.session.id = "resolution-session-1"
+        proto.session.source = "BV1resolution"
+        proto.session.title = "Resolved collection"
+        proto.session.sourceKind = "collection"
+        proto.session.createdAt.seconds = 100
+        proto.session.createdAt.nanos = 250_000_000
+        proto.session.expiresAt.seconds = 1_000
+        proto.session.defaultCandidateToken = "candidate-default"
+
+        var candidate = TvosNetPlayer_V1_BilibiliResolutionCandidate()
+        candidate.candidateToken = "candidate-2"
+        candidate.title = "Episode 2"
+        candidate.subtitle = "Season episode"
+        candidate.sourceKind = "season_episode"
+        candidate.identity.kind = .seasonEpisode
+        candidate.identity.aid = 42
+        candidate.identity.bvid = "BV1identity"
+        candidate.identity.cid = 84
+        candidate.identity.epid = 126
+        candidate.index = 2
+        candidate.durationSeconds = 1_800
+        proto.candidates = [candidate]
+        proto.pageInfo.totalSize = 75
+        proto.pageInfo.nextPageToken = "opaque-page-2"
+        proto.pageInfo.snapshotID = "snapshot-1"
+
+        let page = BilibiliResolutionPage(proto)
+
+        XCTAssertEqual(page.session.id, "resolution-session-1")
+        XCTAssertEqual(page.session.source, "BV1resolution")
+        XCTAssertEqual(page.session.createdAt, Date(timeIntervalSince1970: 100.25))
+        XCTAssertEqual(page.session.expiresAt, Date(timeIntervalSince1970: 1_000))
+        XCTAssertEqual(page.session.defaultCandidateToken, "candidate-default")
+        XCTAssertEqual(page.candidates.first?.id, "candidate-2")
+        XCTAssertEqual(
+            page.candidates.first?.identity,
+            BilibiliContentIdentity(
+                kind: .seasonEpisode,
+                aid: 42,
+                bvid: "BV1identity",
+                cid: 84,
+                epid: 126
+            )
+        )
+        XCTAssertEqual(page.candidates.first?.index, 2)
+        XCTAssertEqual(page.candidates.first?.durationSeconds, 1_800)
+        XCTAssertEqual(page.totalSize, 75)
+        XCTAssertEqual(page.nextPageToken, "opaque-page-2")
+        XCTAssertEqual(page.snapshotID, "snapshot-1")
+        XCTAssertTrue(page.hasMoreCandidates)
+    }
+
+    func testBilibiliResolutionPagePreservesUnknownContentKind() {
+        var proto = TvosNetPlayer_V1_BilibiliResolutionPage()
+        var candidate = TvosNetPlayer_V1_BilibiliResolutionCandidate()
+        candidate.identity.kind = .UNRECOGNIZED(99)
+        proto.candidates = [candidate]
+
+        let page = BilibiliResolutionPage(proto)
+
+        XCTAssertEqual(page.candidates.first?.identity.kind, .unknown(99))
     }
 
     func testTaskOutputSummaryMapsToPublicModel() {
@@ -283,6 +355,129 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(proto.playbackPolicy.weakNetworkPreference, .adaptive)
     }
 
+    func testStartBilibiliResolutionRequestNormalizesHumanInputAndPageSize() throws {
+        let options = BilibiliPlaybackTaskOptions(
+            qualityPreference: "1080p",
+            encodingPreference: "h264",
+            audioLanguagePreference: "ja-jp",
+            preferTVAPI: true
+        )
+
+        let request = try GRPCCacheControlClient.startBilibiliResolutionRequest(
+            urlOrID: "  BV1resolution  \n",
+            options: options,
+            pageSize: 500
+        )
+
+        XCTAssertEqual(request.urlOrID, "BV1resolution")
+        XCTAssertEqual(request.options.qualityPreference, "1080p")
+        XCTAssertEqual(request.options.encodingPreference, "h264")
+        XCTAssertEqual(request.options.audioLanguage, "ja-jp")
+        XCTAssertTrue(request.options.preferTvApi)
+        XCTAssertEqual(request.page.pageSize, 200)
+        XCTAssertEqual(request.page.pageToken, "")
+    }
+
+    func testBilibiliResolutionPageRequestPreservesOpaqueValuesAndServerDefaultSize() throws {
+        let request = try GRPCCacheControlClient.listBilibiliResolutionCandidatesRequest(
+            sessionID: " session-token ",
+            pageToken: " page-token ",
+            pageSize: -1
+        )
+
+        XCTAssertEqual(request.sessionID, " session-token ")
+        XCTAssertEqual(request.page.pageToken, " page-token ")
+        XCTAssertEqual(request.page.pageSize, 0)
+    }
+
+    func testCreateBilibiliPlaybackTaskV2RequestMapsEveryTokenSelectionMode() throws {
+        let single = try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
+            sessionID: "session-1",
+            selection: .single(candidateToken: " candidate-1 ")
+        )
+        XCTAssertEqual(single.sessionID, "session-1")
+        XCTAssertEqual(single.selection.mode, .single)
+        XCTAssertEqual(single.selection.candidateTokens, [" candidate-1 "])
+        XCTAssertEqual(single.selection.rangeStartCandidateToken, "")
+        XCTAssertEqual(single.selection.rangeEndCandidateToken, "")
+
+        let multiple = try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
+            sessionID: "session-1",
+            selection: .multiple(candidateTokens: ["candidate-2", "candidate-1"])
+        )
+        XCTAssertEqual(multiple.selection.mode, .multiple)
+        XCTAssertEqual(multiple.selection.candidateTokens, ["candidate-2", "candidate-1"])
+
+        let range = try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
+            sessionID: "session-1",
+            selection: .range(
+                startCandidateToken: "candidate-2",
+                endCandidateToken: "candidate-9"
+            )
+        )
+        XCTAssertEqual(range.selection.mode, .range)
+        XCTAssertTrue(range.selection.candidateTokens.isEmpty)
+        XCTAssertEqual(range.selection.rangeStartCandidateToken, "candidate-2")
+        XCTAssertEqual(range.selection.rangeEndCandidateToken, "candidate-9")
+
+        let all = try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
+            sessionID: "session-1",
+            selection: .all
+        )
+        XCTAssertEqual(all.selection.mode, .all)
+        XCTAssertTrue(all.selection.candidateTokens.isEmpty)
+        XCTAssertEqual(all.selection.rangeStartCandidateToken, "")
+        XCTAssertEqual(all.selection.rangeEndCandidateToken, "")
+    }
+
+    func testBilibiliResolutionRequestsRejectStructurallyEmptyInputs() {
+        XCTAssertThrowsError(
+            try GRPCCacheControlClient.startBilibiliResolutionRequest(
+                urlOrID: " \n ",
+                options: BilibiliPlaybackTaskOptions(),
+                pageSize: 50
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? CacheControlClientInvalidRequest,
+                .bilibiliResolutionInputRequired
+            )
+        }
+
+        XCTAssertThrowsError(
+            try GRPCCacheControlClient.listBilibiliResolutionCandidatesRequest(
+                sessionID: "  ",
+                pageToken: "",
+                pageSize: 50
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? CacheControlClientInvalidRequest,
+                .bilibiliResolutionSessionIDRequired
+            )
+        }
+
+        let invalidSelections: [BilibiliResolutionSelection] = [
+            .single(candidateToken: ""),
+            .multiple(candidateTokens: []),
+            .multiple(candidateTokens: ["candidate-1", "  "]),
+            .range(startCandidateToken: "candidate-1", endCandidateToken: ""),
+        ]
+        for selection in invalidSelections {
+            XCTAssertThrowsError(
+                try GRPCCacheControlClient.createBilibiliPlaybackTaskV2Request(
+                    sessionID: "session-1",
+                    selection: selection
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? CacheControlClientInvalidRequest,
+                    .invalidBilibiliResolutionSelection
+                )
+            }
+        }
+    }
+
     func testBilibiliDownloadTaskOptionsMapToGeneratedSchema() {
         let options = BilibiliDownloadTaskOptions(
             qualityPreference: "1080p",
@@ -335,6 +530,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 CacheServerCapability.bilibiliLoginSessions,
                 CacheServerCapability.bilibiliPlaybackPolicy,
                 CacheServerCapability.bilibiliResolve,
+                CacheServerCapability.bilibiliResolutionV2,
                 CacheServerCapability.bilibiliTaskSelection,
                 CacheServerCapability.lanTranscoding,
             ]
@@ -352,6 +548,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(supported.supportsBilibiliLoginSessions)
         XCTAssertTrue(supported.supportsBilibiliPlaybackPolicy)
         XCTAssertTrue(supported.supportsBilibiliResolve)
+        XCTAssertTrue(supported.supportsBilibiliResolutionV2)
         XCTAssertTrue(supported.supportsBilibiliTaskSelection)
         XCTAssertTrue(supported.supportsLanTranscoding)
         XCTAssertFalse(unsupported.supportsBilibiliCredentialStatus)
@@ -359,6 +556,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertFalse(unsupported.supportsBilibiliLoginSessions)
         XCTAssertFalse(unsupported.supportsBilibiliPlaybackPolicy)
         XCTAssertFalse(unsupported.supportsBilibiliResolve)
+        XCTAssertFalse(unsupported.supportsBilibiliResolutionV2)
         XCTAssertFalse(unsupported.supportsBilibiliTaskSelection)
         XCTAssertFalse(unsupported.supportsLanTranscoding)
     }
@@ -382,6 +580,34 @@ final class CacheLibraryPaginationTests: XCTestCase {
             XCTFail("selected playback should require a client implementation")
         } catch {
             XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolve)
+        }
+    }
+
+    func testLegacyConformerReportsBilibiliResolutionV2AsUnsupported() async {
+        let client: any CacheControlClient = LegacyBilibiliPlaybackCacheControlClient()
+
+        do {
+            _ = try await client.startBilibiliResolution(urlOrID: "BV1legacy")
+            XCTFail("Expected StartBilibiliResolution to be unsupported.")
+        } catch {
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolutionV2)
+        }
+
+        do {
+            _ = try await client.listBilibiliResolutionCandidates(sessionID: "session-1")
+            XCTFail("Expected ListBilibiliResolutionCandidates to be unsupported.")
+        } catch {
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolutionV2)
+        }
+
+        do {
+            _ = try await client.createBilibiliPlaybackTaskV2(
+                sessionID: "session-1",
+                selection: .all
+            )
+            XCTFail("Expected CreateBilibiliPlaybackTaskV2 to be unsupported.")
+        } catch {
+            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliResolutionV2)
         }
     }
 

@@ -17,6 +17,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::{
+    bilibili_resolution::{BilibiliTaskCandidateRecord, MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES},
     generated::tvos_net_player::v1::{
         BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliPlaybackOptions,
         BilibiliPlaybackSession, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
@@ -410,6 +411,50 @@ impl BilibiliTaskRegistry {
         options: Option<BilibiliPlaybackOptions>,
         selection: Option<BilibiliTaskSelection>,
     ) -> Result<BilibiliPlaybackTaskCreation, Status> {
+        self.create_bilibili_playback_task_record(
+            source,
+            options,
+            selection,
+            String::new(),
+            Vec::new(),
+            false,
+        )
+    }
+
+    pub(crate) fn create_bilibili_playback_task_v2(
+        &self,
+        source: &str,
+        options: Option<BilibiliPlaybackOptions>,
+        title: String,
+        candidates: Vec<BilibiliTaskCandidateRecord>,
+    ) -> Result<BilibiliPlaybackTaskCreation, Status> {
+        if !self.persistence_available() {
+            return Err(Status::failed_precondition(
+                "Durable task state is unavailable for Bilibili resolution v2.",
+            ));
+        }
+        if candidates.is_empty() {
+            return Err(Status::invalid_argument(
+                "Bilibili resolution selection must contain at least one candidate.",
+            ));
+        }
+        if candidates.len() > MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES {
+            return Err(Status::resource_exhausted(format!(
+                "A Bilibili playback task cannot exceed {MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES} candidates."
+            )));
+        }
+        self.create_bilibili_playback_task_record(source, options, None, title, candidates, true)
+    }
+
+    fn create_bilibili_playback_task_record(
+        &self,
+        source: &str,
+        options: Option<BilibiliPlaybackOptions>,
+        selection: Option<BilibiliTaskSelection>,
+        title: String,
+        candidates: Vec<BilibiliTaskCandidateRecord>,
+        defer_planning_until_durable: bool,
+    ) -> Result<BilibiliPlaybackTaskCreation, Status> {
         let normalized_source = normalize(source);
         if normalized_source.is_empty() {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
@@ -420,12 +465,35 @@ impl BilibiliTaskRegistry {
         let durability_required = self.persistence.is_some();
         let checkpoint = durability_required.then(|| RegistryMutationCheckpoint::capture(&inner));
         let now = current_timestamp();
+        let task_id = format!("bilibili-playback-{}", Uuid::new_v4().simple());
+        let result_items = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| BilibiliTaskResultItem {
+                id: if index == 0 {
+                    task_id.clone()
+                } else {
+                    format!("{task_id}-result-{}", index + 1)
+                },
+                selection_id: String::new(),
+                title: candidate.title.clone(),
+                subtitle: candidate.subtitle.clone(),
+                source_kind: candidate.source_kind.clone(),
+                content_id: candidate.content_id.clone(),
+                index: candidate.index,
+                state: TaskState::Preparing.into(),
+                message: "Queued for Bilibili playback planning.".to_owned(),
+                library_item_id: String::new(),
+                playback_source: None,
+                playback_session: None,
+            })
+            .collect();
         let mut task = Task {
-            id: format!("bilibili-playback-{}", Uuid::new_v4().simple()),
+            id: task_id,
             kind: TaskKind::BilibiliProgressivePlayback.into(),
             state: TaskState::Preparing.into(),
             source: normalized_source.clone(),
-            title: String::new(),
+            title,
             progress: 0.0,
             downloaded_bytes: 0,
             total_bytes: 0,
@@ -437,7 +505,7 @@ impl BilibiliTaskRegistry {
             playback_source: None,
             playback_session: None,
             bilibili_selection: selection,
-            result_items: Vec::new(),
+            result_items,
             output_summary: None,
         };
         let output = TaskOutputRecord::from_legacy_task(&task);
@@ -446,6 +514,11 @@ impl BilibiliTaskRegistry {
         inner
             .playback_options_by_id
             .insert(task.id.clone(), options.clone());
+        if !candidates.is_empty() {
+            inner
+                .bilibili_candidates_by_id
+                .insert(task.id.clone(), candidates);
+        }
         let cancellation = BilibiliTaskCancellation::default();
         inner
             .planning_cancellations_by_id
@@ -463,6 +536,7 @@ impl BilibiliTaskRegistry {
             task,
             created: true,
             cancellation: Some(cancellation),
+            requires_persistence_recovery: defer_planning_until_durable && !outcome.is_durable(),
         })
     }
 
@@ -2671,8 +2745,13 @@ impl BilibiliTaskRegistry {
         validate_unique_task_record_identities(&records)?;
         let mut inner = RegistryInner::default();
         for record in records {
-            let Some((mut task, download_options, playback_options, mut output)) =
-                restore_persisted_record(record)
+            let Some(RestoredTaskRecord {
+                mut task,
+                download_options,
+                playback_options,
+                bilibili_candidates,
+                mut output,
+            }) = restore_persisted_record(record)
             else {
                 continue;
             };
@@ -2706,6 +2785,11 @@ impl BilibiliTaskRegistry {
                 inner
                     .playback_options_by_id
                     .insert(task_id.clone(), playback_options);
+            }
+            if !bilibili_candidates.is_empty() {
+                inner
+                    .bilibili_candidates_by_id
+                    .insert(task_id.clone(), bilibili_candidates);
             }
             inner.outputs_by_task_id.insert(task_id.clone(), output);
             inner.tasks_by_id.insert(task_id, task);
@@ -3568,6 +3652,7 @@ pub struct BilibiliPlaybackTaskCreation {
     pub task: Task,
     pub created: bool,
     pub cancellation: Option<BilibiliTaskCancellation>,
+    pub(crate) requires_persistence_recovery: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3645,6 +3730,7 @@ struct RegistryInner {
     visible_outputs_by_task_id: HashMap<String, Arc<VisibleTaskOutput>>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
+    bilibili_candidates_by_id: HashMap<String, Vec<BilibiliTaskCandidateRecord>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
     queued_task_ids: VecDeque<String>,
     running_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
@@ -3665,6 +3751,7 @@ struct RegistryMutationCheckpoint {
     outputs_by_task_id: HashMap<String, TaskOutputRecord>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
+    bilibili_candidates_by_id: HashMap<String, Vec<BilibiliTaskCandidateRecord>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
     queued_task_ids: VecDeque<String>,
     running_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
@@ -3721,6 +3808,7 @@ impl RegistryMutationCheckpoint {
             outputs_by_task_id: inner.outputs_by_task_id.clone(),
             download_options_by_id: inner.download_options_by_id.clone(),
             playback_options_by_id: inner.playback_options_by_id.clone(),
+            bilibili_candidates_by_id: inner.bilibili_candidates_by_id.clone(),
             active_task_ids_by_key: inner.active_task_ids_by_key.clone(),
             queued_task_ids: inner.queued_task_ids.clone(),
             running_cancellations_by_id: inner.running_cancellations_by_id.clone(),
@@ -3735,6 +3823,7 @@ impl RegistryMutationCheckpoint {
         inner.outputs_by_task_id = self.outputs_by_task_id;
         inner.download_options_by_id = self.download_options_by_id;
         inner.playback_options_by_id = self.playback_options_by_id;
+        inner.bilibili_candidates_by_id = self.bilibili_candidates_by_id;
         inner.active_task_ids_by_key = self.active_task_ids_by_key;
         inner.queued_task_ids = self.queued_task_ids;
         inner.running_cancellations_by_id = self.running_cancellations_by_id;
@@ -4472,15 +4561,22 @@ fn is_terminal(state: TaskState) -> bool {
     )
 }
 
-fn restore_persisted_record(
-    record: PersistedTaskRecord,
-) -> Option<(
-    Task,
-    Option<BilibiliDownloadOptions>,
-    Option<BilibiliPlaybackOptions>,
-    TaskOutputRecord,
-)> {
-    let mut task = record.task;
+struct RestoredTaskRecord {
+    task: Task,
+    download_options: Option<BilibiliDownloadOptions>,
+    playback_options: Option<BilibiliPlaybackOptions>,
+    bilibili_candidates: Vec<BilibiliTaskCandidateRecord>,
+    output: TaskOutputRecord,
+}
+
+fn restore_persisted_record(record: PersistedTaskRecord) -> Option<RestoredTaskRecord> {
+    let PersistedTaskRecord {
+        mut task,
+        options,
+        playback_options,
+        bilibili_candidates,
+        output,
+    } = record;
     task.id = normalize(&task.id);
     task.source = normalize(&task.source);
     let task_kind = task.kind();
@@ -4561,7 +4657,13 @@ fn restore_persisted_record(
         task.finished_at = Some(updated_at);
     }
 
-    Some((task, record.options, record.playback_options, record.output))
+    Some(RestoredTaskRecord {
+        task,
+        download_options: options,
+        playback_options,
+        bilibili_candidates,
+        output,
+    })
 }
 
 fn reconcile_all_task_outputs_locked(
@@ -4971,7 +5073,12 @@ fn persisted_records_locked_with_clone_limit(
             .playback_options_by_id
             .get(&task.id)
             .and_then(Option::as_ref);
-        clone_estimate.add_record(task, options, playback_options, output)?;
+        let bilibili_candidates = inner
+            .bilibili_candidates_by_id
+            .get(&task.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        clone_estimate.add_record(task, options, playback_options, bilibili_candidates, output)?;
     }
     clone_estimate.validate_limit(clone_limit)?;
 
@@ -4993,6 +5100,11 @@ fn persisted_records_locked_with_clone_limit(
                 .get(&task.id)
                 .cloned()
                 .flatten(),
+            bilibili_candidates: inner
+                .bilibili_candidates_by_id
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_default(),
             task: task.clone(),
         })
         .collect())
@@ -5009,6 +5121,7 @@ impl PersistenceSnapshotCloneEstimate {
         task: &Task,
         options: Option<&BilibiliDownloadOptions>,
         playback_options: Option<&BilibiliPlaybackOptions>,
+        bilibili_candidates: &[BilibiliTaskCandidateRecord],
         output: &TaskOutputRecord,
     ) -> io::Result<()> {
         self.add_bytes(std::mem::size_of::<PersistedTaskRecord>())?;
@@ -5031,6 +5144,15 @@ impl PersistenceSnapshotCloneEstimate {
         }
         if let Some(playback_options) = playback_options {
             self.add_message(playback_options)?;
+        }
+        self.add_vec_allocation(bilibili_candidates)?;
+        for candidate in bilibili_candidates {
+            self.add_bytes(candidate.selection_id.len())?;
+            self.add_bytes(candidate.title.len())?;
+            self.add_bytes(candidate.subtitle.len())?;
+            self.add_bytes(candidate.source_kind.len())?;
+            self.add_bytes(candidate.content_id.len())?;
+            self.add_bytes(candidate.identity.bvid.as_ref().map_or(0, String::len))?;
         }
 
         self.add_bytes(output.snapshot_id.len())?;
@@ -5139,6 +5261,7 @@ fn apply_pruned_tasks_locked(inner: &mut RegistryInner, task_ids: &[String]) {
         inner.outputs_by_task_id.remove(task_id);
         inner.download_options_by_id.remove(task_id);
         inner.playback_options_by_id.remove(task_id);
+        inner.bilibili_candidates_by_id.remove(task_id);
         inner.running_cancellations_by_id.remove(task_id);
         inner.planning_cancellations_by_id.remove(task_id);
     }
@@ -5248,6 +5371,7 @@ mod tests {
                         task,
                         None,
                         None,
+                        &[],
                         inner
                             .outputs_by_task_id
                             .get(&task.id)
@@ -5283,6 +5407,7 @@ mod tests {
                 first_task,
                 None,
                 None,
+                &[],
                 inner.outputs_by_task_id.get("task-one").unwrap(),
             )
             .unwrap();
@@ -5335,6 +5460,152 @@ mod tests {
         assert!(repeated_playback.created);
         assert_ne!(playback.task.id, repeated_playback.task.id);
         assert_ne!(playback.task.id, different_playback.task.id);
+    }
+
+    #[test]
+    fn accepted_bilibili_v2_candidates_survive_registry_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let candidate = BilibiliTaskCandidateRecord {
+            selection_id: "page:1:cid:2001:bvid:BV1stable:aid:1001".to_owned(),
+            title: "Part 1".to_owned(),
+            subtitle: "Page 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            identity: crate::bilibili_playback::BilibiliContentIdentity {
+                kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+                aid: Some(1_001),
+                bvid: Some("BV1stable".to_owned()),
+                cid: Some(2_001),
+                epid: None,
+            },
+            index: 1,
+            duration_seconds: Some(60),
+        };
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let created = registry
+            .create_bilibili_playback_task_v2(
+                "BV1stable",
+                Some(playback_options("1080p")),
+                "Stable video".to_owned(),
+                vec![candidate.clone()],
+            )
+            .expect("v2 task should be durably accepted");
+        assert_eq!(TaskState::Preparing, created.task.state());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(state_path);
+        let restored_task = restored
+            .get_task(&created.task.id)
+            .expect("accepted task should survive restart");
+        assert_eq!(TaskState::Failed, restored_task.state());
+        assert_eq!(1, restored_task.result_items.len());
+        assert!(restored_task.result_items[0].selection_id.is_empty());
+        assert_eq!(
+            vec![candidate],
+            restored
+                .inner
+                .lock()
+                .expect("task registry lock should not be poisoned")
+                .bilibili_candidates_by_id
+                .get(&created.task.id)
+                .expect("accepted stable candidates should survive restart")
+                .clone()
+        );
+    }
+
+    #[test]
+    fn bilibili_v2_creation_rejects_oversized_execution_batch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+
+        let error = match registry.create_bilibili_playback_task_v2(
+            "BV1execution-bound",
+            None,
+            "Bounded execution".to_owned(),
+            vec![sample_bilibili_task_candidate(); MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES + 1],
+        ) {
+            Ok(_) => panic!("oversized execution batches must fail before task creation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(tonic::Code::ResourceExhausted, error.code());
+        assert!(error.message().contains("cannot exceed 100 candidates"));
+        assert!(
+            registry
+                .inner
+                .lock()
+                .expect("task registry lock should not be poisoned")
+                .tasks_by_id
+                .is_empty()
+        );
+        assert!(
+            TaskStateStore::new(state_path)
+                .load()
+                .expect("rejected task creation should leave valid state")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bilibili_v2_creation_retains_installed_task_until_directory_sync_is_durable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        registry.fail_next_persistence_directory_sync();
+
+        let creation = registry
+            .create_bilibili_playback_task_v2(
+                "BV1durable-v2",
+                None,
+                "Durable video".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("an installed task must remain owned while durability recovers");
+
+        assert!(creation.requires_persistence_recovery);
+        assert!(!registry.persistence_available());
+        {
+            let inner = registry
+                .inner
+                .lock()
+                .expect("task registry lock should not be poisoned");
+            assert!(inner.tasks_by_id.contains_key(&creation.task.id));
+            assert!(inner.visible_tasks_by_id.contains_key(&creation.task.id));
+            assert!(
+                inner
+                    .bilibili_candidates_by_id
+                    .contains_key(&creation.task.id)
+            );
+            assert!(
+                inner
+                    .planning_cancellations_by_id
+                    .contains_key(&creation.task.id)
+            );
+            assert!(inner.pending_publications_by_id.is_empty());
+        }
+        let installed_records = TaskStateStore::new(state_path.clone())
+            .load()
+            .expect("the installed snapshot should remain readable");
+        assert_eq!(1, installed_records.len());
+        assert_eq!(creation.task.id, installed_records[0].task.id);
+
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::Durable,
+            registry.retry_pending_persistence_outcome()
+        );
+        assert!(registry.persistence_available());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(state_path);
+        assert_eq!(
+            TaskState::Failed,
+            restored
+                .get_task(&creation.task.id)
+                .expect("the durably accepted task should survive restart")
+                .state()
+        );
     }
 
     #[test]
@@ -10495,6 +10766,7 @@ mod tests {
             task,
             options: None,
             playback_options: None,
+            bilibili_candidates: Vec::new(),
         }
     }
 
@@ -10544,6 +10816,25 @@ mod tests {
             prefer_tv_api: false,
             audio_language: String::new(),
             playback_policy: None,
+        }
+    }
+
+    fn sample_bilibili_task_candidate() -> BilibiliTaskCandidateRecord {
+        BilibiliTaskCandidateRecord {
+            selection_id: "page:1:cid:2001:bvid:BV1stable:aid:1001".to_owned(),
+            title: "Part 1".to_owned(),
+            subtitle: "Page 1".to_owned(),
+            source_kind: "video_page".to_owned(),
+            content_id: "2001".to_owned(),
+            identity: crate::bilibili_playback::BilibiliContentIdentity {
+                kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+                aid: Some(1_001),
+                bvid: Some("BV1stable".to_owned()),
+                cid: Some(2_001),
+                epid: None,
+            },
+            index: 1,
+            duration_seconds: Some(60),
         }
     }
 
