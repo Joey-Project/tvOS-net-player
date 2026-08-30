@@ -37,7 +37,9 @@ use std::{
 use axum::{Router, routing::get};
 use bbdown_adapter::BbdownBilibiliAdapter;
 use bilibili_resolution::{BilibiliResolutionStore, MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS};
-use bilibili_worker::{BilibiliDownloadAdapter, run_bilibili_task_worker};
+use bilibili_worker::{
+    BilibiliDownloadAdapter, run_bilibili_task_worker, run_pending_file_cleanup_worker,
+};
 use generated::tvos_net_player::v1::{
     BilibiliLoginSession, LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
@@ -947,6 +949,10 @@ impl AppState {
             )),
             BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
         ))
+    }
+
+    pub(crate) fn spawn_pending_file_cleanup_worker(&self) -> JoinHandle<()> {
+        tokio::spawn(run_pending_file_cleanup_worker(Arc::clone(&self.tasks)))
     }
 
     pub(crate) fn list_completed_hls_library_items(&self) -> Vec<LibraryItem> {
@@ -2649,6 +2655,7 @@ pub async fn run_with_state(
         }
     };
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
+    let _file_cleanup_worker_task = state.spawn_pending_file_cleanup_worker();
     let _hls_cache_quota_monitor = state.spawn_hls_cache_quota_monitor();
 
     tokio::select! {

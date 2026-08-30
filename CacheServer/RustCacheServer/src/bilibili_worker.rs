@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::FutureExt;
@@ -24,6 +25,9 @@ use crate::{
     },
     task_store::PersistedFileCleanupKind,
 };
+
+const FILE_CLEANUP_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const FILE_CLEANUP_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 pub type BilibiliDownloadFuture<'a> = Pin<
     Box<dyn Future<Output = Result<BilibiliDownloadOutput, BilibiliDownloadError>> + Send + 'a>,
@@ -175,6 +179,41 @@ pub async fn run_bilibili_task_worker(
             let _permit = permit;
             run_one_bilibili_task(registry, adapter, work_item, credentials_configured).await;
         });
+    }
+}
+
+pub(crate) async fn run_pending_file_cleanup_worker(registry: Arc<BilibiliTaskRegistry>) {
+    run_pending_file_cleanup_worker_with_backoff(
+        registry,
+        FILE_CLEANUP_RETRY_INITIAL_DELAY,
+        FILE_CLEANUP_RETRY_MAX_DELAY,
+    )
+    .await;
+}
+
+async fn run_pending_file_cleanup_worker_with_backoff(
+    registry: Arc<BilibiliTaskRegistry>,
+    initial_delay: Duration,
+    max_delay: Duration,
+) {
+    let mut retry_delay = initial_delay;
+    loop {
+        registry.wait_for_pending_file_cleanups().await;
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_succeeded =
+            tokio::task::spawn_blocking(move || cleanup_registry.retry_pending_file_cleanups())
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Pending file cleanup worker task failed: {error}");
+                    false
+                });
+        if cleanup_succeeded {
+            retry_delay = initial_delay;
+            continue;
+        }
+
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay.saturating_mul(2), max_delay);
     }
 }
 
@@ -691,6 +730,7 @@ mod tests {
         },
         library::LocalMediaLibrary,
         task_registry::TaskRetentionPolicy,
+        task_store::TaskStateStore,
     };
     use tokio::sync::Notify;
 
@@ -790,6 +830,91 @@ mod tests {
             .expect("the claim task should not panic");
         assert_eq!(task.id, work_item.task_id);
         assert!(!stale_output_path.exists());
+    }
+
+    #[tokio::test]
+    async fn pending_file_cleanup_worker_retries_terminal_task_without_new_queue_work() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1terminal-cleanup-retry",
+                None,
+                None,
+                "Terminal cleanup retry".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let transient_path = root_path
+            .join("Bilibili")
+            .join(&task.id)
+            .join("blocked-subtitle.srt");
+        std::fs::create_dir_all(&transient_path)
+            .expect("directory fixture should block file cleanup");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Completed with transient output.".to_owned(),
+                vec![transient_path.clone()],
+                Vec::new(),
+            )
+            .expect("terminal output should commit");
+        assert!(registry.has_pending_file_cleanups());
+        assert!(registry.try_claim_next_bilibili_task().is_none());
+
+        let cleanup = tokio::spawn(run_pending_file_cleanup_worker_with_backoff(
+            Arc::clone(&registry),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(registry.has_pending_file_cleanups());
+        std::fs::remove_dir(&transient_path).expect("cleanup blocker should become removable");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persisted_cleanup_is_empty = TaskStateStore::new(&state_path)
+                    .load_state()
+                    .is_ok_and(|state| state.file_cleanup_intents.is_empty());
+                if !registry.has_pending_file_cleanups() && persisted_cleanup_is_empty {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background worker should clear terminal cleanup ownership");
+        cleanup.abort();
+        let _ = cleanup.await;
+
+        assert!(!transient_path.exists());
+        assert!(
+            TaskStateStore::new(&state_path)
+                .load_state()
+                .expect("persisted task state should load")
+                .file_cleanup_intents
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1018,6 +1143,13 @@ mod tests {
         ));
 
         let cancelled = wait_for_state(&registry, &task.id, TaskState::Cancelled).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owned_output_directory.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled v2 output cleanup should finish before the worker stops");
         worker.abort();
         let _ = worker.await;
         let output = registry

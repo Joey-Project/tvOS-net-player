@@ -157,6 +157,7 @@ pub struct BilibiliTaskRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     mutation_lock: Mutex<()>,
     queue_notify: Arc<Notify>,
+    file_cleanup_notify: Arc<Notify>,
     persistence: Option<TaskStatePersistence>,
     // Load failure suppresses the writable store but must not erase configuration intent.
     persistence_configured: bool,
@@ -1035,6 +1036,7 @@ impl BilibiliTaskRegistry {
             inner
                 .retained_resource_snapshots
                 .insert(snapshot.resource_lease_id.clone(), retained);
+            rebuild_retained_resource_index_locked(&mut inner);
         }
         drop(inner);
         self.cleanup_durable_resource_bodies();
@@ -1751,39 +1753,31 @@ impl BilibiliTaskRegistry {
 
     #[cfg(test)]
     pub(crate) fn task_resource(&self, id: &str) -> Option<TaskResourceRecord> {
-        self.retire_expired_task_resources();
         let normalized_id = normalize(id).to_ascii_lowercase();
         if normalized_id.is_empty() {
             return None;
         }
         let now = current_timestamp();
-        let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-        let record = inner
-            .visible_outputs_by_task_id
-            .values()
-            .find_map(|output| output.available_resources_by_id.get(&normalized_id))
-            .cloned()
-            .or_else(|| {
-                inner
-                    .retained_resource_snapshots
-                    .values()
-                    .find_map(|snapshot| {
-                        snapshot
-                            .output
-                            .available_resources_by_id
-                            .get(&normalized_id)
-                    })
-                    .cloned()
-            })
-            .filter(|record| {
-                record
-                    .resource
-                    .expires_at
-                    .as_ref()
-                    .is_none_or(|expires_at| timestamp_nanos(expires_at) > timestamp_nanos(&now))
-            });
-        drop(inner);
+        let indexed = indexed_task_resource_locked(
+            &self.inner.lock().expect("task registry lock poisoned"),
+            &normalized_id,
+            Instant::now(),
+        );
+        let record = indexed.and_then(|(record, live_task_id)| {
+            if record
+                .resource
+                .expires_at
+                .as_ref()
+                .is_some_and(|expires_at| timestamp_nanos(expires_at) <= timestamp_nanos(&now))
+            {
+                if let Some(task_id) = live_task_id {
+                    self.retire_expired_task_resources_for_task(&task_id);
+                }
+                None
+            } else {
+                Some(record)
+            }
+        });
         self.cleanup_durable_resource_bodies();
         record
     }
@@ -1797,7 +1791,6 @@ impl BilibiliTaskRegistry {
         id: &str,
         before_cleanup_lock: impl FnOnce(),
     ) -> io::Result<Option<OpenedTaskResource>> {
-        self.retire_expired_task_resources();
         let normalized_id = normalize(id).to_ascii_lowercase();
         if normalized_id.is_empty() {
             return Ok(None);
@@ -1811,39 +1804,29 @@ impl BilibiliTaskRegistry {
             .lock()
             .expect("task resource cleanup lock poisoned");
         let now = current_timestamp();
-        let record = {
-            let mut inner = self.inner.lock().expect("task registry lock poisoned");
-            prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-            inner
-                .visible_outputs_by_task_id
-                .values()
-                .find_map(|output| output.available_resources_by_id.get(&normalized_id))
-                .cloned()
-                .or_else(|| {
-                    inner
-                        .retained_resource_snapshots
-                        .values()
-                        .find_map(|snapshot| {
-                            snapshot
-                                .output
-                                .available_resources_by_id
-                                .get(&normalized_id)
-                                .cloned()
-                        })
-                })
-                .filter(|record| {
-                    record
-                        .resource
-                        .expires_at
-                        .as_ref()
-                        .is_none_or(|expires_at| {
-                            timestamp_nanos(expires_at) > timestamp_nanos(&now)
-                        })
-                })
-        };
-        let Some(record) = record else {
+        let indexed = indexed_task_resource_locked(
+            &self.inner.lock().expect("task registry lock poisoned"),
+            &normalized_id,
+            Instant::now(),
+        );
+        let Some((record, live_task_id)) = indexed else {
+            drop(cleanup_guard);
+            self.cleanup_durable_resource_bodies();
             return Ok(None);
         };
+        if record
+            .resource
+            .expires_at
+            .as_ref()
+            .is_some_and(|expires_at| timestamp_nanos(expires_at) <= timestamp_nanos(&now))
+        {
+            drop(cleanup_guard);
+            if let Some(task_id) = live_task_id {
+                self.retire_expired_task_resources_for_task(&task_id);
+            }
+            self.cleanup_durable_resource_bodies();
+            return Ok(None);
+        }
 
         // The cleanup lock protects object identity from authorization through the no-follow open.
         // After open, the file descriptor keeps that exact body object readable even if cleanup
@@ -1870,6 +1853,11 @@ impl BilibiliTaskRegistry {
                 timestamp_nanos(expires_at) <= timestamp_nanos(&current_timestamp())
             })
         {
+            drop(cleanup_guard);
+            if let Some(task_id) = live_task_id {
+                self.retire_expired_task_resources_for_task(&task_id);
+            }
+            self.cleanup_durable_resource_bodies();
             return Ok(None);
         }
         let opened = OpenedTaskResource {
@@ -1890,8 +1878,15 @@ impl BilibiliTaskRegistry {
 
     pub(crate) fn release_task_output_snapshots(&self, resource_lease_ids: &[String]) {
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let mut removed = false;
         for resource_lease_id in resource_lease_ids {
-            inner.retained_resource_snapshots.remove(resource_lease_id);
+            removed |= inner
+                .retained_resource_snapshots
+                .remove(resource_lease_id)
+                .is_some();
+        }
+        if removed {
+            rebuild_retained_resource_index_locked(&mut inner);
         }
         drop(inner);
         self.cleanup_durable_resource_bodies();
@@ -2153,6 +2148,25 @@ impl BilibiliTaskRegistry {
                     .is_some_and(|candidates| !candidates.is_empty())
                 && has_pending_bilibili_owned_output_cleanup(&inner, task_id)
         })
+    }
+
+    pub(crate) fn has_pending_file_cleanups(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .pending_file_cleanup_intents
+            .is_empty()
+    }
+
+    pub(crate) async fn wait_for_pending_file_cleanups(&self) {
+        loop {
+            let notified = self.file_cleanup_notify.notified();
+            if self.has_pending_file_cleanups() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) async fn wait_for_bilibili_task_queue_change(&self) {
@@ -4078,12 +4092,14 @@ impl BilibiliTaskRegistry {
                 )
             })
             .collect();
+        rebuild_visible_resource_index_locked(&mut inner);
 
         let orphan_resource_scan_pending = resource_root_path.is_some();
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             mutation_lock: Mutex::new(()),
             queue_notify: Arc::new(Notify::new()),
+            file_cleanup_notify: Arc::new(Notify::new()),
             persistence: store.map(TaskStatePersistence::new),
             persistence_configured,
             retention_policy,
@@ -4108,6 +4124,40 @@ impl BilibiliTaskRegistry {
 
     fn retire_expired_task_resources(&self) -> bool {
         self.retire_expired_task_resources_except(&HashSet::new())
+    }
+
+    fn retire_expired_task_resources_for_task(&self, task_id: &str) -> bool {
+        let now = current_timestamp();
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        let retired_resource_ids = inner
+            .outputs_by_task_id
+            .get_mut(task_id)
+            .map(|output| output.retire_expired_resources_except(&now, &HashSet::new()))
+            .unwrap_or_default();
+        if retired_resource_ids.is_empty() {
+            return false;
+        }
+        inner
+            .pending_resource_cleanup_ids
+            .extend(retired_resource_ids);
+        let summary = inner
+            .outputs_by_task_id
+            .get(task_id)
+            .expect("updated task output must exist")
+            .summary();
+        let task = inner
+            .tasks_by_id
+            .get_mut(task_id)
+            .expect("resource-owning task must exist");
+        task.output_summary = Some(summary);
+        task.updated_at = Some(copy_timestamp(&now));
+        let task = task.clone();
+        let durability_required = self.persistence.is_some();
+        let checkpoint = durability_required.then_some(checkpoint);
+        self.persist_task_and_publish(inner, task, durability_required, checkpoint)
+            .is_committed()
     }
 
     fn retire_expired_task_resources_except(
@@ -4317,7 +4367,14 @@ impl BilibiliTaskRegistry {
                 debug_assert!(false, "serialized registry mutations cannot be superseded");
             }
         }
+        let file_cleanup_should_notify = matches!(
+            outcome,
+            PersistenceCommitOutcome::Durable | PersistenceCommitOutcome::Volatile
+        ) && !inner.pending_file_cleanup_intents.is_empty();
         drop(inner);
+        if file_cleanup_should_notify {
+            self.file_cleanup_notify.notify_one();
+        }
         if outcome.is_durable() {
             if self
                 .orphan_resource_scan_pending
@@ -4490,6 +4547,7 @@ impl BilibiliTaskRegistry {
                 )
             })
             .collect();
+        rebuild_visible_resource_index_locked(inner);
     }
 
     fn mark_resource_cleanup_durable_locked(
@@ -4576,19 +4634,36 @@ impl BilibiliTaskRegistry {
             .resource_cleanup_lock
             .lock()
             .expect("task resource cleanup lock poisoned");
+        let orphan_scan_pending = self
+            .orphan_resource_scan_pending
+            .load(AtomicOrdering::Acquire);
+        let cleanup_work_pending = {
+            let inner = self.inner.lock().expect("task registry lock poisoned");
+            !inner.durable_resource_cleanup_ids.is_empty()
+                || !inner.resource_storage_revalidation_ids.is_empty()
+        };
+        if !orphan_scan_pending && !cleanup_work_pending {
+            self.resource_storage_available
+                .store(true, AtomicOrdering::Release);
+            return true;
+        }
         let storage_revalidated =
             self.revalidate_pending_resource_storage_locked(resource_root_path);
         let candidates = {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
             prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
-            let now = current_timestamp();
-            let resource_body_owner_ids = resource_body_owner_ids_locked(&inner, &now);
-            inner
-                .durable_resource_cleanup_ids
-                .iter()
-                .filter(|resource_id| !resource_body_owner_ids.contains(resource_id.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
+            if inner.durable_resource_cleanup_ids.is_empty() {
+                Vec::new()
+            } else {
+                let now = current_timestamp();
+                let resource_body_owner_ids = resource_body_owner_ids_locked(&inner, &now);
+                inner
+                    .durable_resource_cleanup_ids
+                    .iter()
+                    .filter(|resource_id| !resource_body_owner_ids.contains(resource_id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
         };
         if candidates.is_empty() {
             if storage_revalidated
@@ -5090,6 +5165,8 @@ struct RegistryInner {
     planning_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     watchers: HashMap<Uuid, TaskWatcher>,
     retained_resource_snapshots: HashMap<String, RetainedTaskResourceSnapshot>,
+    visible_resource_task_ids_by_id: HashMap<String, String>,
+    retained_resource_lease_ids_by_id: HashMap<String, String>,
     staged_resource_owner_counts: HashMap<String, usize>,
     pending_resource_cleanup_ids: HashSet<String>,
     durable_resource_cleanup_ids: HashSet<String>,
@@ -6177,9 +6254,77 @@ fn reconcile_all_task_outputs_locked(
 }
 
 fn prune_expired_resource_snapshots_locked(inner: &mut RegistryInner, now: Instant) {
+    let previous_len = inner.retained_resource_snapshots.len();
     inner
         .retained_resource_snapshots
         .retain(|_, snapshot| snapshot.expires_at > now);
+    if inner.retained_resource_snapshots.len() != previous_len {
+        rebuild_retained_resource_index_locked(inner);
+    }
+}
+
+fn rebuild_visible_resource_index_locked(inner: &mut RegistryInner) {
+    let mut index = HashMap::new();
+    for (task_id, output) in &inner.visible_outputs_by_task_id {
+        for resource_id in output.available_resources_by_id.keys() {
+            let previous = index.insert(resource_id.to_ascii_lowercase(), task_id.clone());
+            debug_assert!(
+                previous.is_none(),
+                "visible task resource ids must be unique"
+            );
+        }
+    }
+    inner.visible_resource_task_ids_by_id = index;
+}
+
+fn rebuild_retained_resource_index_locked(inner: &mut RegistryInner) {
+    let mut indexed = HashMap::<String, (String, Instant)>::new();
+    for (lease_id, snapshot) in &inner.retained_resource_snapshots {
+        for resource_id in snapshot.output.available_resources_by_id.keys() {
+            let key = resource_id.to_ascii_lowercase();
+            match indexed.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((lease_id.clone(), snapshot.expires_at));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if snapshot.expires_at > entry.get().1 {
+                        entry.insert((lease_id.clone(), snapshot.expires_at));
+                    }
+                }
+            }
+        }
+    }
+    inner.retained_resource_lease_ids_by_id = indexed
+        .into_iter()
+        .map(|(resource_id, (lease_id, _))| (resource_id, lease_id))
+        .collect();
+}
+
+fn indexed_task_resource_locked(
+    inner: &RegistryInner,
+    resource_id: &str,
+    now: Instant,
+) -> Option<(TaskResourceRecord, Option<String>)> {
+    if let Some(task_id) = inner.visible_resource_task_ids_by_id.get(resource_id)
+        && let Some(record) = inner
+            .visible_outputs_by_task_id
+            .get(task_id)
+            .and_then(|output| output.available_resources_by_id.get(resource_id))
+    {
+        return Some((record.clone(), Some(task_id.clone())));
+    }
+
+    let lease_id = inner.retained_resource_lease_ids_by_id.get(resource_id)?;
+    let snapshot = inner.retained_resource_snapshots.get(lease_id)?;
+    if snapshot.expires_at <= now {
+        return None;
+    }
+    snapshot
+        .output
+        .available_resources_by_id
+        .get(resource_id)
+        .cloned()
+        .map(|record| (record, None))
 }
 
 fn resource_body_owner_ids_locked<'a>(
@@ -6396,7 +6541,13 @@ fn install_library_publication_gate<'a>(
     gate.install_durable_blocked_paths(
         intents
             .into_iter()
-            .filter(|intent| intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory)
+            .filter(|intent| {
+                matches!(
+                    intent.kind,
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                        | PersistedFileCleanupKind::LocalLibraryItem
+                )
+            })
             .map(|intent| intent.relative_path.as_str()),
     )
 }
@@ -10777,6 +10928,85 @@ mod tests {
         assert!(published_path.join("video.mp4").is_file());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_local_item_cleanup_remains_hidden_until_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        let media_directory = root_path.join("Movies");
+        std::fs::create_dir_all(&media_directory).expect("media directory should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_directory = root_path.join("Movies");
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &root_path,
+                &root_path.join("Bilibili"),
+            )
+            .expect("Bilibili output should be inside the cache root"),
+        );
+        let library = crate::library::LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(crate::config::CacheServerOptions {
+                root_path: root_path.clone(),
+                ..crate::config::CacheServerOptions::default()
+            }),
+            Arc::clone(&publication_gate),
+        );
+        let registry =
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+                Some(publication_gate),
+            );
+        let media_path = media_directory.join("movie.mp4");
+        std::fs::write(&media_path, b"movie").expect("media should be written");
+        let item_id = library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("media item id should resolve");
+        let deletion = library
+            .prepare_item_deletion(&item_id)
+            .await
+            .expect("deletion should prepare")
+            .expect("media item should exist");
+
+        std::fs::set_permissions(&media_directory, std::fs::Permissions::from_mode(0o555))
+            .expect("media directory should become read-only");
+        registry
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())
+            .expect("local item tombstone should be durable");
+        let error = registry
+            .retry_file_cleanup_intents_for_owner(
+                PersistedFileCleanupKind::LocalLibraryItem,
+                deletion.item_id(),
+            )
+            .expect_err("read-only parent should block file cleanup");
+        assert_eq!(tonic::Code::Internal, error.code());
+        assert!(media_path.is_file());
+        assert!(library.get_item(&item_id).await.is_none());
+        assert!(library.list_items_page(None, 0, 50).await.items.is_empty());
+
+        std::fs::set_permissions(&media_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("media directory should become writable again");
+        assert!(
+            registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::LocalLibraryItem,
+                    deletion.item_id(),
+                )
+                .expect("local item cleanup retry should succeed")
+        );
+        assert!(!media_path.exists());
+
+        std::fs::write(&media_path, b"replacement").expect("replacement media should be written");
+        assert!(library.get_item(&item_id).await.is_some());
+    }
+
     #[test]
     fn failed_terminal_output_cleanup_remains_durable_until_retry_succeeds() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -12253,6 +12483,87 @@ mod tests {
             TaskArtifactState::Unavailable,
             restored_output.output.record.results[0].artifacts[0].state()
         );
+    }
+
+    #[test]
+    fn resource_open_retires_only_the_requested_expired_owner() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let live_task = registry
+            .create_bilibili_task("BV1indexed-live-resource", None)
+            .expect("live resource task should be created");
+        let expired_task = registry
+            .create_bilibili_task("BV1indexed-expired-resource", None)
+            .expect("expired resource task should be created");
+        let live_resource = test_task_resource("indexed-live-resource", 4);
+        let mut expired_resource = test_task_resource("indexed-expired-resource", 7);
+        expired_resource.resource.expires_at = Some(Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+        let expired_body_path = root_path.join(expired_resource.relative_path());
+        commit_test_task_output_with_resource(
+            &registry,
+            &live_task.id,
+            vec![test_task_result_with_resources(
+                "indexed-live-result",
+                std::slice::from_ref(&live_resource),
+            )],
+            live_resource,
+            b"live",
+        );
+        commit_test_task_output_with_resource(
+            &registry,
+            &expired_task.id,
+            vec![test_task_result_with_resources(
+                "indexed-expired-result",
+                std::slice::from_ref(&expired_resource),
+            )],
+            expired_resource,
+            b"expired",
+        );
+
+        assert!(
+            registry
+                .open_task_resource("indexed-live-resource")
+                .expect("live resource open should not fail")
+                .is_some()
+        );
+        assert_eq!(
+            1,
+            registry
+                .task_output_snapshot(&expired_task.id)
+                .expect("unrelated expired output should remain unchanged")
+                .output
+                .record
+                .resources
+                .len()
+        );
+        assert!(expired_body_path.is_file());
+
+        assert!(
+            registry
+                .open_task_resource("indexed-expired-resource")
+                .expect("expired resource lookup should not be a storage failure")
+                .is_none()
+        );
+        assert!(
+            registry
+                .task_output_snapshot(&expired_task.id)
+                .expect("expired owner should remain queryable")
+                .output
+                .record
+                .resources
+                .is_empty()
+        );
+        assert!(!expired_body_path.exists());
     }
 
     #[tokio::test]
