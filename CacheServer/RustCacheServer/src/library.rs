@@ -322,6 +322,23 @@ impl LocalMediaLibrary {
         page_size: usize,
         cancellation: BlockingCancellation,
     ) -> LibraryItemPage {
+        self.list_items_page_blocking_with_scan_observer(
+            filter,
+            page_offset,
+            page_size,
+            cancellation,
+            || {},
+        )
+    }
+
+    fn list_items_page_blocking_with_scan_observer(
+        &self,
+        filter: Option<&LibraryFilter>,
+        page_offset: i64,
+        page_size: usize,
+        cancellation: BlockingCancellation,
+        mut after_scan: impl FnMut(),
+    ) -> LibraryItemPage {
         if page_offset < 0
             || page_size == 0
             || page_offset > i32::MAX.into()
@@ -331,19 +348,21 @@ impl LocalMediaLibrary {
         }
 
         let root_path = self.root_path();
-        let publication_gate = self.publication_gate.snapshot();
-        let candidates = match self.enumerate_media_candidates(
-            &root_path,
-            filter,
-            &cancellation,
-            &publication_gate,
-        ) {
-            Ok(candidates) => candidates,
-            Err(_) => return LibraryItemPage::empty(),
-        };
-
         self.publication_gate
             .with_stable_snapshot(|publication_gate| {
+                // Candidate pruning and page projection must use the same publication
+                // generation so an ownership release cannot make an incomplete scan current.
+                let candidates = match self.enumerate_media_candidates(
+                    &root_path,
+                    filter,
+                    &cancellation,
+                    publication_gate,
+                ) {
+                    Ok(candidates) => candidates,
+                    Err(_) => return LibraryItemPage::empty(),
+                };
+                after_scan();
+
                 let mut skipped_items = 0_i64;
                 let mut items = Vec::with_capacity(page_size);
                 let mut next_page_offset = None;
@@ -473,20 +492,31 @@ impl LocalMediaLibrary {
     }
 
     fn count_items_blocking(&self, cancellation: BlockingCancellation) -> i32 {
+        self.count_items_blocking_with_scan_observer(cancellation, || {})
+    }
+
+    fn count_items_blocking_with_scan_observer(
+        &self,
+        cancellation: BlockingCancellation,
+        mut after_scan: impl FnMut(),
+    ) -> i32 {
         if !self.is_root_available_blocking() {
             return 0;
         }
 
         let root_path = self.root_path();
-        let publication_gate = self.publication_gate.snapshot();
-        let Ok(candidates) =
-            self.enumerate_media_candidates(&root_path, None, &cancellation, &publication_gate)
-        else {
-            return 0;
-        };
-
         self.publication_gate
             .with_stable_snapshot(|publication_gate| {
+                let Ok(candidates) = self.enumerate_media_candidates(
+                    &root_path,
+                    None,
+                    &cancellation,
+                    publication_gate,
+                ) else {
+                    return 0;
+                };
+                after_scan();
+
                 candidates
                     .iter()
                     .filter_map(|candidate| self.try_create_media_file(&root_path, &candidate.path))
@@ -2623,6 +2653,62 @@ mod tests {
                 .items
                 .len()
         );
+    }
+
+    #[test]
+    fn list_and_count_retry_when_publication_is_released_after_candidate_scan() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let media_path = root_path.join("Bilibili/task-1/video.mp4");
+        fs::create_dir_all(media_path.parent().unwrap())
+            .expect("media directory should be created");
+        fs::write(&media_path, b"video").expect("media should be written");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let gate = Arc::new(LibraryPublicationGate::known_empty());
+        gate.install_durable_blocked_paths(["Bilibili/task-1"])
+            .expect("task output should start blocked");
+        let library = LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(CacheServerOptions {
+                root_path,
+                ..CacheServerOptions::default()
+            }),
+            Arc::clone(&gate),
+        );
+
+        let mut list_scans = 0;
+        let page = library.list_items_page_blocking_with_scan_observer(
+            None,
+            0,
+            50,
+            BlockingCancellation::default(),
+            || {
+                list_scans += 1;
+                if list_scans == 1 {
+                    gate.install_durable_blocked_paths(std::iter::empty::<&str>())
+                        .expect("publication should be released after the first list scan");
+                }
+            },
+        );
+        assert_eq!(2, list_scans);
+        assert_eq!(1, page.items.len());
+
+        gate.install_durable_blocked_paths(["Bilibili/task-1"])
+            .expect("task output should be blocked again");
+        let mut count_scans = 0;
+        let count = library.count_items_blocking_with_scan_observer(
+            BlockingCancellation::default(),
+            || {
+                count_scans += 1;
+                if count_scans == 1 {
+                    gate.install_durable_blocked_paths(std::iter::empty::<&str>())
+                        .expect("publication should be released after the first count scan");
+                }
+            },
+        );
+        assert_eq!(2, count_scans);
+        assert_eq!(1, count);
     }
 
     #[test]
