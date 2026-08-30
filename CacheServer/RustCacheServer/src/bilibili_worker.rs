@@ -198,7 +198,7 @@ async fn run_pending_file_cleanup_worker_with_backoff(
 ) {
     let mut retry_delay = initial_delay;
     loop {
-        registry.wait_for_pending_file_cleanups().await;
+        registry.wait_for_retryable_pending_file_cleanups().await;
         let cleanup_registry = Arc::clone(&registry);
         let cleanup_succeeded =
             tokio::task::spawn_blocking(move || cleanup_registry.retry_pending_file_cleanups())

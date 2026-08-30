@@ -160,6 +160,8 @@ pub struct BilibiliTaskRegistry {
     file_cleanup_notify: Arc<Notify>,
     #[cfg(test)]
     file_cleanup_attempt_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    file_cleanup_idle_wait_count: std::sync::atomic::AtomicUsize,
     persistence: Option<TaskStatePersistence>,
     // Load failure suppresses the writable store but must not erase configuration intent.
     persistence_configured: bool,
@@ -1243,10 +1245,9 @@ impl BilibiliTaskRegistry {
             inner
                 .pending_file_cleanup_intents
                 .iter()
-                .filter(|intent| {
-                    owner.is_none_or(|(kind, owner_id)| {
-                        intent.kind == kind && intent.owner_id == owner_id
-                    })
+                .filter(|intent| match owner {
+                    Some((kind, owner_id)) => intent.kind == kind && intent.owner_id == owner_id,
+                    None => file_cleanup_intent_is_ready_for_global_retry(&inner, intent),
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -2155,6 +2156,7 @@ impl BilibiliTaskRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_file_cleanups(&self) -> bool {
         !self
             .inner
@@ -2169,12 +2171,28 @@ impl BilibiliTaskRegistry {
         self.file_cleanup_attempt_count.load(AtomicOrdering::SeqCst)
     }
 
-    pub(crate) async fn wait_for_pending_file_cleanups(&self) {
+    #[cfg(test)]
+    pub(crate) fn file_cleanup_idle_wait_count(&self) -> usize {
+        self.file_cleanup_idle_wait_count
+            .load(AtomicOrdering::SeqCst)
+    }
+
+    pub(crate) async fn wait_for_retryable_pending_file_cleanups(&self) {
         loop {
             let notified = self.file_cleanup_notify.notified();
-            if self.has_pending_file_cleanups() {
+            let has_retryable_cleanup = {
+                let inner = self.inner.lock().expect("task registry lock poisoned");
+                inner
+                    .pending_file_cleanup_intents
+                    .iter()
+                    .any(|intent| file_cleanup_intent_is_ready_for_global_retry(&inner, intent))
+            };
+            if has_retryable_cleanup {
                 return;
             }
+            #[cfg(test)]
+            self.file_cleanup_idle_wait_count
+                .fetch_add(1, AtomicOrdering::SeqCst);
             notified.await;
         }
     }
@@ -3501,15 +3519,7 @@ impl BilibiliTaskRegistry {
                 continue;
             }
 
-            let has_successful_result = task
-                .output_summary
-                .as_ref()
-                .map(|summary| summary.successful_result_count > 0)
-                .unwrap_or_else(|| {
-                    task.result_items.iter().any(|result| {
-                        matches!(result.state(), TaskState::Succeeded | TaskState::Completed)
-                    })
-                });
+            let has_successful_result = task_has_successful_media_result(task);
             if task.kind() == TaskKind::BilibiliDownload && !has_successful_result {
                 task.state = TaskState::Failed.into();
                 task.message = LIBRARY_ITEM_DELETED_MESSAGE.to_owned();
@@ -4112,6 +4122,8 @@ impl BilibiliTaskRegistry {
             file_cleanup_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             file_cleanup_attempt_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            file_cleanup_idle_wait_count: std::sync::atomic::AtomicUsize::new(0),
             persistence: store.map(TaskStatePersistence::new),
             persistence_configured,
             retention_policy,
@@ -4382,7 +4394,10 @@ impl BilibiliTaskRegistry {
         let file_cleanup_should_notify = matches!(
             outcome,
             PersistenceCommitOutcome::Durable | PersistenceCommitOutcome::Volatile
-        ) && !inner.pending_file_cleanup_intents.is_empty();
+        ) && inner
+            .pending_file_cleanup_intents
+            .iter()
+            .any(|intent| file_cleanup_intent_is_ready_for_global_retry(&inner, intent));
         drop(inner);
         if file_cleanup_should_notify {
             self.file_cleanup_notify.notify_one();
@@ -5192,6 +5207,21 @@ fn has_pending_bilibili_owned_output_cleanup(inner: &RegistryInner, task_id: &st
     inner.pending_file_cleanup_intents.iter().any(|intent| {
         intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
             && intent.owner_id == task_id
+    })
+}
+
+fn file_cleanup_intent_is_ready_for_global_retry(
+    inner: &RegistryInner,
+    intent: &PersistedFileCleanupIntent,
+) -> bool {
+    if intent.kind != PersistedFileCleanupKind::BilibiliOwnedOutputDirectory {
+        return true;
+    }
+    !inner.tasks_by_id.get(&intent.owner_id).is_some_and(|task| {
+        matches!(
+            task.state(),
+            TaskState::Running | TaskState::CancelRequested
+        )
     })
 }
 
@@ -6135,6 +6165,16 @@ fn is_active(state: TaskState) -> bool {
             | TaskState::Planned
             | TaskState::Preparing
     )
+}
+
+fn task_has_successful_media_result(task: &Task) -> bool {
+    if task.result_items.is_empty() {
+        return matches!(task.state(), TaskState::Succeeded | TaskState::Completed)
+            && !task.library_item_id.is_empty();
+    }
+    task.result_items
+        .iter()
+        .any(|result| matches!(result.state(), TaskState::Succeeded | TaskState::Completed))
 }
 
 fn is_terminal(state: TaskState) -> bool {
@@ -8071,6 +8111,138 @@ mod tests {
         assert_eq!(
             TaskArtifactState::Deleted,
             restored_output.output.record.results[0].artifacts[0].state()
+        );
+    }
+
+    #[test]
+    fn library_deletion_fails_sole_classic_and_candidate_legacy_results() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let relative_path = "Bilibili/legacy-sole-result.mp4";
+        let library_item_id = create_item_id(relative_path);
+        let media_path = root_path.join(relative_path);
+        std::fs::create_dir_all(media_path.parent().expect("media should have a parent"))
+            .expect("media directory should be created");
+        std::fs::write(&media_path, b"legacy media").expect("legacy media should be written");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+
+        let classic = registry
+            .create_bilibili_task("BV1classic-legacy-delete", None)
+            .expect("classic task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("classic task should become running");
+        registry
+            .complete_task_succeeded(
+                &classic.id,
+                library_item_id.clone(),
+                "Downloaded classic result.".to_owned(),
+            )
+            .expect("classic task should succeed");
+
+        let candidate = registry
+            .create_bilibili_download_task_v2(
+                "BV1candidate-legacy-delete",
+                None,
+                None,
+                "Candidate legacy deletion".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("candidate task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("candidate task should become running");
+        registry
+            .complete_task_succeeded(
+                &candidate.id,
+                library_item_id.clone(),
+                "Downloaded candidate result.".to_owned(),
+            )
+            .expect("candidate task should succeed through the legacy path");
+        {
+            let _mutation_guard = registry.mutation_guard();
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            let candidate_task = inner
+                .tasks_by_id
+                .get_mut(&candidate.id)
+                .expect("candidate task should remain stored");
+            candidate_task.result_items[0].state = TaskState::Succeeded.into();
+            candidate_task.result_items[0].library_item_id = library_item_id.clone();
+            candidate_task.result_items[0].message = "Downloaded candidate result.".to_owned();
+            let candidate_task = candidate_task.clone();
+            let outcome = registry.persist_task_and_publish(inner, candidate_task, true, None);
+            assert!(outcome.is_durable());
+        }
+        assert!(
+            registry
+                .inner
+                .lock()
+                .expect("task registry lock poisoned")
+                .outputs_by_task_id
+                .get(&candidate.id)
+                .is_some_and(|output| output.legacy_managed)
+        );
+
+        let updated_task_ids = registry
+            .tombstone_library_item_before_delete(&library_item_id, relative_path)
+            .expect("legacy task references should tombstone durably")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            HashSet::from([classic.id.clone(), candidate.id.clone()]),
+            updated_task_ids
+        );
+        let classic_updated = registry
+            .get_task(&classic.id)
+            .expect("classic tombstone should remain visible");
+        assert_eq!(TaskState::Failed, classic_updated.state());
+        assert!(classic_updated.library_item_id.is_empty());
+        assert_eq!(
+            Some(0),
+            classic_updated
+                .output_summary
+                .map(|summary| summary.successful_result_count)
+        );
+        let candidate_updated = registry
+            .get_task(&candidate.id)
+            .expect("candidate tombstone should remain visible");
+        assert_eq!(TaskState::Failed, candidate_updated.state());
+        assert!(candidate_updated.library_item_id.is_empty());
+        assert_eq!(TaskState::Failed, candidate_updated.result_items[0].state());
+        assert!(candidate_updated.result_items[0].library_item_id.is_empty());
+        assert_eq!(
+            Some(0),
+            candidate_updated
+                .output_summary
+                .map(|summary| summary.successful_result_count)
+        );
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        assert!(!media_path.exists());
+        assert_eq!(
+            TaskState::Failed,
+            restored
+                .get_task(&classic.id)
+                .expect("classic tombstone should survive restart")
+                .state()
+        );
+        let restored_candidate = restored
+            .get_task(&candidate.id)
+            .expect("candidate tombstone should survive restart");
+        assert_eq!(TaskState::Failed, restored_candidate.state());
+        assert_eq!(
+            TaskState::Failed,
+            restored_candidate.result_items[0].state()
         );
     }
 
@@ -10824,6 +10996,77 @@ mod tests {
         assert_eq!(
             TaskState::Queued,
             restored.get_task(&task.id).unwrap().state()
+        );
+    }
+
+    #[test]
+    fn global_cleanup_preserves_running_v2_output_ownership_until_terminal() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1active-owned-output",
+                None,
+                None,
+                "Active owned output".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("ownership must be durable before output creation");
+
+        assert!(registry.retry_pending_file_cleanups());
+        assert_eq!(
+            2,
+            TaskStateStore::new(&state_path)
+                .load_state()
+                .expect("active ownership should remain durable")
+                .file_cleanup_intents
+                .len()
+        );
+
+        std::fs::create_dir_all(staging_path.join("nested"))
+            .expect("staging output should be created after ownership");
+        std::fs::write(staging_path.join("nested/raw.m4s"), b"raw")
+            .expect("staging output should be written");
+        std::fs::create_dir_all(&published_path)
+            .expect("published output should be created after ownership");
+        std::fs::write(published_path.join("active.mp4"), b"media")
+            .expect("published output should be written");
+        assert!(registry.retry_pending_file_cleanups());
+        assert!(staging_path.is_dir());
+        assert!(published_path.is_dir());
+
+        registry
+            .complete_task_cancelled(&task.id, "Cancelled by test.".to_owned())
+            .expect("running task should become terminal");
+        assert!(registry.retry_pending_file_cleanups());
+        assert!(!staging_path.exists());
+        assert!(!published_path.exists());
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .expect("terminal cleanup should persist")
+                .file_cleanup_intents
+                .is_empty()
         );
     }
 

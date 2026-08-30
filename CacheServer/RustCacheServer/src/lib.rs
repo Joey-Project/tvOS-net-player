@@ -3933,6 +3933,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn media_listener_preserves_running_v2_output_until_terminal() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let task = state
+            .tasks
+            .create_bilibili_download_task_v2(
+                "BV1active-cleanup-worker",
+                None,
+                None,
+                "Active cleanup worker".to_owned(),
+                vec![BilibiliTaskCandidateRecord {
+                    selection_id: "page:1:cid:2001:bvid:BV1stable:aid:1001".to_owned(),
+                    title: "Active cleanup worker".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "2001".to_owned(),
+                    identity: BilibiliContentIdentity {
+                        kind: BilibiliContentKind::VideoPage,
+                        aid: Some(1_001),
+                        bvid: Some("BV1stable".to_owned()),
+                        cid: Some(2_001),
+                        epid: None,
+                    },
+                    index: 1,
+                    duration_seconds: Some(60),
+                }],
+            )
+            .expect("v2 task should be created");
+        state
+            .tasks
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = state
+            .options
+            .root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = state.options.root_path.join("Bilibili").join(&task.id);
+        state
+            .tasks
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("active output ownership should persist");
+        std::fs::create_dir_all(staging_path.join("nested"))
+            .expect("staging output should be created");
+        std::fs::write(staging_path.join("nested/raw.m4s"), b"raw")
+            .expect("staging output should be written");
+        std::fs::create_dir_all(&published_path).expect("published output should be created");
+        std::fs::write(published_path.join("active.mp4"), b"media")
+            .expect("published output should be written");
+        let attempts_before = state.tasks.file_cleanup_attempt_count();
+        let idle_waits_before = state.tasks.file_cleanup_idle_wait_count();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("media listener should bind");
+        let server = tokio::spawn(run_media_listener(listener, state.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.tasks.file_cleanup_idle_wait_count() == idle_waits_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup worker should park while output ownership is active");
+        assert_eq!(1, state.pending_file_cleanup_worker_start_count());
+        assert_eq!(attempts_before, state.tasks.file_cleanup_attempt_count());
+        assert!(staging_path.is_dir());
+        assert!(published_path.is_dir());
+        assert!(state.tasks.has_pending_file_cleanups());
+
+        state
+            .tasks
+            .complete_task_cancelled(&task.id, "Cancelled by test.".to_owned())
+            .expect("active task should become terminal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let durable_cleanup_is_empty =
+                    TaskStateStore::new(state.options.task_state_path.clone())
+                        .load_state()
+                        .is_ok_and(|snapshot| snapshot.file_cleanup_intents.is_empty());
+                if state.tasks.file_cleanup_attempt_count() > attempts_before
+                    && !state.tasks.has_pending_file_cleanups()
+                    && durable_cleanup_is_empty
+                    && !staging_path.exists()
+                    && !published_path.exists()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal transition should release output ownership for cleanup");
+
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("aborted media listener should not complete normally")
+                .is_cancelled()
+        );
+    }
+
     #[test]
     fn eviction_protection_registration_waits_for_hls_deletion_mutation() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
