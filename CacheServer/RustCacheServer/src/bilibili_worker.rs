@@ -248,7 +248,7 @@ async fn run_one_bilibili_task(
             })
             .await;
             if is_v2 {
-                retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id);
+                retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id).await;
             }
             return;
         }
@@ -278,7 +278,7 @@ async fn run_one_bilibili_task(
         })
         .await;
         if is_v2 {
-            retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id);
+            retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id).await;
         }
         return;
     }
@@ -343,17 +343,51 @@ async fn run_one_bilibili_task(
         }
     }
     if is_v2 {
-        retry_v2_owned_output_directory_cleanup(&registry, &work_item.task_id);
+        retry_v2_owned_output_directory_cleanup(&registry, &work_item.task_id).await;
     }
 }
 
-fn retry_v2_owned_output_directory_cleanup(registry: &BilibiliTaskRegistry, task_id: &str) {
-    if let Err(error) = registry.retry_file_cleanup_intents_for_owner(
-        PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+async fn retry_v2_owned_output_directory_cleanup(
+    registry: &Arc<BilibiliTaskRegistry>,
+    task_id: &str,
+) {
+    retry_v2_file_cleanup_intents(
+        registry,
         task_id,
-    ) {
+        PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+        "Bilibili owned-output directory cleanup",
+        "directory cleanup",
+    )
+    .await;
+}
+
+async fn retry_v2_transient_output_cleanup(registry: &Arc<BilibiliTaskRegistry>, task_id: &str) {
+    retry_v2_file_cleanup_intents(
+        registry,
+        task_id,
+        PersistedFileCleanupKind::BilibiliTransientOutput,
+        "Bilibili transient-output cleanup",
+        "output cleanup",
+    )
+    .await;
+}
+
+async fn retry_v2_file_cleanup_intents(
+    registry: &Arc<BilibiliTaskRegistry>,
+    task_id: &str,
+    kind: PersistedFileCleanupKind,
+    context: &'static str,
+    pending_description: &'static str,
+) {
+    let cleanup_registry = Arc::clone(registry);
+    let cleanup_task_id = task_id.to_owned();
+    let outcome = run_blocking_worker_attempt(context, move || {
+        cleanup_registry.retry_file_cleanup_intents_for_owner(kind, &cleanup_task_id)
+    })
+    .await;
+    if let Some(Err(error)) = outcome {
         eprintln!(
-            "Bilibili v2 task {task_id} retained pending directory cleanup for retry: {error}"
+            "Bilibili v2 task {task_id} retained pending {pending_description} for retry: {error}"
         );
     }
 }
@@ -429,14 +463,7 @@ async fn complete_v2_terminal_task(
 
     match publication {
         Ok(()) => {
-            if let Err(error) = registry.retry_file_cleanup_intents_for_owner(
-                PersistedFileCleanupKind::BilibiliTransientOutput,
-                &task_id,
-            ) {
-                eprintln!(
-                    "Bilibili v2 task {task_id} retained pending output cleanup for retry: {error}"
-                );
-            }
+            retry_v2_transient_output_cleanup(registry, &task_id).await;
         }
         Err(error) => {
             if error.code() == tonic::Code::Cancelled {
@@ -444,7 +471,7 @@ async fn complete_v2_terminal_task(
                     registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
                 })
                 .await;
-                retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id);
+                retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id).await;
                 return;
             }
             let detail = crate::error_detail_for_log(credentials_configured, &error);
@@ -458,7 +485,7 @@ async fn complete_v2_terminal_task(
             .await;
         }
     }
-    retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id);
+    retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id).await;
 }
 
 fn validate_library_item_publication_leases(
@@ -577,11 +604,11 @@ where
     loop {
         let completion_registry = Arc::clone(registry);
         let completion = Arc::clone(&complete);
-        let Some(attempt) = run_blocking_terminal_persistence_attempt(
-            "Bilibili terminal task completion",
-            move || completion(&completion_registry),
-        )
-        .await
+        let Some(attempt) =
+            run_blocking_worker_attempt("Bilibili terminal task completion", move || {
+                completion(&completion_registry)
+            })
+            .await
         else {
             return Err(tonic::Status::internal(
                 "Bilibili terminal task completion could not be joined.",
@@ -621,14 +648,14 @@ async fn retry_pending_task_persistence(
     registry: &Arc<BilibiliTaskRegistry>,
 ) -> TaskPersistenceRecoveryOutcome {
     let registry = Arc::clone(registry);
-    run_blocking_terminal_persistence_attempt("Bilibili task persistence retry", move || {
+    run_blocking_worker_attempt("Bilibili task persistence retry", move || {
         registry.retry_pending_persistence_outcome()
     })
     .await
     .unwrap_or(TaskPersistenceRecoveryOutcome::PermanentFailure)
 }
 
-async fn run_blocking_terminal_persistence_attempt<T>(
+async fn run_blocking_worker_attempt<T>(
     context: &'static str,
     attempt: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T>
@@ -649,7 +676,7 @@ where
 mod tests {
     use std::{
         sync::{
-            Condvar, Mutex,
+            Barrier, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
@@ -1149,6 +1176,86 @@ mod tests {
         assert!(
             progressed_before_release,
             "the async runtime should progress while terminal persistence is blocked"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_output_cleanup_does_not_block_the_async_runtime() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-runtime",
+                None,
+                None,
+                "Cleanup runtime".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let cleanup_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&cleanup_path),
+            )
+            .expect("cleanup ownership should be durable");
+        std::fs::create_dir_all(&cleanup_path).expect("owned output should be created");
+        std::fs::write(cleanup_path.join("partial.m4s"), b"partial")
+            .expect("owned output should contain a file");
+
+        let save_entered = Arc::new(Barrier::new(2));
+        let save_resume = Arc::new(Barrier::new(2));
+        registry.block_next_persistence_save(Arc::clone(&save_entered), Arc::clone(&save_resume));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_progressed = Arc::clone(&runtime_progressed);
+        let observer_entered = Arc::clone(&save_entered);
+        let observer_resume = Arc::clone(&save_resume);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            let progress_deadline = Instant::now() + Duration::from_millis(500);
+            while !observer_progressed.load(Ordering::SeqCst) && Instant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release = observer_progressed.load(Ordering::SeqCst);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            heartbeat_progressed.store(true, Ordering::SeqCst);
+        });
+        retry_v2_owned_output_directory_cleanup(&registry, &task.id).await;
+
+        heartbeat.await.expect("heartbeat should finish cleanly");
+        assert!(
+            observer.join().expect("observer should finish cleanly"),
+            "the async runtime should progress while output cleanup persistence is blocked"
+        );
+        assert!(!cleanup_path.exists());
+        assert!(
+            !registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                    &task.id,
+                )
+                .expect("the cleanup intent should already be cleared")
         );
     }
 

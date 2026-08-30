@@ -78,11 +78,19 @@ impl LibraryPublicationGate {
             .into_iter()
             .map(|path| normalized_publication_gate_path(Path::new(path)))
             .collect::<io::Result<HashSet<_>>>()?;
-        *self
+        let mut current = self
             .state
             .write()
-            .expect("library publication gate lock poisoned") =
-            Arc::new(LibraryPublicationGateState::Known { blocked_paths });
+            .expect("library publication gate lock poisoned");
+        if matches!(
+            current.as_ref(),
+            LibraryPublicationGateState::Known {
+                blocked_paths: current_paths,
+            } if current_paths == &blocked_paths
+        ) {
+            return Ok(());
+        }
+        *current = Arc::new(LibraryPublicationGateState::Known { blocked_paths });
         Ok(())
     }
 
@@ -2774,6 +2782,30 @@ mod tests {
         update.join().expect("gate update should finish");
         assert_eq!(2, attempts);
         assert!(!visible);
+    }
+
+    #[test]
+    fn stable_snapshot_ignores_reinstalling_the_same_blocked_paths_during_work() {
+        let gate = LibraryPublicationGate::known_empty();
+        gate.install_durable_blocked_paths(["Bilibili/task-1"])
+            .expect("initial ownership should install");
+        let initial_snapshot = gate.snapshot();
+        let mut attempts = 0;
+
+        let blocked = gate
+            .with_stable_snapshot(|snapshot| {
+                attempts += 1;
+                for _ in 0..=MAX_PUBLICATION_GATE_STABILIZATION_ATTEMPTS {
+                    gate.install_durable_blocked_paths(["Bilibili/task-1", "Bilibili/task-1"])
+                        .expect("equivalent ownership should reinstall idempotently");
+                }
+                snapshot.blocks(Path::new("Bilibili/task-1/video.mp4"))
+            })
+            .expect("equivalent durable state should not invalidate the scan");
+
+        assert_eq!(1, attempts);
+        assert!(blocked);
+        assert!(Arc::ptr_eq(&initial_snapshot, &gate.snapshot()));
     }
 
     #[test]
