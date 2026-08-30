@@ -158,6 +158,8 @@ pub struct BilibiliTaskRegistry {
     mutation_lock: Mutex<()>,
     queue_notify: Arc<Notify>,
     file_cleanup_notify: Arc<Notify>,
+    #[cfg(test)]
+    file_cleanup_attempt_count: std::sync::atomic::AtomicUsize,
     persistence: Option<TaskStatePersistence>,
     // Load failure suppresses the writable store but must not erase configuration intent.
     persistence_configured: bool,
@@ -1252,6 +1254,9 @@ impl BilibiliTaskRegistry {
         if candidates.is_empty() {
             return Ok(false);
         }
+        #[cfg(test)]
+        self.file_cleanup_attempt_count
+            .fetch_add(1, AtomicOrdering::SeqCst);
 
         // A cleanup intent owns a logical cache-relative pathname until it is cleared. No-follow
         // traversal protects containment and the no-symlink traversal policy. Object/content
@@ -2157,6 +2162,11 @@ impl BilibiliTaskRegistry {
             .expect("task registry lock poisoned")
             .pending_file_cleanup_intents
             .is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_cleanup_attempt_count(&self) -> usize {
+        self.file_cleanup_attempt_count.load(AtomicOrdering::SeqCst)
     }
 
     pub(crate) async fn wait_for_pending_file_cleanups(&self) {
@@ -4100,6 +4110,8 @@ impl BilibiliTaskRegistry {
             mutation_lock: Mutex::new(()),
             queue_notify: Arc::new(Notify::new()),
             file_cleanup_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            file_cleanup_attempt_count: std::sync::atomic::AtomicUsize::new(0),
             persistence: store.map(TaskStatePersistence::new),
             persistence_configured,
             retention_policy,
@@ -6545,6 +6557,7 @@ fn install_library_publication_gate<'a>(
                 matches!(
                     intent.kind,
                     PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                        | PersistedFileCleanupKind::BilibiliTransientOutput
                         | PersistedFileCleanupKind::LocalLibraryItem
                 )
             })
@@ -11007,16 +11020,40 @@ mod tests {
         assert!(library.get_item(&item_id).await.is_some());
     }
 
-    #[test]
-    fn failed_terminal_output_cleanup_remains_durable_until_retry_succeeds() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_transient_media_cleanup_remains_hidden_across_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
-        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
-            &state_path,
-            TaskRetentionPolicy::default(),
-            Some(root_path.clone()),
+        std::fs::create_dir_all(root_path.join("Bilibili"))
+            .expect("Bilibili output directory should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &root_path,
+                &root_path.join("Bilibili"),
+            )
+            .expect("Bilibili output should be inside the cache root"),
         );
+        let library = crate::library::LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(crate::config::CacheServerOptions {
+                root_path: root_path.clone(),
+                ..crate::config::CacheServerOptions::default()
+            }),
+            Arc::clone(&publication_gate),
+        );
+        let registry =
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+                Some(Arc::clone(&publication_gate)),
+            );
         let task = registry
             .create_bilibili_download_task_v2(
                 "BV1cleanup-retry",
@@ -11026,12 +11063,17 @@ mod tests {
                 vec![sample_bilibili_task_candidate()],
             )
             .expect("v2 task should be created");
-        let transient_path = root_path
-            .join("Bilibili")
-            .join(&task.id)
-            .join("stuck-subtitle.srt");
-        std::fs::create_dir_all(&transient_path)
-            .expect("directory fixture should block file unlink");
+        let transient_directory = root_path.join("Bilibili").join(&task.id);
+        std::fs::create_dir_all(&transient_directory)
+            .expect("transient output directory should be created");
+        let transient_path = transient_directory.join("stuck-transient.mp4");
+        std::fs::write(&transient_path, b"transient media")
+            .expect("transient media should be written");
+        let item_id = library
+            .item_id_for_media_path(&transient_path)
+            .await
+            .expect("transient media item id should resolve");
+        assert!(library.get_item(&item_id).await.is_some());
         registry
             .try_claim_next_bilibili_task()
             .expect("v2 task should become running");
@@ -11052,13 +11094,18 @@ mod tests {
             )
             .expect("terminal output and cleanup intent should commit together");
 
+        std::fs::set_permissions(&transient_directory, std::fs::Permissions::from_mode(0o555))
+            .expect("transient output directory should become read-only");
         let error = registry
             .retry_file_cleanup_intents_for_owner(
                 PersistedFileCleanupKind::BilibiliTransientOutput,
                 &task.id,
             )
-            .expect_err("a directory must not be accepted as a cleaned file");
+            .expect_err("read-only parent should block transient cleanup");
         assert_eq!(tonic::Code::Internal, error.code());
+        assert!(transient_path.is_file());
+        assert!(library.get_item(&item_id).await.is_none());
+        assert!(library.list_items_page(None, 0, 50).await.items.is_empty());
         assert_eq!(
             1,
             TaskStateStore::new(&state_path)
@@ -11068,10 +11115,53 @@ mod tests {
                 .len()
         );
 
-        std::fs::remove_dir(&transient_path).expect("blocking directory should be removable");
-        std::fs::write(&transient_path, b"subtitle").expect("retry file fixture should be created");
+        drop(registry);
+        drop(library);
+        drop(publication_gate);
+
+        let restored_gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &root_path,
+                &root_path.join("Bilibili"),
+            )
+            .expect("restored Bilibili output should be inside the cache root"),
+        );
+        let restored_library = crate::library::LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(crate::config::CacheServerOptions {
+                root_path: root_path.clone(),
+                ..crate::config::CacheServerOptions::default()
+            }),
+            Arc::clone(&restored_gate),
+        );
+        let restored =
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+                Some(restored_gate),
+            );
+        assert!(transient_path.is_file());
+        assert!(restored_library.get_item(&item_id).await.is_none());
         assert!(
-            registry
+            restored_library
+                .list_items_page(None, 0, 50)
+                .await
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            1,
+            TaskStateStore::new(&state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .len()
+        );
+
+        std::fs::set_permissions(&transient_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("transient output directory should become writable again");
+        assert!(
+            restored
                 .retry_file_cleanup_intents_for_owner(
                     PersistedFileCleanupKind::BilibiliTransientOutput,
                     &task.id,
@@ -11086,6 +11176,9 @@ mod tests {
                 .file_cleanup_intents
                 .is_empty()
         );
+        std::fs::write(&transient_path, b"replacement media")
+            .expect("replacement media should be written");
+        assert!(restored_library.get_item(&item_id).await.is_some());
     }
 
     #[cfg(unix)]

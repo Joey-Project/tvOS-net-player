@@ -137,6 +137,64 @@ pub struct AppState {
     completed_hls_deletion_lock: Arc<Mutex<()>>,
     pending_hls_session_cleanups: Arc<Mutex<PendingHlsSessionCleanups>>,
     hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
+    pending_file_cleanup_runtime: Arc<PendingFileCleanupRuntime>,
+}
+
+#[derive(Default)]
+struct PendingFileCleanupRuntime {
+    state: Mutex<PendingFileCleanupRuntimeState>,
+}
+
+#[derive(Default)]
+struct PendingFileCleanupRuntimeState {
+    worker: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    start_count: usize,
+}
+
+impl PendingFileCleanupRuntime {
+    fn ensure_running(&self, tasks: Arc<BilibiliTaskRegistry>) -> bool {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending file cleanup runtime lock poisoned");
+        if state
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return true;
+        }
+        state.worker = Some(handle.spawn(run_pending_file_cleanup_worker(tasks)));
+        #[cfg(test)]
+        {
+            state.start_count += 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn start_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("pending file cleanup runtime lock poisoned")
+            .start_count
+    }
+}
+
+impl Drop for PendingFileCleanupRuntime {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(worker) = state.worker.take() {
+            worker.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -568,6 +626,7 @@ impl AppState {
                 pending: pending_hls_runtime_startup,
                 worker_running: false,
             })),
+            pending_file_cleanup_runtime: Arc::new(PendingFileCleanupRuntime::default()),
         };
         state.ensure_hls_runtime_startup();
         state
@@ -929,12 +988,15 @@ impl AppState {
         adapter: Arc<dyn BilibiliDownloadAdapter>,
         max_concurrent_tasks: usize,
     ) -> JoinHandle<()> {
-        tokio::spawn(run_bilibili_task_worker(
-            Arc::clone(&self.tasks),
-            adapter,
-            max_concurrent_tasks,
-            self.options.bbdown_credential_path.is_some(),
-        ))
+        let _ = self.ensure_pending_file_cleanup_worker();
+        let cleanup_runtime = Arc::clone(&self.pending_file_cleanup_runtime);
+        let tasks = Arc::clone(&self.tasks);
+        let credentials_configured = self.options.bbdown_credential_path.is_some();
+        tokio::spawn(async move {
+            let _cleanup_runtime = cleanup_runtime;
+            run_bilibili_task_worker(tasks, adapter, max_concurrent_tasks, credentials_configured)
+                .await;
+        })
     }
 
     pub fn spawn_configured_bilibili_task_worker(&self) -> Option<JoinHandle<()>> {
@@ -951,8 +1013,16 @@ impl AppState {
         ))
     }
 
-    pub(crate) fn spawn_pending_file_cleanup_worker(&self) -> JoinHandle<()> {
-        tokio::spawn(run_pending_file_cleanup_worker(Arc::clone(&self.tasks)))
+    /// Ensures one cleanup worker is active for this shared application state.
+    /// The worker stays alive while the shared state or a worker spawned from it is retained.
+    pub fn ensure_pending_file_cleanup_worker(&self) -> bool {
+        self.pending_file_cleanup_runtime
+            .ensure_running(Arc::clone(&self.tasks))
+    }
+
+    #[cfg(test)]
+    fn pending_file_cleanup_worker_start_count(&self) -> usize {
+        self.pending_file_cleanup_runtime.start_count()
     }
 
     pub(crate) fn list_completed_hls_library_items(&self) -> Vec<LibraryItem> {
@@ -2638,6 +2708,7 @@ pub async fn run_with_state(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let grpc_addrs = state.options.grpc_listen_addrs()?;
     let media_addrs = state.options.media_listen_addrs()?;
     let grpc_listeners = bind_listener_group(grpc_addrs).await?;
@@ -2655,7 +2726,6 @@ pub async fn run_with_state(
         }
     };
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
-    let _file_cleanup_worker_task = state.spawn_pending_file_cleanup_worker();
     let _hls_cache_quota_monitor = state.spawn_hls_cache_quota_monitor();
 
     tokio::select! {
@@ -2670,6 +2740,7 @@ pub async fn run_grpc_servers(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_grpc_listener).await
 }
@@ -2679,6 +2750,7 @@ pub async fn run_grpc_server(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let listener = bind_tcp_listener(addr).await?;
     run_grpc_listener(listener, state).await
 }
@@ -2689,6 +2761,7 @@ pub async fn run_grpc_listener(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     Server::builder()
         .add_service(ServerServiceServer::new(ServerGrpcService::new(
             state.clone(),
@@ -2708,6 +2781,7 @@ pub async fn run_media_servers(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let listeners = bind_listener_group(addrs).await?;
     run_servers(listeners, state, run_media_listener).await
 }
@@ -2717,6 +2791,7 @@ pub async fn run_media_server(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let listener = bind_tcp_listener(addr).await?;
     run_media_listener(listener, state).await
 }
@@ -2727,6 +2802,7 @@ pub async fn run_media_listener(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
+    let _ = state.ensure_pending_file_cleanup_worker();
     let router = Router::new()
         .route("/", get(root))
         .route(
@@ -2894,12 +2970,17 @@ mod tests {
             BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
             BilibiliMediaRequestKind,
         },
-        bilibili_playback::{BilibiliPlaybackPlanner, BilibiliPlaybackPlanningRequest},
+        bilibili_playback::{
+            BilibiliContentIdentity, BilibiliContentKind, BilibiliPlaybackPlanner,
+            BilibiliPlaybackPlanningRequest,
+        },
+        bilibili_resolution::BilibiliTaskCandidateRecord,
         bilibili_worker::BilibiliDownloadError,
         generated::tvos_net_player::v1::{
-            BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
+            BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem, TaskResult,
         },
         hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
+        task_store::TaskStateStore,
         transcoding::HlsTranscodingPlan,
     };
 
@@ -3733,6 +3814,123 @@ mod tests {
                         .is_cancelled()
                 );
             });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_listener_starts_idempotent_terminal_file_cleanup_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let task = state
+            .tasks
+            .create_bilibili_download_task_v2(
+                "BV1QtjA6BEB8",
+                None,
+                None,
+                "Split server cleanup".to_owned(),
+                vec![BilibiliTaskCandidateRecord {
+                    selection_id: "page:1:cid:2001:bvid:BV1stable:aid:1001".to_owned(),
+                    title: "Split server cleanup".to_owned(),
+                    subtitle: String::new(),
+                    source_kind: "video_page".to_owned(),
+                    content_id: "2001".to_owned(),
+                    identity: BilibiliContentIdentity {
+                        kind: BilibiliContentKind::VideoPage,
+                        aid: Some(1_001),
+                        bvid: Some("BV1stable".to_owned()),
+                        cid: Some(2_001),
+                        epid: None,
+                    },
+                    index: 1,
+                    duration_seconds: Some(60),
+                }],
+            )
+            .expect("v2 task should be created");
+        state
+            .tasks
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let transient_path = state
+            .options
+            .root_path
+            .join("Bilibili")
+            .join(&task.id)
+            .join("blocked-transient.mp4");
+        let transient_directory = transient_path
+            .parent()
+            .expect("transient media should have a parent");
+        std::fs::create_dir_all(transient_directory)
+            .expect("transient output directory should be created");
+        std::fs::write(&transient_path, b"transient media")
+            .expect("transient media should be written");
+        state
+            .tasks
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Completed with transient output.".to_owned(),
+                vec![transient_path.clone()],
+                Vec::new(),
+            )
+            .expect("terminal output should commit");
+        std::fs::set_permissions(transient_directory, std::fs::Permissions::from_mode(0o555))
+            .expect("transient output directory should become read-only");
+        assert!(state.tasks.try_claim_next_bilibili_task().is_none());
+        assert!(state.tasks.has_pending_file_cleanups());
+        let attempts_before = state.tasks.file_cleanup_attempt_count();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("media listener should bind");
+        let server = tokio::spawn(run_media_listener(listener, state.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.tasks.file_cleanup_attempt_count() == attempts_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("media listener should start terminal cleanup recovery");
+        assert!(state.tasks.has_pending_file_cleanups());
+        assert_eq!(1, state.pending_file_cleanup_worker_start_count());
+        assert!(state.ensure_pending_file_cleanup_worker());
+        assert_eq!(1, state.pending_file_cleanup_worker_start_count());
+
+        std::fs::set_permissions(transient_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("transient output directory should become writable again");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let durable_cleanup_is_empty =
+                    TaskStateStore::new(state.options.task_state_path.clone())
+                        .load_state()
+                        .is_ok_and(|snapshot| snapshot.file_cleanup_intents.is_empty());
+                if !state.tasks.has_pending_file_cleanups()
+                    && durable_cleanup_is_empty
+                    && !transient_path.exists()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("split-server cleanup worker should retry without queued work");
+
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("aborted media listener should not complete normally")
+                .is_cancelled()
+        );
     }
 
     #[test]
