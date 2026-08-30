@@ -1182,8 +1182,11 @@ impl BbdownBilibiliAdapter {
         let mut resources = Vec::new();
         let mut resource_bodies = Vec::new();
 
-        if !library_item_id.is_empty() {
-            artifacts.push(library_media_artifact(entry, &library_item_id));
+        if let Some(library_output_path) = library_output_path.as_deref() {
+            artifacts.push(library_media_artifact(
+                library_output_path,
+                &library_item_id,
+            ));
         }
         for (index, file) in entry
             .files
@@ -4388,19 +4391,9 @@ fn proto_candidate_identity(
     }
 }
 
-fn library_media_artifact(entry: &EntryDownloadReport, library_item_id: &str) -> TaskArtifact {
-    let format = entry
-        .mux
-        .as_ref()
-        .map(|mux| &mux.output_path)
-        .or_else(|| {
-            entry
-                .files
-                .iter()
-                .find(|file| file.kind.is_media())
-                .map(|file| &file.path)
-        })
-        .and_then(|path| path.extension())
+fn library_media_artifact(library_output_path: &Path, library_item_id: &str) -> TaskArtifact {
+    let format = library_output_path
+        .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
         .unwrap_or_else(|| "media".to_owned());
@@ -6283,18 +6276,10 @@ mod tests {
         assert_eq!(cache_path_bodies, 1);
         assert!(metadata_body_found);
 
-        let media_entry = EntryDownloadReport {
-            index: 2,
-            title: "Episode 2".to_owned(),
-            directory: temp.path().join("private-media-entry"),
-            files: Vec::new(),
-            mux: Some(MuxReport {
-                output_path: temp.path().join("private-media-marker.mp4"),
-                command: vec!["https://upstream.invalid/private/media".to_owned()],
-                chapter_count: 0,
-            }),
-        };
-        let media_artifact = library_media_artifact(&media_entry, "library-media-one");
+        let media_artifact = library_media_artifact(
+            &temp.path().join("private-media-marker.mp4"),
+            "library-media-one",
+        );
         assert_eq!(media_artifact.format, "mp4");
         assert_eq!(media_artifact.library_item_id, "library-media-one");
         assert!(media_artifact.resource.is_none());
@@ -6302,10 +6287,87 @@ mod tests {
             &media_artifact,
             "private-media-marker"
         ));
-        assert!(!encoded_message_contains(
-            &media_artifact,
-            "https://upstream.invalid/private/media"
-        ));
+    }
+
+    #[tokio::test]
+    async fn v2_media_artifact_uses_the_selected_raw_output_format_when_mux_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let library_root = temp.path().join("library");
+        std_fs::create_dir(&library_root).expect("library root should be created");
+        let library_root = library_root
+            .canonicalize()
+            .expect("library root should be canonical");
+        let entry_directory = library_root.join("Bilibili/task-1/candidate-00001/entry");
+        let mux_path = entry_directory.join("Episode 2.mp4");
+        let raw_video_path = entry_directory.join("video.m4s");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        std_fs::write(&mux_path, b"muxed").expect("mux output should be written");
+        std_fs::write(&raw_video_path, b"raw video").expect("raw output should be written");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: library_root,
+            allowed_extensions: vec![".m4s".to_owned()],
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: entry_directory.parent().unwrap().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: raw_video_path.clone(),
+                    bytes_written: 9,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: mux_path.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::VideoOnly,
+            )
+            .await
+            .expect("the allowed raw output should map into the local library");
+
+        let media = mapped
+            .result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind() == TaskArtifactKind::Media)
+            .expect("the selected raw output should publish a media artifact");
+        assert_eq!("m4s", media.format);
+        assert_eq!(mapped.library_item_id, media.library_item_id);
+        assert_eq!(vec![mux_path], mapped.transient_output_paths);
+        assert_eq!(
+            Some(mapped.library_item_id.as_str()),
+            adapter
+                .library
+                .item_id_for_media_path(raw_video_path)
+                .await
+                .as_deref()
+        );
     }
 
     #[tokio::test]

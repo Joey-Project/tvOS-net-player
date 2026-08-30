@@ -1711,11 +1711,20 @@ impl TaskService for TaskGrpcService {
         PlaybackPolicy::from_playback_options(request.options.as_ref())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         normalize_bilibili_request_context(request.context.as_mut())?;
-        freeze_bilibili_resolution_context(
-            &mut request.context,
-            request.options.as_ref(),
-            &self.state.options,
-        )?;
+        self.ensure_bilibili_resolution_reaper_started();
+        let server_options = Arc::clone(&self.state.options);
+        let context_options = request.options.clone();
+        let mut context = request.context.take();
+        request.context = self
+            .run_bilibili_resolution_blocking(move || {
+                freeze_bilibili_resolution_context(
+                    &mut context,
+                    context_options.as_ref(),
+                    &server_options,
+                )?;
+                Ok(context)
+            })
+            .await?;
 
         let _permit = Arc::clone(&self.state.playback_planning_permits)
             .acquire_owned()
@@ -1736,7 +1745,6 @@ impl TaskService for TaskGrpcService {
             })
             .await
             .map_err(|error| playback_status_from_error(&self.state, error))?;
-        self.ensure_bilibili_resolution_reaper_started();
         let resolutions = Arc::clone(&self.state.bilibili_resolutions);
         let page = self
             .run_bilibili_resolution_blocking(move || {
@@ -2883,6 +2891,8 @@ fn frozen_bilibili_credential_profile_id(
     let Some(path) = options.bbdown_credential_path.as_ref() else {
         return Ok(String::new());
     };
+    #[cfg(test)]
+    observe_bilibili_credential_profile_load(path);
     let profiles = CredentialStore::new(path.clone())
         .load_profiles()
         .map_err(|_| Status::failed_precondition("Failed to load BBDown credential file."))?;
@@ -2892,6 +2902,73 @@ fn frozen_bilibili_credential_profile_id(
         ));
     }
     Ok(profiles.default_profile)
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BilibiliCredentialProfileLoadProbe {
+    path: std::path::PathBuf,
+    blocking_permits: Arc<Semaphore>,
+    observed_thread: Arc<StdMutex<Option<std::thread::ThreadId>>>,
+    observed_available_permits: Arc<std::sync::atomic::AtomicUsize>,
+    observed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static BILIBILI_CREDENTIAL_PROFILE_LOAD_PROBE: std::sync::OnceLock<
+    StdMutex<Option<BilibiliCredentialProfileLoadProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct BilibiliCredentialProfileLoadProbeRegistration;
+
+#[cfg(test)]
+impl Drop for BilibiliCredentialProfileLoadProbeRegistration {
+    fn drop(&mut self) {
+        *BILIBILI_CREDENTIAL_PROFILE_LOAD_PROBE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .expect("credential profile load probe lock poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_bilibili_credential_profile_load_probe(
+    probe: BilibiliCredentialProfileLoadProbe,
+) -> BilibiliCredentialProfileLoadProbeRegistration {
+    let mut active_probe = BILIBILI_CREDENTIAL_PROFILE_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("credential profile load probe lock poisoned");
+    assert!(
+        active_probe.is_none(),
+        "credential load probe already active"
+    );
+    *active_probe = Some(probe);
+    BilibiliCredentialProfileLoadProbeRegistration
+}
+
+#[cfg(test)]
+fn observe_bilibili_credential_profile_load(path: &std::path::Path) {
+    let probe = BILIBILI_CREDENTIAL_PROFILE_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("credential profile load probe lock poisoned")
+        .as_ref()
+        .filter(|probe| probe.path == path)
+        .cloned();
+    let Some(probe) = probe else {
+        return;
+    };
+    *probe
+        .observed_thread
+        .lock()
+        .expect("credential load observation lock poisoned") = Some(std::thread::current().id());
+    probe.observed_available_permits.store(
+        probe.blocking_permits.available_permits(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    probe.observed.notify_one();
 }
 
 fn create_accepted_bilibili_playback_task_v2<T>(
@@ -8145,6 +8222,194 @@ mod tests {
                 .last()
                 .cloned()
         );
+    }
+
+    #[tokio::test]
+    async fn start_bilibili_resolution_loads_credentials_only_after_blocking_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("invalid-credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": { "default": {} }
+            }"#,
+        )
+        .expect("initial credential file should be written");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credentials_path.clone()),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let blocking_permits = Arc::clone(&state.bilibili_resolution_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 0..crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&blocking_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking permit should be acquired"),
+            );
+        }
+        let service = TaskGrpcService::new(state);
+        fs::write(&credentials_path, b"not valid credential JSON")
+            .expect("credential file should become invalid before the RPC");
+
+        let invalid_context = timeout(
+            Duration::from_millis(250),
+            service.start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                url_or_id: "BV1invalid-context".to_owned(),
+                context: Some(BilibiliRequestContext {
+                    api_mode: i32::MAX,
+                    credential_profile_id: String::new(),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("request validation must precede blocking admission")
+        .expect_err("unknown API mode should be rejected");
+        assert_eq!(tonic::Code::InvalidArgument, invalid_context.code());
+
+        let request_service = service.clone();
+        let mut pending = tokio::spawn(async move {
+            request_service
+                .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                    url_or_id: "BV1bounded-credential-load".to_owned(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        assert!(
+            timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "credential loading must wait for bounded blocking admission"
+        );
+
+        drop(
+            held_permits
+                .pop()
+                .expect("one blocking permit should be released"),
+        );
+        let load_error = timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("credential loading should run after admission")
+            .expect("resolution task should not panic")
+            .expect_err("invalid credential file should preserve its load error");
+        assert_eq!(tonic::Code::FailedPrecondition, load_error.code());
+        assert_eq!(
+            "Failed to load BBDown credential file.",
+            load_error.message()
+        );
+        drop(held_permits);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_bilibili_resolution_loads_credentials_on_bounded_blocking_thread() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "blocking-profile",
+                "profiles": {
+                    "blocking-profile": {}
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let resolve_contexts = Arc::new(Mutex::new(Vec::new()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                task_state_path: root_path.join("state").join("tasks.json"),
+                root_path,
+                bilibili_worker_enabled: false,
+                bbdown_credential_path: Some(credentials_path.clone()),
+                ..CacheServerOptions::default()
+            },
+            Arc::new(ContextRecordingResolvePlanner {
+                contexts: Arc::clone(&resolve_contexts),
+                resolution: sample_resolution_with_pages(),
+            }),
+        );
+        let blocking_permits = Arc::clone(&state.bilibili_resolution_blocking_permits);
+        let mut held_permits = Vec::new();
+        for _ in 1..crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS {
+            held_permits.push(
+                Arc::clone(&blocking_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("blocking permit should be acquired"),
+            );
+        }
+        let observed_thread = Arc::new(Mutex::new(None));
+        let observed_available_permits = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let _probe_registration =
+            install_bilibili_credential_profile_load_probe(BilibiliCredentialProfileLoadProbe {
+                path: credentials_path,
+                blocking_permits: Arc::clone(&blocking_permits),
+                observed_thread: Arc::clone(&observed_thread),
+                observed_available_permits: Arc::clone(&observed_available_permits),
+                observed: Arc::clone(&observed),
+            });
+        let async_worker_thread = std::thread::current().id();
+        let service = TaskGrpcService::new(state);
+
+        let pending = tokio::spawn(async move {
+            service
+                .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
+                    url_or_id: "BV1blocking-credential-load".to_owned(),
+                    ..Default::default()
+                }))
+                .await
+        });
+        timeout(Duration::from_secs(1), observed.notified())
+            .await
+            .expect("credential load should be observed");
+
+        assert_eq!(
+            0,
+            observed_available_permits.load(Ordering::SeqCst),
+            "credential loading must consume the final blocking permit"
+        );
+        let credential_load_thread = observed_thread
+            .lock()
+            .expect("credential load observation lock should not be poisoned")
+            .expect("credential load thread should be recorded");
+        assert_ne!(
+            async_worker_thread, credential_load_thread,
+            "credential loading must not run on the async runtime worker"
+        );
+
+        let page = timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("resolution should finish")
+            .expect("resolution task should not panic")
+            .expect("resolution should succeed")
+            .into_inner();
+        assert_eq!(
+            Some(BilibiliRequestContext {
+                api_mode: BilibiliApiMode::Web.into(),
+                credential_profile_id: "blocking-profile".to_owned(),
+            }),
+            page.session
+                .expect("resolution should include its session")
+                .context
+        );
+        drop(held_permits);
     }
 
     #[tokio::test]

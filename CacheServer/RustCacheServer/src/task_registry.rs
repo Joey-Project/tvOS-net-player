@@ -167,11 +167,43 @@ pub struct BilibiliTaskRegistry {
     persistence_configured: bool,
     retention_policy: TaskRetentionPolicy,
     resource_root_path: Option<PathBuf>,
+    bilibili_output_root_relative_path: Option<PathBuf>,
     resource_cleanup_lock: Mutex<()>,
     file_cleanup_lock: Mutex<()>,
     library_publication_gate: Option<Arc<LibraryPublicationGate>>,
     resource_storage_available: AtomicBool,
     orphan_resource_scan_pending: AtomicBool,
+}
+
+pub(crate) struct PreparedLibraryItemDeletion<'a> {
+    registry: &'a BilibiliTaskRegistry,
+    owner_id: String,
+    updated_task_ids: Vec<String>,
+    armed: bool,
+}
+
+impl PreparedLibraryItemDeletion<'_> {
+    pub(crate) fn updated_task_ids(&self) -> &[String] {
+        &self.updated_task_ids
+    }
+
+    pub(crate) fn delete(mut self) -> Result<bool, Status> {
+        let result = self.registry.retry_file_cleanup_intents_for_owner(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            &self.owner_id,
+        );
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for PreparedLibraryItemDeletion<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .release_local_library_cleanup_barrier(&self.owner_id);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1219,6 +1251,22 @@ impl BilibiliTaskRegistry {
         self.retry_file_cleanup_intents(Some((kind, owner_id)))
     }
 
+    fn release_local_library_cleanup_barrier(&self, owner_id: &str) {
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let released = self
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .deferred_local_library_cleanup_owner_ids
+            .remove(owner_id);
+        if released {
+            self.file_cleanup_notify.notify_one();
+        }
+    }
+
     pub(crate) fn retry_pending_file_cleanups(&self) -> bool {
         match self.retry_file_cleanup_intents(None) {
             Ok(_) => true,
@@ -1240,9 +1288,15 @@ impl BilibiliTaskRegistry {
             .file_cleanup_lock
             .lock()
             .expect("file cleanup lock poisoned");
-        let candidates = {
-            let inner = self.inner.lock().expect("task registry lock poisoned");
-            inner
+        let (candidates, released_local_library_barrier) = {
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            let released_local_library_barrier = owner.is_some_and(|(kind, owner_id)| {
+                kind == PersistedFileCleanupKind::LocalLibraryItem
+                    && inner
+                        .deferred_local_library_cleanup_owner_ids
+                        .remove(owner_id)
+            });
+            let candidates = inner
                 .pending_file_cleanup_intents
                 .iter()
                 .filter(|intent| match owner {
@@ -1250,8 +1304,15 @@ impl BilibiliTaskRegistry {
                     None => file_cleanup_intent_is_ready_for_global_retry(&inner, intent),
                 })
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (candidates, released_local_library_barrier)
         };
+        if released_local_library_barrier {
+            // The explicit deleter still owns file_cleanup_lock, so a woken background worker
+            // cannot overtake the result-page invalidation and this attempt. The notification
+            // only guarantees recovery if this attempt cannot finish or persist cleanup.
+            self.file_cleanup_notify.notify_one();
+        }
         if candidates.is_empty() {
             return Ok(false);
         }
@@ -1284,6 +1345,21 @@ impl BilibiliTaskRegistry {
             };
             match removal {
                 Ok(removed) => {
+                    if matches!(
+                        intent.kind,
+                        PersistedFileCleanupKind::BilibiliTransientOutput
+                            | PersistedFileCleanupKind::LocalLibraryItem
+                    ) && let Err(error) = self.prune_managed_bilibili_output_ancestors(
+                        resource_root_path,
+                        &intent.relative_path,
+                    ) {
+                        cleanup_failed = true;
+                        eprintln!(
+                            "Failed to prune pending cache output directories for {}: {error}",
+                            intent.owner_id
+                        );
+                        continue;
+                    }
                     removed_any |= removed;
                     completed.push(intent);
                 }
@@ -1325,6 +1401,52 @@ impl BilibiliTaskRegistry {
             ));
         }
         Ok(removed_any)
+    }
+
+    fn prune_managed_bilibili_output_ancestors(
+        &self,
+        resource_root_path: &Path,
+        relative_path: &str,
+    ) -> io::Result<()> {
+        let Some(output_root) = self.bilibili_output_root_relative_path.as_deref() else {
+            return Ok(());
+        };
+        let relative_path = Path::new(relative_path);
+        if !relative_path.starts_with(output_root) {
+            return Ok(());
+        }
+        let Some(mut directory) = relative_path.parent() else {
+            return Ok(());
+        };
+
+        // Only emptiness is protected here: no-follow traversal confines pruning to the
+        // configured BBDown output root, and a non-empty ancestor is a successful stop rather
+        // than a mutation failure. File content and directory object identity are not compared.
+        for _ in 0..MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH {
+            if directory == output_root || directory.as_os_str().is_empty() {
+                return Ok(());
+            }
+            let directory_path = directory.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Bilibili output cleanup path is not valid UTF-8",
+                )
+            })?;
+            match remove_empty_directory_no_follow(resource_root_path, directory_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let Some(parent) = directory.parent() else {
+                return Ok(());
+            };
+            directory = parent;
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Bilibili output directory cleanup exceeds the supported depth",
+        ))
     }
 
     fn create_staged_resource_body(
@@ -3357,11 +3479,11 @@ impl BilibiliTaskRegistry {
         Ok(true)
     }
 
-    pub fn tombstone_library_item_before_delete(
+    pub(crate) fn tombstone_library_item_before_delete(
         &self,
         library_item_id: &str,
         relative_path: &str,
-    ) -> Result<Vec<String>, Status> {
+    ) -> Result<PreparedLibraryItemDeletion<'_>, Status> {
         let library_item_id = normalize(library_item_id);
         if library_item_id.is_empty() {
             return Err(Status::invalid_argument("Library item id is required."));
@@ -3388,12 +3510,24 @@ impl BilibiliTaskRegistry {
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
         let checkpoint = RegistryMutationCheckpoint::capture(&inner);
-        replace_file_cleanup_intents_for_owner_locked(
+        if let Err(error) = replace_file_cleanup_intents_for_owner_locked(
             &mut inner,
             PersistedFileCleanupKind::LocalLibraryItem,
             &library_item_id,
             vec![cleanup_intent],
-        )?;
+        ) {
+            checkpoint.restore(&mut inner);
+            return Err(error);
+        }
+        if !inner
+            .deferred_local_library_cleanup_owner_ids
+            .insert(library_item_id.clone())
+        {
+            checkpoint.restore(&mut inner);
+            return Err(Status::aborted(
+                "Library item deletion is already being coordinated.",
+            ));
+        }
         let task_ids = inner.tasks_by_id.keys().cloned().collect::<Vec<_>>();
         let mut updated_tasks = Vec::new();
 
@@ -3453,6 +3587,9 @@ impl BilibiliTaskRegistry {
                 Ok(output_update) => output_update,
                 Err(error) => {
                     checkpoint.restore(&mut inner);
+                    inner
+                        .deferred_local_library_cleanup_owner_ids
+                        .remove(&library_item_id);
                     return Err(Status::internal(format!(
                         "Library deletion would create invalid task output: {error}"
                     )));
@@ -3543,11 +3680,22 @@ impl BilibiliTaskRegistry {
             checkpoint,
         );
         if durability_required && !outcome.is_durable() {
+            self.inner
+                .lock()
+                .expect("task registry lock poisoned")
+                .deferred_local_library_cleanup_owner_ids
+                .remove(&library_item_id);
+            self.file_cleanup_notify.notify_one();
             return Err(Status::unavailable(
                 "Task references and cleanup intent could not be persisted before library deletion.",
             ));
         }
-        Ok(updated_task_ids)
+        Ok(PreparedLibraryItemDeletion {
+            registry: self,
+            owner_id: library_item_id,
+            updated_task_ids,
+            armed: true,
+        })
     }
 
     pub fn complete_task_cancelled(&self, id: &str, message: String) -> Result<Task, Status> {
@@ -4115,6 +4263,9 @@ impl BilibiliTaskRegistry {
         rebuild_visible_resource_index_locked(&mut inner);
 
         let orphan_resource_scan_pending = resource_root_path.is_some();
+        let bilibili_output_root_relative_path = library_publication_gate
+            .as_ref()
+            .and_then(|gate| gate.managed_output_prefix());
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             mutation_lock: Mutex::new(()),
@@ -4128,6 +4279,7 @@ impl BilibiliTaskRegistry {
             persistence_configured,
             retention_policy,
             resource_root_path,
+            bilibili_output_root_relative_path,
             resource_cleanup_lock: Mutex::new(()),
             file_cleanup_lock: Mutex::new(()),
             library_publication_gate,
@@ -5199,6 +5351,7 @@ struct RegistryInner {
     durable_resource_cleanup_ids: HashSet<String>,
     resource_storage_revalidation_ids: HashSet<String>,
     pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
+    deferred_local_library_cleanup_owner_ids: HashSet<String>,
     pending_publications_by_id: HashMap<String, Task>,
     persistence_generation: u64,
 }
@@ -5214,6 +5367,13 @@ fn file_cleanup_intent_is_ready_for_global_retry(
     inner: &RegistryInner,
     intent: &PersistedFileCleanupIntent,
 ) -> bool {
+    if intent.kind == PersistedFileCleanupKind::LocalLibraryItem
+        && inner
+            .deferred_local_library_cleanup_owner_ids
+            .contains(&intent.owner_id)
+    {
+        return false;
+    }
     if intent.kind != PersistedFileCleanupKind::BilibiliOwnedOutputDirectory {
         return true;
     }
@@ -7992,7 +8152,8 @@ mod tests {
         registry.fail_next_persistence_directory_sync();
         let error = registry
             .tombstone_library_item_before_delete(&library_one_id, library_one_relative_path)
-            .expect_err("library deletion must wait for directory durability");
+            .err()
+            .expect("library deletion must wait for directory durability");
         assert_eq!(tonic::Code::Unavailable, error.code());
         let rolled_back = registry
             .task_output_snapshot(&task.id)
@@ -8017,10 +8178,13 @@ mod tests {
         );
         assert!(registry.retry_pending_persistence());
 
-        let updated_task_ids = registry
+        let prepared = registry
             .tombstone_library_item_before_delete(&library_one_id, library_one_relative_path)
-            .expect("library references should tombstone durably")
-            .into_iter()
+            .expect("library references should tombstone durably");
+        let updated_task_ids = prepared
+            .updated_task_ids()
+            .iter()
+            .cloned()
             .collect::<HashSet<_>>();
         assert_eq!(
             HashSet::from([task.id.clone(), shared_task.id.clone()]),
@@ -8079,6 +8243,7 @@ mod tests {
                 .expect("library cleanup intent should be durable with tombstones")
                 .file_cleanup_intents
         );
+        drop(prepared);
         drop(registry);
 
         let restored = BilibiliTaskRegistry::with_persistence_path(path);
@@ -8188,10 +8353,13 @@ mod tests {
                 .is_some_and(|output| output.legacy_managed)
         );
 
-        let updated_task_ids = registry
+        let prepared = registry
             .tombstone_library_item_before_delete(&library_item_id, relative_path)
-            .expect("legacy task references should tombstone durably")
-            .into_iter()
+            .expect("legacy task references should tombstone durably");
+        let updated_task_ids = prepared
+            .updated_task_ids()
+            .iter()
+            .cloned()
             .collect::<HashSet<_>>();
         assert_eq!(
             HashSet::from([classic.id.clone(), candidate.id.clone()]),
@@ -8221,6 +8389,7 @@ mod tests {
                 .output_summary
                 .map(|summary| summary.successful_result_count)
         );
+        drop(prepared);
         drop(registry);
 
         let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
@@ -11233,14 +11402,11 @@ mod tests {
 
         std::fs::set_permissions(&media_directory, std::fs::Permissions::from_mode(0o555))
             .expect("media directory should become read-only");
-        registry
+        let prepared = registry
             .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())
             .expect("local item tombstone should be durable");
-        let error = registry
-            .retry_file_cleanup_intents_for_owner(
-                PersistedFileCleanupKind::LocalLibraryItem,
-                deletion.item_id(),
-            )
+        let error = prepared
+            .delete()
             .expect_err("read-only parent should block file cleanup");
         assert_eq!(tonic::Code::Internal, error.code());
         assert!(media_path.is_file());
@@ -11412,6 +11578,7 @@ mod tests {
                 .expect("cleanup retry should succeed")
         );
         assert!(!transient_path.exists());
+        assert!(!transient_directory.exists());
         assert!(
             TaskStateStore::new(state_path)
                 .load_state()
@@ -11419,6 +11586,8 @@ mod tests {
                 .file_cleanup_intents
                 .is_empty()
         );
+        std::fs::create_dir_all(&transient_directory)
+            .expect("replacement media directory should be recreated");
         std::fs::write(&transient_path, b"replacement media")
             .expect("replacement media should be written");
         assert!(restored_library.get_item(&item_id).await.is_some());

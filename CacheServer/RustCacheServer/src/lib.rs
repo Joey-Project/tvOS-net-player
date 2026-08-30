@@ -79,13 +79,14 @@ use crate::{
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
-    task_store::PersistedFileCleanupKind,
     transcoding::HlsTranscodingPlanState,
 };
 
 const BBDOWN_WORKER_MAX_CONCURRENT_TASKS: usize = 1;
 const HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS: usize = 1;
 const TASK_RESOURCE_OPEN_MAX_CONCURRENT_JOBS: usize = 32;
+const LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS: usize = 4;
+const LOCAL_LIBRARY_DELETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const HLS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -119,6 +120,7 @@ pub struct AppState {
     playback_planning_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_cache_finalization_permits: Arc<Semaphore>,
     pub(crate) task_resource_open_permits: Arc<Semaphore>,
+    pub(crate) local_library_deletion_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
@@ -601,6 +603,9 @@ impl AppState {
             playback_planning_active_jobs,
             hls_cache_finalization_permits,
             task_resource_open_permits,
+            local_library_deletion_permits: Arc::new(Semaphore::new(
+                LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS,
+            )),
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
             hls_fill_scheduler,
@@ -1142,23 +1147,44 @@ impl AppState {
         else {
             return Ok(false);
         };
-        let updated_task_ids = self
-            .tasks
-            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())?;
-        if !updated_task_ids.is_empty() {
-            let task_ids = updated_task_ids.into_iter().collect::<HashSet<_>>();
-            let released_resource_lease_ids = self
-                .task_result_pages
-                .lock()
-                .expect("task result page store lock poisoned")
-                .invalidate_tasks(&task_ids);
-            self.tasks
-                .release_task_output_snapshots(&released_resource_lease_ids);
-        }
-        self.tasks.retry_file_cleanup_intents_for_owner(
-            PersistedFileCleanupKind::LocalLibraryItem,
-            deletion.item_id(),
+        let permit = tokio::time::timeout(
+            LOCAL_LIBRARY_DELETION_ADMISSION_TIMEOUT,
+            Arc::clone(&self.local_library_deletion_permits).acquire_owned(),
         )
+        .await
+        .map_err(|_| {
+            Status::resource_exhausted("Library deletion is busy; retry the request shortly.")
+        })?
+        .map_err(|_| Status::unavailable("Library deletion is shutting down."))?;
+        let tasks = Arc::clone(&self.tasks);
+        let task_result_pages = Arc::clone(&self.task_result_pages);
+
+        tokio::task::spawn_blocking(move || {
+            // Keep the admission slot until detached work finishes after RPC cancellation.
+            let _permit = permit;
+            let prepared = tasks.tombstone_library_item_before_delete(
+                deletion.item_id(),
+                deletion.relative_path(),
+            )?;
+            if !prepared.updated_task_ids().is_empty() {
+                let task_ids = prepared
+                    .updated_task_ids()
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let released_resource_lease_ids = task_result_pages
+                    .lock()
+                    .expect("task result page store lock poisoned")
+                    .invalidate_tasks(&task_ids);
+                tasks.release_task_output_snapshots(&released_resource_lease_ids);
+            }
+            prepared.delete()
+        })
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to join local library deletion operation: {error}");
+            Status::internal("Library deletion failed unexpectedly.")
+        })?
     }
 
     pub(crate) async fn delete_completed_hls_library_item(
@@ -1617,6 +1643,8 @@ impl AppState {
                 == self.options.bilibili_worker_max_concurrent_tasks.max(1)
             && self.hls_cache_finalization_permits.available_permits()
                 == HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS
+            && self.local_library_deletion_permits.available_permits()
+                == LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS
             && self.lan_transcoding_permits.available_permits()
                 == self.options.lan_transcoding_max_concurrent_jobs.max(1)
             && self.lan_transcoding_active_job_count() == 0
@@ -1643,12 +1671,14 @@ impl AppState {
         let (hls_fill_current, hls_fill_foreground, hls_fill_demoted) =
             self.hls_fill_scheduler.diagnostic_counts();
         format!(
-            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}",
+            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, library_deletion_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}",
             self.playback_planning_active_jobs.load(Ordering::SeqCst),
             self.playback_planning_permits.available_permits(),
             self.options.bilibili_worker_max_concurrent_tasks.max(1),
             self.hls_cache_finalization_permits.available_permits(),
             HLS_CACHE_FINALIZATION_MAX_CONCURRENT_TASKS,
+            self.local_library_deletion_permits.available_permits(),
+            LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS,
             self.lan_transcoding_active_job_count(),
             self.lan_transcoding_permits.available_permits(),
             self.options.lan_transcoding_max_concurrent_jobs.max(1),
@@ -4036,6 +4066,240 @@ mod tests {
                 .await
                 .expect_err("aborted media listener should not complete normally")
                 .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_library_cleanup_worker_waits_for_deletion_barrier() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let media_path = state
+            .options
+            .root_path
+            .join("Bilibili")
+            .join("cleanup-barrier-task")
+            .join("candidate-1")
+            .join("video.mp4");
+        std::fs::create_dir_all(
+            media_path
+                .parent()
+                .expect("test media should have a parent directory"),
+        )
+        .expect("test media directory should be created");
+        std::fs::write(&media_path, b"media").expect("test media should be written");
+        let item_id = state
+            .library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("test media should be a library item");
+        let deletion = state
+            .library
+            .prepare_item_deletion(&item_id)
+            .await
+            .expect("library deletion should prepare")
+            .expect("test media should still exist");
+        let prepared = state
+            .tasks
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())
+            .expect("cleanup intent should persist behind a deletion barrier");
+        assert!(prepared.updated_task_ids().is_empty());
+        let attempts_before = state.tasks.file_cleanup_attempt_count();
+        let idle_waits_before = state.tasks.file_cleanup_idle_wait_count();
+
+        assert!(state.ensure_pending_file_cleanup_worker());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.tasks.file_cleanup_idle_wait_count() == idle_waits_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup worker should observe the deferred intent and park");
+        assert_eq!(attempts_before, state.tasks.file_cleanup_attempt_count());
+        assert!(media_path.is_file());
+        assert!(state.tasks.has_pending_file_cleanups());
+
+        assert!(
+            prepared
+                .delete()
+                .expect("coordinated deletion should succeed")
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.tasks.has_pending_file_cleanups() || media_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit deletion should clear the intent before the worker retries");
+    }
+
+    #[tokio::test]
+    async fn local_library_deletion_waits_for_bounded_blocking_admission() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let media_path = state.options.root_path.join("bounded-delete.mp4");
+        std::fs::write(&media_path, b"media").expect("test media should be written");
+        let item_id = state
+            .library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("test media should be a library item");
+        let held_permits = Arc::clone(&state.local_library_deletion_permits)
+            .acquire_many_owned(LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS as u32)
+            .await
+            .expect("test should hold every deletion permit");
+        let delete_state = state.clone();
+        let delete_item_id = item_id.clone();
+        let deletion = tokio::spawn(async move {
+            delete_state
+                .delete_local_library_item(&delete_item_id)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!deletion.is_finished());
+        assert!(media_path.is_file());
+        assert!(!state.tasks.has_pending_file_cleanups());
+
+        drop(held_permits);
+        assert!(
+            deletion
+                .await
+                .expect("deletion task should join")
+                .expect("deletion should succeed after admission")
+        );
+        assert!(!media_path.exists());
+        assert_eq!(
+            LOCAL_LIBRARY_DELETION_MAX_CONCURRENT_JOBS,
+            state.local_library_deletion_permits.available_permits()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_library_deletion_prunes_only_empty_managed_output_ancestors() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let managed_root = state.options.root_path.join("Bilibili");
+        let first_media = managed_root
+            .join("prune-task")
+            .join("candidate-00001")
+            .join("entry")
+            .join("first.mp4");
+        let second_media = managed_root
+            .join("prune-task")
+            .join("candidate-00002")
+            .join("second.mp4");
+        let unmanaged_directory = state
+            .options
+            .root_path
+            .join("Personal")
+            .join("keep-empty-directory");
+        let unmanaged_media = unmanaged_directory.join("personal.mp4");
+        for media_path in [&first_media, &second_media, &unmanaged_media] {
+            std::fs::create_dir_all(
+                media_path
+                    .parent()
+                    .expect("test media should have a parent directory"),
+            )
+            .expect("test media directory should be created");
+            std::fs::write(media_path, b"media").expect("test media should be written");
+        }
+        let first_item_id = state
+            .library
+            .item_id_for_media_path(&first_media)
+            .await
+            .expect("first managed item should resolve");
+        let second_item_id = state
+            .library
+            .item_id_for_media_path(&second_media)
+            .await
+            .expect("second managed item should resolve");
+        let unmanaged_item_id = state
+            .library
+            .item_id_for_media_path(&unmanaged_media)
+            .await
+            .expect("unmanaged item should resolve");
+
+        assert!(
+            state
+                .delete_local_library_item(&first_item_id)
+                .await
+                .expect("first managed deletion should succeed")
+        );
+        assert!(!first_media.parent().unwrap().exists());
+        assert!(second_media.is_file());
+        assert!(managed_root.join("prune-task").is_dir());
+
+        assert!(
+            state
+                .delete_local_library_item(&second_item_id)
+                .await
+                .expect("second managed deletion should succeed")
+        );
+        assert!(!managed_root.join("prune-task").exists());
+        assert!(managed_root.is_dir());
+
+        assert!(
+            state
+                .delete_local_library_item(&unmanaged_item_id)
+                .await
+                .expect("unmanaged deletion should succeed")
+        );
+        assert!(unmanaged_directory.is_dir());
+    }
+
+    #[tokio::test]
+    async fn local_library_cleanup_replays_managed_ancestor_pruning_after_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let task_directory = state
+            .options
+            .root_path
+            .join("Bilibili")
+            .join("restart-prune-task");
+        let media_path = task_directory
+            .join("candidate-00001")
+            .join("entry")
+            .join("video.mp4");
+        std::fs::create_dir_all(media_path.parent().unwrap())
+            .expect("test media directory should be created");
+        std::fs::write(&media_path, b"media").expect("test media should be written");
+        let item_id = state
+            .library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("test media should resolve");
+        let deletion = state
+            .library
+            .prepare_item_deletion(&item_id)
+            .await
+            .expect("library deletion should prepare")
+            .expect("test media should still exist");
+        let prepared = state
+            .tasks
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())
+            .expect("cleanup intent should persist before restart");
+        assert_eq!(
+            1,
+            TaskStateStore::new(state.options.task_state_path.clone())
+                .load_state()
+                .expect("cleanup intent should be durable")
+                .file_cleanup_intents
+                .len()
+        );
+        drop(prepared);
+        drop(deletion);
+        drop(state);
+
+        let restored = test_app_state(&temp);
+        assert!(!media_path.exists());
+        assert!(!task_directory.exists());
+        assert!(restored.options.root_path.join("Bilibili").is_dir());
+        assert!(
+            TaskStateStore::new(restored.options.task_state_path.clone())
+                .load_state()
+                .expect("completed cleanup should persist")
+                .file_cleanup_intents
+                .is_empty()
         );
     }
 

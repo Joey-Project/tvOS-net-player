@@ -32,6 +32,7 @@ const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 
 pub(crate) struct LibraryPublicationGate {
     state: StdRwLock<Arc<LibraryPublicationGateState>>,
+    managed_output_prefix: Option<PathBuf>,
 }
 
 enum LibraryPublicationGateState {
@@ -45,6 +46,7 @@ impl LibraryPublicationGate {
             state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Known {
                 blocked_paths: HashSet::new(),
             })),
+            managed_output_prefix: None,
         }
     }
 
@@ -65,9 +67,14 @@ impl LibraryPublicationGate {
         };
         Ok(Self {
             state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Unknown {
-                blocked_prefix,
+                blocked_prefix: blocked_prefix.clone(),
             })),
+            managed_output_prefix: Some(blocked_prefix),
         })
+    }
+
+    pub(crate) fn managed_output_prefix(&self) -> Option<PathBuf> {
+        self.managed_output_prefix.clone()
     }
 
     pub(crate) fn install_durable_blocked_paths<'a>(
