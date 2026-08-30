@@ -1,11 +1,12 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     ffi::{CString, OsStr},
     fs::{self, File},
     io,
     path::{Component, Components, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -13,7 +14,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost_types::Timestamp;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore};
 
 use crate::{
     config::CacheServerOptions,
@@ -32,6 +33,7 @@ const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 pub struct LocalMediaLibrary {
     options: Arc<CacheServerOptions>,
     blocking_jobs: Arc<Semaphore>,
+    item_mutation_locks: Arc<StdMutex<HashMap<String, Weak<RwLock<()>>>>>,
 }
 
 impl LocalMediaLibrary {
@@ -39,6 +41,7 @@ impl LocalMediaLibrary {
         Self {
             options,
             blocking_jobs: Arc::new(Semaphore::new(MAX_BLOCKING_LIBRARY_JOBS)),
+            item_mutation_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -75,6 +78,21 @@ impl LocalMediaLibrary {
             .await
     }
 
+    pub async fn reserve_media_path_for_publication(
+        &self,
+        path: impl Into<PathBuf>,
+    ) -> Option<LibraryItemPublicationLease> {
+        let path = path.into();
+        let item_id = self.item_id_for_media_path(path.clone()).await?;
+        let guard = self.acquire_item_publication_guard(&item_id).await;
+        (self.item_id_for_media_path(path).await.as_deref() == Some(item_id.as_str())).then_some(
+            LibraryItemPublicationLease {
+                item_id,
+                _guard: guard,
+            },
+        )
+    }
+
     pub async fn get_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
         let item_id = item_id.to_owned();
         let variant_id = variant_id.to_owned();
@@ -99,9 +117,29 @@ impl LocalMediaLibrary {
     }
 
     pub async fn delete_item(&self, id: &str) -> io::Result<bool> {
-        let id = id.to_owned();
-        self.run_blocking(move |library, _| library.delete_item_blocking(&id))
-            .await
+        let Some(deletion) = self.prepare_item_deletion(id).await? else {
+            return Ok(false);
+        };
+        deletion.delete().await
+    }
+
+    pub async fn prepare_item_deletion(&self, id: &str) -> io::Result<Option<LibraryItemDeletion>> {
+        let requested_id = id.to_owned();
+        let Some((item_id, relative_path)) = self
+            .run_blocking(move |library, _| {
+                library.canonical_deletable_item_id_blocking(&requested_id)
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        let guard = self.acquire_item_deletion_guard(&item_id).await;
+        Ok(Some(LibraryItemDeletion {
+            library: self.clone(),
+            item_id,
+            relative_path,
+            _guard: guard,
+        }))
     }
 
     pub async fn is_root_available(&self) -> bool {
@@ -136,6 +174,31 @@ impl LocalMediaLibrary {
         .expect("library blocking task panicked");
         drop(cancellation_guard);
         result
+    }
+
+    async fn acquire_item_publication_guard(&self, item_id: &str) -> OwnedRwLockReadGuard<()> {
+        self.item_mutation_lock(item_id).read_owned().await
+    }
+
+    async fn acquire_item_deletion_guard(&self, item_id: &str) -> OwnedRwLockWriteGuard<()> {
+        self.item_mutation_lock(item_id).write_owned().await
+    }
+
+    fn item_mutation_lock(&self, item_id: &str) -> Arc<RwLock<()>> {
+        {
+            let mut locks = self
+                .item_mutation_locks
+                .lock()
+                .expect("library item mutation lock map poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(item_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(RwLock::new(()));
+                locks.insert(item_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     fn list_items_page_blocking(
@@ -403,6 +466,46 @@ impl LocalMediaLibrary {
         }))
     }
 
+    fn canonical_deletable_item_id_blocking(
+        &self,
+        item_id: &str,
+    ) -> io::Result<Option<(String, String)>> {
+        let root_path = self.root_path();
+        ensure_deletable_root(&root_path)?;
+        let Some(relative_path) = decode_item_id(item_id) else {
+            return Ok(None);
+        };
+        let relative_path = relative_path.components().collect::<PathBuf>();
+        if relative_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let full_candidate_path = absolute_path(&root_path.join(&relative_path));
+        if !is_within_root(&root_path, &full_candidate_path)
+            || is_internal_cache_components(relative_path.components())
+            || !self
+                .allowed_extensions()
+                .contains(&extension_with_dot(&full_candidate_path))
+        {
+            return Ok(None);
+        }
+        // Existing parents must preserve directory-only, no-follow access policy. Missing
+        // descendants are allowed so durable task references can still be tombstoned after an
+        // out-of-process removal; the later unlink path performs its own no-follow validation.
+        if existing_relative_parent_has_unsafe_component(&root_path, &relative_path)? {
+            return Ok(None);
+        }
+        let relative_path = relative_path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library item id is not valid UTF-8",
+            )
+        })?;
+        Ok(Some((
+            create_item_id(relative_path),
+            relative_path.to_owned(),
+        )))
+    }
+
     fn try_create_library_item(&self, root_path: &Path, path: &Path) -> Option<LibraryItem> {
         let media_file = self.try_create_media_file(root_path, path)?;
         Some(self.create_library_item(&media_file))
@@ -507,6 +610,38 @@ impl LocalMediaLibrary {
                 }
             })
             .collect()
+    }
+}
+
+/// Keeps API-owned deletion from invalidating a canonical library item during publication.
+/// The lease protects logical availability, not content or filesystem object identity against
+/// out-of-process replacement; serving still uses the existing no-follow validation.
+pub struct LibraryItemPublicationLease {
+    pub item_id: String,
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+pub struct LibraryItemDeletion {
+    library: LocalMediaLibrary,
+    item_id: String,
+    relative_path: String,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+impl LibraryItemDeletion {
+    pub fn item_id(&self) -> &str {
+        &self.item_id
+    }
+
+    pub(crate) fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub async fn delete(self) -> io::Result<bool> {
+        let item_id = self.item_id.clone();
+        self.library
+            .run_blocking(move |library, _| library.delete_item_blocking(&item_id))
+            .await
     }
 }
 
@@ -828,6 +963,32 @@ fn path_contains_link(root_path: &Path, candidate_path: &Path) -> bool {
     false
 }
 
+fn existing_relative_parent_has_unsafe_component(
+    root_path: &Path,
+    relative_path: &Path,
+) -> io::Result<bool> {
+    let Some(parent) = relative_path.parent() else {
+        return Ok(false);
+    };
+    let mut current = root_path.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return Ok(true);
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 fn path_has_link_component(path: &Path) -> bool {
     let full_path = absolute_path(path);
     let mut current_path = PathBuf::new();
@@ -1147,6 +1308,365 @@ pub(crate) fn remove_empty_directory_no_follow(
 }
 
 #[cfg(unix)]
+pub(crate) fn create_directory_exclusive_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<()> {
+    create_directory_path_no_follow(root_path, relative_path, true)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_directory_exclusive_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory creation is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_directory_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+    create_directory_path_no_follow(root_path, relative_path, false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_directory_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory creation is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn create_directory_path_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+    leaf_must_be_new: bool,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    for (index, segment) in segments.iter().enumerate() {
+        let is_leaf = index + 1 == segments.len();
+        // SAFETY: directory is a live directory descriptor and segment is NUL-terminated.
+        let created = unsafe { libc::mkdirat(directory.as_raw_fd(), segment.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists || (is_leaf && leaf_must_be_new) {
+                return Err(error);
+            }
+        }
+        let child = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )?;
+        if created == 0 {
+            child.sync_all()?;
+            directory.sync_all()?;
+        }
+        directory = child;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn rename_directory_no_replace_no_follow(
+    root_path: &Path,
+    source_relative_path: &str,
+    destination_relative_path: &str,
+) -> io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    let (source_parent, source_leaf) =
+        open_relative_parent_no_follow(root_path, source_relative_path)?;
+    let (destination_parent, destination_leaf) =
+        open_relative_parent_no_follow(root_path, destination_relative_path)?;
+    let source_directory = open_at(
+        source_parent.as_raw_fd(),
+        &source_leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let source_metadata = source_directory.metadata()?;
+
+    rename_at_no_replace(
+        source_parent.as_raw_fd(),
+        &source_leaf,
+        destination_parent.as_raw_fd(),
+        &destination_leaf,
+    )?;
+
+    let destination_directory = open_at(
+        destination_parent.as_raw_fd(),
+        &destination_leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let destination_metadata = destination_directory.metadata()?;
+    if source_metadata.dev() != destination_metadata.dev()
+        || source_metadata.ino() != destination_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "renamed directory identity changed during publication",
+        ));
+    }
+
+    destination_directory.sync_all()?;
+    source_parent.sync_all()?;
+    destination_parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn rename_directory_no_replace_no_follow(
+    _root_path: &Path,
+    _source_relative_path: &str,
+    _destination_relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-replace directory rename is not implemented on this platform",
+    ))
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn rename_at_no_replace(
+    source_parent_fd: i32,
+    source_leaf: &CString,
+    destination_parent_fd: i32,
+    destination_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: both descriptors are live directories and both names are NUL-terminated.
+    let result = unsafe {
+        libc::renameatx_np(
+            source_parent_fd,
+            source_leaf.as_ptr(),
+            destination_parent_fd,
+            destination_leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn rename_at_no_replace(
+    source_parent_fd: i32,
+    source_leaf: &CString,
+    destination_parent_fd: i32,
+    destination_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: both descriptors are live directories and both names are NUL-terminated.
+    let result = unsafe {
+        libc::renameat2(
+            source_parent_fd,
+            source_leaf.as_ptr(),
+            destination_parent_fd,
+            destination_leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux"))))]
+fn rename_at_no_replace(
+    _source_parent_fd: i32,
+    _source_leaf: &CString,
+    _destination_parent_fd: i32,
+    _destination_leaf: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory rename is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_directory_tree_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    if max_entries == 0 || max_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory cleanup bounds must be positive",
+        ));
+    }
+    let (parent, leaf) = open_relative_parent_no_follow(root_path, relative_path)?;
+    let directory = match open_at(
+        parent.as_raw_fd(),
+        &leaf,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut remaining_entries = max_entries;
+    remove_open_directory_contents_no_follow(&directory, &mut remaining_entries, max_depth)?;
+
+    // The intent owns this logical directory pathname and its descendants. Traversal never
+    // follows a symlink; object identity is not retained across calls because a replacement at
+    // the still-owned name must either be removed safely or make cleanup fail for retry.
+    // SAFETY: parent is live and leaf is NUL-terminated.
+    let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+    if removed == 0 {
+        parent.sync_all()?;
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_directory_tree_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+    _max_entries: usize,
+    _max_depth: usize,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure recursive directory cleanup is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_open_directory_contents_no_follow(
+    directory: &File,
+    remaining_entries: &mut usize,
+    remaining_depth: usize,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if remaining_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed directory depth limit exceeded",
+        ));
+    }
+    let dot = CString::new(".").expect("dot contains no NUL");
+    let listing = open_at(
+        directory.as_raw_fd(),
+        &dot,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let names = list_open_directory_names_bounded(listing, *remaining_entries)?;
+    for name in names {
+        *remaining_entries = remaining_entries.checked_sub(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory entry limit exceeded",
+            )
+        })?;
+        let name = CString::new(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed entry name contains NUL",
+            )
+        })?;
+        match open_at(
+            directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC,
+        ) {
+            Ok(child) => {
+                remove_open_directory_contents_no_follow(
+                    &child,
+                    remaining_entries,
+                    remaining_depth - 1,
+                )?;
+                // SAFETY: directory is live and name is NUL-terminated.
+                let removed = unsafe {
+                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                };
+                if removed != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOTDIR)
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                if error.kind() == io::ErrorKind::NotFound {
+                    continue;
+                }
+                // SAFETY: directory is live and name is NUL-terminated. unlinkat without
+                // AT_REMOVEDIR removes the named non-directory or symlink without following it.
+                let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+                if removed != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    directory.sync_all()
+}
+
+#[cfg(unix)]
+fn open_relative_parent_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<(File, CString)> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        directory = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )?;
+    }
+    Ok((
+        directory,
+        segments.last().expect("segments is not empty").clone(),
+    ))
+}
+
+#[cfg(unix)]
 fn relative_path_segments(relative_path: &str) -> io::Result<Vec<CString>> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1265,6 +1785,65 @@ mod tests {
         assert!(decode_item_id(&create_item_id("../escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("/escape.mp4")).is_none());
         assert!(decode_item_id(&create_item_id("./escape.mp4")).is_none());
+    }
+
+    #[test]
+    fn deletion_lock_keys_canonicalize_equivalent_item_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(root_path.join("Movies")).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            ..CacheServerOptions::default()
+        }));
+        let canonical = create_item_id("Movies/Sample.mp4");
+        let alias = create_item_id("Movies//Sample.mp4");
+
+        assert_ne!(canonical, alias);
+        assert_eq!(
+            Some((canonical.clone(), "Movies/Sample.mp4".to_owned())),
+            library
+                .canonical_deletable_item_id_blocking(&alias)
+                .expect("equivalent item path should validate")
+        );
+        fs::remove_dir_all(root_path.join("Movies"))
+            .expect("external directory removal should succeed");
+        assert_eq!(
+            Some((canonical, "Movies/Sample.mp4".to_owned())),
+            library
+                .canonical_deletable_item_id_blocking(&alias)
+                .expect("missing parent should still identify the logical item")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_lock_keys_reject_an_existing_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let outside_path = temp.path().join("outside");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        fs::create_dir_all(&outside_path).expect("outside directory should be created");
+        symlink(&outside_path, root_path.join("Movies")).expect("symlink should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+
+        assert_eq!(
+            None,
+            library
+                .canonical_deletable_item_id_blocking(&create_item_id("Movies/Sample.mp4"))
+                .expect("symlink parent should be rejected")
+        );
     }
 
     #[test]
@@ -1475,6 +2054,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn publication_lease_blocks_deletion_until_the_artifact_is_committed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_path = root_path.join("leased.mp4");
+        fs::write(&media_path, b"leased media").expect("media should be written");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+        let lease = library
+            .reserve_media_path_for_publication(media_path.clone())
+            .await
+            .expect("media should be reservable for publication");
+        let second_lease = library
+            .reserve_media_path_for_publication(media_path.clone())
+            .await
+            .expect("the same media should allow concurrent publication leases");
+        let item_id = lease.item_id.clone();
+        let deleting_library = library.clone();
+        let deletion = tokio::spawn(async move { deleting_library.delete_item(&item_id).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !deletion.is_finished(),
+            "deletion must wait for the publication lease"
+        );
+        drop(lease);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !deletion.is_finished(),
+            "deletion must wait for every publication lease"
+        );
+        drop(second_lease);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), deletion)
+                .await
+                .expect("deletion should finish after publication")
+                .expect("deletion task should not panic")
+                .expect("deletion should succeed")
+        );
+        assert!(!media_path.exists());
+    }
+
     #[test]
     fn delete_item_errors_when_cache_root_disappears() {
         let temp = tempfile::tempdir().unwrap();
@@ -1663,6 +2290,126 @@ mod tests {
                 .expect_err("non-normal directory path should be rejected");
             assert_eq!(io::ErrorKind::InvalidInput, error.kind());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_output_directory_creation_and_no_replace_rename_are_contained() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        ensure_directory_no_follow(&root_path, "Bilibili").unwrap();
+        create_directory_exclusive_no_follow(&root_path, ".tvos-net-player/bbdown-staging/task-1")
+            .unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/bbdown-staging/task-1/video.mp4"),
+            b"video",
+        )
+        .unwrap();
+
+        rename_directory_no_replace_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            "Bilibili/task-1",
+        )
+        .unwrap();
+
+        assert!(
+            !root_path
+                .join(".tvos-net-player/bbdown-staging/task-1")
+                .exists()
+        );
+        assert_eq!(
+            b"video",
+            fs::read(root_path.join("Bilibili/task-1/video.mp4"))
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(
+            io::ErrorKind::AlreadyExists,
+            create_directory_exclusive_no_follow(&root_path, "Bilibili/task-1")
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_unlinks_children_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let owned = root_path.join(".tvos-net-player/bbdown-staging/task-1");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(owned.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(owned.join("nested/video.mp4"), b"video").unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside, owned.join("outside-link")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        assert!(
+            remove_directory_tree_no_follow(
+                &root_path,
+                ".tvos-net-player/bbdown-staging/task-1",
+                16,
+                8,
+            )
+            .unwrap()
+        );
+
+        assert!(!owned.exists());
+        assert_eq!(
+            b"keep",
+            fs::read(outside.join("keep.txt")).unwrap().as_slice()
+        );
+        assert!(
+            !remove_directory_tree_no_follow(
+                &root_path,
+                ".tvos-net-player/bbdown-staging/task-1",
+                16,
+                8,
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_refuses_a_symlinked_owned_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let staging_parent = root_path.join(".tvos-net-player/bbdown-staging");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&staging_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside, staging_parent.join("task-1")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        remove_directory_tree_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            16,
+            8,
+        )
+        .expect_err("a symlinked owned root is an access-policy change");
+
+        assert_eq!(
+            b"keep",
+            fs::read(outside.join("keep.txt")).unwrap().as_slice()
+        );
+        assert!(
+            fs::symlink_metadata(staging_parent.join("task-1"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

@@ -239,6 +239,10 @@ public struct CacheServerSummary: Equatable, Sendable {
         capabilities.contains(CacheServerCapability.bilibiliResolutionV2)
     }
 
+    public var supportsBilibiliExecutionV2: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliExecutionV2)
+    }
+
     public var supportsBilibiliCredentialStatus: Bool {
         capabilities.contains(CacheServerCapability.bilibiliCredentialStatus)
     }
@@ -295,6 +299,7 @@ public enum CacheServerCapability {
     public static let bilibiliResolve = "bilibiliResolve"
     public static let bilibiliTaskSelection = "bilibiliTaskSelection"
     public static let bilibiliResolutionV2 = "bilibiliResolutionV2"
+    public static let bilibiliExecutionV2 = "bilibiliExecutionV2"
     public static let bilibiliPlaybackPolicy = "bilibiliPlaybackPolicy"
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
@@ -1015,6 +1020,61 @@ public struct BilibiliPlaybackTaskOptions: Equatable, Sendable {
     }
 }
 
+public enum BilibiliAPIMode: Equatable, Sendable {
+    case unspecified
+    case web
+    case tv
+    case app
+    case unknown(Int)
+}
+
+public struct BilibiliRequestContext: Equatable, Sendable {
+    public static let `default` = Self()
+
+    public let apiMode: BilibiliAPIMode
+    public let credentialProfileID: String
+
+    public init(
+        apiMode: BilibiliAPIMode = .unspecified,
+        credentialProfileID: String = ""
+    ) {
+        self.apiMode = apiMode
+        self.credentialProfileID = credentialProfileID
+    }
+
+    public var isDefault: Bool {
+        self == Self.default
+    }
+}
+
+public enum BilibiliVideoCodec: Equatable, Sendable {
+    case unspecified
+    case auto
+    case h264
+    case hevc
+    case av1
+    case unknown(Int)
+}
+
+public struct BilibiliPlaybackSpec: Equatable, Sendable {
+    public let qualityQN: UInt32
+    public let codec: BilibiliVideoCodec
+    public let audioLanguage: String
+    public let policy: BilibiliPlaybackPolicy
+
+    public init(
+        qualityQN: UInt32 = 0,
+        codec: BilibiliVideoCodec = .unspecified,
+        audioLanguage: String = "",
+        policy: BilibiliPlaybackPolicy = .default
+    ) {
+        self.qualityQN = qualityQN
+        self.codec = codec
+        self.audioLanguage = audioLanguage
+        self.policy = policy
+    }
+}
+
 public enum BilibiliSubtitleAIPolicy: String, CaseIterable, Equatable, Hashable, Sendable {
     case unspecified
     case include
@@ -1028,6 +1088,53 @@ public enum BilibiliDanmakuFormat: String, CaseIterable, Equatable, Hashable, Se
     case ass
 }
 
+public enum BilibiliDownloadMode: Equatable, Sendable {
+    case unspecified
+    case all
+    case videoOnly
+    case audioOnly
+    case subtitleOnly
+    case danmakuOnly
+    case coverOnly
+    case unknown(Int)
+}
+
+public struct BilibiliDownloadSpec: Equatable, Sendable {
+    public let qualityQN: UInt32
+    public let audioLanguage: String
+    public let mode: BilibiliDownloadMode
+    public let downloadSubtitles: Bool
+    public let subtitleAIPolicy: BilibiliSubtitleAIPolicy
+    public let downloadDanmaku: Bool
+    public let danmakuFormats: [BilibiliDanmakuFormat]
+    public let downloadCover: Bool
+
+    public init(
+        qualityQN: UInt32 = 0,
+        audioLanguage: String = "",
+        mode: BilibiliDownloadMode = .unspecified,
+        downloadSubtitles: Bool = false,
+        subtitleAIPolicy: BilibiliSubtitleAIPolicy = .unspecified,
+        downloadDanmaku: Bool = false,
+        danmakuFormats: [BilibiliDanmakuFormat] = [],
+        downloadCover: Bool = false
+    ) {
+        self.qualityQN = qualityQN
+        self.audioLanguage = audioLanguage
+        self.mode = mode
+        self.downloadSubtitles = downloadSubtitles
+        self.subtitleAIPolicy = subtitleAIPolicy
+        self.downloadDanmaku = downloadDanmaku
+        self.danmakuFormats = danmakuFormats
+        self.downloadCover = downloadCover
+    }
+}
+
+public enum BilibiliTaskExecution: Equatable, Sendable {
+    case playback(BilibiliPlaybackSpec)
+    case download(BilibiliDownloadSpec)
+}
+
 public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
     public let qualityPreference: String
     public let encodingPreference: String
@@ -1038,6 +1145,7 @@ public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
     public let downloadCover: Bool
     public let subtitleAIPolicy: BilibiliSubtitleAIPolicy
     public let danmakuFormats: [BilibiliDanmakuFormat]
+    public let downloadMode: BilibiliDownloadMode
 
     public init(
         qualityPreference: String = "",
@@ -1048,7 +1156,8 @@ public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
         downloadDanmaku: Bool = false,
         downloadCover: Bool = false,
         subtitleAIPolicy: BilibiliSubtitleAIPolicy = .unspecified,
-        danmakuFormats: [BilibiliDanmakuFormat] = []
+        danmakuFormats: [BilibiliDanmakuFormat] = [],
+        downloadMode: BilibiliDownloadMode = .unspecified
     ) {
         self.qualityPreference = qualityPreference
         self.encodingPreference = encodingPreference
@@ -1059,6 +1168,7 @@ public struct BilibiliDownloadTaskOptions: Equatable, Sendable {
         self.downloadCover = downloadCover
         self.subtitleAIPolicy = subtitleAIPolicy
         self.danmakuFormats = danmakuFormats
+        self.downloadMode = downloadMode
     }
 }
 
@@ -1179,6 +1289,7 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
     public let createdAt: Date?
     public let expiresAt: Date?
     public let defaultCandidateToken: String
+    public let context: BilibiliRequestContext
 
     public init(
         id: String,
@@ -1187,7 +1298,8 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
         sourceKind: String,
         createdAt: Date?,
         expiresAt: Date?,
-        defaultCandidateToken: String
+        defaultCandidateToken: String,
+        context: BilibiliRequestContext = .default
     ) {
         self.id = id
         self.source = source
@@ -1196,6 +1308,7 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
         self.createdAt = createdAt
         self.expiresAt = expiresAt
         self.defaultCandidateToken = defaultCandidateToken
+        self.context = context
     }
 }
 
@@ -1289,6 +1402,7 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
     public let libraryItemID: String
     public let playbackSource: CachePlaybackSource?
     public let playbackSession: CacheBilibiliPlaybackSession?
+    public let identity: BilibiliContentIdentity?
 
     public init(
         id: String,
@@ -1302,7 +1416,8 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
         message: String,
         libraryItemID: String,
         playbackSource: CachePlaybackSource? = nil,
-        playbackSession: CacheBilibiliPlaybackSession? = nil
+        playbackSession: CacheBilibiliPlaybackSession? = nil,
+        identity: BilibiliContentIdentity? = nil
     ) {
         self.id = id
         self.selectionID = selectionID
@@ -1316,6 +1431,7 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
         self.libraryItemID = libraryItemID
         self.playbackSource = playbackSource
         self.playbackSession = playbackSession
+        self.identity = identity
     }
 }
 
@@ -1420,6 +1536,37 @@ public struct CacheResourceReference: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct CacheTaskResultSubject: Equatable, Sendable {
+    public let provider: String
+    public let kind: String
+    public let id: String
+    public let index: UInt32
+
+    public init(provider: String, kind: String, id: String, index: UInt32) {
+        self.provider = provider
+        self.kind = kind
+        self.id = id
+        self.index = index
+    }
+}
+
+public struct BilibiliTaskResultDetails: Equatable, Sendable {
+    public let identity: BilibiliContentIdentity?
+    public let playbackSession: CacheBilibiliPlaybackSession?
+
+    public init(
+        identity: BilibiliContentIdentity?,
+        playbackSession: CacheBilibiliPlaybackSession?
+    ) {
+        self.identity = identity
+        self.playbackSession = playbackSession
+    }
+}
+
+public enum CacheTaskResultProviderDetails: Equatable, Sendable {
+    case bilibili(BilibiliTaskResultDetails)
+}
+
 public struct CacheTaskArtifact: Identifiable, Equatable, Sendable {
     public let id: String
     public let kind: String
@@ -1430,6 +1577,7 @@ public struct CacheTaskArtifact: Identifiable, Equatable, Sendable {
     public let isAIGenerated: Bool
     public let resource: CacheResourceReference?
     public let problem: CacheTaskProblem?
+    public let libraryItemID: String
 
     public init(
         id: String,
@@ -1440,7 +1588,8 @@ public struct CacheTaskArtifact: Identifiable, Equatable, Sendable {
         languageTag: String,
         isAIGenerated: Bool,
         resource: CacheResourceReference?,
-        problem: CacheTaskProblem?
+        problem: CacheTaskProblem?,
+        libraryItemID: String = ""
     ) {
         self.id = id
         self.kind = kind
@@ -1451,6 +1600,7 @@ public struct CacheTaskArtifact: Identifiable, Equatable, Sendable {
         self.isAIGenerated = isAIGenerated
         self.resource = resource
         self.problem = problem
+        self.libraryItemID = libraryItemID
     }
 }
 
@@ -1466,6 +1616,8 @@ public struct CacheTaskResult: Identifiable, Equatable, Sendable {
     public let artifacts: [CacheTaskArtifact]
     public let createdAt: Date?
     public let updatedAt: Date?
+    public let subject: CacheTaskResultSubject?
+    public let providerDetails: CacheTaskResultProviderDetails?
 
     public init(
         id: String,
@@ -1478,7 +1630,9 @@ public struct CacheTaskResult: Identifiable, Equatable, Sendable {
         playbackSource: CachePlaybackSource?,
         artifacts: [CacheTaskArtifact],
         createdAt: Date?,
-        updatedAt: Date?
+        updatedAt: Date?,
+        subject: CacheTaskResultSubject? = nil,
+        providerDetails: CacheTaskResultProviderDetails? = nil
     ) {
         self.id = id
         self.state = state
@@ -1491,6 +1645,8 @@ public struct CacheTaskResult: Identifiable, Equatable, Sendable {
         self.artifacts = artifacts
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.subject = subject
+        self.providerDetails = providerDetails
     }
 }
 

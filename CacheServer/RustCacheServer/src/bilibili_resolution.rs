@@ -15,7 +15,9 @@ use crate::{
         MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
     },
     generated::tvos_net_player::v1::{
-        BilibiliPlaybackOptions, BilibiliResolutionSelection, BilibiliResolutionSelectionMode,
+        BilibiliContentIdentity as ProtoBilibiliContentIdentity,
+        BilibiliContentKind as ProtoBilibiliContentKind, BilibiliPlaybackOptions,
+        BilibiliRequestContext, BilibiliResolutionSelection, BilibiliResolutionSelectionMode,
     },
 };
 
@@ -47,6 +49,7 @@ pub(crate) struct BilibiliResolutionSessionView {
     pub(crate) created_at: SystemTime,
     pub(crate) expires_at: SystemTime,
     pub(crate) default_candidate_token: String,
+    pub(crate) request_context: Option<BilibiliRequestContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,10 +66,11 @@ pub(crate) struct AcceptedBilibiliResolution {
     pub(crate) source: String,
     pub(crate) title: String,
     pub(crate) options: Option<BilibiliPlaybackOptions>,
+    pub(crate) request_context: Option<BilibiliRequestContext>,
     pub(crate) candidates: Vec<BilibiliResolvedCandidate>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct BilibiliTaskCandidateRecord {
     pub(crate) selection_id: String,
     pub(crate) title: String,
@@ -76,6 +80,28 @@ pub(crate) struct BilibiliTaskCandidateRecord {
     pub(crate) identity: BilibiliContentIdentity,
     pub(crate) index: u32,
     pub(crate) duration_seconds: Option<u32>,
+}
+
+impl BilibiliTaskCandidateRecord {
+    pub(crate) fn proto_identity(&self) -> ProtoBilibiliContentIdentity {
+        ProtoBilibiliContentIdentity {
+            kind: match self.identity.kind {
+                crate::bilibili_playback::BilibiliContentKind::VideoPage => {
+                    ProtoBilibiliContentKind::VideoPage.into()
+                }
+                crate::bilibili_playback::BilibiliContentKind::SeasonEpisode => {
+                    ProtoBilibiliContentKind::SeasonEpisode.into()
+                }
+                crate::bilibili_playback::BilibiliContentKind::CollectionItem => {
+                    ProtoBilibiliContentKind::CollectionItem.into()
+                }
+            },
+            aid: self.identity.aid.unwrap_or_default(),
+            bvid: self.identity.bvid.clone().unwrap_or_default(),
+            cid: self.identity.cid.unwrap_or_default(),
+            epid: self.identity.epid.unwrap_or_default(),
+        }
+    }
 }
 
 impl From<&BilibiliResolvedCandidate> for BilibiliTaskCandidateRecord {
@@ -139,13 +165,14 @@ impl BilibiliResolutionStore {
         &mut self,
         resolution: BilibiliInputResolution,
         options: Option<BilibiliPlaybackOptions>,
+        request_context: Option<BilibiliRequestContext>,
         now: Instant,
         wall_clock_now: SystemTime,
         page_size: usize,
     ) -> Result<BilibiliResolutionPageView, Status> {
         self.prune(now);
         validate_page_size(page_size)?;
-        validate_resolution(&resolution, options.as_ref())?;
+        validate_resolution(&resolution, options.as_ref(), request_context.as_ref())?;
 
         let session_id = format!("bilibili-resolution-{}", Uuid::new_v4().simple());
         let snapshot_id = format!("bilibili-resolution-snapshot-{}", Uuid::new_v4().simple());
@@ -191,9 +218,15 @@ impl BilibiliResolutionStore {
             created_at: wall_clock_now,
             expires_at: wall_clock_expires_at,
             default_candidate_token,
+            request_context: request_context.clone(),
         };
-        let estimated_bytes =
-            estimate_session_bytes(&view, &snapshot_id, options.as_ref(), &candidates)?;
+        let estimated_bytes = estimate_session_bytes(
+            &view,
+            &snapshot_id,
+            options.as_ref(),
+            request_context.as_ref(),
+            &candidates,
+        )?;
 
         if estimated_bytes > MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES {
             return Err(Status::resource_exhausted(
@@ -296,6 +329,7 @@ impl BilibiliResolutionStore {
             source: snapshot.view.source.clone(),
             title: snapshot.view.title.clone(),
             options: snapshot.options.clone(),
+            request_context: snapshot.view.request_context.clone(),
             candidates,
         })
     }
@@ -386,6 +420,7 @@ impl BilibiliResolutionStore {
 fn validate_resolution(
     resolution: &BilibiliInputResolution,
     options: Option<&BilibiliPlaybackOptions>,
+    request_context: Option<&BilibiliRequestContext>,
 ) -> Result<(), Status> {
     if resolution.candidates_truncated
         || resolution.candidates.len() > MAX_BILIBILI_RESOLUTION_CANDIDATES
@@ -410,6 +445,17 @@ fn validate_resolution(
         return Err(Status::resource_exhausted(
             "Bilibili playback options exceed the resolution-session limit.",
         ));
+    }
+    if let Some(request_context) = request_context {
+        validate_string(
+            "Bilibili credential profile id",
+            &request_context.credential_profile_id,
+        )?;
+        if request_context.encoded_len() > MAX_BILIBILI_RESOLUTION_STRING_BYTES {
+            return Err(Status::resource_exhausted(
+                "Bilibili request context exceeds the resolution-session limit.",
+            ));
+        }
     }
     let mut selection_ids = HashSet::with_capacity(resolution.candidates.len());
     for candidate in &resolution.candidates {
@@ -486,6 +532,7 @@ fn estimate_session_bytes(
     view: &BilibiliResolutionSessionView,
     snapshot_id: &str,
     options: Option<&BilibiliPlaybackOptions>,
+    request_context: Option<&BilibiliRequestContext>,
     candidates: &[TokenizedBilibiliCandidate],
 ) -> Result<usize, Status> {
     let mut total = mem::size_of::<BilibiliResolutionSessionSnapshot>();
@@ -497,6 +544,7 @@ fn estimate_session_bytes(
         view.default_candidate_token.len(),
         snapshot_id.len(),
         options.map_or(0, Message::encoded_len),
+        request_context.map_or(0, Message::encoded_len),
         // The store owns an additional session-id key and queue entry.
         view.id.len(),
         view.id.len(),
@@ -765,6 +813,7 @@ mod tests {
             .create_session(
                 sample_resolution("BV1snapshot", 3),
                 None,
+                None,
                 now,
                 wall_clock_now,
                 2,
@@ -785,6 +834,7 @@ mod tests {
             .create_session(
                 sample_resolution("BV1other", 1),
                 None,
+                None,
                 now,
                 wall_clock_now,
                 1,
@@ -803,6 +853,7 @@ mod tests {
         let page = store
             .create_session(
                 sample_resolution("BV1select", 4),
+                None,
                 None,
                 now,
                 SystemTime::UNIX_EPOCH,
@@ -863,6 +914,7 @@ mod tests {
             .create_session(
                 sample_resolution("BV1expiry", 2),
                 None,
+                None,
                 now,
                 SystemTime::UNIX_EPOCH,
                 2,
@@ -902,7 +954,14 @@ mod tests {
         let mut resolution = sample_resolution("BV1truncated", 2);
         resolution.candidates_truncated = true;
         let error = BilibiliResolutionStore::default()
-            .create_session(resolution, None, Instant::now(), SystemTime::UNIX_EPOCH, 2)
+            .create_session(
+                resolution,
+                None,
+                None,
+                Instant::now(),
+                SystemTime::UNIX_EPOCH,
+                2,
+            )
             .expect_err("truncated input must fail closed");
         assert_eq!(tonic::Code::ResourceExhausted, error.code());
     }
@@ -915,6 +974,7 @@ mod tests {
             .create_session(
                 sample_resolution("BV1first", 1),
                 None,
+                None,
                 now,
                 SystemTime::UNIX_EPOCH,
                 1,
@@ -923,6 +983,7 @@ mod tests {
         let second = store
             .create_session(
                 sample_resolution("BV1second", 1),
+                None,
                 None,
                 now,
                 SystemTime::UNIX_EPOCH,
@@ -952,6 +1013,7 @@ mod tests {
         let page = store
             .create_session(
                 sample_resolution("BV1invalid-selection", 3),
+                None,
                 None,
                 now,
                 SystemTime::UNIX_EPOCH,
@@ -1017,6 +1079,7 @@ mod tests {
                     u32::try_from(candidate_count).expect("the execution bound should fit in u32"),
                 ),
                 None,
+                None,
                 now,
                 SystemTime::UNIX_EPOCH,
                 candidate_count,
@@ -1061,6 +1124,7 @@ mod tests {
             .create_session(
                 sample_resolution("BV1oldest", 1),
                 None,
+                None,
                 now,
                 SystemTime::UNIX_EPOCH,
                 1,
@@ -1071,6 +1135,7 @@ mod tests {
                 .create_session(
                     sample_resolution(&format!("BV1capacity{index}"), 1),
                     None,
+                    None,
                     now,
                     SystemTime::UNIX_EPOCH,
                     1,
@@ -1080,6 +1145,7 @@ mod tests {
         let newest = store
             .create_session(
                 sample_resolution("BV1newest", 1),
+                None,
                 None,
                 now,
                 SystemTime::UNIX_EPOCH,
@@ -1099,14 +1165,28 @@ mod tests {
         let mut incomplete = sample_resolution("BV1incomplete", 1);
         incomplete.candidates[0].identity.cid = None;
         let error = BilibiliResolutionStore::default()
-            .create_session(incomplete, None, Instant::now(), SystemTime::UNIX_EPOCH, 1)
+            .create_session(
+                incomplete,
+                None,
+                None,
+                Instant::now(),
+                SystemTime::UNIX_EPOCH,
+                1,
+            )
             .expect_err("incomplete stable identity must fail before publication");
         assert_eq!(tonic::Code::FailedPrecondition, error.code());
 
         let mut mismatched = sample_resolution("BV1mismatched", 1);
         mismatched.candidates[0].identity.cid = Some(9_999);
         let error = BilibiliResolutionStore::default()
-            .create_session(mismatched, None, Instant::now(), SystemTime::UNIX_EPOCH, 1)
+            .create_session(
+                mismatched,
+                None,
+                None,
+                Instant::now(),
+                SystemTime::UNIX_EPOCH,
+                1,
+            )
             .expect_err("typed identity must match the candidate content id");
         assert_eq!(tonic::Code::FailedPrecondition, error.code());
 
@@ -1115,6 +1195,7 @@ mod tests {
         let error = BilibiliResolutionStore::default()
             .create_session(
                 unknown_default,
+                None,
                 None,
                 Instant::now(),
                 SystemTime::UNIX_EPOCH,
@@ -1132,7 +1213,7 @@ mod tests {
             "https://provider.invalid/private-cover?credential=must-not-retain".to_owned();
         let mut store = BilibiliResolutionStore::default();
         let page = store
-            .create_session(resolution, None, now, SystemTime::UNIX_EPOCH, 1)
+            .create_session(resolution, None, None, now, SystemTime::UNIX_EPOCH, 1)
             .expect("resolution should be created");
         assert_eq!(
             0,
@@ -1158,6 +1239,71 @@ mod tests {
             .expect("selection should be accepted");
 
         assert!(accepted.candidates[0].cover_uri.is_empty());
+    }
+
+    #[test]
+    fn request_context_is_an_immutable_bounded_part_of_the_resolution_snapshot() {
+        let now = Instant::now();
+        let context = BilibiliRequestContext {
+            api_mode: crate::generated::tvos_net_player::v1::BilibiliApiMode::Web.into(),
+            credential_profile_id: "living-room".to_owned(),
+        };
+        let mut store = BilibiliResolutionStore::default();
+        let page = store
+            .create_session(
+                sample_resolution("BV1context", 1),
+                None,
+                Some(context.clone()),
+                now,
+                SystemTime::UNIX_EPOCH,
+                1,
+            )
+            .expect("request context should be retained with the snapshot");
+
+        assert_eq!(Some(context.clone()), page.session.request_context);
+        let accepted = store
+            .accept_selection(
+                &page.session.id,
+                &BilibiliResolutionSelection {
+                    mode: BilibiliResolutionSelectionMode::All.into(),
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("accepted values should copy the immutable context");
+        assert_eq!(Some(context), accepted.request_context);
+
+        let oversized = BilibiliRequestContext {
+            credential_profile_id: "x".repeat(MAX_BILIBILI_RESOLUTION_STRING_BYTES + 1),
+            ..Default::default()
+        };
+        let error = store
+            .create_session(
+                sample_resolution("BV1oversized-context", 1),
+                None,
+                Some(oversized),
+                now,
+                SystemTime::UNIX_EPOCH,
+                1,
+            )
+            .expect_err("oversized request context must fail before publication");
+        assert_eq!(tonic::Code::ResourceExhausted, error.code());
+    }
+
+    #[test]
+    fn task_candidate_projects_its_stable_typed_identity() {
+        let record = BilibiliTaskCandidateRecord::from(&sample_candidate(1));
+
+        assert_eq!(
+            ProtoBilibiliContentIdentity {
+                kind: ProtoBilibiliContentKind::VideoPage.into(),
+                aid: 2_001,
+                bvid: "BV1snapshot".to_owned(),
+                cid: 1_001,
+                epid: 0,
+            },
+            record.proto_identity()
+        );
     }
 
     fn sample_resolution(source: &str, count: u32) -> BilibiliInputResolution {

@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::generated::tvos_net_player::v1::{
-    CacheResourceRef, Task, TaskArtifactKind, TaskArtifactState, TaskOutputSummary, TaskProblem,
-    TaskProblemCategory, TaskResult, TaskResultProgress, TaskState,
+    BilibiliContentIdentity, BilibiliContentKind, BilibiliPlaybackSession, BilibiliPlaybackVariant,
+    BilibiliTaskResultDetails, CacheResourceRef, Task, TaskArtifactKind, TaskArtifactState,
+    TaskOutputSummary, TaskProblem, TaskProblemCategory, TaskResult, TaskResultProgress,
+    TaskResultProviderDetails, TaskResultSubject, TaskState, task_result_provider_details,
 };
 use http::HeaderValue;
 use prost::Message;
@@ -22,6 +24,7 @@ const MAX_TASK_CLIENT_REDACTION_OVERHEAD_BYTES: usize = 16;
 const MAX_TASK_RESOURCE_ENCODED_BYTES: usize = 64 * 1024;
 const MAX_TASK_OUTPUT_STRING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_OUTPUT_ENCODED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TASK_RESULT_PROVIDER_VARIANTS: usize = 10_000;
 const INTERNAL_RESOURCE_DIR: &str = ".tvos-net-player/resources";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,8 +99,17 @@ impl TaskOutputRecord {
 
     pub(crate) fn replace(
         previous: Option<&Self>,
+        results: Vec<TaskResult>,
+        resources: Vec<TaskResourceRecord>,
+    ) -> Result<Self, TaskOutputValidationError> {
+        Self::replace_with_primary_result(previous, results, resources, None)
+    }
+
+    pub(crate) fn replace_with_primary_result(
+        previous: Option<&Self>,
         mut results: Vec<TaskResult>,
         resources: Vec<TaskResourceRecord>,
+        preferred_primary_result_id: Option<&str>,
     ) -> Result<Self, TaskOutputValidationError> {
         validate_collection_sizes(&results, &resources)?;
         validate_and_bind_resources(&mut results, &resources)?;
@@ -105,9 +117,41 @@ impl TaskOutputRecord {
         validate_result_ids(&results)?;
         validate_resource_representations(previous, &resources)?;
 
+        let primary_result_id = match preferred_primary_result_id {
+            Some(primary_result_id)
+                if results.iter().any(|result| result.id == primary_result_id) =>
+            {
+                primary_result_id.to_owned()
+            }
+            Some(_) => {
+                return Err(TaskOutputValidationError::new(
+                    "preferred task output primary result is missing",
+                ));
+            }
+            None => {
+                let has_successful_result = results.iter().any(|result| {
+                    matches!(result.state(), TaskState::Succeeded | TaskState::Completed)
+                });
+                previous
+                    .map(|output| output.primary_result_id.as_str())
+                    .filter(|primary_result_id| {
+                        results.iter().any(|result| {
+                            result.id.as_str() == *primary_result_id
+                                && (!has_successful_result
+                                    || matches!(
+                                        result.state(),
+                                        TaskState::Succeeded | TaskState::Completed
+                                    ))
+                        })
+                    })
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| inferred_primary_result_id(&results))
+            }
+        };
         let unchanged = previous.is_some_and(|previous| {
             previous.results == results
                 && previous.resources == resources
+                && previous.primary_result_id == primary_result_id
                 && !previous.legacy_managed
         });
         let revision = match previous {
@@ -115,15 +159,6 @@ impl TaskOutputRecord {
             Some(previous) => previous.revision.saturating_add(1).max(1),
             None => 1,
         };
-        let primary_result_id = previous
-            .map(|output| output.primary_result_id.as_str())
-            .filter(|primary_result_id| {
-                results
-                    .iter()
-                    .any(|result| result.id.as_str() == *primary_result_id)
-            })
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| inferred_primary_result_id(&results));
         Ok(Self {
             revision,
             snapshot_id: if unchanged {
@@ -365,6 +400,7 @@ impl TaskOutputRecord {
                 }
                 artifact.state = TaskArtifactState::Deleted.into();
                 artifact.resource = None;
+                artifact.library_item_id.clear();
                 artifact.problem = Some(TaskProblem {
                     category: TaskProblemCategory::NotFound.into(),
                     code: "cache.resource_deleted".to_owned(),
@@ -408,6 +444,94 @@ impl TaskOutputRecord {
         updated.snapshot_id = new_snapshot_id();
         *self = updated;
         Ok(retired_ids)
+    }
+
+    pub(crate) fn mark_library_item_deleted(
+        &mut self,
+        library_item_id: &str,
+        message: &str,
+    ) -> Result<Option<Vec<String>>, TaskOutputValidationError> {
+        if self.legacy_managed {
+            return Ok(None);
+        }
+        let mut updated = self.clone();
+        let mut changed = false;
+        for result in &mut updated.results {
+            let result_matches = result.library_item_id == library_item_id
+                || result
+                    .playback_source
+                    .as_ref()
+                    .is_some_and(|source| source.item_id == library_item_id);
+            let mut artifact_matches = false;
+            for artifact in &mut result.artifacts {
+                if artifact.library_item_id != library_item_id {
+                    continue;
+                }
+                artifact_matches = true;
+                artifact.state = TaskArtifactState::Deleted.into();
+                artifact.resource = None;
+                artifact.library_item_id.clear();
+                artifact.problem = Some(TaskProblem {
+                    category: TaskProblemCategory::NotFound.into(),
+                    code: "cache.library_item_deleted".to_owned(),
+                    message: message.to_owned(),
+                    retryable: false,
+                });
+            }
+            if !result_matches && !artifact_matches {
+                continue;
+            }
+            result.state = TaskState::Failed.into();
+            if result.library_item_id == library_item_id {
+                result.library_item_id.clear();
+            }
+            if result
+                .playback_source
+                .as_ref()
+                .is_some_and(|source| source.item_id == library_item_id)
+            {
+                result.playback_source = None;
+            }
+            result.problem = Some(TaskProblem {
+                category: TaskProblemCategory::NotFound.into(),
+                code: "cache.library_item_deleted".to_owned(),
+                message: message.to_owned(),
+                retryable: false,
+            });
+            if let Some(progress) = result.progress.as_mut() {
+                progress.phase = "deleted".to_owned();
+                progress.message = message.to_owned();
+            }
+            changed = true;
+        }
+        if !changed {
+            return Ok(None);
+        }
+
+        let referenced_ids = updated
+            .results
+            .iter()
+            .flat_map(|result| &result.artifacts)
+            .filter_map(|artifact| artifact.resource.as_ref())
+            .map(|resource| resource.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut retired_ids = Vec::new();
+        updated.resources.retain(|resource| {
+            let retained = referenced_ids.contains(resource.resource.id.as_str());
+            if !retained {
+                retired_ids.push(resource.resource.id.clone());
+            }
+            retained
+        });
+        updated.primary_result_id = inferred_primary_result_id(&updated.results);
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_and_bind_resources(&mut updated.results, &updated.resources)?;
+        validate_collection_sizes(&updated.results, &updated.resources)?;
+        validate_result_ids(&updated.results)?;
+        updated.revision = updated.revision.saturating_add(1).max(1);
+        updated.snapshot_id = new_snapshot_id();
+        *self = updated;
+        Ok(Some(retired_ids))
     }
 }
 
@@ -457,30 +581,56 @@ pub(crate) fn legacy_task_results(task: &Task) -> Vec<TaskResult> {
             artifacts: Vec::new(),
             created_at: task.created_at,
             updated_at: task.updated_at,
+            subject: None,
+            provider_details: None,
         }];
     }
 
     task.result_items
         .iter()
-        .map(|item| TaskResult {
-            id: item.id.clone(),
-            state: item.state,
-            title: item.title.clone(),
-            subtitle: item.subtitle.clone(),
-            progress: Some(TaskResultProgress {
-                fraction: terminal_progress(item.state()),
-                completed_bytes: 0,
-                total_bytes: 0,
-                total_bytes_known: false,
-                phase: String::new(),
-                message: String::new(),
-            }),
-            problem: legacy_problem(item.state()),
-            library_item_id: item.library_item_id.clone(),
-            playback_source: item.playback_source.clone(),
-            artifacts: Vec::new(),
-            created_at: task.created_at,
-            updated_at: task.updated_at,
+        .map(|item| {
+            let subject = (!item.source_kind.trim().is_empty()
+                && item.source_kind == item.source_kind.trim()
+                && !item.content_id.trim().is_empty()
+                && item.content_id == item.content_id.trim())
+            .then(|| TaskResultSubject {
+                provider: "bilibili".to_owned(),
+                kind: item.source_kind.clone(),
+                id: item.content_id.clone(),
+                index: item.index,
+            });
+            let provider_details = (subject.is_some()
+                && (item.identity.is_some() || item.playback_session.is_some()))
+            .then(|| TaskResultProviderDetails {
+                details: Some(task_result_provider_details::Details::Bilibili(
+                    BilibiliTaskResultDetails {
+                        identity: item.identity.clone(),
+                        playback_session: item.playback_session.clone(),
+                    },
+                )),
+            });
+            TaskResult {
+                id: item.id.clone(),
+                state: item.state,
+                title: item.title.clone(),
+                subtitle: item.subtitle.clone(),
+                progress: Some(TaskResultProgress {
+                    fraction: terminal_progress(item.state()),
+                    completed_bytes: 0,
+                    total_bytes: 0,
+                    total_bytes_known: false,
+                    phase: String::new(),
+                    message: String::new(),
+                }),
+                problem: legacy_problem(item.state()),
+                library_item_id: item.library_item_id.clone(),
+                playback_source: item.playback_source.clone(),
+                artifacts: Vec::new(),
+                created_at: task.created_at,
+                updated_at: task.updated_at,
+                subject,
+                provider_details,
+            }
         })
         .collect()
 }
@@ -552,6 +702,103 @@ fn validate_result_ids(results: &[TaskResult]) -> Result<(), TaskOutputValidatio
             )));
         }
         validate_problem(result.problem.as_ref(), &result.id)?;
+        validate_result_subject_and_provider_details(result)?;
+    }
+    Ok(())
+}
+
+fn validate_result_subject_and_provider_details(
+    result: &TaskResult,
+) -> Result<(), TaskOutputValidationError> {
+    if let Some(subject) = result.subject.as_ref()
+        && [
+            subject.provider.as_str(),
+            subject.kind.as_str(),
+            subject.id.as_str(),
+        ]
+        .into_iter()
+        .any(|value| value.trim().is_empty() || value != value.trim())
+    {
+        return Err(TaskOutputValidationError::new(format!(
+            "task result has an invalid subject: {}",
+            result.id
+        )));
+    }
+
+    let Some(provider_details) = result.provider_details.as_ref() else {
+        return Ok(());
+    };
+    let Some(details) = provider_details.details.as_ref() else {
+        return Err(TaskOutputValidationError::new(format!(
+            "task result has empty provider details: {}",
+            result.id
+        )));
+    };
+    let Some(subject) = result.subject.as_ref() else {
+        return Err(TaskOutputValidationError::new(format!(
+            "task result provider details require a subject: {}",
+            result.id
+        )));
+    };
+
+    match details {
+        task_result_provider_details::Details::Bilibili(details) => {
+            if subject.provider != "bilibili" {
+                return Err(TaskOutputValidationError::new(format!(
+                    "Bilibili task result details require a Bilibili subject: {}",
+                    result.id
+                )));
+            }
+            if details.identity.is_none() && details.playback_session.is_none() {
+                return Err(TaskOutputValidationError::new(format!(
+                    "Bilibili task result details must not be empty: {}",
+                    result.id
+                )));
+            }
+            if let Some(identity) = details.identity.as_ref() {
+                validate_bilibili_result_identity(identity, &subject.id, &result.id)?;
+            }
+            if let Some(session) = details.playback_session.as_ref()
+                && session.variants.len() > MAX_TASK_RESULT_PROVIDER_VARIANTS
+            {
+                return Err(TaskOutputValidationError::new(format!(
+                    "Bilibili task result playback session cannot exceed {MAX_TASK_RESULT_PROVIDER_VARIANTS} variants: {}",
+                    result.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bilibili_result_identity(
+    identity: &BilibiliContentIdentity,
+    subject_id: &str,
+    result_id: &str,
+) -> Result<(), TaskOutputValidationError> {
+    let bvid = identity.bvid.as_str();
+    let aid_or_bvid = identity.aid > 0 || !bvid.is_empty();
+    let complete = bvid == bvid.trim()
+        && match identity.kind() {
+            BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => {
+                identity.cid > 0 && aid_or_bvid && identity.epid == 0
+            }
+            BilibiliContentKind::SeasonEpisode => identity.epid > 0,
+            BilibiliContentKind::Unspecified => false,
+        };
+    let matches_subject = match identity.kind() {
+        BilibiliContentKind::VideoPage => subject_id == identity.cid.to_string(),
+        BilibiliContentKind::SeasonEpisode => subject_id == identity.epid.to_string(),
+        BilibiliContentKind::CollectionItem => {
+            (!bvid.is_empty() && subject_id == bvid)
+                || (identity.aid > 0 && subject_id == format!("av{}", identity.aid))
+        }
+        BilibiliContentKind::Unspecified => false,
+    };
+    if !complete || !matches_subject {
+        return Err(TaskOutputValidationError::new(format!(
+            "Bilibili task result has an invalid identity: {result_id}"
+        )));
     }
     Ok(())
 }
@@ -732,7 +979,85 @@ fn task_result_string_bytes(result: &TaskResult) -> usize {
             .iter()
             .map(playback_source_string_bytes),
     )
+    .chain(result.subject.iter().map(|subject| {
+        subject
+            .provider
+            .len()
+            .saturating_add(subject.kind.len())
+            .saturating_add(subject.id.len())
+    }))
+    .chain(
+        result
+            .provider_details
+            .iter()
+            .map(provider_details_string_bytes),
+    )
     .chain(result.artifacts.iter().map(artifact_string_bytes))
+    .fold(0_usize, usize::saturating_add)
+}
+
+fn provider_details_string_bytes(details: &TaskResultProviderDetails) -> usize {
+    match details.details.as_ref() {
+        Some(task_result_provider_details::Details::Bilibili(details)) => details
+            .identity
+            .iter()
+            .map(|identity| identity.bvid.len())
+            .chain(
+                details
+                    .playback_session
+                    .iter()
+                    .map(bilibili_playback_session_string_bytes),
+            )
+            .fold(0_usize, usize::saturating_add),
+        None => 0,
+    }
+}
+
+fn bilibili_playback_session_string_bytes(session: &BilibiliPlaybackSession) -> usize {
+    [
+        session.id.len(),
+        session.title.len(),
+        session.content_id.len(),
+        session.selected_variant_id.len(),
+    ]
+    .into_iter()
+    .chain(
+        session
+            .selected_variant
+            .iter()
+            .map(bilibili_playback_variant_string_bytes),
+    )
+    .chain(
+        session
+            .variants
+            .iter()
+            .map(bilibili_playback_variant_string_bytes),
+    )
+    .chain(session.transcoding_plan.iter().map(|plan| {
+        [
+            plan.profile_id.len(),
+            plan.reason.len(),
+            plan.source_variant_id.len(),
+            plan.target_container.len(),
+            plan.target_video_codec.len(),
+            plan.target_audio_codec.len(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add)
+    }))
+    .fold(0_usize, usize::saturating_add)
+}
+
+fn bilibili_playback_variant_string_bytes(variant: &BilibiliPlaybackVariant) -> usize {
+    [
+        variant.id.len(),
+        variant.label.len(),
+        variant.source_kind.len(),
+        variant.container.len(),
+        variant.video_codec.len(),
+        variant.audio_codec.len(),
+    ]
+    .into_iter()
     .fold(0_usize, usize::saturating_add)
 }
 
@@ -742,6 +1067,7 @@ fn artifact_string_bytes(artifact: &crate::generated::tvos_net_player::v1::TaskA
         artifact.title.len(),
         artifact.format.len(),
         artifact.language_tag.len(),
+        artifact.library_item_id.len(),
     ]
     .into_iter()
     .chain(artifact.resource.iter().map(resource_string_bytes))
@@ -815,13 +1141,39 @@ fn validate_and_bind_resources(
                 )));
             }
             validate_problem(artifact.problem.as_ref(), &artifact.id)?;
+            let has_resource = artifact.resource.is_some();
+            let has_library_item = !artifact.library_item_id.is_empty();
+            if has_library_item
+                && (artifact.library_item_id.trim().is_empty()
+                    || artifact.library_item_id != artifact.library_item_id.trim())
+            {
+                return Err(TaskOutputValidationError::new(format!(
+                    "task artifact has an invalid library item id: {}",
+                    artifact.id
+                )));
+            }
+            if has_resource && has_library_item {
+                return Err(TaskOutputValidationError::new(format!(
+                    "task artifact cannot have both resource and library item backings: {}",
+                    artifact.id
+                )));
+            }
+            if has_library_item && artifact.kind() != TaskArtifactKind::Media {
+                return Err(TaskOutputValidationError::new(format!(
+                    "only media task artifacts can use a library item backing: {}",
+                    artifact.id
+                )));
+            }
+            if artifact.state() == TaskArtifactState::Available
+                && !has_resource
+                && !has_library_item
+            {
+                return Err(TaskOutputValidationError::new(format!(
+                    "available task artifact must have exactly one backing: {}",
+                    artifact.id
+                )));
+            }
             let Some(reference) = artifact.resource.as_ref() else {
-                if artifact.state() == TaskArtifactState::Available {
-                    return Err(TaskOutputValidationError::new(format!(
-                        "available task artifact has no resource: {}",
-                        artifact.id
-                    )));
-                }
                 continue;
             };
             let canonical_id = reference.id.to_ascii_lowercase();
@@ -1038,7 +1390,39 @@ fn legacy_problem(state: TaskState) -> Option<TaskProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::tvos_net_player::v1::{TaskArtifact, TaskArtifactKind, TaskKind};
+    use crate::generated::tvos_net_player::v1::{
+        BilibiliTaskResultItem, TaskArtifact, TaskArtifactKind, TaskKind,
+    };
+
+    fn bilibili_subject() -> TaskResultSubject {
+        TaskResultSubject {
+            provider: "bilibili".to_owned(),
+            kind: "video_page".to_owned(),
+            id: "2001".to_owned(),
+            index: 1,
+        }
+    }
+
+    fn bilibili_provider_details() -> TaskResultProviderDetails {
+        TaskResultProviderDetails {
+            details: Some(task_result_provider_details::Details::Bilibili(
+                BilibiliTaskResultDetails {
+                    identity: Some(BilibiliContentIdentity {
+                        kind: BilibiliContentKind::VideoPage.into(),
+                        aid: 1_001,
+                        bvid: "BV1stable".to_owned(),
+                        cid: 2_001,
+                        epid: 0,
+                    }),
+                    playback_session: Some(BilibiliPlaybackSession {
+                        id: "session-one".to_owned(),
+                        content_id: "2001".to_owned(),
+                        ..Default::default()
+                    }),
+                },
+            )),
+        }
+    }
 
     #[test]
     fn summary_counts_results_and_available_artifacts() {
@@ -1074,6 +1458,50 @@ mod tests {
         assert_eq!(1, output.summary().successful_result_count);
         assert_eq!(1, output.summary().available_artifact_count);
         assert_eq!("result-one", output.summary().primary_result_id);
+    }
+
+    #[test]
+    fn preferred_primary_result_replaces_an_existing_queued_primary() {
+        let previous = TaskOutputRecord::replace(
+            None,
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Queued.into(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Queued.into(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let output = TaskOutputRecord::replace_with_primary_result(
+            Some(&previous),
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Failed.into(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "local.default.result-two".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+            Some("result-two"),
+        )
+        .unwrap();
+
+        assert_eq!("result-two", output.primary_result_id);
+        assert!(output.revision > previous.revision);
     }
 
     #[test]
@@ -1198,6 +1626,148 @@ mod tests {
         let error = TaskOutputRecord::replace(Some(&previous), vec![result], vec![changed])
             .expect_err("a resource id must identify one immutable representation");
         assert!(error.to_string().contains("different representation"));
+    }
+
+    #[test]
+    fn artifact_backing_validation_accepts_library_media_and_rejects_ambiguous_backings() {
+        let library_media = TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "media-one".to_owned(),
+                kind: TaskArtifactKind::Media.into(),
+                state: TaskArtifactState::Available.into(),
+                library_item_id: "library-one".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        TaskOutputRecord::replace(None, vec![library_media.clone()], Vec::new())
+            .expect("available media may use a library item backing");
+        TaskOutputRecord::replace(
+            None,
+            vec![TaskResult {
+                id: "result-unavailable".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "metadata-unavailable".to_owned(),
+                    kind: TaskArtifactKind::Metadata.into(),
+                    state: TaskArtifactState::Unavailable.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            Vec::new(),
+        )
+        .expect("non-available artifacts may omit their backing");
+
+        let mut missing = library_media.clone();
+        missing.artifacts[0].library_item_id.clear();
+        let error = TaskOutputRecord::replace(None, vec![missing], Vec::new())
+            .expect_err("available artifacts require exactly one backing");
+        assert!(error.to_string().contains("exactly one backing"));
+
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "media-one".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ambiguous = library_media.clone();
+        ambiguous.artifacts[0].resource = Some(resource.resource.clone());
+        let error = TaskOutputRecord::replace(None, vec![ambiguous], vec![resource])
+            .expect_err("an artifact cannot expose two backings");
+        assert!(error.to_string().contains("both resource and library item"));
+
+        let mut non_media = library_media;
+        non_media.artifacts[0].kind = TaskArtifactKind::Subtitle.into();
+        non_media.artifacts[0].state = TaskArtifactState::Unavailable.into();
+        let error = TaskOutputRecord::replace(None, vec![non_media], Vec::new())
+            .expect_err("library items are media-only even for non-available artifacts");
+        assert!(error.to_string().contains("only media"));
+
+        let mut malformed = TaskResult {
+            id: "result-malformed".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "media-malformed".to_owned(),
+                kind: TaskArtifactKind::Media.into(),
+                state: TaskArtifactState::Unavailable.into(),
+                library_item_id: " library-one ".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let error = TaskOutputRecord::replace(None, vec![malformed.clone()], Vec::new())
+            .expect_err("non-available artifact backings remain structurally validated");
+        assert!(error.to_string().contains("invalid library item id"));
+        malformed.artifacts[0].library_item_id = "library-one".to_owned();
+        TaskOutputRecord::replace(None, vec![malformed], Vec::new())
+            .expect("non-available media may retain a valid library item backing");
+    }
+
+    #[test]
+    fn provider_details_are_validated_and_budgeted() {
+        let valid = TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Completed.into(),
+            subject: Some(bilibili_subject()),
+            provider_details: Some(bilibili_provider_details()),
+            ..Default::default()
+        };
+        TaskOutputRecord::replace(None, vec![valid.clone()], Vec::new())
+            .expect("matching Bilibili details should be accepted");
+
+        let mut wrong_provider = valid.clone();
+        wrong_provider.subject.as_mut().unwrap().provider = "other".to_owned();
+        let error = TaskOutputRecord::replace(None, vec![wrong_provider], Vec::new())
+            .expect_err("provider details must match the generic subject");
+        assert!(error.to_string().contains("require a Bilibili subject"));
+
+        let mut mismatched_identity = valid.clone();
+        let Some(task_result_provider_details::Details::Bilibili(details)) = mismatched_identity
+            .provider_details
+            .as_mut()
+            .and_then(|details| details.details.as_mut())
+        else {
+            panic!("test fixture should contain Bilibili details");
+        };
+        details.identity.as_mut().unwrap().cid = 2_002;
+        let error = TaskOutputRecord::replace(None, vec![mismatched_identity], Vec::new())
+            .expect_err("provider identity must match the generic subject");
+        assert!(error.to_string().contains("invalid identity"));
+
+        let mut too_many_variants = valid.clone();
+        let Some(task_result_provider_details::Details::Bilibili(details)) = too_many_variants
+            .provider_details
+            .as_mut()
+            .and_then(|details| details.details.as_mut())
+        else {
+            panic!("test fixture should contain Bilibili details");
+        };
+        details.playback_session.as_mut().unwrap().variants =
+            vec![BilibiliPlaybackVariant::default(); MAX_TASK_RESULT_PROVIDER_VARIANTS + 1];
+        let error = TaskOutputRecord::replace(None, vec![too_many_variants], Vec::new())
+            .expect_err("provider variant collections must be bounded");
+        assert!(error.to_string().contains("variants"));
+
+        let mut aggregate = valid;
+        let Some(task_result_provider_details::Details::Bilibili(details)) = aggregate
+            .provider_details
+            .as_mut()
+            .and_then(|details| details.details.as_mut())
+        else {
+            panic!("test fixture should contain Bilibili details");
+        };
+        details.playback_session.as_mut().unwrap().title = "x".repeat(950_000);
+        let results = (0..9)
+            .map(|index| TaskResult {
+                id: format!("provider-result-{index}"),
+                ..aggregate.clone()
+            })
+            .collect();
+        let error = TaskOutputRecord::replace(None, results, Vec::new())
+            .expect_err("provider detail strings must count toward the aggregate budget");
+        assert!(error.to_string().contains("string bytes"));
     }
 
     #[test]
@@ -1355,6 +1925,58 @@ mod tests {
     }
 
     #[test]
+    fn library_deletion_tombstones_media_and_promotes_a_surviving_primary() {
+        let mut output = TaskOutputRecord::replace(
+            None,
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-one".to_owned(),
+                    artifacts: vec![TaskArtifact {
+                        id: "media-one".to_owned(),
+                        kind: TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: "library-one".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-two".to_owned(),
+                    artifacts: vec![TaskArtifact {
+                        id: "media-two".to_owned(),
+                        kind: TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: "library-two".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("task output should be valid");
+
+        let update = output
+            .mark_library_item_deleted("library-one", "Cached media was deleted.")
+            .expect("library deletion should preserve output validity");
+
+        assert_eq!(Some(Vec::new()), update);
+        assert_eq!(TaskState::Failed, output.results[0].state());
+        assert!(output.results[0].library_item_id.is_empty());
+        assert_eq!(
+            TaskArtifactState::Deleted,
+            output.results[0].artifacts[0].state()
+        );
+        assert!(output.results[0].artifacts[0].library_item_id.is_empty());
+        assert_eq!(TaskState::Succeeded, output.results[1].state());
+        assert_eq!("result-two", output.primary_result_id);
+    }
+
+    #[test]
     fn cache_deletion_rejects_an_oversized_mutation_without_changing_output() {
         let mut output = TaskOutputRecord::replace(
             None,
@@ -1398,6 +2020,102 @@ mod tests {
         assert_eq!("task-one", output.results[0].id);
         assert_eq!(0.25, output.results[0].progress.as_ref().unwrap().fraction);
         assert_eq!(1, output.summary().revision);
+    }
+
+    #[test]
+    fn legacy_bilibili_results_project_subject_identity_and_playback_session() {
+        let identity = BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage.into(),
+            aid: 1_001,
+            bvid: "BV1stable".to_owned(),
+            cid: 2_001,
+            epid: 0,
+        };
+        let playback_session = BilibiliPlaybackSession {
+            id: "session-one".to_owned(),
+            content_id: "2001".to_owned(),
+            ..Default::default()
+        };
+        let task = Task {
+            id: "task-one".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Playable.into(),
+            result_items: vec![BilibiliTaskResultItem {
+                id: "result-one".to_owned(),
+                source_kind: "video_page".to_owned(),
+                content_id: "2001".to_owned(),
+                index: 1,
+                state: TaskState::Playable.into(),
+                identity: Some(identity.clone()),
+                playback_session: Some(playback_session.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        let result = &output.results[0];
+        assert_eq!(Some(bilibili_subject()), result.subject.clone());
+        let Some(task_result_provider_details::Details::Bilibili(details)) = result
+            .provider_details
+            .as_ref()
+            .and_then(|details| details.details.as_ref())
+        else {
+            panic!("legacy result should expose Bilibili provider details");
+        };
+        assert_eq!(Some(&identity), details.identity.as_ref());
+        assert_eq!(Some(&playback_session), details.playback_session.as_ref());
+    }
+
+    #[test]
+    fn legacy_bilibili_result_projection_allows_session_transport_content_ids() {
+        let task = Task {
+            id: "task-one".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Playable.into(),
+            result_items: vec![BilibiliTaskResultItem {
+                id: "result-two".to_owned(),
+                source_kind: "video_page".to_owned(),
+                content_id: "logical-page-two".to_owned(),
+                state: TaskState::Playable.into(),
+                playback_session: Some(BilibiliPlaybackSession {
+                    id: "result-two".to_owned(),
+                    content_id: "transport-resource-one".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        TaskOutputRecord::replace(None, output.results, Vec::new())
+            .expect("transport content ids are independent from logical result subjects");
+    }
+
+    #[test]
+    fn incomplete_legacy_bilibili_results_omit_generic_provider_metadata() {
+        let task = Task {
+            id: "task-one".to_owned(),
+            kind: TaskKind::BilibiliProgressivePlayback.into(),
+            state: TaskState::Preparing.into(),
+            result_items: vec![BilibiliTaskResultItem {
+                id: "result-one".to_owned(),
+                state: TaskState::Cancelled.into(),
+                playback_session: Some(BilibiliPlaybackSession {
+                    id: "result-one".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        assert!(output.results[0].subject.is_none());
+        assert!(output.results[0].provider_details.is_none());
+        TaskOutputRecord::replace(None, output.results, Vec::new())
+            .expect("incomplete legacy provider metadata should remain representable");
     }
 
     #[test]

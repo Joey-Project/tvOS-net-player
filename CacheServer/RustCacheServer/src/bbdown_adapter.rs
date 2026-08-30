@@ -12,10 +12,10 @@ use std::{
 
 use bbdown_core::{
     BiliClient, ClientConfig, CredentialProfileSelection, CredentialStore, Credentials,
-    DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadOptions,
-    DownloadProgressEvent, DownloadProgressSink, DownloadReport, DuplicateDecision,
-    EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection, Input,
-    MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
+    DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadMode,
+    DownloadOptions, DownloadPlan, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
+    DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
+    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
     PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
     PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode, ResolvedContent,
     RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection, StreamSelection,
@@ -35,23 +35,37 @@ use crate::{
         BilibiliResolvedCandidate, MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES,
         MAX_BILIBILI_RESOLUTION_STRING_BYTES, MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
     },
+    bilibili_resolution::BilibiliTaskCandidateRecord,
     bilibili_worker::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
-        BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadRequest,
+        BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadOutputV2,
+        BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
+        cleanup_unpublished_output_paths,
     },
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
         BbdownRestrictedProxy as CacheBbdownRestrictedProxy, CacheServerOptions,
     },
     generated::tvos_net_player::v1::{
-        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliSubtitleAiPolicy,
+        BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity,
+        BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
+        BilibiliRequestContext, BilibiliSubtitleAiPolicy, BilibiliTaskResultDetails,
+        CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState, TaskProblem,
+        TaskProblemCategory, TaskResult, TaskResultProgress, TaskResultProviderDetails,
+        TaskResultSubject, TaskState,
     },
-    library::LocalMediaLibrary,
+    library::{
+        LibraryItemPublicationLease, LocalMediaLibrary, create_directory_exclusive_no_follow,
+        ensure_directory_no_follow, remove_directory_tree_no_follow,
+        rename_directory_no_replace_no_follow,
+    },
     playback_policy::{
         CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
     },
+    task_output::TaskResourceRecord,
     task_registry::BilibiliTaskProgress,
 };
+use uuid::Uuid;
 
 const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
@@ -60,6 +74,9 @@ const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
+const BILIBILI_V2_STAGING_DIRECTORY: &str = ".tvos-net-player/bbdown-staging";
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BilibiliResolveCandidateWindow {
@@ -91,6 +108,7 @@ fn invalid_resolve_candidate_limit(candidate_limit: usize) -> BilibiliDownloadEr
 }
 
 pub struct BbdownBilibiliAdapter {
+    options: Arc<CacheServerOptions>,
     client: BiliClient,
     tv_client: BiliClient,
     library: Arc<LocalMediaLibrary>,
@@ -98,6 +116,23 @@ pub struct BbdownBilibiliAdapter {
     archive_path: PathBuf,
     ffmpeg_path: PathBuf,
     archive_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    archive_save_fail_after: StdMutex<Option<usize>>,
+}
+
+#[derive(Default)]
+struct V2TaskArchive {
+    accepted: DownloadArchive,
+}
+
+impl V2TaskArchive {
+    fn stage_candidate(&self) -> DownloadArchive {
+        self.accepted.clone()
+    }
+
+    fn accept_candidate(&mut self, candidate: DownloadArchive) {
+        self.accepted = candidate;
+    }
 }
 
 #[allow(dead_code)]
@@ -282,6 +317,9 @@ impl BbdownBilibiliAdapter {
             archive_path: options.bbdown_archive_path(),
             ffmpeg_path: options.bbdown_ffmpeg_path.clone(),
             archive_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            archive_save_fail_after: StdMutex::new(None),
+            options,
         }
     }
 
@@ -296,10 +334,14 @@ impl BbdownBilibiliAdapter {
             ));
         }
 
+        if !request.candidates.is_empty() {
+            return self.run_v2_download(request, context).await;
+        }
+
         let input = Input::parse(&request.source).map_err(failed)?;
         let download_options = self.download_options(request.options.as_ref())?;
-        let client = self.client_for_options(request.options.as_ref());
-
+        let client =
+            self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
         context.report_progress(progress(
             0.02,
             "Planning Bilibili download with BBDown core.",
@@ -393,10 +435,11 @@ impl BbdownBilibiliAdapter {
                         "Cancelled before committing the BBDown archive.".to_owned(),
                     ));
                 }
-                archive.save(&self.archive_path).map_err(failed)?;
+                self.save_archive(&archive)?;
                 return Ok(BilibiliDownloadOutput {
                     library_item_id,
                     message: success_message(&report),
+                    v2: None,
                 });
             }
         }
@@ -407,6 +450,793 @@ impl BbdownBilibiliAdapter {
         )))
     }
 
+    async fn run_v2_download(
+        &self,
+        request: BilibiliDownloadRequest,
+        context: BilibiliDownloadContext,
+    ) -> Result<BilibiliDownloadOutput, BilibiliDownloadError> {
+        let client =
+            self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
+        let download_mode = download_mode_from_options(request.options.as_ref())?;
+        validate_supported_download_options(request.options.as_ref())?;
+        let input = playback_input_for_planning(&request.source)?;
+        let output_directories = self
+            .prepare_v2_output_directories(&request.task_id, &context)
+            .await?;
+        let mut candidate_outcomes = Vec::with_capacity(request.candidates.len());
+        let mut retained_backing = RetainedV2DownloadBacking::default();
+        let mut primary_library_item_id = String::new();
+        let mut successful_results = 0_usize;
+        let mut cancelled = false;
+        let mut output_integrity_error = None;
+        let mut completed_downloaded_bytes = 0_u64;
+        let mut total_bytes_floor = 0_u64;
+
+        let _archive_guard = self.archive_lock.lock().await;
+        // V2 task output is the durable authority. This task-local archive only coordinates
+        // duplicate names between candidates and is never committed ahead of terminal output.
+        let mut archive = V2TaskArchive::default();
+
+        for (offset, candidate) in request.candidates.iter().enumerate() {
+            let result_id = bilibili_v2_result_id(&request.task_id, offset);
+            if cancelled || context.is_cancel_requested() {
+                cancelled = true;
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    cancelled_download_result(result_id, candidate),
+                )));
+                continue;
+            }
+            if let Some(error) = output_integrity_error.as_ref() {
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    failed_download_result(result_id, candidate, error),
+                )));
+                continue;
+            }
+
+            context.report_progress(progress(
+                v2_candidate_progress(offset, request.candidates.len(), 0.02),
+                format!(
+                    "Planning Bilibili download {}/{}.",
+                    offset + 1,
+                    request.candidates.len()
+                ),
+            ));
+
+            let plan = match self
+                .plan_download_candidate(&client, &input, candidate, || {
+                    context.is_cancel_requested()
+                })
+                .await
+            {
+                Ok(plan) => plan,
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    cancelled = true;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    continue;
+                }
+            };
+
+            let candidate_output = match self
+                .prepare_v2_candidate_output_directory(&output_directories, offset)
+                .await
+            {
+                Ok(candidate_output) => candidate_output,
+                Err(error) => {
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    output_integrity_error = Some(error);
+                    continue;
+                }
+            };
+            let download_options = download_options_for_output_dir(
+                candidate_output.path.clone(),
+                request.options.as_ref(),
+            )?;
+
+            let download_cancellation = DownloadCancellationToken::new();
+            let download_progress = BilibiliBbdownProgressSink::for_v2_candidate(
+                context.clone(),
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
+            let mut candidate_archive = archive.stage_candidate();
+            let report = match run_bbdown_download_until_cancelled(
+                client.download_plan_with_archive_decision_with_progress_and_cancellation(
+                    &plan,
+                    download_options.clone(),
+                    &mut candidate_archive,
+                    DuplicateDecision::KeepBoth,
+                    &download_progress,
+                    &download_cancellation,
+                ),
+                &download_cancellation,
+                || context.is_cancel_requested(),
+                "Cancelled while the BBDown download was running.",
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
+                    cancelled = true;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    report_v2_candidate_finished(
+                        &context,
+                        offset,
+                        request.candidates.len(),
+                        completed_downloaded_bytes,
+                        total_bytes_floor,
+                    );
+                    continue;
+                }
+            };
+            let snapshot = download_progress.v2_progress_snapshot();
+            completed_downloaded_bytes =
+                snapshot.downloaded_bytes.max(report.summary().total_bytes);
+            total_bytes_floor = snapshot.total_bytes.max(completed_downloaded_bytes);
+
+            context.report_progress(BilibiliTaskProgress {
+                progress: Some(v2_candidate_progress(
+                    offset,
+                    request.candidates.len(),
+                    0.85,
+                )),
+                downloaded_bytes: Some(to_i64_saturating(completed_downloaded_bytes)),
+                total_bytes: Some(to_i64_saturating(total_bytes_floor)),
+                message: Some(format!(
+                    "Muxing Bilibili download {}/{}.",
+                    offset + 1,
+                    request.candidates.len()
+                )),
+            });
+
+            let mut report = report;
+            match mux_download_report_in_place(&mut report, &self.ffmpeg_path, &|| {
+                context.is_cancel_requested()
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    cleanup_unpublished_download_report(&report).await;
+                    cancelled = true;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    cleanup_unpublished_download_report(&report).await;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    report_v2_candidate_finished(
+                        &context,
+                        offset,
+                        request.candidates.len(),
+                        completed_downloaded_bytes,
+                        total_bytes_floor,
+                    );
+                    continue;
+                }
+            };
+            archive.accept_candidate(candidate_archive);
+            candidate_outcomes.push(V2CandidateDownloadOutcome::Downloaded {
+                result_id,
+                plan,
+                report,
+            });
+            report_v2_candidate_finished(
+                &context,
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
+        }
+
+        let has_downloaded_output = candidate_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, V2CandidateDownloadOutcome::Downloaded { .. }));
+        let mut publication_error = output_integrity_error;
+        if publication_error.is_none() && has_downloaded_output {
+            publication_error = self
+                .publish_v2_output_directory(&output_directories)
+                .await
+                .err();
+        }
+        if publication_error.is_none() && has_downloaded_output {
+            for outcome in &mut candidate_outcomes {
+                let V2CandidateDownloadOutcome::Downloaded { report, .. } = outcome else {
+                    continue;
+                };
+                match remap_download_report_root(
+                    report.clone(),
+                    &output_directories.staging_path,
+                    &output_directories.published_path,
+                ) {
+                    Ok(remapped) => *report = remapped,
+                    Err(error) => {
+                        publication_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = publication_error.as_ref() {
+            log_v2_candidate_error(
+                &request.task_id,
+                &request.task_id,
+                self.options.bbdown_credential_path.is_some(),
+                error,
+            );
+        }
+
+        let mut results = Vec::with_capacity(request.candidates.len());
+        for (offset, outcome) in candidate_outcomes.into_iter().enumerate() {
+            let candidate = &request.candidates[offset];
+            match outcome {
+                V2CandidateDownloadOutcome::Terminal(result) => results.push(*result),
+                V2CandidateDownloadOutcome::Downloaded {
+                    result_id,
+                    plan,
+                    report,
+                } => {
+                    if let Some(error) = publication_error.as_ref() {
+                        results.push(failed_download_result(result_id, candidate, error));
+                        continue;
+                    }
+                    let mapped = self
+                        .finalize_v2_download_result(
+                            result_id.clone(),
+                            candidate,
+                            &plan,
+                            report,
+                            download_mode,
+                            false,
+                        )
+                        .await;
+                    match mapped {
+                        Ok(mapped) => retain_v2_success(
+                            mapped,
+                            &mut primary_library_item_id,
+                            &mut successful_results,
+                            &mut results,
+                            &mut retained_backing,
+                        ),
+                        Err(BilibiliDownloadError::Cancelled(_)) => {
+                            cancelled = true;
+                            results.push(cancelled_download_result(result_id, candidate));
+                        }
+                        Err(error) => {
+                            log_v2_candidate_error(
+                                &request.task_id,
+                                &result_id,
+                                self.options.bbdown_credential_path.is_some(),
+                                &error,
+                            );
+                            results.push(failed_download_result(result_id, candidate, &error));
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = request.candidates.len();
+        let terminal_state = if cancelled {
+            TaskState::Cancelled
+        } else if successful_results > 0 {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        };
+        let message = match terminal_state {
+            TaskState::Cancelled => format!(
+                "Cancelled after completing {successful_results}/{total} Bilibili result(s)."
+            ),
+            TaskState::Succeeded if successful_results == total => {
+                format!("Downloaded all {total} Bilibili result(s).")
+            }
+            TaskState::Succeeded => {
+                format!("Downloaded {successful_results}/{total} Bilibili result(s).")
+            }
+            TaskState::Failed => format!("Failed to download all {total} Bilibili result(s)."),
+            _ => unreachable!("v2 download must finish in a terminal state"),
+        };
+        let owned_directory_cleanup_paths = if primary_library_item_id.is_empty() {
+            vec![
+                output_directories.staging_path,
+                output_directories.published_path,
+            ]
+        } else {
+            vec![output_directories.staging_path]
+        };
+
+        Ok(BilibiliDownloadOutput {
+            library_item_id: primary_library_item_id,
+            message,
+            v2: Some(BilibiliDownloadOutputV2 {
+                terminal_state,
+                results,
+                resources: retained_backing.resources,
+                resource_bodies: retained_backing.resource_bodies,
+                library_item_leases: retained_backing.library_item_leases,
+                unpublished_output_paths: retained_backing.unpublished_output_paths,
+                transient_output_paths: retained_backing.transient_output_paths,
+                owned_directory_cleanup_paths,
+            }),
+        })
+    }
+
+    async fn prepare_v2_output_directories(
+        &self,
+        task_id: &str,
+        context: &BilibiliDownloadContext,
+    ) -> Result<V2TaskOutputDirectories, BilibiliDownloadError> {
+        let cache_root = self.library.root_path();
+        let staging_path = cache_root.join(BILIBILI_V2_STAGING_DIRECTORY).join(task_id);
+        let published_path = self.output_dir.join(task_id);
+        let staging_relative_path = cache_relative_normal_path(&cache_root, &staging_path)?;
+        let published_relative_path = cache_relative_normal_path(&cache_root, &published_path)?;
+        let output_directory_relative_path =
+            cache_relative_normal_path_allow_empty(&cache_root, &self.output_dir)?;
+        context
+            .register_owned_output_directories(vec![staging_path.clone(), published_path.clone()])
+            .await?;
+
+        let cache_root_for_creation = cache_root.clone();
+        let staging_relative_for_creation = staging_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if !output_directory_relative_path.is_empty() {
+                ensure_directory_no_follow(
+                    &cache_root_for_creation,
+                    &output_directory_relative_path,
+                )?;
+            }
+            create_directory_exclusive_no_follow(
+                &cache_root_for_creation,
+                &staging_relative_for_creation,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output staging directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(V2TaskOutputDirectories {
+            cache_root,
+            staging_path,
+            staging_relative_path,
+            published_path,
+            published_relative_path,
+        })
+    }
+
+    async fn prepare_v2_candidate_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        offset: usize,
+    ) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+        let candidate_output = v2_candidate_output_directory(directories, offset)?;
+        let cache_root = directories.cache_root.clone();
+        let relative_path_for_creation = candidate_output.relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            create_directory_exclusive_no_follow(&cache_root, &relative_path_for_creation)
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(candidate_output)
+    }
+
+    async fn cleanup_failed_v2_candidate_output(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        candidate_output: &V2CandidateOutputDirectory,
+        task_id: &str,
+        result_id: &str,
+        output_integrity_error: &mut Option<BilibiliDownloadError>,
+    ) {
+        let cache_root = directories.cache_root.clone();
+        let relative_path = candidate_output.relative_path.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output cleanup worker failed.".to_owned(),
+            )
+        })
+        .and_then(|result| {
+            result.map_err(|_| {
+                BilibiliDownloadError::Failed(
+                    "Bilibili candidate output directory could not be cleaned safely.".to_owned(),
+                )
+            })
+        });
+
+        if let Err(error) = cleanup {
+            log_v2_candidate_error(
+                task_id,
+                result_id,
+                self.options.bbdown_credential_path.is_some(),
+                &error,
+            );
+            if output_integrity_error.is_none() {
+                *output_integrity_error = Some(error);
+            }
+        }
+    }
+
+    async fn publish_v2_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+    ) -> Result<(), BilibiliDownloadError> {
+        let cache_root = directories.cache_root.clone();
+        let staging_relative_path = directories.staging_relative_path.clone();
+        let published_relative_path = directories.published_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            rename_directory_no_replace_no_follow(
+                &cache_root,
+                &staging_relative_path,
+                &published_relative_path,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed("Bilibili output publication worker failed.".to_owned())
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory could not be published safely.".to_owned(),
+            )
+        })
+    }
+
+    fn save_archive(&self, archive: &DownloadArchive) -> Result<(), BilibiliDownloadError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .archive_save_fail_after
+                .lock()
+                .expect("archive save failure hook lock poisoned");
+            if let Some(remaining) = remaining.as_mut() {
+                if *remaining == 0 {
+                    return Err(BilibiliDownloadError::Failed(
+                        "Injected BBDown archive persistence failure.".to_owned(),
+                    ));
+                }
+                *remaining -= 1;
+            }
+        }
+        archive.save(&self.archive_path).map_err(failed)
+    }
+
+    async fn plan_download_candidate(
+        &self,
+        client: &BiliClient,
+        input: &Input,
+        candidate: &BilibiliTaskCandidateRecord,
+        is_cancel_requested: impl Fn() -> bool,
+    ) -> Result<DownloadPlan, BilibiliDownloadError> {
+        let PlaybackInputSelection {
+            input_override,
+            selection,
+            expected_identity,
+        } = playback_selection_from_id(input, Some(&candidate.selection_id))?;
+        let direct_collection_item = input_override.is_some();
+        let selected_input = input_override.unwrap_or_else(|| input.clone());
+        let selection = if direct_collection_item {
+            Some(
+                resolve_direct_collection_item_page(
+                    client,
+                    &selected_input,
+                    expected_identity
+                        .as_ref()
+                        .expect("direct collection item must retain expected identity"),
+                    &is_cancel_requested,
+                )
+                .await?,
+            )
+        } else {
+            selection.or_else(|| default_selection_for_input(&selected_input))
+        };
+        let plan = run_bbdown_until_cancelled(
+            client.plan(selected_input, selection),
+            &is_cancel_requested,
+            "Cancelled while BBDown planning was running.",
+        )
+        .await?;
+        let matching_entries = plan
+            .entries
+            .into_iter()
+            .filter(|entry| download_entry_matches_candidate(entry, candidate))
+            .collect::<Vec<_>>();
+        if matching_entries.len() != 1 {
+            return Err(BilibiliDownloadError::Failed(
+                "Selected Bilibili content no longer matches the accepted resolution snapshot. Resolve the input again and retry."
+                    .to_owned(),
+            ));
+        }
+        Ok(DownloadPlan {
+            title: plan.title,
+            entries: matching_entries,
+        })
+    }
+
+    async fn finalize_v2_download_result(
+        &self,
+        result_id: String,
+        candidate: &BilibiliTaskCandidateRecord,
+        plan: &DownloadPlan,
+        report: DownloadReport,
+        download_mode: DownloadMode,
+        cancel_requested: bool,
+    ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
+        if cancel_requested {
+            cleanup_unpublished_download_report(&report).await;
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled after BBDown finished downloading.".to_owned(),
+            ));
+        }
+
+        match self
+            .map_v2_download_result(result_id, candidate, plan, &report, download_mode)
+            .await
+        {
+            Ok(mapped) => Ok(mapped),
+            Err(error) => {
+                cleanup_unpublished_download_report(&report).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn map_v2_download_result(
+        &self,
+        result_id: String,
+        candidate: &BilibiliTaskCandidateRecord,
+        plan: &DownloadPlan,
+        report: &DownloadReport,
+        download_mode: DownloadMode,
+    ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
+        let entry = report.entries.first().ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown returned no entry for the selected Bilibili result.".to_owned(),
+            )
+        })?;
+        if report.entries.len() != 1 {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown returned an ambiguous multi-entry report for one accepted Bilibili result."
+                    .to_owned(),
+            ));
+        }
+        let plan_entry = plan.entries.first().ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown returned no plan entry for the selected Bilibili result.".to_owned(),
+            )
+        })?;
+
+        let mut library_item_id = String::new();
+        let mut library_item_lease = None;
+        let mut library_output_path = None;
+        for candidate_path in playable_entry_output_candidates(entry) {
+            if let Some(lease) = self
+                .library
+                .reserve_media_path_for_publication(candidate_path.clone())
+                .await
+            {
+                library_item_id = lease.item_id.clone();
+                library_item_lease = Some(lease);
+                library_output_path = Some(candidate_path);
+                break;
+            }
+        }
+        if download_mode_requires_media(download_mode) && library_item_id.is_empty() {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown finished but produced no playable cache-library item for the selected result."
+                    .to_owned(),
+            ));
+        }
+
+        let mut artifacts = Vec::new();
+        let mut resources = Vec::new();
+        let mut resource_bodies = Vec::new();
+
+        if !library_item_id.is_empty() {
+            artifacts.push(library_media_artifact(entry, &library_item_id));
+        }
+        for (index, file) in entry
+            .files
+            .iter()
+            .filter(|file| !file.kind.is_media())
+            .enumerate()
+        {
+            let mapped = map_sidecar_artifact(file, index).await?;
+            artifacts.push(mapped.artifact);
+            resources.push(mapped.resource);
+            resource_bodies.push(mapped.body);
+        }
+        if let Some(required_kind) = sidecar_only_required_artifact_kind(download_mode)
+            && !artifacts
+                .iter()
+                .any(|artifact| artifact.kind() == required_kind)
+        {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown finished but did not produce the requested sidecar artifact.".to_owned(),
+            ));
+        }
+        if !plan_entry.chapters.is_empty() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "chapters": plan_entry.chapters,
+            }))
+            .map_err(failed)?;
+            let mapped = map_generated_artifact(
+                TaskArtifactKind::Chapters,
+                "Chapters",
+                "json",
+                "application/json",
+                body,
+            )?;
+            artifacts.push(mapped.artifact);
+            resources.push(mapped.resource);
+            resource_bodies.push(mapped.body);
+        }
+
+        let summary = report.summary();
+        let metadata_body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "provider": "bilibili",
+            "subject": {
+                "kind": candidate.source_kind,
+                "id": candidate.content_id,
+                "index": candidate.index,
+                "aid": candidate.identity.aid,
+                "bvid": candidate.identity.bvid,
+                "cid": candidate.identity.cid,
+                "epid": candidate.identity.epid,
+            },
+            "title": candidate.title,
+            "subtitle": candidate.subtitle,
+            "download": {
+                "file_count": summary.file_count,
+                "media_file_count": summary.media_file_count,
+                "sidecar_file_count": summary.sidecar_file_count,
+                "mux_count": summary.mux_count,
+                "total_bytes": summary.total_bytes,
+            },
+        }))
+        .map_err(failed)?;
+        let metadata = map_generated_artifact(
+            TaskArtifactKind::Metadata,
+            "Metadata",
+            "json",
+            "application/json",
+            metadata_body,
+        )?;
+        artifacts.push(metadata.artifact);
+        resources.push(metadata.resource);
+        resource_bodies.push(metadata.body);
+
+        let unpublished_output_paths = download_report_output_paths(report);
+        let transient_output_paths = transient_download_output_paths(
+            &unpublished_output_paths,
+            library_output_path.as_deref(),
+        );
+        Ok(MappedV2DownloadResult {
+            library_item_id: library_item_id.clone(),
+            result: successful_download_result(
+                result_id,
+                candidate,
+                library_item_id,
+                artifacts,
+                summary.total_bytes,
+            ),
+            resources,
+            resource_bodies,
+            library_item_lease,
+            unpublished_output_paths,
+            transient_output_paths,
+        })
+    }
+
     fn download_options(
         &self,
         options: Option<&BilibiliDownloadOptions>,
@@ -414,12 +1244,21 @@ impl BbdownBilibiliAdapter {
         download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
-    fn client_for_options(&self, options: Option<&BilibiliDownloadOptions>) -> BiliClient {
-        if options.is_some_and(|options| options.prefer_tv_api) {
+    fn client_for_request(
+        &self,
+        options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+    ) -> Result<BiliClient, BilibiliDownloadError> {
+        if let Some(config) =
+            bbdown_client_config_for_request(&self.options, options, request_context)?
+        {
+            return Ok(BiliClient::new(config));
+        }
+        Ok(if options.is_some_and(|options| options.prefer_tv_api) {
             self.tv_client.clone()
         } else {
             self.client.clone()
-        }
+        })
     }
 
     #[allow(dead_code)]
@@ -427,6 +1266,7 @@ impl BbdownBilibiliAdapter {
         &self,
         source: &str,
         options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
         candidate_limit: usize,
         include_candidate_cover_uri: bool,
         is_cancel_requested: impl Fn() -> bool,
@@ -435,7 +1275,7 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input, candidate_window)?;
-        let client = self.client_for_options(options);
+        let client = self.client_for_request(options, request_context)?;
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
             client.resolve(input.clone(), selection),
@@ -509,6 +1349,7 @@ impl BbdownBilibiliAdapter {
         source: &str,
         selection_id: Option<&str>,
         options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
         policy: PlaybackPolicy,
         is_cancel_requested: impl Fn() -> bool,
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
@@ -521,7 +1362,7 @@ impl BbdownBilibiliAdapter {
         } = playback_selection_from_id(&input, selection_id)?;
         let direct_collection_item = input_override.is_some();
         let input = input_override.unwrap_or(input);
-        let client = self.client_for_options(options);
+        let client = self.client_for_request(options, request_context)?;
         let selection = if direct_collection_item {
             Some(
                 resolve_direct_collection_item_page(
@@ -610,13 +1451,86 @@ fn bbdown_client_config(
     options: &CacheServerOptions,
     playurl_mode: PlayurlMode,
 ) -> Result<ClientConfig, BilibiliDownloadError> {
-    Ok(ClientConfig::default()
-        .with_credentials(bbdown_credentials(
-            options.bbdown_credential_path.as_deref(),
-            options.bbdown_credential_profile.as_deref(),
-        )?)
+    bbdown_client_config_with_profile(
+        options,
+        playurl_mode,
+        options.bbdown_credential_profile.as_deref(),
+    )
+}
+
+fn bbdown_client_config_for_request(
+    server_options: &CacheServerOptions,
+    options: Option<&BilibiliDownloadOptions>,
+    request_context: Option<&BilibiliRequestContext>,
+) -> Result<Option<ClientConfig>, BilibiliDownloadError> {
+    let explicit_profile = request_context
+        .map(|context| context.credential_profile_id.trim())
+        .filter(|profile| !profile.is_empty());
+    let explicit_mode = request_context
+        .map(|context| BilibiliApiMode::try_from(context.api_mode))
+        .transpose()
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili API mode is unknown to this cache server.".to_owned(),
+            )
+        })?
+        .filter(|mode| *mode != BilibiliApiMode::Unspecified);
+
+    if request_context.is_none() && explicit_profile.is_none() && explicit_mode.is_none() {
+        return Ok(None);
+    }
+
+    let playurl_mode = match explicit_mode {
+        Some(BilibiliApiMode::Web) => PlayurlMode::Web,
+        Some(BilibiliApiMode::Tv) => PlayurlMode::Tv,
+        Some(BilibiliApiMode::App) => PlayurlMode::App,
+        Some(BilibiliApiMode::Unspecified) => unreachable!("unspecified mode was filtered out"),
+        None if options.is_some_and(|options| options.prefer_tv_api) => PlayurlMode::Tv,
+        None => PlayurlMode::Web,
+    };
+    let credentials = match explicit_profile {
+        Some(profile) => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            Some(profile),
+        )?,
+        None if request_context.is_some() => Credentials::default(),
+        None => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            server_options.bbdown_credential_profile.as_deref(),
+        )?,
+    };
+    Ok(Some(bbdown_client_config_with_credentials(
+        server_options,
+        playurl_mode,
+        credentials,
+    )))
+}
+
+fn bbdown_client_config_with_profile(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+    credential_profile: Option<&str>,
+) -> Result<ClientConfig, BilibiliDownloadError> {
+    let credentials = bbdown_credentials(
+        options.bbdown_credential_path.as_deref(),
+        credential_profile,
+    )?;
+    Ok(bbdown_client_config_with_credentials(
+        options,
+        playurl_mode,
+        credentials,
+    ))
+}
+
+fn bbdown_client_config_with_credentials(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+    credentials: Credentials,
+) -> ClientConfig {
+    ClientConfig::default()
+        .with_credentials(credentials)
         .with_restricted_area(bbdown_restricted_area_config(options))
-        .with_playurl_mode(playurl_mode))
+        .with_playurl_mode(playurl_mode)
 }
 
 fn bbdown_credentials(
@@ -624,6 +1538,12 @@ fn bbdown_credentials(
     profile: Option<&str>,
 ) -> Result<Credentials, BilibiliDownloadError> {
     let Some(path) = path else {
+        if profile.is_some() {
+            return Err(BilibiliDownloadError::Failed(
+                "A Bilibili credential profile was selected, but credential storage is not configured."
+                    .to_owned(),
+            ));
+        }
         return Ok(Credentials::default());
     };
     let selection = match profile {
@@ -820,6 +1740,7 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
 struct BilibiliBbdownProgressSink {
     context: BilibiliDownloadContext,
     accumulator: StdMutex<BilibiliBbdownProgressAccumulator>,
+    v2_window: Option<BilibiliV2ProgressWindow>,
 }
 
 impl BilibiliBbdownProgressSink {
@@ -827,6 +1748,47 @@ impl BilibiliBbdownProgressSink {
         Self {
             context,
             accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: None,
+        }
+    }
+
+    fn for_v2_candidate(
+        context: BilibiliDownloadContext,
+        offset: usize,
+        total: usize,
+        completed_downloaded_bytes: u64,
+        total_bytes_floor: u64,
+    ) -> Self {
+        Self {
+            context,
+            accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: Some(BilibiliV2ProgressWindow {
+                offset,
+                total,
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            }),
+        }
+    }
+
+    fn v2_progress_snapshot(&self) -> BilibiliV2ProgressSnapshot {
+        let Some(window) = self.v2_window else {
+            return BilibiliV2ProgressSnapshot::default();
+        };
+        let accumulator = self
+            .accumulator
+            .lock()
+            .expect("BBDown progress accumulator lock poisoned");
+        let (downloaded_bytes, total_bytes) = accumulator.known_bytes_snapshot();
+        BilibiliV2ProgressSnapshot {
+            downloaded_bytes: window
+                .completed_downloaded_bytes
+                .saturating_add(downloaded_bytes),
+            total_bytes: window.total_bytes_floor.max(
+                window
+                    .completed_downloaded_bytes
+                    .saturating_add(total_bytes.unwrap_or(downloaded_bytes)),
+            ),
         }
     }
 }
@@ -838,10 +1800,49 @@ impl DownloadProgressSink for BilibiliBbdownProgressSink {
             .lock()
             .ok()
             .and_then(|mut accumulator| accumulator.record(event));
-        if let Some(progress) = progress {
+        if let Some(mut progress) = progress {
+            if let Some(window) = self.v2_window {
+                window.map(&mut progress);
+            }
             self.context.report_progress(progress);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct BilibiliV2ProgressWindow {
+    offset: usize,
+    total: usize,
+    completed_downloaded_bytes: u64,
+    total_bytes_floor: u64,
+}
+
+impl BilibiliV2ProgressWindow {
+    fn map(self, progress: &mut BilibiliTaskProgress) {
+        if let Some(fraction) = progress.progress.as_mut() {
+            *fraction = v2_candidate_progress(self.offset, self.total, *fraction);
+        }
+        if let Some(downloaded_bytes) = progress.downloaded_bytes.as_mut() {
+            *downloaded_bytes = to_i64_saturating(
+                self.completed_downloaded_bytes
+                    .saturating_add(nonnegative_i64_to_u64(*downloaded_bytes)),
+            );
+        }
+        if let Some(total_bytes) = progress.total_bytes.as_mut() {
+            *total_bytes = to_i64_saturating(
+                self.total_bytes_floor.max(
+                    self.completed_downloaded_bytes
+                        .saturating_add(nonnegative_i64_to_u64(*total_bytes)),
+                ),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BilibiliV2ProgressSnapshot {
+    downloaded_bytes: u64,
+    total_bytes: u64,
 }
 
 #[derive(Default)]
@@ -2779,6 +3780,7 @@ fn download_options_for_output_dir(
 
     let mut download_options = DownloadOptions::new(output_dir)
         .with_stream_selection(stream_selection_from_options(options))
+        .with_download_mode(download_mode_from_options(options)?)
         .with_cover(options.is_some_and(|options| options.download_cover))
         .with_subtitles(options.is_some_and(|options| options.download_subtitles))
         .with_subtitle_ai_policy(subtitle_ai_policy_from_options(options)?)
@@ -2888,6 +3890,688 @@ fn video_quality_preference(value: &str) -> Option<u32> {
     }
 }
 
+struct V2TaskOutputDirectories {
+    cache_root: PathBuf,
+    staging_path: PathBuf,
+    staging_relative_path: String,
+    published_path: PathBuf,
+    published_relative_path: String,
+}
+
+struct V2CandidateOutputDirectory {
+    path: PathBuf,
+    relative_path: String,
+}
+
+fn v2_candidate_output_directory(
+    directories: &V2TaskOutputDirectories,
+    offset: usize,
+) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+    let candidate_number = offset.checked_add(1).ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Bilibili candidate output directory index overflowed.".to_owned(),
+        )
+    })?;
+    let directory_name = format!("candidate-{candidate_number:05}");
+    let path = directories.staging_path.join(directory_name);
+    let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
+    Ok(V2CandidateOutputDirectory {
+        path,
+        relative_path,
+    })
+}
+
+enum V2CandidateDownloadOutcome {
+    Terminal(Box<TaskResult>),
+    Downloaded {
+        result_id: String,
+        plan: DownloadPlan,
+        report: DownloadReport,
+    },
+}
+
+fn cache_relative_normal_path(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = cache_relative_normal_path_allow_empty(cache_root, path)?;
+    if relative.is_empty() {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path cannot equal the cache root.".to_owned(),
+        ));
+    }
+    Ok(relative)
+}
+
+fn cache_relative_normal_path_allow_empty(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = path.strip_prefix(cache_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "Bilibili output path is outside the configured cache root.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path is not canonical.".to_owned(),
+        ));
+    }
+    relative.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        BilibiliDownloadError::Failed("Bilibili output path is not valid UTF-8.".to_owned())
+    })
+}
+
+fn remap_download_report_root(
+    mut report: DownloadReport,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<DownloadReport, BilibiliDownloadError> {
+    report.output_dir =
+        remap_download_output_path(&report.output_dir, staging_root, published_root)?;
+    for entry in &mut report.entries {
+        entry.directory =
+            remap_download_output_path(&entry.directory, staging_root, published_root)?;
+        for file in &mut entry.files {
+            file.path = remap_download_output_path(&file.path, staging_root, published_root)?;
+        }
+        if let Some(mux) = entry.mux.as_mut() {
+            mux.output_path =
+                remap_download_output_path(&mux.output_path, staging_root, published_root)?;
+        }
+    }
+    Ok(report)
+}
+
+fn remap_download_output_path(
+    path: &Path,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<PathBuf, BilibiliDownloadError> {
+    let relative = path.strip_prefix(staging_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an output path outside its task-owned staging directory.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a noncanonical task output path.".to_owned(),
+        ));
+    }
+    Ok(published_root.join(relative))
+}
+
+struct MappedV2DownloadResult {
+    result: TaskResult,
+    library_item_id: String,
+    resources: Vec<TaskResourceRecord>,
+    resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_lease: Option<LibraryItemPublicationLease>,
+    unpublished_output_paths: Vec<PathBuf>,
+    transient_output_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct RetainedV2DownloadBacking {
+    resources: Vec<TaskResourceRecord>,
+    resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_leases: Vec<LibraryItemPublicationLease>,
+    unpublished_output_paths: Vec<PathBuf>,
+    transient_output_paths: Vec<PathBuf>,
+}
+
+struct MappedV2Artifact {
+    artifact: TaskArtifact,
+    resource: TaskResourceRecord,
+    body: BilibiliTaskResourceBody,
+}
+
+fn retain_v2_success(
+    mapped: MappedV2DownloadResult,
+    primary_library_item_id: &mut String,
+    successful_results: &mut usize,
+    results: &mut Vec<TaskResult>,
+    retained_backing: &mut RetainedV2DownloadBacking,
+) {
+    if primary_library_item_id.is_empty() && !mapped.library_item_id.is_empty() {
+        *primary_library_item_id = mapped.library_item_id.clone();
+    }
+    *successful_results = successful_results.saturating_add(1);
+    retained_backing.resources.extend(mapped.resources);
+    retained_backing
+        .resource_bodies
+        .extend(mapped.resource_bodies);
+    retained_backing
+        .library_item_leases
+        .extend(mapped.library_item_lease);
+    retained_backing
+        .unpublished_output_paths
+        .extend(mapped.unpublished_output_paths);
+    retained_backing
+        .transient_output_paths
+        .extend(mapped.transient_output_paths);
+    results.push(mapped.result);
+}
+
+fn log_v2_candidate_error(
+    task_id: &str,
+    result_id: &str,
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) {
+    let detail = v2_candidate_error_detail_for_log(credentials_configured, error);
+    eprintln!("Bilibili v2 task {task_id} candidate {result_id} failed: {detail}");
+}
+
+fn v2_candidate_error_detail_for_log(
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) -> String {
+    let raw_detail = download_error_detail(error);
+    crate::error_detail_for_log(credentials_configured, &raw_detail)
+}
+
+fn report_v2_candidate_finished(
+    context: &BilibiliDownloadContext,
+    offset: usize,
+    total: usize,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+) {
+    context.report_progress(BilibiliTaskProgress {
+        progress: Some(v2_candidate_progress(offset, total, 1.0)),
+        downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
+        total_bytes: Some(to_i64_saturating(total_bytes.max(downloaded_bytes))),
+        message: Some(format!(
+            "Finished Bilibili download {}/{}.",
+            offset + 1,
+            total
+        )),
+    });
+}
+
+fn bilibili_v2_result_id(task_id: &str, offset: usize) -> String {
+    if offset == 0 {
+        task_id.to_owned()
+    } else {
+        format!("{task_id}-result-{}", offset + 1)
+    }
+}
+
+fn v2_candidate_progress(offset: usize, total: usize, candidate_progress: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    ((offset as f64) + candidate_progress.clamp(0.0, 1.0)) / total as f64
+}
+
+fn download_entry_matches_candidate(
+    entry: &bbdown_core::DownloadEntry,
+    candidate: &BilibiliTaskCandidateRecord,
+) -> bool {
+    let identity = &candidate.identity;
+    identity.aid.is_none_or(|aid| aid == entry.aid)
+        && identity.cid.is_none_or(|cid| cid == entry.cid)
+        && identity.epid.is_none_or(|epid| entry.epid == Some(epid))
+        && identity.bvid.as_deref().is_none_or(|bvid| {
+            entry
+                .bvid
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(bvid))
+        })
+}
+
+fn playable_entry_output_candidates(entry: &EntryDownloadReport) -> Vec<PathBuf> {
+    let mut candidates = entry
+        .mux
+        .iter()
+        .map(|mux| mux.output_path.clone())
+        .collect::<Vec<_>>();
+    candidates.extend(
+        entry
+            .files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    &file.kind,
+                    DownloadFileKind::Video | DownloadFileKind::FlvSegment
+                )
+            })
+            .map(|file| file.path.clone()),
+    );
+    candidates
+}
+
+fn download_report_output_paths(report: &DownloadReport) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &report.entries {
+        for path in entry
+            .mux
+            .iter()
+            .map(|mux| &mux.output_path)
+            .chain(entry.files.iter().map(|file| &file.path))
+        {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
+fn transient_download_output_paths(
+    output_paths: &[PathBuf],
+    library_output_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    output_paths
+        .iter()
+        .filter(|path| Some(path.as_path()) != library_output_path)
+        .cloned()
+        .collect()
+}
+
+async fn cleanup_unpublished_download_report(report: &DownloadReport) {
+    cleanup_unpublished_output_paths(&download_report_output_paths(report)).await;
+}
+
+fn successful_download_result(
+    id: String,
+    candidate: &BilibiliTaskCandidateRecord,
+    library_item_id: String,
+    artifacts: Vec<TaskArtifact>,
+    total_bytes: u64,
+) -> TaskResult {
+    TaskResult {
+        id,
+        state: TaskState::Succeeded.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 1.0,
+            completed_bytes: to_i64_saturating(total_bytes),
+            total_bytes: to_i64_saturating(total_bytes),
+            total_bytes_known: true,
+            phase: "completed".to_owned(),
+            message: "Downloaded into the LAN cache.".to_owned(),
+        }),
+        problem: None,
+        library_item_id,
+        playback_source: None,
+        artifacts,
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn failed_download_result(
+    id: String,
+    candidate: &BilibiliTaskCandidateRecord,
+    error: &BilibiliDownloadError,
+) -> TaskResult {
+    let (category, code, message, retryable) = match error {
+        BilibiliDownloadError::ResourceExhausted(_) => (
+            TaskProblemCategory::ResourceLimit,
+            "bilibili.resource_limit",
+            "The Bilibili download exceeded a server resource limit.",
+            true,
+        ),
+        BilibiliDownloadError::Cancelled(_) => (
+            TaskProblemCategory::Cancelled,
+            "task.cancelled",
+            "Cancelled by request.",
+            false,
+        ),
+        BilibiliDownloadError::Failed(_) => (
+            TaskProblemCategory::Upstream,
+            "bilibili.download_failed",
+            "The Bilibili download failed.",
+            true,
+        ),
+    };
+    TaskResult {
+        id,
+        state: TaskState::Failed.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 0.0,
+            completed_bytes: 0,
+            total_bytes: 0,
+            total_bytes_known: false,
+            phase: "failed".to_owned(),
+            message: "Bilibili download failed.".to_owned(),
+        }),
+        problem: Some(TaskProblem {
+            category: category.into(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            retryable,
+        }),
+        library_item_id: String::new(),
+        playback_source: None,
+        artifacts: Vec::new(),
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn cancelled_download_result(id: String, candidate: &BilibiliTaskCandidateRecord) -> TaskResult {
+    TaskResult {
+        id,
+        state: TaskState::Cancelled.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 0.0,
+            completed_bytes: 0,
+            total_bytes: 0,
+            total_bytes_known: false,
+            phase: "cancelled".to_owned(),
+            message: "Cancelled by request.".to_owned(),
+        }),
+        problem: Some(TaskProblem {
+            category: TaskProblemCategory::Cancelled.into(),
+            code: "task.cancelled".to_owned(),
+            message: "Cancelled by request.".to_owned(),
+            retryable: false,
+        }),
+        library_item_id: String::new(),
+        playback_source: None,
+        artifacts: Vec::new(),
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn task_result_subject(candidate: &BilibiliTaskCandidateRecord) -> TaskResultSubject {
+    TaskResultSubject {
+        provider: "bilibili".to_owned(),
+        kind: candidate.source_kind.clone(),
+        id: candidate.content_id.clone(),
+        index: candidate.index,
+    }
+}
+
+fn task_result_provider_details(
+    candidate: &BilibiliTaskCandidateRecord,
+) -> TaskResultProviderDetails {
+    TaskResultProviderDetails {
+        details: Some(
+            crate::generated::tvos_net_player::v1::task_result_provider_details::Details::Bilibili(
+                BilibiliTaskResultDetails {
+                    identity: Some(proto_candidate_identity(candidate)),
+                    playback_session: None,
+                },
+            ),
+        ),
+    }
+}
+
+fn proto_candidate_identity(
+    candidate: &BilibiliTaskCandidateRecord,
+) -> ProtoBilibiliContentIdentity {
+    use crate::generated::tvos_net_player::v1::BilibiliContentKind as ProtoKind;
+    ProtoBilibiliContentIdentity {
+        kind: match candidate.identity.kind {
+            BilibiliContentKind::VideoPage => ProtoKind::VideoPage.into(),
+            BilibiliContentKind::SeasonEpisode => ProtoKind::SeasonEpisode.into(),
+            BilibiliContentKind::CollectionItem => ProtoKind::CollectionItem.into(),
+        },
+        aid: candidate.identity.aid.unwrap_or_default(),
+        bvid: candidate.identity.bvid.clone().unwrap_or_default(),
+        cid: candidate.identity.cid.unwrap_or_default(),
+        epid: candidate.identity.epid.unwrap_or_default(),
+    }
+}
+
+fn library_media_artifact(entry: &EntryDownloadReport, library_item_id: &str) -> TaskArtifact {
+    let format = entry
+        .mux
+        .as_ref()
+        .and_then(|mux| mux.output_path.extension())
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "media".to_owned());
+    TaskArtifact {
+        id: new_artifact_id(),
+        kind: TaskArtifactKind::Media.into(),
+        state: TaskArtifactState::Available.into(),
+        title: "Media".to_owned(),
+        format,
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: None,
+        problem: None,
+        library_item_id: library_item_id.to_owned(),
+    }
+}
+
+async fn map_sidecar_artifact(
+    file: &bbdown_core::DownloadedFile,
+    index: usize,
+) -> Result<MappedV2Artifact, BilibiliDownloadError> {
+    let metadata = fs::symlink_metadata(&file.path).await.map_err(failed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown sidecar output is not a regular file.".to_owned(),
+        ));
+    }
+    let (kind, title, format, content_type) = sidecar_description(&file.kind, &file.path, index);
+    let resource_id = new_resource_id();
+    let resource = task_resource_record(&resource_id, content_type, metadata.len())?;
+    let artifact = TaskArtifact {
+        id: new_artifact_id(),
+        kind: kind.into(),
+        state: TaskArtifactState::Available.into(),
+        title,
+        format,
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: Some(resource.resource.clone()),
+        problem: None,
+        library_item_id: String::new(),
+    };
+    Ok(MappedV2Artifact {
+        artifact,
+        resource,
+        body: BilibiliTaskResourceBody {
+            resource_id,
+            source: BilibiliTaskResourceBodySource::CachePath(file.path.clone()),
+        },
+    })
+}
+
+fn map_generated_artifact(
+    kind: TaskArtifactKind,
+    title: &str,
+    format: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<MappedV2Artifact, BilibiliDownloadError> {
+    let resource_id = new_resource_id();
+    let size = u64::try_from(body.len()).map_err(failed)?;
+    let resource = task_resource_record(&resource_id, content_type, size)?;
+    let artifact = TaskArtifact {
+        id: new_artifact_id(),
+        kind: kind.into(),
+        state: TaskArtifactState::Available.into(),
+        title: title.to_owned(),
+        format: format.to_owned(),
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: Some(resource.resource.clone()),
+        problem: None,
+        library_item_id: String::new(),
+    };
+    Ok(MappedV2Artifact {
+        artifact,
+        resource,
+        body: BilibiliTaskResourceBody {
+            resource_id,
+            source: BilibiliTaskResourceBodySource::Bytes(body),
+        },
+    })
+}
+
+fn task_resource_record(
+    id: &str,
+    content_type: &str,
+    size: u64,
+) -> Result<TaskResourceRecord, BilibiliDownloadError> {
+    let size_bytes = i64::try_from(size).map_err(|_| {
+        BilibiliDownloadError::ResourceExhausted(
+            "Bilibili artifact is too large to publish.".to_owned(),
+        )
+    })?;
+    TaskResourceRecord::new(CacheResourceRef {
+        id: id.to_owned(),
+        uri: String::new(),
+        content_type: content_type.to_owned(),
+        size_bytes,
+        size_known: true,
+        supports_byte_ranges: true,
+        etag: format!("\"{id}\""),
+        expires_at: None,
+    })
+    .map_err(failed)
+}
+
+fn sidecar_description(
+    kind: &DownloadFileKind,
+    path: &Path,
+    index: usize,
+) -> (TaskArtifactKind, String, String, &'static str) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(|| "bin".to_owned());
+    match kind {
+        DownloadFileKind::Cover => (
+            TaskArtifactKind::CoverImage,
+            "Cover".to_owned(),
+            extension.clone(),
+            image_content_type(&extension),
+        ),
+        DownloadFileKind::Subtitle => (
+            TaskArtifactKind::Subtitle,
+            format!("Subtitle {}", index + 1),
+            extension.clone(),
+            text_content_type(&extension),
+        ),
+        DownloadFileKind::Danmaku => (
+            TaskArtifactKind::TimedComments,
+            "Danmaku XML".to_owned(),
+            "xml".to_owned(),
+            "application/xml",
+        ),
+        DownloadFileKind::DanmakuAss => (
+            TaskArtifactKind::TimedComments,
+            "Danmaku ASS".to_owned(),
+            "ass".to_owned(),
+            "text/x-ass; charset=utf-8",
+        ),
+        _ => (
+            TaskArtifactKind::Other,
+            format!("Artifact {}", index + 1),
+            extension,
+            "application/octet-stream",
+        ),
+    }
+}
+
+fn image_content_type(extension: &str) -> &'static str {
+    match extension {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn text_content_type(extension: &str) -> &'static str {
+    match extension {
+        "json" => "application/json",
+        "ass" => "text/x-ass; charset=utf-8",
+        "srt" => "application/x-subrip; charset=utf-8",
+        "vtt" => "text/vtt; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn new_resource_id() -> String {
+    format!("task-resource-{}", Uuid::new_v4().simple())
+}
+
+fn new_artifact_id() -> String {
+    format!("task-artifact-{}", Uuid::new_v4().simple())
+}
+
+fn download_error_detail(error: &BilibiliDownloadError) -> &str {
+    match error {
+        BilibiliDownloadError::Failed(message)
+        | BilibiliDownloadError::ResourceExhausted(message)
+        | BilibiliDownloadError::Cancelled(message) => message,
+    }
+}
+
+fn download_mode_requires_media(mode: DownloadMode) -> bool {
+    matches!(
+        mode,
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly
+    )
+}
+
+fn sidecar_only_required_artifact_kind(mode: DownloadMode) -> Option<TaskArtifactKind> {
+    match mode {
+        DownloadMode::SubtitleOnly => Some(TaskArtifactKind::Subtitle),
+        DownloadMode::DanmakuOnly => Some(TaskArtifactKind::TimedComments),
+        DownloadMode::CoverOnly => Some(TaskArtifactKind::CoverImage),
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly | _ => None,
+    }
+}
+
+fn download_mode_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<DownloadMode, BilibiliDownloadError> {
+    let mode = options
+        .map(|options| BilibiliDownloadMode::try_from(options.download_mode))
+        .transpose()
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili download mode is unknown to this cache server.".to_owned(),
+            )
+        })?
+        .unwrap_or(BilibiliDownloadMode::Unspecified);
+    Ok(match mode {
+        BilibiliDownloadMode::Unspecified | BilibiliDownloadMode::All => DownloadMode::All,
+        BilibiliDownloadMode::VideoOnly => DownloadMode::VideoOnly,
+        BilibiliDownloadMode::AudioOnly => DownloadMode::AudioOnly,
+        BilibiliDownloadMode::SubtitleOnly => DownloadMode::SubtitleOnly,
+        BilibiliDownloadMode::DanmakuOnly => DownloadMode::DanmakuOnly,
+        BilibiliDownloadMode::CoverOnly => DownloadMode::CoverOnly,
+    })
+}
+
 fn normalized_preference_token(value: &str) -> String {
     value
         .trim()
@@ -2923,6 +4607,18 @@ async fn mux_download_report<F>(
 where
     F: Fn() -> bool,
 {
+    mux_download_report_in_place(&mut report, ffmpeg_path, is_cancel_requested).await?;
+    Ok(report)
+}
+
+async fn mux_download_report_in_place<F>(
+    report: &mut DownloadReport,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+) -> Result<(), BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
     for entry in &mut report.entries {
         if entry.mux.is_some() {
             continue;
@@ -2936,7 +4632,7 @@ where
             entry.mux = Some(mux);
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 async fn mux_entry_media<F>(
@@ -3269,6 +4965,10 @@ fn to_i64_saturating(value: u64) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
 
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    value.try_into().unwrap_or_default()
+}
+
 fn success_message(report: &DownloadReport) -> String {
     let entry_count = report.entries.len();
     if entry_count == 1 {
@@ -3281,10 +4981,208 @@ fn success_message(report: &DownloadReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
+    use bbdown_core::{
+        DownloadArchiveRecord, DownloadedFile, EntryDownloadReport, MuxReport,
+        RestrictedAreaProxyKind,
+    };
     use std::fs as std_fs;
 
     const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+
+    #[test]
+    fn v2_candidate_failure_log_uses_credential_safe_detail() {
+        let marker = "https://example.test/video?access_key=credential-sensitive-marker";
+        let error = BilibiliDownloadError::Failed(marker.to_owned());
+
+        assert!(v2_candidate_error_detail_for_log(false, &error).contains(marker));
+        let safe = v2_candidate_error_detail_for_log(true, &error);
+        assert_eq!(crate::CREDENTIAL_SAFE_LOG_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_candidate_output_cleanup_is_isolated_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        std_fs::create_dir(&cache_root).unwrap();
+        let staging_relative_path = ".tvos-net-player/bbdown-staging/task-1".to_owned();
+        ensure_directory_no_follow(&cache_root, &staging_relative_path).unwrap();
+        let directories = V2TaskOutputDirectories {
+            staging_path: cache_root.join(&staging_relative_path),
+            staging_relative_path,
+            published_path: cache_root.join("Bilibili/task-1"),
+            published_relative_path: "Bilibili/task-1".to_owned(),
+            cache_root: cache_root.clone(),
+        };
+        let failed = v2_candidate_output_directory(&directories, 0).unwrap();
+        let retained = v2_candidate_output_directory(&directories, 1).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &failed.relative_path).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &retained.relative_path).unwrap();
+        std_fs::create_dir(failed.path.join("entry")).unwrap();
+        std_fs::write(failed.path.join("entry/video.m4s"), b"partial").unwrap();
+        std_fs::create_dir(retained.path.join("entry")).unwrap();
+        std_fs::write(retained.path.join("entry/video.mp4"), b"retained").unwrap();
+
+        assert!(
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &failed.relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+            .unwrap()
+        );
+        assert!(!failed.path.exists());
+        assert_eq!(
+            b"retained".to_vec(),
+            std_fs::read(retained.path.join("entry/video.mp4")).unwrap()
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00001",
+            failed.relative_path
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00002",
+            retained.relative_path
+        );
+    }
+
+    #[test]
+    fn v2_download_report_paths_remap_only_from_the_owned_staging_root() {
+        let staging_root = PathBuf::from("cache/.tvos-net-player/bbdown-staging/task-1");
+        let candidate_root = staging_root.join("candidate-00001");
+        let published_root = PathBuf::from("cache/Bilibili/task-1");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: candidate_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: candidate_root.join("entry/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: candidate_root.join("entry/video.mp4"),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+
+        let remapped = remap_download_report_root(report, &staging_root, &published_root)
+            .expect("owned staging paths should remap");
+        assert_eq!(published_root.join("candidate-00001"), remapped.output_dir);
+        assert_eq!(
+            published_root.join("candidate-00001/entry"),
+            remapped.entries[0].directory
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.m4s"),
+            remapped.entries[0].files[0].path
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.mp4"),
+            remapped.entries[0].mux.as_ref().unwrap().output_path
+        );
+
+        let outside_report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: staging_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: staging_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: PathBuf::from("cache/outside/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        assert!(matches!(
+            remap_download_report_root(outside_report, &staging_root, &published_root),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("outside its task-owned staging directory")
+        ));
+    }
+
+    fn v2_test_candidate() -> BilibiliTaskCandidateRecord {
+        BilibiliTaskCandidateRecord {
+            selection_id: "episode:33".to_owned(),
+            title: "Episode 2".to_owned(),
+            subtitle: "Season".to_owned(),
+            source_kind: "season_episode".to_owned(),
+            content_id: "33".to_owned(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::SeasonEpisode,
+                aid: Some(11),
+                bvid: Some("BV1Test".to_owned()),
+                cid: Some(22),
+                epid: Some(33),
+            },
+            index: 2,
+            duration_seconds: Some(90),
+        }
+    }
+
+    fn v2_test_download_entry() -> bbdown_core::DownloadEntry {
+        serde_json::from_value(serde_json::json!({
+            "index": 2,
+            "aid": 11,
+            "bvid": "BV1Test",
+            "cid": 22,
+            "epid": 33,
+            "title": "Episode 2",
+            "source": "normal_web",
+            "streams": {
+                "videos": [],
+                "audios": [],
+                "flv_segments": [],
+                "accept_quality": [],
+                "duration_seconds": 90
+            },
+            "subtitles": [],
+            "chapters": [{
+                "title": "Opening",
+                "start_seconds": 0,
+                "end_seconds": 15
+            }],
+            "danmaku": {
+                "cid": 22,
+                "xml_url": "https://upstream.invalid/private/danmaku.xml"
+            }
+        }))
+        .expect("test download entry should deserialize")
+    }
+
+    fn bilibili_options_with_download_mode(mode: BilibiliDownloadMode) -> BilibiliDownloadOptions {
+        BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
+            download_mode: mode.into(),
+        }
+    }
+
+    fn encoded_message_contains<M: prost::Message>(message: &M, value: &str) -> bool {
+        let encoded = message.encode_to_vec();
+        encoded
+            .windows(value.len())
+            .any(|window| window == value.as_bytes())
+    }
 
     fn assert_progress_near(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("progress should be set");
@@ -3380,6 +5278,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         assert!(validate_supported_download_options(Some(&options)).is_ok());
@@ -3401,6 +5300,7 @@ mod tests {
                 BilibiliDanmakuFormat::Ass.into(),
                 BilibiliDanmakuFormat::Xml.into(),
             ],
+            download_mode: 0,
         };
 
         let download_options =
@@ -3428,6 +5328,46 @@ mod tests {
     }
 
     #[test]
+    fn pr6d_maps_all_v2_download_modes_to_bbdown_core() {
+        let cases = [
+            (BilibiliDownloadMode::Unspecified, DownloadMode::All),
+            (BilibiliDownloadMode::All, DownloadMode::All),
+            (BilibiliDownloadMode::VideoOnly, DownloadMode::VideoOnly),
+            (BilibiliDownloadMode::AudioOnly, DownloadMode::AudioOnly),
+            (
+                BilibiliDownloadMode::SubtitleOnly,
+                DownloadMode::SubtitleOnly,
+            ),
+            (BilibiliDownloadMode::DanmakuOnly, DownloadMode::DanmakuOnly),
+            (BilibiliDownloadMode::CoverOnly, DownloadMode::CoverOnly),
+        ];
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+
+        assert_eq!(download_mode_from_options(None).unwrap(), DownloadMode::All);
+        for (proto_mode, core_mode) in cases {
+            let options = bilibili_options_with_download_mode(proto_mode);
+            assert_eq!(
+                download_mode_from_options(Some(&options)).unwrap(),
+                core_mode
+            );
+            assert_eq!(
+                download_options_for_output_dir(temp.path().to_path_buf(), Some(&options))
+                    .unwrap()
+                    .mode,
+                core_mode
+            );
+        }
+
+        let mut unknown = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        unknown.download_mode = i32::MAX;
+        assert!(matches!(
+            download_mode_from_options(Some(&unknown)),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("download mode is unknown")
+        ));
+    }
+
+    #[test]
     fn rejects_unsupported_encoding_preference() {
         let options = BilibiliDownloadOptions {
             quality_preference: String::new(),
@@ -3439,6 +5379,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3461,6 +5402,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3479,6 +5421,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::OnlyAi.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3501,6 +5444,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: vec![BilibiliDanmakuFormat::Ass.into()],
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3618,6 +5562,697 @@ mod tests {
         assert_eq!(
             Some("living-tv"),
             config.credentials.tv_access_key.as_deref()
+        );
+    }
+
+    #[test]
+    fn pr6d_request_client_config_honors_explicit_api_modes() {
+        let server_options = CacheServerOptions::default();
+        let mut legacy_options = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        legacy_options.prefer_tv_api = true;
+
+        for (api_mode, expected_mode) in [
+            (BilibiliApiMode::Web, PlayurlMode::Web),
+            (BilibiliApiMode::Tv, PlayurlMode::Tv),
+            (BilibiliApiMode::App, PlayurlMode::App),
+        ] {
+            let context = BilibiliRequestContext {
+                api_mode: api_mode.into(),
+                credential_profile_id: String::new(),
+            };
+            let config = bbdown_client_config_for_request(
+                &server_options,
+                Some(&legacy_options),
+                Some(&context),
+            )
+            .expect("explicit API mode should be accepted")
+            .expect("explicit API mode should build a request client");
+            assert_eq!(config.playurl_mode, expected_mode);
+        }
+
+        let legacy_context = BilibiliRequestContext::default();
+        let frozen_context_config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&legacy_context),
+        )
+        .unwrap()
+        .expect("a persisted request context should build an isolated client");
+        assert_eq!(PlayurlMode::Tv, frozen_context_config.playurl_mode);
+        assert_eq!(Credentials::default(), frozen_context_config.credentials);
+
+        let invalid_context = BilibiliRequestContext {
+            api_mode: i32::MAX,
+            credential_profile_id: String::new(),
+        };
+        assert!(matches!(
+            bbdown_client_config_for_request(
+                &server_options,
+                Some(&legacy_options),
+                Some(&invalid_context),
+            ),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("API mode is unknown")
+        ));
+    }
+
+    #[test]
+    fn pr6d_empty_frozen_profile_does_not_adopt_a_later_server_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server_options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        };
+        let context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Web.into(),
+            credential_profile_id: String::new(),
+        };
+
+        let config = bbdown_client_config_for_request(&server_options, None, Some(&context))
+            .expect("frozen no-profile context should be valid")
+            .expect("an explicit API mode should build a request client");
+
+        assert_eq!(PlayurlMode::Web, config.playurl_mode);
+        assert_eq!(Credentials::default(), config.credentials);
+    }
+
+    #[test]
+    fn pr6d_profile_only_request_preserves_legacy_tv_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    },
+                    "living-room": {
+                        "cookie": "SESSDATA=living-room",
+                        "access_key": "living-access",
+                        "tv_access_key": "living-tv"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server_options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        };
+        let mut legacy_options = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        legacy_options.prefer_tv_api = true;
+        let profile_only_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Unspecified.into(),
+            credential_profile_id: "  living-room  ".to_owned(),
+        };
+
+        let config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&profile_only_context),
+        )
+        .expect("profile-only request should build a client")
+        .expect("explicit profile should require a request client");
+
+        assert_eq!(config.playurl_mode, PlayurlMode::Tv);
+        assert_eq!(
+            config.credentials.cookie.as_deref(),
+            Some("SESSDATA=living-room")
+        );
+        assert_eq!(
+            config.credentials.tv_access_key.as_deref(),
+            Some("living-tv")
+        );
+
+        let explicit_app_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::App.into(),
+            credential_profile_id: "living-room".to_owned(),
+        };
+        let app_config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&explicit_app_context),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(app_config.playurl_mode, PlayurlMode::App);
+        assert_eq!(
+            app_config.credentials.access_key.as_deref(),
+            Some("living-access")
+        );
+    }
+
+    #[test]
+    fn pr6d_accepted_candidate_filter_requires_exact_identity() {
+        let entry = v2_test_download_entry();
+        let candidate = v2_test_candidate();
+        assert!(candidate.identity.is_complete());
+        assert!(download_entry_matches_candidate(&entry, &candidate));
+
+        let mut case_insensitive_bvid = candidate.clone();
+        case_insensitive_bvid.identity.bvid = Some("bv1test".to_owned());
+        assert!(download_entry_matches_candidate(
+            &entry,
+            &case_insensitive_bvid
+        ));
+
+        let mut mismatches = Vec::new();
+        for mutate in [
+            |identity: &mut BilibiliContentIdentity| identity.aid = Some(12),
+            |identity: &mut BilibiliContentIdentity| identity.bvid = Some("BV1Other".to_owned()),
+            |identity: &mut BilibiliContentIdentity| identity.cid = Some(23),
+            |identity: &mut BilibiliContentIdentity| identity.epid = Some(34),
+        ] {
+            let mut mismatch = candidate.clone();
+            mutate(&mut mismatch.identity);
+            mismatches.push(mismatch);
+        }
+        assert!(
+            mismatches
+                .iter()
+                .all(|candidate| !download_entry_matches_candidate(&entry, candidate))
+        );
+
+        let mut missing_bvid = entry.clone();
+        missing_bvid.bvid = None;
+        assert!(!download_entry_matches_candidate(&missing_bvid, &candidate));
+    }
+
+    #[test]
+    fn pr6d_v2_result_maps_generic_subject_and_bilibili_identity() {
+        use crate::generated::tvos_net_player::v1::{
+            BilibiliContentKind as ProtoBilibiliContentKind, task_result_provider_details,
+        };
+
+        let mut candidate = v2_test_candidate();
+        candidate.selection_id = "https://upstream.invalid/private/selection".to_owned();
+        let result = successful_download_result(
+            "task-one".to_owned(),
+            &candidate,
+            "library-one".to_owned(),
+            Vec::new(),
+            42,
+        );
+
+        let subject = result
+            .subject
+            .as_ref()
+            .expect("result subject should exist");
+        assert_eq!(subject.provider, "bilibili");
+        assert_eq!(subject.kind, "season_episode");
+        assert_eq!(subject.id, "33");
+        assert_eq!(subject.index, 2);
+
+        let details = result
+            .provider_details
+            .as_ref()
+            .and_then(|details| details.details.as_ref())
+            .expect("provider details should exist");
+        let task_result_provider_details::Details::Bilibili(details) = details;
+        let identity = details
+            .identity
+            .as_ref()
+            .expect("Bilibili identity should exist");
+        assert_eq!(
+            identity.kind,
+            ProtoBilibiliContentKind::SeasonEpisode as i32
+        );
+        assert_eq!(identity.aid, 11);
+        assert_eq!(identity.bvid, "BV1Test");
+        assert_eq!(identity.cid, 22);
+        assert_eq!(identity.epid, 33);
+        assert!(details.playback_session.is_none());
+        assert!(!encoded_message_contains(
+            &result,
+            "https://upstream.invalid/private/selection"
+        ));
+    }
+
+    #[test]
+    fn pr6d_v2_multi_result_helpers_keep_stable_ids_progress_and_partial_states() {
+        let candidate = v2_test_candidate();
+        assert_eq!(bilibili_v2_result_id("task", 0), "task");
+        assert_eq!(bilibili_v2_result_id("task", 1), "task-result-2");
+        assert_eq!(bilibili_v2_result_id("task", 9), "task-result-10");
+        assert_eq!(v2_candidate_progress(0, 2, 0.5), 0.25);
+        assert_eq!(v2_candidate_progress(1, 2, 0.5), 0.75);
+        assert_eq!(v2_candidate_progress(2, 0, 1.0), 0.0);
+
+        let results = [
+            successful_download_result(
+                bilibili_v2_result_id("task", 0),
+                &candidate,
+                "library-one".to_owned(),
+                Vec::new(),
+                100,
+            ),
+            failed_download_result(
+                bilibili_v2_result_id("task", 1),
+                &candidate,
+                &BilibiliDownloadError::Failed("offline failure".to_owned()),
+            ),
+            cancelled_download_result(bilibili_v2_result_id("task", 2), &candidate),
+        ];
+
+        assert_eq!(results[0].state(), TaskState::Succeeded);
+        assert_eq!(results[1].state(), TaskState::Failed);
+        assert_eq!(results[2].state(), TaskState::Cancelled);
+        assert_eq!(results[0].id, "task");
+        assert_eq!(results[1].id, "task-result-2");
+        assert_eq!(results[2].id, "task-result-3");
+        assert!(results.iter().all(|result| result.subject.is_some()));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.provider_details.is_some())
+        );
+        assert_eq!(
+            "The Bilibili download failed.",
+            results[1]
+                .problem
+                .as_ref()
+                .expect("failed result should include a problem")
+                .message
+        );
+        assert!(!encoded_message_contains(&results[1], "offline failure"));
+    }
+
+    #[test]
+    fn v2_candidate_progress_scales_fraction_and_preserves_aggregate_bytes() {
+        let mut first = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_END),
+            downloaded_bytes: Some(100),
+            total_bytes: Some(120),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 0,
+            total: 2,
+            completed_downloaded_bytes: 0,
+            total_bytes_floor: 0,
+        }
+        .map(&mut first);
+        assert_progress_near(first.progress, 0.40);
+        assert_eq!(Some(100), first.downloaded_bytes);
+        assert_eq!(Some(120), first.total_bytes);
+
+        let mut second = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_START),
+            downloaded_bytes: Some(0),
+            total_bytes: Some(0),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 1,
+            total: 2,
+            completed_downloaded_bytes: 100,
+            total_bytes_floor: 120,
+        }
+        .map(&mut second);
+        assert_progress_near(second.progress, 0.55);
+        assert_eq!(Some(100), second.downloaded_bytes);
+        assert_eq!(Some(120), second.total_bytes);
+    }
+
+    #[test]
+    fn v2_task_archive_only_accepts_successful_candidate_state() {
+        let archive_record = |content_key: &str| DownloadArchiveRecord {
+            content_key: content_key.to_owned(),
+            title: content_key.to_owned(),
+            output_dir: PathBuf::from(content_key),
+            completed_at_unix: 1,
+            entries: Vec::new(),
+        };
+        let mut task_archive = V2TaskArchive::default();
+
+        let mut rejected_candidate = task_archive.stage_candidate();
+        rejected_candidate.records.push(archive_record("rejected"));
+        drop(rejected_candidate);
+        assert!(task_archive.stage_candidate().records.is_empty());
+
+        let mut accepted_candidate = task_archive.stage_candidate();
+        accepted_candidate.records.push(archive_record("accepted"));
+        task_archive.accept_candidate(accepted_candidate);
+        assert_eq!(
+            vec!["accepted"],
+            task_archive
+                .stage_candidate()
+                .records
+                .iter()
+                .map(|record| record.content_key.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn v2_transient_outputs_exclude_the_retained_library_media() {
+        let media_path = PathBuf::from("library/video.mp4");
+        let sidecar_path = PathBuf::from("output/video.srt");
+        let output_paths = vec![media_path.clone(), sidecar_path.clone()];
+
+        assert_eq!(
+            vec![sidecar_path],
+            transient_download_output_paths(&output_paths, Some(&media_path))
+        );
+        assert_eq!(
+            output_paths,
+            transient_download_output_paths(&output_paths, None)
+        );
+    }
+
+    #[test]
+    fn v2_retained_backing_preserves_all_successes() {
+        let candidate = v2_test_candidate();
+        let mut results = Vec::new();
+        let mut retained_backing = RetainedV2DownloadBacking::default();
+        let mut primary_library_item_id = String::new();
+        let mut successful_results = 0;
+
+        for (offset, library_item_id) in ["library-one", "library-two"].into_iter().enumerate() {
+            retain_v2_success(
+                MappedV2DownloadResult {
+                    result: successful_download_result(
+                        bilibili_v2_result_id("task", offset),
+                        &candidate,
+                        library_item_id.to_owned(),
+                        Vec::new(),
+                        100,
+                    ),
+                    library_item_id: library_item_id.to_owned(),
+                    resources: Vec::new(),
+                    resource_bodies: Vec::new(),
+                    library_item_lease: None,
+                    unpublished_output_paths: Vec::new(),
+                    transient_output_paths: Vec::new(),
+                },
+                &mut primary_library_item_id,
+                &mut successful_results,
+                &mut results,
+                &mut retained_backing,
+            );
+        }
+
+        assert_eq!(2, successful_results);
+        assert_eq!(2, results.len());
+        assert!(
+            results
+                .iter()
+                .all(|result| result.state() == TaskState::Succeeded)
+        );
+        assert_eq!("library-one", primary_library_item_id);
+    }
+
+    #[tokio::test]
+    async fn pr6d_v2_artifact_resources_do_not_publish_local_or_upstream_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let sidecar_path = temp.path().join("private-local-marker.subtitle.srt");
+        std_fs::write(&sidecar_path, b"subtitle").expect("sidecar should be written");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let mut candidate = v2_test_candidate();
+        candidate.selection_id = "https://upstream.invalid/private/selection".to_owned();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("private-output-marker"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("private-entry-marker"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: sidecar_path.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::SubtitleOnly,
+            )
+            .await
+            .expect("sidecar-only result should map without media or network access");
+
+        assert!(mapped.library_item_id.is_empty());
+        assert_eq!(vec![sidecar_path.clone()], mapped.unpublished_output_paths);
+        assert_eq!(vec![sidecar_path.clone()], mapped.transient_output_paths);
+        assert_eq!(mapped.result.state(), TaskState::Succeeded);
+        assert_eq!(mapped.result.artifacts.len(), 3);
+        assert_eq!(mapped.resources.len(), 3);
+        assert_eq!(mapped.resource_bodies.len(), 3);
+        let private_values = [
+            temp.path().to_string_lossy().into_owned(),
+            "private-local-marker".to_owned(),
+            "https://upstream.invalid/private/selection".to_owned(),
+            "https://upstream.invalid/private/danmaku.xml".to_owned(),
+        ];
+        for private_value in &private_values {
+            assert!(!encoded_message_contains(&mapped.result, private_value));
+            assert!(
+                mapped
+                    .resources
+                    .iter()
+                    .all(|resource| !encoded_message_contains(&resource.resource, private_value))
+            );
+        }
+        assert!(mapped.resources.iter().all(|resource| {
+            resource
+                .resource
+                .uri
+                .starts_with("/resources/task-resource-")
+        }));
+
+        let mut cache_path_bodies = 0;
+        let mut metadata_body_found = false;
+        for body in &mapped.resource_bodies {
+            match &body.source {
+                BilibiliTaskResourceBodySource::CachePath(path) => {
+                    cache_path_bodies += 1;
+                    assert_eq!(path, &sidecar_path);
+                }
+                BilibiliTaskResourceBodySource::Bytes(bytes) => {
+                    let text = std::str::from_utf8(bytes).expect("generated JSON should be UTF-8");
+                    assert!(private_values.iter().all(|value| !text.contains(value)));
+                    let json: serde_json::Value =
+                        serde_json::from_slice(bytes).expect("generated body should be JSON");
+                    metadata_body_found |=
+                        json.get("provider").and_then(|value| value.as_str()) == Some("bilibili");
+                }
+            }
+        }
+        assert_eq!(cache_path_bodies, 1);
+        assert!(metadata_body_found);
+
+        let media_entry = EntryDownloadReport {
+            index: 2,
+            title: "Episode 2".to_owned(),
+            directory: temp.path().join("private-media-entry"),
+            files: Vec::new(),
+            mux: Some(MuxReport {
+                output_path: temp.path().join("private-media-marker.mp4"),
+                command: vec!["https://upstream.invalid/private/media".to_owned()],
+                chapter_count: 0,
+            }),
+        };
+        let media_artifact = library_media_artifact(&media_entry, "library-media-one");
+        assert_eq!(media_artifact.format, "mp4");
+        assert_eq!(media_artifact.library_item_id, "library-media-one");
+        assert!(media_artifact.resource.is_none());
+        assert!(!encoded_message_contains(
+            &media_artifact,
+            "private-media-marker"
+        ));
+        assert!(!encoded_message_contains(
+            &media_artifact,
+            "https://upstream.invalid/private/media"
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_sidecar_only_modes_require_the_requested_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        for (offset, mode) in [
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let report = DownloadReport {
+                title: "Season".to_owned(),
+                output_dir: temp.path().join(format!("empty-sidecar-{offset}")),
+                entries: vec![EntryDownloadReport {
+                    index: 2,
+                    title: "Episode 2".to_owned(),
+                    directory: temp.path().join(format!("empty-entry-{offset}")),
+                    files: Vec::new(),
+                    mux: None,
+                }],
+            };
+
+            let error = match adapter
+                .map_v2_download_result(
+                    format!("task-sidecar-{offset}"),
+                    &candidate,
+                    &plan,
+                    &report,
+                    mode,
+                )
+                .await
+            {
+                Ok(_) => panic!("an empty sidecar-only result must fail"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, BilibiliDownloadError::Failed(message) if message.contains("requested sidecar artifact"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_finalization_removes_outputs_after_cancellation_or_mapping_failure() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        let cancelled_media = temp.path().join("cancelled.mp4");
+        let cancelled_sidecar = temp.path().join("cancelled.srt");
+        std_fs::write(&cancelled_media, b"media").expect("media should be written");
+        std_fs::write(&cancelled_sidecar, b"subtitle").expect("sidecar should be written");
+        let cancelled_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("cancelled-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("cancelled-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: cancelled_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: cancelled_media.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+        let cancelled = adapter
+            .finalize_v2_download_result(
+                "task-cancelled".to_owned(),
+                &candidate,
+                &plan,
+                cancelled_report,
+                DownloadMode::All,
+                true,
+            )
+            .await;
+        assert!(matches!(
+            cancelled,
+            Err(BilibiliDownloadError::Cancelled(_))
+        ));
+        assert!(!cancelled_media.exists());
+        assert!(!cancelled_sidecar.exists());
+
+        let failed_sidecar = temp.path().join("mapping-failed.srt");
+        std_fs::write(&failed_sidecar, b"subtitle").expect("sidecar should be written");
+        let failed_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("failed-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("failed-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: failed_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let failed = adapter
+            .finalize_v2_download_result(
+                "task-failed".to_owned(),
+                &candidate,
+                &plan,
+                failed_report,
+                DownloadMode::VideoOnly,
+                false,
+            )
+            .await;
+        assert!(matches!(failed, Err(BilibiliDownloadError::Failed(_))));
+        assert!(
+            !failed_sidecar.exists(),
+            "mapping failures must remove unpublished BBDown files"
         );
     }
 
@@ -6006,6 +8641,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         }
     }
 
@@ -6020,6 +8656,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         }
     }
 

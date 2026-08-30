@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    io,
-    path::{Path, PathBuf},
+    io::{self, Write},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -19,23 +19,24 @@ use uuid::Uuid;
 use crate::{
     bilibili_resolution::{BilibiliTaskCandidateRecord, MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES},
     generated::tvos_net_player::v1::{
-        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliPlaybackOptions,
-        BilibiliPlaybackSession, BilibiliSubtitleAiPolicy, BilibiliTaskResultItem,
-        BilibiliTaskSelection, PlaybackSource, Task, TaskArtifactState, TaskKind, TaskResult,
-        TaskState,
+        BilibiliApiMode, BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
+        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliRequestContext,
+        BilibiliSubtitleAiPolicy, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource,
+        Task, TaskArtifactState, TaskKind, TaskResult, TaskState,
     },
     hls_cache::HlsCacheStore,
     library::{
-        list_optional_directory_names_no_follow_bounded, open_read_no_follow,
-        remove_empty_directory_no_follow, remove_file_no_follow,
+        decode_item_id, list_optional_directory_names_no_follow_bounded, open_read_no_follow,
+        remove_directory_tree_no_follow, remove_empty_directory_no_follow, remove_file_no_follow,
     },
     task_output::{
         MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord, TaskResourceRecord,
         resource_id_is_canonical,
     },
     task_store::{
-        MAX_PERSISTED_TASKS, PersistedTaskRecord, TaskStateSaveOutcome, TaskStateStore,
-        validate_unique_task_record_identities,
+        MAX_PERSISTED_FILE_CLEANUP_INTENTS, MAX_PERSISTED_TASKS, PersistedFileCleanupIntent,
+        PersistedFileCleanupKind, PersistedTaskRecord, PersistedTaskState, TaskStateSaveOutcome,
+        TaskStateStore, validate_unique_task_record_identities,
     },
 };
 
@@ -47,6 +48,7 @@ const PLAYBACK_PLAYABLE_MESSAGE: &str = "Bilibili playback session is playable."
 const PLAYBACK_COMPLETED_MESSAGE: &str =
     "Bilibili playback session is cached for offline playback.";
 const PLAYBACK_CACHE_DELETED_MESSAGE: &str = "Bilibili playback cache was deleted.";
+const LIBRARY_ITEM_DELETED_MESSAGE: &str = "Cached media was deleted from the library.";
 const REQUEUED_AFTER_RESTART_MESSAGE: &str = "Requeued after cache server restart.";
 const PREPARING_INTERRUPTED_AFTER_RESTART_MESSAGE: &str =
     "Playback planning was interrupted during cache server restart.";
@@ -67,6 +69,54 @@ const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 
 // bodies untouched and disables v2 resource serving until the namespace is repaired.
 const MAX_TASK_RESOURCE_DIRECTORY_NAMES: usize = MAX_REGISTERED_TASK_RESOURCES + MAX_TASK_RESOURCES;
 const MAX_TASK_PERSISTENCE_CLONE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH: usize = 64;
+
+// Staged publication protects the destination object's identity and the bytes installed in that
+// object. Exclusive fd-relative creation plus device/inode revalidation protects identity; the
+// expected size and read-only access policy protect the synchronized bytes against accidental
+// reuse or later writes through this API. Directory metadata churn is not treated as content
+// mutation, and copying from an already-open no-follow source decouples published bytes from later
+// replacement of the source pathname.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagedResourceBodyIdentity {
+    device_id: u64,
+    inode: u64,
+    size_bytes: u64,
+    mode: u32,
+}
+
+impl StagedResourceBodyIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged task resource destination is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            size_bytes: metadata.len(),
+            mode: metadata.mode(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure staged task resource creation is not implemented on this platform",
+        ))
+    }
+
+    fn same_object(self, other: Self) -> bool {
+        self.device_id == other.device_id && self.inode == other.inode
+    }
+}
 
 pub(crate) fn is_known_safe_cancellation_message(message: &str) -> bool {
     matches!(
@@ -103,6 +153,7 @@ pub struct BilibiliTaskRegistry {
     retention_policy: TaskRetentionPolicy,
     resource_root_path: Option<PathBuf>,
     resource_cleanup_lock: Mutex<()>,
+    file_cleanup_lock: Mutex<()>,
     resource_storage_available: AtomicBool,
     orphan_resource_scan_pending: AtomicBool,
 }
@@ -114,6 +165,28 @@ pub(crate) struct StagedTaskOutputReplacement<'a> {
     resources: Option<Vec<TaskResourceRecord>>,
     resource_ids: Option<HashSet<String>>,
     resource_body_creation_ids: HashSet<String>,
+    created_resource_body_identities: Mutex<HashMap<String, StagedResourceBodyIdentity>>,
+}
+
+struct StagedDownloadTerminalCommit<'a> {
+    results: Vec<TaskResult>,
+    resources: Vec<TaskResourceRecord>,
+    candidate_resource_ids: &'a HashSet<String>,
+    terminal_state: TaskState,
+    library_item_id: String,
+    message: String,
+    transient_output_paths: Vec<PathBuf>,
+    owned_directory_cleanup_paths: Vec<PathBuf>,
+}
+
+struct BilibiliPlaybackTaskRecordRequest<'a> {
+    source: &'a str,
+    options: Option<BilibiliPlaybackOptions>,
+    request_context: Option<BilibiliRequestContext>,
+    selection: Option<BilibiliTaskSelection>,
+    title: String,
+    candidates: Vec<BilibiliTaskCandidateRecord>,
+    defer_planning_until_durable: bool,
 }
 
 #[allow(dead_code)]
@@ -131,6 +204,7 @@ impl<'a> StagedTaskOutputReplacement<'a> {
             resources: Some(resources),
             resource_ids: Some(resource_ids),
             resource_body_creation_ids,
+            created_resource_body_identities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -145,6 +219,173 @@ impl<'a> StagedTaskOutputReplacement<'a> {
                 self.resource_body_creation_ids
                     .contains(&resource.resource.id)
             })
+    }
+
+    pub(crate) fn copy_resource_body_from_cache_path(
+        &self,
+        resource_id: &str,
+        source_path: &Path,
+    ) -> io::Result<()> {
+        self.copy_resource_body_from_cache_path_with_hook(resource_id, source_path, || {})
+    }
+
+    fn copy_resource_body_from_cache_path_with_hook(
+        &self,
+        resource_id: &str,
+        source_path: &Path,
+        after_source_open: impl FnOnce(),
+    ) -> io::Result<()> {
+        let resource = self.resource_requiring_body_creation(resource_id)?;
+        let mut source = self.registry.open_cache_source_no_follow(source_path)?;
+        let source_metadata = source.metadata()?;
+        if !source_metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staged task resource source is not a regular file",
+            ));
+        }
+        after_source_open();
+        let expected_source_size = source_metadata.len();
+        let identity = self
+            .registry
+            .create_staged_resource_body(resource, |body| {
+                let copied = io::copy(&mut source, body)?;
+                if copied != expected_source_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "staged task resource source changed size while it was copied",
+                    ));
+                }
+                Ok(copied)
+            })?;
+        self.record_created_resource_body_identity(resource_id, identity)
+    }
+
+    pub(crate) fn write_resource_body(&self, resource_id: &str, bytes: &[u8]) -> io::Result<()> {
+        let resource = self.resource_requiring_body_creation(resource_id)?;
+        let identity = self
+            .registry
+            .create_staged_resource_body(resource, |body| {
+                body.write_all(bytes)?;
+                u64::try_from(bytes.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "staged task resource body size cannot be represented",
+                    )
+                })
+            })?;
+        self.record_created_resource_body_identity(resource_id, identity)
+    }
+
+    pub(crate) fn commit_download_terminal(
+        mut self,
+        results: Vec<TaskResult>,
+        terminal_state: TaskState,
+        library_item_id: String,
+        message: String,
+        transient_output_paths: Vec<PathBuf>,
+        owned_directory_cleanup_paths: Vec<PathBuf>,
+    ) -> Result<Task, Status> {
+        if !matches!(
+            terminal_state,
+            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
+        ) {
+            return Err(Status::invalid_argument(
+                "Download terminal publication requires succeeded, failed, or cancelled state.",
+            ));
+        }
+        self.validate_created_resource_body_identities()?;
+        let resources = self
+            .resources
+            .take()
+            .expect("staged task output resources must be committed once");
+        let outcome = self.registry.commit_staged_download_terminal(
+            &self.task_id,
+            StagedDownloadTerminalCommit {
+                results,
+                resources,
+                candidate_resource_ids: self
+                    .resource_ids
+                    .as_ref()
+                    .expect("staged task output resource ids must remain registered"),
+                terminal_state,
+                library_item_id,
+                message,
+                transient_output_paths,
+                owned_directory_cleanup_paths,
+            },
+        );
+        if outcome.is_ok() {
+            self.disarm();
+        }
+        outcome
+    }
+
+    fn resource_requiring_body_creation(
+        &self,
+        resource_id: &str,
+    ) -> io::Result<&TaskResourceRecord> {
+        if !self.resource_body_creation_ids.contains(resource_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "task resource id does not require staged body creation",
+            ));
+        }
+        self.resources
+            .as_deref()
+            .expect("staged task output resources must remain available before commit")
+            .iter()
+            .find(|resource| resource.resource.id == resource_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "task resource id is outside this staged output",
+                )
+            })
+    }
+
+    fn record_created_resource_body_identity(
+        &self,
+        resource_id: &str,
+        identity: StagedResourceBodyIdentity,
+    ) -> io::Result<()> {
+        let previous = self
+            .created_resource_body_identities
+            .lock()
+            .expect("staged resource body identity lock poisoned")
+            .insert(resource_id.to_owned(), identity);
+        if previous.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "task resource body was already created by this stage",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_created_resource_body_identities(&self) -> Result<(), Status> {
+        let identities = self
+            .created_resource_body_identities
+            .lock()
+            .expect("staged resource body identity lock poisoned");
+        for resource_id in &self.resource_body_creation_ids {
+            let identity = identities.get(resource_id).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "Task resource body was not created through this stage: {resource_id}."
+                ))
+            })?;
+            let resource = self
+                .resource_requiring_body_creation(resource_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            self.registry
+                .validate_staged_resource_body_identity(resource, *identity)
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "Task resource body changed before publication: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn commit(mut self, results: Vec<TaskResult>) -> Result<Task, Status> {
@@ -201,8 +442,8 @@ impl BilibiliTaskRegistry {
         resource_root_path: Option<PathBuf>,
     ) -> Self {
         let store = TaskStateStore::new(path);
-        let records = match store.load() {
-            Ok(records) => records,
+        let state = match store.load_state() {
+            Ok(state) => state,
             Err(error) => {
                 eprintln!(
                     "Failed to load persisted Bilibili task state from {}; task state writeback is disabled for this process; repair the snapshot and restart the cache server: {error}",
@@ -218,8 +459,8 @@ impl BilibiliTaskRegistry {
                 .expect("empty persisted task records should be valid");
             }
         };
-        let registry = match Self::from_persisted_records(
-            records,
+        let registry = match Self::from_persisted_state(
+            state,
             Some(store.clone()),
             true,
             retention_policy.clone(),
@@ -243,6 +484,7 @@ impl BilibiliTaskRegistry {
         };
         registry.persist_current_state();
         registry.retire_expired_task_resources();
+        registry.retry_pending_file_cleanups();
         registry
     }
 
@@ -319,6 +561,7 @@ impl BilibiliTaskRegistry {
             library_item_id: String::new(),
             playback_source: None,
             playback_session: None,
+            identity: None,
         }];
     }
 
@@ -351,7 +594,8 @@ impl BilibiliTaskRegistry {
 
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        let active_key = ActiveBilibiliTaskKey::download(&normalized_source, options.as_ref());
+        let active_key =
+            ActiveBilibiliTaskKey::download(&normalized_source, options.as_ref(), None, &[]);
         if let Some(active_task_id) = inner.active_task_ids_by_key.get(&active_key)
             && let Some(active_task) = inner.tasks_by_id.get(active_task_id)
             && is_active(active_task.state())
@@ -405,26 +649,120 @@ impl BilibiliTaskRegistry {
         Ok(task)
     }
 
+    pub(crate) fn create_bilibili_download_task_v2(
+        &self,
+        source: &str,
+        options: Option<BilibiliDownloadOptions>,
+        request_context: Option<BilibiliRequestContext>,
+        title: String,
+        candidates: Vec<BilibiliTaskCandidateRecord>,
+    ) -> Result<Task, Status> {
+        if !self.persistence_available() {
+            return Err(Status::failed_precondition(
+                "Durable task state is unavailable for Bilibili task v2.",
+            ));
+        }
+        validate_v2_candidate_batch(&candidates, "download")?;
+        let normalized_source = normalize(source);
+        if normalized_source.is_empty() {
+            return Err(Status::invalid_argument("Bilibili URL or id is required."));
+        }
+        let options = concrete_bilibili_v2_download_options(options)?;
+        let request_context = concrete_bilibili_v2_request_context(request_context)?;
+
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let active_key = ActiveBilibiliTaskKey::download(
+            &normalized_source,
+            Some(&options),
+            Some(&request_context),
+            &candidates,
+        );
+        if let Some(active_task_id) = inner.active_task_ids_by_key.get(&active_key)
+            && let Some(active_task) = inner.tasks_by_id.get(active_task_id)
+            && is_active(active_task.state())
+        {
+            return Ok(active_task.clone());
+        }
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        let now = current_timestamp();
+        let task_id = format!("bilibili-{}", Uuid::new_v4().simple());
+        let mut task = Task {
+            id: task_id.clone(),
+            kind: TaskKind::BilibiliDownload.into(),
+            state: TaskState::Queued.into(),
+            source: normalized_source,
+            title,
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            message: QUEUED_MESSAGE.to_owned(),
+            library_item_id: String::new(),
+            created_at: Some(copy_timestamp(&now)),
+            updated_at: Some(now),
+            finished_at: None,
+            playback_source: None,
+            playback_session: None,
+            bilibili_selection: None,
+            result_items: initial_bilibili_result_items(
+                &task_id,
+                &candidates,
+                TaskState::Queued,
+                QUEUED_MESSAGE,
+            ),
+            output_summary: None,
+        };
+        let output = TaskOutputRecord::from_legacy_task(&task);
+        task.output_summary = Some(output.summary());
+
+        inner
+            .active_task_ids_by_key
+            .insert(active_key, task.id.clone());
+        inner
+            .download_options_by_id
+            .insert(task.id.clone(), Some(options));
+        inner
+            .request_context_by_id
+            .insert(task.id.clone(), Some(request_context));
+        inner
+            .bilibili_candidates_by_id
+            .insert(task.id.clone(), candidates);
+        inner.queued_task_ids.push_back(task.id.clone());
+        inner.outputs_by_task_id.insert(task.id.clone(), output);
+        inner.tasks_by_id.insert(task.id.clone(), task.clone());
+        Self::stage_publication_locked(&mut inner, task.clone());
+        let outcome = self.persist_and_publish_pending(inner, true, Some(checkpoint));
+        if !outcome.is_committed() {
+            return Err(Status::unavailable(
+                "Bilibili task v2 creation could not be committed.",
+            ));
+        }
+        self.queue_notify.notify_one();
+        Ok(task)
+    }
+
     pub fn create_bilibili_playback_task(
         &self,
         source: &str,
         options: Option<BilibiliPlaybackOptions>,
         selection: Option<BilibiliTaskSelection>,
     ) -> Result<BilibiliPlaybackTaskCreation, Status> {
-        self.create_bilibili_playback_task_record(
+        self.create_bilibili_playback_task_record(BilibiliPlaybackTaskRecordRequest {
             source,
             options,
+            request_context: None,
             selection,
-            String::new(),
-            Vec::new(),
-            false,
-        )
+            title: String::new(),
+            candidates: Vec::new(),
+            defer_planning_until_durable: false,
+        })
     }
 
     pub(crate) fn create_bilibili_playback_task_v2(
         &self,
         source: &str,
         options: Option<BilibiliPlaybackOptions>,
+        request_context: Option<BilibiliRequestContext>,
         title: String,
         candidates: Vec<BilibiliTaskCandidateRecord>,
     ) -> Result<BilibiliPlaybackTaskCreation, Status> {
@@ -433,28 +771,31 @@ impl BilibiliTaskRegistry {
                 "Durable task state is unavailable for Bilibili resolution v2.",
             ));
         }
-        if candidates.is_empty() {
-            return Err(Status::invalid_argument(
-                "Bilibili resolution selection must contain at least one candidate.",
-            ));
-        }
-        if candidates.len() > MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES {
-            return Err(Status::resource_exhausted(format!(
-                "A Bilibili playback task cannot exceed {MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES} candidates."
-            )));
-        }
-        self.create_bilibili_playback_task_record(source, options, None, title, candidates, true)
+        validate_v2_candidate_batch(&candidates, "playback")?;
+        self.create_bilibili_playback_task_record(BilibiliPlaybackTaskRecordRequest {
+            source,
+            options,
+            request_context,
+            selection: None,
+            title,
+            candidates,
+            defer_planning_until_durable: true,
+        })
     }
 
     fn create_bilibili_playback_task_record(
         &self,
-        source: &str,
-        options: Option<BilibiliPlaybackOptions>,
-        selection: Option<BilibiliTaskSelection>,
-        title: String,
-        candidates: Vec<BilibiliTaskCandidateRecord>,
-        defer_planning_until_durable: bool,
+        request: BilibiliPlaybackTaskRecordRequest<'_>,
     ) -> Result<BilibiliPlaybackTaskCreation, Status> {
+        let BilibiliPlaybackTaskRecordRequest {
+            source,
+            options,
+            request_context,
+            selection,
+            title,
+            candidates,
+            defer_planning_until_durable,
+        } = request;
         let normalized_source = normalize(source);
         if normalized_source.is_empty() {
             return Err(Status::invalid_argument("Bilibili URL or id is required."));
@@ -462,32 +803,39 @@ impl BilibiliTaskRegistry {
 
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let active_key = defer_planning_until_durable.then(|| {
+            ActiveBilibiliTaskKey::playback(
+                &normalized_source,
+                options.as_ref(),
+                request_context.as_ref(),
+                &candidates,
+            )
+        });
+        if let Some(active_key) = active_key.as_ref()
+            && let Some(active_task_id) = inner.active_task_ids_by_key.get(active_key)
+            && let Some(active_task) = inner.tasks_by_id.get(active_task_id)
+            && is_active(active_task.state())
+        {
+            return Ok(BilibiliPlaybackTaskCreation {
+                task: active_task.clone(),
+                created: false,
+                cancellation: inner
+                    .planning_cancellations_by_id
+                    .get(active_task_id)
+                    .cloned(),
+                requires_persistence_recovery: false,
+            });
+        }
         let durability_required = self.persistence.is_some();
         let checkpoint = durability_required.then(|| RegistryMutationCheckpoint::capture(&inner));
         let now = current_timestamp();
         let task_id = format!("bilibili-playback-{}", Uuid::new_v4().simple());
-        let result_items = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| BilibiliTaskResultItem {
-                id: if index == 0 {
-                    task_id.clone()
-                } else {
-                    format!("{task_id}-result-{}", index + 1)
-                },
-                selection_id: String::new(),
-                title: candidate.title.clone(),
-                subtitle: candidate.subtitle.clone(),
-                source_kind: candidate.source_kind.clone(),
-                content_id: candidate.content_id.clone(),
-                index: candidate.index,
-                state: TaskState::Preparing.into(),
-                message: "Queued for Bilibili playback planning.".to_owned(),
-                library_item_id: String::new(),
-                playback_source: None,
-                playback_session: None,
-            })
-            .collect();
+        let result_items = initial_bilibili_result_items(
+            &task_id,
+            &candidates,
+            TaskState::Preparing,
+            "Queued for Bilibili playback planning.",
+        );
         let mut task = Task {
             id: task_id,
             kind: TaskKind::BilibiliProgressivePlayback.into(),
@@ -514,10 +862,20 @@ impl BilibiliTaskRegistry {
         inner
             .playback_options_by_id
             .insert(task.id.clone(), options.clone());
+        if defer_planning_until_durable {
+            inner
+                .request_context_by_id
+                .insert(task.id.clone(), request_context);
+        }
         if !candidates.is_empty() {
             inner
                 .bilibili_candidates_by_id
                 .insert(task.id.clone(), candidates);
+        }
+        if let Some(active_key) = active_key {
+            inner
+                .active_task_ids_by_key
+                .insert(active_key, task.id.clone());
         }
         let cancellation = BilibiliTaskCancellation::default();
         inner
@@ -613,6 +971,17 @@ impl BilibiliTaskRegistry {
         Ok(snapshot)
     }
 
+    pub(crate) fn task_output_snapshot_is_current(&self, snapshot: &TaskOutputSnapshot) -> bool {
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .visible_outputs_by_task_id
+            .get(&snapshot.task_id)
+            .is_some_and(|current| {
+                current.record.revision == snapshot.revision
+                    && current.record.snapshot_id == snapshot.snapshot_id
+            })
+    }
+
     /// Claims resource IDs against cleanup before PR6D's adapter creates any body files.
     /// Bodies must be created only after this returns and while the returned claim remains alive.
     #[allow(dead_code)]
@@ -660,6 +1029,320 @@ impl BilibiliTaskRegistry {
             ));
         }
         Ok(staged)
+    }
+
+    fn open_cache_source_no_follow(&self, source_path: &Path) -> io::Result<File> {
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "task resource storage root is not configured",
+            )
+        })?;
+        let relative_path = cache_relative_path(resource_root_path, source_path)?;
+        open_read_no_follow(resource_root_path, &relative_path)
+    }
+
+    fn file_cleanup_intents_for_paths(
+        &self,
+        kind: PersistedFileCleanupKind,
+        owner_id: &str,
+        paths: &[PathBuf],
+    ) -> Result<Vec<PersistedFileCleanupIntent>, Status> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            Status::failed_precondition("File cleanup storage root is not configured.")
+        })?;
+        let mut intents = HashSet::with_capacity(paths.len());
+        for path in paths {
+            let relative_path = cache_relative_path(resource_root_path, path).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "Bilibili cleanup output is outside the configured cache root: {error}"
+                ))
+            })?;
+            let intent = PersistedFileCleanupIntent::new(kind, owner_id, relative_path)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            intents.insert(intent);
+        }
+        if intents.len() > MAX_PERSISTED_FILE_CLEANUP_INTENTS {
+            return Err(Status::resource_exhausted(
+                "Bilibili output produced too many pending file cleanups.",
+            ));
+        }
+        let mut intents = intents.into_iter().collect::<Vec<_>>();
+        intents.sort();
+        Ok(intents)
+    }
+
+    pub(crate) fn register_bilibili_owned_output_directories(
+        &self,
+        task_id: &str,
+        paths: &[PathBuf],
+    ) -> Result<(), Status> {
+        if self.persistence.is_none() {
+            return Err(Status::failed_precondition(
+                "Durable task state is required before creating Bilibili output.",
+            ));
+        }
+        let normalized_id = normalize_required_id(task_id)?;
+        let intents = self.file_cleanup_intents_for_paths(
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            paths,
+        )?;
+        if intents.is_empty() {
+            return Err(Status::invalid_argument(
+                "At least one Bilibili output directory is required.",
+            ));
+        }
+
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .ok_or_else(task_not_found)?;
+        if task.kind() != TaskKind::BilibiliDownload
+            || task.state() != TaskState::Running
+            || inner
+                .bilibili_candidates_by_id
+                .get(&normalized_id)
+                .is_none_or(|candidates| candidates.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "Only a running Bilibili v2 download can own output directories.",
+            ));
+        }
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            intents,
+        )?;
+        let outcome =
+            self.persist_and_publish_pending_with_policy(inner, true, Some(checkpoint), true);
+        if !outcome.is_durable() {
+            return Err(Status::unavailable(
+                "Bilibili output directory ownership could not be persisted durably.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retry_file_cleanup_intents_for_owner(
+        &self,
+        kind: PersistedFileCleanupKind,
+        owner_id: &str,
+    ) -> Result<bool, Status> {
+        self.retry_file_cleanup_intents(Some((kind, owner_id)))
+    }
+
+    fn retry_pending_file_cleanups(&self) -> bool {
+        match self.retry_file_cleanup_intents(None) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("Failed to retry pending cache file cleanup: {error}");
+                false
+            }
+        }
+    }
+
+    fn retry_file_cleanup_intents(
+        &self,
+        owner: Option<(PersistedFileCleanupKind, &str)>,
+    ) -> Result<bool, Status> {
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            Status::failed_precondition("File cleanup storage root is not configured.")
+        })?;
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let candidates = {
+            let inner = self.inner.lock().expect("task registry lock poisoned");
+            inner
+                .pending_file_cleanup_intents
+                .iter()
+                .filter(|intent| {
+                    owner.is_none_or(|(kind, owner_id)| {
+                        intent.kind == kind && intent.owner_id == owner_id
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        // A cleanup intent owns a logical cache-relative pathname until it is cleared. No-follow
+        // traversal protects containment and the no-symlink traversal policy. Object/content
+        // identity is not the protected property because a replacement at that still-owned
+        // pathname remains stale output; a type or traversal-policy change fails and leaves the
+        // intent for retry.
+        let mut completed = Vec::new();
+        let mut removed_any = false;
+        let mut cleanup_failed = false;
+        for intent in candidates {
+            let removal = match intent.kind {
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory => {
+                    remove_directory_tree_no_follow(
+                        resource_root_path,
+                        &intent.relative_path,
+                        MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES,
+                        MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH,
+                    )
+                }
+                PersistedFileCleanupKind::BilibiliTransientOutput
+                | PersistedFileCleanupKind::LocalLibraryItem => {
+                    remove_file_no_follow(resource_root_path, &intent.relative_path)
+                }
+            };
+            match removal {
+                Ok(removed) => {
+                    removed_any |= removed;
+                    completed.push(intent);
+                }
+                Err(error) => {
+                    cleanup_failed = true;
+                    eprintln!(
+                        "Failed to remove pending cache output for {}: {error}",
+                        intent.owner_id
+                    );
+                }
+            }
+        }
+
+        if !completed.is_empty() {
+            let _mutation_guard = self.mutation_guard();
+            let mut inner = self.inner.lock().expect("task registry lock poisoned");
+            let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+            for intent in completed {
+                inner.pending_file_cleanup_intents.remove(&intent);
+            }
+            let durability_required = self.persistence.is_some();
+            let checkpoint = durability_required.then_some(checkpoint);
+            let outcome = self.persist_and_publish_pending_with_policy(
+                inner,
+                durability_required,
+                checkpoint,
+                true,
+            );
+            if durability_required && !outcome.is_durable() {
+                return Err(Status::unavailable(
+                    "Completed file cleanup could not be cleared durably.",
+                ));
+            }
+        }
+
+        if cleanup_failed {
+            return Err(Status::internal(
+                "One or more pending cache files could not be removed.",
+            ));
+        }
+        Ok(removed_any)
+    }
+
+    fn create_staged_resource_body(
+        &self,
+        resource: &TaskResourceRecord,
+        writer: impl FnOnce(&mut File) -> io::Result<u64>,
+    ) -> io::Result<StagedResourceBodyIdentity> {
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "task resource storage root is not configured",
+            )
+        })?;
+        let relative_path = resource.relative_path();
+        let (mut body, directories_to_sync) =
+            create_resource_body_exclusive(resource_root_path, &relative_path)?;
+        let created_identity = StagedResourceBodyIdentity::from_metadata(&body.metadata()?)?;
+
+        let write_result = (|| {
+            let written = writer(&mut body)?;
+            validate_resource_body_size(resource, written)?;
+            let metadata = body.metadata()?;
+            let final_identity = StagedResourceBodyIdentity::from_metadata(&metadata)?;
+            if !created_identity.same_object(final_identity) || final_identity.size_bytes != written
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "staged task resource destination identity or size changed while writing",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                body.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+            }
+            body.sync_all()?;
+            for directory in directories_to_sync.iter().rev() {
+                directory.sync_all()?;
+            }
+            let published_identity = StagedResourceBodyIdentity::from_metadata(&body.metadata()?)?;
+            if !created_identity.same_object(published_identity)
+                || published_identity.size_bytes != written
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "staged task resource destination changed before it was synchronized",
+                ));
+            }
+            Ok(published_identity)
+        })();
+
+        match write_result {
+            Ok(identity) => Ok(identity),
+            Err(error) => {
+                drop(body);
+                remove_created_resource_body_if_same(
+                    resource_root_path,
+                    resource,
+                    created_identity,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_staged_resource_body_identity(
+        &self,
+        resource: &TaskResourceRecord,
+        expected_identity: StagedResourceBodyIdentity,
+    ) -> io::Result<()> {
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "task resource storage root is not configured",
+            )
+        })?;
+        let body = open_read_no_follow(resource_root_path, &resource.relative_path())?;
+        let metadata = body.metadata()?;
+        let actual_identity = StagedResourceBodyIdentity::from_metadata(&metadata)?;
+        if !expected_identity.same_object(actual_identity)
+            || expected_identity.size_bytes != actual_identity.size_bytes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged task resource destination object was replaced or mutated",
+            ));
+        }
+        validate_resource_body_size(resource, actual_identity.size_bytes)?;
+        #[cfg(unix)]
+        if actual_identity.mode & 0o222 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staged task resource destination regained write permission",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -756,6 +1439,228 @@ impl BilibiliTaskRegistry {
         if !outcome.is_committed() {
             return Err(Status::unavailable(
                 "Task output could not be persisted durably.",
+            ));
+        }
+        Ok(task)
+    }
+
+    fn commit_staged_download_terminal(
+        &self,
+        id: &str,
+        commit: StagedDownloadTerminalCommit<'_>,
+    ) -> Result<Task, Status> {
+        let StagedDownloadTerminalCommit {
+            results,
+            resources,
+            candidate_resource_ids,
+            terminal_state,
+            library_item_id,
+            message,
+            transient_output_paths,
+            owned_directory_cleanup_paths,
+        } = commit;
+        if !matches!(
+            terminal_state,
+            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
+        ) {
+            return Err(Status::invalid_argument(
+                "Download terminal publication requires succeeded, failed, or cancelled state.",
+            ));
+        }
+        self.retire_expired_task_resources_except(candidate_resource_ids);
+        if !self
+            .resource_storage_available
+            .load(AtomicOrdering::Acquire)
+        {
+            return Err(Status::failed_precondition(
+                "Task resource storage is unavailable.",
+            ));
+        }
+        let normalized_id = normalize_required_id(id)?;
+        let transient_cleanup_intents = self.file_cleanup_intents_for_paths(
+            PersistedFileCleanupKind::BilibiliTransientOutput,
+            &normalized_id,
+            &transient_output_paths,
+        )?;
+        let owned_directory_cleanup_intents = self.file_cleanup_intents_for_paths(
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            &owned_directory_cleanup_paths,
+        )?;
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let current_task = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .ok_or_else(task_not_found)?;
+        if current_task.kind() != TaskKind::BilibiliDownload {
+            return Err(Status::failed_precondition(
+                "Task is not a Bilibili download task.",
+            ));
+        }
+        if is_terminal(current_task.state()) {
+            return Ok(inner
+                .visible_tasks_by_id
+                .get(&normalized_id)
+                .unwrap_or(current_task)
+                .clone());
+        }
+        if current_task.state() == TaskState::CancelRequested
+            && terminal_state != TaskState::Cancelled
+        {
+            return Err(Status::cancelled(
+                "Task cancellation won before Bilibili output publication.",
+            ));
+        }
+        prune_expired_resource_snapshots_locked(&mut inner, Instant::now());
+        validate_task_output_resource_claims_locked(
+            &inner,
+            &normalized_id,
+            &resources,
+            candidate_resource_ids,
+            true,
+        )?;
+        let preferred_primary_result_id = if library_item_id.is_empty() {
+            None
+        } else {
+            Some(
+                results
+                    .iter()
+                    .find(|result| {
+                        result.library_item_id == library_item_id
+                            && matches!(result.state(), TaskState::Succeeded | TaskState::Completed)
+                    })
+                    .ok_or_else(|| {
+                        Status::invalid_argument(
+                            "Download primary library item must belong to a successful result.",
+                        )
+                    })?
+                    .id
+                    .clone(),
+            )
+        };
+        let output = TaskOutputRecord::replace_with_primary_result(
+            inner.outputs_by_task_id.get(&normalized_id),
+            results,
+            resources,
+            preferred_primary_result_id.as_deref(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let legacy_result_updates = output
+            .results
+            .iter()
+            .map(|result| {
+                (
+                    result.id.clone(),
+                    (
+                        result.state,
+                        result.library_item_id.clone(),
+                        result
+                            .problem
+                            .as_ref()
+                            .map(|problem| problem.message.clone())
+                            .unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::BilibiliTransientOutput,
+            &normalized_id,
+            transient_cleanup_intents,
+        )?;
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            owned_directory_cleanup_intents,
+        )?;
+        let retained_ids = output
+            .resources
+            .iter()
+            .map(|resource| resource.resource.id.as_str())
+            .collect::<HashSet<_>>();
+        let retired_ids = inner
+            .outputs_by_task_id
+            .get(&normalized_id)
+            .into_iter()
+            .flat_map(|previous| &previous.resources)
+            .filter(|resource| !retained_ids.contains(resource.resource.id.as_str()))
+            .map(|resource| resource.resource.id.clone())
+            .collect::<Vec<_>>();
+        inner.pending_resource_cleanup_ids.extend(retired_ids);
+        inner
+            .outputs_by_task_id
+            .insert(normalized_id.clone(), output);
+        let summary = inner
+            .outputs_by_task_id
+            .get(&normalized_id)
+            .expect("inserted task output must exist")
+            .summary();
+
+        let task = {
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_id)
+                .expect("validated download task must remain present");
+            let effective_state = if task.state() == TaskState::CancelRequested {
+                TaskState::Cancelled
+            } else {
+                terminal_state
+            };
+            let effective_message = if effective_state == TaskState::Cancelled
+                && terminal_state != TaskState::Cancelled
+            {
+                CANCELLED_BY_REQUEST_MESSAGE.to_owned()
+            } else {
+                message
+            };
+            task.state = effective_state.into();
+            task.message = effective_message.clone();
+            task.progress = 1.0;
+            if effective_state == TaskState::Succeeded {
+                task.library_item_id = library_item_id;
+            } else {
+                task.library_item_id.clear();
+            }
+            for result_item in &mut task.result_items {
+                if let Some((state, result_library_item_id, problem_message)) =
+                    legacy_result_updates.get(&result_item.id)
+                {
+                    result_item.state = *state;
+                    result_item.library_item_id = result_library_item_id.clone();
+                    result_item.message = if problem_message.is_empty() {
+                        effective_message.clone()
+                    } else {
+                        problem_message.clone()
+                    };
+                } else {
+                    result_item.state = effective_state.into();
+                    result_item.message = effective_message.clone();
+                    if effective_state != TaskState::Succeeded {
+                        result_item.library_item_id.clear();
+                    }
+                }
+            }
+            let finished_at = current_timestamp();
+            task.updated_at = Some(copy_timestamp(&finished_at));
+            task.finished_at = Some(finished_at);
+            task.output_summary = Some(summary);
+            task.clone()
+        };
+        let terminal_task = Self::terminal_task_locked(&inner, &task);
+        Self::clear_active_task_locked(&mut inner, &terminal_task);
+        Self::stage_publication_locked(&mut inner, task.clone());
+        let outcome = self.persist_and_publish_pending(inner, true, Some(checkpoint));
+        if !outcome.is_committed() {
+            return Err(Status::unavailable(
+                "Download terminal publication could not be persisted durably.",
             ));
         }
         Ok(task)
@@ -1039,15 +1944,16 @@ impl BilibiliTaskRegistry {
             let updated_at = current_timestamp();
             task.updated_at = Some(copy_timestamp(&updated_at));
             task.finished_at = Some(updated_at);
+            task.library_item_id.clear();
             if task.kind() == TaskKind::BilibiliProgressivePlayback {
                 task.playback_source = None;
                 task.playback_session = None;
-                clear_result_playback_metadata(
-                    &mut task.result_items,
-                    TaskState::Cancelled,
-                    CANCELLED_MESSAGE,
-                );
             }
+            clear_result_playback_metadata(
+                &mut task.result_items,
+                TaskState::Cancelled,
+                CANCELLED_MESSAGE,
+            );
 
             task.clone()
         };
@@ -1097,12 +2003,34 @@ impl BilibiliTaskRegistry {
     pub fn try_claim_next_bilibili_task(&self) -> Option<BilibiliTaskWorkItem> {
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        while let Some(task_id) = inner.queued_task_ids.pop_front() {
+        let queued_task_count = inner.queued_task_ids.len();
+        for _ in 0..queued_task_count {
+            let task_id = inner
+                .queued_task_ids
+                .pop_front()
+                .expect("the bounded queue scan must retain its initial entries");
+            let is_v2_download = inner
+                .bilibili_candidates_by_id
+                .get(&task_id)
+                .is_some_and(|candidates| !candidates.is_empty());
+            if is_v2_download
+                && self.persistence_recovery_supported()
+                && !self.persistence_available()
+            {
+                inner.queued_task_ids.push_back(task_id);
+                continue;
+            }
             let options = inner
                 .download_options_by_id
                 .get(&task_id)
                 .cloned()
                 .flatten();
+            let request_context = inner.request_context_by_id.get(&task_id).cloned().flatten();
+            let accepted_candidates = inner
+                .bilibili_candidates_by_id
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default();
             let cancellation = BilibiliTaskCancellation::default();
             let Some((task, work_item)) = ({
                 let Some(task) = inner.tasks_by_id.get_mut(&task_id) else {
@@ -1119,6 +2047,8 @@ impl BilibiliTaskRegistry {
                     task_id: task.id.clone(),
                     source: task.source.clone(),
                     options,
+                    request_context,
+                    accepted_candidates,
                     cancellation: cancellation.clone(),
                 };
                 Some((task.clone(), work_item))
@@ -1133,6 +2063,27 @@ impl BilibiliTaskRegistry {
         }
 
         None
+    }
+
+    pub(crate) fn has_bilibili_v2_task_waiting_for_persistence(&self) -> bool {
+        if !self.persistence_recovery_supported() || self.persistence_available() {
+            return false;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner.queued_task_ids.iter().any(|task_id| {
+            inner
+                .tasks_by_id
+                .get(task_id)
+                .is_some_and(|task| task.state() == TaskState::Queued)
+                && inner
+                    .bilibili_candidates_by_id
+                    .get(task_id)
+                    .is_some_and(|candidates| !candidates.is_empty())
+        })
+    }
+
+    pub(crate) async fn wait_for_bilibili_task_queue_change(&self) {
+        self.queue_notify.notified().await;
     }
 
     pub fn update_task_progress(&self, id: &str, progress: BilibiliTaskProgress) -> bool {
@@ -2255,6 +3206,7 @@ impl BilibiliTaskRegistry {
         removed_task.finished_at = Some(finished_at);
         inner.download_options_by_id.remove(&normalized_task_id);
         inner.playback_options_by_id.remove(&normalized_task_id);
+        inner.request_context_by_id.remove(&normalized_task_id);
         inner
             .running_cancellations_by_id
             .remove(&normalized_task_id);
@@ -2288,6 +3240,207 @@ impl BilibiliTaskRegistry {
             ));
         }
         Ok(true)
+    }
+
+    pub fn tombstone_library_item_before_delete(
+        &self,
+        library_item_id: &str,
+        relative_path: &str,
+    ) -> Result<Vec<String>, Status> {
+        let library_item_id = normalize(library_item_id);
+        if library_item_id.is_empty() {
+            return Err(Status::invalid_argument("Library item id is required."));
+        }
+        if decode_item_id(&library_item_id)
+            .as_deref()
+            .is_some_and(|decoded| decoded != Path::new(relative_path))
+        {
+            return Err(Status::invalid_argument(
+                "Library item cleanup path does not match its canonical item id.",
+            ));
+        }
+        let cleanup_intent = PersistedFileCleanupIntent::new(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            &library_item_id,
+            relative_path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::LocalLibraryItem,
+            &library_item_id,
+            vec![cleanup_intent],
+        )?;
+        let task_ids = inner.tasks_by_id.keys().cloned().collect::<Vec<_>>();
+        let mut updated_tasks = Vec::new();
+
+        for task_id in task_ids {
+            let output_update = if let Some(output) = inner.outputs_by_task_id.get_mut(&task_id) {
+                match output
+                    .mark_library_item_deleted(&library_item_id, LIBRARY_ITEM_DELETED_MESSAGE)
+                {
+                    Ok(Some(retired_ids)) => Ok(Some({
+                        let result_updates = output
+                            .results
+                            .iter()
+                            .map(|result| {
+                                (
+                                    result.id.clone(),
+                                    (
+                                        result.state,
+                                        result.library_item_id.clone(),
+                                        result.problem.as_ref().is_some_and(|problem| {
+                                            problem.code == "cache.library_item_deleted"
+                                        }),
+                                        result
+                                            .problem
+                                            .as_ref()
+                                            .map(|problem| problem.message.clone())
+                                            .or_else(|| {
+                                                result
+                                                    .progress
+                                                    .as_ref()
+                                                    .map(|progress| progress.message.clone())
+                                            })
+                                            .unwrap_or_default(),
+                                    ),
+                                )
+                            })
+                            .collect::<HashMap<_, _>>();
+                        let primary_library_item_id = output
+                            .results
+                            .iter()
+                            .find(|result| result.id == output.primary_result_id)
+                            .map(|result| result.library_item_id.clone())
+                            .unwrap_or_default();
+                        (
+                            retired_ids,
+                            result_updates,
+                            primary_library_item_id,
+                            output.summary(),
+                        )
+                    })),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(None)
+            };
+            let output_update = match output_update {
+                Ok(output_update) => output_update,
+                Err(error) => {
+                    checkpoint.restore(&mut inner);
+                    return Err(Status::internal(format!(
+                        "Library deletion would create invalid task output: {error}"
+                    )));
+                }
+            };
+
+            let mut changed = output_update.is_some();
+            if let Some((retired_ids, _, _, _)) = output_update.as_ref() {
+                inner
+                    .pending_resource_cleanup_ids
+                    .extend(retired_ids.iter().cloned());
+            }
+            let task = inner
+                .tasks_by_id
+                .get_mut(&task_id)
+                .expect("enumerated task must remain present");
+            let top_level_media_deleted = task.library_item_id == library_item_id
+                || task
+                    .playback_source
+                    .as_ref()
+                    .is_some_and(|source| source.item_id == library_item_id);
+            if top_level_media_deleted {
+                task.library_item_id.clear();
+                task.playback_source = None;
+                task.playback_session = None;
+                changed = true;
+            }
+            for result_item in &mut task.result_items {
+                if let Some((result_updates, _, _)) = output_update
+                    .as_ref()
+                    .map(|(_, updates, primary, summary)| (updates, primary, summary))
+                    && let Some((state, item_library_item_id, media_deleted, message)) =
+                        result_updates.get(&result_item.id)
+                {
+                    result_item.state = *state;
+                    result_item.library_item_id = item_library_item_id.clone();
+                    if *media_deleted {
+                        result_item.playback_source = None;
+                        result_item.playback_session = None;
+                    }
+                    if !message.is_empty() {
+                        result_item.message = message.clone();
+                    }
+                    continue;
+                }
+                if result_item.library_item_id == library_item_id
+                    || result_item
+                        .playback_source
+                        .as_ref()
+                        .is_some_and(|source| source.item_id == library_item_id)
+                {
+                    result_item.state = TaskState::Failed.into();
+                    result_item.library_item_id.clear();
+                    result_item.playback_source = None;
+                    result_item.message = LIBRARY_ITEM_DELETED_MESSAGE.to_owned();
+                    changed = true;
+                }
+            }
+            if let Some((_, _, primary_library_item_id, summary)) = output_update {
+                task.library_item_id = primary_library_item_id;
+                task.output_summary = Some(summary);
+            }
+            if !changed {
+                continue;
+            }
+
+            let has_successful_result = task
+                .output_summary
+                .as_ref()
+                .map(|summary| summary.successful_result_count > 0)
+                .unwrap_or_else(|| {
+                    task.result_items.iter().any(|result| {
+                        matches!(result.state(), TaskState::Succeeded | TaskState::Completed)
+                    })
+                });
+            if task.kind() == TaskKind::BilibiliDownload && !has_successful_result {
+                task.state = TaskState::Failed.into();
+                task.message = LIBRARY_ITEM_DELETED_MESSAGE.to_owned();
+            } else {
+                task.message = "One cached media result was deleted from the library.".to_owned();
+            }
+            task.updated_at = Some(current_timestamp());
+            updated_tasks.push(task.clone());
+        }
+
+        let updated_task_ids = updated_tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let durability_required = self.persistence.is_some();
+        let checkpoint = durability_required.then_some(checkpoint);
+        let outcome = self.persist_tasks_before_destructive_side_effect(
+            inner,
+            updated_tasks,
+            durability_required,
+            checkpoint,
+        );
+        if durability_required && !outcome.is_durable() {
+            return Err(Status::unavailable(
+                "Task references and cleanup intent could not be persisted before library deletion.",
+            ));
+        }
+        Ok(updated_task_ids)
     }
 
     pub fn complete_task_cancelled(&self, id: &str, message: String) -> Result<Task, Status> {
@@ -2705,12 +3858,12 @@ impl BilibiliTaskRegistry {
             {
                 task.progress = progress.clamp(0.0, 1.0);
             }
-            if task.kind() == TaskKind::BilibiliProgressivePlayback
-                && matches!(effective_state, TaskState::Failed | TaskState::Cancelled)
-            {
+            if matches!(effective_state, TaskState::Failed | TaskState::Cancelled) {
                 task.library_item_id.clear();
-                task.playback_source = None;
-                task.playback_session = None;
+                if task.kind() == TaskKind::BilibiliProgressivePlayback {
+                    task.playback_source = None;
+                    task.playback_session = None;
+                }
                 clear_result_playback_metadata(
                     &mut task.result_items,
                     effective_state,
@@ -2742,13 +3895,40 @@ impl BilibiliTaskRegistry {
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
     ) -> io::Result<Self> {
+        Self::from_persisted_state(
+            PersistedTaskState {
+                records,
+                file_cleanup_intents: Vec::new(),
+            },
+            store,
+            persistence_configured,
+            retention_policy,
+            resource_root_path,
+        )
+    }
+
+    fn from_persisted_state(
+        state: PersistedTaskState,
+        store: Option<TaskStateStore>,
+        persistence_configured: bool,
+        retention_policy: TaskRetentionPolicy,
+        resource_root_path: Option<PathBuf>,
+    ) -> io::Result<Self> {
+        let PersistedTaskState {
+            records,
+            file_cleanup_intents,
+        } = state;
         validate_unique_task_record_identities(&records)?;
-        let mut inner = RegistryInner::default();
+        let mut inner = RegistryInner {
+            pending_file_cleanup_intents: file_cleanup_intents.into_iter().collect(),
+            ..RegistryInner::default()
+        };
         for record in records {
             let Some(RestoredTaskRecord {
                 mut task,
                 download_options,
                 playback_options,
+                request_context,
                 bilibili_candidates,
                 mut output,
             }) = restore_persisted_record(record)
@@ -2762,20 +3942,31 @@ impl BilibiliTaskRegistry {
 
             let is_active_task = is_active(task.state());
             let task_id = task.id.clone();
-            let active_download_key = (is_active_task && task.kind() == TaskKind::BilibiliDownload)
-                .then(|| {
-                    active_key_for_task(&task, download_options.as_ref(), playback_options.as_ref())
-                });
-            if active_download_key
+            let participates_in_active_dedupe = is_active_task
+                && (task.kind() == TaskKind::BilibiliDownload
+                    || (task.kind() == TaskKind::BilibiliProgressivePlayback
+                        && !bilibili_candidates.is_empty()));
+            let active_key = participates_in_active_dedupe.then(|| {
+                active_key_for_task(
+                    &task,
+                    download_options.as_ref(),
+                    playback_options.as_ref(),
+                    request_context.as_ref(),
+                    &bilibili_candidates,
+                )
+            });
+            if active_key
                 .as_ref()
                 .is_some_and(|active_key| inner.active_task_ids_by_key.contains_key(active_key))
             {
                 continue;
             }
-            if let Some(active_key) = active_download_key {
+            if let Some(active_key) = active_key {
                 inner
                     .active_task_ids_by_key
                     .insert(active_key, task_id.clone());
+            }
+            if is_active_task && task.kind() == TaskKind::BilibiliDownload {
                 inner.queued_task_ids.push_back(task_id.clone());
                 inner
                     .download_options_by_id
@@ -2785,6 +3976,11 @@ impl BilibiliTaskRegistry {
                 inner
                     .playback_options_by_id
                     .insert(task_id.clone(), playback_options);
+            }
+            if is_active_task {
+                inner
+                    .request_context_by_id
+                    .insert(task_id.clone(), request_context);
             }
             if !bilibili_candidates.is_empty() {
                 inner
@@ -2816,6 +4012,7 @@ impl BilibiliTaskRegistry {
             retention_policy,
             resource_root_path,
             resource_cleanup_lock: Mutex::new(()),
+            file_cleanup_lock: Mutex::new(()),
             resource_storage_available: AtomicBool::new(!orphan_resource_scan_pending),
             orphan_resource_scan_pending: AtomicBool::new(orphan_resource_scan_pending),
         })
@@ -2915,11 +4112,18 @@ impl BilibiliTaskRegistry {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         let records = persisted_records_locked(inner, &pruned_task_id_set)?;
+        let mut file_cleanup_intents = inner
+            .pending_file_cleanup_intents
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        file_cleanup_intents.sort();
         Ok(Some(TaskPersistenceSnapshot {
             generation: inner.persistence_generation,
             records,
             resource_cleanup_ids: resource_cleanup_ids.into_iter().collect(),
             pruned_task_ids,
+            file_cleanup_intents,
         }))
     }
 
@@ -3060,6 +4264,24 @@ impl BilibiliTaskRegistry {
         rollback_checkpoint: Option<RegistryMutationCheckpoint>,
     ) -> PersistenceCommitOutcome {
         Self::stage_publication_locked(&mut inner, task);
+        self.persist_and_publish_pending_with_policy(
+            inner,
+            durability_required,
+            rollback_checkpoint,
+            true,
+        )
+    }
+
+    fn persist_tasks_before_destructive_side_effect(
+        &self,
+        mut inner: MutexGuard<'_, RegistryInner>,
+        tasks: impl IntoIterator<Item = Task>,
+        durability_required: bool,
+        rollback_checkpoint: Option<RegistryMutationCheckpoint>,
+    ) -> PersistenceCommitOutcome {
+        for task in tasks {
+            Self::stage_publication_locked(&mut inner, task);
+        }
         self.persist_and_publish_pending_with_policy(
             inner,
             durability_required,
@@ -3413,6 +4635,8 @@ impl BilibiliTaskRegistry {
         inner.planning_cancellations_by_id.remove(&task.id);
         inner.download_options_by_id.remove(&task.id);
         inner.playback_options_by_id.remove(&task.id);
+        inner.request_context_by_id.remove(&task.id);
+        inner.queued_task_ids.retain(|task_id| task_id != &task.id);
     }
 
     fn clear_active_duplicate_key_locked(inner: &mut RegistryInner, task: &Task) {
@@ -3426,6 +4650,15 @@ impl BilibiliTaskRegistry {
                 .playback_options_by_id
                 .get(&task.id)
                 .and_then(Option::as_ref),
+            inner
+                .request_context_by_id
+                .get(&task.id)
+                .and_then(Option::as_ref),
+            inner
+                .bilibili_candidates_by_id
+                .get(&task.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         );
         if inner
             .active_task_ids_by_key
@@ -3449,6 +4682,15 @@ impl BilibiliTaskRegistry {
                     .playback_options_by_id
                     .get(&task.id)
                     .and_then(Option::as_ref),
+                inner
+                    .request_context_by_id
+                    .get(&task.id)
+                    .and_then(Option::as_ref),
+                inner
+                    .bilibili_candidates_by_id
+                    .get(&task.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -3645,6 +4887,8 @@ pub struct BilibiliTaskWorkItem {
     pub task_id: String,
     pub source: String,
     pub options: Option<BilibiliDownloadOptions>,
+    pub(crate) request_context: Option<BilibiliRequestContext>,
+    pub(crate) accepted_candidates: Vec<BilibiliTaskCandidateRecord>,
     pub cancellation: BilibiliTaskCancellation,
 }
 
@@ -3730,6 +4974,7 @@ struct RegistryInner {
     visible_outputs_by_task_id: HashMap<String, Arc<VisibleTaskOutput>>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
+    request_context_by_id: HashMap<String, Option<BilibiliRequestContext>>,
     bilibili_candidates_by_id: HashMap<String, Vec<BilibiliTaskCandidateRecord>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
     queued_task_ids: VecDeque<String>,
@@ -3741,6 +4986,7 @@ struct RegistryInner {
     pending_resource_cleanup_ids: HashSet<String>,
     durable_resource_cleanup_ids: HashSet<String>,
     resource_storage_revalidation_ids: HashSet<String>,
+    pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
     pending_publications_by_id: HashMap<String, Task>,
     persistence_generation: u64,
 }
@@ -3751,12 +4997,14 @@ struct RegistryMutationCheckpoint {
     outputs_by_task_id: HashMap<String, TaskOutputRecord>,
     download_options_by_id: HashMap<String, Option<BilibiliDownloadOptions>>,
     playback_options_by_id: HashMap<String, Option<BilibiliPlaybackOptions>>,
+    request_context_by_id: HashMap<String, Option<BilibiliRequestContext>>,
     bilibili_candidates_by_id: HashMap<String, Vec<BilibiliTaskCandidateRecord>>,
     active_task_ids_by_key: HashMap<ActiveBilibiliTaskKey, String>,
     queued_task_ids: VecDeque<String>,
     running_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     planning_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     pending_resource_cleanup_ids: HashSet<String>,
+    pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
     pending_publications_by_id: HashMap<String, Task>,
 }
 
@@ -3808,12 +5056,14 @@ impl RegistryMutationCheckpoint {
             outputs_by_task_id: inner.outputs_by_task_id.clone(),
             download_options_by_id: inner.download_options_by_id.clone(),
             playback_options_by_id: inner.playback_options_by_id.clone(),
+            request_context_by_id: inner.request_context_by_id.clone(),
             bilibili_candidates_by_id: inner.bilibili_candidates_by_id.clone(),
             active_task_ids_by_key: inner.active_task_ids_by_key.clone(),
             queued_task_ids: inner.queued_task_ids.clone(),
             running_cancellations_by_id: inner.running_cancellations_by_id.clone(),
             planning_cancellations_by_id: inner.planning_cancellations_by_id.clone(),
             pending_resource_cleanup_ids: inner.pending_resource_cleanup_ids.clone(),
+            pending_file_cleanup_intents: inner.pending_file_cleanup_intents.clone(),
             pending_publications_by_id: inner.pending_publications_by_id.clone(),
         }
     }
@@ -3823,12 +5073,14 @@ impl RegistryMutationCheckpoint {
         inner.outputs_by_task_id = self.outputs_by_task_id;
         inner.download_options_by_id = self.download_options_by_id;
         inner.playback_options_by_id = self.playback_options_by_id;
+        inner.request_context_by_id = self.request_context_by_id;
         inner.bilibili_candidates_by_id = self.bilibili_candidates_by_id;
         inner.active_task_ids_by_key = self.active_task_ids_by_key;
         inner.queued_task_ids = self.queued_task_ids;
         inner.running_cancellations_by_id = self.running_cancellations_by_id;
         inner.planning_cancellations_by_id = self.planning_cancellations_by_id;
         inner.pending_resource_cleanup_ids = self.pending_resource_cleanup_ids;
+        inner.pending_file_cleanup_intents = self.pending_file_cleanup_intents;
         inner.pending_publications_by_id = self.pending_publications_by_id;
     }
 }
@@ -3881,7 +5133,10 @@ impl TaskStatePersistence {
         }
         state.latest_seen_generation = snapshot.generation;
 
-        match self.store.save(&snapshot.records) {
+        match self
+            .store
+            .save_with_file_cleanup_intents(&snapshot.records, &snapshot.file_cleanup_intents)
+        {
             Ok(TaskStateSaveOutcome::Durable) => {
                 self.available.store(true, AtomicOrdering::Release);
                 PersistenceCommitOutcome::Durable
@@ -3965,6 +5220,7 @@ struct TaskPersistenceSnapshot {
     records: Vec<PersistedTaskRecord>,
     resource_cleanup_ids: Vec<String>,
     pruned_task_ids: Vec<String>,
+    file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
 }
 
 struct TerminalTask {
@@ -3985,10 +5241,20 @@ struct ActiveBilibiliTaskKey {
     subtitle_ai_policy: i32,
     download_cover: bool,
     danmaku_formats: Vec<i32>,
+    download_mode: i32,
+    playback_policy: Vec<u8>,
+    api_mode: i32,
+    credential_profile_id: String,
+    candidates: Vec<BilibiliTaskCandidateRecord>,
 }
 
 impl ActiveBilibiliTaskKey {
-    fn download(source: &str, options: Option<&BilibiliDownloadOptions>) -> Self {
+    fn download(
+        source: &str,
+        options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+        candidates: &[BilibiliTaskCandidateRecord],
+    ) -> Self {
         let mut key = Self::new(TaskKind::BilibiliDownload, source);
         if let Some(options) = options {
             key.quality_preference = normalize_option_string(&options.quality_preference);
@@ -4000,19 +5266,44 @@ impl ActiveBilibiliTaskKey {
             key.subtitle_ai_policy = normalize_subtitle_ai_policy_key(options.subtitle_ai_policy);
             key.download_cover = options.download_cover;
             key.danmaku_formats = normalize_danmaku_format_keys(&options.danmaku_formats);
+            key.download_mode = options.download_mode;
         }
+        key.bind_request_context_and_candidates(request_context, candidates);
         key
     }
 
-    fn playback(source: &str, options: Option<&BilibiliPlaybackOptions>) -> Self {
+    fn playback(
+        source: &str,
+        options: Option<&BilibiliPlaybackOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+        candidates: &[BilibiliTaskCandidateRecord],
+    ) -> Self {
         let mut key = Self::new(TaskKind::BilibiliProgressivePlayback, source);
         if let Some(options) = options {
             key.quality_preference = normalize_option_string(&options.quality_preference);
             key.encoding_preference = normalize_option_string(&options.encoding_preference);
             key.audio_language = normalize_option_string(&options.audio_language);
             key.prefer_tv_api = options.prefer_tv_api;
+            key.playback_policy = options
+                .playback_policy
+                .as_ref()
+                .map(Message::encode_to_vec)
+                .unwrap_or_default();
         }
+        key.bind_request_context_and_candidates(request_context, candidates);
         key
+    }
+
+    fn bind_request_context_and_candidates(
+        &mut self,
+        request_context: Option<&BilibiliRequestContext>,
+        candidates: &[BilibiliTaskCandidateRecord],
+    ) {
+        if let Some(request_context) = request_context {
+            self.api_mode = request_context.api_mode;
+            self.credential_profile_id = request_context.credential_profile_id.trim().to_owned();
+        }
+        self.candidates = candidates.to_vec();
     }
 
     fn new(kind: TaskKind, source: &str) -> Self {
@@ -4028,6 +5319,11 @@ impl ActiveBilibiliTaskKey {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
+            playback_policy: Vec::new(),
+            api_mode: 0,
+            credential_profile_id: String::new(),
+            candidates: Vec::new(),
         }
     }
 }
@@ -4076,6 +5372,79 @@ fn normalize_danmaku_format_keys(values: &[i32]) -> Vec<i32> {
     normalized.sort_unstable();
     normalized.dedup();
     normalized
+}
+
+fn concrete_bilibili_v2_download_options(
+    options: Option<BilibiliDownloadOptions>,
+) -> Result<BilibiliDownloadOptions, Status> {
+    let mut options = options.unwrap_or_default();
+    let mode = BilibiliDownloadMode::try_from(options.download_mode)
+        .map_err(|_| Status::invalid_argument("Unknown Bilibili download mode."))?;
+    if mode == BilibiliDownloadMode::Unspecified {
+        options.download_mode = BilibiliDownloadMode::All.into();
+    }
+    Ok(options)
+}
+
+fn concrete_bilibili_v2_request_context(
+    request_context: Option<BilibiliRequestContext>,
+) -> Result<BilibiliRequestContext, Status> {
+    let mut request_context = request_context.unwrap_or_default();
+    let api_mode = BilibiliApiMode::try_from(request_context.api_mode)
+        .map_err(|_| Status::invalid_argument("Unknown Bilibili API mode."))?;
+    if api_mode == BilibiliApiMode::Unspecified {
+        request_context.api_mode = BilibiliApiMode::Web.into();
+    }
+    request_context.credential_profile_id = request_context.credential_profile_id.trim().to_owned();
+    Ok(request_context)
+}
+
+fn validate_v2_candidate_batch(
+    candidates: &[BilibiliTaskCandidateRecord],
+    task_label: &str,
+) -> Result<(), Status> {
+    if candidates.is_empty() {
+        return Err(Status::invalid_argument(
+            "Bilibili resolution selection must contain at least one candidate.",
+        ));
+    }
+    if candidates.len() > MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES {
+        return Err(Status::resource_exhausted(format!(
+            "A Bilibili {task_label} task cannot exceed {MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES} candidates."
+        )));
+    }
+    Ok(())
+}
+
+fn initial_bilibili_result_items(
+    task_id: &str,
+    candidates: &[BilibiliTaskCandidateRecord],
+    state: TaskState,
+    message: &str,
+) -> Vec<BilibiliTaskResultItem> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(offset, candidate)| BilibiliTaskResultItem {
+            id: if offset == 0 {
+                task_id.to_owned()
+            } else {
+                format!("{task_id}-result-{}", offset + 1)
+            },
+            selection_id: String::new(),
+            title: candidate.title.clone(),
+            subtitle: candidate.subtitle.clone(),
+            source_kind: candidate.source_kind.clone(),
+            content_id: candidate.content_id.clone(),
+            index: candidate.index,
+            state: state.into(),
+            message: message.to_owned(),
+            library_item_id: String::new(),
+            playback_source: None,
+            playback_session: None,
+            identity: Some(candidate.proto_identity()),
+        })
+        .collect()
 }
 
 fn normalize_required_id(id: &str) -> Result<String, Status> {
@@ -4534,12 +5903,22 @@ fn active_key_for_task(
     task: &Task,
     download_options: Option<&BilibiliDownloadOptions>,
     playback_options: Option<&BilibiliPlaybackOptions>,
+    request_context: Option<&BilibiliRequestContext>,
+    bilibili_candidates: &[BilibiliTaskCandidateRecord],
 ) -> ActiveBilibiliTaskKey {
     match task.kind() {
-        TaskKind::BilibiliProgressivePlayback => {
-            ActiveBilibiliTaskKey::playback(&task.source, playback_options)
-        }
-        _ => ActiveBilibiliTaskKey::download(&task.source, download_options),
+        TaskKind::BilibiliProgressivePlayback => ActiveBilibiliTaskKey::playback(
+            &task.source,
+            playback_options,
+            request_context,
+            bilibili_candidates,
+        ),
+        _ => ActiveBilibiliTaskKey::download(
+            &task.source,
+            download_options,
+            request_context,
+            bilibili_candidates,
+        ),
     }
 }
 
@@ -4565,6 +5944,7 @@ struct RestoredTaskRecord {
     task: Task,
     download_options: Option<BilibiliDownloadOptions>,
     playback_options: Option<BilibiliPlaybackOptions>,
+    request_context: Option<BilibiliRequestContext>,
     bilibili_candidates: Vec<BilibiliTaskCandidateRecord>,
     output: TaskOutputRecord,
 }
@@ -4574,6 +5954,7 @@ fn restore_persisted_record(record: PersistedTaskRecord) -> Option<RestoredTaskR
         mut task,
         options,
         playback_options,
+        request_context,
         bilibili_candidates,
         output,
     } = record;
@@ -4628,13 +6009,16 @@ fn restore_persisted_record(record: PersistedTaskRecord) -> Option<RestoredTaskR
         let updated_at = current_timestamp();
         task.state = TaskState::Cancelled.into();
         task.message = CANCELLED_AFTER_RESTART_MESSAGE.to_owned();
+        task.library_item_id.clear();
         if task_kind == TaskKind::BilibiliProgressivePlayback {
-            clear_progressive_playback_runtime_metadata(
-                &mut task,
-                TaskState::Cancelled,
-                CANCELLED_AFTER_RESTART_MESSAGE,
-            );
+            task.playback_source = None;
+            task.playback_session = None;
         }
+        clear_result_playback_metadata(
+            &mut task.result_items,
+            TaskState::Cancelled,
+            CANCELLED_AFTER_RESTART_MESSAGE,
+        );
         task.updated_at = Some(copy_timestamp(&updated_at));
         task.finished_at = Some(updated_at);
     } else if task_kind == TaskKind::BilibiliDownload && task_state == TaskState::Running {
@@ -4661,6 +6045,7 @@ fn restore_persisted_record(record: PersistedTaskRecord) -> Option<RestoredTaskR
         task,
         download_options: options,
         playback_options,
+        request_context,
         bilibili_candidates,
         output,
     })
@@ -4778,6 +6163,224 @@ fn validate_task_resource_body(
         ));
     }
     Ok(())
+}
+
+fn validate_resource_body_size(resource: &TaskResourceRecord, actual_size: u64) -> io::Result<()> {
+    if resource.resource.size_known
+        && u64::try_from(resource.resource.size_bytes).ok() != Some(actual_size)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged task resource body size does not match its declared metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn cache_relative_path(resource_root_path: &Path, source_path: &Path) -> io::Result<String> {
+    let root = lexical_absolute_path(resource_root_path)?;
+    let source = lexical_absolute_path(source_path)?;
+    let relative = source.strip_prefix(&root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "staged task resource source is outside the configured cache root",
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staged task resource source path is invalid",
+        ));
+    }
+    relative.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staged task resource source path is not valid UTF-8",
+        )
+    })
+}
+
+fn replace_file_cleanup_intents_for_owner_locked(
+    inner: &mut RegistryInner,
+    kind: PersistedFileCleanupKind,
+    owner_id: &str,
+    replacements: Vec<PersistedFileCleanupIntent>,
+) -> Result<(), Status> {
+    let retained_count = inner
+        .pending_file_cleanup_intents
+        .iter()
+        .filter(|intent| intent.kind != kind || intent.owner_id != owner_id)
+        .count();
+    if retained_count.saturating_add(replacements.len()) > MAX_PERSISTED_FILE_CLEANUP_INTENTS {
+        return Err(Status::resource_exhausted(
+            "Pending cache file cleanup capacity is exhausted.",
+        ));
+    }
+    inner
+        .pending_file_cleanup_intents
+        .retain(|intent| intent.kind != kind || intent.owner_id != owner_id);
+    inner.pending_file_cleanup_intents.extend(replacements);
+    Ok(())
+}
+
+fn lexical_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "path escapes its filesystem root",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn create_resource_body_exclusive(
+    resource_root_path: &Path,
+    relative_path: &str,
+) -> io::Result<(File, Vec<File>)> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+
+    fn open_owned(path: &CString, flags: i32) -> io::Result<File> {
+        // SAFETY: path is NUL-terminated and libc returns a new owned descriptor on success.
+        let descriptor = unsafe { libc::open(path.as_ptr(), flags) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: descriptor was returned by open and ownership transfers to File.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn open_at_owned(
+        directory: &File,
+        name: &CString,
+        flags: i32,
+        mode: libc::mode_t,
+    ) -> io::Result<File> {
+        // SAFETY: directory remains live, name is NUL-terminated, and openat returns a new
+        // descriptor on success.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                libc::c_uint::from(mode),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: descriptor was returned by openat and ownership transfers to File.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    let root = CString::new(resource_root_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cache root contains NUL"))?;
+    let segments = Path::new(relative_path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => CString::new(value.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "resource path contains NUL")
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource path contains a non-normal component",
+            )),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if segments.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource destination path is incomplete",
+        ));
+    }
+
+    let mut directories = vec![open_owned(
+        &root,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?];
+    for segment in &segments[..segments.len() - 1] {
+        let parent = directories
+            .last()
+            .expect("resource directory traversal must retain its parent");
+        // SAFETY: parent remains live and segment is a valid NUL-terminated child name.
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), segment.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        directories.push(open_at_owned(
+            parent,
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?);
+    }
+    let parent = directories
+        .last()
+        .expect("resource body must have an opened parent directory");
+    let body = open_at_owned(
+        parent,
+        segments.last().expect("resource body segment must exist"),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    Ok((body, directories))
+}
+
+#[cfg(not(unix))]
+fn create_resource_body_exclusive(
+    _resource_root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<(File, Vec<File>)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure staged task resource creation is not implemented on this platform",
+    ))
+}
+
+fn remove_created_resource_body_if_same(
+    resource_root_path: &Path,
+    resource: &TaskResourceRecord,
+    expected_identity: StagedResourceBodyIdentity,
+) {
+    let relative_path = resource.relative_path();
+    let same_object = open_read_no_follow(resource_root_path, &relative_path)
+        .and_then(|body| StagedResourceBodyIdentity::from_metadata(&body.metadata()?))
+        .is_ok_and(|actual_identity| expected_identity.same_object(actual_identity));
+    if !same_object {
+        return;
+    }
+    if remove_file_no_follow(resource_root_path, &relative_path).unwrap_or(false) {
+        let _ = remove_empty_directory_no_follow(
+            resource_root_path,
+            &TaskResourceRecord::relative_directory_for_id(&resource.resource.id),
+        );
+    }
 }
 
 fn output_resource_ids_locked(inner: &RegistryInner) -> HashSet<String> {
@@ -5073,12 +6676,23 @@ fn persisted_records_locked_with_clone_limit(
             .playback_options_by_id
             .get(&task.id)
             .and_then(Option::as_ref);
+        let request_context = inner
+            .request_context_by_id
+            .get(&task.id)
+            .and_then(Option::as_ref);
         let bilibili_candidates = inner
             .bilibili_candidates_by_id
             .get(&task.id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        clone_estimate.add_record(task, options, playback_options, bilibili_candidates, output)?;
+        clone_estimate.add_record(
+            task,
+            options,
+            playback_options,
+            request_context,
+            bilibili_candidates,
+            output,
+        )?;
     }
     clone_estimate.validate_limit(clone_limit)?;
 
@@ -5100,6 +6714,7 @@ fn persisted_records_locked_with_clone_limit(
                 .get(&task.id)
                 .cloned()
                 .flatten(),
+            request_context: inner.request_context_by_id.get(&task.id).cloned().flatten(),
             bilibili_candidates: inner
                 .bilibili_candidates_by_id
                 .get(&task.id)
@@ -5121,6 +6736,7 @@ impl PersistenceSnapshotCloneEstimate {
         task: &Task,
         options: Option<&BilibiliDownloadOptions>,
         playback_options: Option<&BilibiliPlaybackOptions>,
+        request_context: Option<&BilibiliRequestContext>,
         bilibili_candidates: &[BilibiliTaskCandidateRecord],
         output: &TaskOutputRecord,
     ) -> io::Result<()> {
@@ -5144,6 +6760,9 @@ impl PersistenceSnapshotCloneEstimate {
         }
         if let Some(playback_options) = playback_options {
             self.add_message(playback_options)?;
+        }
+        if let Some(request_context) = request_context {
+            self.add_message(request_context)?;
         }
         self.add_vec_allocation(bilibili_candidates)?;
         for candidate in bilibili_candidates {
@@ -5261,6 +6880,7 @@ fn apply_pruned_tasks_locked(inner: &mut RegistryInner, task_ids: &[String]) {
         inner.outputs_by_task_id.remove(task_id);
         inner.download_options_by_id.remove(task_id);
         inner.playback_options_by_id.remove(task_id);
+        inner.request_context_by_id.remove(task_id);
         inner.bilibili_candidates_by_id.remove(task_id);
         inner.running_cancellations_by_id.remove(task_id);
         inner.planning_cancellations_by_id.remove(task_id);
@@ -5371,6 +6991,7 @@ mod tests {
                         task,
                         None,
                         None,
+                        None,
                         &[],
                         inner
                             .outputs_by_task_id
@@ -5405,6 +7026,7 @@ mod tests {
         first_estimate
             .add_record(
                 first_task,
+                None,
                 None,
                 None,
                 &[],
@@ -5487,6 +7109,7 @@ mod tests {
             .create_bilibili_playback_task_v2(
                 "BV1stable",
                 Some(playback_options("1080p")),
+                None,
                 "Stable video".to_owned(),
                 vec![candidate.clone()],
             )
@@ -5523,6 +7146,7 @@ mod tests {
         let error = match registry.create_bilibili_playback_task_v2(
             "BV1execution-bound",
             None,
+            None,
             "Bounded execution".to_owned(),
             vec![sample_bilibili_task_candidate(); MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES + 1],
         ) {
@@ -5558,6 +7182,7 @@ mod tests {
         let creation = registry
             .create_bilibili_playback_task_v2(
                 "BV1durable-v2",
+                None,
                 None,
                 "Durable video".to_owned(),
                 vec![sample_bilibili_task_candidate()],
@@ -5667,6 +7292,410 @@ mod tests {
             .create_bilibili_task("BV1yy", None)
             .expect("source can be queued after cancellation");
         assert_ne!(first.id, requeued.id);
+    }
+
+    #[test]
+    fn cancelling_queued_v2_download_terminalizes_result_output() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cancel-queued-v2",
+                None,
+                None,
+                "Queued v2 cancellation".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 download task should be created");
+
+        let cancelled = registry
+            .cancel_task(&task.id)
+            .expect("queued v2 task should be cancelled");
+        let output = registry
+            .task_output_snapshot(&task.id)
+            .expect("cancelled v2 output should remain visible");
+
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert_eq!(1, cancelled.result_items.len());
+        assert_eq!(TaskState::Cancelled, cancelled.result_items[0].state());
+        assert_eq!(1, output.output.record.results.len());
+        assert_eq!(
+            TaskState::Cancelled,
+            output.output.record.results[0].state()
+        );
+        assert_eq!(0, output.output.record.summary().successful_result_count);
+    }
+
+    #[tokio::test]
+    async fn restores_cancel_requested_v2_download_with_terminal_results() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cancel-restart-v2",
+                None,
+                None,
+                "Restart v2 cancellation".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 download task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let cancel_requested = registry
+            .cancel_task(&task.id)
+            .expect("running v2 task should accept cancellation");
+        assert_eq!(TaskState::CancelRequested, cancel_requested.state());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        let restored_task = restored
+            .get_task(&task.id)
+            .expect("cancelled v2 task should restore");
+        let restored_output = restored
+            .task_output_snapshot(&task.id)
+            .expect("cancelled v2 output should restore");
+
+        assert_eq!(TaskState::Cancelled, restored_task.state());
+        assert_eq!(CANCELLED_AFTER_RESTART_MESSAGE, restored_task.message);
+        assert_eq!(1, restored_task.result_items.len());
+        assert_eq!(TaskState::Cancelled, restored_task.result_items[0].state());
+        assert_eq!(1, restored_output.output.record.results.len());
+        assert_eq!(
+            TaskState::Cancelled,
+            restored_output.output.record.results[0].state()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_staged_v2_success_and_removes_resource_body() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let resource_root = temp.path().join("library");
+        std::fs::create_dir_all(&resource_root).expect("resource root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &path,
+            TaskRetentionPolicy::default(),
+            Some(resource_root.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cancel-staged-v2",
+                None,
+                None,
+                "Staged v2 cancellation".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 download task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+
+        let resource = test_task_resource("cancelled-v2-resource", 4);
+        let resource_path = resource_root.join(resource.relative_path());
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("resource output should stage");
+        staged
+            .write_resource_body(&resource.resource.id, b"body")
+            .expect("resource body should stage");
+        assert!(resource_path.is_file());
+        let cancel_requested = registry
+            .cancel_task(&task.id)
+            .expect("running task should accept cancellation");
+        assert_eq!(TaskState::CancelRequested, cancel_requested.state());
+
+        let error = staged
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "local.default.cancelled-v2".to_owned(),
+                    artifacts: vec![
+                        crate::generated::tvos_net_player::v1::TaskArtifact {
+                            id: "cancelled-v2-media".to_owned(),
+                            kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media
+                                .into(),
+                            state:
+                                crate::generated::tvos_net_player::v1::TaskArtifactState::Available
+                                    .into(),
+                            library_item_id: "local.default.cancelled-v2".to_owned(),
+                            ..Default::default()
+                        },
+                        crate::generated::tvos_net_player::v1::TaskArtifact {
+                            id: "cancelled-v2-sidecar".to_owned(),
+                            kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Metadata
+                                .into(),
+                            state:
+                                crate::generated::tvos_net_player::v1::TaskArtifactState::Available
+                                    .into(),
+                            resource: Some(resource.resource.clone()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                "local.default.cancelled-v2".to_owned(),
+                "Late success".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("cancellation must reject late successful output");
+        assert_eq!(tonic::Code::Cancelled, error.code());
+        assert!(!resource_path.exists());
+
+        let cancelled = registry
+            .complete_task_cancelled(&task.id, "Cancelled by request.".to_owned())
+            .expect("cancelled task should finish durably");
+        let output = registry
+            .task_output_snapshot(&task.id)
+            .expect("cancelled output should remain visible");
+        assert_eq!(TaskState::Cancelled, cancelled.state());
+        assert_eq!(TaskState::Cancelled, cancelled.result_items[0].state());
+        assert!(output.output.record.resources.is_empty());
+        assert_eq!(
+            TaskState::Cancelled,
+            output.output.record.results[0].state()
+        );
+    }
+
+    #[test]
+    fn library_deletion_durably_tombstones_v2_results_before_removing_media() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let first_candidate = sample_bilibili_task_candidate();
+        let mut second_candidate = first_candidate.clone();
+        second_candidate.selection_id = "page:2".to_owned();
+        second_candidate.content_id = "2002".to_owned();
+        second_candidate.identity.cid = Some(2002);
+        second_candidate.index = 2;
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1delete-v2",
+                None,
+                None,
+                "Deletion v2".to_owned(),
+                vec![first_candidate, second_candidate],
+            )
+            .expect("v2 download task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let results = [
+            (task.id.clone(), "library-one", "media-one"),
+            (format!("{}-result-2", task.id), "library-two", "media-two"),
+        ]
+        .into_iter()
+        .map(|(id, library_item_id, artifact_id)| TaskResult {
+            id,
+            state: TaskState::Succeeded.into(),
+            library_item_id: library_item_id.to_owned(),
+            artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
+                id: artifact_id.to_owned(),
+                kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
+                state: TaskArtifactState::Available.into(),
+                library_item_id: library_item_id.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("task output should stage")
+            .commit_download_terminal(
+                results,
+                TaskState::Succeeded,
+                "library-one".to_owned(),
+                "Downloaded all results.".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("task output should commit");
+        let shared_task = registry
+            .create_bilibili_download_task_v2(
+                "BV1delete-shared-v2",
+                None,
+                None,
+                "Shared deletion v2".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("shared v2 download task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("shared v2 task should become running");
+        registry
+            .stage_task_output_replacement(&shared_task.id, Vec::new())
+            .expect("shared task output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: shared_task.id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-one".to_owned(),
+                    artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
+                        id: "shared-media-one".to_owned(),
+                        kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: "library-one".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                "library-one".to_owned(),
+                "Downloaded shared result.".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("shared task output should commit");
+        {
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            let task = inner
+                .tasks_by_id
+                .get_mut(&task.id)
+                .expect("download task should remain stored");
+            let playback_source = PlaybackSource {
+                item_id: "library-one".to_owned(),
+                uri: "/library/library-one/media".to_owned(),
+                ..Default::default()
+            };
+            let playback_session = BilibiliPlaybackSession {
+                id: "session-library-one".to_owned(),
+                ..Default::default()
+            };
+            task.playback_source = Some(playback_source.clone());
+            task.playback_session = Some(playback_session.clone());
+            task.result_items[0].playback_source = Some(playback_source);
+            task.result_items[0].playback_session = Some(playback_session);
+        }
+
+        registry.fail_next_persistence_directory_sync();
+        let error = registry
+            .tombstone_library_item_before_delete("library-one", "Bilibili/library-one.mp4")
+            .expect_err("library deletion must wait for directory durability");
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        let rolled_back = registry
+            .task_output_snapshot(&task.id)
+            .expect("rolled-back output should remain visible");
+        assert_eq!(
+            TaskState::Succeeded,
+            rolled_back.output.record.results[0].state()
+        );
+        assert_eq!(
+            TaskArtifactState::Available,
+            rolled_back.output.record.results[0].artifacts[0].state()
+        );
+        assert_eq!(
+            TaskState::Succeeded,
+            registry
+                .task_output_snapshot(&shared_task.id)
+                .expect("shared output should roll back atomically")
+                .output
+                .record
+                .results[0]
+                .state()
+        );
+        assert!(registry.retry_pending_persistence());
+
+        let updated_task_ids = registry
+            .tombstone_library_item_before_delete("library-one", "Bilibili/library-one.mp4")
+            .expect("library references should tombstone durably")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            HashSet::from([task.id.clone(), shared_task.id.clone()]),
+            updated_task_ids
+        );
+        let updated = registry
+            .get_task(&task.id)
+            .expect("updated task should remain visible");
+        let output = registry
+            .task_output_snapshot(&task.id)
+            .expect("updated output should remain visible");
+        assert_eq!(TaskState::Succeeded, updated.state());
+        assert_eq!("library-two", updated.library_item_id);
+        assert!(updated.playback_source.is_none());
+        assert!(updated.playback_session.is_none());
+        assert_eq!(TaskState::Failed, updated.result_items[0].state());
+        assert!(updated.result_items[0].playback_source.is_none());
+        assert!(updated.result_items[0].playback_session.is_none());
+        assert_eq!(TaskState::Succeeded, updated.result_items[1].state());
+        assert_eq!(
+            format!("{}-result-2", task.id),
+            output.output.record.primary_result_id
+        );
+        assert_eq!(
+            TaskArtifactState::Deleted,
+            output.output.record.results[0].artifacts[0].state()
+        );
+        assert!(
+            output.output.record.results[0].artifacts[0]
+                .library_item_id
+                .is_empty()
+        );
+        let shared_updated = registry
+            .get_task(&shared_task.id)
+            .expect("shared task should remain visible as a tombstone");
+        let shared_output = registry
+            .task_output_snapshot(&shared_task.id)
+            .expect("shared output should remain visible as a tombstone");
+        assert_eq!(TaskState::Failed, shared_updated.state());
+        assert!(shared_updated.library_item_id.is_empty());
+        assert_eq!(
+            TaskState::Failed,
+            shared_output.output.record.results[0].state()
+        );
+        assert_eq!(
+            vec![
+                PersistedFileCleanupIntent::new(
+                    PersistedFileCleanupKind::LocalLibraryItem,
+                    "library-one",
+                    "Bilibili/library-one.mp4",
+                )
+                .unwrap()
+            ],
+            TaskStateStore::new(&path)
+                .load_state()
+                .expect("library cleanup intent should be durable with tombstones")
+                .file_cleanup_intents
+        );
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(path);
+        let restored_task = restored
+            .get_task(&task.id)
+            .expect("tombstoned task should survive restart");
+        let restored_output = restored
+            .task_output_snapshot(&task.id)
+            .expect("tombstoned output should survive restart");
+        assert_eq!("library-two", restored_task.library_item_id);
+        assert!(restored_task.playback_source.is_none());
+        assert!(restored_task.playback_session.is_none());
+        assert!(restored_task.result_items[0].playback_source.is_none());
+        assert!(restored_task.result_items[0].playback_session.is_none());
+        let restored_shared_task = restored
+            .get_task(&shared_task.id)
+            .expect("shared tombstoned task should survive restart");
+        let restored_shared_output = restored
+            .task_output_snapshot(&shared_task.id)
+            .expect("shared tombstoned output should survive restart");
+        assert_eq!(TaskState::Failed, restored_shared_task.state());
+        assert_eq!(
+            TaskState::Failed,
+            restored_shared_output.output.record.results[0].state()
+        );
+        assert_eq!(
+            TaskState::Failed,
+            restored_output.output.record.results[0].state()
+        );
+        assert_eq!(
+            TaskArtifactState::Deleted,
+            restored_output.output.record.results[0].artifacts[0].state()
+        );
     }
 
     #[tokio::test]
@@ -5788,6 +7817,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::PreferNonAi.into(),
             download_cover: true,
             danmaku_formats: vec![BilibiliDanmakuFormat::Xml.into()],
+            download_mode: 0,
         };
         let task = BilibiliTaskRegistry::with_persistence_path(&path)
             .create_bilibili_task("BV1persist", Some(options.clone()))
@@ -6102,6 +8132,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: None,
                 playback_session: None,
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6116,6 +8147,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(child_session.clone()),
+                identity: None,
             },
         ];
         registry
@@ -6178,6 +8210,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6192,6 +8225,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -6248,6 +8282,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6262,6 +8297,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -6323,6 +8359,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6337,6 +8374,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -6412,6 +8450,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: None,
                 playback_session: None,
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6426,6 +8465,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(child_session.clone()),
+                identity: None,
             },
         ];
         registry
@@ -6484,6 +8524,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6498,6 +8539,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -6601,6 +8643,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -6615,6 +8658,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -6689,6 +8733,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -6703,6 +8748,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -6823,6 +8869,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -6837,6 +8884,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -6900,6 +8948,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6914,6 +8963,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -6985,6 +9035,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -6999,6 +9050,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -7076,6 +9128,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -7090,6 +9143,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -7162,6 +9216,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -7176,6 +9231,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -7261,6 +9317,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -7275,6 +9332,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -7345,6 +9403,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
+                identity: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -7359,6 +9418,7 @@ mod tests {
                 library_item_id: String::new(),
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
+                identity: None,
             },
         ];
         registry
@@ -7420,6 +9480,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source(result_session_id)),
                     playback_session: Some(playback_session(result_session_id)),
+                    identity: None,
                 }],
             )
             .expect("playback results should become playable");
@@ -7456,6 +9517,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -7470,6 +9532,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -7531,6 +9594,7 @@ mod tests {
                         state: TaskState::Playable.into(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                         ..Default::default()
                     },
                     BilibiliTaskResultItem {
@@ -7538,6 +9602,7 @@ mod tests {
                         state: TaskState::Playable.into(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                         ..Default::default()
                     },
                 ],
@@ -7673,6 +9738,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -7687,6 +9753,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -7868,6 +9935,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&primary_session_id)),
                         playback_session: Some(playback_session(&primary_session_id)),
+                        identity: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -7882,6 +9950,7 @@ mod tests {
                         library_item_id: String::new(),
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
+                        identity: None,
                     },
                 ],
             )
@@ -7920,6 +9989,796 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_v2_download_context_and_candidates_survive_restart_and_claim() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let context = BilibiliRequestContext {
+            api_mode: crate::generated::tvos_net_player::v1::BilibiliApiMode::Web.into(),
+            credential_profile_id: "family-profile".to_owned(),
+        };
+        let candidate = sample_bilibili_task_candidate();
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let created = registry
+            .create_bilibili_download_task_v2(
+                "BV1download-v2",
+                Some(download_options("1080p", true)),
+                Some(context.clone()),
+                "Download collection".to_owned(),
+                vec![candidate.clone()],
+            )
+            .expect("v2 download task should be durably created");
+        assert_eq!(TaskState::Queued, created.state());
+        assert_eq!(1, created.result_items.len());
+        assert_eq!(
+            Some(candidate.proto_identity()),
+            created.result_items[0].identity
+        );
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(state_path);
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("restored v2 download should be claimable");
+        assert_eq!(created.id, work_item.task_id);
+        assert_eq!(Some(context), work_item.request_context);
+        assert_eq!(vec![candidate], work_item.accepted_candidates);
+        assert_eq!(
+            Some("1080p"),
+            work_item
+                .options
+                .as_ref()
+                .map(|options| options.quality_preference.as_str())
+        );
+    }
+
+    #[test]
+    fn bilibili_v2_download_defaults_are_frozen_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1frozen-defaults",
+                None,
+                None,
+                "Frozen defaults".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 download should freeze defaults before persistence");
+
+        let records = TaskStateStore::new(state_path)
+            .load()
+            .expect("frozen v2 download should reload");
+        let record = records
+            .iter()
+            .find(|record| record.task.id == task.id)
+            .expect("created task should persist");
+        assert_eq!(
+            Some(BilibiliDownloadMode::All),
+            record
+                .options
+                .as_ref()
+                .map(BilibiliDownloadOptions::download_mode)
+        );
+        assert_eq!(
+            Some(BilibiliApiMode::Web),
+            record
+                .request_context
+                .as_ref()
+                .map(BilibiliRequestContext::api_mode)
+        );
+        assert_eq!(
+            Some(""),
+            record
+                .request_context
+                .as_ref()
+                .map(|context| context.credential_profile_id.as_str())
+        );
+    }
+
+    #[test]
+    fn bilibili_v2_download_creation_waits_for_installed_snapshot_durability() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let candidate = sample_bilibili_task_candidate();
+        registry.fail_next_persistence_directory_sync();
+
+        let created = registry
+            .create_bilibili_download_task_v2(
+                "BV1download-durability-v2",
+                Some(download_options("1080p", false)),
+                None,
+                "Durable download".to_owned(),
+                vec![candidate.clone()],
+            )
+            .expect("the installed v2 download must remain owned while durability recovers");
+
+        assert!(!registry.persistence_available());
+        assert_eq!(created.id, registry.get_task(&created.id).unwrap().id);
+        assert!(registry.try_claim_next_bilibili_task().is_none());
+        let installed_records = TaskStateStore::new(&state_path)
+            .load()
+            .expect("the installed snapshot should remain readable");
+        assert_eq!(1, installed_records.len());
+        assert_eq!(created.id, installed_records[0].task.id);
+
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::Durable,
+            registry.retry_pending_persistence_outcome()
+        );
+        let duplicate = registry
+            .create_bilibili_download_task_v2(
+                " BV1download-durability-v2 ",
+                Some(download_options("1080P", false)),
+                None,
+                "Durable download".to_owned(),
+                vec![candidate.clone()],
+            )
+            .expect("a durable retry must resolve to the installed task");
+        assert_eq!(created.id, duplicate.id);
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(state_path);
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("the durable v2 download should become claimable");
+        assert_eq!(created.id, work_item.task_id);
+        assert_eq!(vec![candidate], work_item.accepted_candidates);
+    }
+
+    #[test]
+    fn bilibili_v2_active_dedupe_includes_context_options_and_candidates() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path(
+            temp.path().join("state").join("tasks.json"),
+        );
+        let context = BilibiliRequestContext {
+            api_mode: crate::generated::tvos_net_player::v1::BilibiliApiMode::Web.into(),
+            credential_profile_id: "profile-a".to_owned(),
+        };
+        let candidate = sample_bilibili_task_candidate();
+        let first = registry
+            .create_bilibili_download_task_v2(
+                "BV1dedupe-v2",
+                Some(download_options("1080P", false)),
+                Some(context.clone()),
+                "Dedupe".to_owned(),
+                vec![candidate.clone()],
+            )
+            .unwrap();
+        let duplicate = registry
+            .create_bilibili_download_task_v2(
+                " BV1dedupe-v2 ",
+                Some(download_options("1080p", false)),
+                Some(context.clone()),
+                "Dedupe".to_owned(),
+                vec![candidate.clone()],
+            )
+            .unwrap();
+        let different_context = registry
+            .create_bilibili_download_task_v2(
+                "BV1dedupe-v2",
+                Some(download_options("1080p", false)),
+                Some(BilibiliRequestContext {
+                    credential_profile_id: "profile-b".to_owned(),
+                    ..context.clone()
+                }),
+                "Dedupe".to_owned(),
+                vec![candidate.clone()],
+            )
+            .unwrap();
+        let mut mode_options = download_options("1080p", false);
+        mode_options.download_mode =
+            crate::generated::tvos_net_player::v1::BilibiliDownloadMode::AudioOnly.into();
+        let different_options = registry
+            .create_bilibili_download_task_v2(
+                "BV1dedupe-v2",
+                Some(mode_options),
+                Some(context.clone()),
+                "Dedupe".to_owned(),
+                vec![candidate.clone()],
+            )
+            .unwrap();
+        let mut other_candidate = candidate;
+        other_candidate.selection_id = "page:2:cid:2002:bvid:BV1stable:aid:1001".to_owned();
+        other_candidate.content_id = "2002".to_owned();
+        other_candidate.identity.cid = Some(2_002);
+        other_candidate.index = 2;
+        let different_candidates = registry
+            .create_bilibili_download_task_v2(
+                "BV1dedupe-v2",
+                Some(download_options("1080p", false)),
+                Some(context),
+                "Dedupe".to_owned(),
+                vec![other_candidate],
+            )
+            .unwrap();
+
+        assert_eq!(first.id, duplicate.id);
+        assert_ne!(first.id, different_context.id);
+        assert_ne!(first.id, different_options.id);
+        assert_ne!(first.id, different_candidates.id);
+    }
+
+    #[test]
+    fn staged_download_terminal_commit_is_one_durable_publication() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let context = BilibiliRequestContext {
+            api_mode: crate::generated::tvos_net_player::v1::BilibiliApiMode::Web.into(),
+            credential_profile_id: "terminal-profile".to_owned(),
+        };
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1terminal-v2",
+                Some(download_options("1080p", false)),
+                Some(context),
+                "Terminal download".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .unwrap();
+        let claimed = registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should be claimable");
+        assert_eq!(task.id, claimed.task_id);
+        let resource = test_task_resource("terminal-metadata", 4);
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("terminal resource should be staged");
+        staged
+            .write_resource_body(&resource.resource.id, b"test")
+            .expect("terminal body should be written securely");
+        let mut result = test_task_result_with_resources(&task.id, std::slice::from_ref(&resource));
+        result.library_item_id = "library-terminal".to_owned();
+        let completed = staged
+            .commit_download_terminal(
+                vec![result],
+                TaskState::Succeeded,
+                "library-terminal".to_owned(),
+                "Downloaded with artifacts.".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("output and terminal task should commit together");
+
+        assert_eq!(TaskState::Succeeded, completed.state());
+        assert_eq!(1.0, completed.progress);
+        assert_eq!("library-terminal", completed.library_item_id);
+        assert_eq!(TaskState::Completed, completed.result_items[0].state());
+        assert_eq!(
+            Some(1),
+            completed.output_summary.map(|summary| summary.result_count)
+        );
+        {
+            let inner = registry
+                .inner
+                .lock()
+                .expect("registry lock should be valid");
+            assert!(!inner.download_options_by_id.contains_key(&task.id));
+            assert!(!inner.request_context_by_id.contains_key(&task.id));
+            assert!(!inner.running_cancellations_by_id.contains_key(&task.id));
+            assert!(!inner.queued_task_ids.contains(&task.id));
+            assert!(inner.bilibili_candidates_by_id.contains_key(&task.id));
+        }
+        assert_eq!(
+            b"test",
+            std::fs::read(root_path.join(resource.relative_path()))
+                .unwrap()
+                .as_slice()
+        );
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let restored_task = restored.get_task(&task.id).unwrap();
+        assert_eq!(TaskState::Succeeded, restored_task.state());
+        assert_eq!(
+            Some(1),
+            restored_task
+                .output_summary
+                .map(|summary| summary.result_count)
+        );
+        assert!(restored.task_resource("terminal-metadata").is_some());
+        assert!(
+            TaskStateStore::new(temp.path().join("state").join("tasks.json"))
+                .load()
+                .unwrap()
+                .iter()
+                .find(|record| record.task.id == task.id)
+                .is_some_and(|record| record.request_context.is_none())
+        );
+    }
+
+    #[test]
+    fn terminal_download_cleanup_intent_replays_after_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let transient_path = root_path.join("Bilibili/transient-subtitle.srt");
+        std::fs::create_dir_all(transient_path.parent().unwrap())
+            .expect("transient output directory should be created");
+        std::fs::write(&transient_path, b"subtitle").expect("transient output should exist");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-restart",
+                None,
+                None,
+                "Cleanup restart".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    title: task.result_items[0].title.clone(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Downloaded sidecar output.".to_owned(),
+                vec![transient_path.clone()],
+                Vec::new(),
+            )
+            .expect("terminal output and cleanup intent should commit together");
+
+        let persisted = TaskStateStore::new(&state_path)
+            .load_state()
+            .expect("cleanup intent should be readable");
+        assert_eq!(1, persisted.file_cleanup_intents.len());
+        assert_eq!(
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::BilibiliTransientOutput,
+                &task.id,
+                "Bilibili/transient-subtitle.srt",
+            )
+            .unwrap(),
+            persisted.file_cleanup_intents[0]
+        );
+        assert!(transient_path.exists());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        assert_eq!(
+            TaskState::Succeeded,
+            restored.get_task(&task.id).unwrap().state()
+        );
+        assert!(!transient_path.exists());
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn owned_output_directories_are_durable_before_bytes_and_reaped_after_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1owned-output-restart",
+                None,
+                None,
+                "Owned output restart".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("ownership must be durable before output creation");
+        let persisted = TaskStateStore::new(&state_path)
+            .load_state()
+            .expect("directory ownership should be readable");
+        assert_eq!(2, persisted.file_cleanup_intents.len());
+        assert!(persisted.file_cleanup_intents.iter().all(|intent| {
+            intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                && intent.owner_id == task.id
+        }));
+
+        std::fs::create_dir_all(staging_path.join("nested"))
+            .expect("staging fixture should be created after durability");
+        std::fs::write(staging_path.join("nested/raw.m4s"), b"raw")
+            .expect("staging output should exist");
+        std::fs::create_dir_all(&published_path)
+            .expect("published fixture should be created after durability");
+        std::fs::write(published_path.join("orphan.mp4"), b"orphan")
+            .expect("published orphan should exist");
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        assert!(!staging_path.exists());
+        assert!(!published_path.exists());
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .is_empty()
+        );
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+    }
+
+    #[test]
+    fn terminal_publication_releases_only_the_retained_output_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1owned-output-terminal",
+                None,
+                None,
+                "Owned output terminal".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("both directories should start owned");
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(staging_path.join("transient.m4s"), b"transient").unwrap();
+        std::fs::create_dir_all(&published_path).unwrap();
+        std::fs::write(published_path.join("video.mp4"), b"video").unwrap();
+        let library_item_id = "local.default.owned-output".to_owned();
+
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: library_item_id.clone(),
+                    artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
+                        id: "owned-output-media".to_owned(),
+                        kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: library_item_id.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                library_item_id,
+                "Published retained output.".to_owned(),
+                Vec::new(),
+                vec![staging_path.clone()],
+            )
+            .expect("terminal output should transfer directory ownership atomically");
+
+        let persisted = TaskStateStore::new(&state_path).load_state().unwrap();
+        assert_eq!(1, persisted.file_cleanup_intents.len());
+        assert_eq!(
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                &task.id,
+                format!(".tvos-net-player/bbdown-staging/{}", task.id),
+            )
+            .unwrap(),
+            persisted.file_cleanup_intents[0]
+        );
+        assert!(
+            registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                    &task.id,
+                )
+                .expect("staging cleanup should succeed")
+        );
+        assert!(!staging_path.exists());
+        assert!(published_path.join("video.mp4").is_file());
+    }
+
+    #[test]
+    fn failed_terminal_output_cleanup_remains_durable_until_retry_succeeds() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let transient_path = root_path.join("Bilibili/stuck-subtitle.srt");
+        std::fs::create_dir_all(&transient_path)
+            .expect("directory fixture should block file unlink");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-retry",
+                None,
+                None,
+                "Cleanup retry".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Downloaded sidecar output.".to_owned(),
+                vec![transient_path.clone()],
+                Vec::new(),
+            )
+            .expect("terminal output and cleanup intent should commit together");
+
+        let error = registry
+            .retry_file_cleanup_intents_for_owner(
+                PersistedFileCleanupKind::BilibiliTransientOutput,
+                &task.id,
+            )
+            .expect_err("a directory must not be accepted as a cleaned file");
+        assert_eq!(tonic::Code::Internal, error.code());
+        assert_eq!(
+            1,
+            TaskStateStore::new(&state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .len()
+        );
+
+        std::fs::remove_dir(&transient_path).expect("blocking directory should be removable");
+        std::fs::write(&transient_path, b"subtitle").expect("retry file fixture should be created");
+        assert!(
+            registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::BilibiliTransientOutput,
+                    &task.id,
+                )
+                .expect("cleanup retry should succeed")
+        );
+        assert!(!transient_path.exists());
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_resource_helpers_bind_source_and_destination_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(root_path.join("downloads"))
+            .expect("cache source directory should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1staged-identity", None)
+            .expect("task should be created");
+
+        let source_path = root_path.join("downloads/source.txt");
+        std::fs::write(&source_path, b"old").unwrap();
+        let copied = test_task_resource("copied-identity", 3);
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![copied.clone()])
+            .unwrap();
+        let moved_source_path = root_path.join("downloads/source-old.txt");
+        staged
+            .copy_resource_body_from_cache_path_with_hook(&copied.resource.id, &source_path, || {
+                std::fs::rename(&source_path, &moved_source_path).unwrap();
+                std::fs::write(&source_path, b"new").unwrap();
+            })
+            .expect("copy should remain bound to the originally opened source object");
+        staged
+            .commit(vec![test_task_result_with_resources(
+                "copied-result",
+                std::slice::from_ref(&copied),
+            )])
+            .unwrap();
+        let copied_path = root_path.join(copied.relative_path());
+        assert_eq!(b"old", std::fs::read(&copied_path).unwrap().as_slice());
+
+        let unchanged = registry
+            .stage_task_output_replacement(&task.id, vec![copied.clone()])
+            .expect("an immutable current resource representation may be retained");
+        assert_eq!(0, unchanged.resources_requiring_body_creation().count());
+        assert_eq!(
+            io::ErrorKind::InvalidInput,
+            unchanged
+                .write_resource_body(&copied.resource.id, b"new")
+                .expect_err("an immutable current resource must never be overwritten")
+                .kind()
+        );
+        drop(unchanged);
+        assert_eq!(b"old", std::fs::read(copied_path).unwrap().as_slice());
+
+        let outside_path = temp.path().join("outside.txt");
+        std::fs::write(&outside_path, b"bad").unwrap();
+        let source_symlink = root_path.join("downloads/source-link.txt");
+        symlink(&outside_path, &source_symlink).unwrap();
+        let linked = test_task_resource("linked-source", 3);
+        let linked_stage = registry
+            .stage_task_output_replacement(&task.id, vec![linked.clone()])
+            .unwrap();
+        assert!(
+            linked_stage
+                .copy_resource_body_from_cache_path(&linked.resource.id, &source_symlink)
+                .is_err()
+        );
+        assert_eq!(
+            io::ErrorKind::PermissionDenied,
+            linked_stage
+                .copy_resource_body_from_cache_path(&linked.resource.id, &outside_path)
+                .expect_err("sources outside the configured cache root must be rejected")
+                .kind()
+        );
+        assert!(!root_path.join(linked.relative_path()).exists());
+        drop(linked_stage);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_resource_helpers_reject_size_mismatch_symlink_and_replacement() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state").join("tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1staged-rejection", None)
+            .expect("task should be created");
+
+        let wrong_size = test_task_resource("wrong-size", 4);
+        let wrong_size_stage = registry
+            .stage_task_output_replacement(&task.id, vec![wrong_size.clone()])
+            .unwrap();
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            wrong_size_stage
+                .write_resource_body(&wrong_size.resource.id, b"five!")
+                .expect_err("declared size must be enforced")
+                .kind()
+        );
+        assert!(!root_path.join(wrong_size.relative_path()).exists());
+        drop(wrong_size_stage);
+
+        let destination_link = test_task_resource("destination-link", 4);
+        let destination_stage = registry
+            .stage_task_output_replacement(&task.id, vec![destination_link.clone()])
+            .unwrap();
+        let destination_path = root_path.join(destination_link.relative_path());
+        std::fs::create_dir_all(destination_path.parent().unwrap()).unwrap();
+        let link_target = temp.path().join("link-target.txt");
+        std::fs::write(&link_target, b"safe").unwrap();
+        symlink(&link_target, &destination_path).unwrap();
+        assert_eq!(
+            io::ErrorKind::AlreadyExists,
+            destination_stage
+                .write_resource_body(&destination_link.resource.id, b"evil")
+                .expect_err("exclusive destination creation must reject symlinks")
+                .kind()
+        );
+        assert_eq!(b"safe", std::fs::read(&link_target).unwrap().as_slice());
+        drop(destination_stage);
+
+        let replacement = test_task_resource("destination-replacement", 4);
+        let replacement_stage = registry
+            .stage_task_output_replacement(&task.id, vec![replacement.clone()])
+            .unwrap();
+        replacement_stage
+            .write_resource_body(&replacement.resource.id, b"good")
+            .unwrap();
+        let replacement_path = root_path.join(replacement.relative_path());
+        let original_path = replacement_path.with_file_name("body-original");
+        std::fs::rename(&replacement_path, &original_path).unwrap();
+        std::fs::write(&replacement_path, b"evil").unwrap();
+        std::fs::set_permissions(&replacement_path, std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        let error = replacement_stage
+            .commit_download_terminal(
+                vec![test_task_result_with_resources(
+                    "replacement-result",
+                    std::slice::from_ref(&replacement),
+                )],
+                TaskState::Succeeded,
+                "library-item".to_owned(),
+                "Completed.".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("destination replacement must fail before publication");
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
+        assert_eq!(
+            TaskState::Queued,
+            registry.get_task(&task.id).unwrap().state()
+        );
+    }
+
+    #[test]
     fn restores_preparing_progressive_playback_task_as_failed() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
@@ -7947,6 +10806,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
+                    identity: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -8084,6 +10944,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
+                    identity: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -10358,6 +13219,7 @@ mod tests {
             library_item_id: String::new(),
             playback_source: None,
             playback_session: None,
+            identity: None,
         };
 
         let error = registry
@@ -10459,6 +13321,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
+                    identity: None,
                 }],
             )
             .expect_err("an unpersistable playback publication must be rejected");
@@ -10550,12 +13413,14 @@ mod tests {
             records: vec![persisted_task_record("bilibili-new", "BV1new")],
             resource_cleanup_ids: Vec::new(),
             pruned_task_ids: Vec::new(),
+            file_cleanup_intents: Vec::new(),
         });
         persistence.save_snapshot(&TaskPersistenceSnapshot {
             generation: 1,
             records: vec![persisted_task_record("bilibili-old", "BV1old")],
             resource_cleanup_ids: Vec::new(),
             pruned_task_ids: Vec::new(),
+            file_cleanup_intents: Vec::new(),
         });
 
         let records = TaskStateStore::new(path)
@@ -10766,6 +13631,7 @@ mod tests {
             task,
             options: None,
             playback_options: None,
+            request_context: None,
             bilibili_candidates: Vec::new(),
         }
     }
@@ -10806,6 +13672,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         }
     }
 

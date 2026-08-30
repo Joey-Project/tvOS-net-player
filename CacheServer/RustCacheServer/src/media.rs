@@ -3390,6 +3390,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source),
                     playback_session: Some(playback_session),
+                    identity: None,
                 }],
             )
             .expect("playback task should authorize HLS session");

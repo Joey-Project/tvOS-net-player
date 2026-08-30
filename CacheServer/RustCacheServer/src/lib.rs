@@ -77,6 +77,7 @@ use crate::{
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
+    task_store::PersistedFileCleanupKind,
     transcoding::HlsTranscodingPlanState,
 };
 
@@ -1041,6 +1042,36 @@ impl AppState {
             TaskState::Completed => false,
             _ => false,
         }
+    }
+
+    pub(crate) async fn delete_local_library_item(&self, item_id: &str) -> Result<bool, Status> {
+        let Some(deletion) =
+            self.library
+                .prepare_item_deletion(item_id)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("Failed to prepare library item deletion: {error}"))
+                })?
+        else {
+            return Ok(false);
+        };
+        let updated_task_ids = self
+            .tasks
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())?;
+        if !updated_task_ids.is_empty() {
+            let task_ids = updated_task_ids.into_iter().collect::<HashSet<_>>();
+            let released_resource_lease_ids = self
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .invalidate_tasks(&task_ids);
+            self.tasks
+                .release_task_output_snapshots(&released_resource_lease_ids);
+        }
+        self.tasks.retry_file_cleanup_intents_for_owner(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            deletion.item_id(),
+        )
     }
 
     pub(crate) async fn delete_completed_hls_library_item(
@@ -3536,6 +3567,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source),
                     playback_session: Some(sample_playback_session(&child_session_id)),
+                    identity: None,
                 }],
             )
             .expect("preparing task should publish its planned child result");
