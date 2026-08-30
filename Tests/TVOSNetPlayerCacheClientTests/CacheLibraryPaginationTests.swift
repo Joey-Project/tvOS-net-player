@@ -647,7 +647,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(download.danmakuFormats.isEmpty)
     }
 
-    func testLegacyCreateBilibiliTaskRequestAllowsMediaDownloadModes() throws {
+    func testLegacyCreateBilibiliTaskRequestEncodesMediaDownloadModes() throws {
         let defaultRequest = try GRPCCacheControlClient.createBilibiliTaskRequest(
             urlOrID: "BV1legacy",
             options: BilibiliDownloadTaskOptions()
@@ -668,6 +668,23 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 options: BilibiliDownloadTaskOptions(downloadMode: mode)
             )
             XCTAssertEqual(request.options.downloadMode, TvosNetPlayer_V1_BilibiliDownloadMode(mode))
+        }
+    }
+
+    func testLegacyMediaOnlyDownloadModesRequireExecutionV2Capability() {
+        for mode in [BilibiliDownloadMode.unspecified, .all] {
+            XCTAssertNil(
+                GRPCCacheControlClient.requiredCapabilityForLegacyBilibiliDownloadMode(mode),
+                "mode: \(mode)"
+            )
+        }
+
+        for mode in [BilibiliDownloadMode.videoOnly, .audioOnly] {
+            XCTAssertEqual(
+                GRPCCacheControlClient.requiredCapabilityForLegacyBilibiliDownloadMode(mode),
+                CacheServerCapability.bilibiliExecutionV2,
+                "mode: \(mode)"
+            )
         }
     }
 

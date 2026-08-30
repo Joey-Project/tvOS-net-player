@@ -525,6 +525,14 @@ public final class GRPCCacheControlClient: CacheControlClient {
         options: BilibiliDownloadTaskOptions = BilibiliDownloadTaskOptions()
     ) async throws -> CacheTask {
         let request = try Self.createBilibiliTaskRequest(urlOrID: urlOrID, options: options)
+        if let requiredCapability = Self.requiredCapabilityForLegacyBilibiliDownloadMode(
+            options.downloadMode
+        ) {
+            let serverInfo = try await getServerInfo()
+            guard serverInfo.capabilities.contains(requiredCapability) else {
+                throw Self.unsupportedFeature(forMissingCapability: requiredCapability)
+            }
+        }
 
         return try await withGRPCClient(
             transport: .http2NIOTS(
@@ -558,6 +566,17 @@ public final class GRPCCacheControlClient: CacheControlClient {
             throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
         case .unknown:
             throw CacheControlClientInvalidRequest.invalidBilibiliDownloadMode
+        }
+    }
+
+    static func requiredCapabilityForLegacyBilibiliDownloadMode(
+        _ mode: BilibiliDownloadMode
+    ) -> String? {
+        switch mode {
+        case .videoOnly, .audioOnly:
+            return CacheServerCapability.bilibiliExecutionV2
+        case .unspecified, .all, .subtitleOnly, .danmakuOnly, .coverOnly, .unknown:
+            return nil
         }
     }
 

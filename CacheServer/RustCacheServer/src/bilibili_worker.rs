@@ -864,6 +864,13 @@ mod tests {
         ));
 
         let completed = wait_for_state(&registry, &task.id, TaskState::Succeeded).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transient_output_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker should remove copied transient output after durable publication");
         worker.abort();
         let _ = worker.await;
         let successful_result_id = format!("{}-result-2", task.id);

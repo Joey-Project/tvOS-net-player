@@ -6,7 +6,7 @@ use std::{
     io,
     path::{Component, Components, Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdRwLockReadGuard, Weak,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -27,6 +27,7 @@ use crate::{
 pub const ROOT_ID: &str = "default";
 pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
+const MAX_PUBLICATION_GATE_STABILIZATION_ATTEMPTS: usize = 8;
 const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 
 pub(crate) struct LibraryPublicationGate {
@@ -90,6 +91,34 @@ impl LibraryPublicationGate {
             .read()
             .expect("library publication gate lock poisoned")
             .clone()
+    }
+
+    fn read_if_current(
+        &self,
+        snapshot: &Arc<LibraryPublicationGateState>,
+    ) -> Option<StdRwLockReadGuard<'_, Arc<LibraryPublicationGateState>>> {
+        let current = self
+            .state
+            .read()
+            .expect("library publication gate lock poisoned");
+        Arc::ptr_eq(&current, snapshot).then_some(current)
+    }
+
+    fn with_stable_snapshot<T>(
+        &self,
+        mut operation: impl FnMut(&LibraryPublicationGateState) -> T,
+    ) -> Option<T> {
+        // Arc identity is the publication-state generation token. Filesystem metadata may
+        // legitimately change during a scan; no-follow object and access-policy checks remain
+        // responsible for those independent properties.
+        for _ in 0..MAX_PUBLICATION_GATE_STABILIZATION_ATTEMPTS {
+            let snapshot = self.snapshot();
+            let result = operation(&snapshot);
+            if self.read_if_current(&snapshot).is_some() {
+                return Some(result);
+            }
+        }
+        None
     }
 }
 
@@ -313,41 +342,53 @@ impl LocalMediaLibrary {
             Err(_) => return LibraryItemPage::empty(),
         };
 
-        let mut skipped_items = 0_i64;
-        let mut items = Vec::with_capacity(page_size);
-        let mut next_page_offset = None;
-        for candidate in candidates {
-            if cancellation.is_cancelled() {
-                return LibraryItemPage::empty();
-            }
-            let Some(item) = self.try_create_library_item(&root_path, &candidate.path) else {
-                continue;
-            };
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                let mut skipped_items = 0_i64;
+                let mut items = Vec::with_capacity(page_size);
+                let mut next_page_offset = None;
+                for candidate in &candidates {
+                    if cancellation.is_cancelled() {
+                        return LibraryItemPage::empty();
+                    }
+                    let Some(item) = self.try_create_library_item(&root_path, &candidate.path)
+                    else {
+                        continue;
+                    };
+                    if publication_gate.blocks(Path::new(&item.source_id)) {
+                        continue;
+                    }
 
-            if skipped_items < page_offset {
-                skipped_items += 1;
-                continue;
-            }
+                    if skipped_items < page_offset {
+                        skipped_items += 1;
+                        continue;
+                    }
 
-            if items.len() < page_size {
-                items.push(item);
-                continue;
-            }
+                    if items.len() < page_size {
+                        items.push(item);
+                        continue;
+                    }
 
-            next_page_offset = page_offset.checked_add(page_size.try_into().unwrap_or(i64::MAX));
-            break;
-        }
+                    next_page_offset =
+                        page_offset.checked_add(page_size.try_into().unwrap_or(i64::MAX));
+                    break;
+                }
 
-        LibraryItemPage {
-            items,
-            next_page_offset,
-        }
+                LibraryItemPage {
+                    items,
+                    next_page_offset,
+                }
+            })
+            .unwrap_or_else(LibraryItemPage::empty)
     }
 
     fn get_item_blocking(&self, id: &str) -> Option<LibraryItem> {
-        let publication_gate = self.publication_gate.snapshot();
-        let media_file = self.resolve_media_file(id, VARIANT_ID, &publication_gate)?;
-        Some(self.create_library_item(&media_file))
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                let media_file = self.resolve_media_file(id, VARIANT_ID, publication_gate)?;
+                Some(self.create_library_item(&media_file))
+            })
+            .flatten()
     }
 
     fn item_id_for_media_path_blocking(&self, path: &Path) -> Option<String> {
@@ -357,25 +398,32 @@ impl LocalMediaLibrary {
     }
 
     fn get_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
-        let publication_gate = self.publication_gate.snapshot();
-        self.resolve_media_file(item_id, variant_id, &publication_gate)
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                self.resolve_media_file(item_id, variant_id, publication_gate)
+            })
+            .flatten()
     }
 
     fn open_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<OpenedMediaFile> {
-        let publication_gate = self.publication_gate.snapshot();
-        let media_file = self.resolve_media_file(item_id, variant_id, &publication_gate)?;
-        let file = open_read_no_follow(&self.root_path(), &media_file.relative_path).ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.file_type().is_file() {
-            return None;
-        }
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                let media_file = self.resolve_media_file(item_id, variant_id, publication_gate)?;
+                let file =
+                    open_read_no_follow(&self.root_path(), &media_file.relative_path).ok()?;
+                let metadata = file.metadata().ok()?;
+                if !metadata.file_type().is_file() {
+                    return None;
+                }
 
-        Some(OpenedMediaFile {
-            file,
-            content_type: media_file.content_type,
-            last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-            size_bytes: metadata.len(),
-        })
+                Some(OpenedMediaFile {
+                    file,
+                    content_type: media_file.content_type,
+                    last_modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                    size_bytes: metadata.len(),
+                })
+            })
+            .flatten()
     }
 
     fn cache_root_blocking(&self) -> CacheRoot {
@@ -400,12 +448,21 @@ impl LocalMediaLibrary {
     }
 
     fn delete_item_blocking(&self, id: &str) -> io::Result<bool> {
-        let publication_gate = self.publication_gate.snapshot();
-        let Some(media_file) = self.resolve_deletable_media_file(id, &publication_gate)? else {
-            return Ok(false);
-        };
-
-        remove_file_no_follow(&self.root_path(), &media_file.relative_path)
+        for _ in 0..MAX_PUBLICATION_GATE_STABILIZATION_ATTEMPTS {
+            let publication_gate = self.publication_gate.snapshot();
+            let media_file = self.resolve_deletable_media_file(id, &publication_gate)?;
+            let Some(_current_gate) = self.publication_gate.read_if_current(&publication_gate)
+            else {
+                continue;
+            };
+            let Some(media_file) = media_file else {
+                return Ok(false);
+            };
+            // Keep the short generation guard across the irreversible unlink. Directory scans
+            // and canonicalization have already completed without holding the publication lock.
+            return remove_file_no_follow(&self.root_path(), &media_file.relative_path);
+        }
+        Err(publication_gate_changed_error())
     }
 
     fn is_root_available_blocking(&self) -> bool {
@@ -428,16 +485,20 @@ impl LocalMediaLibrary {
             return 0;
         };
 
-        candidates
-            .into_iter()
-            .filter(|candidate| {
-                self.try_create_media_file(&root_path, &candidate.path)
-                    .is_some()
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                candidates
+                    .iter()
+                    .filter_map(|candidate| self.try_create_media_file(&root_path, &candidate.path))
+                    .filter(|media_file| {
+                        !publication_gate.blocks(Path::new(&media_file.relative_path))
+                    })
+                    .take(i32::MAX as usize)
+                    .count()
+                    .try_into()
+                    .unwrap_or(i32::MAX)
             })
-            .take(i32::MAX as usize)
-            .count()
-            .try_into()
-            .unwrap_or(i32::MAX)
+            .unwrap_or(0)
     }
 
     fn create_library_item(&self, media_file: &MediaFile) -> LibraryItem {
@@ -586,7 +647,18 @@ impl LocalMediaLibrary {
         &self,
         item_id: &str,
     ) -> io::Result<Option<(String, String)>> {
-        let publication_gate = self.publication_gate.snapshot();
+        self.publication_gate
+            .with_stable_snapshot(|publication_gate| {
+                self.canonical_deletable_item_id_for_snapshot(item_id, publication_gate)
+            })
+            .unwrap_or_else(|| Err(publication_gate_changed_error()))
+    }
+
+    fn canonical_deletable_item_id_for_snapshot(
+        &self,
+        item_id: &str,
+        publication_gate: &LibraryPublicationGateState,
+    ) -> io::Result<Option<(String, String)>> {
         let root_path = self.root_path();
         ensure_deletable_root(&root_path)?;
         let Some(relative_path) = decode_item_id(item_id) else {
@@ -608,7 +680,7 @@ impl LocalMediaLibrary {
         match fs::symlink_metadata(&full_candidate_path) {
             Ok(_) => {
                 return self
-                    .resolve_deletable_media_file(item_id, &publication_gate)
+                    .resolve_deletable_media_file(item_id, publication_gate)
                     .map(|media_file| {
                         media_file.map(|media_file| {
                             let item_id = create_item_id(&media_file.relative_path);
@@ -754,6 +826,13 @@ impl LocalMediaLibrary {
             })
             .collect()
     }
+}
+
+fn publication_gate_changed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "library publication state changed repeatedly",
+    )
 }
 
 /// Keeps API-owned deletion from invalidating a canonical library item during publication.
@@ -2570,6 +2649,60 @@ mod tests {
             gate.snapshot()
                 .blocks(Path::new("Bilibili/task-1/video.mp4"))
         );
+    }
+
+    #[test]
+    fn stable_snapshot_retries_when_ownership_is_registered_during_work() {
+        let gate = Arc::new(LibraryPublicationGate::known_empty());
+        let (snapshot_in_use_tx, snapshot_in_use_rx) = std::sync::mpsc::channel();
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        let updating_gate = Arc::clone(&gate);
+        let update = std::thread::spawn(move || {
+            snapshot_in_use_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the first snapshot should enter filesystem work");
+            updating_gate
+                .install_durable_blocked_paths(["Bilibili/task-1"])
+                .expect("gate update should succeed");
+            updated_tx
+                .send(())
+                .expect("the gate update should be observable");
+        });
+
+        let mut attempts = 0;
+        let visible = gate
+            .with_stable_snapshot(|snapshot| {
+                attempts += 1;
+                if attempts == 1 {
+                    snapshot_in_use_tx
+                        .send(())
+                        .expect("the updater should be notified");
+                    updated_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("ownership should be registered during the first attempt");
+                }
+                !snapshot.blocks(Path::new("Bilibili/task-1/video.mp4"))
+            })
+            .expect("the publication view should stabilize");
+
+        update.join().expect("gate update should finish");
+        assert_eq!(2, attempts);
+        assert!(!visible);
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_enter_an_irreversible_gate_section() {
+        let gate = LibraryPublicationGate::known_empty();
+        let stale_snapshot = gate.snapshot();
+        gate.install_durable_blocked_paths(["Bilibili/task-1"])
+            .expect("gate update should succeed");
+
+        assert!(gate.read_if_current(&stale_snapshot).is_none());
+        let current_snapshot = gate.snapshot();
+        let current_guard = gate
+            .read_if_current(&current_snapshot)
+            .expect("the current snapshot should enter the guarded section");
+        assert!(current_guard.blocks(Path::new("Bilibili/task-1/video.mp4")));
     }
 
     #[test]
