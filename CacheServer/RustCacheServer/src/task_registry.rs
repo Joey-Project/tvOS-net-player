@@ -3509,6 +3509,11 @@ impl BilibiliTaskRegistry {
             relative_path,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if self.persistence_configured && self.persistence.is_none() {
+            return Err(Status::unavailable(
+                "Task state is not durable enough to delete library media.",
+            ));
+        }
 
         let _file_cleanup_guard = self
             .file_cleanup_lock
@@ -5657,6 +5662,7 @@ impl ActiveBilibiliTaskKey {
         candidates: &[BilibiliTaskCandidateRecord],
     ) -> Self {
         let mut key = Self::new(TaskKind::BilibiliDownload, source);
+        key.download_mode = BilibiliDownloadMode::All.into();
         if let Some(options) = options {
             key.quality_preference = normalize_option_string(&options.quality_preference);
             key.encoding_preference = normalize_option_string(&options.encoding_preference);
@@ -5667,7 +5673,7 @@ impl ActiveBilibiliTaskKey {
             key.subtitle_ai_policy = normalize_subtitle_ai_policy_key(options.subtitle_ai_policy);
             key.download_cover = options.download_cover;
             key.danmaku_formats = normalize_danmaku_format_keys(&options.danmaku_formats);
-            key.download_mode = options.download_mode;
+            key.download_mode = normalize_download_mode_key(options.download_mode);
         }
         key.bind_request_context_and_candidates(request_context, candidates);
         key
@@ -5773,6 +5779,15 @@ fn normalize_danmaku_format_keys(values: &[i32]) -> Vec<i32> {
     normalized.sort_unstable();
     normalized.dedup();
     normalized
+}
+
+fn normalize_download_mode_key(value: i32) -> i32 {
+    match BilibiliDownloadMode::try_from(value) {
+        Ok(BilibiliDownloadMode::Unspecified | BilibiliDownloadMode::All) => {
+            BilibiliDownloadMode::All.into()
+        }
+        _ => value,
+    }
 }
 
 fn concrete_bilibili_v2_download_options(
@@ -7635,6 +7650,29 @@ mod tests {
         assert_eq!(first.id, duplicate.id);
         assert_ne!(first.id, different_quality.id);
         assert_ne!(first.id, different_subtitles.id);
+    }
+
+    #[test]
+    fn dedupes_default_and_explicit_all_download_modes() {
+        let registry = BilibiliTaskRegistry::default();
+        let implicit_all = registry
+            .create_bilibili_task("BV1mode", None)
+            .expect("default download task should be created");
+        let unspecified = registry
+            .create_bilibili_task("BV1mode", Some(BilibiliDownloadOptions::default()))
+            .expect("unspecified mode should resolve to the active default task");
+        let explicit_all = registry
+            .create_bilibili_task(
+                "BV1mode",
+                Some(BilibiliDownloadOptions {
+                    download_mode: BilibiliDownloadMode::All.into(),
+                    ..BilibiliDownloadOptions::default()
+                }),
+            )
+            .expect("explicit all mode should resolve to the active default task");
+
+        assert_eq!(implicit_all.id, unspecified.id);
+        assert_eq!(implicit_all.id, explicit_all.id);
     }
 
     #[test]

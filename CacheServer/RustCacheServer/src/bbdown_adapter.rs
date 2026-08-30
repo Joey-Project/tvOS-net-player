@@ -4757,8 +4757,9 @@ where
     let mut args = Vec::new();
     args.push(OsString::from("-y"));
     args.push(OsString::from("-nostdin"));
-    if only_flv_segments(entry) {
+    let concat_list_cleanup = if only_flv_segments(entry) {
         let list_path = entry.directory.join("cache-server-ffmpeg-concat.txt");
+        let cleanup = TemporaryFileCleanup::new(list_path.clone());
         fs::write(&list_path, concat_file_list(&media_files))
             .await
             .map_err(failed)?;
@@ -4770,12 +4771,14 @@ where
             OsString::from("-i"),
             list_path.into_os_string(),
         ]);
+        Some(cleanup)
     } else {
         for media_file in &media_files {
             args.push(OsString::from("-i"));
             args.push(media_file.as_os_str().to_os_string());
         }
-    }
+        None
+    };
     args.extend([
         OsString::from("-c"),
         OsString::from("copy"),
@@ -4791,6 +4794,12 @@ where
             return Err(error);
         }
     };
+    if let Some(cleanup) = concat_list_cleanup
+        && let Err(error) = cleanup.remove().await
+    {
+        cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+        return Err(error);
+    }
     if !output.status.success() {
         cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
         return Err(BilibiliDownloadError::Failed(format!(
@@ -5059,6 +5068,34 @@ async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError>
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(failed(error)),
+    }
+}
+
+struct TemporaryFileCleanup {
+    path: Option<PathBuf>,
+}
+
+impl TemporaryFileCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    async fn remove(mut self) -> Result<(), BilibiliDownloadError> {
+        let path = self
+            .path
+            .as_ref()
+            .expect("temporary cleanup path should be present");
+        remove_file_if_exists(path).await?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryFileCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -8858,6 +8895,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn mux_download_report_removes_flv_concat_list_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"first").unwrap();
+        std::fs::write(&second_segment, b"second").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir.clone(),
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment.clone(),
+                        bytes_written: 6,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+
+        let report = mux_download_report(report, &ffmpeg, &|| false)
+            .await
+            .expect("FLV segments should mux successfully");
+
+        assert!(report.entries[0].mux.is_some());
+        assert!(!concat_list.exists());
+        assert!(!first_segment.exists());
+        assert!(!second_segment.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn mux_download_report_cancels_running_ffmpeg() {
         use std::sync::{
             Arc,
@@ -8867,10 +8951,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let entry_dir = temp.path().join("entry");
         std::fs::create_dir_all(&entry_dir).unwrap();
-        let video_path = entry_dir.join("video.m4s");
-        let audio_path = entry_dir.join("audio.m4s");
-        std::fs::write(&video_path, b"video").unwrap();
-        std::fs::write(&audio_path, b"audio").unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"video").unwrap();
+        std::fs::write(&second_segment, b"audio").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
         let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
         let output_path = entry_dir.join("Entry.mp4");
         let temp_output_path = temporary_mux_output_path(&output_path);
@@ -8883,14 +8968,14 @@ mod tests {
                 directory: entry_dir,
                 files: vec![
                     DownloadedFile {
-                        kind: DownloadFileKind::Video,
-                        path: video_path.clone(),
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
                     DownloadedFile {
-                        kind: DownloadFileKind::Audio,
-                        path: audio_path.clone(),
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
@@ -8938,8 +9023,9 @@ mod tests {
         ));
         assert!(!output_path.exists());
         assert!(!temp_output_path.exists());
-        assert!(!video_path.exists());
-        assert!(!audio_path.exists());
+        assert!(!first_segment.exists());
+        assert!(!second_segment.exists());
+        assert!(!concat_list.exists());
         wait_for_process_exit(pid).await;
     }
 

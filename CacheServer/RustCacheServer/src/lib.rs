@@ -4423,6 +4423,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_task_snapshot_blocks_local_library_deletion() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let media_path = root_path.join("local-video.mp4");
+        std::fs::write(&media_path, b"media").expect("local media should be written");
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        std::fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state directory should be created");
+        std::fs::write(&task_state_path, b"{ malformed task snapshot")
+            .expect("malformed task snapshot should be written");
+
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path: task_state_path.clone(),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        let item_id = state
+            .library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("local media should resolve to a library item");
+
+        let error = state
+            .delete_local_library_item(&item_id)
+            .await
+            .expect_err("local deletion must fail while configured persistence is unavailable");
+
+        assert_eq!(tonic::Code::Unavailable, error.code());
+        assert!(media_path.is_file());
+        assert!(!state.tasks.has_pending_file_cleanups());
+        assert_eq!(
+            b"{ malformed task snapshot",
+            std::fs::read(&task_state_path)
+                .expect("malformed task snapshot should be preserved")
+                .as_slice()
+        );
+    }
+
+    #[tokio::test]
     async fn manual_hls_deletion_waits_for_the_quota_snapshot_lock() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
