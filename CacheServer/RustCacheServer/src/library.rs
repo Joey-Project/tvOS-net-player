@@ -1308,6 +1308,365 @@ pub(crate) fn remove_empty_directory_no_follow(
 }
 
 #[cfg(unix)]
+pub(crate) fn create_directory_exclusive_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<()> {
+    create_directory_path_no_follow(root_path, relative_path, true)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_directory_exclusive_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory creation is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_directory_no_follow(root_path: &Path, relative_path: &str) -> io::Result<()> {
+    create_directory_path_no_follow(root_path, relative_path, false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_directory_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-follow directory creation is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn create_directory_path_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+    leaf_must_be_new: bool,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    for (index, segment) in segments.iter().enumerate() {
+        let is_leaf = index + 1 == segments.len();
+        // SAFETY: directory is a live directory descriptor and segment is NUL-terminated.
+        let created = unsafe { libc::mkdirat(directory.as_raw_fd(), segment.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists || (is_leaf && leaf_must_be_new) {
+                return Err(error);
+            }
+        }
+        let child = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )?;
+        if created == 0 {
+            child.sync_all()?;
+            directory.sync_all()?;
+        }
+        directory = child;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn rename_directory_no_replace_no_follow(
+    root_path: &Path,
+    source_relative_path: &str,
+    destination_relative_path: &str,
+) -> io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    let (source_parent, source_leaf) =
+        open_relative_parent_no_follow(root_path, source_relative_path)?;
+    let (destination_parent, destination_leaf) =
+        open_relative_parent_no_follow(root_path, destination_relative_path)?;
+    let source_directory = open_at(
+        source_parent.as_raw_fd(),
+        &source_leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let source_metadata = source_directory.metadata()?;
+
+    rename_at_no_replace(
+        source_parent.as_raw_fd(),
+        &source_leaf,
+        destination_parent.as_raw_fd(),
+        &destination_leaf,
+    )?;
+
+    let destination_directory = open_at(
+        destination_parent.as_raw_fd(),
+        &destination_leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let destination_metadata = destination_directory.metadata()?;
+    if source_metadata.dev() != destination_metadata.dev()
+        || source_metadata.ino() != destination_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "renamed directory identity changed during publication",
+        ));
+    }
+
+    destination_directory.sync_all()?;
+    source_parent.sync_all()?;
+    destination_parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn rename_directory_no_replace_no_follow(
+    _root_path: &Path,
+    _source_relative_path: &str,
+    _destination_relative_path: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure no-replace directory rename is not implemented on this platform",
+    ))
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn rename_at_no_replace(
+    source_parent_fd: i32,
+    source_leaf: &CString,
+    destination_parent_fd: i32,
+    destination_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: both descriptors are live directories and both names are NUL-terminated.
+    let result = unsafe {
+        libc::renameatx_np(
+            source_parent_fd,
+            source_leaf.as_ptr(),
+            destination_parent_fd,
+            destination_leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn rename_at_no_replace(
+    source_parent_fd: i32,
+    source_leaf: &CString,
+    destination_parent_fd: i32,
+    destination_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: both descriptors are live directories and both names are NUL-terminated.
+    let result = unsafe {
+        libc::renameat2(
+            source_parent_fd,
+            source_leaf.as_ptr(),
+            destination_parent_fd,
+            destination_leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux"))))]
+fn rename_at_no_replace(
+    _source_parent_fd: i32,
+    _source_leaf: &CString,
+    _destination_parent_fd: i32,
+    _destination_leaf: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory rename is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_directory_tree_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    if max_entries == 0 || max_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory cleanup bounds must be positive",
+        ));
+    }
+    let (parent, leaf) = open_relative_parent_no_follow(root_path, relative_path)?;
+    let directory = match open_at(
+        parent.as_raw_fd(),
+        &leaf,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut remaining_entries = max_entries;
+    remove_open_directory_contents_no_follow(&directory, &mut remaining_entries, max_depth)?;
+
+    // The intent owns this logical directory pathname and its descendants. Traversal never
+    // follows a symlink; object identity is not retained across calls because a replacement at
+    // the still-owned name must either be removed safely or make cleanup fail for retry.
+    // SAFETY: parent is live and leaf is NUL-terminated.
+    let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+    if removed == 0 {
+        parent.sync_all()?;
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_directory_tree_no_follow(
+    _root_path: &Path,
+    _relative_path: &str,
+    _max_entries: usize,
+    _max_depth: usize,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure recursive directory cleanup is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_open_directory_contents_no_follow(
+    directory: &File,
+    remaining_entries: &mut usize,
+    remaining_depth: usize,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if remaining_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed directory depth limit exceeded",
+        ));
+    }
+    let dot = CString::new(".").expect("dot contains no NUL");
+    let listing = open_at(
+        directory.as_raw_fd(),
+        &dot,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let names = list_open_directory_names_bounded(listing, *remaining_entries)?;
+    for name in names {
+        *remaining_entries = remaining_entries.checked_sub(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory entry limit exceeded",
+            )
+        })?;
+        let name = CString::new(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed entry name contains NUL",
+            )
+        })?;
+        match open_at(
+            directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC,
+        ) {
+            Ok(child) => {
+                remove_open_directory_contents_no_follow(
+                    &child,
+                    remaining_entries,
+                    remaining_depth - 1,
+                )?;
+                // SAFETY: directory is live and name is NUL-terminated.
+                let removed = unsafe {
+                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                };
+                if removed != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOTDIR)
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                if error.kind() == io::ErrorKind::NotFound {
+                    continue;
+                }
+                // SAFETY: directory is live and name is NUL-terminated. unlinkat without
+                // AT_REMOVEDIR removes the named non-directory or symlink without following it.
+                let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+                if removed != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    directory.sync_all()
+}
+
+#[cfg(unix)]
+fn open_relative_parent_no_follow(
+    root_path: &Path,
+    relative_path: &str,
+) -> io::Result<(File, CString)> {
+    use std::os::fd::AsRawFd;
+
+    let segments = relative_path_segments(relative_path)?;
+    let mut directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        directory = open_at(
+            directory.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )?;
+    }
+    Ok((
+        directory,
+        segments.last().expect("segments is not empty").clone(),
+    ))
+}
+
+#[cfg(unix)]
 fn relative_path_segments(relative_path: &str) -> io::Result<Vec<CString>> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1931,6 +2290,126 @@ mod tests {
                 .expect_err("non-normal directory path should be rejected");
             assert_eq!(io::ErrorKind::InvalidInput, error.kind());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_output_directory_creation_and_no_replace_rename_are_contained() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        ensure_directory_no_follow(&root_path, "Bilibili").unwrap();
+        create_directory_exclusive_no_follow(&root_path, ".tvos-net-player/bbdown-staging/task-1")
+            .unwrap();
+        fs::write(
+            root_path.join(".tvos-net-player/bbdown-staging/task-1/video.mp4"),
+            b"video",
+        )
+        .unwrap();
+
+        rename_directory_no_replace_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            "Bilibili/task-1",
+        )
+        .unwrap();
+
+        assert!(
+            !root_path
+                .join(".tvos-net-player/bbdown-staging/task-1")
+                .exists()
+        );
+        assert_eq!(
+            b"video",
+            fs::read(root_path.join("Bilibili/task-1/video.mp4"))
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(
+            io::ErrorKind::AlreadyExists,
+            create_directory_exclusive_no_follow(&root_path, "Bilibili/task-1")
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_unlinks_children_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let owned = root_path.join(".tvos-net-player/bbdown-staging/task-1");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(owned.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(owned.join("nested/video.mp4"), b"video").unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside, owned.join("outside-link")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        assert!(
+            remove_directory_tree_no_follow(
+                &root_path,
+                ".tvos-net-player/bbdown-staging/task-1",
+                16,
+                8,
+            )
+            .unwrap()
+        );
+
+        assert!(!owned.exists());
+        assert_eq!(
+            b"keep",
+            fs::read(outside.join("keep.txt")).unwrap().as_slice()
+        );
+        assert!(
+            !remove_directory_tree_no_follow(
+                &root_path,
+                ".tvos-net-player/bbdown-staging/task-1",
+                16,
+                8,
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_refuses_a_symlinked_owned_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let staging_parent = root_path.join(".tvos-net-player/bbdown-staging");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&staging_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside, staging_parent.join("task-1")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        remove_directory_tree_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            16,
+            8,
+        )
+        .expect_err("a symlinked owned root is an access-policy change");
+
+        assert_eq!(
+            b"keep",
+            fs::read(outside.join("keep.txt")).unwrap().as_slice()
+        );
+        assert!(
+            fs::symlink_metadata(staging_parent.join("task-1"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

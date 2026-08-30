@@ -647,6 +647,66 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(download.danmakuFormats.isEmpty)
     }
 
+    func testLegacyCreateBilibiliTaskRequestAllowsDefaultAndAllDownloadModes() throws {
+        let defaultRequest = try GRPCCacheControlClient.createBilibiliTaskRequest(
+            urlOrID: "BV1legacy",
+            options: BilibiliDownloadTaskOptions()
+        )
+        XCTAssertEqual(defaultRequest.urlOrID, "BV1legacy")
+        XCTAssertEqual(defaultRequest.options.downloadMode, .unspecified)
+
+        let allRequest = try GRPCCacheControlClient.createBilibiliTaskRequest(
+            urlOrID: "BV1legacy",
+            options: BilibiliDownloadTaskOptions(downloadMode: .all)
+        )
+        XCTAssertEqual(allRequest.urlOrID, "BV1legacy")
+        XCTAssertEqual(allRequest.options.downloadMode, .all)
+    }
+
+    func testLegacyCreateBilibiliTaskRejectsExplicitDownloadModesBeforeRPC() async {
+        let client = GRPCCacheControlClient(endpoint: CacheServerEndpoint(host: "127.0.0.1", port: 1))
+        let unsafeModes: [BilibiliDownloadMode] = [
+            .videoOnly,
+            .audioOnly,
+            .subtitleOnly,
+            .danmakuOnly,
+            .coverOnly,
+        ]
+
+        for mode in unsafeModes {
+            do {
+                _ = try await client.createBilibiliTask(
+                    urlOrID: "BV1legacy",
+                    options: BilibiliDownloadTaskOptions(downloadMode: mode)
+                )
+                XCTFail("Expected explicit legacy download mode to require Bilibili execution v2.")
+            } catch {
+                XCTAssertEqual(
+                    error as? CacheControlClientUnsupportedFeature,
+                    .bilibiliExecutionV2,
+                    "mode: \(mode)"
+                )
+            }
+        }
+    }
+
+    func testLegacyCreateBilibiliTaskRejectsUnknownDownloadModeBeforeRPC() async {
+        let client = GRPCCacheControlClient(endpoint: CacheServerEndpoint(host: "127.0.0.1", port: 1))
+
+        do {
+            _ = try await client.createBilibiliTask(
+                urlOrID: "BV1legacy",
+                options: BilibiliDownloadTaskOptions(downloadMode: .unknown(99))
+            )
+            XCTFail("Expected unknown legacy download mode to fail locally.")
+        } catch {
+            XCTAssertEqual(
+                error as? CacheControlClientInvalidRequest,
+                .invalidBilibiliDownloadMode
+            )
+        }
+    }
+
     func testBilibiliResolutionRequestsRejectStructurallyEmptyInputs() {
         XCTAssertThrowsError(
             try GRPCCacheControlClient.startBilibiliResolutionRequest(

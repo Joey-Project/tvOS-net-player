@@ -27,7 +27,7 @@ use crate::{
     hls_cache::HlsCacheStore,
     library::{
         decode_item_id, list_optional_directory_names_no_follow_bounded, open_read_no_follow,
-        remove_empty_directory_no_follow, remove_file_no_follow,
+        remove_directory_tree_no_follow, remove_empty_directory_no_follow, remove_file_no_follow,
     },
     task_output::{
         MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord, TaskResourceRecord,
@@ -69,6 +69,8 @@ const DEFAULT_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(30 * 24 * 
 // bodies untouched and disables v2 resource serving until the namespace is repaired.
 const MAX_TASK_RESOURCE_DIRECTORY_NAMES: usize = MAX_REGISTERED_TASK_RESOURCES + MAX_TASK_RESOURCES;
 const MAX_TASK_PERSISTENCE_CLONE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH: usize = 64;
 
 // Staged publication protects the destination object's identity and the bytes installed in that
 // object. Exclusive fd-relative creation plus device/inode revalidation protects identity; the
@@ -174,6 +176,7 @@ struct StagedDownloadTerminalCommit<'a> {
     library_item_id: String,
     message: String,
     transient_output_paths: Vec<PathBuf>,
+    owned_directory_cleanup_paths: Vec<PathBuf>,
 }
 
 struct BilibiliPlaybackTaskRecordRequest<'a> {
@@ -281,6 +284,7 @@ impl<'a> StagedTaskOutputReplacement<'a> {
         library_item_id: String,
         message: String,
         transient_output_paths: Vec<PathBuf>,
+        owned_directory_cleanup_paths: Vec<PathBuf>,
     ) -> Result<Task, Status> {
         if !matches!(
             terminal_state,
@@ -308,6 +312,7 @@ impl<'a> StagedTaskOutputReplacement<'a> {
                 library_item_id,
                 message,
                 transient_output_paths,
+                owned_directory_cleanup_paths,
             },
         );
         if outcome.is_ok() {
@@ -1070,6 +1075,66 @@ impl BilibiliTaskRegistry {
         Ok(intents)
     }
 
+    pub(crate) fn register_bilibili_owned_output_directories(
+        &self,
+        task_id: &str,
+        paths: &[PathBuf],
+    ) -> Result<(), Status> {
+        if self.persistence.is_none() {
+            return Err(Status::failed_precondition(
+                "Durable task state is required before creating Bilibili output.",
+            ));
+        }
+        let normalized_id = normalize_required_id(task_id)?;
+        let intents = self.file_cleanup_intents_for_paths(
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            paths,
+        )?;
+        if intents.is_empty() {
+            return Err(Status::invalid_argument(
+                "At least one Bilibili output directory is required.",
+            ));
+        }
+
+        let _file_cleanup_guard = self
+            .file_cleanup_lock
+            .lock()
+            .expect("file cleanup lock poisoned");
+        let _mutation_guard = self.mutation_guard();
+        let mut inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .ok_or_else(task_not_found)?;
+        if task.kind() != TaskKind::BilibiliDownload
+            || task.state() != TaskState::Running
+            || inner
+                .bilibili_candidates_by_id
+                .get(&normalized_id)
+                .is_none_or(|candidates| candidates.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "Only a running Bilibili v2 download can own output directories.",
+            ));
+        }
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            intents,
+        )?;
+        let outcome =
+            self.persist_and_publish_pending_with_policy(inner, true, Some(checkpoint), true);
+        if !outcome.is_durable() {
+            return Err(Status::unavailable(
+                "Bilibili output directory ownership could not be persisted durably.",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn retry_file_cleanup_intents_for_owner(
         &self,
         kind: PersistedFileCleanupKind,
@@ -1116,14 +1181,30 @@ impl BilibiliTaskRegistry {
             return Ok(false);
         }
 
-        // The cleanup intent owns a logical cache-relative pathname until it is cleared. The
-        // no-follow unlink protects the root access policy; object/content identity is not the
-        // protected property because a replacement at that owned pathname is still stale output.
+        // A cleanup intent owns a logical cache-relative pathname until it is cleared. No-follow
+        // traversal protects containment and the no-symlink traversal policy. Object/content
+        // identity is not the protected property because a replacement at that still-owned
+        // pathname remains stale output; a type or traversal-policy change fails and leaves the
+        // intent for retry.
         let mut completed = Vec::new();
         let mut removed_any = false;
         let mut cleanup_failed = false;
         for intent in candidates {
-            match remove_file_no_follow(resource_root_path, &intent.relative_path) {
+            let removal = match intent.kind {
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory => {
+                    remove_directory_tree_no_follow(
+                        resource_root_path,
+                        &intent.relative_path,
+                        MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES,
+                        MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH,
+                    )
+                }
+                PersistedFileCleanupKind::BilibiliTransientOutput
+                | PersistedFileCleanupKind::LocalLibraryItem => {
+                    remove_file_no_follow(resource_root_path, &intent.relative_path)
+                }
+            };
+            match removal {
                 Ok(removed) => {
                     removed_any |= removed;
                     completed.push(intent);
@@ -1376,6 +1457,7 @@ impl BilibiliTaskRegistry {
             library_item_id,
             message,
             transient_output_paths,
+            owned_directory_cleanup_paths,
         } = commit;
         if !matches!(
             terminal_state,
@@ -1399,6 +1481,11 @@ impl BilibiliTaskRegistry {
             PersistedFileCleanupKind::BilibiliTransientOutput,
             &normalized_id,
             &transient_output_paths,
+        )?;
+        let owned_directory_cleanup_intents = self.file_cleanup_intents_for_paths(
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            &owned_directory_cleanup_paths,
         )?;
         let _file_cleanup_guard = self
             .file_cleanup_lock
@@ -1487,6 +1574,12 @@ impl BilibiliTaskRegistry {
             PersistedFileCleanupKind::BilibiliTransientOutput,
             &normalized_id,
             transient_cleanup_intents,
+        )?;
+        replace_file_cleanup_intents_for_owner_locked(
+            &mut inner,
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+            &normalized_id,
+            owned_directory_cleanup_intents,
         )?;
         let retained_ids = output
             .resources
@@ -7348,6 +7441,7 @@ mod tests {
                 "local.default.cancelled-v2".to_owned(),
                 "Late success".to_owned(),
                 Vec::new(),
+                Vec::new(),
             )
             .expect_err("cancellation must reject late successful output");
         assert_eq!(tonic::Code::Cancelled, error.code());
@@ -7419,6 +7513,7 @@ mod tests {
                 "library-one".to_owned(),
                 "Downloaded all results.".to_owned(),
                 Vec::new(),
+                Vec::new(),
             )
             .expect("task output should commit");
         let shared_task = registry
@@ -7453,6 +7548,7 @@ mod tests {
                 TaskState::Succeeded,
                 "library-one".to_owned(),
                 "Downloaded shared result.".to_owned(),
+                Vec::new(),
                 Vec::new(),
             )
             .expect("shared task output should commit");
@@ -10149,6 +10245,7 @@ mod tests {
                 "library-terminal".to_owned(),
                 "Downloaded with artifacts.".to_owned(),
                 Vec::new(),
+                Vec::new(),
             )
             .expect("output and terminal task should commit together");
 
@@ -10243,6 +10340,7 @@ mod tests {
                 String::new(),
                 "Downloaded sidecar output.".to_owned(),
                 vec![transient_path.clone()],
+                Vec::new(),
             )
             .expect("terminal output and cleanup intent should commit together");
 
@@ -10279,6 +10377,166 @@ mod tests {
                 .file_cleanup_intents
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn owned_output_directories_are_durable_before_bytes_and_reaped_after_restart() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1owned-output-restart",
+                None,
+                None,
+                "Owned output restart".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("ownership must be durable before output creation");
+        let persisted = TaskStateStore::new(&state_path)
+            .load_state()
+            .expect("directory ownership should be readable");
+        assert_eq!(2, persisted.file_cleanup_intents.len());
+        assert!(persisted.file_cleanup_intents.iter().all(|intent| {
+            intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                && intent.owner_id == task.id
+        }));
+
+        std::fs::create_dir_all(staging_path.join("nested"))
+            .expect("staging fixture should be created after durability");
+        std::fs::write(staging_path.join("nested/raw.m4s"), b"raw")
+            .expect("staging output should exist");
+        std::fs::create_dir_all(&published_path)
+            .expect("published fixture should be created after durability");
+        std::fs::write(published_path.join("orphan.mp4"), b"orphan")
+            .expect("published orphan should exist");
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        assert!(!staging_path.exists());
+        assert!(!published_path.exists());
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .is_empty()
+        );
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+    }
+
+    #[test]
+    fn terminal_publication_releases_only_the_retained_output_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1owned-output-terminal",
+                None,
+                None,
+                "Owned output terminal".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_path.clone(), published_path.clone()],
+            )
+            .expect("both directories should start owned");
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(staging_path.join("transient.m4s"), b"transient").unwrap();
+        std::fs::create_dir_all(&published_path).unwrap();
+        std::fs::write(published_path.join("video.mp4"), b"video").unwrap();
+        let library_item_id = "local.default.owned-output".to_owned();
+
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: library_item_id.clone(),
+                    artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
+                        id: "owned-output-media".to_owned(),
+                        kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        library_item_id: library_item_id.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                library_item_id,
+                "Published retained output.".to_owned(),
+                Vec::new(),
+                vec![staging_path.clone()],
+            )
+            .expect("terminal output should transfer directory ownership atomically");
+
+        let persisted = TaskStateStore::new(&state_path).load_state().unwrap();
+        assert_eq!(1, persisted.file_cleanup_intents.len());
+        assert_eq!(
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                &task.id,
+                format!(".tvos-net-player/bbdown-staging/{}", task.id),
+            )
+            .unwrap(),
+            persisted.file_cleanup_intents[0]
+        );
+        assert!(
+            registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                    &task.id,
+                )
+                .expect("staging cleanup should succeed")
+        );
+        assert!(!staging_path.exists());
+        assert!(published_path.join("video.mp4").is_file());
     }
 
     #[test]
@@ -10319,6 +10577,7 @@ mod tests {
                 String::new(),
                 "Downloaded sidecar output.".to_owned(),
                 vec![transient_path.clone()],
+                Vec::new(),
             )
             .expect("terminal output and cleanup intent should commit together");
 
@@ -10508,6 +10767,7 @@ mod tests {
                 TaskState::Succeeded,
                 "library-item".to_owned(),
                 "Completed.".to_owned(),
+                Vec::new(),
                 Vec::new(),
             )
             .expect_err("destination replacement must fail before publication");

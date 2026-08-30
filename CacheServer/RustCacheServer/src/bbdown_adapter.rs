@@ -54,7 +54,11 @@ use crate::{
         TaskProblemCategory, TaskResult, TaskResultProgress, TaskResultProviderDetails,
         TaskResultSubject, TaskState,
     },
-    library::{LibraryItemPublicationLease, LocalMediaLibrary},
+    library::{
+        LibraryItemPublicationLease, LocalMediaLibrary, create_directory_exclusive_no_follow,
+        ensure_directory_no_follow, remove_directory_tree_no_follow,
+        rename_directory_no_replace_no_follow,
+    },
     playback_policy::{
         CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
     },
@@ -70,6 +74,9 @@ const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
+const BILIBILI_V2_STAGING_DIRECTORY: &str = ".tvos-net-player/bbdown-staging";
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BilibiliResolveCandidateWindow {
@@ -451,12 +458,17 @@ impl BbdownBilibiliAdapter {
         let client =
             self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
         let download_mode = download_mode_from_options(request.options.as_ref())?;
+        validate_supported_download_options(request.options.as_ref())?;
         let input = playback_input_for_planning(&request.source)?;
-        let mut results = Vec::with_capacity(request.candidates.len());
+        let output_directories = self
+            .prepare_v2_output_directories(&request.task_id, &context)
+            .await?;
+        let mut candidate_outcomes = Vec::with_capacity(request.candidates.len());
         let mut retained_backing = RetainedV2DownloadBacking::default();
         let mut primary_library_item_id = String::new();
         let mut successful_results = 0_usize;
         let mut cancelled = false;
+        let mut output_integrity_error = None;
         let mut completed_downloaded_bytes = 0_u64;
         let mut total_bytes_floor = 0_u64;
 
@@ -469,7 +481,15 @@ impl BbdownBilibiliAdapter {
             let result_id = bilibili_v2_result_id(&request.task_id, offset);
             if cancelled || context.is_cancel_requested() {
                 cancelled = true;
-                results.push(cancelled_download_result(result_id, candidate));
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    cancelled_download_result(result_id, candidate),
+                )));
+                continue;
+            }
+            if let Some(error) = output_integrity_error.as_ref() {
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    failed_download_result(result_id, candidate, error),
+                )));
                 continue;
             }
 
@@ -491,16 +511,43 @@ impl BbdownBilibiliAdapter {
                 Ok(plan) => plan,
                 Err(BilibiliDownloadError::Cancelled(_)) => {
                     cancelled = true;
-                    results.push(cancelled_download_result(result_id, candidate));
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
                     continue;
                 }
                 Err(error) => {
-                    results.push(failed_download_result(result_id, candidate, &error));
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
                     continue;
                 }
             };
 
-            let download_options = self.download_options(request.options.as_ref())?;
+            let candidate_output = match self
+                .prepare_v2_candidate_output_directory(&output_directories, offset)
+                .await
+            {
+                Ok(candidate_output) => candidate_output,
+                Err(error) => {
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    output_integrity_error = Some(error);
+                    continue;
+                }
+            };
+            let download_options = download_options_for_output_dir(
+                candidate_output.path.clone(),
+                request.options.as_ref(),
+            )?;
+
             let download_cancellation = DownloadCancellationToken::new();
             let download_progress = BilibiliBbdownProgressSink::for_v2_candidate(
                 context.clone(),
@@ -513,7 +560,7 @@ impl BbdownBilibiliAdapter {
             let report = match run_bbdown_download_until_cancelled(
                 client.download_plan_with_archive_decision_with_progress_and_cancellation(
                     &plan,
-                    download_options,
+                    download_options.clone(),
                     &mut candidate_archive,
                     DuplicateDecision::KeepBoth,
                     &download_progress,
@@ -531,20 +578,40 @@ impl BbdownBilibiliAdapter {
                     completed_downloaded_bytes = snapshot.downloaded_bytes;
                     total_bytes_floor = snapshot.total_bytes;
                     cancelled = true;
-                    results.push(cancelled_download_result(result_id, candidate));
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
                     continue;
                 }
                 Err(error) => {
                     let snapshot = download_progress.v2_progress_snapshot();
                     completed_downloaded_bytes = snapshot.downloaded_bytes;
                     total_bytes_floor = snapshot.total_bytes;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
                     log_v2_candidate_error(
                         &request.task_id,
                         &result_id,
                         self.options.bbdown_credential_path.is_some(),
                         &error,
                     );
-                    results.push(failed_download_result(result_id, candidate, &error));
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
                     report_v2_candidate_finished(
                         &context,
                         offset,
@@ -585,18 +652,38 @@ impl BbdownBilibiliAdapter {
                 Err(BilibiliDownloadError::Cancelled(_)) => {
                     cleanup_unpublished_download_report(&report).await;
                     cancelled = true;
-                    results.push(cancelled_download_result(result_id, candidate));
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
                     continue;
                 }
                 Err(error) => {
                     cleanup_unpublished_download_report(&report).await;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
                     log_v2_candidate_error(
                         &request.task_id,
                         &result_id,
                         self.options.bbdown_credential_path.is_some(),
                         &error,
                     );
-                    results.push(failed_download_result(result_id, candidate, &error));
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
                     report_v2_candidate_finished(
                         &context,
                         offset,
@@ -607,42 +694,12 @@ impl BbdownBilibiliAdapter {
                     continue;
                 }
             };
-
-            let mapped = self
-                .finalize_v2_download_result(
-                    result_id.clone(),
-                    candidate,
-                    &plan,
-                    report,
-                    download_mode,
-                    context.is_cancel_requested(),
-                )
-                .await;
-            match mapped {
-                Ok(mapped) => {
-                    archive.accept_candidate(candidate_archive);
-                    retain_v2_success(
-                        mapped,
-                        &mut primary_library_item_id,
-                        &mut successful_results,
-                        &mut results,
-                        &mut retained_backing,
-                    );
-                }
-                Err(BilibiliDownloadError::Cancelled(_)) => {
-                    cancelled = true;
-                    results.push(cancelled_download_result(result_id, candidate));
-                }
-                Err(error) => {
-                    log_v2_candidate_error(
-                        &request.task_id,
-                        &result_id,
-                        self.options.bbdown_credential_path.is_some(),
-                        &error,
-                    );
-                    results.push(failed_download_result(result_id, candidate, &error));
-                }
-            }
+            archive.accept_candidate(candidate_archive);
+            candidate_outcomes.push(V2CandidateDownloadOutcome::Downloaded {
+                result_id,
+                plan,
+                report,
+            });
             report_v2_candidate_finished(
                 &context,
                 offset,
@@ -650,6 +707,93 @@ impl BbdownBilibiliAdapter {
                 completed_downloaded_bytes,
                 total_bytes_floor,
             );
+        }
+
+        let has_downloaded_output = candidate_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, V2CandidateDownloadOutcome::Downloaded { .. }));
+        let mut publication_error = output_integrity_error;
+        if publication_error.is_none() && has_downloaded_output {
+            publication_error = self
+                .publish_v2_output_directory(&output_directories)
+                .await
+                .err();
+        }
+        if publication_error.is_none() && has_downloaded_output {
+            for outcome in &mut candidate_outcomes {
+                let V2CandidateDownloadOutcome::Downloaded { report, .. } = outcome else {
+                    continue;
+                };
+                match remap_download_report_root(
+                    report.clone(),
+                    &output_directories.staging_path,
+                    &output_directories.published_path,
+                ) {
+                    Ok(remapped) => *report = remapped,
+                    Err(error) => {
+                        publication_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = publication_error.as_ref() {
+            log_v2_candidate_error(
+                &request.task_id,
+                &request.task_id,
+                self.options.bbdown_credential_path.is_some(),
+                error,
+            );
+        }
+
+        let mut results = Vec::with_capacity(request.candidates.len());
+        for (offset, outcome) in candidate_outcomes.into_iter().enumerate() {
+            let candidate = &request.candidates[offset];
+            match outcome {
+                V2CandidateDownloadOutcome::Terminal(result) => results.push(*result),
+                V2CandidateDownloadOutcome::Downloaded {
+                    result_id,
+                    plan,
+                    report,
+                } => {
+                    if let Some(error) = publication_error.as_ref() {
+                        results.push(failed_download_result(result_id, candidate, error));
+                        continue;
+                    }
+                    let mapped = self
+                        .finalize_v2_download_result(
+                            result_id.clone(),
+                            candidate,
+                            &plan,
+                            report,
+                            download_mode,
+                            false,
+                        )
+                        .await;
+                    match mapped {
+                        Ok(mapped) => retain_v2_success(
+                            mapped,
+                            &mut primary_library_item_id,
+                            &mut successful_results,
+                            &mut results,
+                            &mut retained_backing,
+                        ),
+                        Err(BilibiliDownloadError::Cancelled(_)) => {
+                            cancelled = true;
+                            results.push(cancelled_download_result(result_id, candidate));
+                        }
+                        Err(error) => {
+                            log_v2_candidate_error(
+                                &request.task_id,
+                                &result_id,
+                                self.options.bbdown_credential_path.is_some(),
+                                &error,
+                            );
+                            results.push(failed_download_result(result_id, candidate, &error));
+                        }
+                    }
+                }
+            }
         }
 
         let total = request.candidates.len();
@@ -673,6 +817,14 @@ impl BbdownBilibiliAdapter {
             TaskState::Failed => format!("Failed to download all {total} Bilibili result(s)."),
             _ => unreachable!("v2 download must finish in a terminal state"),
         };
+        let owned_directory_cleanup_paths = if primary_library_item_id.is_empty() {
+            vec![
+                output_directories.staging_path,
+                output_directories.published_path,
+            ]
+        } else {
+            vec![output_directories.staging_path]
+        };
 
         Ok(BilibiliDownloadOutput {
             library_item_id: primary_library_item_id,
@@ -685,7 +837,155 @@ impl BbdownBilibiliAdapter {
                 library_item_leases: retained_backing.library_item_leases,
                 unpublished_output_paths: retained_backing.unpublished_output_paths,
                 transient_output_paths: retained_backing.transient_output_paths,
+                owned_directory_cleanup_paths,
             }),
+        })
+    }
+
+    async fn prepare_v2_output_directories(
+        &self,
+        task_id: &str,
+        context: &BilibiliDownloadContext,
+    ) -> Result<V2TaskOutputDirectories, BilibiliDownloadError> {
+        let cache_root = self.library.root_path();
+        let staging_path = cache_root.join(BILIBILI_V2_STAGING_DIRECTORY).join(task_id);
+        let published_path = self.output_dir.join(task_id);
+        let staging_relative_path = cache_relative_normal_path(&cache_root, &staging_path)?;
+        let published_relative_path = cache_relative_normal_path(&cache_root, &published_path)?;
+        let output_directory_relative_path =
+            cache_relative_normal_path_allow_empty(&cache_root, &self.output_dir)?;
+        context
+            .register_owned_output_directories(vec![staging_path.clone(), published_path.clone()])
+            .await?;
+
+        let cache_root_for_creation = cache_root.clone();
+        let staging_relative_for_creation = staging_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if !output_directory_relative_path.is_empty() {
+                ensure_directory_no_follow(
+                    &cache_root_for_creation,
+                    &output_directory_relative_path,
+                )?;
+            }
+            create_directory_exclusive_no_follow(
+                &cache_root_for_creation,
+                &staging_relative_for_creation,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output staging directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(V2TaskOutputDirectories {
+            cache_root,
+            staging_path,
+            staging_relative_path,
+            published_path,
+            published_relative_path,
+        })
+    }
+
+    async fn prepare_v2_candidate_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        offset: usize,
+    ) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+        let candidate_output = v2_candidate_output_directory(directories, offset)?;
+        let cache_root = directories.cache_root.clone();
+        let relative_path_for_creation = candidate_output.relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            create_directory_exclusive_no_follow(&cache_root, &relative_path_for_creation)
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(candidate_output)
+    }
+
+    async fn cleanup_failed_v2_candidate_output(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        candidate_output: &V2CandidateOutputDirectory,
+        task_id: &str,
+        result_id: &str,
+        output_integrity_error: &mut Option<BilibiliDownloadError>,
+    ) {
+        let cache_root = directories.cache_root.clone();
+        let relative_path = candidate_output.relative_path.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output cleanup worker failed.".to_owned(),
+            )
+        })
+        .and_then(|result| {
+            result.map_err(|_| {
+                BilibiliDownloadError::Failed(
+                    "Bilibili candidate output directory could not be cleaned safely.".to_owned(),
+                )
+            })
+        });
+
+        if let Err(error) = cleanup {
+            log_v2_candidate_error(
+                task_id,
+                result_id,
+                self.options.bbdown_credential_path.is_some(),
+                &error,
+            );
+            if output_integrity_error.is_none() {
+                *output_integrity_error = Some(error);
+            }
+        }
+    }
+
+    async fn publish_v2_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+    ) -> Result<(), BilibiliDownloadError> {
+        let cache_root = directories.cache_root.clone();
+        let staging_relative_path = directories.staging_relative_path.clone();
+        let published_relative_path = directories.published_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            rename_directory_no_replace_no_follow(
+                &cache_root,
+                &staging_relative_path,
+                &published_relative_path,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed("Bilibili output publication worker failed.".to_owned())
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory could not be published safely.".to_owned(),
+            )
         })
     }
 
@@ -3590,6 +3890,123 @@ fn video_quality_preference(value: &str) -> Option<u32> {
     }
 }
 
+struct V2TaskOutputDirectories {
+    cache_root: PathBuf,
+    staging_path: PathBuf,
+    staging_relative_path: String,
+    published_path: PathBuf,
+    published_relative_path: String,
+}
+
+struct V2CandidateOutputDirectory {
+    path: PathBuf,
+    relative_path: String,
+}
+
+fn v2_candidate_output_directory(
+    directories: &V2TaskOutputDirectories,
+    offset: usize,
+) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+    let candidate_number = offset.checked_add(1).ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Bilibili candidate output directory index overflowed.".to_owned(),
+        )
+    })?;
+    let directory_name = format!("candidate-{candidate_number:05}");
+    let path = directories.staging_path.join(directory_name);
+    let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
+    Ok(V2CandidateOutputDirectory {
+        path,
+        relative_path,
+    })
+}
+
+enum V2CandidateDownloadOutcome {
+    Terminal(Box<TaskResult>),
+    Downloaded {
+        result_id: String,
+        plan: DownloadPlan,
+        report: DownloadReport,
+    },
+}
+
+fn cache_relative_normal_path(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = cache_relative_normal_path_allow_empty(cache_root, path)?;
+    if relative.is_empty() {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path cannot equal the cache root.".to_owned(),
+        ));
+    }
+    Ok(relative)
+}
+
+fn cache_relative_normal_path_allow_empty(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = path.strip_prefix(cache_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "Bilibili output path is outside the configured cache root.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path is not canonical.".to_owned(),
+        ));
+    }
+    relative.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        BilibiliDownloadError::Failed("Bilibili output path is not valid UTF-8.".to_owned())
+    })
+}
+
+fn remap_download_report_root(
+    mut report: DownloadReport,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<DownloadReport, BilibiliDownloadError> {
+    report.output_dir =
+        remap_download_output_path(&report.output_dir, staging_root, published_root)?;
+    for entry in &mut report.entries {
+        entry.directory =
+            remap_download_output_path(&entry.directory, staging_root, published_root)?;
+        for file in &mut entry.files {
+            file.path = remap_download_output_path(&file.path, staging_root, published_root)?;
+        }
+        if let Some(mux) = entry.mux.as_mut() {
+            mux.output_path =
+                remap_download_output_path(&mux.output_path, staging_root, published_root)?;
+        }
+    }
+    Ok(report)
+}
+
+fn remap_download_output_path(
+    path: &Path,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<PathBuf, BilibiliDownloadError> {
+    let relative = path.strip_prefix(staging_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an output path outside its task-owned staging directory.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a noncanonical task output path.".to_owned(),
+        ));
+    }
+    Ok(published_root.join(relative))
+}
+
 struct MappedV2DownloadResult {
     result: TaskResult,
     library_item_id: String,
@@ -4581,6 +4998,119 @@ mod tests {
         let safe = v2_candidate_error_detail_for_log(true, &error);
         assert_eq!(crate::CREDENTIAL_SAFE_LOG_DETAIL, safe);
         assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_candidate_output_cleanup_is_isolated_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        std_fs::create_dir(&cache_root).unwrap();
+        let staging_relative_path = ".tvos-net-player/bbdown-staging/task-1".to_owned();
+        ensure_directory_no_follow(&cache_root, &staging_relative_path).unwrap();
+        let directories = V2TaskOutputDirectories {
+            staging_path: cache_root.join(&staging_relative_path),
+            staging_relative_path,
+            published_path: cache_root.join("Bilibili/task-1"),
+            published_relative_path: "Bilibili/task-1".to_owned(),
+            cache_root: cache_root.clone(),
+        };
+        let failed = v2_candidate_output_directory(&directories, 0).unwrap();
+        let retained = v2_candidate_output_directory(&directories, 1).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &failed.relative_path).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &retained.relative_path).unwrap();
+        std_fs::create_dir(failed.path.join("entry")).unwrap();
+        std_fs::write(failed.path.join("entry/video.m4s"), b"partial").unwrap();
+        std_fs::create_dir(retained.path.join("entry")).unwrap();
+        std_fs::write(retained.path.join("entry/video.mp4"), b"retained").unwrap();
+
+        assert!(
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &failed.relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+            .unwrap()
+        );
+        assert!(!failed.path.exists());
+        assert_eq!(
+            b"retained".to_vec(),
+            std_fs::read(retained.path.join("entry/video.mp4")).unwrap()
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00001",
+            failed.relative_path
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00002",
+            retained.relative_path
+        );
+    }
+
+    #[test]
+    fn v2_download_report_paths_remap_only_from_the_owned_staging_root() {
+        let staging_root = PathBuf::from("cache/.tvos-net-player/bbdown-staging/task-1");
+        let candidate_root = staging_root.join("candidate-00001");
+        let published_root = PathBuf::from("cache/Bilibili/task-1");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: candidate_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: candidate_root.join("entry/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: candidate_root.join("entry/video.mp4"),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+
+        let remapped = remap_download_report_root(report, &staging_root, &published_root)
+            .expect("owned staging paths should remap");
+        assert_eq!(published_root.join("candidate-00001"), remapped.output_dir);
+        assert_eq!(
+            published_root.join("candidate-00001/entry"),
+            remapped.entries[0].directory
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.m4s"),
+            remapped.entries[0].files[0].path
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.mp4"),
+            remapped.entries[0].mux.as_ref().unwrap().output_path
+        );
+
+        let outside_report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: staging_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: staging_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: PathBuf::from("cache/outside/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        assert!(matches!(
+            remap_download_report_root(outside_report, &staging_root, &published_root),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("outside its task-owned staging directory")
+        ));
     }
 
     fn v2_test_candidate() -> BilibiliTaskCandidateRecord {

@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
+    ffi::OsStr,
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
@@ -58,6 +59,7 @@ const MAX_PERSISTED_CLEANUP_RELATIVE_PATH_BYTES: usize = 4_096;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistedFileCleanupKind {
+    BilibiliOwnedOutputDirectory,
     BilibiliTransientOutput,
     LocalLibraryItem,
 }
@@ -97,13 +99,28 @@ impl PersistedFileCleanupIntent {
         }
         let relative = Path::new(&self.relative_path);
         let normalized = relative.components().collect::<PathBuf>();
-        let targets_internal_storage = matches!(
-            relative.components().next(),
-            Some(Component::Normal(value))
-                if value
-                    .to_str()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(".tvos-net-player"))
-        );
+        let components = relative.components().collect::<Vec<_>>();
+        let targets_internal_storage = components.first().is_some_and(|component| {
+            matches!(
+                component,
+                Component::Normal(value)
+                    if value
+                        .to_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(".tvos-net-player"))
+            )
+        });
+        let valid_owned_output_directory = self.kind
+            == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+            && components.last().is_some_and(
+                |component| matches!(component, Component::Normal(value) if *value == OsStr::new(&self.owner_id)),
+            )
+            && (!targets_internal_storage
+                || matches!(
+                    components.as_slice(),
+                    [Component::Normal(internal), Component::Normal(staging), Component::Normal(_)]
+                        if *internal == OsStr::new(".tvos-net-player")
+                            && *staging == OsStr::new("bbdown-staging")
+                ));
         if self.relative_path.is_empty()
             || self.relative_path.len() > MAX_PERSISTED_CLEANUP_RELATIVE_PATH_BYTES
             || self.relative_path.contains('\0')
@@ -111,7 +128,10 @@ impl PersistedFileCleanupIntent {
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
             || normalized.to_str() != Some(self.relative_path.as_str())
-            || targets_internal_storage
+            || (self.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                && !valid_owned_output_directory)
+            || (self.kind != PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                && targets_internal_storage)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2736,6 +2756,32 @@ mod tests {
             )
             .is_err()
         );
+        for relative_path in [
+            ".tvos-net-player/bbdown-staging/bilibili-cleanup-task",
+            "Bilibili/bilibili-cleanup-task",
+        ] {
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                "bilibili-cleanup-task",
+                relative_path,
+            )
+            .expect("task-owned output directory should be valid");
+        }
+        for relative_path in [
+            ".tvos-net-player/resources/bilibili-cleanup-task",
+            ".tvos-net-player/bbdown-staging/another-task",
+            ".TVOS-NET-PLAYER/bbdown-staging/bilibili-cleanup-task",
+            "Bilibili/another-task",
+        ] {
+            assert!(
+                PersistedFileCleanupIntent::new(
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                    "bilibili-cleanup-task",
+                    relative_path,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

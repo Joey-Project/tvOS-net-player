@@ -524,18 +524,40 @@ public final class GRPCCacheControlClient: CacheControlClient {
         urlOrID: String,
         options: BilibiliDownloadTaskOptions = BilibiliDownloadTaskOptions()
     ) async throws -> CacheTask {
-        try await withGRPCClient(
+        let request = try Self.createBilibiliTaskRequest(urlOrID: urlOrID, options: options)
+
+        return try await withGRPCClient(
             transport: .http2NIOTS(
                 target: endpoint.grpcTarget,
                 transportSecurity: endpoint.grpcTransportSecurity
             )
         ) { client in
             let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
-            var request = TvosNetPlayer_V1_CreateBilibiliTaskRequest()
-            request.urlOrID = urlOrID
-            request.options = TvosNetPlayer_V1_BilibiliDownloadOptions(options)
             let response = try await service.createBilibiliTask(request, options: callOptions)
             return CacheTask(response)
+        }
+    }
+
+    static func createBilibiliTaskRequest(
+        urlOrID: String,
+        options: BilibiliDownloadTaskOptions
+    ) throws -> TvosNetPlayer_V1_CreateBilibiliTaskRequest {
+        try validateLegacyBilibiliDownloadMode(options.downloadMode)
+
+        var request = TvosNetPlayer_V1_CreateBilibiliTaskRequest()
+        request.urlOrID = urlOrID
+        request.options = TvosNetPlayer_V1_BilibiliDownloadOptions(options)
+        return request
+    }
+
+    private static func validateLegacyBilibiliDownloadMode(_ mode: BilibiliDownloadMode) throws {
+        switch mode {
+        case .unspecified, .all:
+            return
+        case .videoOnly, .audioOnly, .subtitleOnly, .danmakuOnly, .coverOnly:
+            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+        case .unknown:
+            throw CacheControlClientInvalidRequest.invalidBilibiliDownloadMode
         }
     }
 

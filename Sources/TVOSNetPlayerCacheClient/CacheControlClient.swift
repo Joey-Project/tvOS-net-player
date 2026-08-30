@@ -111,6 +111,7 @@ public enum CacheControlClientInvalidRequest: Error, Equatable, Sendable {
     case bilibiliResolutionInputRequired
     case bilibiliResolutionSessionIDRequired
     case invalidBilibiliResolutionSelection
+    case invalidBilibiliDownloadMode
 }
 
 public extension CacheControlClient {
@@ -306,6 +307,8 @@ extension CacheControlClientInvalidRequest: LocalizedError {
             return "A Bilibili resolution session ID is required."
         case .invalidBilibiliResolutionSelection:
             return "The Bilibili resolution selection is structurally invalid."
+        case .invalidBilibiliDownloadMode:
+            return "The Bilibili download mode is not recognized."
         }
     }
 }

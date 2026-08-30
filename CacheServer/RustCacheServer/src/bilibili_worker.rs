@@ -60,6 +60,7 @@ pub struct BilibiliDownloadOutputV2 {
     pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
     pub(crate) unpublished_output_paths: Vec<PathBuf>,
     pub(crate) transient_output_paths: Vec<PathBuf>,
+    pub(crate) owned_directory_cleanup_paths: Vec<PathBuf>,
 }
 
 pub struct BilibiliTaskResourceBody {
@@ -103,6 +104,28 @@ impl BilibiliDownloadContext {
 
     pub fn report_progress(&self, progress: BilibiliTaskProgress) -> bool {
         self.registry.update_task_progress(&self.task_id, progress)
+    }
+
+    pub async fn register_owned_output_directories(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), BilibiliDownloadError> {
+        let registry = Arc::clone(&self.registry);
+        let task_id = self.task_id.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.register_bilibili_owned_output_directories(&task_id, &paths)
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output ownership persistence worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output ownership could not be persisted durably.".to_owned(),
+            )
+        })
     }
 }
 
@@ -187,6 +210,7 @@ async fn run_one_bilibili_task(
         Ok(result) => result,
         Err(_) => {
             let task_id = work_item.task_id.clone();
+            let cleanup_task_id = task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_failed(
                     &task_id,
@@ -194,6 +218,9 @@ async fn run_one_bilibili_task(
                 )
             })
             .await;
+            if is_v2 {
+                retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id);
+            }
             return;
         }
     };
@@ -221,10 +248,14 @@ async fn run_one_bilibili_task(
             _ => "Cancelled by request.".to_owned(),
         };
         let task_id = work_item.task_id.clone();
+        let cleanup_task_id = task_id.clone();
         complete_terminal_task(&registry, move |registry| {
             registry.complete_task_cancelled(&task_id, message.clone())
         })
         .await;
+        if is_v2 {
+            retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id);
+        }
         return;
     }
 
@@ -287,6 +318,20 @@ async fn run_one_bilibili_task(
             .await;
         }
     }
+    if is_v2 {
+        retry_v2_owned_output_directory_cleanup(&registry, &work_item.task_id);
+    }
+}
+
+fn retry_v2_owned_output_directory_cleanup(registry: &BilibiliTaskRegistry, task_id: &str) {
+    if let Err(error) = registry.retry_file_cleanup_intents_for_owner(
+        PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+        task_id,
+    ) {
+        eprintln!(
+            "Bilibili v2 task {task_id} retained pending directory cleanup for retry: {error}"
+        );
+    }
 }
 
 fn sanitize_download_output_v2(output: &mut BilibiliDownloadOutputV2) {
@@ -327,6 +372,7 @@ async fn complete_v2_terminal_task(
     credentials_configured: bool,
 ) {
     let output = Arc::new(output);
+    let cleanup_task_id = task_id.clone();
     let publication = complete_terminal_task_with_outcome(registry, {
         let task_id = task_id.clone();
         let library_item_id = library_item_id.clone();
@@ -351,6 +397,7 @@ async fn complete_v2_terminal_task(
                 library_item_id.clone(),
                 message.clone(),
                 output.transient_output_paths.clone(),
+                output.owned_directory_cleanup_paths.clone(),
             )
         }
     })
@@ -374,6 +421,7 @@ async fn complete_v2_terminal_task(
                     registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
                 })
                 .await;
+                retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id);
                 return;
             }
             let detail = crate::error_detail_for_log(credentials_configured, &error);
@@ -387,6 +435,7 @@ async fn complete_v2_terminal_task(
             .await;
         }
     }
+    retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id);
 }
 
 pub(crate) async fn cleanup_unpublished_output_paths(paths: &[PathBuf]) {
@@ -1470,6 +1519,7 @@ mod tests {
                         library_item_leases: Vec::new(),
                         unpublished_output_paths: vec![output_path],
                         transient_output_paths: Vec::new(),
+                        owned_directory_cleanup_paths: Vec::new(),
                     }),
                 })
             })
@@ -1532,6 +1582,7 @@ mod tests {
                         library_item_leases: Vec::new(),
                         unpublished_output_paths: vec![transient_output_path.clone()],
                         transient_output_paths: vec![transient_output_path],
+                        owned_directory_cleanup_paths: Vec::new(),
                     }),
                 })
             })
