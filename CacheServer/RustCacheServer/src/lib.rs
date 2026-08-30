@@ -362,8 +362,12 @@ impl Drop for HlsCacheEvictionProtectionGuard {
 
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
-        Self::new_with_playback_planner_factory(options, |options, library| {
-            Arc::new(BbdownBilibiliAdapter::new(options, library))
+        Self::new_with_playback_planner_factory(options, |options, library, blocking_permits| {
+            Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
+                options,
+                library,
+                blocking_permits,
+            ))
         })
     }
 
@@ -372,7 +376,9 @@ impl AppState {
         options: CacheServerOptions,
         playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     ) -> Self {
-        Self::new_with_playback_planner_factory(options, |_options, _library| playback_planner)
+        Self::new_with_playback_planner_factory(options, |_options, _library, _blocking_permits| {
+            playback_planner
+        })
     }
 
     #[cfg(test)]
@@ -383,7 +389,7 @@ impl AppState {
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
             options,
-            |_options, _library| playback_planner,
+            |_options, _library, _blocking_permits| playback_planner,
             Some(hls_cache),
         )
     }
@@ -393,6 +399,7 @@ impl AppState {
         playback_planner_factory: impl FnOnce(
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
+            Arc<Semaphore>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
@@ -407,6 +414,7 @@ impl AppState {
         playback_planner_factory: impl FnOnce(
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
+            Arc<Semaphore>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
         hls_cache_override: Option<HlsCacheStore>,
     ) -> Self {
@@ -552,7 +560,13 @@ impl AppState {
             }
         }
         let hls_upstream_client = build_hls_upstream_client();
-        let playback_planner = playback_planner_factory(Arc::clone(&options), Arc::clone(&library));
+        let bilibili_resolution_blocking_permits =
+            Arc::new(Semaphore::new(MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS));
+        let playback_planner = playback_planner_factory(
+            Arc::clone(&options),
+            Arc::clone(&library),
+            Arc::clone(&bilibili_resolution_blocking_permits),
+        );
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
         ));
@@ -613,9 +627,7 @@ impl AppState {
             hls_playback_progress,
             bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
             bilibili_resolutions: Arc::new(Mutex::new(BilibiliResolutionStore::default())),
-            bilibili_resolution_blocking_permits: Arc::new(Semaphore::new(
-                MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS,
-            )),
+            bilibili_resolution_blocking_permits,
             task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
             completed_hls_cache_playback_supported,
             last_hls_cache_eviction: Arc::new(Mutex::new(None)),
@@ -1010,9 +1022,10 @@ impl AppState {
         }
 
         Some(self.spawn_bilibili_task_worker(
-            Arc::new(BbdownBilibiliAdapter::new(
+            Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
                 Arc::clone(&self.options),
                 Arc::clone(&self.library),
+                Arc::clone(&self.bilibili_resolution_blocking_permits),
             )),
             BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
         ))

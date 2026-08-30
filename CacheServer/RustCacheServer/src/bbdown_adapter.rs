@@ -25,8 +25,8 @@ use tokio::{
     fs,
     io::AsyncReadExt,
     process::Command,
-    sync::Mutex,
-    time::{Instant, sleep},
+    sync::{Mutex, Semaphore},
+    time::{Instant, sleep, timeout},
 };
 
 use crate::{
@@ -55,7 +55,7 @@ use crate::{
     },
     library::{
         LibraryItemPublicationLease, LocalMediaLibrary, create_directory_exclusive_no_follow,
-        ensure_directory_no_follow, remove_directory_tree_no_follow,
+        ensure_directory_no_follow, open_read_no_follow, remove_directory_tree_no_follow,
         rename_directory_no_replace_no_follow,
     },
     playback_policy::{
@@ -71,6 +71,7 @@ const DOWNLOAD_PROGRESS_END: f64 = 0.80;
 const ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP: f64 = 0.50;
 const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const BBDOWN_CREDENTIAL_LOAD_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
 const BILIBILI_V2_STAGING_DIRECTORY: &str = ".tvos-net-player/bbdown-staging";
@@ -115,6 +116,7 @@ pub struct BbdownBilibiliAdapter {
     archive_path: PathBuf,
     ffmpeg_path: PathBuf,
     archive_lock: Arc<Mutex<()>>,
+    blocking_operation_permits: Arc<Semaphore>,
     #[cfg(test)]
     archive_save_fail_after: StdMutex<Option<usize>>,
 }
@@ -303,7 +305,22 @@ struct SelectedCorePlaybackVariant<'a> {
 }
 
 impl BbdownBilibiliAdapter {
-    pub fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
+    #[cfg(test)]
+    fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
+        Self::new_with_blocking_permits(
+            options,
+            library,
+            Arc::new(Semaphore::new(
+                crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS,
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_blocking_permits(
+        options: Arc<CacheServerOptions>,
+        library: Arc<LocalMediaLibrary>,
+        blocking_operation_permits: Arc<Semaphore>,
+    ) -> Self {
         let client_config = bbdown_client_config(&options, PlayurlMode::Web)
             .unwrap_or_else(|error| panic!("failed to configure BBDown client: {error:?}"));
         let tv_client_config = bbdown_client_config(&options, PlayurlMode::Tv)
@@ -316,6 +333,7 @@ impl BbdownBilibiliAdapter {
             archive_path: options.bbdown_archive_path(),
             ffmpeg_path: options.bbdown_ffmpeg_path.clone(),
             archive_lock: Arc::new(Mutex::new(())),
+            blocking_operation_permits,
             #[cfg(test)]
             archive_save_fail_after: StdMutex::new(None),
             options,
@@ -340,8 +358,9 @@ impl BbdownBilibiliAdapter {
         let input = Input::parse(&request.source).map_err(failed)?;
         let download_mode = download_mode_from_options(request.options.as_ref())?;
         let download_options = self.download_options(request.options.as_ref())?;
-        let client =
-            self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
+        let client = self
+            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+            .await?;
         context.report_progress(progress(
             0.02,
             "Planning Bilibili download with BBDown core.",
@@ -390,6 +409,8 @@ impl BbdownBilibiliAdapter {
         .await?;
 
         let downloaded_bytes = report.summary().total_bytes;
+        let cache_root = self.library.root_path();
+        validate_download_report_paths_no_follow(&cache_root, &self.output_dir, &report).await?;
         if context.is_cancel_requested() {
             cleanup_downloaded_media_sources(&report).await;
             return Err(BilibiliDownloadError::Cancelled(
@@ -466,8 +487,9 @@ impl BbdownBilibiliAdapter {
         request: BilibiliDownloadRequest,
         context: BilibiliDownloadContext,
     ) -> Result<BilibiliDownloadOutput, BilibiliDownloadError> {
-        let client =
-            self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
+        let client = self
+            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+            .await?;
         let download_mode = download_mode_from_options(request.options.as_ref())?;
         validate_supported_download_options(request.options.as_ref())?;
         let input = playback_input_for_planning(&request.source)?;
@@ -661,11 +683,13 @@ impl BbdownBilibiliAdapter {
             });
 
             let mut report = report;
-            match prepare_download_report_for_playback_in_place(
+            match prepare_owned_download_report_for_playback_in_place(
                 &mut report,
                 download_mode,
                 &self.ffmpeg_path,
                 &|| context.is_cancel_requested(),
+                &output_directories.cache_root,
+                &candidate_output.path,
             )
             .await
             {
@@ -1288,21 +1312,56 @@ impl BbdownBilibiliAdapter {
         download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
-    fn client_for_request(
+    async fn client_for_request(
         &self,
         options: Option<&BilibiliDownloadOptions>,
         request_context: Option<&BilibiliRequestContext>,
     ) -> Result<BiliClient, BilibiliDownloadError> {
-        if let Some(config) =
-            bbdown_client_config_for_request(&self.options, options, request_context)?
-        {
-            return Ok(BiliClient::new(config));
+        if request_context.is_none() {
+            return Ok(if options.is_some_and(|options| options.prefer_tv_api) {
+                self.tv_client.clone()
+            } else {
+                self.client.clone()
+            });
         }
-        Ok(if options.is_some_and(|options| options.prefer_tv_api) {
-            self.tv_client.clone()
-        } else {
-            self.client.clone()
+
+        let permit = timeout(
+            BBDOWN_CREDENTIAL_LOAD_ADMISSION_TIMEOUT,
+            Arc::clone(&self.blocking_operation_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili credential operations are busy; retry the request.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili credential operation limiter is unavailable.".to_owned(),
+            )
+        })?;
+        let server_options = Arc::clone(&self.options);
+        let options = options.cloned();
+        let request_context = request_context.cloned();
+        let config = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            bbdown_client_config_for_request(
+                &server_options,
+                options.as_ref(),
+                request_context.as_ref(),
+            )
         })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed("Bilibili credential loading worker failed.".to_owned())
+        })??;
+
+        let Some(config) = config else {
+            return Err(BilibiliDownloadError::Failed(
+                "Bilibili request context did not produce a client configuration.".to_owned(),
+            ));
+        };
+        Ok(BiliClient::new(config))
     }
 
     #[allow(dead_code)]
@@ -1319,7 +1378,7 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input, candidate_window)?;
-        let client = self.client_for_request(options, request_context)?;
+        let client = self.client_for_request(options, request_context).await?;
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
             client.resolve(input.clone(), selection),
@@ -1406,7 +1465,7 @@ impl BbdownBilibiliAdapter {
         } = playback_selection_from_id(&input, selection_id)?;
         let direct_collection_item = input_override.is_some();
         let input = input_override.unwrap_or(input);
-        let client = self.client_for_request(options, request_context)?;
+        let client = self.client_for_request(options, request_context).await?;
         let selection = if direct_collection_item {
             Some(
                 resolve_direct_collection_item_page(
@@ -1489,6 +1548,74 @@ fn direct_collection_item_page_selection(
             )
         })?;
     Ok(Selection::Page(page.index))
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BbdownCredentialLoadProbe {
+    path: PathBuf,
+    blocking_permits: Arc<Semaphore>,
+    observed_thread: Arc<StdMutex<Option<std::thread::ThreadId>>>,
+    observed_available_permits: Arc<std::sync::atomic::AtomicUsize>,
+    observed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static BBDOWN_CREDENTIAL_LOAD_PROBE: std::sync::OnceLock<
+    StdMutex<Option<BbdownCredentialLoadProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct BbdownCredentialLoadProbeRegistration;
+
+#[cfg(test)]
+impl Drop for BbdownCredentialLoadProbeRegistration {
+    fn drop(&mut self) {
+        *BBDOWN_CREDENTIAL_LOAD_PROBE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .expect("BBDown credential load probe lock poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_bbdown_credential_load_probe(
+    probe: BbdownCredentialLoadProbe,
+) -> BbdownCredentialLoadProbeRegistration {
+    let mut active_probe = BBDOWN_CREDENTIAL_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("BBDown credential load probe lock poisoned");
+    assert!(
+        active_probe.is_none(),
+        "credential load probe already active"
+    );
+    *active_probe = Some(probe);
+    BbdownCredentialLoadProbeRegistration
+}
+
+#[cfg(test)]
+fn observe_bbdown_credential_load(path: &Path) {
+    let probe = BBDOWN_CREDENTIAL_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("BBDown credential load probe lock poisoned")
+        .as_ref()
+        .filter(|probe| probe.path == path)
+        .cloned();
+    let Some(probe) = probe else {
+        return;
+    };
+    *probe
+        .observed_thread
+        .lock()
+        .expect("BBDown credential load observation lock poisoned") =
+        Some(std::thread::current().id());
+    probe.observed_available_permits.store(
+        probe.blocking_permits.available_permits(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    probe.observed.notify_one();
 }
 
 fn bbdown_client_config(
@@ -1595,6 +1722,8 @@ fn bbdown_credentials(
         None => CredentialProfileSelection::default_profile(),
     };
     let store = CredentialStore::new(path.to_path_buf());
+    #[cfg(test)]
+    observe_bbdown_credential_load(path);
     let Some(profile) = selection.profile_name() else {
         return store.load().map_err(failed);
     };
@@ -4026,6 +4155,108 @@ fn cache_relative_normal_path_allow_empty(
     })
 }
 
+#[derive(Clone, Copy)]
+enum DownloadReportPathKind {
+    Directory,
+    File,
+}
+
+async fn validate_download_report_paths_no_follow(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+) -> Result<(), BilibiliDownloadError> {
+    let cache_root = cache_root.to_path_buf();
+    let owned_root = owned_root.to_path_buf();
+    let report = report.clone();
+    tokio::task::spawn_blocking(move || {
+        validate_download_report_paths_no_follow_blocking(&cache_root, &owned_root, &report)
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("Bilibili download path validation worker failed.".to_owned())
+    })?
+}
+
+fn validate_download_report_paths_no_follow_blocking(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+) -> Result<(), BilibiliDownloadError> {
+    validate_download_report_path_no_follow(
+        cache_root,
+        owned_root,
+        &report.output_dir,
+        DownloadReportPathKind::Directory,
+    )?;
+    for entry in &report.entries {
+        validate_download_report_path_no_follow(
+            cache_root,
+            owned_root,
+            &entry.directory,
+            DownloadReportPathKind::Directory,
+        )?;
+        for file in &entry.files {
+            validate_download_report_path_no_follow(
+                cache_root,
+                owned_root,
+                &file.path,
+                DownloadReportPathKind::File,
+            )?;
+        }
+        if let Some(mux) = &entry.mux {
+            validate_download_report_path_no_follow(
+                cache_root,
+                owned_root,
+                &mux.output_path,
+                DownloadReportPathKind::File,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_download_report_path_no_follow(
+    cache_root: &Path,
+    owned_root: &Path,
+    path: &Path,
+    expected_kind: DownloadReportPathKind,
+) -> Result<(), BilibiliDownloadError> {
+    let relative_to_owned = path.strip_prefix(owned_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an output path outside its task-owned directory.".to_owned(),
+        )
+    })?;
+    if relative_to_owned
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a noncanonical task output path.".to_owned(),
+        ));
+    }
+
+    let relative_to_cache = cache_relative_normal_path(cache_root, path)?;
+    let opened = open_read_no_follow(cache_root, &relative_to_cache).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an unsafe or unreadable task output path.".to_owned(),
+        )
+    })?;
+    let metadata = opened.metadata().map_err(|_| {
+        BilibiliDownloadError::Failed("BBDown returned an unreadable task output path.".to_owned())
+    })?;
+    let expected_kind_matches = match expected_kind {
+        DownloadReportPathKind::Directory => metadata.is_dir(),
+        DownloadReportPathKind::File => metadata.is_file(),
+    };
+    if !expected_kind_matches {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a task output path with an unexpected file type.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn remap_download_report_root(
     mut report: DownloadReport,
     staging_root: &Path,
@@ -4684,6 +4915,22 @@ where
     Ok(report)
 }
 
+async fn prepare_owned_download_report_for_playback_in_place<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    cache_root: &Path,
+    owned_root: &Path,
+) -> Result<(), BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    validate_download_report_paths_no_follow(cache_root, owned_root, report).await?;
+    prepare_download_report_for_playback_in_place(report, mode, ffmpeg_path, is_cancel_requested)
+        .await
+}
+
 async fn prepare_download_report_for_playback_in_place<F>(
     report: &mut DownloadReport,
     mode: DownloadMode,
@@ -5250,6 +5497,80 @@ mod tests {
             Err(BilibiliDownloadError::Failed(message))
                 if message.contains("outside its task-owned staging directory")
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_mux_rejects_symlinked_report_paths_before_invoking_ffmpeg() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        std_fs::create_dir_all(&entry_directory).expect("candidate directory should be created");
+        let cache_root = cache_root
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        let outside_media = temp.path().join("outside-video.m4s");
+        std_fs::write(&outside_media, b"outside").expect("outside media should be written");
+        let reported_media = entry_directory.join("video.m4s");
+        symlink(&outside_media, &reported_media).expect("reported media symlink should be created");
+        let mut report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: reported_media.clone(),
+                    bytes_written: 7,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+
+        let result = prepare_owned_download_report_for_playback_in_place(
+            &mut report,
+            DownloadMode::All,
+            &ffmpeg,
+            &|| false,
+            &cache_root,
+            &candidate_root,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("unsafe or unreadable")
+        ));
+        assert_eq!(b"outside", std_fs::read(&outside_media).unwrap().as_slice());
+        assert!(
+            !temp.path().join("ffmpeg-args.log").exists(),
+            "ffmpeg must not observe an untrusted report path"
+        );
+
+        std_fs::remove_file(&reported_media).expect("reported symlink should be removed");
+        std_fs::write(&reported_media, b"inside").expect("owned media should be written");
+        prepare_owned_download_report_for_playback_in_place(
+            &mut report,
+            DownloadMode::All,
+            &ffmpeg,
+            &|| false,
+            &cache_root,
+            &candidate_root,
+        )
+        .await
+        .expect("validated owned media should be muxed");
+        assert!(candidate_root.join("entry/Entry.mp4").is_file());
+        assert_eq!(b"outside", std_fs::read(&outside_media).unwrap().as_slice());
     }
 
     fn v2_test_candidate() -> BilibiliTaskCandidateRecord {
@@ -6624,6 +6945,99 @@ mod tests {
         assert!(
             failed_sidecar.exists(),
             "mapping failures must leave cleanup to the bounded task-owned directory"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_credentials_use_the_shared_bounded_blocking_pool() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std_fs::create_dir(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let credentials_path = temp.path().join("credentials.json");
+        // Synthetic token catalog id: access-a.
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "blocking-profile",
+                "profiles": {
+                    "blocking-profile": {
+                        "access_key": "codex_synth_v1_access_a"
+                    }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let options = Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bbdown_output_dir: Some(root_path.join("Bilibili")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            bbdown_credential_path: Some(credentials_path.clone()),
+            ..CacheServerOptions::default()
+        });
+        let blocking_permits = Arc::new(Semaphore::new(1));
+        let adapter = Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+            Arc::clone(&blocking_permits),
+        ));
+        let held_permit = Arc::clone(&blocking_permits)
+            .acquire_owned()
+            .await
+            .expect("blocking permit should be acquired");
+        let observed_thread = Arc::new(StdMutex::new(None));
+        let observed_available_permits = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let _probe_registration = install_bbdown_credential_load_probe(BbdownCredentialLoadProbe {
+            path: credentials_path,
+            blocking_permits: Arc::clone(&blocking_permits),
+            observed_thread: Arc::clone(&observed_thread),
+            observed_available_permits: Arc::clone(&observed_available_permits),
+            observed: Arc::clone(&observed),
+        });
+        let async_worker_thread = std::thread::current().id();
+        let request = tokio::spawn(async move {
+            adapter
+                .client_for_request(
+                    None,
+                    Some(&BilibiliRequestContext {
+                        api_mode: BilibiliApiMode::Web.into(),
+                        credential_profile_id: "blocking-profile".to_owned(),
+                    }),
+                )
+                .await
+        });
+
+        assert!(
+            timeout(Duration::from_millis(100), observed.notified())
+                .await
+                .is_err(),
+            "credential loading must wait for blocking admission"
+        );
+        drop(held_permit);
+        timeout(Duration::from_secs(1), observed.notified())
+            .await
+            .expect("credential load should be observed");
+        request
+            .await
+            .expect("credential loading task should not panic")
+            .expect("credential loading should succeed");
+
+        assert_eq!(
+            0,
+            observed_available_permits.load(std::sync::atomic::Ordering::SeqCst),
+            "credential loading must hold the final blocking permit"
+        );
+        let credential_load_thread = observed_thread
+            .lock()
+            .expect("credential load observation lock should not be poisoned")
+            .expect("credential load thread should be recorded");
+        assert_ne!(
+            async_worker_thread, credential_load_thread,
+            "credential loading must not run on the async runtime worker"
         );
     }
 
