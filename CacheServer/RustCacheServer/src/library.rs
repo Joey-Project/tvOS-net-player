@@ -1886,6 +1886,23 @@ pub(crate) fn remove_directory_tree_no_follow(
     max_entries: usize,
     max_depth: usize,
 ) -> io::Result<bool> {
+    remove_directory_tree_no_follow_with_parent_sync(
+        root_path,
+        relative_path,
+        max_entries,
+        max_depth,
+        File::sync_all,
+    )
+}
+
+#[cfg(unix)]
+fn remove_directory_tree_no_follow_with_parent_sync(
+    root_path: &Path,
+    relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
+    mut sync_parent: impl FnMut(&File) -> io::Result<()>,
+) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     if max_entries == 0 || max_depth == 0 {
@@ -1894,14 +1911,36 @@ pub(crate) fn remove_directory_tree_no_follow(
             "directory cleanup bounds must be positive",
         ));
     }
-    let (parent, leaf) = open_relative_parent_no_follow(root_path, relative_path)?;
+    let segments = relative_path_segments(relative_path)?;
+    let mut parent = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    for segment in &segments[..segments.len() - 1] {
+        parent = match open_at(
+            parent.as_raw_fd(),
+            segment,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                sync_parent(&parent)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    let leaf = segments.last().expect("segments is not empty");
     let directory = match open_at(
         parent.as_raw_fd(),
-        &leaf,
+        leaf,
         libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
     ) {
         Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            sync_parent(&parent)?;
+            return Ok(false);
+        }
         Err(error) => return Err(error),
     };
     let mut remaining_entries = max_entries;
@@ -1913,11 +1952,12 @@ pub(crate) fn remove_directory_tree_no_follow(
     // SAFETY: parent is live and leaf is NUL-terminated.
     let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
     if removed == 0 {
-        parent.sync_all()?;
+        sync_parent(&parent)?;
         return Ok(true);
     }
     let error = io::Error::last_os_error();
     if error.kind() == io::ErrorKind::NotFound {
+        sync_parent(&parent)?;
         Ok(false)
     } else {
         Err(error)
@@ -3213,6 +3253,78 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_syncs_the_nearest_parent_of_a_missing_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let internal_root = root_path.join(".tvos-net-player");
+        fs::create_dir_all(&internal_root).unwrap();
+        let expected_parent = fs::metadata(&internal_root).unwrap();
+        let mut parent_syncs = 0;
+
+        let removed = remove_directory_tree_no_follow_with_parent_sync(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            16,
+            8,
+            |parent| {
+                parent_syncs += 1;
+                let actual_parent = parent.metadata()?;
+                assert_eq!(expected_parent.dev(), actual_parent.dev());
+                assert_eq!(expected_parent.ino(), actual_parent.ino());
+                parent.sync_all()
+            },
+        )
+        .expect("a durably missing ancestor should make the owned tree absent");
+
+        assert!(!removed);
+        assert_eq!(1, parent_syncs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_directory_cleanup_retries_parent_sync_after_unlink_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let owned = root_path.join(".tvos-net-player/bbdown-staging/task-1");
+        fs::create_dir_all(&owned).unwrap();
+        let mut failed_syncs = 0;
+
+        remove_directory_tree_no_follow_with_parent_sync(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            16,
+            8,
+            |_| {
+                failed_syncs += 1;
+                Err(io::Error::other("injected parent directory sync failure"))
+            },
+        )
+        .expect_err("an unsynchronized tree unlink must remain retryable");
+
+        assert_eq!(1, failed_syncs);
+        assert!(!owned.exists());
+
+        let mut retry_syncs = 0;
+        let removed = remove_directory_tree_no_follow_with_parent_sync(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            16,
+            8,
+            |parent| {
+                retry_syncs += 1;
+                parent.sync_all()
+            },
+        )
+        .expect("the missing tree should retry its containing-directory sync");
+
+        assert!(!removed);
+        assert_eq!(1, retry_syncs);
     }
 
     #[cfg(unix)]

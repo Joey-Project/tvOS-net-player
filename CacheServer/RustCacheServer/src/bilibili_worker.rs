@@ -835,6 +835,61 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn restored_v2_task_reclaims_when_owned_output_directories_were_never_created() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-before-create",
+                None,
+                None,
+                "Cleanup before output creation".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_output = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let final_output = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_output.clone(), final_output.clone()],
+            )
+            .expect("pre-creation output ownership should be durable");
+        assert!(!staging_output.exists());
+        assert!(!final_output.exists());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+        assert!(!restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("the restored task should become claimable after absent-tree cleanup");
+        assert_eq!(task.id, work_item.task_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn completed_output_cleanup_wakes_a_pre_registered_task_queue_waiter() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state/tasks.json");
