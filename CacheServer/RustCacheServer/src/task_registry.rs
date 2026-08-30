@@ -36,8 +36,9 @@ use crate::{
     },
     task_store::{
         MAX_PERSISTED_FILE_CLEANUP_INTENTS, MAX_PERSISTED_TASKS, PersistedFileCleanupIntent,
-        PersistedFileCleanupKind, PersistedTaskRecord, PersistedTaskState, TaskStateSaveOutcome,
-        TaskStateStore, validate_unique_task_record_identities,
+        PersistedFileCleanupKind, PersistedFileCleanupRootIdentity, PersistedTaskRecord,
+        PersistedTaskState, TaskStateSaveOutcome, TaskStateStore,
+        validate_unique_task_record_identities,
     },
 };
 
@@ -1155,13 +1156,25 @@ impl BilibiliTaskRegistry {
         kind: PersistedFileCleanupKind,
         owner_id: &str,
         paths: &[PathBuf],
-    ) -> Result<Vec<PersistedFileCleanupIntent>, Status> {
+    ) -> Result<
+        (
+            Option<PersistedFileCleanupRootIdentity>,
+            Vec<PersistedFileCleanupIntent>,
+        ),
+        Status,
+    > {
         if paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok((None, Vec::new()));
         }
         let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
             Status::failed_precondition("File cleanup storage root is not configured.")
         })?;
+        let initial_root_identity = file_cleanup_root_identity_for_path(resource_root_path)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "File cleanup storage root could not be bound safely: {error}"
+                ))
+            })?;
         let mut intents = HashSet::with_capacity(paths.len());
         for path in paths {
             let relative_path = cache_relative_path(resource_root_path, path).map_err(|error| {
@@ -1180,7 +1193,18 @@ impl BilibiliTaskRegistry {
         }
         let mut intents = intents.into_iter().collect::<Vec<_>>();
         intents.sort();
-        Ok(intents)
+        let final_root_identity =
+            file_cleanup_root_identity_for_path(resource_root_path).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "File cleanup storage root could not be revalidated safely: {error}"
+                ))
+            })?;
+        if final_root_identity != initial_root_identity {
+            return Err(Status::failed_precondition(
+                "File cleanup storage root changed while cleanup ownership was prepared.",
+            ));
+        }
+        Ok((Some(final_root_identity), intents))
     }
 
     pub(crate) fn register_bilibili_owned_output_directories(
@@ -1194,7 +1218,7 @@ impl BilibiliTaskRegistry {
             ));
         }
         let normalized_id = normalize_required_id(task_id)?;
-        let intents = self.file_cleanup_intents_for_paths(
+        let (root_identity, intents) = self.file_cleanup_intents_for_paths(
             PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
             &normalized_id,
             paths,
@@ -1231,6 +1255,7 @@ impl BilibiliTaskRegistry {
             &mut inner,
             PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
             &normalized_id,
+            root_identity.as_ref(),
             intents,
         )?;
         let outcome =
@@ -1288,7 +1313,7 @@ impl BilibiliTaskRegistry {
             .file_cleanup_lock
             .lock()
             .expect("file cleanup lock poisoned");
-        let (candidates, released_local_library_barrier) = {
+        let (candidates, released_local_library_barrier, bound_root_identity) = {
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
             let released_local_library_barrier = owner.is_some_and(|(kind, owner_id)| {
                 kind == PersistedFileCleanupKind::LocalLibraryItem
@@ -1305,7 +1330,11 @@ impl BilibiliTaskRegistry {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            (candidates, released_local_library_barrier)
+            (
+                candidates,
+                released_local_library_barrier,
+                inner.file_cleanup_root_identity.clone(),
+            )
         };
         if released_local_library_barrier {
             // The explicit deleter still owns file_cleanup_lock, so a woken background worker
@@ -1315,6 +1344,22 @@ impl BilibiliTaskRegistry {
         }
         if candidates.is_empty() {
             return Ok(false);
+        }
+        let bound_root_identity = bound_root_identity.ok_or_else(|| {
+            Status::failed_precondition(
+                "Pending file cleanup ownership is missing its cache root identity.",
+            )
+        })?;
+        let current_root_identity = file_cleanup_root_identity_for_path(resource_root_path)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "File cleanup storage root could not be revalidated safely: {error}"
+                ))
+            })?;
+        if current_root_identity != bound_root_identity {
+            return Err(Status::failed_precondition(
+                "Pending file cleanup ownership belongs to a different cache root.",
+            ));
         }
         #[cfg(test)]
         self.file_cleanup_attempt_count
@@ -1382,6 +1427,9 @@ impl BilibiliTaskRegistry {
             let checkpoint = RegistryMutationCheckpoint::capture(&inner);
             for intent in completed {
                 inner.pending_file_cleanup_intents.remove(&intent);
+            }
+            if inner.pending_file_cleanup_intents.is_empty() {
+                inner.file_cleanup_root_identity = None;
             }
             let durability_required = self.persistence.is_some();
             let checkpoint = durability_required.then_some(checkpoint);
@@ -1685,16 +1733,27 @@ impl BilibiliTaskRegistry {
             ));
         }
         let normalized_id = normalize_required_id(id)?;
-        let transient_cleanup_intents = self.file_cleanup_intents_for_paths(
-            PersistedFileCleanupKind::BilibiliTransientOutput,
-            &normalized_id,
-            &transient_output_paths,
-        )?;
-        let owned_directory_cleanup_intents = self.file_cleanup_intents_for_paths(
-            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
-            &normalized_id,
-            &owned_directory_cleanup_paths,
-        )?;
+        let (transient_root_identity, transient_cleanup_intents) = self
+            .file_cleanup_intents_for_paths(
+                PersistedFileCleanupKind::BilibiliTransientOutput,
+                &normalized_id,
+                &transient_output_paths,
+            )?;
+        let (owned_directory_root_identity, owned_directory_cleanup_intents) = self
+            .file_cleanup_intents_for_paths(
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                &normalized_id,
+                &owned_directory_cleanup_paths,
+            )?;
+        let cleanup_root_identity = match (transient_root_identity, owned_directory_root_identity) {
+            (Some(transient), Some(owned)) if transient != owned => {
+                return Err(Status::failed_precondition(
+                    "File cleanup storage root changed while terminal output was prepared.",
+                ));
+            }
+            (Some(identity), _) | (_, Some(identity)) => Some(identity),
+            (None, None) => None,
+        };
         let _file_cleanup_guard = self
             .file_cleanup_lock
             .lock()
@@ -1777,18 +1836,26 @@ impl BilibiliTaskRegistry {
             })
             .collect::<HashMap<_, _>>();
         let checkpoint = RegistryMutationCheckpoint::capture(&inner);
-        replace_file_cleanup_intents_for_owner_locked(
+        if let Err(error) = replace_file_cleanup_intents_for_owner_locked(
             &mut inner,
             PersistedFileCleanupKind::BilibiliTransientOutput,
             &normalized_id,
+            cleanup_root_identity.as_ref(),
             transient_cleanup_intents,
-        )?;
-        replace_file_cleanup_intents_for_owner_locked(
+        ) {
+            checkpoint.restore(&mut inner);
+            return Err(error);
+        }
+        if let Err(error) = replace_file_cleanup_intents_for_owner_locked(
             &mut inner,
             PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
             &normalized_id,
+            cleanup_root_identity.as_ref(),
             owned_directory_cleanup_intents,
-        )?;
+        ) {
+            checkpoint.restore(&mut inner);
+            return Err(error);
+        }
         let retained_ids = output
             .resources
             .iter()
@@ -3509,6 +3576,15 @@ impl BilibiliTaskRegistry {
             relative_path,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
+            Status::failed_precondition("File cleanup storage root is not configured.")
+        })?;
+        let root_identity =
+            file_cleanup_root_identity_for_path(resource_root_path).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "File cleanup storage root could not be bound safely: {error}"
+                ))
+            })?;
         if self.persistence_configured && self.persistence.is_none() {
             return Err(Status::unavailable(
                 "Task state is not durable enough to delete library media.",
@@ -3526,6 +3602,7 @@ impl BilibiliTaskRegistry {
             &mut inner,
             PersistedFileCleanupKind::LocalLibraryItem,
             &library_item_id,
+            Some(&root_identity),
             vec![cleanup_intent],
         ) {
             checkpoint.restore(&mut inner);
@@ -4167,6 +4244,7 @@ impl BilibiliTaskRegistry {
             PersistedTaskState {
                 records,
                 file_cleanup_intents: Vec::new(),
+                file_cleanup_root_identity: None,
             },
             store,
             persistence_configured,
@@ -4187,10 +4265,44 @@ impl BilibiliTaskRegistry {
         let PersistedTaskState {
             records,
             file_cleanup_intents,
+            file_cleanup_root_identity,
         } = state;
         validate_unique_task_record_identities(&records)?;
+        let file_cleanup_root_identity =
+            match (file_cleanup_intents.is_empty(), file_cleanup_root_identity) {
+                (true, None) => None,
+                (false, Some(persisted_identity)) => {
+                    let resource_root_path = resource_root_path.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "persisted file cleanup intents require a configured cache root",
+                        )
+                    })?;
+                    let current_identity = file_cleanup_root_identity_for_path(resource_root_path)?;
+                    if current_identity != persisted_identity {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "persisted file cleanup intents belong to a different cache root",
+                        ));
+                    }
+                    Some(persisted_identity)
+                }
+                (true, Some(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted cleanup root identity has no cleanup intents",
+                    ));
+                }
+                (false, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted file cleanup intents are missing their cache root identity",
+                    ));
+                }
+            };
         let mut inner = RegistryInner {
             pending_file_cleanup_intents: file_cleanup_intents.into_iter().collect(),
+            file_cleanup_root_identity,
             ..RegistryInner::default()
         };
         for record in records {
@@ -4440,6 +4552,7 @@ impl BilibiliTaskRegistry {
             resource_cleanup_ids: resource_cleanup_ids.into_iter().collect(),
             pruned_task_ids,
             file_cleanup_intents,
+            file_cleanup_root_identity: inner.file_cleanup_root_identity.clone(),
         }))
     }
 
@@ -5363,6 +5476,7 @@ struct RegistryInner {
     durable_resource_cleanup_ids: HashSet<String>,
     resource_storage_revalidation_ids: HashSet<String>,
     pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
+    file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
     deferred_local_library_cleanup_owner_ids: HashSet<String>,
     pending_publications_by_id: HashMap<String, Task>,
     persistence_generation: u64,
@@ -5411,6 +5525,7 @@ struct RegistryMutationCheckpoint {
     planning_cancellations_by_id: HashMap<String, BilibiliTaskCancellation>,
     pending_resource_cleanup_ids: HashSet<String>,
     pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
+    file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
     pending_publications_by_id: HashMap<String, Task>,
 }
 
@@ -5470,6 +5585,7 @@ impl RegistryMutationCheckpoint {
             planning_cancellations_by_id: inner.planning_cancellations_by_id.clone(),
             pending_resource_cleanup_ids: inner.pending_resource_cleanup_ids.clone(),
             pending_file_cleanup_intents: inner.pending_file_cleanup_intents.clone(),
+            file_cleanup_root_identity: inner.file_cleanup_root_identity.clone(),
             pending_publications_by_id: inner.pending_publications_by_id.clone(),
         }
     }
@@ -5487,6 +5603,7 @@ impl RegistryMutationCheckpoint {
         inner.planning_cancellations_by_id = self.planning_cancellations_by_id;
         inner.pending_resource_cleanup_ids = self.pending_resource_cleanup_ids;
         inner.pending_file_cleanup_intents = self.pending_file_cleanup_intents;
+        inner.file_cleanup_root_identity = self.file_cleanup_root_identity;
         inner.pending_publications_by_id = self.pending_publications_by_id;
     }
 }
@@ -5539,10 +5656,11 @@ impl TaskStatePersistence {
         }
         state.latest_seen_generation = snapshot.generation;
 
-        match self
-            .store
-            .save_with_file_cleanup_intents(&snapshot.records, &snapshot.file_cleanup_intents)
-        {
+        match self.store.save_with_file_cleanup_intents(
+            &snapshot.records,
+            &snapshot.file_cleanup_intents,
+            snapshot.file_cleanup_root_identity.as_ref(),
+        ) {
             Ok(TaskStateSaveOutcome::Durable) => {
                 self.available.store(true, AtomicOrdering::Release);
                 PersistenceCommitOutcome::Durable
@@ -5627,6 +5745,7 @@ struct TaskPersistenceSnapshot {
     resource_cleanup_ids: Vec<String>,
     pruned_task_ids: Vec<String>,
     file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
+    file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
 }
 
 struct TerminalTask {
@@ -6791,6 +6910,7 @@ fn replace_file_cleanup_intents_for_owner_locked(
     inner: &mut RegistryInner,
     kind: PersistedFileCleanupKind,
     owner_id: &str,
+    root_identity: Option<&PersistedFileCleanupRootIdentity>,
     replacements: Vec<PersistedFileCleanupIntent>,
 ) -> Result<(), Status> {
     let retained_count = inner
@@ -6803,11 +6923,98 @@ fn replace_file_cleanup_intents_for_owner_locked(
             "Pending cache file cleanup capacity is exhausted.",
         ));
     }
+    if !replacements.is_empty() {
+        let root_identity = root_identity.ok_or_else(|| {
+            Status::failed_precondition(
+                "Pending file cleanup ownership is missing its cache root identity.",
+            )
+        })?;
+        if inner
+            .file_cleanup_root_identity
+            .as_ref()
+            .is_some_and(|existing| existing != root_identity)
+        {
+            return Err(Status::failed_precondition(
+                "Pending file cleanup ownership belongs to a different cache root.",
+            ));
+        }
+        inner.file_cleanup_root_identity = Some(root_identity.clone());
+    }
     inner
         .pending_file_cleanup_intents
         .retain(|intent| intent.kind != kind || intent.owner_id != owner_id);
     inner.pending_file_cleanup_intents.extend(replacements);
+    if inner.pending_file_cleanup_intents.is_empty() {
+        inner.file_cleanup_root_identity = None;
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_cleanup_root_identity_for_path(
+    resource_root_path: &Path,
+) -> io::Result<PersistedFileCleanupRootIdentity> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::FromRawFd,
+            unix::{ffi::OsStrExt, fs::MetadataExt},
+        },
+    };
+
+    fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cache root contains NUL"))?;
+        // SAFETY: path is NUL-terminated and open returns a new owned descriptor on success.
+        let descriptor = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: descriptor was returned by open and ownership transfers to File.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    let canonical_before = std::fs::canonicalize(resource_root_path)?;
+    let configured_root = open_directory_no_follow(resource_root_path)?;
+    let canonical_root = open_directory_no_follow(&canonical_before)?;
+    let configured_metadata = configured_root.metadata()?;
+    let canonical_metadata = canonical_root.metadata()?;
+    let canonical_after = std::fs::canonicalize(resource_root_path)?;
+    if canonical_after != canonical_before
+        || configured_metadata.dev() != canonical_metadata.dev()
+        || configured_metadata.ino() != canonical_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache root path changed while its cleanup identity was captured",
+        ));
+    }
+    let canonical_path = canonical_before.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache root canonical path is not valid UTF-8",
+        )
+    })?;
+    PersistedFileCleanupRootIdentity::new(
+        canonical_path,
+        configured_metadata.dev(),
+        configured_metadata.ino(),
+    )
+}
+
+#[cfg(not(unix))]
+fn file_cleanup_root_identity_for_path(
+    _resource_root_path: &Path,
+) -> io::Result<PersistedFileCleanupRootIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure file cleanup root binding is not implemented on this platform",
+    ))
 }
 
 fn lexical_absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -8080,7 +8287,13 @@ mod tests {
     fn library_deletion_durably_tombstones_v2_results_before_removing_media() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
-        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let resource_root = temp.path().join("cache");
+        std::fs::create_dir_all(&resource_root).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &path,
+            TaskRetentionPolicy::default(),
+            Some(resource_root.clone()),
+        );
         let first_candidate = sample_bilibili_task_candidate();
         let mut second_candidate = first_candidate.clone();
         second_candidate.selection_id = "page:2".to_owned();
@@ -8291,7 +8504,11 @@ mod tests {
         drop(prepared);
         drop(registry);
 
-        let restored = BilibiliTaskRegistry::with_persistence_path(path);
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            path,
+            TaskRetentionPolicy::default(),
+            Some(resource_root),
+        );
         let restored_task = restored
             .get_task(&task.id)
             .expect("tombstoned task should survive restart");
@@ -11141,6 +11358,81 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_intent_restart_rejects_a_different_cache_root() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let original_root = temp.path().join("cache-original");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(original_root.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-root-binding",
+                None,
+                None,
+                "Cleanup root binding".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        let relative_path = format!("Bilibili/{}/transient-subtitle.srt", task.id);
+        let original_path = original_root.join(&relative_path);
+        std::fs::create_dir_all(original_path.parent().unwrap())
+            .expect("original cleanup parent should be created");
+        std::fs::write(&original_path, b"original").expect("original cleanup target should exist");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    title: task.result_items[0].title.clone(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Downloaded sidecar output.".to_owned(),
+                vec![original_path.clone()],
+                Vec::new(),
+            )
+            .expect("cleanup ownership should persist against the original root");
+        let durable_state = std::fs::read(&state_path).expect("task state should be readable");
+        drop(registry);
+
+        let different_root = temp.path().join("cache-different");
+        let different_path = different_root.join(&relative_path);
+        std::fs::create_dir_all(different_path.parent().unwrap())
+            .expect("different cleanup parent should be created");
+        std::fs::write(&different_path, b"do not delete")
+            .expect("different-root sentinel should exist");
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(different_root),
+        );
+
+        assert!(!restored.persistence_available());
+        assert_eq!(
+            b"original",
+            std::fs::read(&original_path).unwrap().as_slice()
+        );
+        assert_eq!(
+            b"do not delete",
+            std::fs::read(&different_path).unwrap().as_slice()
+        );
+        assert_eq!(
+            durable_state,
+            std::fs::read(&state_path).expect("mismatched state must remain untouched")
+        );
+    }
+
+    #[test]
     fn owned_output_directories_are_durable_before_bytes_and_reaped_after_restart() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
@@ -13893,7 +14185,7 @@ mod tests {
             &std::fs::read(&state_path).expect("migrated snapshot should be readable"),
         )
         .expect("migrated snapshot should decode");
-        assert_eq!(Some(6), migrated["schema_version"].as_u64());
+        assert_eq!(Some(7), migrated["schema_version"].as_u64());
         assert!(migrated["tasks"][0]["output"]["resources"][0]["body_identity"].is_object());
     }
 
@@ -14758,6 +15050,7 @@ mod tests {
             resource_cleanup_ids: Vec::new(),
             pruned_task_ids: Vec::new(),
             file_cleanup_intents: Vec::new(),
+            file_cleanup_root_identity: None,
         });
         persistence.save_snapshot(&TaskPersistenceSnapshot {
             generation: 1,
@@ -14765,6 +15058,7 @@ mod tests {
             resource_cleanup_ids: Vec::new(),
             pruned_task_ids: Vec::new(),
             file_cleanup_intents: Vec::new(),
+            file_cleanup_root_identity: None,
         });
 
         let records = TaskStateStore::new(path)

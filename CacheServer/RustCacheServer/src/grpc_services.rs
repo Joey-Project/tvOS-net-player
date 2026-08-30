@@ -1059,6 +1059,31 @@ impl TaskResultPageStore {
             .collect()
     }
 
+    pub(crate) fn invalidate_library_item(&mut self, library_item_id: &str) -> Vec<String> {
+        let snapshot_ids = self
+            .snapshots_by_id
+            .iter()
+            .filter(|(_, snapshot)| {
+                snapshot.output.record.results.iter().any(|result| {
+                    result.library_item_id == library_item_id
+                        || result
+                            .playback_source
+                            .as_ref()
+                            .is_some_and(|source| source.item_id == library_item_id)
+                        || result
+                            .artifacts
+                            .iter()
+                            .any(|artifact| artifact.library_item_id == library_item_id)
+                })
+            })
+            .map(|(snapshot_id, _)| snapshot_id.clone())
+            .collect::<Vec<_>>();
+        snapshot_ids
+            .into_iter()
+            .filter_map(|snapshot_id| self.remove_snapshot(&snapshot_id))
+            .collect()
+    }
+
     fn mark_reaper_started(&mut self) -> bool {
         if self.reaper_started {
             return false;
@@ -5359,6 +5384,98 @@ mod tests {
         assert!(!pages.publish_first_page(&registration));
         assert!(pages.snapshots_by_id.is_empty());
         assert!(pages.cursors_by_token.is_empty());
+    }
+
+    #[test]
+    fn library_item_invalidation_removes_published_and_unpublished_snapshots() {
+        use crate::generated::tvos_net_player::v1::{
+            TaskArtifact, TaskArtifactKind, TaskArtifactState,
+        };
+
+        let now = Instant::now();
+        let expires_at = (now + TASK_RESULT_PAGE_SNAPSHOT_TTL).into_std();
+        let library_item_id = "local.default.deleted-item";
+        let mut published_result = task_result("published-result", TaskState::Completed);
+        published_result.library_item_id = library_item_id.to_owned();
+        let published_snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "pruned-task",
+            2,
+            "snapshot-published-library-item",
+            "lease-published-library-item",
+            expires_at,
+            vec![
+                published_result,
+                task_result("published-result-two", TaskState::Completed),
+            ],
+            1024,
+        );
+        let mut artifact_result = task_result("artifact-result", TaskState::Completed);
+        artifact_result.artifacts.push(TaskArtifact {
+            id: "media-artifact".to_owned(),
+            kind: TaskArtifactKind::Media.into(),
+            state: TaskArtifactState::Available.into(),
+            library_item_id: library_item_id.to_owned(),
+            ..Default::default()
+        });
+        let unpublished_snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "live-task",
+            3,
+            "snapshot-unpublished-library-item",
+            "lease-unpublished-library-item",
+            expires_at,
+            vec![artifact_result],
+            1024,
+        );
+        let unrelated_snapshot = crate::task_registry::TaskOutputSnapshot::for_tests(
+            "unrelated-task",
+            1,
+            "snapshot-unrelated-library-item",
+            "lease-unrelated-library-item",
+            expires_at,
+            vec![task_result("unrelated-result", TaskState::Completed)],
+            1024,
+        );
+        let mut pages = TaskResultPageStore::default();
+
+        let (published_page, _, _, published_registration) =
+            pages.first_page(published_snapshot, now, 1);
+        let continuation_token = published_page
+            .expect("published first page should be available")
+            .1
+            .next_page_token;
+        let published_registration =
+            published_registration.expect("published snapshot should register its first page");
+        assert!(pages.publish_first_page(&published_registration));
+        let (_, _, _, unpublished_registration) = pages.first_page(unpublished_snapshot, now, 1);
+        let unpublished_registration = unpublished_registration
+            .expect("unpublished snapshot should retain a first-page registration");
+        let (_, _, _, unrelated_registration) = pages.first_page(unrelated_snapshot, now, 1);
+        let unrelated_registration = unrelated_registration
+            .expect("unrelated snapshot should retain a first-page registration");
+
+        let mut released = pages.invalidate_library_item(library_item_id);
+        released.sort();
+
+        assert_eq!(
+            vec![
+                "lease-published-library-item".to_owned(),
+                "lease-unpublished-library-item".to_owned(),
+            ],
+            released
+        );
+        assert!(
+            pages
+                .continuation_page(&continuation_token, "pruned-task", now, 1)
+                .0
+                .is_err()
+        );
+        assert!(!pages.publish_first_page(&unpublished_registration));
+        assert!(pages.publish_first_page(&unrelated_registration));
+        assert!(
+            pages
+                .snapshots_by_id
+                .contains_key("snapshot-unrelated-library-item")
+        );
     }
 
     #[test]

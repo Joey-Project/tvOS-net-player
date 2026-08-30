@@ -5004,9 +5004,8 @@ where
     let mut args = Vec::new();
     args.push(OsString::from("-y"));
     args.push(OsString::from("-nostdin"));
-    let concat_list_cleanup = if only_flv_segments(entry) {
+    let concat_list_path = if only_flv_segments(entry) {
         let list_path = entry.directory.join("cache-server-ffmpeg-concat.txt");
-        let cleanup = TemporaryFileCleanup::new(list_path.clone());
         fs::write(&list_path, concat_file_list(&media_files))
             .await
             .map_err(failed)?;
@@ -5016,9 +5015,9 @@ where
             OsString::from("-safe"),
             OsString::from("0"),
             OsString::from("-i"),
-            list_path.into_os_string(),
+            list_path.as_os_str().to_os_string(),
         ]);
-        Some(cleanup)
+        Some(list_path)
     } else {
         for media_file in &media_files {
             args.push(OsString::from("-i"));
@@ -5034,16 +5033,21 @@ where
         mux_output_path.as_os_str().to_os_string(),
     ]);
 
-    let output = match run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await {
+    // Controlled exits remove the manifest asynchronously. Abrupt future cancellation leaves it
+    // inside the durably owned candidate directory for the task cleanup worker to reclaim.
+    let output = run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await;
+    let concat_cleanup_error = match concat_list_path.as_deref() {
+        Some(path) => remove_file_if_exists(path).await.err(),
+        None => None,
+    };
+    let output = match output {
         Ok(output) => output,
         Err(error) => {
             cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
             return Err(error);
         }
     };
-    if let Some(cleanup) = concat_list_cleanup
-        && let Err(error) = cleanup.remove().await
-    {
+    if let Some(error) = concat_cleanup_error {
         cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
         return Err(error);
     }
@@ -5315,34 +5319,6 @@ async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError>
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(failed(error)),
-    }
-}
-
-struct TemporaryFileCleanup {
-    path: Option<PathBuf>,
-}
-
-impl TemporaryFileCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    async fn remove(mut self) -> Result<(), BilibiliDownloadError> {
-        let path = self
-            .path
-            .as_ref()
-            .expect("temporary cleanup path should be present");
-        remove_file_if_exists(path).await?;
-        self.path = None;
-        Ok(())
-    }
-}
-
-impl Drop for TemporaryFileCleanup {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
@@ -9441,6 +9417,74 @@ mod tests {
         assert!(!second_segment.exists());
         assert!(!concat_list.exists());
         wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_mux_leaves_concat_manifest_for_owned_directory_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"video").unwrap();
+        std::fs::write(&second_segment, b"audio").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
+        let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+        let ffmpeg_for_task = ffmpeg.clone();
+        let mux_task =
+            tokio::spawn(
+                async move { mux_download_report(report, &ffmpeg_for_task, &|| false).await },
+            );
+
+        wait_for_path(&temp.path().join("ffmpeg-started")).await;
+        let pid = std::fs::read_to_string(temp.path().join("ffmpeg.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        mux_task.abort();
+        let join_error = tokio::time::timeout(std::time::Duration::from_secs(3), mux_task)
+            .await
+            .expect("aborted mux should leave the runtime promptly")
+            .expect_err("aborted mux should not complete normally");
+
+        assert!(join_error.is_cancelled());
+        assert!(concat_list.is_file());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::task::yield_now(),
+        )
+        .await
+        .expect("aborting mux must not block the current-thread runtime");
+        wait_for_process_exit(pid).await;
+        tokio::fs::remove_file(concat_list)
+            .await
+            .expect("test should emulate the owned-directory cleanup worker");
     }
 
     #[tokio::test]

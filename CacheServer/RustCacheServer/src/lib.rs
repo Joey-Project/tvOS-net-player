@@ -218,6 +218,26 @@ struct CompletedHlsDeletionPlan {
     task_cleanup: Option<(String, String)>,
 }
 
+fn invalidate_task_result_pages_before_library_deletion(
+    tasks: &Arc<BilibiliTaskRegistry>,
+    task_result_pages: &Arc<Mutex<TaskResultPageStore>>,
+    library_item_id: &str,
+    updated_task_ids: &[String],
+) {
+    let released_resource_lease_ids = {
+        let mut pages = task_result_pages
+            .lock()
+            .expect("task result page store lock poisoned");
+        let mut released = pages.invalidate_library_item(library_item_id);
+        if !updated_task_ids.is_empty() {
+            let task_ids = updated_task_ids.iter().cloned().collect::<HashSet<_>>();
+            released.extend(pages.invalidate_tasks(&task_ids));
+        }
+        released
+    };
+    tasks.release_task_output_snapshots(&released_resource_lease_ids);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HlsCleanupOverflowDecision {
     Remove,
@@ -1175,22 +1195,17 @@ impl AppState {
         tokio::task::spawn_blocking(move || {
             // Keep the admission slot until detached work finishes after RPC cancellation.
             let _permit = permit;
+            let library_item_id = deletion.item_id().to_owned();
             let prepared = tasks.tombstone_library_item_before_delete(
                 deletion.item_id(),
                 deletion.relative_path(),
             )?;
-            if !prepared.updated_task_ids().is_empty() {
-                let task_ids = prepared
-                    .updated_task_ids()
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let released_resource_lease_ids = task_result_pages
-                    .lock()
-                    .expect("task result page store lock poisoned")
-                    .invalidate_tasks(&task_ids);
-                tasks.release_task_output_snapshots(&released_resource_lease_ids);
-            }
+            invalidate_task_result_pages_before_library_deletion(
+                &tasks,
+                &task_result_pages,
+                &library_item_id,
+                prepared.updated_task_ids(),
+            );
             prepared.delete()
         })
         .await
@@ -1278,6 +1293,12 @@ impl AppState {
                     {
                         return Ok(Some(false));
                     }
+                    invalidate_task_result_pages_before_library_deletion(
+                        &self.tasks,
+                        &self.task_result_pages,
+                        item_id,
+                        &[],
+                    );
                     self.remove_hls_sessions_for_library_item(item_id, &plan.session_ids)?;
                     return Ok(Some(true));
                 }
@@ -2042,6 +2063,12 @@ impl AppState {
             if !self.remove_evicted_completed_hls_task(&entry)? {
                 continue;
             }
+            invalidate_task_result_pages_before_library_deletion(
+                &self.tasks,
+                &self.task_result_pages,
+                &entry.library_item_id,
+                &[],
+            );
             self.remove_hls_sessions_tracking_failures(&entry.library_item_id, &session_ids)?;
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(

@@ -48,7 +48,8 @@ const BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION: u32 = 3;
 const BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION: u32 = 4;
 const FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION: u32 = 5;
 const TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION: u32 = 6;
-const TASK_STATE_SCHEMA_VERSION: u32 = TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION;
+const FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION: u32 = 7;
+const TASK_STATE_SCHEMA_VERSION: u32 = FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 pub(crate) const MAX_PERSISTED_FILE_CLEANUP_INTENTS: usize = 100_000;
@@ -58,6 +59,7 @@ const MAX_PERSISTED_BILIBILI_PROFILE_ID_BYTES: usize = 256;
 // A local library item ID base64-encodes the complete bounded relative path.
 const MAX_PERSISTED_CLEANUP_OWNER_ID_BYTES: usize = 8_192;
 const MAX_PERSISTED_CLEANUP_RELATIVE_PATH_BYTES: usize = 4_096;
+const MAX_PERSISTED_CLEANUP_ROOT_PATH_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +163,50 @@ impl PersistedFileCleanupIntent {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PersistedFileCleanupRootIdentity {
+    pub(crate) canonical_path: String,
+    pub(crate) device_id: u64,
+    pub(crate) inode: u64,
+}
+
+impl PersistedFileCleanupRootIdentity {
+    pub(crate) fn new(
+        canonical_path: impl Into<String>,
+        device_id: u64,
+        inode: u64,
+    ) -> io::Result<Self> {
+        let identity = Self {
+            canonical_path: canonical_path.into(),
+            device_id,
+            inode,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        let path = Path::new(&self.canonical_path);
+        let normalized = path.components().collect::<PathBuf>();
+        if self.canonical_path.is_empty()
+            || self.canonical_path.len() > MAX_PERSISTED_CLEANUP_ROOT_PATH_BYTES
+            || self.canonical_path.contains('\0')
+            || self.canonical_path.chars().any(char::is_control)
+            || !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || normalized.to_str() != Some(self.canonical_path.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted file cleanup root identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn valid_bilibili_download_task_id(value: &str) -> bool {
     value.strip_prefix("bilibili-").is_some_and(|suffix| {
         suffix.len() == 32
@@ -174,6 +220,7 @@ fn valid_bilibili_download_task_id(value: &str) -> bool {
 pub(crate) struct PersistedTaskState {
     pub(crate) records: Vec<PersistedTaskRecord>,
     pub(crate) file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
+    pub(crate) file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
 }
 
 thread_local! {
@@ -420,6 +467,7 @@ impl TaskStateStore {
                 | BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION
                 | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
                 | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
+                | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
                 | TASK_STATE_SCHEMA_VERSION
         ) {
             return Err(io::Error::new(
@@ -440,7 +488,20 @@ impl TaskStateStore {
                 "task state schemas before v5 cannot contain file cleanup intents",
             ));
         }
+        if schema_version < FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION
+            && (!snapshot.file_cleanup_intents.is_empty()
+                || snapshot.file_cleanup_root_identity.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state schemas before v7 cannot safely replay file cleanup intents",
+            ));
+        }
         validate_file_cleanup_intents(&snapshot.file_cleanup_intents)?;
+        validate_file_cleanup_root_binding(
+            &snapshot.file_cleanup_intents,
+            snapshot.file_cleanup_root_identity.as_ref(),
+        )?;
         let records = snapshot
             .tasks
             .into_iter()
@@ -451,22 +512,25 @@ impl TaskStateStore {
         Ok(PersistedTaskState {
             records,
             file_cleanup_intents: snapshot.file_cleanup_intents,
+            file_cleanup_root_identity: snapshot.file_cleanup_root_identity,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn save(&self, records: &[PersistedTaskRecord]) -> io::Result<TaskStateSaveOutcome> {
-        self.save_with_file_cleanup_intents(records, &[])
+        self.save_with_file_cleanup_intents(records, &[], None)
     }
 
     pub(crate) fn save_with_file_cleanup_intents(
         &self,
         records: &[PersistedTaskRecord],
         file_cleanup_intents: &[PersistedFileCleanupIntent],
+        file_cleanup_root_identity: Option<&PersistedFileCleanupRootIdentity>,
     ) -> io::Result<TaskStateSaveOutcome> {
         let snapshot = serialize_task_snapshot_with_file_cleanup_intents_and_limit(
             records,
             file_cleanup_intents,
+            file_cleanup_root_identity,
             MAX_TASK_STATE_SNAPSHOT_BYTES,
         )?;
         let directories_to_sync = parent_directories_requiring_sync(self.path())?;
@@ -626,27 +690,48 @@ fn validate_file_cleanup_intents(intents: &[PersistedFileCleanupIntent]) -> io::
     Ok(())
 }
 
+fn validate_file_cleanup_root_binding(
+    intents: &[PersistedFileCleanupIntent],
+    root_identity: Option<&PersistedFileCleanupRootIdentity>,
+) -> io::Result<()> {
+    match (intents.is_empty(), root_identity) {
+        (true, None) => Ok(()),
+        (false, Some(root_identity)) => root_identity.validate(),
+        (true, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task state cannot retain a cleanup root identity without cleanup intents",
+        )),
+        (false, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task state cleanup intents are missing their cache root identity",
+        )),
+    }
+}
+
 #[cfg(test)]
 fn serialize_task_snapshot_with_limit<'a, I>(records: I, limit: usize) -> io::Result<Vec<u8>>
 where
     I: IntoIterator<Item = &'a PersistedTaskRecord>,
 {
-    serialize_task_snapshot_with_file_cleanup_intents_and_limit(records, &[], limit)
+    serialize_task_snapshot_with_file_cleanup_intents_and_limit(records, &[], None, limit)
 }
 
 fn serialize_task_snapshot_with_file_cleanup_intents_and_limit<'a, I>(
     records: I,
     file_cleanup_intents: &[PersistedFileCleanupIntent],
+    file_cleanup_root_identity: Option<&PersistedFileCleanupRootIdentity>,
     limit: usize,
 ) -> io::Result<Vec<u8>>
 where
     I: IntoIterator<Item = &'a PersistedTaskRecord>,
 {
     validate_file_cleanup_intents(file_cleanup_intents)?;
+    validate_file_cleanup_root_binding(file_cleanup_intents, file_cleanup_root_identity)?;
     let snapshot = PersistedTaskSnapshotForSave {
         schema_version: TASK_STATE_SCHEMA_VERSION,
         tasks: PersistedTaskSequence::new(records.into_iter()),
         file_cleanup_intents,
+        file_cleanup_root_identity,
     };
     let mut serialized = BoundedSnapshotWriter::new(limit);
     serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
@@ -658,6 +743,7 @@ struct PersistedTaskSnapshotForSave<'a, I> {
     schema_version: u32,
     tasks: PersistedTaskSequence<I>,
     file_cleanup_intents: &'a [PersistedFileCleanupIntent],
+    file_cleanup_root_identity: Option<&'a PersistedFileCleanupRootIdentity>,
 }
 
 impl<'a, 'b, I> Serialize for PersistedTaskSnapshotForSave<'a, I>
@@ -668,10 +754,14 @@ where
     where
         S: serde::Serializer,
     {
-        let mut snapshot = serializer.serialize_struct("PersistedTaskSnapshot", 3)?;
+        let mut snapshot = serializer.serialize_struct("PersistedTaskSnapshot", 4)?;
         snapshot.serialize_field("schema_version", &self.schema_version)?;
         snapshot.serialize_field("tasks", &self.tasks)?;
         snapshot.serialize_field("file_cleanup_intents", &self.file_cleanup_intents)?;
+        snapshot.serialize_field(
+            "file_cleanup_root_identity",
+            &self.file_cleanup_root_identity,
+        )?;
         snapshot.end()
     }
 }
@@ -1224,6 +1314,8 @@ struct PersistedTaskSnapshot {
     tasks: Vec<PersistedTaskFile>,
     #[serde(default, deserialize_with = "deserialize_file_cleanup_intents")]
     file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
+    #[serde(default)]
+    file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
 }
 
 fn validate_collection_len(label: &str, len: usize, limit: usize) -> io::Result<()> {
@@ -2761,16 +2853,18 @@ mod tests {
             format!("Bilibili/{CLEANUP_TASK_ID}/video.zh-CN.srt"),
         )
         .expect("cleanup intent should be valid");
+        let root_identity = PersistedFileCleanupRootIdentity::new("/cache/test", 1, 2)
+            .expect("cleanup root identity should be valid");
         store
-            .save_with_file_cleanup_intents(&[], std::slice::from_ref(&intent))
+            .save_with_file_cleanup_intents(
+                &[],
+                std::slice::from_ref(&intent),
+                Some(&root_identity),
+            )
             .expect("cleanup intent should persist");
-        assert_eq!(
-            vec![intent.clone()],
-            store
-                .load_state()
-                .expect("cleanup intent should reload")
-                .file_cleanup_intents
-        );
+        let restored = store.load_state().expect("cleanup intent should reload");
+        assert_eq!(vec![intent.clone()], restored.file_cleanup_intents);
+        assert_eq!(Some(root_identity), restored.file_cleanup_root_identity);
 
         let snapshot: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("cleanup snapshot should be readable"))
@@ -2826,6 +2920,7 @@ mod tests {
 
         let mut legacy_without_intent = legacy_with_intent;
         legacy_without_intent["file_cleanup_intents"] = serde_json::Value::Array(Vec::new());
+        legacy_without_intent["file_cleanup_root_identity"] = serde_json::Value::Null;
         fs::write(
             &path,
             serde_json::to_vec_pretty(&legacy_without_intent)
@@ -3071,6 +3166,7 @@ mod tests {
                     .map(PersistedTaskFile::from)
                     .collect(),
                 file_cleanup_intents: Vec::new(),
+                file_cleanup_root_identity: None,
             };
             std::fs::write(
                 &path,
@@ -3169,6 +3265,7 @@ mod tests {
                 persisted_task("budget-two", &["resource-two"]),
             ],
             file_cleanup_intents: Vec::new(),
+            file_cleanup_root_identity: None,
         };
         let accepted_bytes = serde_json::to_vec(&accepted).unwrap();
 
@@ -3183,6 +3280,7 @@ mod tests {
                 persisted_task("budget-four", &["resource-five"]),
             ],
             file_cleanup_intents: Vec::new(),
+            file_cleanup_root_identity: None,
         };
         let rejected_bytes = serde_json::to_vec(&rejected).unwrap();
         let error = match deserialize_task_snapshot_with_resource_limit(&rejected_bytes, 2) {
