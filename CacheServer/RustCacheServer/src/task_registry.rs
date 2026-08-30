@@ -26,12 +26,13 @@ use crate::{
     },
     hls_cache::HlsCacheStore,
     library::{
-        decode_item_id, list_optional_directory_names_no_follow_bounded, open_read_no_follow,
-        remove_directory_tree_no_follow, remove_empty_directory_no_follow, remove_file_no_follow,
+        LibraryPublicationGate, decode_item_id, list_optional_directory_names_no_follow_bounded,
+        open_read_no_follow, remove_directory_tree_no_follow, remove_empty_directory_no_follow,
+        remove_file_no_follow,
     },
     task_output::{
-        MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord, TaskResourceRecord,
-        resource_id_is_canonical,
+        MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord,
+        TaskResourceBodyIdentity, TaskResourceRecord, resource_id_is_canonical,
     },
     task_store::{
         MAX_PERSISTED_FILE_CLEANUP_INTENTS, MAX_PERSISTED_TASKS, PersistedFileCleanupIntent,
@@ -116,6 +117,15 @@ impl StagedResourceBodyIdentity {
     fn same_object(self, other: Self) -> bool {
         self.device_id == other.device_id && self.inode == other.inode
     }
+
+    fn durable(self) -> TaskResourceBodyIdentity {
+        TaskResourceBodyIdentity {
+            device_id: self.device_id,
+            inode: self.inode,
+            size_bytes: self.size_bytes,
+            mode: self.mode,
+        }
+    }
 }
 
 pub(crate) fn is_known_safe_cancellation_message(message: &str) -> bool {
@@ -154,6 +164,7 @@ pub struct BilibiliTaskRegistry {
     resource_root_path: Option<PathBuf>,
     resource_cleanup_lock: Mutex<()>,
     file_cleanup_lock: Mutex<()>,
+    library_publication_gate: Option<Arc<LibraryPublicationGate>>,
     resource_storage_available: AtomicBool,
     orphan_resource_scan_pending: AtomicBool,
 }
@@ -295,6 +306,7 @@ impl<'a> StagedTaskOutputReplacement<'a> {
             ));
         }
         self.validate_created_resource_body_identities()?;
+        self.bind_created_resource_body_identities()?;
         let resources = self
             .resources
             .take()
@@ -369,26 +381,52 @@ impl<'a> StagedTaskOutputReplacement<'a> {
             .lock()
             .expect("staged resource body identity lock poisoned");
         for resource_id in &self.resource_body_creation_ids {
-            let identity = identities.get(resource_id).ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "Task resource body was not created through this stage: {resource_id}."
-                ))
-            })?;
             let resource = self
                 .resource_requiring_body_creation(resource_id)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            self.registry
-                .validate_staged_resource_body_identity(resource, *identity)
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "Task resource body changed before publication: {error}"
-                    ))
-                })?;
+            if let Some(identity) = identities.get(resource_id) {
+                self.registry
+                    .validate_staged_resource_body_identity(resource, *identity)
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "Task resource body changed before publication: {error}"
+                        ))
+                    })?;
+            } else {
+                return Err(Status::failed_precondition(format!(
+                    "Task resource body was not created through this stage: {resource_id}."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_created_resource_body_identities(&mut self) -> Result<(), Status> {
+        let identities = self
+            .created_resource_body_identities
+            .lock()
+            .expect("staged resource body identity lock poisoned");
+        let resources = self
+            .resources
+            .as_deref_mut()
+            .expect("staged task output resources must remain available before commit");
+        for resource in resources {
+            if let Some(identity) = identities.get(&resource.resource.id) {
+                resource.bind_body_identity(identity.durable());
+            }
+            if resource.body_identity.is_none() {
+                return Err(Status::failed_precondition(format!(
+                    "Task resource body identity is unavailable before publication: {}.",
+                    resource.resource.id
+                )));
+            }
         }
         Ok(())
     }
 
     pub(crate) fn commit(mut self, results: Vec<TaskResult>) -> Result<Task, Status> {
+        self.validate_created_resource_body_identities()?;
+        self.bind_created_resource_body_identities()?;
         let resources = self
             .resources
             .take()
@@ -441,6 +479,20 @@ impl BilibiliTaskRegistry {
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
     ) -> Self {
+        Self::with_persistence_path_retention_resource_root_and_publication_gate(
+            path,
+            retention_policy,
+            resource_root_path,
+            None,
+        )
+    }
+
+    pub(crate) fn with_persistence_path_retention_resource_root_and_publication_gate(
+        path: impl Into<PathBuf>,
+        retention_policy: TaskRetentionPolicy,
+        resource_root_path: Option<PathBuf>,
+        library_publication_gate: Option<Arc<LibraryPublicationGate>>,
+    ) -> Self {
         let store = TaskStateStore::new(path);
         let state = match store.load_state() {
             Ok(state) => state,
@@ -455,6 +507,7 @@ impl BilibiliTaskRegistry {
                     true,
                     retention_policy,
                     resource_root_path,
+                    library_publication_gate,
                 )
                 .expect("empty persisted task records should be valid");
             }
@@ -465,6 +518,7 @@ impl BilibiliTaskRegistry {
             true,
             retention_policy.clone(),
             resource_root_path.clone(),
+            library_publication_gate.clone(),
         ) {
             Ok(registry) => registry,
             Err(error) => {
@@ -478,10 +532,12 @@ impl BilibiliTaskRegistry {
                     true,
                     retention_policy,
                     resource_root_path,
+                    library_publication_gate,
                 )
                 .expect("empty persisted task records should be valid");
             }
         };
+        registry.install_library_publication_gate_from_current_state();
         registry.persist_current_state();
         registry.retire_expired_task_resources();
         registry.retry_pending_file_cleanups();
@@ -500,6 +556,20 @@ impl BilibiliTaskRegistry {
 
     pub(crate) fn persistence_recovery_supported(&self) -> bool {
         self.persistence.is_some()
+    }
+
+    fn install_library_publication_gate_from_current_state(&self) {
+        let Some(gate) = self.library_publication_gate.as_ref() else {
+            return;
+        };
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        if let Err(error) =
+            install_library_publication_gate(gate, inner.pending_file_cleanup_intents.iter())
+        {
+            eprintln!(
+                "Failed to install the durable Bilibili library publication gate; keeping the previous fail-closed view: {error}"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -988,7 +1058,7 @@ impl BilibiliTaskRegistry {
     pub(crate) fn stage_task_output_replacement(
         &self,
         id: &str,
-        resources: Vec<TaskResourceRecord>,
+        mut resources: Vec<TaskResourceRecord>,
     ) -> Result<StagedTaskOutputReplacement<'_>, Status> {
         if !self
             .resource_storage_available
@@ -1008,7 +1078,7 @@ impl BilibiliTaskRegistry {
             .collect::<HashSet<_>>();
         let resource_body_creation_ids = self.register_staged_task_output_resources(
             &normalized_id,
-            &resources,
+            &mut resources,
             &candidate_resource_ids,
         )?;
         let mut staged = StagedTaskOutputReplacement::new(
@@ -1336,10 +1406,12 @@ impl BilibiliTaskRegistry {
         }
         validate_resource_body_size(resource, actual_identity.size_bytes)?;
         #[cfg(unix)]
-        if actual_identity.mode & 0o222 != 0 {
+        if expected_identity.mode & 0o7777 != actual_identity.mode & 0o7777
+            || actual_identity.mode & 0o222 != 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "staged task resource destination regained write permission",
+                "staged task resource destination access policy changed",
             ));
         }
         Ok(())
@@ -1783,31 +1855,13 @@ impl BilibiliTaskRegistry {
                 return Err(error);
             }
         };
-        let metadata = match file.metadata() {
+        let metadata = match validate_opened_task_resource_body(&file, &record) {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.mark_resource_storage_for_revalidation(&normalized_id, &error);
                 return Err(error);
             }
         };
-        if !metadata.file_type().is_file() {
-            let error = io::Error::new(
-                io::ErrorKind::InvalidData,
-                "task resource body is not a regular file",
-            );
-            self.mark_resource_storage_for_revalidation(&normalized_id, &error);
-            return Err(error);
-        }
-        if record.resource.size_known
-            && u64::try_from(record.resource.size_bytes).ok() != Some(metadata.len())
-        {
-            let error = io::Error::new(
-                io::ErrorKind::InvalidData,
-                "task resource body size does not match its durable metadata",
-            );
-            self.mark_resource_storage_for_revalidation(&normalized_id, &error);
-            return Err(error);
-        }
         if record
             .resource
             .expires_at
@@ -3894,6 +3948,7 @@ impl BilibiliTaskRegistry {
         persistence_configured: bool,
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
+        library_publication_gate: Option<Arc<LibraryPublicationGate>>,
     ) -> io::Result<Self> {
         Self::from_persisted_state(
             PersistedTaskState {
@@ -3904,6 +3959,7 @@ impl BilibiliTaskRegistry {
             persistence_configured,
             retention_policy,
             resource_root_path,
+            library_publication_gate,
         )
     }
 
@@ -3913,6 +3969,7 @@ impl BilibiliTaskRegistry {
         persistence_configured: bool,
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
+        library_publication_gate: Option<Arc<LibraryPublicationGate>>,
     ) -> io::Result<Self> {
         let PersistedTaskState {
             records,
@@ -3990,6 +4047,7 @@ impl BilibiliTaskRegistry {
             inner.outputs_by_task_id.insert(task_id.clone(), output);
             inner.tasks_by_id.insert(task_id, task);
         }
+        migrate_pending_task_resource_body_identities(&mut inner, resource_root_path.as_deref())?;
         inner.visible_tasks_by_id = inner.tasks_by_id.clone();
         inner.visible_outputs_by_task_id = inner
             .outputs_by_task_id
@@ -4013,6 +4071,7 @@ impl BilibiliTaskRegistry {
             resource_root_path,
             resource_cleanup_lock: Mutex::new(()),
             file_cleanup_lock: Mutex::new(()),
+            library_publication_gate,
             resource_storage_available: AtomicBool::new(!orphan_resource_scan_pending),
             orphan_resource_scan_pending: AtomicBool::new(orphan_resource_scan_pending),
         })
@@ -4195,6 +4254,16 @@ impl BilibiliTaskRegistry {
                         &mut inner,
                         snapshot.resource_cleanup_ids.clone(),
                     );
+                    if let Some(gate) = self.library_publication_gate.as_ref()
+                        && let Err(error) = install_library_publication_gate(
+                            gate,
+                            snapshot.file_cleanup_intents.iter(),
+                        )
+                    {
+                        eprintln!(
+                            "Failed to advance the durable Bilibili library publication gate; keeping the previous fail-closed view: {error}"
+                        );
+                    }
                 }
                 Self::refresh_pending_publications_locked(&mut inner);
                 Self::publish_pending_locked(&mut inner);
@@ -4312,7 +4381,7 @@ impl BilibiliTaskRegistry {
     fn register_staged_task_output_resources(
         &self,
         task_id: &str,
-        resources: &[TaskResourceRecord],
+        resources: &mut [TaskResourceRecord],
         resource_ids: &HashSet<String>,
     ) -> Result<HashSet<String>, Status> {
         let _cleanup_guard = self
@@ -4331,6 +4400,20 @@ impl BilibiliTaskRegistry {
             resource_ids,
             false,
         )?;
+        if let Some(current_output) = inner.outputs_by_task_id.get(task_id) {
+            let current_resources_by_id = current_output
+                .resources
+                .iter()
+                .map(|resource| (resource.resource.id.as_str(), resource))
+                .collect::<HashMap<_, _>>();
+            for resource in resources.iter_mut() {
+                if let Some(current) = current_resources_by_id.get(resource.resource.id.as_str()) {
+                    resource.body_identity = current.body_identity;
+                    resource.body_identity_migration_pending =
+                        current.body_identity_migration_pending;
+                }
+            }
+        }
         let current_task_resource_ids = inner
             .outputs_by_task_id
             .get(task_id)
@@ -4766,6 +4849,7 @@ impl Default for BilibiliTaskRegistry {
             None,
             false,
             TaskRetentionPolicy::default(),
+            None,
             None,
         )
         .expect("empty persisted task records should be valid")
@@ -6147,6 +6231,13 @@ fn validate_task_resource_body(
     record: &TaskResourceRecord,
 ) -> io::Result<()> {
     let file = open_read_no_follow(resource_root_path, &record.relative_path())?;
+    validate_opened_task_resource_body(&file, record).map(|_| ())
+}
+
+fn validate_opened_task_resource_body(
+    file: &File,
+    record: &TaskResourceRecord,
+) -> io::Result<std::fs::Metadata> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -6161,6 +6252,69 @@ fn validate_task_resource_body(
             io::ErrorKind::InvalidData,
             "task resource body size does not match its durable metadata",
         ));
+    }
+    let actual_identity = StagedResourceBodyIdentity::from_metadata(&metadata)?.durable();
+    let expected_identity = record.body_identity.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task resource body has no durable identity",
+        )
+    })?;
+    if expected_identity.device_id != actual_identity.device_id
+        || expected_identity.inode != actual_identity.inode
+        || expected_identity.size_bytes != actual_identity.size_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task resource body object does not match its durable identity",
+        ));
+    }
+    if expected_identity.mode & 0o7777 != actual_identity.mode & 0o7777
+        || actual_identity.mode & 0o222 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "task resource body access policy does not match its durable identity",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn migrate_pending_task_resource_body_identities(
+    inner: &mut RegistryInner,
+    resource_root_path: Option<&Path>,
+) -> io::Result<()> {
+    let migration_pending = inner
+        .outputs_by_task_id
+        .values()
+        .flat_map(|output| &output.resources)
+        .any(|resource| resource.body_identity_migration_pending);
+    if !migration_pending {
+        return Ok(());
+    }
+    let resource_root_path = resource_root_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy task resources cannot be migrated without a resource root",
+        )
+    })?;
+    for output in inner.outputs_by_task_id.values_mut() {
+        for resource in &mut output.resources {
+            if !resource.body_identity_migration_pending {
+                continue;
+            }
+            let file = open_read_no_follow(resource_root_path, &resource.relative_path())?;
+            let metadata = file.metadata()?;
+            validate_resource_body_size(resource, metadata.len())?;
+            let identity = StagedResourceBodyIdentity::from_metadata(&metadata)?.durable();
+            if identity.mode & 0o222 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "legacy task resource body regained write permission before migration",
+                ));
+            }
+            resource.bind_body_identity(identity);
+        }
     }
     Ok(())
 }
@@ -6202,6 +6356,18 @@ fn cache_relative_path(resource_root_path: &Path, source_path: &Path) -> io::Res
             "staged task resource source path is not valid UTF-8",
         )
     })
+}
+
+fn install_library_publication_gate<'a>(
+    gate: &LibraryPublicationGate,
+    intents: impl IntoIterator<Item = &'a PersistedFileCleanupIntent>,
+) -> io::Result<()> {
+    gate.install_durable_blocked_paths(
+        intents
+            .into_iter()
+            .filter(|intent| intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory)
+            .map(|intent| intent.relative_path.as_str()),
+    )
 }
 
 fn replace_file_cleanup_intents_for_owner_locked(
@@ -6469,7 +6635,14 @@ fn validate_task_output_resource_claims_locked(
             ));
         }
         let current_task_resource = current_task_resources_by_id.get(resource_id);
-        if current_task_resource.is_some_and(|existing| *existing != resource) {
+        let representation_changed = current_task_resource.is_some_and(|existing| {
+            if claim_is_registered {
+                *existing != resource
+            } else {
+                existing.resource != resource.resource
+            }
+        });
+        if representation_changed {
             return Err(Status::invalid_argument(format!(
                 "Task resource id cannot be reused for a different representation: {}.",
                 resource.resource.id
@@ -9626,36 +9799,34 @@ mod tests {
         })
         .unwrap();
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
-        std::fs::write(&resource_path, b"test").unwrap();
-        registry
-            .replace_task_output(
-                &created.task.id,
-                vec![
-                    TaskResult {
-                        id: created.task.id.clone(),
-                        state: TaskState::Playable.into(),
-                        playback_source: Some(playback_source(&created.task.id)),
+        commit_test_task_output_with_resource(
+            &registry,
+            &created.task.id,
+            vec![
+                TaskResult {
+                    id: created.task.id.clone(),
+                    state: TaskState::Playable.into(),
+                    playback_source: Some(playback_source(&created.task.id)),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: child_session_id.clone(),
+                    state: TaskState::Completed.into(),
+                    library_item_id: child_library_item_id.clone(),
+                    playback_source: Some(playback_source(&child_session_id)),
+                    artifacts: vec![TaskArtifact {
+                        id: "child-media".to_owned(),
+                        kind: TaskArtifactKind::Media.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
                         ..Default::default()
-                    },
-                    TaskResult {
-                        id: child_session_id.clone(),
-                        state: TaskState::Completed.into(),
-                        library_item_id: child_library_item_id.clone(),
-                        playback_source: Some(playback_source(&child_session_id)),
-                        artifacts: vec![TaskArtifact {
-                            id: "child-media".to_owned(),
-                            kind: TaskArtifactKind::Media.into(),
-                            state: TaskArtifactState::Available.into(),
-                            resource: Some(resource.resource.clone()),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                ],
-                vec![resource],
-            )
-            .unwrap();
+                    }],
+                    ..Default::default()
+                },
+            ],
+            resource,
+            b"test",
+        );
 
         let durable_task = registry.get_task(&created.task.id).unwrap();
         let durable_output = registry.task_output_snapshot(&created.task.id).unwrap();
@@ -10452,17 +10623,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_publication_releases_only_the_retained_output_directory() {
+    #[tokio::test]
+    async fn terminal_publication_releases_only_the_retained_output_directory() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
         std::fs::create_dir_all(&root_path).expect("cache root should be created");
-        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
-            &state_path,
-            TaskRetentionPolicy::default(),
-            Some(root_path.clone()),
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &root_path,
+                &root_path.join("Bilibili"),
+            )
+            .expect("Bilibili output should be inside the cache root"),
         );
+        let library = crate::library::LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(crate::config::CacheServerOptions {
+                root_path: root_path.clone(),
+                ..crate::config::CacheServerOptions::default()
+            }),
+            Arc::clone(&publication_gate),
+        );
+        let registry =
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+                Some(publication_gate),
+            );
         let task = registry
             .create_bilibili_download_task_v2(
                 "BV1owned-output-terminal",
@@ -10489,7 +10679,12 @@ mod tests {
         std::fs::write(staging_path.join("transient.m4s"), b"transient").unwrap();
         std::fs::create_dir_all(&published_path).unwrap();
         std::fs::write(published_path.join("video.mp4"), b"video").unwrap();
-        let library_item_id = "local.default.owned-output".to_owned();
+        let library_item_id = library
+            .item_id_for_media_path(published_path.join("video.mp4"))
+            .await
+            .expect("internal publication probe should resolve the media item");
+        assert!(library.get_item(&library_item_id).await.is_none());
+        assert!(library.list_items_page(None, 0, 50).await.items.is_empty());
 
         registry
             .stage_task_output_replacement(&task.id, Vec::new())
@@ -10509,12 +10704,15 @@ mod tests {
                     ..Default::default()
                 }],
                 TaskState::Succeeded,
-                library_item_id,
+                library_item_id.clone(),
                 "Published retained output.".to_owned(),
                 Vec::new(),
                 vec![staging_path.clone()],
             )
             .expect("terminal output should transfer directory ownership atomically");
+
+        assert!(library.get_item(&library_item_id).await.is_some());
+        assert_eq!(1, library.list_items_page(None, 0, 50).await.items.len());
 
         let persisted = TaskStateStore::new(&state_path).load_state().unwrap();
         assert_eq!(1, persisted.file_cleanup_intents.len());
@@ -10656,6 +10854,10 @@ mod tests {
             .unwrap();
         let copied_path = root_path.join(copied.relative_path());
         assert_eq!(b"old", std::fs::read(&copied_path).unwrap().as_slice());
+        let committed_identity = registry
+            .task_resource(&copied.resource.id)
+            .and_then(|resource| resource.body_identity)
+            .expect("committed resource should have a durable body identity");
 
         let unchanged = registry
             .stage_task_output_replacement(&task.id, vec![copied.clone()])
@@ -10668,8 +10870,19 @@ mod tests {
                 .expect_err("an immutable current resource must never be overwritten")
                 .kind()
         );
-        drop(unchanged);
-        assert_eq!(b"old", std::fs::read(copied_path).unwrap().as_slice());
+        unchanged
+            .commit(vec![test_task_result_with_resources(
+                "copied-result",
+                std::slice::from_ref(&copied),
+            )])
+            .expect("the authoritative private identity should hydrate an idempotent retry");
+        assert_eq!(b"old", std::fs::read(&copied_path).unwrap().as_slice());
+        assert_eq!(
+            Some(committed_identity),
+            registry
+                .task_resource(&copied.resource.id)
+                .and_then(|resource| resource.body_identity)
+        );
 
         let outside_path = temp.path().join("outside.txt");
         std::fs::write(&outside_path, b"bad").unwrap();
@@ -10745,6 +10958,23 @@ mod tests {
         assert_eq!(b"safe", std::fs::read(&link_target).unwrap().as_slice());
         drop(destination_stage);
 
+        let mode_drift = test_task_resource("destination-mode-drift", 4);
+        let mode_drift_stage = registry
+            .stage_task_output_replacement(&task.id, vec![mode_drift.clone()])
+            .unwrap();
+        mode_drift_stage
+            .write_resource_body(&mode_drift.resource.id, b"safe")
+            .unwrap();
+        let mode_drift_path = root_path.join(mode_drift.relative_path());
+        std::fs::set_permissions(&mode_drift_path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let error = mode_drift_stage
+            .commit(vec![test_task_result_with_resources(
+                "mode-drift-result",
+                std::slice::from_ref(&mode_drift),
+            )])
+            .expect_err("a read-only access-policy change must fail before publication");
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
+
         let replacement = test_task_resource("destination-replacement", 4);
         let replacement_stage = registry
             .stage_task_output_replacement(&task.id, vec![replacement.clone()])
@@ -10776,6 +11006,135 @@ mod tests {
             TaskState::Queued,
             registry.get_task(&task.id).unwrap().state()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_resource_identity_rejects_same_size_replacement_during_persistence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-race", None)
+            .expect("task should be created");
+        let resource = test_task_resource("resource-race", 4);
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("resource output should stage");
+        staged
+            .write_resource_body(&resource.resource.id, b"good")
+            .expect("resource body should be written");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        registry.block_next_persistence_save(Arc::clone(&entered), Arc::clone(&resume));
+        let body_path = root_path.join(resource.relative_path());
+        let original_path = temp.path().join("resource-race-original");
+        std::thread::scope(|scope| {
+            let resource_for_commit = resource.clone();
+            let commit = scope.spawn(move || {
+                staged.commit_download_terminal(
+                    vec![test_task_result_with_resources(
+                        "resource-race-result",
+                        std::slice::from_ref(&resource_for_commit),
+                    )],
+                    TaskState::Succeeded,
+                    String::new(),
+                    "Completed.".to_owned(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            });
+
+            entered.wait();
+            std::fs::rename(&body_path, &original_path).expect("original body should move aside");
+            std::fs::write(&body_path, b"evil").expect("same-size replacement should be written");
+            std::fs::set_permissions(&body_path, std::fs::Permissions::from_mode(0o400))
+                .expect("replacement should match the staged access mode");
+            resume.wait();
+            commit
+                .join()
+                .expect("commit thread should not panic")
+                .expect("the already-built snapshot should commit");
+        });
+
+        let error = match registry.open_task_resource(&resource.resource.id) {
+            Err(error) => error,
+            Ok(_) => panic!("same-size replacement must not be served"),
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let restored_error = match restored.open_task_resource(&resource.resource.id) {
+            Err(error) => error,
+            Ok(_) => panic!("same-size replacement must remain rejected after restart"),
+        };
+        assert_eq!(io::ErrorKind::InvalidData, restored_error.kind());
+        assert_eq!(b"evil", std::fs::read(body_path).unwrap().as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_resource_identity_allows_unrelated_parent_entry_churn() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state/tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-parent-churn", None)
+            .expect("task should be created");
+        let resource = test_task_resource("resource-parent-churn", 4);
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("resource output should stage");
+        staged
+            .write_resource_body(&resource.resource.id, b"good")
+            .expect("resource body should be written");
+        let sibling_path = root_path
+            .join(resource.relative_path())
+            .with_file_name("unrelated-sibling");
+        std::fs::write(&sibling_path, b"temporary").expect("sibling should be created");
+        std::fs::remove_file(&sibling_path).expect("sibling should be removed");
+
+        staged
+            .commit_download_terminal(
+                vec![test_task_result_with_resources(
+                    "resource-parent-churn-result",
+                    std::slice::from_ref(&resource),
+                )],
+                TaskState::Succeeded,
+                String::new(),
+                "Completed.".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("unrelated parent churn must not change body identity");
+        let mut opened = registry
+            .open_task_resource(&resource.resource.id)
+            .expect("resource open should succeed")
+            .expect("resource should remain available");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut opened.file, &mut bytes)
+            .expect("resource should be readable");
+        assert_eq!(b"good", bytes.as_slice());
     }
 
     #[test]
@@ -11587,9 +11946,6 @@ mod tests {
         })
         .unwrap();
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap())
-            .expect("staged resource directory should be created");
-        std::fs::write(&resource_path, b"test").expect("staged body should be written");
         let invalid_results = vec![TaskResult {
             id: String::new(),
             state: TaskState::Completed.into(),
@@ -11602,9 +11958,15 @@ mod tests {
             }],
             ..Default::default()
         }];
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("invalid output resource should stage before output validation");
+        staged
+            .write_resource_body(&resource.resource.id, b"test")
+            .expect("invalid output resource body should stage");
 
-        let error = registry
-            .replace_task_output(&task.id, invalid_results, vec![resource])
+        let error = staged
+            .commit(invalid_results)
             .expect_err("invalid task output must be rejected");
 
         assert_eq!(tonic::Code::InvalidArgument, error.code());
@@ -11694,7 +12056,10 @@ mod tests {
         let staged_live = registry
             .stage_task_output_replacement(&owner.id, vec![live.clone()])
             .expect("live resource should acquire staged ownership");
-        let live_path = write_task_resource_body(&root_path, &live, b"live");
+        staged_live
+            .write_resource_body(&live.resource.id, b"live")
+            .expect("live resource body should be staged");
+        let live_path = root_path.join(live.relative_path());
         staged_live
             .commit(vec![test_task_result_with_resources(
                 "owner-result",
@@ -11737,12 +12102,10 @@ mod tests {
         let initial = registry
             .stage_task_output_replacement(&task.id, vec![resource.clone()])
             .expect("new resource should acquire staged ownership");
-        let initial_resource = initial
-            .resources_requiring_body_creation()
-            .next()
-            .expect("new resource should require body creation")
-            .clone();
-        let body_path = write_task_resource_body(&root_path, &initial_resource, b"live");
+        initial
+            .write_resource_body(&resource.resource.id, b"live")
+            .expect("new resource body should be staged");
+        let body_path = root_path.join(resource.relative_path());
         let results = vec![test_task_result_with_resources(
             "immutable-result",
             std::slice::from_ref(&resource),
@@ -11798,17 +12161,17 @@ mod tests {
             seconds: 0,
             nanos: 0,
         });
-        let body_path = write_task_resource_body(&root_path, &resource, b"expired");
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![test_task_result_with_resources(
-                    "expired-result",
-                    std::slice::from_ref(&resource),
-                )],
-                vec![resource],
-            )
-            .expect("expired resource metadata should be accepted before retirement");
+        let body_path = root_path.join(resource.relative_path());
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![test_task_result_with_resources(
+                "expired-result",
+                std::slice::from_ref(&resource),
+            )],
+            resource,
+            b"expired",
+        );
         assert!(body_path.exists());
 
         let snapshot = registry
@@ -11883,9 +12246,6 @@ mod tests {
         })
         .unwrap();
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap())
-            .expect("staged resource directory should be created");
-        std::fs::write(&resource_path, b"old!").expect("staged resource body should be written");
         let results = vec![TaskResult {
             id: "result-one".to_owned(),
             state: TaskState::Completed.into(),
@@ -11898,11 +12258,17 @@ mod tests {
             }],
             ..Default::default()
         }];
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("authoritative output should stage");
+        staged
+            .write_resource_body(&resource.resource.id, b"old!")
+            .expect("authoritative resource body should stage");
 
         std::fs::remove_file(&path).expect("state file should be removable");
         std::fs::create_dir(&path).expect("directory should block snapshot replacement");
-        let error = registry
-            .replace_task_output(&task.id, results.clone(), vec![resource.clone()])
+        let error = staged
+            .commit(results.clone())
             .expect_err("authoritative output must report failed durability");
         assert_eq!(tonic::Code::Unavailable, error.code());
         assert_eq!(durable_task, registry.get_task(&task.id).unwrap());
@@ -11955,11 +12321,14 @@ mod tests {
             "a reconnected watcher must not receive the rolled-back output"
         );
 
-        std::fs::create_dir_all(resource_path.parent().unwrap())
-            .expect("retry resource directory should be created");
-        std::fs::write(&resource_path, b"new!").expect("retry resource body should be written");
-        registry
-            .replace_task_output(&task.id, results.clone(), vec![resource.clone()])
+        let retry = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("explicit output retry should stage");
+        retry
+            .write_resource_body(&resource.resource.id, b"new!")
+            .expect("retry resource body should stage");
+        retry
+            .commit(results.clone())
             .expect("an explicit retry should persist the authoritative output");
         let published = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
             .await
@@ -11979,9 +12348,12 @@ mod tests {
             .expect("reconnected watcher should remain active");
         assert_eq!(published.output_summary, reconnected_event.output_summary);
         assert!(registry.task_resource("failed-output-resource").is_some());
+        let committed_resource = registry
+            .task_resource("failed-output-resource")
+            .expect("durable resource should retain its body identity");
 
         registry
-            .replace_task_output(&task.id, results, vec![resource])
+            .replace_task_output(&task.id, results, vec![committed_resource])
             .expect("identical output should already be durable");
         assert!(
             tokio::time::timeout(Duration::from_millis(25), subscription.recv())
@@ -12003,6 +12375,7 @@ mod tests {
             true,
             TaskRetentionPolicy::default(),
             None,
+            None,
         ) {
             Ok(_) => panic!("direct restore must reject normalized duplicate task ids"),
             Err(error) => error,
@@ -12020,10 +12393,10 @@ mod tests {
             let temp = tempfile::tempdir().expect("temp dir should be created");
             let state_path = temp.path().join("state").join("tasks.json");
             let root_path = temp.path().join("cache");
-            let first_resource = test_task_resource("collision-owned-one", 3);
-            let second_resource = test_task_resource("collision-owned-two", 3);
-            let first_path = write_task_resource_body(&root_path, &first_resource, b"one");
-            let second_path = write_task_resource_body(&root_path, &second_resource, b"two");
+            let mut first_resource = test_task_resource("collision-owned-one", 3);
+            let mut second_resource = test_task_resource("collision-owned-two", 3);
+            let first_path = write_task_resource_body(&root_path, &mut first_resource, b"one");
+            let second_path = write_task_resource_body(&root_path, &mut second_resource, b"two");
             let record = |id: &str, source: &str, resource: TaskResourceRecord| {
                 let mut record = persisted_task_record(id, source);
                 record.output = TaskOutputRecord::replace(
@@ -12095,7 +12468,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
-        let resource = TaskResourceRecord::new(CacheResourceRef {
+        let mut resource = TaskResourceRecord::new(CacheResourceRef {
             id: "skipped-record-resource".to_owned(),
             content_type: "text/vtt".to_owned(),
             size_bytes: 4,
@@ -12104,9 +12477,7 @@ mod tests {
             ..Default::default()
         })
         .expect("resource should be valid");
-        let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
-        std::fs::write(&resource_path, b"test").unwrap();
+        let resource_path = write_task_resource_body(&root_path, &mut resource, b"test");
 
         let mut record = persisted_task_record("invalid-task", "");
         record.output = TaskOutputRecord::replace(
@@ -12163,16 +12534,17 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
-        let pending = test_task_resource("pending-owned-resource", 7);
-        let unavailable = test_task_resource("unavailable-owned-resource", 11);
+        let mut pending = test_task_resource("pending-owned-resource", 7);
+        let mut unavailable = test_task_resource("unavailable-owned-resource", 11);
         let mut expired = test_task_resource("expired-owned-resource", 7);
         expired.resource.expires_at = Some(Timestamp {
             seconds: 0,
             nanos: 0,
         });
-        let pending_path = write_task_resource_body(&root_path, &pending, b"pending");
-        let unavailable_path = write_task_resource_body(&root_path, &unavailable, b"unavailable");
-        let expired_path = write_task_resource_body(&root_path, &expired, b"expired");
+        let pending_path = write_task_resource_body(&root_path, &mut pending, b"pending");
+        let unavailable_path =
+            write_task_resource_body(&root_path, &mut unavailable, b"unavailable");
+        let expired_path = write_task_resource_body(&root_path, &mut expired, b"expired");
 
         let mut record = persisted_task_record("owned-resource-task", "BV1owned-resource");
         record.output = TaskOutputRecord::replace(
@@ -12318,7 +12690,7 @@ mod tests {
             seconds: 0,
             nanos: 0,
         });
-        let expired_path = write_task_resource_body(&root_path, &expired, b"expired");
+        let expired_path = write_task_resource_body(&root_path, &mut expired, b"expired");
 
         let mut record = persisted_task_record("staged-resource-task", "BV1staged-resource");
         record.output = TaskOutputRecord::replace(
@@ -12348,14 +12720,12 @@ mod tests {
         std::fs::remove_dir(&rewrite_blocker).expect("startup rewrite blocker should be removable");
         let replacement = test_task_resource("staged-during-startup-scan", 5);
         let staged = registry
-            .stage_task_output_replacement("staged-resource-task", vec![replacement])
+            .stage_task_output_replacement("staged-resource-task", vec![replacement.clone()])
             .expect("replacement should recover persistence before body creation");
-        let replacement = staged
-            .resources_requiring_body_creation()
-            .next()
-            .expect("a new resource should require body creation")
-            .clone();
-        let replacement_path = write_task_resource_body(&root_path, &replacement, b"fresh");
+        staged
+            .write_resource_body(&replacement.resource.id, b"fresh")
+            .expect("replacement body should be created through the stage");
+        let replacement_path = root_path.join(replacement.relative_path());
         staged
             .commit(vec![test_task_result_with_resources(
                 "replacement-result",
@@ -12391,8 +12761,8 @@ mod tests {
         let task = registry
             .create_bilibili_task("BV1cleanup-serialized-stage", None)
             .expect("task should be created");
-        let resource = test_task_resource("cleanup-serialized-resource", 5);
-        let resource_path = write_task_resource_body(&root_path, &resource, b"stale");
+        let mut resource = test_task_resource("cleanup-serialized-resource", 5);
+        let resource_path = write_task_resource_body(&root_path, &mut resource, b"stale");
         registry
             .inner
             .lock()
@@ -12420,7 +12790,6 @@ mod tests {
         let (stage_started_sender, stage_started_receiver) = std::sync::mpsc::channel();
         let (stage_acquired_sender, stage_acquired_receiver) = std::sync::mpsc::channel();
         let stage_registry = Arc::clone(&registry);
-        let stage_root_path = root_path.clone();
         let stage_task_id = task.id.clone();
         let stage_resource_path = resource_path.clone();
         let stage = std::thread::spawn(move || {
@@ -12442,7 +12811,9 @@ mod tests {
                 .next()
                 .expect("a cleaned resource id should require body creation")
                 .clone();
-            write_task_resource_body(&stage_root_path, &staged_resource, b"fresh");
+            staged
+                .write_resource_body(&staged_resource.resource.id, b"fresh")
+                .expect("fresh resource body should be created through the stage");
             staged
                 .commit(vec![test_task_result_with_resources(
                     "cleanup-serialized-result",
@@ -12487,7 +12858,13 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
-        let registry = BilibiliTaskRegistry::with_persistence_path(&path);
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
         let task = registry
             .create_bilibili_task("BV1generic-output", None)
             .expect("task should be created");
@@ -12501,24 +12878,26 @@ mod tests {
             ..Default::default()
         })
         .expect("resource should be valid");
-        let updated = registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "episode-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    title: "Episode one".to_owned(),
-                    artifacts: vec![TaskArtifact {
-                        id: "subtitle-artifact".to_owned(),
-                        kind: TaskArtifactKind::Subtitle.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("generic output should stage");
+        staged
+            .write_resource_body(&resource.resource.id, b"hello world!")
+            .expect("generic output resource body should stage");
+        let updated = staged
+            .commit(vec![TaskResult {
+                id: "episode-one".to_owned(),
+                state: TaskState::Completed.into(),
+                title: "Episode one".to_owned(),
+                artifacts: vec![TaskArtifact {
+                    id: "subtitle-artifact".to_owned(),
+                    kind: TaskArtifactKind::Subtitle.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
+                ..Default::default()
+            }])
             .expect("generic output should be stored");
         let summary = updated
             .output_summary
@@ -12528,7 +12907,11 @@ mod tests {
         assert_eq!("episode-one", summary.primary_result_id);
 
         drop(registry);
-        let restored = BilibiliTaskRegistry::with_persistence_path(&path);
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
         let snapshot = restored
             .task_output_snapshot(&task.id)
             .expect("generic output should restore");
@@ -12545,6 +12928,69 @@ mod tests {
             ".tvos-net-player/resources/subtitle-resource/body",
             restored_resource.relative_path()
         );
+    }
+
+    #[test]
+    fn schema_v5_resource_body_identity_migrates_from_the_secure_body() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1resource-identity-migration", None)
+            .expect("task should be created");
+        let resource = test_task_resource("legacy-v5-resource", 4);
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![test_task_result_with_resources(
+                "legacy-v5-result",
+                std::slice::from_ref(&resource),
+            )],
+            resource,
+            b"test",
+        );
+        drop(registry);
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path).expect("schema-v5 snapshot should be readable"),
+        )
+        .expect("schema-v5 snapshot should decode");
+        legacy["schema_version"] = serde_json::Value::from(5_u64);
+        legacy["tasks"][0]["output"]["resources"][0]
+            .as_object_mut()
+            .expect("persisted resource should be an object")
+            .remove("body_identity");
+        let mut legacy_bytes =
+            serde_json::to_vec_pretty(&legacy).expect("schema-v5 fixture should serialize");
+        legacy_bytes.push(b'\n');
+        std::fs::write(&state_path, legacy_bytes).expect("schema-v5 fixture should be written");
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let mut opened = restored
+            .open_task_resource("legacy-v5-resource")
+            .expect("migrated resource storage should remain valid")
+            .expect("migrated resource should remain available");
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut opened.file, &mut body)
+            .expect("migrated resource should be readable");
+        assert_eq!(b"test", body.as_slice());
+
+        let migrated: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path).expect("migrated snapshot should be readable"),
+        )
+        .expect("migrated snapshot should decode");
+        assert_eq!(Some(6), migrated["schema_version"].as_u64());
+        assert!(migrated["tasks"][0]["output"]["resources"][0]["body_identity"].is_object());
     }
 
     #[test]
@@ -12565,25 +13011,25 @@ mod tests {
             .create_bilibili_task("BV1unavailable-snapshot", None)
             .expect("task should be created");
         let resource = test_task_resource("unavailable-snapshot-resource", 4);
-        let resource_path = write_task_resource_body(&root_path, &resource, b"test");
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "unavailable-result".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "unavailable-artifact".to_owned(),
-                        kind: TaskArtifactKind::Subtitle.into(),
-                        state: TaskArtifactState::Unavailable.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        let resource_path = root_path.join(resource.relative_path());
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![TaskResult {
+                id: "unavailable-result".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "unavailable-artifact".to_owned(),
+                    kind: TaskArtifactKind::Subtitle.into(),
+                    state: TaskArtifactState::Unavailable.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource.clone()],
-            )
-            .expect("unavailable resource metadata should commit");
+                ..Default::default()
+            }],
+            resource.clone(),
+            b"test",
+        );
         let snapshot = registry
             .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
             .expect("result page snapshot should retain every referenced resource id");
@@ -12653,26 +13099,24 @@ mod tests {
         })
         .unwrap();
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
-        std::fs::write(&resource_path, b"test").unwrap();
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "subtitle-one".to_owned(),
-                        kind: TaskArtifactKind::Subtitle.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "subtitle-one".to_owned(),
+                    kind: TaskArtifactKind::Subtitle.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .unwrap();
+                ..Default::default()
+            }],
+            resource,
+            b"test",
+        );
         let first_snapshot = registry
             .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
             .unwrap();
@@ -12736,25 +13180,27 @@ mod tests {
             ..Default::default()
         })
         .expect("resource should be valid");
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "artifact-one".to_owned(),
-                        kind: TaskArtifactKind::Metadata.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        let resource_path = root_path.join(resource.relative_path());
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "artifact-one".to_owned(),
+                    kind: TaskArtifactKind::Metadata.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource.clone()],
-            )
-            .expect("resource output should persist");
-        let resource_path = root_path.join(resource.relative_path());
+                ..Default::default()
+            }],
+            resource.clone(),
+            b"test",
+        );
+        std::fs::remove_file(&resource_path)
+            .expect("published resource body should be replaceable by the cleanup blocker");
         std::fs::create_dir_all(&resource_path)
             .expect("a directory at the body path should block file cleanup");
 
@@ -12806,8 +13252,6 @@ mod tests {
         })
         .expect("resource should be valid");
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
-        std::fs::write(&resource_path, b"old!").unwrap();
         let artifact = TaskArtifact {
             id: "artifact-one".to_owned(),
             kind: TaskArtifactKind::Metadata.into(),
@@ -12815,18 +13259,18 @@ mod tests {
             resource: Some(resource.resource.clone()),
             ..Default::default()
         };
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![artifact.clone()],
-                    ..Default::default()
-                }],
-                vec![resource.clone()],
-            )
-            .expect("resource output should persist");
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![artifact.clone()],
+                ..Default::default()
+            }],
+            resource.clone(),
+            b"old!",
+        );
 
         std::fs::rename(&root_path, &unavailable_root_path)
             .expect("cache root should become temporarily unavailable");
@@ -12894,26 +13338,24 @@ mod tests {
         })
         .expect("resource should be valid");
         let resource_path = root_path.join(resource.relative_path());
-        std::fs::create_dir_all(resource_path.parent().unwrap()).unwrap();
-        std::fs::write(&resource_path, b"test").unwrap();
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "artifact-one".to_owned(),
-                        kind: TaskArtifactKind::Metadata.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "artifact-one".to_owned(),
+                    kind: TaskArtifactKind::Metadata.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .expect("resource output should persist");
+                ..Default::default()
+            }],
+            resource,
+            b"test",
+        );
         let retained = registry
             .retain_task_output_snapshot(&task.id, Instant::now() + Duration::from_secs(60))
             .expect("output snapshot should retain its resource");
@@ -12966,17 +13408,16 @@ mod tests {
             seconds: expires_since_epoch.as_secs().try_into().unwrap(),
             nanos: expires_since_epoch.subsec_nanos().try_into().unwrap(),
         });
-        write_task_resource_body(&root_path, &resource, b"test");
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![test_task_result_with_resources(
-                    "expiry-lock-result",
-                    std::slice::from_ref(&resource),
-                )],
-                vec![resource],
-            )
-            .expect("expiring resource should persist");
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![test_task_result_with_resources(
+                "expiry-lock-result",
+                std::slice::from_ref(&resource),
+            )],
+            resource,
+            b"test",
+        );
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -13023,17 +13464,16 @@ mod tests {
             .create_bilibili_task("BV1resource-storage-revalidation", None)
             .expect("task should be created");
         let resource = test_task_resource("storage-revalidation-resource", 4);
-        write_task_resource_body(&root_path, &resource, b"test");
-        registry
-            .replace_task_output(
-                &task.id,
-                vec![test_task_result_with_resources(
-                    "storage-revalidation-result",
-                    std::slice::from_ref(&resource),
-                )],
-                vec![resource],
-            )
-            .expect("resource output should persist");
+        commit_test_task_output_with_resource(
+            &registry,
+            &task.id,
+            vec![test_task_result_with_resources(
+                "storage-revalidation-result",
+                std::slice::from_ref(&resource),
+            )],
+            resource,
+            b"test",
+        );
         assert!(registry.task_output_v2_available());
 
         let managed_path = root_path.join(".tvos-net-player");
@@ -13775,13 +14215,43 @@ mod tests {
 
     fn write_task_resource_body(
         root_path: &Path,
-        resource: &TaskResourceRecord,
+        resource: &mut TaskResourceRecord,
         body: &[u8],
     ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
         let path = root_path.join(resource.relative_path());
         std::fs::create_dir_all(path.parent().unwrap())
             .expect("staged resource directory should be created");
         std::fs::write(&path, body).expect("staged resource body should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("staged resource body should become read-only");
+        resource.bind_body_identity(
+            StagedResourceBodyIdentity::from_metadata(
+                &std::fs::metadata(&path).expect("staged resource metadata should be readable"),
+            )
+            .expect("staged resource body should be regular")
+            .durable(),
+        );
         path
+    }
+
+    fn commit_test_task_output_with_resource(
+        registry: &BilibiliTaskRegistry,
+        task_id: &str,
+        results: Vec<TaskResult>,
+        resource: TaskResourceRecord,
+        body: &[u8],
+    ) -> Task {
+        let resource_id = resource.resource.id.clone();
+        let staged = registry
+            .stage_task_output_replacement(task_id, vec![resource])
+            .expect("test task resource output should stage");
+        staged
+            .write_resource_body(&resource_id, body)
+            .expect("test task resource body should be created through the stage");
+        staged
+            .commit(results)
+            .expect("test task resource output should commit")
     }
 }

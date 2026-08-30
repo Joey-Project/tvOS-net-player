@@ -84,7 +84,12 @@ impl Default for CacheServerOptions {
             task_state_path: state_path.join("tasks.json"),
             task_retention_max_terminal_tasks: 200,
             task_retention_terminal_age_days: 30,
-            allowed_extensions: vec![".mp4".to_owned(), ".m4v".to_owned(), ".mov".to_owned()],
+            allowed_extensions: vec![
+                ".mp4".to_owned(),
+                ".m4v".to_owned(),
+                ".mov".to_owned(),
+                ".m4a".to_owned(),
+            ],
             allow_library_item_delete: false,
             hls_cache_max_bytes: DEFAULT_HLS_CACHE_MAX_BYTES,
             hls_cache_high_watermark_percent: 90,

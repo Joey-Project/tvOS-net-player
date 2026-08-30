@@ -34,7 +34,7 @@ use crate::generated::tvos_net_player::v1::{
 use crate::playback_policy::PlaybackPolicy;
 use crate::task_output::{
     MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS,
-    TaskOutputRecord, TaskResourceRecord,
+    TaskOutputRecord, TaskResourceBodyIdentity, TaskResourceRecord,
 };
 use crate::{
     bilibili_playback::{BilibiliContentIdentity, BilibiliContentKind},
@@ -45,7 +45,9 @@ const LEGACY_TASK_STATE_SCHEMA_VERSION: u32 = 1;
 const GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION: u32 = 2;
 const BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION: u32 = 3;
 const BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION: u32 = 4;
-const TASK_STATE_SCHEMA_VERSION: u32 = 5;
+const FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION: u32 = 5;
+const TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION: u32 = 6;
+const TASK_STATE_SCHEMA_VERSION: u32 = TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 pub(crate) const MAX_PERSISTED_FILE_CLEANUP_INTENTS: usize = 100_000;
@@ -391,6 +393,7 @@ impl TaskStateStore {
                 | GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION
                 | BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION
                 | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
+                | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
                 | TASK_STATE_SCHEMA_VERSION
         ) {
             return Err(io::Error::new(
@@ -403,7 +406,9 @@ impl TaskStateStore {
         }
 
         let schema_version = snapshot.schema_version;
-        if schema_version < TASK_STATE_SCHEMA_VERSION && !snapshot.file_cleanup_intents.is_empty() {
+        if schema_version < FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
+            && !snapshot.file_cleanup_intents.is_empty()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "task state schemas before v5 cannot contain file cleanup intents",
@@ -1449,6 +1454,7 @@ impl PersistedTaskFile {
             GENERIC_TASK_OUTPUT_STATE_SCHEMA_VERSION
             | BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION
             | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
+            | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
             | TASK_STATE_SCHEMA_VERSION => self
                 .output
                 .ok_or_else(|| {
@@ -1457,7 +1463,7 @@ impl PersistedTaskFile {
                         format!("task state schema v{schema_version} task is missing output"),
                     )
                 })?
-                .into_output(&task)?,
+                .into_output(&task, schema_version)?,
             _ => unreachable!("task state schema version was validated before conversion"),
         };
 
@@ -1515,7 +1521,7 @@ impl From<TaskOutputRecord> for PersistedTaskOutput {
 }
 
 impl PersistedTaskOutput {
-    fn into_output(self, task: &Task) -> io::Result<TaskOutputRecord> {
+    fn into_output(self, task: &Task, schema_version: u32) -> io::Result<TaskOutputRecord> {
         let PersistedTaskOutput {
             revision,
             snapshot_id,
@@ -1530,7 +1536,7 @@ impl PersistedTaskOutput {
             .collect::<io::Result<Vec<_>>>()?;
         let resources = resources
             .into_iter()
-            .map(PersistedCacheResourceRef::into_record)
+            .map(|resource| resource.into_task_resource_record(schema_version))
             .collect::<io::Result<Vec<_>>>()?;
         let results = if legacy_managed {
             if !resources.is_empty() {
@@ -1842,9 +1848,8 @@ impl PersistedTaskArtifact {
             is_ai_generated: self.is_ai_generated,
             resource: self
                 .resource
-                .map(PersistedCacheResourceRef::into_record)
-                .transpose()?
-                .map(|record| record.resource),
+                .map(PersistedCacheResourceRef::into_public_resource)
+                .transpose()?,
             problem: self.problem.map(TaskProblem::from),
             library_item_id: self.library_item_id,
         })
@@ -1860,11 +1865,25 @@ struct PersistedCacheResourceRef {
     supports_byte_ranges: bool,
     etag: String,
     expires_at: Option<PersistedTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_identity: Option<PersistedTaskResourceBodyIdentity>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct PersistedTaskResourceBodyIdentity {
+    device_id: u64,
+    inode: u64,
+    size_bytes: u64,
+    mode: u32,
 }
 
 impl From<TaskResourceRecord> for PersistedCacheResourceRef {
     fn from(record: TaskResourceRecord) -> Self {
-        Self::from(record.resource)
+        let mut persisted = Self::from(record.resource);
+        persisted.body_identity = record
+            .body_identity
+            .map(PersistedTaskResourceBodyIdentity::from);
+        persisted
     }
 }
 
@@ -1878,13 +1897,14 @@ impl From<CacheResourceRef> for PersistedCacheResourceRef {
             supports_byte_ranges: resource.supports_byte_ranges,
             etag: resource.etag,
             expires_at: resource.expires_at.map(PersistedTimestamp::from),
+            body_identity: None,
         }
     }
 }
 
 impl PersistedCacheResourceRef {
-    fn into_record(self) -> io::Result<TaskResourceRecord> {
-        TaskResourceRecord::new(CacheResourceRef {
+    fn into_public_resource(self) -> io::Result<CacheResourceRef> {
+        Ok(TaskResourceRecord::new(CacheResourceRef {
             id: self.id,
             uri: String::new(),
             content_type: self.content_type,
@@ -1894,7 +1914,48 @@ impl PersistedCacheResourceRef {
             etag: self.etag,
             expires_at: self.expires_at.map(Timestamp::from),
         })
+        .map_err(invalid_data)?
+        .resource)
+    }
+
+    fn into_task_resource_record(self, schema_version: u32) -> io::Result<TaskResourceRecord> {
+        let body_identity = self.body_identity.map(TaskResourceBodyIdentity::from);
+        let migration_pending = body_identity.is_none()
+            && schema_version < TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION;
+        if body_identity.is_none() && !migration_pending {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted task resource is missing its body identity",
+            ));
+        }
+        TaskResourceRecord::restored(
+            self.into_public_resource()?,
+            body_identity,
+            migration_pending,
+        )
         .map_err(invalid_data)
+    }
+}
+
+impl From<TaskResourceBodyIdentity> for PersistedTaskResourceBodyIdentity {
+    fn from(identity: TaskResourceBodyIdentity) -> Self {
+        Self {
+            device_id: identity.device_id,
+            inode: identity.inode,
+            size_bytes: identity.size_bytes,
+            mode: identity.mode,
+        }
+    }
+}
+
+impl From<PersistedTaskResourceBodyIdentity> for TaskResourceBodyIdentity {
+    fn from(identity: PersistedTaskResourceBodyIdentity) -> Self {
+        Self {
+            device_id: identity.device_id,
+            inode: identity.inode,
+            size_bytes: identity.size_bytes,
+            mode: identity.mode,
+        }
     }
 }
 
@@ -3647,7 +3708,7 @@ mod tests {
     fn round_trips_nested_task_output_without_persisting_resource_locations() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("tasks.json");
-        let subtitle_resource = TaskResourceRecord::new(CacheResourceRef {
+        let mut subtitle_resource = TaskResourceRecord::new(CacheResourceRef {
             id: "subtitle-z".to_owned(),
             uri: "file:///private/tmp/must-not-persist".to_owned(),
             content_type: "text/vtt; charset=utf-8".to_owned(),
@@ -3661,7 +3722,13 @@ mod tests {
             }),
         })
         .expect("subtitle resource should be valid");
-        let cover_resource = TaskResourceRecord::new(CacheResourceRef {
+        subtitle_resource.bind_body_identity(TaskResourceBodyIdentity {
+            device_id: 1,
+            inode: 101,
+            size_bytes: 321,
+            mode: 0o100400,
+        });
+        let mut cover_resource = TaskResourceRecord::new(CacheResourceRef {
             id: "cover-a".to_owned(),
             uri: "https://upstream.example.test/private-cover".to_owned(),
             content_type: "image/jpeg".to_owned(),
@@ -3675,6 +3742,12 @@ mod tests {
             }),
         })
         .expect("cover resource should be valid");
+        cover_resource.bind_body_identity(TaskResourceBodyIdentity {
+            device_id: 1,
+            inode: 102,
+            size_bytes: 654,
+            mode: 0o100400,
+        });
         let results = vec![
             TaskResult {
                 id: "result-z".to_owned(),
@@ -3909,6 +3982,7 @@ mod tests {
         assert!(!resource_json.contains_key("uri"));
         assert!(!resource_json.contains_key("relative_path"));
         assert!(!resource_json.contains_key("local_path"));
+        assert!(resource_json.contains_key("body_identity"));
         let artifact_resource_json =
             snapshot["tasks"][0]["output"]["results"][0]["artifacts"][0]["resource"]
                 .as_object()
@@ -3916,6 +3990,24 @@ mod tests {
         assert!(!artifact_resource_json.contains_key("uri"));
         assert!(!artifact_resource_json.contains_key("relative_path"));
         assert!(!artifact_resource_json.contains_key("local_path"));
+        assert!(!artifact_resource_json.contains_key("body_identity"));
+
+        let mut missing_identity = snapshot.clone();
+        missing_identity["tasks"][0]["output"]["resources"][0]
+            .as_object_mut()
+            .expect("persisted output resource should be mutable")
+            .remove("body_identity");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&missing_identity)
+                .expect("missing identity fixture should serialize"),
+        )
+        .expect("missing identity fixture should be written");
+        let error = match TaskStateStore::new(&path).load() {
+            Ok(_) => panic!("schema-v6 resources must retain their private body identity"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
 
         snapshot["tasks"][0]["output"]["resources"][0]
             .as_object_mut()

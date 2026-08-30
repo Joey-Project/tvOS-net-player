@@ -30,6 +30,16 @@ const INTERNAL_RESOURCE_DIR: &str = ".tvos-net-player/resources";
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TaskResourceRecord {
     pub(crate) resource: CacheResourceRef,
+    pub(crate) body_identity: Option<TaskResourceBodyIdentity>,
+    pub(crate) body_identity_migration_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskResourceBodyIdentity {
+    pub(crate) device_id: u64,
+    pub(crate) inode: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) mode: u32,
 }
 
 impl TaskResourceRecord {
@@ -50,7 +60,27 @@ impl TaskResourceRecord {
         if resource.etag.len() > 512 || HeaderValue::from_str(&resource.etag).is_err() {
             resource.etag.clear();
         }
-        Ok(Self { resource })
+        Ok(Self {
+            resource,
+            body_identity: None,
+            body_identity_migration_pending: false,
+        })
+    }
+
+    pub(crate) fn restored(
+        resource: CacheResourceRef,
+        body_identity: Option<TaskResourceBodyIdentity>,
+        body_identity_migration_pending: bool,
+    ) -> Result<Self, TaskOutputValidationError> {
+        let mut record = Self::new(resource)?;
+        record.body_identity = body_identity;
+        record.body_identity_migration_pending = body_identity_migration_pending;
+        Ok(record)
+    }
+
+    pub(crate) fn bind_body_identity(&mut self, body_identity: TaskResourceBodyIdentity) {
+        self.body_identity = Some(body_identity);
+        self.body_identity_migration_pending = false;
     }
 
     pub(crate) fn relative_path(&self) -> String {

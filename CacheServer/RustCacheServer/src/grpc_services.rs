@@ -5613,36 +5613,27 @@ mod tests {
             ..Default::default()
         })
         .expect("resource record should be valid");
-        let resource_path = state.options.root_path.join(resource.relative_path());
-        std::fs::create_dir_all(
-            resource_path
-                .parent()
-                .expect("resource body should have a parent"),
-        )
-        .expect("resource directory should be created");
-        std::fs::write(&resource_path, vec![0_u8; 42]).expect("resource body should be written");
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![
-                    task_result("result-1", TaskState::Completed),
-                    TaskResult {
-                        id: "result-2".to_owned(),
-                        state: TaskState::Completed.into(),
-                        artifacts: vec![TaskArtifact {
-                            id: "cover".to_owned(),
-                            kind: TaskArtifactKind::CoverImage.into(),
-                            state: TaskArtifactState::Available.into(),
-                            resource: Some(resource.resource.clone()),
-                            ..Default::default()
-                        }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![
+                task_result("result-1", TaskState::Completed),
+                TaskResult {
+                    id: "result-2".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
                         ..Default::default()
-                    },
-                ],
-                vec![resource],
-            )
-            .expect("task output should be replaced");
+                    }],
+                    ..Default::default()
+                },
+            ],
+            resource,
+            &[0_u8; 42],
+        );
         let mut snapshot = state
             .tasks
             .retain_task_output_snapshot(&task.id, StdInstant::now() + Duration::from_secs(60 * 60))
@@ -5983,32 +5974,24 @@ mod tests {
         })
         .expect("resource record should be valid");
         let resource_path = root_path.join(resource.relative_path());
-        fs::create_dir_all(
-            resource_path
-                .parent()
-                .expect("resource body should have a parent"),
-        )
-        .expect("resource directory should be created");
-        fs::write(&resource_path, b"cover").expect("resource body should be written");
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "read-expired-result".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "cover".to_owned(),
-                        kind: TaskArtifactKind::CoverImage.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![TaskResult {
+                id: "read-expired-result".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "cover".to_owned(),
+                    kind: TaskArtifactKind::CoverImage.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .expect("task output should persist");
+                ..Default::default()
+            }],
+            resource,
+            b"cover",
+        );
         fs::remove_file(&resource_path).expect("resource body should become unavailable");
         state
             .tasks
@@ -6221,33 +6204,24 @@ mod tests {
             ..Default::default()
         })
         .expect("resource record should be valid");
-        let resource_path = state.options.root_path.join(resource.relative_path());
-        std::fs::create_dir_all(
-            resource_path
-                .parent()
-                .expect("resource body should have a parent"),
-        )
-        .expect("resource directory should be created");
-        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "cancelled-retention-result".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "cover".to_owned(),
-                        kind: TaskArtifactKind::CoverImage.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![TaskResult {
+                id: "cancelled-retention-result".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "cover".to_owned(),
+                    kind: TaskArtifactKind::CoverImage.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .expect("task output should be replaced");
+                ..Default::default()
+            }],
+            resource,
+            b"cover",
+        );
         let service = TaskGrpcService::new(state.clone());
         let permits = Arc::clone(&service.result_page_blocking_permits);
         let task_id = task.id.clone();
@@ -6353,33 +6327,24 @@ mod tests {
             ..Default::default()
         })
         .expect("resource record should be valid");
-        let resource_path = state.options.root_path.join(resource.relative_path());
-        std::fs::create_dir_all(
-            resource_path
-                .parent()
-                .expect("resource body should have a parent"),
-        )
-        .expect("resource directory should be created");
-        std::fs::write(&resource_path, b"cover").expect("resource body should be written");
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "cancelled-after-insertion-result".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "cover".to_owned(),
-                        kind: TaskArtifactKind::CoverImage.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![TaskResult {
+                id: "cancelled-after-insertion-result".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "cover".to_owned(),
+                    kind: TaskArtifactKind::CoverImage.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .expect("task output should be replaced");
+                ..Default::default()
+            }],
+            resource,
+            b"cover",
+        );
         let service = TaskGrpcService::new(state.clone());
         let permits = Arc::clone(&service.result_page_blocking_permits);
         let task_id = task.id.clone();
@@ -6930,25 +6895,24 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "cover-artifact".to_owned(),
-                        kind: TaskArtifactKind::CoverImage.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(resource.resource.clone()),
-                        ..Default::default()
-                    }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![TaskResult {
+                id: "result-one".to_owned(),
+                state: TaskState::Completed.into(),
+                artifacts: vec![TaskArtifact {
+                    id: "cover-artifact".to_owned(),
+                    kind: TaskArtifactKind::CoverImage.into(),
+                    state: TaskArtifactState::Available.into(),
+                    resource: Some(resource.resource.clone()),
                     ..Default::default()
                 }],
-                vec![resource],
-            )
-            .unwrap();
+                ..Default::default()
+            }],
+            resource,
+            &[0_u8; 42],
+        );
 
         let page = TaskGrpcService::new(state)
             .list_task_results(Request::new(ListTaskResultsRequest {
@@ -6993,28 +6957,27 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        state
-            .tasks
-            .replace_task_output(
-                &task.id,
-                vec![
-                    task_result("result-1", TaskState::Completed),
-                    TaskResult {
-                        id: "result-2".to_owned(),
-                        state: TaskState::Completed.into(),
-                        artifacts: vec![TaskArtifact {
-                            id: "cover".to_owned(),
-                            kind: TaskArtifactKind::CoverImage.into(),
-                            state: TaskArtifactState::Available.into(),
-                            resource: Some(resource.resource.clone()),
-                            ..Default::default()
-                        }],
+        commit_task_output_with_resource(
+            &state,
+            &task.id,
+            vec![
+                task_result("result-1", TaskState::Completed),
+                TaskResult {
+                    id: "result-2".to_owned(),
+                    state: TaskState::Completed.into(),
+                    artifacts: vec![TaskArtifact {
+                        id: "cover".to_owned(),
+                        kind: TaskArtifactKind::CoverImage.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
                         ..Default::default()
-                    },
-                ],
-                vec![resource],
-            )
-            .unwrap();
+                    }],
+                    ..Default::default()
+                },
+            ],
+            resource,
+            b"cover",
+        );
         let first = TaskGrpcService::new(state.clone())
             .list_task_results(Request::new(ListTaskResultsRequest {
                 task_id: task.id.clone(),
@@ -7052,6 +7015,26 @@ mod tests {
             .expect("old snapshot resource should remain projected");
         assert_eq!("snapshot-cover", returned_resource.id);
         assert!(state.tasks.task_resource("snapshot-cover").is_some());
+    }
+
+    fn commit_task_output_with_resource(
+        state: &AppState,
+        task_id: &str,
+        results: Vec<TaskResult>,
+        resource: crate::task_output::TaskResourceRecord,
+        body: &[u8],
+    ) {
+        let resource_id = resource.resource.id.clone();
+        let staged = state
+            .tasks
+            .stage_task_output_replacement(task_id, vec![resource])
+            .expect("task resource output should stage");
+        staged
+            .write_resource_body(&resource_id, body)
+            .expect("task resource body should be created through the stage");
+        staged
+            .commit(results)
+            .expect("task resource output should commit");
     }
 
     fn initialized_cache_root(temp: &tempfile::TempDir) -> PathBuf {

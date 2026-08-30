@@ -1,12 +1,12 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CString, OsStr},
     fs::{self, File},
     io,
     path::{Component, Components, Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, Weak,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdRwLockReadGuard, Weak,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -29,19 +29,97 @@ pub const VARIANT_ID: &str = "original";
 const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
 const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 
+pub(crate) struct LibraryPublicationGate {
+    state: StdRwLock<LibraryPublicationGateState>,
+}
+
+enum LibraryPublicationGateState {
+    Unknown { blocked_prefix: PathBuf },
+    Known { blocked_paths: HashSet<PathBuf> },
+}
+
+impl LibraryPublicationGate {
+    fn known_empty() -> Self {
+        Self {
+            state: StdRwLock::new(LibraryPublicationGateState::Known {
+                blocked_paths: HashSet::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn unknown_for_output_directory(
+        cache_root: &Path,
+        output_directory: &Path,
+    ) -> io::Result<Self> {
+        let relative_path = output_directory.strip_prefix(cache_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Bilibili output directory is outside the cache root",
+            )
+        })?;
+        let blocked_prefix = normalized_publication_gate_path(relative_path)?;
+        Ok(Self {
+            state: StdRwLock::new(LibraryPublicationGateState::Unknown { blocked_prefix }),
+        })
+    }
+
+    pub(crate) fn install_durable_blocked_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> io::Result<()> {
+        let blocked_paths = paths
+            .into_iter()
+            .map(|path| normalized_publication_gate_path(Path::new(path)))
+            .collect::<io::Result<HashSet<_>>>()?;
+        *self
+            .state
+            .write()
+            .expect("library publication gate lock poisoned") =
+            LibraryPublicationGateState::Known { blocked_paths };
+        Ok(())
+    }
+
+    fn read(&self) -> StdRwLockReadGuard<'_, LibraryPublicationGateState> {
+        self.state
+            .read()
+            .expect("library publication gate lock poisoned")
+    }
+}
+
+impl LibraryPublicationGateState {
+    fn blocks(&self, relative_path: &Path) -> bool {
+        match self {
+            Self::Unknown { blocked_prefix } => relative_path.starts_with(blocked_prefix),
+            Self::Known { blocked_paths } => relative_path
+                .ancestors()
+                .filter(|path| !path.as_os_str().is_empty())
+                .any(|ancestor| blocked_paths.contains(ancestor)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalMediaLibrary {
     options: Arc<CacheServerOptions>,
     blocking_jobs: Arc<Semaphore>,
     item_mutation_locks: Arc<StdMutex<HashMap<String, Weak<RwLock<()>>>>>,
+    publication_gate: Arc<LibraryPublicationGate>,
 }
 
 impl LocalMediaLibrary {
     pub fn new(options: Arc<CacheServerOptions>) -> Self {
+        Self::new_with_publication_gate(options, Arc::new(LibraryPublicationGate::known_empty()))
+    }
+
+    pub(crate) fn new_with_publication_gate(
+        options: Arc<CacheServerOptions>,
+        publication_gate: Arc<LibraryPublicationGate>,
+    ) -> Self {
         Self {
             options,
             blocking_jobs: Arc::new(Semaphore::new(MAX_BLOCKING_LIBRARY_JOBS)),
             item_mutation_locks: Arc::new(StdMutex::new(HashMap::new())),
+            publication_gate,
         }
     }
 
@@ -217,7 +295,13 @@ impl LocalMediaLibrary {
         }
 
         let root_path = self.root_path();
-        let candidates = match self.enumerate_media_candidates(&root_path, filter, &cancellation) {
+        let publication_gate = self.publication_gate.read();
+        let candidates = match self.enumerate_media_candidates(
+            &root_path,
+            filter,
+            &cancellation,
+            &publication_gate,
+        ) {
             Ok(candidates) => candidates,
             Err(_) => return LibraryItemPage::empty(),
         };
@@ -254,7 +338,8 @@ impl LocalMediaLibrary {
     }
 
     fn get_item_blocking(&self, id: &str) -> Option<LibraryItem> {
-        let media_file = self.resolve_media_file(id, VARIANT_ID)?;
+        let publication_gate = self.publication_gate.read();
+        let media_file = self.resolve_media_file(id, VARIANT_ID, &publication_gate)?;
         Some(self.create_library_item(&media_file))
     }
 
@@ -265,11 +350,13 @@ impl LocalMediaLibrary {
     }
 
     fn get_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
-        self.resolve_media_file(item_id, variant_id)
+        let publication_gate = self.publication_gate.read();
+        self.resolve_media_file(item_id, variant_id, &publication_gate)
     }
 
     fn open_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<OpenedMediaFile> {
-        let media_file = self.resolve_media_file(item_id, variant_id)?;
+        let publication_gate = self.publication_gate.read();
+        let media_file = self.resolve_media_file(item_id, variant_id, &publication_gate)?;
         let file = open_read_no_follow(&self.root_path(), &media_file.relative_path).ok()?;
         let metadata = file.metadata().ok()?;
         if !metadata.file_type().is_file() {
@@ -306,7 +393,8 @@ impl LocalMediaLibrary {
     }
 
     fn delete_item_blocking(&self, id: &str) -> io::Result<bool> {
-        let Some(media_file) = self.resolve_deletable_media_file(id)? else {
+        let publication_gate = self.publication_gate.read();
+        let Some(media_file) = self.resolve_deletable_media_file(id, &publication_gate)? else {
             return Ok(false);
         };
 
@@ -326,7 +414,9 @@ impl LocalMediaLibrary {
         }
 
         let root_path = self.root_path();
-        let Ok(candidates) = self.enumerate_media_candidates(&root_path, None, &cancellation)
+        let publication_gate = self.publication_gate.read();
+        let Ok(candidates) =
+            self.enumerate_media_candidates(&root_path, None, &cancellation, &publication_gate)
         else {
             return 0;
         };
@@ -387,22 +477,37 @@ impl LocalMediaLibrary {
         item
     }
 
-    fn resolve_media_file(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
+    fn resolve_media_file(
+        &self,
+        item_id: &str,
+        variant_id: &str,
+        publication_gate: &LibraryPublicationGateState,
+    ) -> Option<MediaFile> {
         if variant_id != VARIANT_ID {
             return None;
         }
 
         let relative_path = decode_item_id(item_id)?;
+        if publication_gate.blocks(&relative_path) {
+            return None;
+        }
         self.try_create_media_file(&self.root_path(), &self.root_path().join(relative_path))
     }
 
-    fn resolve_deletable_media_file(&self, item_id: &str) -> io::Result<Option<MediaFile>> {
+    fn resolve_deletable_media_file(
+        &self,
+        item_id: &str,
+        publication_gate: &LibraryPublicationGateState,
+    ) -> io::Result<Option<MediaFile>> {
         let root_path = self.root_path();
         ensure_deletable_root(&root_path)?;
 
         let Some(decoded_relative_path) = decode_item_id(item_id) else {
             return Ok(None);
         };
+        if publication_gate.blocks(&decoded_relative_path) {
+            return Ok(None);
+        }
         let full_candidate_path = absolute_path(&root_path.join(decoded_relative_path));
         if !is_within_root(&root_path, &full_candidate_path) {
             return Ok(None);
@@ -470,6 +575,7 @@ impl LocalMediaLibrary {
         &self,
         item_id: &str,
     ) -> io::Result<Option<(String, String)>> {
+        let publication_gate = self.publication_gate.read();
         let root_path = self.root_path();
         ensure_deletable_root(&root_path)?;
         let Some(relative_path) = decode_item_id(item_id) else {
@@ -477,6 +583,9 @@ impl LocalMediaLibrary {
         };
         let relative_path = relative_path.components().collect::<PathBuf>();
         if relative_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        if publication_gate.blocks(&relative_path) {
             return Ok(None);
         }
         let full_candidate_path = absolute_path(&root_path.join(&relative_path));
@@ -569,6 +678,7 @@ impl LocalMediaLibrary {
         root_path: &Path,
         filter: Option<&LibraryFilter>,
         cancellation: &BlockingCancellation,
+        publication_gate: &LibraryPublicationGateState,
     ) -> io::Result<Vec<MediaCandidate>> {
         if let Some(filter) = filter {
             let requested_sources = filter.sources.to_vec();
@@ -590,6 +700,7 @@ impl LocalMediaLibrary {
             &allowed_extensions,
             &search_text,
             cancellation,
+            publication_gate,
             &mut candidates,
         )?;
         candidates.sort();
@@ -736,6 +847,7 @@ fn collect_media_candidates(
     allowed_extensions: &[String],
     search_text: &Option<String>,
     cancellation: &BlockingCancellation,
+    publication_gate: &LibraryPublicationGateState,
     candidates: &mut Vec<MediaCandidate>,
 ) -> io::Result<()> {
     if cancellation.is_cancelled() {
@@ -768,6 +880,12 @@ fn collect_media_candidates(
             continue;
         };
         let path = entry.path();
+        let Ok(entry_relative_path) = path.strip_prefix(root_path) else {
+            continue;
+        };
+        if publication_gate.blocks(entry_relative_path) {
+            continue;
+        }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -786,6 +904,7 @@ fn collect_media_candidates(
                 allowed_extensions,
                 search_text,
                 cancellation,
+                publication_gate,
                 candidates,
             )?;
             continue;
@@ -866,6 +985,26 @@ pub fn decode_item_id(item_id: &str) -> Option<PathBuf> {
     }
 
     Some(path)
+}
+
+fn normalized_publication_gate_path(path: &Path) -> io::Result<PathBuf> {
+    let components = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value.to_os_string()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library publication gate path is not a normal relative path",
+            )),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "library publication gate path cannot be empty",
+        ));
+    }
+    Ok(components.into_iter().collect())
 }
 
 fn relative_path(root_path: &Path, path: &Path) -> Option<String> {
@@ -1384,8 +1523,17 @@ pub(crate) fn rename_directory_no_replace_no_follow(
     root_path: &Path,
     source_relative_path: &str,
     destination_relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
 ) -> io::Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    if max_entries == 0 || max_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory publication bounds must be positive",
+        ));
+    }
 
     let (source_parent, source_leaf) =
         open_relative_parent_no_follow(root_path, source_relative_path)?;
@@ -1397,6 +1545,8 @@ pub(crate) fn rename_directory_no_replace_no_follow(
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
     )?;
     let source_metadata = source_directory.metadata()?;
+    let mut remaining_entries = max_entries;
+    sync_open_directory_tree_no_follow(&source_directory, &mut remaining_entries, max_depth)?;
 
     rename_at_no_replace(
         source_parent.as_raw_fd(),
@@ -1431,11 +1581,83 @@ pub(crate) fn rename_directory_no_replace_no_follow(
     _root_path: &Path,
     _source_relative_path: &str,
     _destination_relative_path: &str,
+    _max_entries: usize,
+    _max_depth: usize,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-replace directory rename is not implemented on this platform",
     ))
+}
+
+#[cfg(unix)]
+fn sync_open_directory_tree_no_follow(
+    directory: &File,
+    remaining_entries: &mut usize,
+    remaining_depth: usize,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if remaining_depth == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed directory depth limit exceeded",
+        ));
+    }
+    let dot = CString::new(".").expect("dot contains no NUL");
+    let listing = open_at(
+        directory.as_raw_fd(),
+        &dot,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let names = list_open_directory_names_bounded(listing, *remaining_entries)?;
+    for name in names {
+        *remaining_entries = remaining_entries.checked_sub(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory entry limit exceeded",
+            )
+        })?;
+        let name = CString::new(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed entry name contains NUL",
+            )
+        })?;
+        match open_at(
+            directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC,
+        ) {
+            Ok(child) => {
+                sync_open_directory_tree_no_follow(&child, remaining_entries, remaining_depth - 1)?
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                let file = open_at(
+                    directory.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed directory contains an unsupported entry type",
+                    ));
+                }
+                file.sync_all()?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // BBDown has relinquished this task-owned tree before publication. Syncing every regular
+    // file and directory protects the durability of those closed output bytes; it does not claim
+    // content stability against an out-of-process writer that violates exclusive ownership.
+    directory.sync_all()
 }
 
 #[cfg(all(unix, target_vendor = "apple"))]
@@ -2103,6 +2325,108 @@ mod tests {
     }
 
     #[test]
+    fn owned_output_gate_blocks_library_reads_until_durable_release() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let media_path = root_path.join("Bilibili/task-1/video.mp4");
+        fs::create_dir_all(media_path.parent().unwrap())
+            .expect("media directory should be created");
+        fs::write(&media_path, b"video").expect("media should be written");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_path = root_path.join("Bilibili/task-1/video.mp4");
+        let gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &root_path,
+                &root_path.join("Bilibili"),
+            )
+            .expect("output directory should be valid"),
+        );
+        let library = LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(CacheServerOptions {
+                root_path,
+                allow_library_item_delete: true,
+                ..CacheServerOptions::default()
+            }),
+            Arc::clone(&gate),
+        );
+        let item_id = library
+            .item_id_for_media_path_blocking(&media_path)
+            .expect("internal publication probing should bypass the read gate");
+
+        let assert_hidden = || {
+            assert!(
+                library
+                    .list_items_page_blocking(None, 0, 50, BlockingCancellation::default())
+                    .items
+                    .is_empty()
+            );
+            assert_eq!(
+                0,
+                library.count_items_blocking(BlockingCancellation::default())
+            );
+            assert!(library.get_item_blocking(&item_id).is_none());
+            assert!(
+                library
+                    .get_media_file_blocking(&item_id, VARIANT_ID)
+                    .is_none()
+            );
+            assert!(
+                library
+                    .open_media_file_blocking(&item_id, VARIANT_ID)
+                    .is_none()
+            );
+            assert!(!library.delete_item_blocking(&item_id).unwrap());
+            assert!(media_path.exists());
+        };
+        assert_hidden();
+
+        gate.install_durable_blocked_paths(["Bilibili/task-1"])
+            .expect("durable task ownership should install");
+        assert_hidden();
+
+        gate.install_durable_blocked_paths(std::iter::empty())
+            .expect("durable terminal publication should release the gate");
+        assert_eq!(
+            1,
+            library.count_items_blocking(BlockingCancellation::default())
+        );
+        assert!(library.get_item_blocking(&item_id).is_some());
+        assert!(
+            library
+                .get_media_file_blocking(&item_id, VARIANT_ID)
+                .is_some()
+        );
+        assert!(
+            library
+                .open_media_file_blocking(&item_id, VARIANT_ID)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn owned_output_gate_update_waits_for_an_in_flight_reader() {
+        let gate = Arc::new(LibraryPublicationGate::known_empty());
+        let read_guard = gate.read();
+        let updating_gate = Arc::clone(&gate);
+        let update = std::thread::spawn(move || {
+            updating_gate
+                .install_durable_blocked_paths(["Bilibili/task-1"])
+                .expect("gate update should succeed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !update.is_finished(),
+            "a gate update must wait for the complete library read operation"
+        );
+        drop(read_guard);
+        update.join().expect("gate update should finish");
+        assert!(gate.read().blocks(Path::new("Bilibili/task-1/video.mp4")));
+    }
+
+    #[test]
     fn delete_item_errors_when_cache_root_disappears() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("cache");
@@ -2313,6 +2637,8 @@ mod tests {
             &root_path,
             ".tvos-net-player/bbdown-staging/task-1",
             "Bilibili/task-1",
+            16,
+            8,
         )
         .unwrap();
 
@@ -2333,6 +2659,49 @@ mod tests {
                 .unwrap_err()
                 .kind()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_output_directory_publication_rejects_symlinks_and_entry_overflow() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let staging = root_path.join(".tvos-net-player/bbdown-staging/task-1");
+        let outside = temp.path().join("outside.mp4");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(root_path.join("Bilibili")).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, staging.join("video.mp4")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+
+        rename_directory_no_replace_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            "Bilibili/task-1",
+            16,
+            8,
+        )
+        .expect_err("a symlink cannot be synchronized for publication");
+        assert!(staging.exists());
+        assert!(!root_path.join("Bilibili/task-1").exists());
+        assert_eq!(b"outside", fs::read(&outside).unwrap().as_slice());
+
+        fs::remove_file(staging.join("video.mp4")).unwrap();
+        fs::write(staging.join("video.mp4"), b"video").unwrap();
+        fs::write(staging.join("audio.m4a"), b"audio").unwrap();
+        let error = rename_directory_no_replace_no_follow(
+            &root_path,
+            ".tvos-net-player/bbdown-staging/task-1",
+            "Bilibili/task-1",
+            1,
+            8,
+        )
+        .expect_err("publication must enforce the entry bound before rename");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(staging.exists());
+        assert!(!root_path.join("Bilibili/task-1").exists());
     }
 
     #[cfg(unix)]
@@ -2445,12 +2814,16 @@ mod tests {
         drop(guard);
 
         let mut candidates = Vec::new();
+        let publication_gate = LibraryPublicationGateState::Known {
+            blocked_paths: HashSet::new(),
+        };
         let result = collect_media_candidates(
             Path::new("."),
             Path::new("."),
             &[".mp4".to_owned()],
             &None,
             &cancellation,
+            &publication_gate,
             &mut candidates,
         );
 

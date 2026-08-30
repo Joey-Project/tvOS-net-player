@@ -58,7 +58,6 @@ pub struct BilibiliDownloadOutputV2 {
     pub(crate) resources: Vec<TaskResourceRecord>,
     pub resource_bodies: Vec<BilibiliTaskResourceBody>,
     pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
-    pub(crate) unpublished_output_paths: Vec<PathBuf>,
     pub(crate) transient_output_paths: Vec<PathBuf>,
     pub(crate) owned_directory_cleanup_paths: Vec<PathBuf>,
 }
@@ -235,11 +234,6 @@ async fn run_one_bilibili_task(
                     .is_some_and(|output| output.terminal_state == TaskState::Cancelled)
         )
     {
-        if let Ok(output) = &result
-            && let Some(output_v2) = output.v2.as_ref()
-        {
-            cleanup_unpublished_output_paths(&output_v2.unpublished_output_paths).await;
-        }
         let message = match result {
             Err(BilibiliDownloadError::Cancelled(_)) if is_v2 => "Cancelled by request.".to_owned(),
             Err(BilibiliDownloadError::Cancelled(message)) => {
@@ -415,7 +409,6 @@ async fn complete_v2_terminal_task(
             }
         }
         Err(error) => {
-            cleanup_unpublished_output_paths(&output.unpublished_output_paths).await;
             if error.code() == tonic::Code::Cancelled {
                 complete_terminal_task(registry, move |registry| {
                     registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
@@ -436,25 +429,6 @@ async fn complete_v2_terminal_task(
         }
     }
     retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id);
-}
-
-pub(crate) async fn cleanup_unpublished_output_paths(paths: &[PathBuf]) {
-    let mut removed = HashSet::with_capacity(paths.len());
-    for path in paths {
-        if !removed.insert(path) {
-            continue;
-        }
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                eprintln!(
-                    "Failed to remove unpublished Bilibili output {}: {error}",
-                    path.display()
-                );
-            }
-        }
-    }
 }
 
 fn validate_library_item_publication_leases(
@@ -874,10 +848,15 @@ mod tests {
     async fn worker_rejects_v2_success_returned_after_cancellation() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
-        let unpublished_output_path = temp.path().join("late-success.mp4");
-        std::fs::write(&unpublished_output_path, b"late success")
-            .expect("unpublished output should be written");
-        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&state_path));
+        let resource_root = temp.path().join("library");
+        std::fs::create_dir(&resource_root).expect("resource root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(resource_root.clone()),
+            ),
+        );
         let task = registry
             .create_bilibili_download_task_v2(
                 "BV1worker-cancel-race-v2",
@@ -887,10 +866,12 @@ mod tests {
                 vec![test_candidate(1)],
             )
             .expect("v2 task should be created durably");
+        let owned_output_directory = resource_root.join("Bilibili").join(&task.id);
+        let unpublished_output_path = owned_output_directory.join("late-success.mp4");
         let worker = tokio::spawn(run_bilibili_task_worker(
             Arc::clone(&registry),
             Arc::new(LateSuccessAfterCancellationV2Adapter {
-                output_path: unpublished_output_path.clone(),
+                output_directory: owned_output_directory.clone(),
             }),
             1,
             true,
@@ -913,9 +894,10 @@ mod tests {
         );
         assert!(output.output.record.resources.is_empty());
         assert!(
-            !unpublished_output_path.exists(),
-            "a late v2 success rejected by cancellation must remove its output"
+            !owned_output_directory.exists(),
+            "a late v2 success rejected by cancellation must remove its owned output tree"
         );
+        assert!(!unpublished_output_path.exists());
     }
 
     #[tokio::test]
@@ -1480,7 +1462,7 @@ mod tests {
     }
 
     struct LateSuccessAfterCancellationV2Adapter {
-        output_path: PathBuf,
+        output_directory: PathBuf,
     }
 
     impl BilibiliDownloadAdapter for LateSuccessAfterCancellationV2Adapter {
@@ -1489,8 +1471,19 @@ mod tests {
             request: BilibiliDownloadRequest,
             context: BilibiliDownloadContext,
         ) -> BilibiliDownloadFuture<'a> {
-            let output_path = self.output_path.clone();
+            let output_directory = self.output_directory.clone();
             Box::pin(async move {
+                context
+                    .registry
+                    .register_bilibili_owned_output_directories(
+                        &request.task_id,
+                        std::slice::from_ref(&output_directory),
+                    )
+                    .expect("test output ownership should become durable");
+                std::fs::create_dir_all(&output_directory)
+                    .expect("owned output directory should be created");
+                std::fs::write(output_directory.join("late-success.mp4"), b"late success")
+                    .expect("owned output should be written");
                 context
                     .registry
                     .cancel_task(&request.task_id)
@@ -1517,7 +1510,6 @@ mod tests {
                         resources: Vec::new(),
                         resource_bodies: Vec::new(),
                         library_item_leases: Vec::new(),
-                        unpublished_output_paths: vec![output_path],
                         transient_output_paths: Vec::new(),
                         owned_directory_cleanup_paths: Vec::new(),
                     }),
@@ -1580,7 +1572,6 @@ mod tests {
                             source: BilibiliTaskResourceBodySource::Bytes(body),
                         }],
                         library_item_leases: Vec::new(),
-                        unpublished_output_paths: vec![transient_output_path.clone()],
                         transient_output_paths: vec![transient_output_path],
                         owned_directory_cleanup_paths: Vec::new(),
                     }),

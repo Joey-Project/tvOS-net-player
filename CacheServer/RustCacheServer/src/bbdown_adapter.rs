@@ -40,7 +40,6 @@ use crate::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadOutputV2,
         BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
-        cleanup_unpublished_output_paths,
     },
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
@@ -650,7 +649,6 @@ impl BbdownBilibiliAdapter {
             {
                 Ok(()) => {}
                 Err(BilibiliDownloadError::Cancelled(_)) => {
-                    cleanup_unpublished_download_report(&report).await;
                     cancelled = true;
                     self.cleanup_failed_v2_candidate_output(
                         &output_directories,
@@ -666,7 +664,6 @@ impl BbdownBilibiliAdapter {
                     continue;
                 }
                 Err(error) => {
-                    cleanup_unpublished_download_report(&report).await;
                     self.cleanup_failed_v2_candidate_output(
                         &output_directories,
                         &candidate_output,
@@ -779,10 +776,42 @@ impl BbdownBilibiliAdapter {
                             &mut retained_backing,
                         ),
                         Err(BilibiliDownloadError::Cancelled(_)) => {
+                            let candidate_output = v2_published_candidate_output_directory(
+                                &output_directories,
+                                offset,
+                            )?;
+                            let mut cleanup_error = None;
+                            self.cleanup_failed_v2_candidate_output(
+                                &output_directories,
+                                &candidate_output,
+                                &request.task_id,
+                                &result_id,
+                                &mut cleanup_error,
+                            )
+                            .await;
+                            if let Some(error) = cleanup_error {
+                                return Err(error);
+                            }
                             cancelled = true;
                             results.push(cancelled_download_result(result_id, candidate));
                         }
                         Err(error) => {
+                            let candidate_output = v2_published_candidate_output_directory(
+                                &output_directories,
+                                offset,
+                            )?;
+                            let mut cleanup_error = None;
+                            self.cleanup_failed_v2_candidate_output(
+                                &output_directories,
+                                &candidate_output,
+                                &request.task_id,
+                                &result_id,
+                                &mut cleanup_error,
+                            )
+                            .await;
+                            if let Some(cleanup_error) = cleanup_error {
+                                return Err(cleanup_error);
+                            }
                             log_v2_candidate_error(
                                 &request.task_id,
                                 &result_id,
@@ -835,7 +864,6 @@ impl BbdownBilibiliAdapter {
                 resources: retained_backing.resources,
                 resource_bodies: retained_backing.resource_bodies,
                 library_item_leases: retained_backing.library_item_leases,
-                unpublished_output_paths: retained_backing.unpublished_output_paths,
                 transient_output_paths: retained_backing.transient_output_paths,
                 owned_directory_cleanup_paths,
             }),
@@ -976,6 +1004,8 @@ impl BbdownBilibiliAdapter {
                 &cache_root,
                 &staging_relative_path,
                 &published_relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
             )
         })
         .await
@@ -1070,22 +1100,13 @@ impl BbdownBilibiliAdapter {
         cancel_requested: bool,
     ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
         if cancel_requested {
-            cleanup_unpublished_download_report(&report).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled after BBDown finished downloading.".to_owned(),
             ));
         }
 
-        match self
-            .map_v2_download_result(result_id, candidate, plan, &report, download_mode)
+        self.map_v2_download_result(result_id, candidate, plan, &report, download_mode)
             .await
-        {
-            Ok(mapped) => Ok(mapped),
-            Err(error) => {
-                cleanup_unpublished_download_report(&report).await;
-                Err(error)
-            }
-        }
     }
 
     async fn map_v2_download_result(
@@ -1215,11 +1236,9 @@ impl BbdownBilibiliAdapter {
         resources.push(metadata.resource);
         resource_bodies.push(metadata.body);
 
-        let unpublished_output_paths = download_report_output_paths(report);
-        let transient_output_paths = transient_download_output_paths(
-            &unpublished_output_paths,
-            library_output_path.as_deref(),
-        );
+        let output_paths = download_report_output_paths(report);
+        let transient_output_paths =
+            transient_download_output_paths(&output_paths, library_output_path.as_deref());
         Ok(MappedV2DownloadResult {
             library_item_id: library_item_id.clone(),
             result: successful_download_result(
@@ -1232,7 +1251,6 @@ impl BbdownBilibiliAdapter {
             resources,
             resource_bodies,
             library_item_lease,
-            unpublished_output_paths,
             transient_output_paths,
         })
     }
@@ -3907,18 +3925,35 @@ fn v2_candidate_output_directory(
     directories: &V2TaskOutputDirectories,
     offset: usize,
 ) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
-    let candidate_number = offset.checked_add(1).ok_or_else(|| {
-        BilibiliDownloadError::Failed(
-            "Bilibili candidate output directory index overflowed.".to_owned(),
-        )
-    })?;
-    let directory_name = format!("candidate-{candidate_number:05}");
+    let directory_name = v2_candidate_output_directory_name(offset)?;
     let path = directories.staging_path.join(directory_name);
     let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
     Ok(V2CandidateOutputDirectory {
         path,
         relative_path,
     })
+}
+
+fn v2_published_candidate_output_directory(
+    directories: &V2TaskOutputDirectories,
+    offset: usize,
+) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+    let directory_name = v2_candidate_output_directory_name(offset)?;
+    let path = directories.published_path.join(directory_name);
+    let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
+    Ok(V2CandidateOutputDirectory {
+        path,
+        relative_path,
+    })
+}
+
+fn v2_candidate_output_directory_name(offset: usize) -> Result<String, BilibiliDownloadError> {
+    let candidate_number = offset.checked_add(1).ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Bilibili candidate output directory index overflowed.".to_owned(),
+        )
+    })?;
+    Ok(format!("candidate-{candidate_number:05}"))
 }
 
 enum V2CandidateDownloadOutcome {
@@ -4013,7 +4048,6 @@ struct MappedV2DownloadResult {
     resources: Vec<TaskResourceRecord>,
     resource_bodies: Vec<BilibiliTaskResourceBody>,
     library_item_lease: Option<LibraryItemPublicationLease>,
-    unpublished_output_paths: Vec<PathBuf>,
     transient_output_paths: Vec<PathBuf>,
 }
 
@@ -4022,7 +4056,6 @@ struct RetainedV2DownloadBacking {
     resources: Vec<TaskResourceRecord>,
     resource_bodies: Vec<BilibiliTaskResourceBody>,
     library_item_leases: Vec<LibraryItemPublicationLease>,
-    unpublished_output_paths: Vec<PathBuf>,
     transient_output_paths: Vec<PathBuf>,
 }
 
@@ -4050,9 +4083,6 @@ fn retain_v2_success(
     retained_backing
         .library_item_leases
         .extend(mapped.library_item_lease);
-    retained_backing
-        .unpublished_output_paths
-        .extend(mapped.unpublished_output_paths);
     retained_backing
         .transient_output_paths
         .extend(mapped.transient_output_paths);
@@ -4140,7 +4170,9 @@ fn playable_entry_output_candidates(entry: &EntryDownloadReport) -> Vec<PathBuf>
             .filter(|file| {
                 matches!(
                     &file.kind,
-                    DownloadFileKind::Video | DownloadFileKind::FlvSegment
+                    DownloadFileKind::Video
+                        | DownloadFileKind::Audio
+                        | DownloadFileKind::FlvSegment
                 )
             })
             .map(|file| file.path.clone()),
@@ -4175,10 +4207,6 @@ fn transient_download_output_paths(
         .filter(|path| Some(path.as_path()) != library_output_path)
         .cloned()
         .collect()
-}
-
-async fn cleanup_unpublished_download_report(report: &DownloadReport) {
-    cleanup_unpublished_output_paths(&download_report_output_paths(report)).await;
 }
 
 fn successful_download_result(
@@ -4341,7 +4369,15 @@ fn library_media_artifact(entry: &EntryDownloadReport, library_item_id: &str) ->
     let format = entry
         .mux
         .as_ref()
-        .and_then(|mux| mux.output_path.extension())
+        .map(|mux| &mux.output_path)
+        .or_else(|| {
+            entry
+                .files
+                .iter()
+                .find(|file| file.kind.is_media())
+                .map(|file| &file.path)
+        })
+        .and_then(|path| path.extension())
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
         .unwrap_or_else(|| "media".to_owned());
@@ -5959,7 +5995,6 @@ mod tests {
                     resources: Vec::new(),
                     resource_bodies: Vec::new(),
                     library_item_lease: None,
-                    unpublished_output_paths: Vec::new(),
                     transient_output_paths: Vec::new(),
                 },
                 &mut primary_library_item_id,
@@ -6029,7 +6064,6 @@ mod tests {
             .expect("sidecar-only result should map without media or network access");
 
         assert!(mapped.library_item_id.is_empty());
-        assert_eq!(vec![sidecar_path.clone()], mapped.unpublished_output_paths);
         assert_eq!(vec![sidecar_path.clone()], mapped.transient_output_paths);
         assert_eq!(mapped.result.state(), TaskState::Succeeded);
         assert_eq!(mapped.result.artifacts.len(), 3);
@@ -6104,6 +6138,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_audio_only_maps_m4a_as_a_playable_library_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let library_root = temp.path().join("library");
+        std_fs::create_dir(&library_root).expect("library root should be created");
+        let library_root = library_root
+            .canonicalize()
+            .expect("library root should be canonical");
+        let entry_directory = library_root.join("Bilibili/task-1/candidate-00001/entry");
+        let audio_path = entry_directory.join("audio-ja-JP.m4a");
+        std_fs::create_dir_all(&entry_directory).expect("audio directory should be created");
+        std_fs::write(&audio_path, b"audio").expect("audio output should be written");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: library_root,
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: entry_directory.parent().unwrap().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Audio,
+                    path: audio_path,
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::AudioOnly,
+            )
+            .await
+            .expect("audio-only output should map into the local library");
+
+        assert!(!mapped.library_item_id.is_empty());
+        assert!(mapped.transient_output_paths.is_empty());
+        let media = mapped
+            .result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind() == TaskArtifactKind::Media)
+            .expect("audio-only output should publish a media artifact");
+        assert_eq!("m4a", media.format);
+        assert_eq!(mapped.library_item_id, media.library_item_id);
+    }
+
+    #[tokio::test]
     async fn v2_sidecar_only_modes_require_the_requested_artifact() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let server_options = Arc::new(CacheServerOptions {
@@ -6162,7 +6263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_finalization_removes_outputs_after_cancellation_or_mapping_failure() {
+    async fn v2_finalization_never_unlinks_untrusted_report_paths() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let server_options = Arc::new(CacheServerOptions {
             root_path: temp.path().join("library"),
@@ -6218,8 +6319,8 @@ mod tests {
             cancelled,
             Err(BilibiliDownloadError::Cancelled(_))
         ));
-        assert!(!cancelled_media.exists());
-        assert!(!cancelled_sidecar.exists());
+        assert!(cancelled_media.exists());
+        assert!(cancelled_sidecar.exists());
 
         let failed_sidecar = temp.path().join("mapping-failed.srt");
         std_fs::write(&failed_sidecar, b"subtitle").expect("sidecar should be written");
@@ -6251,8 +6352,8 @@ mod tests {
             .await;
         assert!(matches!(failed, Err(BilibiliDownloadError::Failed(_))));
         assert!(
-            !failed_sidecar.exists(),
-            "mapping failures must remove unpublished BBDown files"
+            failed_sidecar.exists(),
+            "mapping failures must leave cleanup to the bounded task-owned directory"
         );
     }
 

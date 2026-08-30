@@ -70,7 +70,7 @@ use crate::{
         HlsPlaybackProgressSnapshot, HlsPlaybackProgressTracker, PlaybackProgressIntent,
         PlaybackProgressRecordOutcome, PlaybackProgressReport, session_id_from_report,
     },
-    library::LocalMediaLibrary,
+    library::{LibraryPublicationGate, LocalMediaLibrary},
     media::{
         MediaState, hls_master_playlist_get, hls_master_playlist_head, hls_segment_get,
         hls_segment_head, media_get, media_head, resource_get, resource_head,
@@ -354,13 +354,24 @@ impl AppState {
         let task_state_path = options.task_state_path();
         let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
-        let library = Arc::new(LocalMediaLibrary::new(Arc::clone(&options)));
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(
+                &options.root_path,
+                &options.bbdown_output_dir(),
+            )
+            .expect("validated Bilibili output directory must be inside the cache root"),
+        );
+        let library = Arc::new(LocalMediaLibrary::new_with_publication_gate(
+            Arc::clone(&options),
+            Arc::clone(&publication_gate),
+        ));
         let playback_uri_factory = Arc::new(PlaybackUriFactory::new(Arc::clone(&options)));
         let tasks = Arc::new(
-            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
                 task_state_path,
                 task_retention_policy,
                 Some(options.root_path.clone()),
+                Some(publication_gate),
             ),
         );
         let hls_sessions = HlsPlaybackRegistry::default();
