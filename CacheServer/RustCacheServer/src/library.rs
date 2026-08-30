@@ -6,7 +6,7 @@ use std::{
     io,
     path::{Component, Components, Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, RwLock as StdRwLock, RwLockReadGuard as StdRwLockReadGuard, Weak,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -30,7 +30,7 @@ const MAX_BLOCKING_LIBRARY_JOBS: usize = 4;
 const INTERNAL_CACHE_DIR: &str = ".tvos-net-player";
 
 pub(crate) struct LibraryPublicationGate {
-    state: StdRwLock<LibraryPublicationGateState>,
+    state: StdRwLock<Arc<LibraryPublicationGateState>>,
 }
 
 enum LibraryPublicationGateState {
@@ -41,9 +41,9 @@ enum LibraryPublicationGateState {
 impl LibraryPublicationGate {
     fn known_empty() -> Self {
         Self {
-            state: StdRwLock::new(LibraryPublicationGateState::Known {
+            state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Known {
                 blocked_paths: HashSet::new(),
-            }),
+            })),
         }
     }
 
@@ -63,7 +63,9 @@ impl LibraryPublicationGate {
             normalized_publication_gate_path(relative_path)?
         };
         Ok(Self {
-            state: StdRwLock::new(LibraryPublicationGateState::Unknown { blocked_prefix }),
+            state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Unknown {
+                blocked_prefix,
+            })),
         })
     }
 
@@ -79,14 +81,15 @@ impl LibraryPublicationGate {
             .state
             .write()
             .expect("library publication gate lock poisoned") =
-            LibraryPublicationGateState::Known { blocked_paths };
+            Arc::new(LibraryPublicationGateState::Known { blocked_paths });
         Ok(())
     }
 
-    fn read(&self) -> StdRwLockReadGuard<'_, LibraryPublicationGateState> {
+    fn snapshot(&self) -> Arc<LibraryPublicationGateState> {
         self.state
             .read()
             .expect("library publication gate lock poisoned")
+            .clone()
     }
 }
 
@@ -299,7 +302,7 @@ impl LocalMediaLibrary {
         }
 
         let root_path = self.root_path();
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let candidates = match self.enumerate_media_candidates(
             &root_path,
             filter,
@@ -342,7 +345,7 @@ impl LocalMediaLibrary {
     }
 
     fn get_item_blocking(&self, id: &str) -> Option<LibraryItem> {
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let media_file = self.resolve_media_file(id, VARIANT_ID, &publication_gate)?;
         Some(self.create_library_item(&media_file))
     }
@@ -354,12 +357,12 @@ impl LocalMediaLibrary {
     }
 
     fn get_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<MediaFile> {
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         self.resolve_media_file(item_id, variant_id, &publication_gate)
     }
 
     fn open_media_file_blocking(&self, item_id: &str, variant_id: &str) -> Option<OpenedMediaFile> {
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let media_file = self.resolve_media_file(item_id, variant_id, &publication_gate)?;
         let file = open_read_no_follow(&self.root_path(), &media_file.relative_path).ok()?;
         let metadata = file.metadata().ok()?;
@@ -397,7 +400,7 @@ impl LocalMediaLibrary {
     }
 
     fn delete_item_blocking(&self, id: &str) -> io::Result<bool> {
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let Some(media_file) = self.resolve_deletable_media_file(id, &publication_gate)? else {
             return Ok(false);
         };
@@ -418,7 +421,7 @@ impl LocalMediaLibrary {
         }
 
         let root_path = self.root_path();
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let Ok(candidates) =
             self.enumerate_media_candidates(&root_path, None, &cancellation, &publication_gate)
         else {
@@ -583,7 +586,7 @@ impl LocalMediaLibrary {
         &self,
         item_id: &str,
     ) -> io::Result<Option<(String, String)>> {
-        let publication_gate = self.publication_gate.read();
+        let publication_gate = self.publication_gate.snapshot();
         let root_path = self.root_path();
         ensure_deletable_root(&root_path)?;
         let Some(relative_path) = decode_item_id(item_id) else {
@@ -2544,24 +2547,29 @@ mod tests {
     }
 
     #[test]
-    fn owned_output_gate_update_waits_for_an_in_flight_reader() {
+    fn owned_output_gate_update_does_not_wait_for_an_in_flight_snapshot() {
         let gate = Arc::new(LibraryPublicationGate::known_empty());
-        let read_guard = gate.read();
+        let snapshot = gate.snapshot();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let updating_gate = Arc::clone(&gate);
         let update = std::thread::spawn(move || {
             updating_gate
                 .install_durable_blocked_paths(["Bilibili/task-1"])
                 .expect("gate update should succeed");
+            completed_tx
+                .send(())
+                .expect("completion signal should be delivered");
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            !update.is_finished(),
-            "a gate update must wait for the complete library read operation"
-        );
-        drop(read_guard);
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a gate update must not wait for a filesystem scan using an older snapshot");
         update.join().expect("gate update should finish");
-        assert!(gate.read().blocks(Path::new("Bilibili/task-1/video.mp4")));
+        assert!(!snapshot.blocks(Path::new("Bilibili/task-1/video.mp4")));
+        assert!(
+            gate.snapshot()
+                .blocks(Path::new("Bilibili/task-1/video.mp4"))
+        );
     }
 
     #[test]
