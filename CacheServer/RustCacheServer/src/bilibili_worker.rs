@@ -22,6 +22,7 @@ use crate::{
         BilibiliTaskCancellation, BilibiliTaskProgress, BilibiliTaskRegistry, BilibiliTaskWorkItem,
         StagedTaskOutputReplacement, TaskPersistenceRecoveryOutcome,
     },
+    task_store::PersistedFileCleanupKind,
 };
 
 pub type BilibiliDownloadFuture<'a> = Pin<
@@ -237,6 +238,7 @@ async fn run_one_bilibili_task(
                     output.library_item_id,
                     output.message,
                     output_v2,
+                    credentials_configured,
                 )
                 .await;
                 return;
@@ -269,6 +271,7 @@ async fn run_one_bilibili_task(
         ) => {
             let detail = error.message();
             let message = if is_v2 {
+                let detail = crate::error_detail_for_log(credentials_configured, &detail);
                 eprintln!(
                     "Bilibili v2 task {} failed before result publication: {detail}",
                     work_item.task_id
@@ -321,6 +324,7 @@ async fn complete_v2_terminal_task(
     library_item_id: String,
     message: String,
     output: BilibiliDownloadOutputV2,
+    credentials_configured: bool,
 ) {
     let output = Arc::new(output);
     let publication = complete_terminal_task_with_outcome(registry, {
@@ -346,13 +350,23 @@ async fn complete_v2_terminal_task(
                 output.terminal_state,
                 library_item_id.clone(),
                 message.clone(),
+                output.transient_output_paths.clone(),
             )
         }
     })
     .await;
 
     match publication {
-        Ok(()) => cleanup_unpublished_output_paths(&output.transient_output_paths).await,
+        Ok(()) => {
+            if let Err(error) = registry.retry_file_cleanup_intents_for_owner(
+                PersistedFileCleanupKind::BilibiliTransientOutput,
+                &task_id,
+            ) {
+                eprintln!(
+                    "Bilibili v2 task {task_id} retained pending output cleanup for retry: {error}"
+                );
+            }
+        }
         Err(error) => {
             cleanup_unpublished_output_paths(&output.unpublished_output_paths).await;
             if error.code() == tonic::Code::Cancelled {
@@ -362,7 +376,8 @@ async fn complete_v2_terminal_task(
                 .await;
                 return;
             }
-            eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {error}");
+            let detail = crate::error_detail_for_log(credentials_configured, &error);
+            eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {detail}");
             complete_terminal_task(registry, move |registry| {
                 registry.complete_task_failed(
                     &task_id,
@@ -688,8 +703,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let resource_root = temp.path().join("library");
-        let transient_output_path = temp.path().join("worker-subtitle-source.srt");
-        std::fs::create_dir_all(&resource_root).expect("resource root should be created");
+        let transient_output_path = resource_root.join("Bilibili/worker-subtitle-source.srt");
+        std::fs::create_dir_all(transient_output_path.parent().unwrap())
+            .expect("resource root should be created");
         std::fs::write(&transient_output_path, b"worker subtitle\n")
             .expect("transient subtitle should be written");
         let registry = Arc::new(

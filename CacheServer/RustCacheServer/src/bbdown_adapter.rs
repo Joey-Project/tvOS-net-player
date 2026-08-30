@@ -538,7 +538,12 @@ impl BbdownBilibiliAdapter {
                     let snapshot = download_progress.v2_progress_snapshot();
                     completed_downloaded_bytes = snapshot.downloaded_bytes;
                     total_bytes_floor = snapshot.total_bytes;
-                    log_v2_candidate_error(&request.task_id, &result_id, &error);
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
                     results.push(failed_download_result(result_id, candidate, &error));
                     report_v2_candidate_finished(
                         &context,
@@ -585,7 +590,12 @@ impl BbdownBilibiliAdapter {
                 }
                 Err(error) => {
                     cleanup_unpublished_download_report(&report).await;
-                    log_v2_candidate_error(&request.task_id, &result_id, &error);
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
                     results.push(failed_download_result(result_id, candidate, &error));
                     report_v2_candidate_finished(
                         &context,
@@ -624,7 +634,12 @@ impl BbdownBilibiliAdapter {
                     results.push(cancelled_download_result(result_id, candidate));
                 }
                 Err(error) => {
-                    log_v2_candidate_error(&request.task_id, &result_id, &error);
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
                     results.push(failed_download_result(result_id, candidate, &error));
                 }
             }
@@ -3627,11 +3642,22 @@ fn retain_v2_success(
     results.push(mapped.result);
 }
 
-fn log_v2_candidate_error(task_id: &str, result_id: &str, error: &BilibiliDownloadError) {
-    eprintln!(
-        "Bilibili v2 task {task_id} candidate {result_id} failed: {}",
-        download_error_detail(error)
-    );
+fn log_v2_candidate_error(
+    task_id: &str,
+    result_id: &str,
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) {
+    let detail = v2_candidate_error_detail_for_log(credentials_configured, error);
+    eprintln!("Bilibili v2 task {task_id} candidate {result_id} failed: {detail}");
+}
+
+fn v2_candidate_error_detail_for_log(
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) -> String {
+    let raw_detail = download_error_detail(error);
+    crate::error_detail_for_log(credentials_configured, &raw_detail)
 }
 
 fn report_v2_candidate_finished(
@@ -4545,6 +4571,17 @@ mod tests {
     use std::fs as std_fs;
 
     const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+
+    #[test]
+    fn v2_candidate_failure_log_uses_credential_safe_detail() {
+        let marker = "https://example.test/video?access_key=credential-sensitive-marker";
+        let error = BilibiliDownloadError::Failed(marker.to_owned());
+
+        assert!(v2_candidate_error_detail_for_log(false, &error).contains(marker));
+        let safe = v2_candidate_error_detail_for_log(true, &error);
+        assert_eq!(crate::CREDENTIAL_SAFE_LOG_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
 
     fn v2_test_candidate() -> BilibiliTaskCandidateRecord {
         BilibiliTaskCandidateRecord {

@@ -125,7 +125,7 @@ impl LocalMediaLibrary {
 
     pub async fn prepare_item_deletion(&self, id: &str) -> io::Result<Option<LibraryItemDeletion>> {
         let requested_id = id.to_owned();
-        let Some(item_id) = self
+        let Some((item_id, relative_path)) = self
             .run_blocking(move |library, _| {
                 library.canonical_deletable_item_id_blocking(&requested_id)
             })
@@ -137,6 +137,7 @@ impl LocalMediaLibrary {
         Ok(Some(LibraryItemDeletion {
             library: self.clone(),
             item_id,
+            relative_path,
             _guard: guard,
         }))
     }
@@ -465,7 +466,10 @@ impl LocalMediaLibrary {
         }))
     }
 
-    fn canonical_deletable_item_id_blocking(&self, item_id: &str) -> io::Result<Option<String>> {
+    fn canonical_deletable_item_id_blocking(
+        &self,
+        item_id: &str,
+    ) -> io::Result<Option<(String, String)>> {
         let root_path = self.root_path();
         ensure_deletable_root(&root_path)?;
         let Some(relative_path) = decode_item_id(item_id) else {
@@ -496,7 +500,10 @@ impl LocalMediaLibrary {
                 "library item id is not valid UTF-8",
             )
         })?;
-        Ok(Some(create_item_id(relative_path)))
+        Ok(Some((
+            create_item_id(relative_path),
+            relative_path.to_owned(),
+        )))
     }
 
     fn try_create_library_item(&self, root_path: &Path, path: &Path) -> Option<LibraryItem> {
@@ -617,12 +624,17 @@ pub struct LibraryItemPublicationLease {
 pub struct LibraryItemDeletion {
     library: LocalMediaLibrary,
     item_id: String,
+    relative_path: String,
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
 impl LibraryItemDeletion {
     pub fn item_id(&self) -> &str {
         &self.item_id
+    }
+
+    pub(crate) fn relative_path(&self) -> &str {
+        &self.relative_path
     }
 
     pub async fn delete(self) -> io::Result<bool> {
@@ -1433,7 +1445,7 @@ mod tests {
 
         assert_ne!(canonical, alias);
         assert_eq!(
-            Some(canonical.clone()),
+            Some((canonical.clone(), "Movies/Sample.mp4".to_owned())),
             library
                 .canonical_deletable_item_id_blocking(&alias)
                 .expect("equivalent item path should validate")
@@ -1441,7 +1453,7 @@ mod tests {
         fs::remove_dir_all(root_path.join("Movies"))
             .expect("external directory removal should succeed");
         assert_eq!(
-            Some(canonical),
+            Some((canonical, "Movies/Sample.mp4".to_owned())),
             library
                 .canonical_deletable_item_id_blocking(&alias)
                 .expect("missing parent should still identify the logical item")

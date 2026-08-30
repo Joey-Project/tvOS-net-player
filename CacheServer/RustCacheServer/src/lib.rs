@@ -77,6 +77,7 @@ use crate::{
     },
     playback::PlaybackUriFactory,
     task_registry::BilibiliTaskRegistry,
+    task_store::PersistedFileCleanupKind,
     transcoding::HlsTranscodingPlanState,
 };
 
@@ -1056,7 +1057,7 @@ impl AppState {
         };
         let updated_task_ids = self
             .tasks
-            .tombstone_library_item_before_delete(deletion.item_id())?;
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())?;
         if !updated_task_ids.is_empty() {
             let task_ids = updated_task_ids.into_iter().collect::<HashSet<_>>();
             let released_resource_lease_ids = self
@@ -1067,10 +1068,10 @@ impl AppState {
             self.tasks
                 .release_task_output_snapshots(&released_resource_lease_ids);
         }
-        deletion
-            .delete()
-            .await
-            .map_err(|error| Status::internal(format!("Failed to delete library item: {error}")))
+        self.tasks.retry_file_cleanup_intents_for_owner(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            deletion.item_id(),
+        )
     }
 
     pub(crate) async fn delete_completed_hls_library_item(
