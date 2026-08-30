@@ -97,6 +97,24 @@ pub struct BilibiliDownloadContext {
 }
 
 impl BilibiliDownloadContext {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        registry: Arc<BilibiliTaskRegistry>,
+        task_id: String,
+        cancellation: BilibiliTaskCancellation,
+    ) -> Self {
+        Self {
+            registry,
+            task_id,
+            cancellation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancellation.request_cancel_for_test();
+    }
+
     pub fn is_cancel_requested(&self) -> bool {
         self.cancellation.is_cancel_requested()
     }
@@ -178,6 +196,18 @@ async fn claim_next_bilibili_task(registry: Arc<BilibiliTaskRegistry>) -> Bilibi
                     );
                 }
             }
+        }
+        if registry.has_bilibili_v2_task_waiting_for_output_cleanup() {
+            let cleanup_registry = Arc::clone(&registry);
+            let cleanup_succeeded =
+                tokio::task::spawn_blocking(move || cleanup_registry.retry_pending_file_cleanups())
+                    .await
+                    .unwrap_or(false);
+            if cleanup_succeeded {
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
         }
         registry.wait_for_bilibili_task_queue_change().await;
     }
@@ -660,6 +690,79 @@ mod tests {
         assert_eq!(1.0, completed.progress);
         assert_eq!(512, completed.downloaded_bytes);
         assert_eq!(1024, completed.total_bytes);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_v2_task_waits_for_owned_output_cleanup_before_reclaim() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-before-reclaim",
+                None,
+                None,
+                "Cleanup before reclaim".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let stale_output_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&stale_output_path),
+            )
+            .expect("stale output ownership should be durable");
+        std::fs::create_dir_all(stale_output_path.parent().unwrap())
+            .expect("staging parent should be created");
+        std::fs::write(
+            &stale_output_path,
+            b"temporarily inaccessible as a directory",
+        )
+        .expect("a non-directory fixture should block safe cleanup");
+        drop(registry);
+
+        let restored = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        let claiming_registry = Arc::clone(&restored);
+        let claim = tokio::spawn(async move { claim_next_bilibili_task(claiming_registry).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !claim.is_finished(),
+            "the restored task must remain queued while cleanup is blocked"
+        );
+        std::fs::remove_file(&stale_output_path)
+            .expect("the simulated storage failure should be cleared");
+
+        let work_item = tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .expect("the worker should retry cleanup")
+            .expect("the claim task should not panic");
+        assert_eq!(task.id, work_item.task_id);
+        assert!(!stale_output_path.exists());
     }
 
     #[tokio::test]

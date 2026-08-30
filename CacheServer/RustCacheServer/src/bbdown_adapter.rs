@@ -471,9 +471,8 @@ impl BbdownBilibiliAdapter {
         let mut completed_downloaded_bytes = 0_u64;
         let mut total_bytes_floor = 0_u64;
 
-        let _archive_guard = self.archive_lock.lock().await;
         // V2 task output is the durable authority. This task-local archive only coordinates
-        // duplicate names between candidates and is never committed ahead of terminal output.
+        // duplicate names between this task's candidates and needs no cross-task lock.
         let mut archive = V2TaskArchive::default();
 
         for (offset, candidate) in request.candidates.iter().enumerate() {
@@ -1259,6 +1258,7 @@ impl BbdownBilibiliAdapter {
         &self,
         options: Option<&BilibiliDownloadOptions>,
     ) -> Result<DownloadOptions, BilibiliDownloadError> {
+        validate_legacy_download_mode(options)?;
         download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
@@ -4586,6 +4586,18 @@ fn sidecar_only_required_artifact_kind(mode: DownloadMode) -> Option<TaskArtifac
     }
 }
 
+fn validate_legacy_download_mode(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<(), BilibiliDownloadError> {
+    let mode = download_mode_from_options(options)?;
+    if sidecar_only_required_artifact_kind(mode).is_some() {
+        return Err(BilibiliDownloadError::Failed(
+            "Sidecar-only Bilibili download modes require the v2 task API.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn download_mode_from_options(
     options: Option<&BilibiliDownloadOptions>,
 ) -> Result<DownloadMode, BilibiliDownloadError> {
@@ -5017,6 +5029,7 @@ fn success_message(report: &DownloadReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_registry::{BilibiliTaskRegistry, TaskRetentionPolicy};
     use bbdown_core::{
         DownloadArchiveRecord, DownloadedFile, EntryDownloadReport, MuxReport,
         RestrictedAreaProxyKind,
@@ -5401,6 +5414,32 @@ mod tests {
             Err(BilibiliDownloadError::Failed(message))
                 if message.contains("download mode is unknown")
         ));
+    }
+
+    #[test]
+    fn legacy_downloads_reject_sidecar_only_modes_before_execution() {
+        for mode in [
+            BilibiliDownloadMode::SubtitleOnly,
+            BilibiliDownloadMode::DanmakuOnly,
+            BilibiliDownloadMode::CoverOnly,
+        ] {
+            let options = bilibili_options_with_download_mode(mode);
+            assert!(matches!(
+                validate_legacy_download_mode(Some(&options)),
+                Err(BilibiliDownloadError::Failed(message))
+                    if message.contains("require the v2 task API")
+            ));
+        }
+
+        for mode in [
+            BilibiliDownloadMode::All,
+            BilibiliDownloadMode::VideoOnly,
+            BilibiliDownloadMode::AudioOnly,
+        ] {
+            let options = bilibili_options_with_download_mode(mode);
+            validate_legacy_download_mode(Some(&options))
+                .expect("legacy media modes should remain supported");
+        }
     }
 
     #[test]
@@ -6012,6 +6051,78 @@ mod tests {
                 .all(|result| result.state() == TaskState::Succeeded)
         );
         assert_eq!("library-one", primary_library_item_id);
+    }
+
+    #[tokio::test]
+    async fn v2_download_does_not_wait_for_the_legacy_archive_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("library");
+        std_fs::create_dir_all(&root_path).expect("library root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("library root should canonicalize");
+        let options = Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bbdown_output_dir: Some(root_path.join("Bilibili")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+        );
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                temp.path().join("state/tasks.json"),
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1xx411c7mD",
+                None,
+                None,
+                "Archive isolation".to_owned(),
+                vec![v2_test_candidate()],
+            )
+            .expect("v2 task should be created");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let context = BilibiliDownloadContext::new_for_test(
+            registry,
+            task.id.clone(),
+            work_item.cancellation,
+        );
+        context.cancel_for_test();
+        let request = BilibiliDownloadRequest {
+            task_id: task.id,
+            source: "BV1xx411c7mD".to_owned(),
+            options: Some(bilibili_options_with_download_mode(
+                BilibiliDownloadMode::All,
+            )),
+            request_context: None,
+            candidates: vec![v2_test_candidate()],
+        };
+        let archive_lock = Arc::clone(&adapter.archive_lock);
+        let _legacy_archive_guard = archive_lock.lock().await;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.run_v2_download(request, context),
+        )
+        .await
+        .expect("a task-local v2 archive must not wait for the legacy archive lock")
+        .expect("a cancelled v2 request should still produce terminal output");
+
+        assert_eq!(
+            TaskState::Cancelled,
+            output
+                .v2
+                .expect("v2 output should be present")
+                .terminal_state
+        );
     }
 
     #[tokio::test]

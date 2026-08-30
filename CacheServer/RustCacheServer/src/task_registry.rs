@@ -1213,7 +1213,7 @@ impl BilibiliTaskRegistry {
         self.retry_file_cleanup_intents(Some((kind, owner_id)))
     }
 
-    fn retry_pending_file_cleanups(&self) -> bool {
+    pub(crate) fn retry_pending_file_cleanups(&self) -> bool {
         match self.retry_file_cleanup_intents(None) {
             Ok(_) => true,
             Err(error) => {
@@ -2074,6 +2074,10 @@ impl BilibiliTaskRegistry {
                 inner.queued_task_ids.push_back(task_id);
                 continue;
             }
+            if is_v2_download && has_pending_bilibili_owned_output_cleanup(&inner, &task_id) {
+                inner.queued_task_ids.push_back(task_id);
+                continue;
+            }
             let options = inner
                 .download_options_by_id
                 .get(&task_id)
@@ -2133,6 +2137,21 @@ impl BilibiliTaskRegistry {
                     .bilibili_candidates_by_id
                     .get(task_id)
                     .is_some_and(|candidates| !candidates.is_empty())
+        })
+    }
+
+    pub(crate) fn has_bilibili_v2_task_waiting_for_output_cleanup(&self) -> bool {
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner.queued_task_ids.iter().any(|task_id| {
+            inner
+                .tasks_by_id
+                .get(task_id)
+                .is_some_and(|task| task.state() == TaskState::Queued)
+                && inner
+                    .bilibili_candidates_by_id
+                    .get(task_id)
+                    .is_some_and(|candidates| !candidates.is_empty())
+                && has_pending_bilibili_owned_output_cleanup(&inner, task_id)
         })
     }
 
@@ -5005,6 +5024,11 @@ impl BilibiliTaskCancellation {
         self.cancelled.load(AtomicOrdering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_cancel_for_test(&self) {
+        self.request_cancel();
+    }
+
     fn request_cancel(&self) {
         self.cancelled.store(true, AtomicOrdering::Relaxed);
     }
@@ -5073,6 +5097,13 @@ struct RegistryInner {
     pending_file_cleanup_intents: HashSet<PersistedFileCleanupIntent>,
     pending_publications_by_id: HashMap<String, Task>,
     persistence_generation: u64,
+}
+
+fn has_pending_bilibili_owned_output_cleanup(inner: &RegistryInner, task_id: &str) -> bool {
+    inner.pending_file_cleanup_intents.iter().any(|intent| {
+        intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+            && intent.owner_id == task_id
+    })
 }
 
 #[derive(Clone)]

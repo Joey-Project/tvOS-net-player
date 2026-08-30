@@ -57,7 +57,11 @@ impl LibraryPublicationGate {
                 "Bilibili output directory is outside the cache root",
             )
         })?;
-        let blocked_prefix = normalized_publication_gate_path(relative_path)?;
+        let blocked_prefix = if relative_path.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            normalized_publication_gate_path(relative_path)?
+        };
         Ok(Self {
             state: StdRwLock::new(LibraryPublicationGateState::Unknown { blocked_prefix }),
         })
@@ -1043,6 +1047,7 @@ fn extension_with_dot(path: &Path) -> String {
 
 fn content_type(path: &Path) -> &'static str {
     match extension_with_dot(path).as_str() {
+        ".m4a" => "audio/mp4",
         ".m4v" => "video/x-m4v",
         ".mov" => "video/quicktime",
         _ => "video/mp4",
@@ -2010,6 +2015,11 @@ mod tests {
     }
 
     #[test]
+    fn m4a_media_uses_an_audio_content_type() {
+        assert_eq!("audio/mp4", content_type(Path::new("episode.m4a")));
+    }
+
+    #[test]
     fn deletion_lock_keys_canonicalize_equivalent_item_paths() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp.path().join("cache");
@@ -2402,6 +2412,45 @@ mod tests {
             library
                 .open_media_file_blocking(&item_id, VARIANT_ID)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn root_output_gate_blocks_the_entire_library_until_durable_state_is_loaded() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        fs::create_dir_all(&root_path).expect("cache root should be created");
+        fs::write(root_path.join("video.mp4"), b"video").expect("media should be written");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let gate = Arc::new(
+            LibraryPublicationGate::unknown_for_output_directory(&root_path, &root_path)
+                .expect("the cache root should be a valid output directory"),
+        );
+        let library = LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(CacheServerOptions {
+                root_path,
+                ..CacheServerOptions::default()
+            }),
+            Arc::clone(&gate),
+        );
+
+        assert!(
+            library
+                .list_items_page_blocking(None, 0, 50, BlockingCancellation::default())
+                .items
+                .is_empty()
+        );
+
+        gate.install_durable_blocked_paths(std::iter::empty::<&str>())
+            .expect("an empty durable block set should release the library");
+        assert_eq!(
+            1,
+            library
+                .list_items_page_blocking(None, 0, 50, BlockingCancellation::default())
+                .items
+                .len()
         );
     }
 
