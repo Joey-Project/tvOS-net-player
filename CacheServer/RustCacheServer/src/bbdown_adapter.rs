@@ -338,6 +338,7 @@ impl BbdownBilibiliAdapter {
         }
 
         let input = Input::parse(&request.source).map_err(failed)?;
+        let download_mode = download_mode_from_options(request.options.as_ref())?;
         let download_options = self.download_options(request.options.as_ref())?;
         let client =
             self.client_for_request(request.options.as_ref(), request.request_context.as_ref())?;
@@ -396,14 +397,25 @@ impl BbdownBilibiliAdapter {
             ));
         }
 
+        let preparing_audio_only = download_mode == DownloadMode::AudioOnly;
         context.report_progress(BilibiliTaskProgress {
             progress: Some(0.80),
             downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
             total_bytes: Some(to_i64_saturating(downloaded_bytes)),
-            message: Some("Muxing downloaded media for local playback.".to_owned()),
+            message: Some(if preparing_audio_only {
+                "Preparing downloaded audio for local playback.".to_owned()
+            } else {
+                "Muxing downloaded media for local playback.".to_owned()
+            }),
         });
         let is_cancel_requested = || context.is_cancel_requested();
-        let report = mux_download_report(report, &self.ffmpeg_path, &is_cancel_requested).await?;
+        let report = prepare_download_report_for_playback(
+            report,
+            download_mode,
+            &self.ffmpeg_path,
+            &is_cancel_requested,
+        )
+        .await?;
 
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -633,17 +645,28 @@ impl BbdownBilibiliAdapter {
                 )),
                 downloaded_bytes: Some(to_i64_saturating(completed_downloaded_bytes)),
                 total_bytes: Some(to_i64_saturating(total_bytes_floor)),
-                message: Some(format!(
-                    "Muxing Bilibili download {}/{}.",
-                    offset + 1,
-                    request.candidates.len()
-                )),
+                message: Some(if download_mode == DownloadMode::AudioOnly {
+                    format!(
+                        "Preparing Bilibili audio download {}/{}.",
+                        offset + 1,
+                        request.candidates.len()
+                    )
+                } else {
+                    format!(
+                        "Muxing Bilibili download {}/{}.",
+                        offset + 1,
+                        request.candidates.len()
+                    )
+                }),
             });
 
             let mut report = report;
-            match mux_download_report_in_place(&mut report, &self.ffmpeg_path, &|| {
-                context.is_cancel_requested()
-            })
+            match prepare_download_report_for_playback_in_place(
+                &mut report,
+                download_mode,
+                &self.ffmpeg_path,
+                &|| context.is_cancel_requested(),
+            )
             .await
             {
                 Ok(()) => {}
@@ -4636,10 +4659,12 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     }
     for entry in &report.entries {
         for file in &entry.files {
-            if matches!(
+            let playable = matches!(
                 &file.kind,
                 DownloadFileKind::Video | DownloadFileKind::FlvSegment
-            ) {
+            ) || (entry.mux.is_none()
+                && matches!(&file.kind, DownloadFileKind::Audio));
+            if playable {
                 candidates.push(file.path.clone());
             }
         }
@@ -4647,6 +4672,41 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     candidates
 }
 
+async fn prepare_download_report_for_playback<F>(
+    mut report: DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+) -> Result<DownloadReport, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    prepare_download_report_for_playback_in_place(
+        &mut report,
+        mode,
+        ffmpeg_path,
+        is_cancel_requested,
+    )
+    .await?;
+    Ok(report)
+}
+
+async fn prepare_download_report_for_playback_in_place<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+) -> Result<(), BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    if mode == DownloadMode::AudioOnly {
+        return Ok(());
+    }
+    mux_download_report_in_place(report, ffmpeg_path, is_cancel_requested).await
+}
+
+#[cfg(test)]
 async fn mux_download_report<F>(
     mut report: DownloadReport,
     ffmpeg_path: &Path,
@@ -8618,6 +8678,45 @@ mod tests {
         assert!(file_name.len() <= MAX_FILE_NAME_BYTES);
         assert!(temp_file_name.len() <= MAX_FILE_NAME_BYTES);
         assert!(file_name.is_char_boundary(file_name.trim_end_matches(PLAYBACK_EXTENSION).len()));
+    }
+
+    #[tokio::test]
+    async fn audio_only_preserves_raw_audio_without_invoking_ffmpeg() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let audio_path = temp.path().join("audio.m4a");
+        std::fs::write(&audio_path, b"audio").expect("audio should be written");
+        let report = DownloadReport {
+            title: "Audio".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Audio".to_owned(),
+                directory: temp.path().to_path_buf(),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Audio,
+                    path: audio_path.clone(),
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let prepared = prepare_download_report_for_playback(
+            report,
+            DownloadMode::AudioOnly,
+            &temp.path().join("missing-ffmpeg"),
+            &|| false,
+        )
+        .await
+        .expect("audio-only preparation should not require ffmpeg");
+
+        assert!(prepared.entries[0].mux.is_none());
+        assert_eq!(
+            vec![audio_path.clone()],
+            playable_output_candidates(&prepared)
+        );
+        assert!(audio_path.is_file());
     }
 
     #[cfg(unix)]

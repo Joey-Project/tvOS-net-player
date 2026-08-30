@@ -486,6 +486,8 @@ impl TaskOutputRecord {
         }
         let mut updated = self.clone();
         let mut changed = false;
+        let mut primary_result_affected = false;
+        let current_primary_result_id = updated.primary_result_id.clone();
         for result in &mut updated.results {
             let result_matches = result.library_item_id == library_item_id
                 || result
@@ -511,6 +513,7 @@ impl TaskOutputRecord {
             if !result_matches && !artifact_matches {
                 continue;
             }
+            primary_result_affected |= result.id == current_primary_result_id;
             result.state = TaskState::Failed.into();
             if result.library_item_id == library_item_id {
                 result.library_item_id.clear();
@@ -553,7 +556,14 @@ impl TaskOutputRecord {
             }
             retained
         });
-        updated.primary_result_id = inferred_primary_result_id(&updated.results);
+        if primary_result_affected
+            || !updated
+                .results
+                .iter()
+                .any(|result| result.id == updated.primary_result_id)
+        {
+            updated.primary_result_id = inferred_primary_result_id(&updated.results);
+        }
         validate_collection_sizes(&updated.results, &updated.resources)?;
         validate_and_bind_resources(&mut updated.results, &updated.resources)?;
         validate_collection_sizes(&updated.results, &updated.resources)?;
@@ -2004,6 +2014,44 @@ mod tests {
         assert!(output.results[0].artifacts[0].library_item_id.is_empty());
         assert_eq!(TaskState::Succeeded, output.results[1].state());
         assert_eq!("result-two", output.primary_result_id);
+    }
+
+    #[test]
+    fn library_deletion_preserves_an_unaffected_explicit_primary_result() {
+        let mut output = TaskOutputRecord::replace_with_primary_result(
+            None,
+            vec![
+                TaskResult {
+                    id: "result-one".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-one".to_owned(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-two".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-two".to_owned(),
+                    ..Default::default()
+                },
+                TaskResult {
+                    id: "result-three".to_owned(),
+                    state: TaskState::Succeeded.into(),
+                    library_item_id: "library-three".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            Vec::new(),
+            Some("result-two"),
+        )
+        .expect("task output should be valid");
+
+        output
+            .mark_library_item_deleted("library-three", "Cached media was deleted.")
+            .expect("library deletion should preserve output validity");
+
+        assert_eq!("result-two", output.primary_result_id);
+        assert_eq!(TaskState::Succeeded, output.results[1].state());
+        assert_eq!(TaskState::Failed, output.results[2].state());
     }
 
     #[test]

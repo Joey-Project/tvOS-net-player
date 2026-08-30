@@ -647,7 +647,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertTrue(download.danmakuFormats.isEmpty)
     }
 
-    func testLegacyCreateBilibiliTaskRequestAllowsDefaultAndAllDownloadModes() throws {
+    func testLegacyCreateBilibiliTaskRequestAllowsMediaDownloadModes() throws {
         let defaultRequest = try GRPCCacheControlClient.createBilibiliTaskRequest(
             urlOrID: "BV1legacy",
             options: BilibiliDownloadTaskOptions()
@@ -661,13 +661,19 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
         XCTAssertEqual(allRequest.urlOrID, "BV1legacy")
         XCTAssertEqual(allRequest.options.downloadMode, .all)
+
+        for mode in [BilibiliDownloadMode.videoOnly, .audioOnly] {
+            let request = try GRPCCacheControlClient.createBilibiliTaskRequest(
+                urlOrID: "BV1legacy",
+                options: BilibiliDownloadTaskOptions(downloadMode: mode)
+            )
+            XCTAssertEqual(request.options.downloadMode, TvosNetPlayer_V1_BilibiliDownloadMode(mode))
+        }
     }
 
-    func testLegacyCreateBilibiliTaskRejectsExplicitDownloadModesBeforeRPC() async {
+    func testLegacyCreateBilibiliTaskRejectsSidecarOnlyDownloadModesBeforeRPC() async {
         let client = GRPCCacheControlClient(endpoint: CacheServerEndpoint(host: "127.0.0.1", port: 1))
         let unsafeModes: [BilibiliDownloadMode] = [
-            .videoOnly,
-            .audioOnly,
             .subtitleOnly,
             .danmakuOnly,
             .coverOnly,
@@ -679,7 +685,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
                     urlOrID: "BV1legacy",
                     options: BilibiliDownloadTaskOptions(downloadMode: mode)
                 )
-                XCTFail("Expected explicit legacy download mode to require Bilibili execution v2.")
+                XCTFail("Expected sidecar-only legacy download mode to require Bilibili execution v2.")
             } catch {
                 XCTAssertEqual(
                     error as? CacheControlClientUnsupportedFeature,

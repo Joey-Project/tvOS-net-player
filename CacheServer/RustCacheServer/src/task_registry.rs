@@ -7149,6 +7149,7 @@ fn copy_timestamp(timestamp: &Timestamp) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::create_item_id;
 
     #[test]
     fn mutation_checkpoint_restores_pending_resource_cleanup_reservations() {
@@ -7689,20 +7690,27 @@ mod tests {
         registry
             .try_claim_next_bilibili_task()
             .expect("v2 task should become running");
+        let library_one_relative_path = "Bilibili/library-one.mp4";
+        let library_one_id = create_item_id(library_one_relative_path);
+        let library_two_id = create_item_id("Bilibili/library-two.mp4");
         let results = [
-            (task.id.clone(), "library-one", "media-one"),
-            (format!("{}-result-2", task.id), "library-two", "media-two"),
+            (task.id.clone(), library_one_id.clone(), "media-one"),
+            (
+                format!("{}-result-2", task.id),
+                library_two_id.clone(),
+                "media-two",
+            ),
         ]
         .into_iter()
         .map(|(id, library_item_id, artifact_id)| TaskResult {
             id,
             state: TaskState::Succeeded.into(),
-            library_item_id: library_item_id.to_owned(),
+            library_item_id: library_item_id.clone(),
             artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
                 id: artifact_id.to_owned(),
                 kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
                 state: TaskArtifactState::Available.into(),
-                library_item_id: library_item_id.to_owned(),
+                library_item_id,
                 ..Default::default()
             }],
             ..Default::default()
@@ -7714,7 +7722,7 @@ mod tests {
             .commit_download_terminal(
                 results,
                 TaskState::Succeeded,
-                "library-one".to_owned(),
+                library_one_id.clone(),
                 "Downloaded all results.".to_owned(),
                 Vec::new(),
                 Vec::new(),
@@ -7739,18 +7747,18 @@ mod tests {
                 vec![TaskResult {
                     id: shared_task.id.clone(),
                     state: TaskState::Succeeded.into(),
-                    library_item_id: "library-one".to_owned(),
+                    library_item_id: library_one_id.clone(),
                     artifacts: vec![crate::generated::tvos_net_player::v1::TaskArtifact {
                         id: "shared-media-one".to_owned(),
                         kind: crate::generated::tvos_net_player::v1::TaskArtifactKind::Media.into(),
                         state: TaskArtifactState::Available.into(),
-                        library_item_id: "library-one".to_owned(),
+                        library_item_id: library_one_id.clone(),
                         ..Default::default()
                     }],
                     ..Default::default()
                 }],
                 TaskState::Succeeded,
-                "library-one".to_owned(),
+                library_one_id.clone(),
                 "Downloaded shared result.".to_owned(),
                 Vec::new(),
                 Vec::new(),
@@ -7763,7 +7771,7 @@ mod tests {
                 .get_mut(&task.id)
                 .expect("download task should remain stored");
             let playback_source = PlaybackSource {
-                item_id: "library-one".to_owned(),
+                item_id: library_one_id.clone(),
                 uri: "/library/library-one/media".to_owned(),
                 ..Default::default()
             };
@@ -7779,7 +7787,7 @@ mod tests {
 
         registry.fail_next_persistence_directory_sync();
         let error = registry
-            .tombstone_library_item_before_delete("library-one", "Bilibili/library-one.mp4")
+            .tombstone_library_item_before_delete(&library_one_id, library_one_relative_path)
             .expect_err("library deletion must wait for directory durability");
         assert_eq!(tonic::Code::Unavailable, error.code());
         let rolled_back = registry
@@ -7806,7 +7814,7 @@ mod tests {
         assert!(registry.retry_pending_persistence());
 
         let updated_task_ids = registry
-            .tombstone_library_item_before_delete("library-one", "Bilibili/library-one.mp4")
+            .tombstone_library_item_before_delete(&library_one_id, library_one_relative_path)
             .expect("library references should tombstone durably")
             .into_iter()
             .collect::<HashSet<_>>();
@@ -7821,7 +7829,7 @@ mod tests {
             .task_output_snapshot(&task.id)
             .expect("updated output should remain visible");
         assert_eq!(TaskState::Succeeded, updated.state());
-        assert_eq!("library-two", updated.library_item_id);
+        assert_eq!(library_two_id, updated.library_item_id);
         assert!(updated.playback_source.is_none());
         assert!(updated.playback_session.is_none());
         assert_eq!(TaskState::Failed, updated.result_items[0].state());
@@ -7857,8 +7865,8 @@ mod tests {
             vec![
                 PersistedFileCleanupIntent::new(
                     PersistedFileCleanupKind::LocalLibraryItem,
-                    "library-one",
-                    "Bilibili/library-one.mp4",
+                    &library_one_id,
+                    library_one_relative_path,
                 )
                 .unwrap()
             ],
@@ -7876,7 +7884,7 @@ mod tests {
         let restored_output = restored
             .task_output_snapshot(&task.id)
             .expect("tombstoned output should survive restart");
-        assert_eq!("library-two", restored_task.library_item_id);
+        assert_eq!(library_two_id, restored_task.library_item_id);
         assert!(restored_task.playback_source.is_none());
         assert!(restored_task.playback_session.is_none());
         assert!(restored_task.result_items[0].playback_source.is_none());
@@ -10507,10 +10515,6 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
-        let transient_path = root_path.join("Bilibili/transient-subtitle.srt");
-        std::fs::create_dir_all(transient_path.parent().unwrap())
-            .expect("transient output directory should be created");
-        std::fs::write(&transient_path, b"subtitle").expect("transient output should exist");
         let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
             &state_path,
             TaskRetentionPolicy::default(),
@@ -10525,6 +10529,11 @@ mod tests {
                 vec![sample_bilibili_task_candidate()],
             )
             .expect("v2 task should be created");
+        let transient_relative_path = format!("Bilibili/{}/transient-subtitle.srt", task.id);
+        let transient_path = root_path.join(&transient_relative_path);
+        std::fs::create_dir_all(transient_path.parent().unwrap())
+            .expect("transient output directory should be created");
+        std::fs::write(&transient_path, b"subtitle").expect("transient output should exist");
         registry
             .try_claim_next_bilibili_task()
             .expect("v2 task should become running");
@@ -10554,7 +10563,7 @@ mod tests {
             PersistedFileCleanupIntent::new(
                 PersistedFileCleanupKind::BilibiliTransientOutput,
                 &task.id,
-                "Bilibili/transient-subtitle.srt",
+                &transient_relative_path,
             )
             .unwrap(),
             persisted.file_cleanup_intents[0]
@@ -10773,13 +10782,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let root_path = temp.path().join("cache");
-        let transient_path = root_path.join("Bilibili/stuck-subtitle.srt");
-        std::fs::create_dir_all(&transient_path)
-            .expect("directory fixture should block file unlink");
         let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
             &state_path,
             TaskRetentionPolicy::default(),
-            Some(root_path),
+            Some(root_path.clone()),
         );
         let task = registry
             .create_bilibili_download_task_v2(
@@ -10790,6 +10796,12 @@ mod tests {
                 vec![sample_bilibili_task_candidate()],
             )
             .expect("v2 task should be created");
+        let transient_path = root_path
+            .join("Bilibili")
+            .join(&task.id)
+            .join("stuck-subtitle.srt");
+        std::fs::create_dir_all(&transient_path)
+            .expect("directory fixture should block file unlink");
         registry
             .try_claim_next_bilibili_task()
             .expect("v2 task should become running");

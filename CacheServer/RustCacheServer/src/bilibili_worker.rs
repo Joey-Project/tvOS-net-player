@@ -829,11 +829,6 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
         let resource_root = temp.path().join("library");
-        let transient_output_path = resource_root.join("Bilibili/worker-subtitle-source.srt");
-        std::fs::create_dir_all(transient_output_path.parent().unwrap())
-            .expect("resource root should be created");
-        std::fs::write(&transient_output_path, b"worker subtitle\n")
-            .expect("transient subtitle should be written");
         let registry = Arc::new(
             BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
                 &state_path,
@@ -851,6 +846,14 @@ mod tests {
                 candidates,
             )
             .expect("v2 task should be created durably");
+        let transient_output_path = resource_root
+            .join("Bilibili")
+            .join(&task.id)
+            .join("worker-subtitle-source.srt");
+        std::fs::create_dir_all(transient_output_path.parent().unwrap())
+            .expect("task output directory should be created");
+        std::fs::write(&transient_output_path, b"worker subtitle\n")
+            .expect("transient subtitle should be written");
         let worker = tokio::spawn(run_bilibili_task_worker(
             Arc::clone(&registry),
             Arc::new(PartialV2Adapter {

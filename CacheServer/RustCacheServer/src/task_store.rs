@@ -31,6 +31,7 @@ use crate::generated::tvos_net_player::v1::{
     PlaybackSource, Task, TaskArtifact, TaskKind, TaskProblem, TaskResult, TaskResultProgress,
     TaskResultProviderDetails, TaskResultSubject, TaskState, task_result_provider_details,
 };
+use crate::library::decode_item_id;
 use crate::playback_policy::PlaybackPolicy;
 use crate::task_output::{
     MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_ARTIFACTS, MAX_TASK_RESOURCES, MAX_TASK_RESULTS,
@@ -111,8 +112,13 @@ impl PersistedFileCleanupIntent {
                         .is_some_and(|value| value.eq_ignore_ascii_case(".tvos-net-player"))
             )
         });
+        let valid_bilibili_owner = valid_bilibili_download_task_id(&self.owner_id);
+        let path_contains_owner = components.iter().any(
+            |component| matches!(component, Component::Normal(value) if *value == OsStr::new(&self.owner_id)),
+        );
         let valid_owned_output_directory = self.kind
             == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+            && valid_bilibili_owner
             && components.last().is_some_and(
                 |component| matches!(component, Component::Normal(value) if *value == OsStr::new(&self.owner_id)),
             )
@@ -123,6 +129,14 @@ impl PersistedFileCleanupIntent {
                         if *internal == OsStr::new(".tvos-net-player")
                             && *staging == OsStr::new("bbdown-staging")
                 ));
+        let valid_transient_output = self.kind == PersistedFileCleanupKind::BilibiliTransientOutput
+            && valid_bilibili_owner
+            && path_contains_owner
+            && !targets_internal_storage;
+        let valid_local_library_item = self.kind == PersistedFileCleanupKind::LocalLibraryItem
+            && decode_item_id(&self.owner_id).is_some_and(|path| {
+                path.components().collect::<PathBuf>().to_str() == Some(self.relative_path.as_str())
+            });
         if self.relative_path.is_empty()
             || self.relative_path.len() > MAX_PERSISTED_CLEANUP_RELATIVE_PATH_BYTES
             || self.relative_path.contains('\0')
@@ -130,10 +144,13 @@ impl PersistedFileCleanupIntent {
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
             || normalized.to_str() != Some(self.relative_path.as_str())
-            || (self.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
-                && !valid_owned_output_directory)
-            || (self.kind != PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
-                && targets_internal_storage)
+            || match self.kind {
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory => {
+                    !valid_owned_output_directory
+                }
+                PersistedFileCleanupKind::BilibiliTransientOutput => !valid_transient_output,
+                PersistedFileCleanupKind::LocalLibraryItem => !valid_local_library_item,
+            }
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -142,6 +159,15 @@ impl PersistedFileCleanupIntent {
         }
         Ok(())
     }
+}
+
+fn valid_bilibili_download_task_id(value: &str) -> bool {
+    value.strip_prefix("bilibili-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 #[derive(Default)]
@@ -2684,6 +2710,9 @@ mod tests {
         LanTranscodingPlan, LanTranscodingPlanState, PlaybackProtocol, TaskArtifactKind,
         TaskArtifactState, TaskKind, TaskProblemCategory, TaskState,
     };
+    use crate::library::create_item_id;
+
+    const CLEANUP_TASK_ID: &str = "bilibili-00000000000000000000000000000001";
 
     fn persisted_task_artifact_fixture(id: &str) -> PersistedTaskArtifact {
         PersistedTaskArtifact {
@@ -2728,8 +2757,8 @@ mod tests {
         let store = TaskStateStore::new(&path);
         let intent = PersistedFileCleanupIntent::new(
             PersistedFileCleanupKind::BilibiliTransientOutput,
-            "bilibili-cleanup-task",
-            "Bilibili/video.zh-CN.srt",
+            CLEANUP_TASK_ID,
+            format!("Bilibili/{CLEANUP_TASK_ID}/video.zh-CN.srt"),
         )
         .expect("cleanup intent should be valid");
         store
@@ -2761,6 +2790,24 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(io::ErrorKind::InvalidData, duplicate_error.kind());
+
+        let mut shared_namespace_cleanup = snapshot.clone();
+        shared_namespace_cleanup["file_cleanup_intents"] = serde_json::json!([{
+            "kind": "bilibili_owned_output_directory",
+            "owner_id": "Bilibili",
+            "relative_path": "Bilibili"
+        }]);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&shared_namespace_cleanup)
+                .expect("shared namespace cleanup fixture should serialize"),
+        )
+        .expect("shared namespace cleanup fixture should be written");
+        let shared_namespace_error = match store.load_state() {
+            Ok(_) => panic!("shared cache namespaces must never restore as task-owned output"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, shared_namespace_error.kind());
 
         let mut legacy_with_intent = snapshot.clone();
         legacy_with_intent["schema_version"] =
@@ -2818,31 +2865,57 @@ mod tests {
             .is_err()
         );
         for relative_path in [
-            ".tvos-net-player/bbdown-staging/bilibili-cleanup-task",
-            "Bilibili/bilibili-cleanup-task",
+            format!(".tvos-net-player/bbdown-staging/{CLEANUP_TASK_ID}"),
+            format!("Bilibili/{CLEANUP_TASK_ID}"),
         ] {
             PersistedFileCleanupIntent::new(
                 PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
-                "bilibili-cleanup-task",
+                CLEANUP_TASK_ID,
                 relative_path,
             )
             .expect("task-owned output directory should be valid");
         }
         for relative_path in [
-            ".tvos-net-player/resources/bilibili-cleanup-task",
-            ".tvos-net-player/bbdown-staging/another-task",
-            ".TVOS-NET-PLAYER/bbdown-staging/bilibili-cleanup-task",
-            "Bilibili/another-task",
+            format!(".tvos-net-player/resources/{CLEANUP_TASK_ID}"),
+            ".tvos-net-player/bbdown-staging/bilibili-00000000000000000000000000000002".to_owned(),
+            format!(".TVOS-NET-PLAYER/bbdown-staging/{CLEANUP_TASK_ID}"),
+            "Bilibili/bilibili-00000000000000000000000000000002".to_owned(),
         ] {
             assert!(
                 PersistedFileCleanupIntent::new(
                     PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
-                    "bilibili-cleanup-task",
+                    CLEANUP_TASK_ID,
                     relative_path,
                 )
                 .is_err()
             );
         }
+        assert!(
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                "Bilibili",
+                "Bilibili",
+            )
+            .is_err(),
+            "a restored intent must never claim a shared cache namespace"
+        );
+
+        let library_relative_path = "Bilibili/library-one.mp4";
+        let library_item_id = create_item_id(library_relative_path);
+        PersistedFileCleanupIntent::new(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            &library_item_id,
+            library_relative_path,
+        )
+        .expect("a canonical library item cleanup should be valid");
+        assert!(
+            PersistedFileCleanupIntent::new(
+                PersistedFileCleanupKind::LocalLibraryItem,
+                &library_item_id,
+                "Bilibili/library-two.mp4",
+            )
+            .is_err()
+        );
     }
 
     #[test]

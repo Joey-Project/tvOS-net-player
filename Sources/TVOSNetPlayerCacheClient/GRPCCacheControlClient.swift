@@ -552,9 +552,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
 
     private static func validateLegacyBilibiliDownloadMode(_ mode: BilibiliDownloadMode) throws {
         switch mode {
-        case .unspecified, .all:
+        case .unspecified, .all, .videoOnly, .audioOnly:
             return
-        case .videoOnly, .audioOnly, .subtitleOnly, .danmakuOnly, .coverOnly:
+        case .subtitleOnly, .danmakuOnly, .coverOnly:
             throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
         case .unknown:
             throw CacheControlClientInvalidRequest.invalidBilibiliDownloadMode

@@ -492,10 +492,12 @@ impl LocalMediaLibrary {
         }
 
         let relative_path = decode_item_id(item_id)?;
-        if publication_gate.blocks(&relative_path) {
+        let media_file =
+            self.try_create_media_file(&self.root_path(), &self.root_path().join(relative_path))?;
+        if publication_gate.blocks(Path::new(&media_file.relative_path)) {
             return None;
         }
-        self.try_create_media_file(&self.root_path(), &self.root_path().join(relative_path))
+        Some(media_file)
     }
 
     fn resolve_deletable_media_file(
@@ -509,9 +511,6 @@ impl LocalMediaLibrary {
         let Some(decoded_relative_path) = decode_item_id(item_id) else {
             return Ok(None);
         };
-        if publication_gate.blocks(&decoded_relative_path) {
-            return Ok(None);
-        }
         let full_candidate_path = absolute_path(&root_path.join(decoded_relative_path));
         if !is_within_root(&root_path, &full_candidate_path) {
             return Ok(None);
@@ -530,6 +529,14 @@ impl LocalMediaLibrary {
             return Ok(None);
         }
 
+        let Some((canonical_root_path, full_candidate_path, relative_path)) =
+            canonical_existing_media_path(&root_path, &full_candidate_path)
+        else {
+            return Ok(None);
+        };
+        if publication_gate.blocks(Path::new(&relative_path)) {
+            return Ok(None);
+        }
         if !self
             .allowed_extensions()
             .contains(&extension_with_dot(&full_candidate_path))
@@ -537,9 +544,6 @@ impl LocalMediaLibrary {
             return Ok(None);
         }
 
-        let Some(relative_path) = relative_path(&root_path, &full_candidate_path) else {
-            return Ok(None);
-        };
         if is_internal_cache_path(&relative_path) {
             return Ok(None);
         }
@@ -555,7 +559,7 @@ impl LocalMediaLibrary {
             }));
         }
 
-        let file = match open_read_no_follow(&root_path, &relative_path) {
+        let file = match open_read_no_follow(&canonical_root_path, &relative_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -595,9 +599,26 @@ impl LocalMediaLibrary {
         let full_candidate_path = absolute_path(&root_path.join(&relative_path));
         if !is_within_root(&root_path, &full_candidate_path)
             || is_internal_cache_components(relative_path.components())
-            || !self
-                .allowed_extensions()
-                .contains(&extension_with_dot(&full_candidate_path))
+        {
+            return Ok(None);
+        }
+        match fs::symlink_metadata(&full_candidate_path) {
+            Ok(_) => {
+                return self
+                    .resolve_deletable_media_file(item_id, &publication_gate)
+                    .map(|media_file| {
+                        media_file.map(|media_file| {
+                            let item_id = create_item_id(&media_file.relative_path);
+                            (item_id, media_file.relative_path)
+                        })
+                    });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !self
+            .allowed_extensions()
+            .contains(&extension_with_dot(&full_candidate_path))
         {
             return Ok(None);
         }
@@ -639,6 +660,11 @@ impl LocalMediaLibrary {
             return None;
         }
 
+        // Canonical spelling supplies one logical identity for filesystem aliases. The later
+        // descriptor-relative no-follow open independently enforces the access policy.
+        let (canonical_root_path, full_candidate_path, relative_path) =
+            canonical_existing_media_path(root_path, &full_candidate_path)?;
+
         if !self
             .allowed_extensions()
             .contains(&extension_with_dot(&full_candidate_path))
@@ -646,7 +672,6 @@ impl LocalMediaLibrary {
             return None;
         }
 
-        let relative_path = relative_path(root_path, &full_candidate_path)?;
         if is_internal_cache_path(&relative_path) {
             return None;
         }
@@ -661,7 +686,7 @@ impl LocalMediaLibrary {
             });
         }
 
-        let file = open_read_no_follow(root_path, &relative_path).ok()?;
+        let file = open_read_no_follow(&canonical_root_path, &relative_path).ok()?;
         let metadata = file.metadata().ok()?;
         if !metadata.file_type().is_file() {
             return None;
@@ -961,7 +986,7 @@ fn is_internal_cache_components(mut components: Components<'_>) -> bool {
     )
 }
 
-fn create_item_id(relative_path: &str) -> String {
+pub(crate) fn create_item_id(relative_path: &str) -> String {
     format!(
         "local.{ROOT_ID}.{}",
         URL_SAFE_NO_PAD.encode(relative_path.as_bytes())
@@ -1027,6 +1052,19 @@ fn relative_path(root_path: &Path, path: &Path) -> Option<String> {
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/"),
     )
+}
+
+fn canonical_existing_media_path(
+    root_path: &Path,
+    candidate_path: &Path,
+) -> Option<(PathBuf, PathBuf, String)> {
+    let canonical_root_path = fs::canonicalize(root_path).ok()?;
+    let canonical_candidate_path = fs::canonicalize(candidate_path).ok()?;
+    if !is_within_root(&canonical_root_path, &canonical_candidate_path) {
+        return None;
+    }
+    let relative_path = relative_path(&canonical_root_path, &canonical_candidate_path)?;
+    Some((canonical_root_path, canonical_candidate_path, relative_path))
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -2412,6 +2450,57 @@ mod tests {
             library
                 .open_media_file_blocking(&item_id, VARIANT_ID)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn filesystem_aliases_share_canonical_gate_and_mutation_identity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let media_path = root_path.join("Bilibili/Task-One/Video.mp4");
+        fs::create_dir_all(media_path.parent().unwrap())
+            .expect("media directory should be created");
+        fs::write(&media_path, b"video").expect("media should be written");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let alias_path = root_path.join("bilibili/task-one/video.mp4");
+        if !alias_path.is_file() {
+            return;
+        }
+
+        let gate = Arc::new(LibraryPublicationGate::known_empty());
+        gate.install_durable_blocked_paths(["Bilibili/Task-One"])
+            .expect("durable task ownership should install");
+        let library = LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(CacheServerOptions {
+                root_path,
+                allow_library_item_delete: true,
+                ..CacheServerOptions::default()
+            }),
+            Arc::clone(&gate),
+        );
+        let alias_id = create_item_id("bilibili/task-one/video.mp4");
+        assert!(library.get_item_blocking(&alias_id).is_none());
+        assert!(
+            library
+                .canonical_deletable_item_id_blocking(&alias_id)
+                .expect("alias validation should succeed")
+                .is_none()
+        );
+
+        gate.install_durable_blocked_paths(std::iter::empty::<&str>())
+            .expect("durable publication should release the gate");
+        let canonical_id = create_item_id("Bilibili/Task-One/Video.mp4");
+        assert_eq!(
+            Some(canonical_id.clone()),
+            library.item_id_for_media_path_blocking(&alias_path)
+        );
+        assert_eq!(
+            Some((canonical_id, "Bilibili/Task-One/Video.mp4".to_owned())),
+            library
+                .canonical_deletable_item_id_blocking(&alias_id)
+                .expect("alias validation should succeed")
         );
     }
 
