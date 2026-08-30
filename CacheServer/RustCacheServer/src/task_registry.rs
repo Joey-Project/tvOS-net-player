@@ -12,7 +12,7 @@ use std::{
 
 use prost::Message;
 use prost_types::Timestamp;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, futures::OwnedNotified, mpsc};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -752,7 +752,7 @@ impl BilibiliTaskRegistry {
                 "Task creation could not be persisted durably.",
             ));
         }
-        self.queue_notify.notify_one();
+        self.queue_notify.notify_waiters();
         Ok(task)
     }
 
@@ -844,7 +844,7 @@ impl BilibiliTaskRegistry {
                 "Bilibili task v2 creation could not be committed.",
             ));
         }
-        self.queue_notify.notify_one();
+        self.queue_notify.notify_waiters();
         Ok(task)
     }
 
@@ -1373,6 +1373,9 @@ impl BilibiliTaskRegistry {
             }
         }
 
+        let bilibili_queue_may_be_unblocked = completed
+            .iter()
+            .any(|intent| intent.kind == PersistedFileCleanupKind::BilibiliOwnedOutputDirectory);
         if !completed.is_empty() {
             let _mutation_guard = self.mutation_guard();
             let mut inner = self.inner.lock().expect("task registry lock poisoned");
@@ -1392,6 +1395,9 @@ impl BilibiliTaskRegistry {
                 return Err(Status::unavailable(
                     "Completed file cleanup could not be cleared durably.",
                 ));
+            }
+            if bilibili_queue_may_be_unblocked {
+                self.queue_notify.notify_waiters();
             }
         }
 
@@ -2169,11 +2175,12 @@ impl BilibiliTaskRegistry {
 
     pub async fn claim_next_bilibili_task(&self) -> BilibiliTaskWorkItem {
         loop {
+            let queue_changed = self.bilibili_task_queue_change();
             if let Some(work_item) = self.try_claim_next_bilibili_task() {
                 return work_item;
             }
 
-            self.queue_notify.notified().await;
+            queue_changed.await;
         }
     }
 
@@ -2319,8 +2326,8 @@ impl BilibiliTaskRegistry {
         }
     }
 
-    pub(crate) async fn wait_for_bilibili_task_queue_change(&self) {
-        self.queue_notify.notified().await;
+    pub(crate) fn bilibili_task_queue_change(&self) -> OwnedNotified {
+        Arc::clone(&self.queue_notify).notified_owned()
     }
 
     pub fn update_task_progress(&self, id: &str, progress: BilibiliTaskProgress) -> bool {

@@ -219,6 +219,7 @@ async fn run_pending_file_cleanup_worker_with_backoff(
 
 async fn claim_next_bilibili_task(registry: Arc<BilibiliTaskRegistry>) -> BilibiliTaskWorkItem {
     loop {
+        let queue_changed = registry.bilibili_task_queue_change();
         if let Some(work_item) = registry.try_claim_next_bilibili_task() {
             return work_item;
         }
@@ -248,7 +249,7 @@ async fn claim_next_bilibili_task(registry: Arc<BilibiliTaskRegistry>) -> Bilibi
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
-        registry.wait_for_bilibili_task_queue_change().await;
+        queue_changed.await;
     }
 }
 
@@ -828,6 +829,79 @@ mod tests {
             .await
             .expect("the worker should retry cleanup")
             .expect("the claim task should not panic");
+        assert_eq!(task.id, work_item.task_id);
+        assert!(!stale_output_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_output_cleanup_wakes_a_pre_registered_task_queue_waiter() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-queue-notify",
+                None,
+                None,
+                "Cleanup queue notification".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let stale_output_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&stale_output_path),
+            )
+            .expect("stale output ownership should be durable");
+        std::fs::create_dir_all(stale_output_path.parent().unwrap())
+            .expect("staging parent should be created");
+        std::fs::write(&stale_output_path, b"block startup directory cleanup")
+            .expect("a non-directory fixture should block startup cleanup");
+        drop(registry);
+
+        let restored = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        assert!(restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        std::fs::remove_file(&stale_output_path)
+            .expect("the startup cleanup blocker should be removable");
+        std::fs::create_dir(&stale_output_path)
+            .expect("the stale task-owned output directory should be restorable");
+        std::fs::write(stale_output_path.join("partial.m4s"), b"stale")
+            .expect("stale output should be created");
+
+        // Register before the final condition check to model cleanup completing after the failed
+        // claim but before the worker awaits. notify_waiters records this transition in the
+        // already-created future even though it has not been polled yet.
+        let queue_changed = restored.bilibili_task_queue_change();
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        assert!(restored.retry_pending_file_cleanups());
+        assert!(!restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        tokio::time::timeout(Duration::from_secs(1), queue_changed)
+            .await
+            .expect("durable cleanup completion should wake the task queue waiter");
+
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("the restored task should become claimable");
         assert_eq!(task.id, work_item.task_id);
         assert!(!stale_output_path.exists());
     }

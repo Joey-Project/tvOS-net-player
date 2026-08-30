@@ -1510,6 +1510,16 @@ fn set_errno(value: i32) {
 
 #[cfg(unix)]
 pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
+    remove_entry_no_follow_with_parent_sync(root_path, relative_path, 0, File::sync_all)
+}
+
+#[cfg(unix)]
+fn remove_entry_no_follow_with_parent_sync(
+    root_path: &Path,
+    relative_path: &str,
+    unlink_flags: i32,
+    mut sync_parent: impl FnMut(&File) -> io::Result<()>,
+) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
@@ -1524,28 +1534,37 @@ pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
         ) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                sync_parent(&directory)?;
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
     }
 
+    // The protected property is durable absence of this named entry beneath the verified
+    // no-follow parent chain. The entry's previous object identity and content are irrelevant:
+    // after unlink, or after observing an already-missing entry from a prior failed sync, the
+    // containing directory must reach stable storage before cleanup ownership can be cleared.
     // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
     let result = unsafe {
         libc::unlinkat(
             directory.as_raw_fd(),
             segments.last().expect("segments is not empty").as_ptr(),
-            0,
+            unlink_flags,
         )
     };
     if result != 0 {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::NotFound {
+            sync_parent(&directory)?;
             Ok(false)
         } else {
             Err(error)
         };
     }
 
+    sync_parent(&directory)?;
     Ok(true)
 }
 
@@ -1563,46 +1582,15 @@ pub(crate) fn remove_empty_directory_no_follow(
     root_path: &Path,
     relative_path: &str,
 ) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-
-    let segments = relative_path_segments(relative_path)?;
-    let mut directory = open_path(
-        root_path,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-    )?;
-    for segment in &segments[..segments.len() - 1] {
-        directory = match open_at(
-            directory.as_raw_fd(),
-            segment,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-        ) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-    }
-
     // Protect path containment and no-follow access policy, not continuity of the leaf's
     // identity across calls: every parent is verified, and unlinkat removes only its named empty
     // child. A replacement that is not an empty directory fails instead of being traversed.
-    // SAFETY: directory fd is borrowed from a live File and the last path segment is a valid C string.
-    let result = unsafe {
-        libc::unlinkat(
-            directory.as_raw_fd(),
-            segments.last().expect("segments is not empty").as_ptr(),
-            libc::AT_REMOVEDIR,
-        )
-    };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(false)
-        } else {
-            Err(error)
-        };
-    }
-
-    Ok(true)
+    remove_entry_no_follow_with_parent_sync(
+        root_path,
+        relative_path,
+        libc::AT_REMOVEDIR,
+        File::sync_all,
+    )
 }
 
 #[cfg(not(unix))]
@@ -2873,6 +2861,44 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_no_follow_retries_parent_sync_after_unlink_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let movie_dir = root_path.join("Movies");
+        let movie_path = movie_dir.join("Sample.mp4");
+        fs::create_dir_all(&movie_dir).unwrap();
+        fs::write(&movie_path, b"sample").unwrap();
+        let mut failed_syncs = 0;
+
+        let error =
+            remove_entry_no_follow_with_parent_sync(&root_path, "Movies/Sample.mp4", 0, |_| {
+                failed_syncs += 1;
+                Err(io::Error::other("injected parent directory sync failure"))
+            })
+            .expect_err("an unsynchronized unlink must remain retryable");
+
+        assert_eq!(io::ErrorKind::Other, error.kind());
+        assert_eq!(1, failed_syncs);
+        assert!(!movie_path.exists());
+
+        let mut retry_syncs = 0;
+        let removed = remove_entry_no_follow_with_parent_sync(
+            &root_path,
+            "Movies/Sample.mp4",
+            0,
+            |directory| {
+                retry_syncs += 1;
+                directory.sync_all()
+            },
+        )
+        .expect("the missing entry should retry its parent directory sync");
+
+        assert!(!removed);
+        assert_eq!(1, retry_syncs);
+    }
+
     #[test]
     fn delete_item_rejects_all_internal_cache_files() {
         let temp = tempfile::tempdir().unwrap();
@@ -2912,6 +2938,45 @@ mod tests {
 
         assert!(!resource_dir.exists());
         assert!(root_path.join(".tvos-net-player/resources").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_directory_no_follow_retries_parent_sync_after_unlink_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let resource_dir = root_path.join(".tvos-net-player/resources/resource-1");
+        fs::create_dir_all(&resource_dir).unwrap();
+        let mut failed_syncs = 0;
+
+        remove_entry_no_follow_with_parent_sync(
+            &root_path,
+            ".tvos-net-player/resources/resource-1",
+            libc::AT_REMOVEDIR,
+            |_| {
+                failed_syncs += 1;
+                Err(io::Error::other("injected parent directory sync failure"))
+            },
+        )
+        .expect_err("an unsynchronized directory unlink must remain retryable");
+
+        assert_eq!(1, failed_syncs);
+        assert!(!resource_dir.exists());
+
+        let mut retry_syncs = 0;
+        let removed = remove_entry_no_follow_with_parent_sync(
+            &root_path,
+            ".tvos-net-player/resources/resource-1",
+            libc::AT_REMOVEDIR,
+            |directory| {
+                retry_syncs += 1;
+                directory.sync_all()
+            },
+        )
+        .expect("the missing directory should retry its parent directory sync");
+
+        assert!(!removed);
+        assert_eq!(1, retry_syncs);
     }
 
     #[cfg(unix)]
