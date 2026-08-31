@@ -50,21 +50,7 @@ impl LibraryPublicationGate {
         }
     }
 
-    pub(crate) fn known_empty_for_output_directory(
-        cache_root: &Path,
-        output_directory: &Path,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Known {
-                blocked_paths: HashSet::new(),
-            })),
-            managed_output_prefix: Some(publication_gate_output_prefix(
-                cache_root,
-                output_directory,
-            )?),
-        })
-    }
-
+    #[cfg(test)]
     pub(crate) fn unknown_for_output_directory(
         cache_root: &Path,
         output_directory: &Path,
@@ -78,8 +64,30 @@ impl LibraryPublicationGate {
         })
     }
 
+    pub(crate) fn unknown_until_restore_for_output_directory(
+        cache_root: &Path,
+        output_directory: &Path,
+    ) -> io::Result<Self> {
+        let managed_output_prefix = publication_gate_output_prefix(cache_root, output_directory)?;
+        Ok(Self {
+            // A failed snapshot cannot reveal historical output roots, so startup blocks the
+            // complete cache until restoration installs the exact durable blocked-path set.
+            state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Unknown {
+                blocked_prefix: PathBuf::new(),
+            })),
+            managed_output_prefix: Some(managed_output_prefix),
+        })
+    }
+
     pub(crate) fn managed_output_prefix(&self) -> Option<PathBuf> {
         self.managed_output_prefix.clone()
+    }
+
+    fn restoration_is_pending(&self) -> bool {
+        matches!(
+            self.snapshot().as_ref(),
+            LibraryPublicationGateState::Unknown { .. }
+        )
     }
 
     pub(crate) fn install_durable_blocked_paths<'a>(
@@ -272,6 +280,10 @@ impl LocalMediaLibrary {
             return Ok(false);
         };
         deletion.delete().await
+    }
+
+    pub(crate) fn publication_restoration_is_pending(&self) -> bool {
+        self.publication_gate.restoration_is_pending()
     }
 
     pub async fn prepare_item_deletion(&self, id: &str) -> io::Result<Option<LibraryItemDeletion>> {

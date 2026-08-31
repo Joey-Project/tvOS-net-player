@@ -445,20 +445,18 @@ impl AppState {
         let task_state_path = options.task_state_path();
         let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
-        let publication_gate = Arc::new(
+        let publication_output_directory =
             if options.bilibili_worker_enabled || options.bbdown_output_dir.is_some() {
-                LibraryPublicationGate::unknown_for_output_directory(
-                    &options.root_path,
-                    &options.bbdown_output_dir(),
-                )
-                .expect("validated Bilibili output directory must be inside the cache root")
+                options.bbdown_output_dir()
             } else {
-                LibraryPublicationGate::known_empty_for_output_directory(
-                    &options.root_path,
-                    &options.root_path.join("Bilibili"),
-                )
-                .expect("default Bilibili output directory must be inside the cache root")
-            },
+                options.root_path.join("Bilibili")
+            };
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_until_restore_for_output_directory(
+                &options.root_path,
+                &publication_output_directory,
+            )
+            .expect("validated Bilibili output directory must be inside the cache root"),
         );
         let library = Arc::new(LocalMediaLibrary::new_with_publication_gate(
             Arc::clone(&options),
@@ -1179,6 +1177,11 @@ impl AppState {
     }
 
     pub(crate) async fn delete_local_library_item(&self, item_id: &str) -> Result<bool, Status> {
+        if self.library.publication_restoration_is_pending() {
+            return Err(Status::unavailable(
+                "Library publication state is unavailable; repair task state and restart.",
+            ));
+        }
         let Some(deletion) =
             self.library
                 .prepare_item_deletion(item_id)
@@ -4556,6 +4559,60 @@ mod tests {
             std::fs::read(&task_state_path)
                 .expect("malformed task snapshot should be preserved")
                 .as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_task_snapshot_keeps_the_complete_library_fail_closed() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let historical_media_path = root_path.join("OldOutput/task-one/video.mp4");
+        let local_media_path = root_path.join("Personal/video.mp4");
+        std::fs::create_dir_all(historical_media_path.parent().unwrap())
+            .expect("historical output directory should be created");
+        std::fs::create_dir_all(local_media_path.parent().unwrap())
+            .expect("local media directory should be created");
+        std::fs::write(&historical_media_path, b"unpublished")
+            .expect("historical media should be written");
+        std::fs::write(&local_media_path, b"local").expect("local media should be written");
+        let task_state_path = root_path.join(".state/tasks.json");
+        std::fs::create_dir_all(task_state_path.parent().unwrap())
+            .expect("task state directory should be created");
+        std::fs::write(&task_state_path, b"{ malformed task snapshot")
+            .expect("malformed task snapshot should be written");
+
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path,
+                task_state_path,
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+        let historical_item_id = state
+            .library
+            .item_id_for_media_path(&historical_media_path)
+            .await
+            .expect("historical media should have an opaque item id");
+        let local_item_id = state
+            .library
+            .item_id_for_media_path(&local_media_path)
+            .await
+            .expect("local media should have an opaque item id");
+
+        assert!(state.library.get_item(&historical_item_id).await.is_none());
+        assert!(state.library.get_item(&local_item_id).await.is_none());
+        assert!(
+            state
+                .library
+                .list_items_page(None, 0, 50)
+                .await
+                .items
+                .is_empty()
         );
     }
 

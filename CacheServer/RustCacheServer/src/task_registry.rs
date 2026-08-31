@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -73,6 +73,7 @@ const MAX_TASK_RESOURCE_DIRECTORY_NAMES: usize = MAX_REGISTERED_TASK_RESOURCES +
 const MAX_TASK_PERSISTENCE_CLONE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES: usize = 100_000;
 const MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH: usize = 64;
+const TASK_RESOURCE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 // Staged publication protects the destination object's identity and the bytes installed in that
 // object. Exclusive fd-relative creation plus device/inode revalidation protects identity; the
@@ -285,26 +286,37 @@ impl<'a> StagedTaskOutputReplacement<'a> {
         after_source_open: impl FnOnce(),
     ) -> io::Result<()> {
         let source = self.registry.open_cache_source_no_follow(source_path)?;
-        self.copy_resource_body_from_open_cache_file_with_hook(
+        self.copy_resource_body_from_open_cache_file_with_hooks(
             resource_id,
             &source,
             after_source_open,
+            || false,
+            |_| {},
         )
     }
 
-    pub(crate) fn copy_resource_body_from_open_cache_file(
+    pub(crate) fn copy_resource_body_from_open_cache_file_with_cancellation(
         &self,
         resource_id: &str,
         source: &File,
+        is_cancel_requested: impl Fn() -> bool,
     ) -> io::Result<()> {
-        self.copy_resource_body_from_open_cache_file_with_hook(resource_id, source, || {})
+        self.copy_resource_body_from_open_cache_file_with_hooks(
+            resource_id,
+            source,
+            || {},
+            is_cancel_requested,
+            |_| {},
+        )
     }
 
-    fn copy_resource_body_from_open_cache_file_with_hook(
+    fn copy_resource_body_from_open_cache_file_with_hooks(
         &self,
         resource_id: &str,
         source: &File,
         after_source_open: impl FnOnce(),
+        is_cancel_requested: impl Fn() -> bool,
+        after_chunk: impl Fn(u64),
     ) -> io::Result<()> {
         let resource = self.resource_requiring_body_creation(resource_id)?;
         let mut source = source.try_clone()?;
@@ -321,7 +333,47 @@ impl<'a> StagedTaskOutputReplacement<'a> {
         let identity = self
             .registry
             .create_staged_resource_body(resource, |body| {
-                let copied = io::copy(&mut source, body)?;
+                let mut copied = 0_u64;
+                let mut buffer = [0_u8; TASK_RESOURCE_COPY_BUFFER_BYTES];
+                loop {
+                    if is_cancel_requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "staged task resource copy was cancelled",
+                        ));
+                    }
+                    let read = source.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    if is_cancel_requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "staged task resource copy was cancelled",
+                        ));
+                    }
+                    body.write_all(&buffer[..read])?;
+                    copied = copied
+                        .checked_add(u64::try_from(read).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "staged task resource copy size cannot be represented",
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "staged task resource copy size overflowed",
+                            )
+                        })?;
+                    after_chunk(copied);
+                }
+                if is_cancel_requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "staged task resource copy was cancelled",
+                    ));
+                }
                 if copied != expected_source_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -542,7 +594,7 @@ impl BilibiliTaskRegistry {
     ) -> Self {
         let library_publication_gate = resource_root_path.as_ref().map(|root_path| {
             Arc::new(
-                LibraryPublicationGate::known_empty_for_output_directory(
+                LibraryPublicationGate::unknown_until_restore_for_output_directory(
                     root_path,
                     &root_path.join("Bilibili"),
                 )
@@ -1506,6 +1558,9 @@ impl BilibiliTaskRegistry {
         let Some(output_root) = self.bilibili_output_root_relative_path.as_deref() else {
             return Ok(());
         };
+        if output_root.as_os_str().is_empty() {
+            return Ok(());
+        }
         let relative_path = Path::new(relative_path);
         if !relative_path.starts_with(output_root) {
             return Ok(());
@@ -12165,6 +12220,64 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn local_item_deletion_preserves_ancestors_when_output_root_is_cache_root() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        let season_path = root_path.join("Personal/Season");
+        std::fs::create_dir_all(&season_path).expect("local media directories should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let season_path = root_path.join("Personal/Season");
+        let media_path = season_path.join("video.mp4");
+        std::fs::write(&media_path, b"media").expect("local media should be written");
+        let publication_gate = Arc::new(
+            LibraryPublicationGate::unknown_until_restore_for_output_directory(
+                &root_path, &root_path,
+            )
+            .expect("cache-root output should be supported"),
+        );
+        let library = crate::library::LocalMediaLibrary::new_with_publication_gate(
+            Arc::new(crate::config::CacheServerOptions {
+                root_path: root_path.clone(),
+                bbdown_output_dir: Some(root_path.clone()),
+                ..crate::config::CacheServerOptions::default()
+            }),
+            Arc::clone(&publication_gate),
+        );
+        let registry =
+            BilibiliTaskRegistry::with_persistence_path_retention_resource_root_and_publication_gate(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+                Some(publication_gate),
+            );
+        let item_id = library
+            .item_id_for_media_path(&media_path)
+            .await
+            .expect("local media item id should resolve");
+        let deletion = library
+            .prepare_item_deletion(&item_id)
+            .await
+            .expect("local deletion should prepare")
+            .expect("local media should exist");
+        let prepared = registry
+            .tombstone_library_item_before_delete(deletion.item_id(), deletion.relative_path())
+            .expect("local item tombstone should be durable");
+
+        assert!(
+            prepared
+                .delete()
+                .expect("local media deletion should succeed")
+        );
+        assert!(!media_path.exists());
+        assert!(season_path.is_dir());
+        assert!(root_path.join("Personal").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failed_transient_media_cleanup_remains_hidden_across_restart() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -12325,6 +12438,59 @@ mod tests {
         std::fs::write(&transient_path, b"replacement media")
             .expect("replacement media should be written");
         assert!(restored_library.get_item(&item_id).await.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_resource_copy_removes_partial_body_when_cancelled_between_chunks() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let source_directory = root_path.join("downloads");
+        std::fs::create_dir_all(&source_directory).expect("source directory should be created");
+        let source_path = source_directory.join("large-subtitle.bin");
+        let source_bytes = vec![b'x'; TASK_RESOURCE_COPY_BUFFER_BYTES * 2];
+        std::fs::write(&source_path, &source_bytes).expect("source body should be written");
+        let source = File::open(&source_path).expect("source descriptor should open");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state/tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_task("BV1cancel-resource-copy", None)
+            .expect("task should be created");
+        let resource = test_task_resource(
+            "cancelled-resource-copy",
+            i64::try_from(source_bytes.len()).expect("fixture size should fit"),
+        );
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("resource output should stage");
+        let cancelled = AtomicBool::new(false);
+        let copied_chunks = std::sync::atomic::AtomicUsize::new(0);
+
+        let error = staged
+            .copy_resource_body_from_open_cache_file_with_hooks(
+                &resource.resource.id,
+                &source,
+                || {},
+                || cancelled.load(AtomicOrdering::SeqCst),
+                |copied| {
+                    assert_eq!(
+                        u64::try_from(TASK_RESOURCE_COPY_BUFFER_BYTES)
+                            .expect("buffer size should fit"),
+                        copied
+                    );
+                    copied_chunks.fetch_add(1, AtomicOrdering::SeqCst);
+                    cancelled.store(true, AtomicOrdering::SeqCst);
+                },
+            )
+            .expect_err("cancellation after the first chunk must stop the copy");
+
+        assert_eq!(io::ErrorKind::Interrupted, error.kind());
+        assert_eq!(1, copied_chunks.load(AtomicOrdering::SeqCst));
+        assert!(!root_path.join(resource.relative_path()).exists());
     }
 
     #[cfg(unix)]

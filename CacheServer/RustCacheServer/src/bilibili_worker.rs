@@ -143,12 +143,17 @@ impl BilibiliTaskResourceCacheFile {
         &self,
         staged: &StagedTaskOutputReplacement<'_>,
         resource_id: &str,
+        cancellation: &BilibiliTaskCancellation,
     ) -> io::Result<()> {
         // The protected property is this regular-file object's identity, validated length, and
         // access mode. Path replacement cannot redirect the copy because it uses this descriptor;
         // timestamps and sibling-directory churn are intentionally ignored.
         self.revalidate()?;
-        staged.copy_resource_body_from_open_cache_file(resource_id, &self.file)?;
+        staged.copy_resource_body_from_open_cache_file_with_cancellation(
+            resource_id,
+            &self.file,
+            || cancellation.is_cancel_requested(),
+        )?;
         self.revalidate()
     }
 }
@@ -410,6 +415,7 @@ async fn run_one_bilibili_task(
                     output.library_item_id,
                     output.message,
                     output_v2,
+                    work_item.cancellation.clone(),
                     credentials_configured,
                 )
                 .await;
@@ -544,6 +550,7 @@ async fn complete_v2_terminal_task(
     library_item_id: String,
     message: String,
     output: BilibiliDownloadOutputV2,
+    cancellation: BilibiliTaskCancellation,
     credentials_configured: bool,
 ) {
     let output = Arc::new(output);
@@ -564,8 +571,16 @@ async fn complete_v2_terminal_task(
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
             let staged =
                 registry.stage_task_output_replacement(&task_id, output.resources.clone())?;
-            create_staged_resource_bodies(&staged, &output.resource_bodies)
-                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            create_staged_resource_bodies(&staged, &output.resource_bodies, &cancellation)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && cancellation.is_cancel_requested()
+                    {
+                        tonic::Status::cancelled("Cancelled by request.")
+                    } else {
+                        tonic::Status::internal(error.to_string())
+                    }
+                })?;
             staged.commit_download_terminal(
                 output.results.clone(),
                 output.terminal_state,
@@ -679,12 +694,19 @@ fn validate_resource_body_descriptors(
 fn create_staged_resource_bodies(
     staged: &StagedTaskOutputReplacement<'_>,
     bodies: &[BilibiliTaskResourceBody],
+    cancellation: &BilibiliTaskCancellation,
 ) -> io::Result<()> {
     let bodies = bodies
         .iter()
         .map(|body| (body.resource_id.as_str(), &body.source))
         .collect::<HashMap<_, _>>();
     for resource in staged.resources_requiring_body_creation() {
+        if cancellation.is_cancel_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Bilibili task resource publication was cancelled",
+            ));
+        }
         let source = bodies.get(resource.resource.id.as_str()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -693,11 +715,17 @@ fn create_staged_resource_bodies(
         })?;
         match source {
             BilibiliTaskResourceBodySource::CacheFile(source) => {
-                source.copy_into(staged, &resource.resource.id)?;
+                source.copy_into(staged, &resource.resource.id, cancellation)?;
             }
             BilibiliTaskResourceBodySource::Bytes(bytes) => {
                 staged.write_resource_body(&resource.resource.id, bytes)?;
             }
+        }
+        if cancellation.is_cancel_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Bilibili task resource publication was cancelled",
+            ));
         }
     }
     Ok(())
@@ -897,6 +925,7 @@ mod tests {
                 resource_id: resource.resource.id.clone(),
                 source: BilibiliTaskResourceBodySource::CacheFile(source),
             }],
+            &BilibiliTaskCancellation::default(),
         )
         .expect("descriptor-bound sidecar should be copied");
 
