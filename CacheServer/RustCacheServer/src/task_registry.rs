@@ -27,8 +27,8 @@ use crate::{
     hls_cache::HlsCacheStore,
     library::{
         LibraryPublicationGate, decode_item_id, list_optional_directory_names_no_follow_bounded,
-        open_read_no_follow, remove_directory_tree_no_follow, remove_empty_directory_no_follow,
-        remove_file_no_follow,
+        open_read_no_follow, remove_directory_tree_no_follow_at, remove_empty_directory_no_follow,
+        remove_empty_directory_no_follow_at, remove_file_no_follow, remove_file_no_follow_at,
     },
     task_output::{
         MAX_REGISTERED_TASK_RESOURCES, MAX_TASK_RESOURCES, TaskOutputRecord,
@@ -1306,6 +1306,14 @@ impl BilibiliTaskRegistry {
         &self,
         owner: Option<(PersistedFileCleanupKind, &str)>,
     ) -> Result<bool, Status> {
+        self.retry_file_cleanup_intents_with_predelete_hook(owner, || {})
+    }
+
+    fn retry_file_cleanup_intents_with_predelete_hook(
+        &self,
+        owner: Option<(PersistedFileCleanupKind, &str)>,
+        predelete_hook: impl FnOnce(),
+    ) -> Result<bool, Status> {
         let resource_root_path = self.resource_root_path.as_ref().ok_or_else(|| {
             Status::failed_precondition("File cleanup storage root is not configured.")
         })?;
@@ -1350,34 +1358,35 @@ impl BilibiliTaskRegistry {
                 "Pending file cleanup ownership is missing its cache root identity.",
             )
         })?;
-        let current_root_identity = file_cleanup_root_identity_for_path(resource_root_path)
-            .map_err(|error| {
+        let current_root =
+            bind_file_cleanup_root_for_path(resource_root_path).map_err(|error| {
                 Status::failed_precondition(format!(
                     "File cleanup storage root could not be revalidated safely: {error}"
                 ))
             })?;
-        if current_root_identity != bound_root_identity {
+        if current_root.identity != bound_root_identity {
             return Err(Status::failed_precondition(
                 "Pending file cleanup ownership belongs to a different cache root.",
             ));
         }
+        predelete_hook();
         #[cfg(test)]
         self.file_cleanup_attempt_count
             .fetch_add(1, AtomicOrdering::SeqCst);
 
-        // A cleanup intent owns a logical cache-relative pathname until it is cleared. No-follow
-        // traversal protects containment and the no-symlink traversal policy. Object/content
-        // identity is not the protected property because a replacement at that still-owned
-        // pathname remains stale output; a type or traversal-policy change fails and leaves the
-        // intent for retry.
+        // The held root descriptor protects the persisted cache-root object identity for this
+        // entire batch. Descriptor-relative no-follow traversal protects containment and access
+        // policy below that root. Child content identity is intentionally irrelevant: an intent
+        // owns its logical name, so a replacement there is still stale output; a type or traversal
+        // policy change fails and leaves the intent for retry.
         let mut completed = Vec::new();
         let mut removed_any = false;
         let mut cleanup_failed = false;
         for intent in candidates {
             let removal = match intent.kind {
                 PersistedFileCleanupKind::BilibiliOwnedOutputDirectory => {
-                    remove_directory_tree_no_follow(
-                        resource_root_path,
+                    remove_directory_tree_no_follow_at(
+                        &current_root.directory,
                         &intent.relative_path,
                         MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_ENTRIES,
                         MAX_BILIBILI_OWNED_DIRECTORY_CLEANUP_DEPTH,
@@ -1385,7 +1394,7 @@ impl BilibiliTaskRegistry {
                 }
                 PersistedFileCleanupKind::BilibiliTransientOutput
                 | PersistedFileCleanupKind::LocalLibraryItem => {
-                    remove_file_no_follow(resource_root_path, &intent.relative_path)
+                    remove_file_no_follow_at(&current_root.directory, &intent.relative_path)
                 }
             };
             match removal {
@@ -1395,7 +1404,7 @@ impl BilibiliTaskRegistry {
                         PersistedFileCleanupKind::BilibiliTransientOutput
                             | PersistedFileCleanupKind::LocalLibraryItem
                     ) && let Err(error) = self.prune_managed_bilibili_output_ancestors(
-                        resource_root_path,
+                        &current_root.directory,
                         &intent.relative_path,
                     ) {
                         cleanup_failed = true;
@@ -1459,7 +1468,7 @@ impl BilibiliTaskRegistry {
 
     fn prune_managed_bilibili_output_ancestors(
         &self,
-        resource_root_path: &Path,
+        resource_root: &File,
         relative_path: &str,
     ) -> io::Result<()> {
         let Some(output_root) = self.bilibili_output_root_relative_path.as_deref() else {
@@ -1486,7 +1495,7 @@ impl BilibiliTaskRegistry {
                     "Bilibili output cleanup path is not valid UTF-8",
                 )
             })?;
-            match remove_empty_directory_no_follow(resource_root_path, directory_path) {
+            match remove_empty_directory_no_follow_at(resource_root, directory_path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
                 Err(error) => return Err(error),
@@ -6950,10 +6959,13 @@ fn replace_file_cleanup_intents_for_owner_locked(
     Ok(())
 }
 
+struct BoundFileCleanupRoot {
+    identity: PersistedFileCleanupRootIdentity,
+    directory: File,
+}
+
 #[cfg(unix)]
-fn file_cleanup_root_identity_for_path(
-    resource_root_path: &Path,
-) -> io::Result<PersistedFileCleanupRootIdentity> {
+fn bind_file_cleanup_root_for_path(resource_root_path: &Path) -> io::Result<BoundFileCleanupRoot> {
     use std::{
         ffi::CString,
         os::{
@@ -7000,21 +7012,29 @@ fn file_cleanup_root_identity_for_path(
             "cache root canonical path is not valid UTF-8",
         )
     })?;
-    PersistedFileCleanupRootIdentity::new(
+    let identity = PersistedFileCleanupRootIdentity::new(
         canonical_path,
         configured_metadata.dev(),
         configured_metadata.ino(),
-    )
+    )?;
+    Ok(BoundFileCleanupRoot {
+        identity,
+        directory: configured_root,
+    })
 }
 
 #[cfg(not(unix))]
-fn file_cleanup_root_identity_for_path(
-    _resource_root_path: &Path,
-) -> io::Result<PersistedFileCleanupRootIdentity> {
+fn bind_file_cleanup_root_for_path(_resource_root_path: &Path) -> io::Result<BoundFileCleanupRoot> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure file cleanup root binding is not implemented on this platform",
     ))
+}
+
+fn file_cleanup_root_identity_for_path(
+    resource_root_path: &Path,
+) -> io::Result<PersistedFileCleanupRootIdentity> {
+    Ok(bind_file_cleanup_root_for_path(resource_root_path)?.identity)
 }
 
 fn lexical_absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -11429,6 +11449,85 @@ mod tests {
         assert_eq!(
             durable_state,
             std::fs::read(&state_path).expect("mismatched state must remain untouched")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_batch_stays_bound_when_the_configured_root_is_replaced() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let root_path = temp.path().join("cache");
+        let displaced_root = temp.path().join("displaced-cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-root-race",
+                None,
+                None,
+                "Cleanup root race".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        let relative_path = format!("Bilibili/{}/transient-subtitle.srt", task.id);
+        let original_path = root_path.join(&relative_path);
+        std::fs::create_dir_all(original_path.parent().unwrap())
+            .expect("original cleanup parent should be created");
+        std::fs::write(&original_path, b"original").expect("original cleanup target should exist");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    title: task.result_items[0].title.clone(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Downloaded sidecar output.".to_owned(),
+                vec![original_path.clone()],
+                Vec::new(),
+            )
+            .expect("cleanup ownership should be durable");
+
+        let replacement_path = root_path.join(&relative_path);
+        assert!(
+            registry
+                .retry_file_cleanup_intents_with_predelete_hook(
+                    Some((PersistedFileCleanupKind::BilibiliTransientOutput, &task.id)),
+                    || {
+                        std::fs::rename(&root_path, &displaced_root)
+                            .expect("configured root should be displaced after descriptor binding");
+                        std::fs::create_dir_all(replacement_path.parent().unwrap())
+                            .expect("replacement cleanup parent should be created");
+                        std::fs::write(&replacement_path, b"replacement")
+                            .expect("replacement-root sentinel should exist");
+                    },
+                )
+                .expect("cleanup should remain bound to the original root")
+        );
+
+        assert!(!displaced_root.join(&relative_path).exists());
+        assert_eq!(
+            b"replacement",
+            std::fs::read(&replacement_path).unwrap().as_slice()
+        );
+        assert!(
+            TaskStateStore::new(state_path)
+                .load_state()
+                .unwrap()
+                .file_cleanup_intents
+                .is_empty()
         );
     }
 

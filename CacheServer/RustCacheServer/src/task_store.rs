@@ -1573,6 +1573,7 @@ impl PersistedTaskFile {
             | BILIBILI_CANDIDATE_TASK_STATE_SCHEMA_VERSION
             | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
             | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
+            | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
             | TASK_STATE_SCHEMA_VERSION => self
                 .output
                 .ok_or_else(|| {
@@ -4162,6 +4163,20 @@ mod tests {
         assert!(!artifact_resource_json.contains_key("relative_path"));
         assert!(!artifact_resource_json.contains_key("local_path"));
         assert!(!artifact_resource_json.contains_key("body_identity"));
+
+        let mut schema_v6_snapshot = snapshot.clone();
+        schema_v6_snapshot["schema_version"] =
+            serde_json::Value::from(TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&schema_v6_snapshot)
+                .expect("schema-v6 fixture should serialize"),
+        )
+        .expect("schema-v6 fixture should be written");
+        let schema_v6_records = TaskStateStore::new(&path)
+            .load()
+            .expect("schema-v6 task output should migrate without panicking");
+        assert_eq!(output, schema_v6_records[0].output);
 
         let mut missing_identity = snapshot.clone();
         missing_identity["tasks"][0]["output"]["resources"][0]

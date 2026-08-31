@@ -1339,26 +1339,34 @@ fn supports_secure_no_follow_open() -> bool {
 
 #[cfg(unix)]
 pub(crate) fn open_read_no_follow(root_path: &Path, relative_path: &str) -> io::Result<File> {
+    let root_directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    open_read_no_follow_at(&root_directory, relative_path)
+}
+
+#[cfg(unix)]
+pub(crate) fn open_read_no_follow_at(
+    root_directory: &File,
+    relative_path: &str,
+) -> io::Result<File> {
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
-
-    let mut directory = open_path(
-        root_path,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-    )?;
+    let mut directory = root_directory.try_clone()?;
     for segment in &segments[..segments.len() - 1] {
         directory = open_at(
             directory.as_raw_fd(),
             segment,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )?;
     }
 
     open_at(
         directory.as_raw_fd(),
         segments.last().expect("segments is not empty"),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
     )
 }
 
@@ -1367,6 +1375,17 @@ pub(crate) fn open_read_no_follow(_root_path: &Path, _relative_path: &str) -> io
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow media open is not implemented on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_read_no_follow_at(
+    _root_directory: &File,
+    _relative_path: &str,
+) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-relative media open is not implemented on this platform",
     ))
 }
 
@@ -1510,12 +1529,24 @@ fn set_errno(value: i32) {
 
 #[cfg(unix)]
 pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
-    remove_entry_no_follow_with_parent_sync(root_path, relative_path, 0, File::sync_all)
+    let root_directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    remove_file_no_follow_at(&root_directory, relative_path)
 }
 
 #[cfg(unix)]
-fn remove_entry_no_follow_with_parent_sync(
-    root_path: &Path,
+pub(crate) fn remove_file_no_follow_at(
+    root_directory: &File,
+    relative_path: &str,
+) -> io::Result<bool> {
+    remove_entry_no_follow_at_with_parent_sync(root_directory, relative_path, 0, File::sync_all)
+}
+
+#[cfg(unix)]
+fn remove_entry_no_follow_at_with_parent_sync(
+    root_directory: &File,
     relative_path: &str,
     unlink_flags: i32,
     mut sync_parent: impl FnMut(&File) -> io::Result<()>,
@@ -1523,10 +1554,7 @@ fn remove_entry_no_follow_with_parent_sync(
     use std::os::fd::AsRawFd;
 
     let segments = relative_path_segments(relative_path)?;
-    let mut directory = open_path(
-        root_path,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-    )?;
+    let mut directory = root_directory.try_clone()?;
     for segment in &segments[..segments.len() - 1] {
         directory = match open_at(
             directory.as_raw_fd(),
@@ -1568,6 +1596,25 @@ fn remove_entry_no_follow_with_parent_sync(
     Ok(true)
 }
 
+#[cfg(all(unix, test))]
+fn remove_entry_no_follow_with_parent_sync(
+    root_path: &Path,
+    relative_path: &str,
+    unlink_flags: i32,
+    sync_parent: impl FnMut(&File) -> io::Result<()>,
+) -> io::Result<bool> {
+    let root_directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    remove_entry_no_follow_at_with_parent_sync(
+        &root_directory,
+        relative_path,
+        unlink_flags,
+        sync_parent,
+    )
+}
+
 #[cfg(not(unix))]
 pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io::Result<bool> {
     match fs::remove_file(root_path.join(relative_path)) {
@@ -1577,16 +1624,39 @@ pub(crate) fn remove_file_no_follow(root_path: &Path, relative_path: &str) -> io
     }
 }
 
+#[cfg(not(unix))]
+pub(crate) fn remove_file_no_follow_at(
+    _root_directory: &File,
+    _relative_path: &str,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-relative file removal is not implemented on this platform",
+    ))
+}
+
 #[cfg(unix)]
 pub(crate) fn remove_empty_directory_no_follow(
     root_path: &Path,
     relative_path: &str,
 ) -> io::Result<bool> {
+    let root_directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    remove_empty_directory_no_follow_at(&root_directory, relative_path)
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_empty_directory_no_follow_at(
+    root_directory: &File,
+    relative_path: &str,
+) -> io::Result<bool> {
     // Protect path containment and no-follow access policy, not continuity of the leaf's
     // identity across calls: every parent is verified, and unlinkat removes only its named empty
     // child. A replacement that is not an empty directory fails instead of being traversed.
-    remove_entry_no_follow_with_parent_sync(
-        root_path,
+    remove_entry_no_follow_at_with_parent_sync(
+        root_directory,
         relative_path,
         libc::AT_REMOVEDIR,
         File::sync_all,
@@ -1601,6 +1671,17 @@ pub(crate) fn remove_empty_directory_no_follow(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure no-follow directory removal is not implemented on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_empty_directory_no_follow_at(
+    _root_directory: &File,
+    _relative_path: &str,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-relative directory removal is not implemented on this platform",
     ))
 }
 
@@ -1886,8 +1967,22 @@ pub(crate) fn remove_directory_tree_no_follow(
     max_entries: usize,
     max_depth: usize,
 ) -> io::Result<bool> {
-    remove_directory_tree_no_follow_with_parent_sync(
+    let root_directory = open_path(
         root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    remove_directory_tree_no_follow_at(&root_directory, relative_path, max_entries, max_depth)
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_directory_tree_no_follow_at(
+    root_directory: &File,
+    relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
+) -> io::Result<bool> {
+    remove_directory_tree_no_follow_at_with_parent_sync(
+        root_directory,
         relative_path,
         max_entries,
         max_depth,
@@ -1895,9 +1990,30 @@ pub(crate) fn remove_directory_tree_no_follow(
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn remove_directory_tree_no_follow_with_parent_sync(
     root_path: &Path,
+    relative_path: &str,
+    max_entries: usize,
+    max_depth: usize,
+    sync_parent: impl FnMut(&File) -> io::Result<()>,
+) -> io::Result<bool> {
+    let root_directory = open_path(
+        root_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    remove_directory_tree_no_follow_at_with_parent_sync(
+        &root_directory,
+        relative_path,
+        max_entries,
+        max_depth,
+        sync_parent,
+    )
+}
+
+#[cfg(unix)]
+fn remove_directory_tree_no_follow_at_with_parent_sync(
+    root_directory: &File,
     relative_path: &str,
     max_entries: usize,
     max_depth: usize,
@@ -1912,10 +2028,7 @@ fn remove_directory_tree_no_follow_with_parent_sync(
         ));
     }
     let segments = relative_path_segments(relative_path)?;
-    let mut parent = open_path(
-        root_path,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    )?;
+    let mut parent = root_directory.try_clone()?;
     for segment in &segments[..segments.len() - 1] {
         parent = match open_at(
             parent.as_raw_fd(),
@@ -1974,6 +2087,19 @@ pub(crate) fn remove_directory_tree_no_follow(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure recursive directory cleanup is not implemented on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_directory_tree_no_follow_at(
+    _root_directory: &File,
+    _relative_path: &str,
+    _max_entries: usize,
+    _max_depth: usize,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-relative recursive cleanup is not implemented on this platform",
     ))
 }
 
@@ -2898,6 +3024,60 @@ mod tests {
         assert!(
             !remove_file_no_follow(&root_path, "Movies/Series/Episode.mp4")
                 .expect("a raced nested deletion should remain idempotent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_cleanup_stays_bound_to_a_replaced_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("cache");
+        let displaced_root_path = temp.path().join("displaced-cache");
+        let file_relative_path = "Bilibili/task-file/video.mp4";
+        let directory_relative_path = "Bilibili/task-directory";
+        fs::create_dir_all(root_path.join("Bilibili/task-file")).unwrap();
+        fs::create_dir_all(root_path.join(directory_relative_path)).unwrap();
+        fs::write(root_path.join(file_relative_path), b"original-file").unwrap();
+        fs::write(
+            root_path.join(directory_relative_path).join("video.mp4"),
+            b"original-directory",
+        )
+        .unwrap();
+        let root_directory = open_path(
+            &root_path,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+        .unwrap();
+
+        fs::rename(&root_path, &displaced_root_path).unwrap();
+        fs::create_dir_all(root_path.join("Bilibili/task-file")).unwrap();
+        fs::create_dir_all(root_path.join(directory_relative_path)).unwrap();
+        fs::write(root_path.join(file_relative_path), b"replacement-file").unwrap();
+        fs::write(
+            root_path.join(directory_relative_path).join("video.mp4"),
+            b"replacement-directory",
+        )
+        .unwrap();
+
+        assert!(remove_file_no_follow_at(&root_directory, file_relative_path).unwrap());
+        assert!(
+            remove_directory_tree_no_follow_at(&root_directory, directory_relative_path, 8, 4,)
+                .unwrap()
+        );
+
+        assert!(!displaced_root_path.join(file_relative_path).exists());
+        assert!(!displaced_root_path.join(directory_relative_path).exists());
+        assert_eq!(
+            b"replacement-file",
+            fs::read(root_path.join(file_relative_path))
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(
+            b"replacement-directory",
+            fs::read(root_path.join(directory_relative_path).join("video.mp4"))
+                .unwrap()
+                .as_slice()
         );
     }
 
