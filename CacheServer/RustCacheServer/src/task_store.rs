@@ -137,6 +137,7 @@ impl PersistedFileCleanupIntent {
             && path_contains_owner
             && !targets_internal_storage;
         let valid_local_library_item = self.kind == PersistedFileCleanupKind::LocalLibraryItem
+            && !targets_internal_storage
             && decode_item_id(&self.owner_id).is_some_and(|path| {
                 path.components().collect::<PathBuf>().to_str() == Some(self.relative_path.as_str())
             });
@@ -1708,6 +1709,7 @@ impl PersistedTaskFile {
             | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
             | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
             | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
+            | FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION
             | TASK_STATE_SCHEMA_VERSION => self
                 .output
                 .ok_or_else(|| {
@@ -1717,7 +1719,12 @@ impl PersistedTaskFile {
                     )
                 })?
                 .into_output(&task, schema_version)?,
-            _ => unreachable!("task state schema version was validated before conversion"),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported task state schema version: {schema_version}"),
+                ));
+            }
         };
 
         Ok(PersistedTaskRecord {
@@ -3188,6 +3195,138 @@ mod tests {
                 "Bilibili/library-two.mp4",
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn nonempty_schema_v7_snapshot_migrates_to_current_schema() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let store = TaskStateStore::new(&path);
+        let task = Task {
+            id: "task-v7-migration".to_owned(),
+            kind: TaskKind::BilibiliDownload.into(),
+            state: TaskState::Completed.into(),
+            source: "BV1v7migration".to_owned(),
+            title: "Schema v7 migration".to_owned(),
+            ..Default::default()
+        };
+        let record = PersistedTaskRecord {
+            output: TaskOutputRecord::from_legacy_task(&task),
+            task,
+            options: None,
+            playback_options: None,
+            request_context: None,
+            bilibili_candidates: Vec::new(),
+        };
+        store
+            .save(std::slice::from_ref(&record))
+            .expect("current snapshot should persist");
+
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("snapshot should be readable"))
+                .expect("snapshot should be valid JSON");
+        snapshot["schema_version"] =
+            serde_json::Value::from(FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION);
+        snapshot
+            .as_object_mut()
+            .expect("snapshot should be an object")
+            .remove("bilibili_cleanup_owner_tombstones");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&snapshot).expect("v7 fixture should serialize"),
+        )
+        .expect("v7 fixture should be written");
+
+        let restored = store
+            .load_state()
+            .expect("a nonempty schema v7 snapshot should migrate");
+        assert_eq!(1, restored.records.len());
+        assert_eq!(record.task.id, restored.records[0].task.id);
+        assert_eq!(record.output, restored.records[0].output);
+
+        store
+            .save(&restored.records)
+            .expect("migrated records should write back in the current schema");
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated snapshot should be readable"))
+                .expect("migrated snapshot should be valid JSON");
+        assert_eq!(
+            Some(u64::from(TASK_STATE_SCHEMA_VERSION)),
+            migrated["schema_version"].as_u64()
+        );
+    }
+
+    #[test]
+    fn unknown_schema_version_conversion_fails_closed() {
+        let task = Task {
+            id: "task-unknown-schema".to_owned(),
+            source: "BV1unknownschema".to_owned(),
+            ..Default::default()
+        };
+        let file = PersistedTaskFile::from(PersistedTaskRecord {
+            output: TaskOutputRecord::from_legacy_task(&task),
+            task,
+            options: None,
+            playback_options: None,
+            request_context: None,
+            bilibili_candidates: Vec::new(),
+        });
+
+        let error = match file.into_record(TASK_STATE_SCHEMA_VERSION + 1) {
+            Ok(_) => panic!("an unknown schema version must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported task state schema version")
+        );
+    }
+
+    #[test]
+    fn internal_local_library_item_cleanup_snapshot_is_rejected_before_replay() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let path = temp.path().join("state").join("tasks.json");
+        let store = TaskStateStore::new(&path);
+        let library_relative_path = "Bilibili/library-item.mp4";
+        let intent = PersistedFileCleanupIntent::new(
+            PersistedFileCleanupKind::LocalLibraryItem,
+            create_item_id(library_relative_path),
+            library_relative_path,
+        )
+        .expect("ordinary local library cleanup should be valid");
+        let root_identity = PersistedFileCleanupRootIdentity::new("/cache/test", 1, 2)
+            .expect("cleanup root identity should be valid");
+        store
+            .save_with_file_cleanup_intents(&[], &[intent], Some(&root_identity))
+            .expect("ordinary local library cleanup should persist");
+
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("snapshot should be readable"))
+                .expect("snapshot should be valid JSON");
+        let internal_path = ".TvOS-Net-Player/task-resources/body";
+        snapshot["file_cleanup_intents"][0]["owner_id"] =
+            serde_json::Value::String(create_item_id(internal_path));
+        snapshot["file_cleanup_intents"][0]["relative_path"] =
+            serde_json::Value::String(internal_path.to_owned());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&snapshot)
+                .expect("internal cleanup fixture should serialize"),
+        )
+        .expect("internal cleanup fixture should be written");
+
+        let error = match store.load_state() {
+            Ok(_) => panic!("internal local library cleanup must not reach replay"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            error
+                .to_string()
+                .contains("persisted file cleanup relative path is invalid")
         );
     }
 

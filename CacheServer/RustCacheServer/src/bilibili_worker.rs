@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::File,
     future::Future,
     io,
     panic::AssertUnwindSafe,
@@ -72,8 +73,84 @@ pub struct BilibiliTaskResourceBody {
 }
 
 pub enum BilibiliTaskResourceBodySource {
-    CachePath(std::path::PathBuf),
+    CacheFile(BilibiliTaskResourceCacheFile),
     Bytes(Vec<u8>),
+}
+
+pub struct BilibiliTaskResourceCacheFile {
+    file: File,
+    identity: BilibiliTaskResourceCacheFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliTaskResourceCacheFileIdentity {
+    pub(crate) device_id: u64,
+    pub(crate) inode: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) mode: u32,
+}
+
+impl BilibiliTaskResourceCacheFileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "validated Bilibili task resource source is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            size_bytes: metadata.len(),
+            mode: metadata.mode() & 0o7777,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure Bilibili task resource source validation is not implemented on this platform",
+        ))
+    }
+}
+
+impl BilibiliTaskResourceCacheFile {
+    pub(crate) fn new(
+        file: File,
+        identity: BilibiliTaskResourceCacheFileIdentity,
+    ) -> io::Result<Self> {
+        let source = Self { file, identity };
+        source.revalidate()?;
+        Ok(source)
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        let actual = BilibiliTaskResourceCacheFileIdentity::from_metadata(&self.file.metadata()?)?;
+        if actual != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "validated Bilibili task resource source identity, length, or permission mode changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn copy_into(
+        &self,
+        staged: &StagedTaskOutputReplacement<'_>,
+        resource_id: &str,
+    ) -> io::Result<()> {
+        // The protected property is this regular-file object's identity, validated length, and
+        // access mode. Path replacement cannot redirect the copy because it uses this descriptor;
+        // timestamps and sibling-directory churn are intentionally ignored.
+        self.revalidate()?;
+        staged.copy_resource_body_from_open_cache_file(resource_id, &self.file)?;
+        self.revalidate()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,8 +692,8 @@ fn create_staged_resource_bodies(
             )
         })?;
         match source {
-            BilibiliTaskResourceBodySource::CachePath(path) => {
-                staged.copy_resource_body_from_cache_path(&resource.resource.id, path)?;
+            BilibiliTaskResourceBodySource::CacheFile(source) => {
+                source.copy_into(staged, &resource.resource.id)?;
             }
             BilibiliTaskResourceBodySource::Bytes(bytes) => {
                 staged.write_resource_body(&resource.resource.id, bytes)?;
@@ -758,6 +835,83 @@ mod tests {
         assert_eq!(1.0, completed.progress);
         assert_eq!(512, completed.downloaded_bytes);
         assert_eq!(1024, completed.total_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_bound_sidecar_copy_ignores_same_size_path_replacement() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let source_directory = root_path.join("Bilibili/task/candidate/entry");
+        std::fs::create_dir_all(&source_directory).expect("sidecar directory should be created");
+        let source_path = source_directory.join("subtitle.srt");
+        std::fs::write(&source_path, b"original").expect("original sidecar should be written");
+        let source_file = std::fs::File::open(&source_path)
+            .expect("original sidecar descriptor should be opened");
+        let identity = BilibiliTaskResourceCacheFileIdentity::from_metadata(
+            &source_file
+                .metadata()
+                .expect("original sidecar metadata should be readable"),
+        )
+        .expect("original sidecar identity should validate");
+        let source = BilibiliTaskResourceCacheFile::new(source_file, identity)
+            .expect("sidecar descriptor should bind to its validated object");
+
+        let displaced_path = source_directory.join("subtitle.original.srt");
+        std::fs::rename(&source_path, &displaced_path)
+            .expect("validated sidecar should be displaced");
+        std::fs::write(&source_path, b"replaced")
+            .expect("same-size replacement sidecar should be written");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state/tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1descriptor-sidecar",
+                None,
+                None,
+                "Descriptor sidecar".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "descriptor-sidecar".to_owned(),
+            content_type: "application/x-subrip".to_owned(),
+            size_bytes: 8,
+            size_known: true,
+            ..Default::default()
+        })
+        .expect("sidecar resource should be valid");
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("sidecar resource should be staged");
+        create_staged_resource_bodies(
+            &staged,
+            &[BilibiliTaskResourceBody {
+                resource_id: resource.resource.id.clone(),
+                source: BilibiliTaskResourceBodySource::CacheFile(source),
+            }],
+        )
+        .expect("descriptor-bound sidecar should be copied");
+
+        assert_eq!(
+            b"original",
+            std::fs::read(root_path.join(resource.relative_path()))
+                .expect("staged sidecar should be readable")
+                .as_slice()
+        );
+        assert_eq!(
+            b"replaced",
+            std::fs::read(source_path)
+                .expect("replacement sidecar should remain separate")
+                .as_slice()
+        );
     }
 
     #[cfg(unix)]

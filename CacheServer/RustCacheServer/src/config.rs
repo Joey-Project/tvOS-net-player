@@ -12,6 +12,7 @@ use crate::{task_output::MAX_TASK_RESOURCE_BASE_URI_BYTES, task_registry::TaskRe
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const DEFAULT_HLS_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+const RESERVED_CACHE_NAMESPACE: &str = ".tvos-net-player";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheServerOptions {
@@ -190,6 +191,11 @@ impl CacheServerOptions {
                 return Err(ConfigError::new(
                     "BBDown output directory must be inside Cache:RootPath.",
                 ));
+            }
+            if bbdown_output_dir_uses_reserved_namespace(&root_path, &bbdown_output_dir) {
+                return Err(ConfigError::new(format!(
+                    "BBDown output directory must not be inside the reserved {RESERVED_CACHE_NAMESPACE} namespace.",
+                )));
             }
             if bbdown_output_dir_contains_link(&root_path, &bbdown_output_dir)? {
                 return Err(ConfigError::new(
@@ -657,6 +663,22 @@ fn normalize_existing_path_prefix(path: &Path) -> PathBuf {
 fn path_contains_parent_component(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn bbdown_output_dir_uses_reserved_namespace(root_path: &Path, output_dir: &Path) -> bool {
+    output_dir
+        .strip_prefix(root_path)
+        .ok()
+        .and_then(|relative_path| relative_path.components().next())
+        .is_some_and(|component| {
+            matches!(
+                component,
+                Component::Normal(name)
+                    if name
+                        .to_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(RESERVED_CACHE_NAMESPACE))
+            )
+        })
 }
 
 fn bbdown_output_dir_contains_link(
@@ -1294,6 +1316,70 @@ mod tests {
         };
 
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bbdown_output_dir_at_reserved_staging_root() {
+        let root_path = PathBuf::from("/tmp/cache-root");
+        let options = CacheServerOptions {
+            bbdown_output_dir: Some(root_path.join(".tvos-net-player").join("bbdown-staging")),
+            root_path,
+            ..CacheServerOptions::default()
+        };
+
+        let error = options
+            .validate()
+            .expect_err("the fixed BBDown staging root must remain reserved");
+        assert!(error.to_string().contains("reserved .tvos-net-player"));
+    }
+
+    #[test]
+    fn rejects_bbdown_output_dir_below_reserved_staging_root() {
+        let root_path = PathBuf::from("/tmp/cache-root");
+        let options = CacheServerOptions {
+            bbdown_output_dir: Some(
+                root_path
+                    .join(".tvos-net-player")
+                    .join("bbdown-staging")
+                    .join("custom-output"),
+            ),
+            root_path,
+            ..CacheServerOptions::default()
+        };
+
+        let error = options
+            .validate()
+            .expect_err("BBDown staging descendants must remain reserved");
+        assert!(error.to_string().contains("reserved .tvos-net-player"));
+    }
+
+    #[test]
+    fn rejects_case_insensitive_reserved_bbdown_output_namespace() {
+        let root_path = PathBuf::from("/tmp/cache-root");
+        let options = CacheServerOptions {
+            bbdown_output_dir: Some(root_path.join(".TVOS-NET-PLAYER").join("custom-output")),
+            root_path,
+            ..CacheServerOptions::default()
+        };
+
+        let error = options
+            .validate()
+            .expect_err("reserved namespace spelling must be case insensitive");
+        assert!(error.to_string().contains("reserved .tvos-net-player"));
+    }
+
+    #[test]
+    fn accepts_custom_bbdown_output_dir_outside_reserved_namespace() {
+        let root_path = PathBuf::from("/tmp/cache-root");
+        let options = CacheServerOptions {
+            bbdown_output_dir: Some(root_path.join("downloads").join("bbdown")),
+            root_path,
+            ..CacheServerOptions::default()
+        };
+
+        options
+            .validate()
+            .expect("ordinary custom BBDown output directories should remain valid");
     }
 
     #[cfg(unix)]

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -284,8 +284,31 @@ impl<'a> StagedTaskOutputReplacement<'a> {
         source_path: &Path,
         after_source_open: impl FnOnce(),
     ) -> io::Result<()> {
+        let source = self.registry.open_cache_source_no_follow(source_path)?;
+        self.copy_resource_body_from_open_cache_file_with_hook(
+            resource_id,
+            &source,
+            after_source_open,
+        )
+    }
+
+    pub(crate) fn copy_resource_body_from_open_cache_file(
+        &self,
+        resource_id: &str,
+        source: &File,
+    ) -> io::Result<()> {
+        self.copy_resource_body_from_open_cache_file_with_hook(resource_id, source, || {})
+    }
+
+    fn copy_resource_body_from_open_cache_file_with_hook(
+        &self,
+        resource_id: &str,
+        source: &File,
+        after_source_open: impl FnOnce(),
+    ) -> io::Result<()> {
         let resource = self.resource_requiring_body_creation(resource_id)?;
-        let mut source = self.registry.open_cache_source_no_follow(source_path)?;
+        let mut source = source.try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
         let source_metadata = source.metadata()?;
         if !source_metadata.file_type().is_file() {
             return Err(io::Error::new(

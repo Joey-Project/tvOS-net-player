@@ -24,7 +24,6 @@ use bbdown_core::{
     SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
-    fs,
     io::AsyncReadExt,
     process::Command,
     sync::{Mutex, Semaphore},
@@ -42,6 +41,7 @@ use crate::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
         BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadOutputV2,
         BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
+        BilibiliTaskResourceCacheFile, BilibiliTaskResourceCacheFileIdentity,
     },
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
@@ -80,6 +80,31 @@ const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
 const BILIBILI_V2_STAGING_DIRECTORY: &str = ".tvos-net-player/bbdown-staging";
 const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES: usize = 100_000;
 const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH: usize = 64;
+const MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 512;
+const FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 128;
+const BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE: u64 = 4;
+
+#[cfg(unix)]
+fn bilibili_v2_retained_descriptor_budget() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the supplied rlimit on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET;
+    }
+    // SAFETY: the successful getrlimit call initialized limit.
+    let soft_limit = unsafe { limit.assume_init() }.rlim_cur;
+    if soft_limit == libc::RLIM_INFINITY {
+        return MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET;
+    }
+    usize::try_from(soft_limit / BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE)
+        .unwrap_or(MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET)
+        .min(MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET)
+}
+
+#[cfg(not(unix))]
+fn bilibili_v2_retained_descriptor_budget() -> usize {
+    FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BilibiliResolveCandidateWindow {
@@ -574,6 +599,8 @@ impl BbdownBilibiliAdapter {
         let mut output_integrity_error = None;
         let mut completed_downloaded_bytes = 0_u64;
         let mut total_bytes_floor = 0_u64;
+        let retained_descriptor_budget = bilibili_v2_retained_descriptor_budget();
+        let mut retained_validation_descriptors = 0_usize;
 
         // V2 task output is the durable authority. This task-local archive only coordinates
         // duplicate names between this task's candidates and needs no cross-task lock.
@@ -753,60 +780,73 @@ impl BbdownBilibiliAdapter {
             });
 
             let mut report = report;
-            let validated_paths = match prepare_owned_download_report_for_playback_in_place(
-                &mut report,
-                download_mode,
-                &self.ffmpeg_path,
-                &|| context.is_cancel_requested(),
-                &output_directories.cache_root,
-                &candidate_output.path,
-            )
-            .await
-            {
-                Ok(validated_paths) => validated_paths,
-                Err(BilibiliDownloadError::Cancelled(_)) => {
-                    cancelled = true;
-                    self.cleanup_failed_v2_candidate_output(
-                        &output_directories,
-                        &candidate_output,
-                        &request.task_id,
-                        &result_id,
-                        &mut output_integrity_error,
+            let remaining_descriptor_budget =
+                retained_descriptor_budget.saturating_sub(retained_validation_descriptors);
+            let validated_paths =
+                match prepare_owned_download_report_for_playback_in_place_with_descriptor_budget(
+                    &mut report,
+                    download_mode,
+                    &self.ffmpeg_path,
+                    &|| context.is_cancel_requested(),
+                    &output_directories.cache_root,
+                    &candidate_output.path,
+                    remaining_descriptor_budget,
+                )
+                .await
+                {
+                    Ok(validated_paths) => validated_paths,
+                    Err(BilibiliDownloadError::Cancelled(_)) => {
+                        cancelled = true;
+                        self.cleanup_failed_v2_candidate_output(
+                            &output_directories,
+                            &candidate_output,
+                            &request.task_id,
+                            &result_id,
+                            &mut output_integrity_error,
+                        )
+                        .await;
+                        candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                            cancelled_download_result(result_id, candidate),
+                        )));
+                        continue;
+                    }
+                    Err(error) => {
+                        self.cleanup_failed_v2_candidate_output(
+                            &output_directories,
+                            &candidate_output,
+                            &request.task_id,
+                            &result_id,
+                            &mut output_integrity_error,
+                        )
+                        .await;
+                        log_v2_candidate_error(
+                            &request.task_id,
+                            &result_id,
+                            self.options.bbdown_credential_path.is_some(),
+                            &error,
+                        );
+                        candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                            failed_download_result(result_id, candidate, &error),
+                        )));
+                        report_v2_candidate_finished(
+                            &context,
+                            offset,
+                            request.candidates.len(),
+                            completed_downloaded_bytes,
+                            total_bytes_floor,
+                        );
+                        continue;
+                    }
+                };
+            retained_validation_descriptors = retained_validation_descriptors
+                .checked_add(validated_paths.descriptor_count())
+                .filter(|count| *count <= retained_descriptor_budget)
+                .ok_or_else(|| {
+                    BilibiliDownloadError::ResourceExhausted(
+                        "Bilibili task output exceeded its retained file-descriptor budget."
+                            .to_owned(),
                     )
-                    .await;
-                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
-                        cancelled_download_result(result_id, candidate),
-                    )));
-                    continue;
-                }
-                Err(error) => {
-                    self.cleanup_failed_v2_candidate_output(
-                        &output_directories,
-                        &candidate_output,
-                        &request.task_id,
-                        &result_id,
-                        &mut output_integrity_error,
-                    )
-                    .await;
-                    log_v2_candidate_error(
-                        &request.task_id,
-                        &result_id,
-                        self.options.bbdown_credential_path.is_some(),
-                        &error,
-                    );
-                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
-                        failed_download_result(result_id, candidate, &error),
-                    )));
-                    report_v2_candidate_finished(
-                        &context,
-                        offset,
-                        request.candidates.len(),
-                        completed_downloaded_bytes,
-                        total_bytes_floor,
-                    );
-                    continue;
-                }
-            };
+                })?;
             archive.accept_candidate(candidate_archive);
             candidate_outcomes.push(V2CandidateDownloadOutcome::Downloaded {
                 result_id,
@@ -845,7 +885,7 @@ impl BbdownBilibiliAdapter {
                 };
                 let published_candidate =
                     v2_published_candidate_output_directory(&output_directories, offset)?;
-                if let Err(error) = revalidate_download_report_media_after_publication(
+                if let Err(error) = revalidate_download_report_files_after_publication(
                     &output_directories.cache_root,
                     &published_candidate.path,
                     validated_paths,
@@ -903,7 +943,7 @@ impl BbdownBilibiliAdapter {
                             download_mode,
                             V2DownloadFinalization {
                                 cancel_requested: false,
-                                publication_validation: Some(V2PublishedMediaValidation {
+                                publication_validation: Some(V2PublishedOutputValidation {
                                     cache_root: &output_directories.cache_root,
                                     published_root: &published_candidate.path,
                                     validated_paths: &validated_paths,
@@ -1267,7 +1307,7 @@ impl BbdownBilibiliAdapter {
         plan: &DownloadPlan,
         report: &DownloadReport,
         download_mode: DownloadMode,
-        publication_validation: Option<V2PublishedMediaValidation<'_>>,
+        publication_validation: Option<V2PublishedOutputValidation<'_>>,
     ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
         let entry = report.entries.first().ok_or_else(|| {
             BilibiliDownloadError::Failed(
@@ -1291,7 +1331,7 @@ impl BbdownBilibiliAdapter {
         let mut library_output_path = None;
         for candidate_path in playable_entry_output_candidates(entry) {
             if let Some(validation) = publication_validation {
-                revalidate_download_report_media_after_publication(
+                revalidate_download_report_files_after_publication(
                     validation.cache_root,
                     validation.published_root,
                     validation.validated_paths,
@@ -1304,7 +1344,7 @@ impl BbdownBilibiliAdapter {
                 .await
             {
                 if let Some(validation) = publication_validation {
-                    revalidate_download_report_media_after_publication(
+                    revalidate_download_report_files_after_publication(
                         validation.cache_root,
                         validation.published_root,
                         validation.validated_paths,
@@ -1340,7 +1380,7 @@ impl BbdownBilibiliAdapter {
             .filter(|file| !file.kind.is_media())
             .enumerate()
         {
-            let mapped = map_sidecar_artifact(file, index).await?;
+            let mapped = map_sidecar_artifact(file, index, publication_validation)?;
             artifacts.push(mapped.artifact);
             resources.push(mapped.resource);
             resource_bodies.push(mapped.body);
@@ -4290,8 +4330,20 @@ struct ValidatedDownloadReportPaths {
     entries: Vec<ValidatedDownloadEntryPaths>,
 }
 
+impl ValidatedDownloadReportPaths {
+    fn descriptor_count(&self) -> usize {
+        self.entries.iter().fold(1_usize, |count, entry| {
+            count.saturating_add(
+                1_usize
+                    .saturating_add(entry.media_files.len())
+                    .saturating_add(entry.sidecar_files.len()),
+            )
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
-struct V2PublishedMediaValidation<'a> {
+struct V2PublishedOutputValidation<'a> {
     cache_root: &'a Path,
     published_root: &'a Path,
     validated_paths: &'a ValidatedDownloadReportPaths,
@@ -4299,12 +4351,13 @@ struct V2PublishedMediaValidation<'a> {
 
 struct V2DownloadFinalization<'a> {
     cancel_requested: bool,
-    publication_validation: Option<V2PublishedMediaValidation<'a>>,
+    publication_validation: Option<V2PublishedOutputValidation<'a>>,
 }
 
 struct ValidatedDownloadEntryPaths {
     directory: File,
     media_files: Vec<ValidatedMediaFile>,
+    sidecar_files: Vec<ValidatedMediaFile>,
 }
 
 struct ValidatedMediaFile {
@@ -4330,7 +4383,7 @@ impl ValidatedMediaFileIdentity {
         if !metadata.file_type().is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "validated BBDown media path is not a regular file",
+                "validated BBDown output path is not a regular file",
             ));
         }
         Ok(Self {
@@ -4345,7 +4398,7 @@ impl ValidatedMediaFileIdentity {
     fn from_metadata(_metadata: &std::fs::Metadata) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "secure BBDown media identity validation is not implemented on this platform",
+            "secure BBDown output identity validation is not implemented on this platform",
         ))
     }
 
@@ -4354,16 +4407,60 @@ impl ValidatedMediaFileIdentity {
     }
 }
 
+struct RetainedDescriptorBudget {
+    maximum: usize,
+    used: usize,
+}
+
+impl RetainedDescriptorBudget {
+    fn new(maximum: usize) -> Self {
+        Self { maximum, used: 0 }
+    }
+
+    fn claim(&mut self) -> Result<(), BilibiliDownloadError> {
+        self.used = self
+            .used
+            .checked_add(1)
+            .filter(|used| *used <= self.maximum)
+            .ok_or_else(|| {
+                BilibiliDownloadError::ResourceExhausted(
+                    "Bilibili task output exceeded its retained file-descriptor budget.".to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+}
+
 async fn validate_download_report_paths_no_follow(
     cache_root: &Path,
     owned_root: &Path,
     report: &DownloadReport,
 ) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
+    validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        bilibili_v2_retained_descriptor_budget(),
+    )
+    .await
+}
+
+async fn validate_download_report_paths_no_follow_with_descriptor_budget(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+    max_retained_descriptors: usize,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
     let cache_root = cache_root.to_path_buf();
     let owned_root = owned_root.to_path_buf();
     let report = report.clone();
     tokio::task::spawn_blocking(move || {
-        validate_download_report_paths_no_follow_blocking(&cache_root, &owned_root, &report)
+        validate_download_report_paths_no_follow_blocking(
+            &cache_root,
+            &owned_root,
+            &report,
+            max_retained_descriptors,
+        )
     })
     .await
     .map_err(|_| {
@@ -4375,7 +4472,10 @@ fn validate_download_report_paths_no_follow_blocking(
     cache_root: &Path,
     owned_root: &Path,
     report: &DownloadReport,
+    max_retained_descriptors: usize,
 ) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
+    let mut descriptor_budget = RetainedDescriptorBudget::new(max_retained_descriptors);
+    descriptor_budget.claim()?;
     let owned_root_relative = cache_relative_normal_path(cache_root, owned_root)?;
     let owned_root_directory =
         open_read_no_follow(cache_root, &owned_root_relative).map_err(|_| {
@@ -4397,6 +4497,7 @@ fn validate_download_report_paths_no_follow_blocking(
     )?;
     let mut entries = Vec::with_capacity(report.entries.len());
     for entry in &report.entries {
+        descriptor_budget.claim()?;
         let (_, directory) = validate_download_report_path_no_follow_at(
             &owned_root_directory,
             owned_root,
@@ -4404,48 +4505,59 @@ fn validate_download_report_paths_no_follow_blocking(
             DownloadReportPathKind::Directory,
         )?;
         let mut media_files = Vec::new();
+        let mut sidecar_files = Vec::new();
         let mut media_paths = HashSet::new();
+        let mut sidecar_paths = HashSet::new();
         for file in &entry.files {
+            let (retained_files, retained_paths) = if is_media_kind(&file.kind) {
+                (&mut media_files, &mut media_paths)
+            } else {
+                (&mut sidecar_files, &mut sidecar_paths)
+            };
+            if !retained_paths.insert(file.path.clone()) {
+                continue;
+            }
+            descriptor_budget.claim()?;
             let (relative_to_owned_root, opened) = validate_download_report_path_no_follow_at(
                 &owned_root_directory,
                 owned_root,
                 &file.path,
                 DownloadReportPathKind::File,
             )?;
-            if is_media_kind(&file.kind) && media_paths.insert(file.path.clone()) {
-                let identity =
-                    ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
-                        .map_err(failed)?;
-                media_files.push(ValidatedMediaFile {
-                    path: file.path.clone(),
-                    relative_to_owned_root,
-                    file: opened,
-                    identity,
-                });
-            }
+            let identity =
+                ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
+                    .map_err(failed)?;
+            retained_files.push(ValidatedMediaFile {
+                path: file.path.clone(),
+                relative_to_owned_root,
+                file: opened,
+                identity,
+            });
         }
-        if let Some(mux) = &entry.mux {
+        if let Some(mux) = &entry.mux
+            && media_paths.insert(mux.output_path.clone())
+        {
+            descriptor_budget.claim()?;
             let (relative_to_owned_root, opened) = validate_download_report_path_no_follow_at(
                 &owned_root_directory,
                 owned_root,
                 &mux.output_path,
                 DownloadReportPathKind::File,
             )?;
-            if media_paths.insert(mux.output_path.clone()) {
-                let identity =
-                    ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
-                        .map_err(failed)?;
-                media_files.push(ValidatedMediaFile {
-                    path: mux.output_path.clone(),
-                    relative_to_owned_root,
-                    file: opened,
-                    identity,
-                });
-            }
+            let identity =
+                ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
+                    .map_err(failed)?;
+            media_files.push(ValidatedMediaFile {
+                path: mux.output_path.clone(),
+                relative_to_owned_root,
+                file: opened,
+                identity,
+            });
         }
         entries.push(ValidatedDownloadEntryPaths {
             directory,
             media_files,
+            sidecar_files,
         });
     }
     Ok(ValidatedDownloadReportPaths {
@@ -4505,7 +4617,7 @@ fn validate_download_report_path_no_follow_at(
     Ok((relative_to_owned_root.to_owned(), opened))
 }
 
-struct PublishedMediaValidationFile {
+struct PublishedFileValidation {
     relative_to_owned_root: String,
     file: File,
     identity: ValidatedMediaFileIdentity,
@@ -4573,7 +4685,7 @@ async fn verify_rebound_mux_file_identities(
     .map_err(failed)
 }
 
-async fn revalidate_download_report_media_after_publication(
+async fn revalidate_download_report_files_after_publication(
     cache_root: &Path,
     published_root: &Path,
     validated_paths: &ValidatedDownloadReportPaths,
@@ -4584,18 +4696,18 @@ async fn revalidate_download_report_media_after_publication(
     let files = validated_paths
         .entries
         .iter()
-        .flat_map(|entry| &entry.media_files)
-        .map(|media| {
-            Ok(PublishedMediaValidationFile {
-                relative_to_owned_root: media.relative_to_owned_root.clone(),
-                file: media.file.try_clone()?,
-                identity: media.identity,
+        .flat_map(|entry| entry.media_files.iter().chain(&entry.sidecar_files))
+        .map(|file| {
+            Ok(PublishedFileValidation {
+                relative_to_owned_root: file.relative_to_owned_root.clone(),
+                file: file.file.try_clone()?,
+                identity: file.identity,
             })
         })
         .collect::<io::Result<Vec<_>>>()
         .map_err(failed)?;
     tokio::task::spawn_blocking(move || {
-        revalidate_download_report_media_after_publication_blocking(
+        revalidate_download_report_files_after_publication_blocking(
             &cache_root,
             &published_relative_path,
             &expected_root,
@@ -4605,18 +4717,18 @@ async fn revalidate_download_report_media_after_publication(
     .await
     .map_err(|_| {
         BilibiliDownloadError::Failed(
-            "Bilibili published-media validation worker failed.".to_owned(),
+            "Bilibili published-output validation worker failed.".to_owned(),
         )
     })?
     .map_err(failed)
 }
 
 #[cfg(unix)]
-fn revalidate_download_report_media_after_publication_blocking(
+fn revalidate_download_report_files_after_publication_blocking(
     cache_root: &Path,
     published_relative_path: &str,
     expected_root: &File,
-    files: &[PublishedMediaValidationFile],
+    files: &[PublishedFileValidation],
 ) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4643,7 +4755,7 @@ fn revalidate_download_report_media_after_publication_blocking(
         if held_identity != validated.identity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "descriptor-bound BBDown media changed before publication",
+                "descriptor-bound BBDown output changed before publication",
             ));
         }
         let published_file =
@@ -4656,7 +4768,7 @@ fn revalidate_download_report_media_after_publication_blocking(
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "published BBDown media no longer identifies the validated object",
+                "published BBDown output no longer identifies the validated object",
             ));
         }
     }
@@ -4664,11 +4776,11 @@ fn revalidate_download_report_media_after_publication_blocking(
 }
 
 #[cfg(not(unix))]
-fn revalidate_download_report_media_after_publication_blocking(
+fn revalidate_download_report_files_after_publication_blocking(
     _cache_root: &Path,
     _published_relative_path: &str,
     _expected_root: &File,
-    _files: &[PublishedMediaValidationFile],
+    _files: &[PublishedFileValidation],
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -5061,19 +5173,43 @@ fn library_media_artifact(library_output_path: &Path, library_item_id: &str) -> 
     }
 }
 
-async fn map_sidecar_artifact(
+fn map_sidecar_artifact(
     file: &bbdown_core::DownloadedFile,
     index: usize,
+    publication_validation: Option<V2PublishedOutputValidation<'_>>,
 ) -> Result<MappedV2Artifact, BilibiliDownloadError> {
-    let metadata = fs::symlink_metadata(&file.path).await.map_err(failed)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    let validation = publication_validation.ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "BBDown sidecar output requires descriptor-bound publication validation.".to_owned(),
+        )
+    })?;
+    if validation.validated_paths.entries.len() != 1 {
         return Err(BilibiliDownloadError::Failed(
-            "BBDown sidecar output is not a regular file.".to_owned(),
+            "Validated BBDown sidecar output does not match one result entry.".to_owned(),
         ));
     }
+    let relative_path = cache_relative_normal_path(validation.published_root, &file.path)?;
+    let validated = validation.validated_paths.entries[0]
+        .sidecar_files
+        .iter()
+        .find(|validated| validated.relative_to_owned_root == relative_path)
+        .ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown sidecar output was not retained by publication validation.".to_owned(),
+            )
+        })?;
+    let identity = BilibiliTaskResourceCacheFileIdentity {
+        device_id: validated.identity.device_id,
+        inode: validated.identity.inode,
+        size_bytes: validated.identity.size_bytes,
+        mode: validated.identity.mode,
+    };
+    let source =
+        BilibiliTaskResourceCacheFile::new(validated.file.try_clone().map_err(failed)?, identity)
+            .map_err(failed)?;
     let (kind, title, format, content_type) = sidecar_description(&file.kind, &file.path, index);
     let resource_id = new_resource_id();
-    let resource = task_resource_record(&resource_id, content_type, metadata.len())?;
+    let resource = task_resource_record(&resource_id, content_type, identity.size_bytes)?;
     let artifact = TaskArtifact {
         id: new_artifact_id(),
         kind: kind.into(),
@@ -5091,7 +5227,7 @@ async fn map_sidecar_artifact(
         resource,
         body: BilibiliTaskResourceBody {
             resource_id,
-            source: BilibiliTaskResourceBodySource::CachePath(file.path.clone()),
+            source: BilibiliTaskResourceBodySource::CacheFile(source),
         },
     })
 }
@@ -5344,6 +5480,7 @@ where
     Ok(report)
 }
 
+#[cfg(test)]
 async fn prepare_owned_download_report_for_playback_in_place<F>(
     report: &mut DownloadReport,
     mode: DownloadMode,
@@ -5355,8 +5492,37 @@ async fn prepare_owned_download_report_for_playback_in_place<F>(
 where
     F: Fn() -> bool,
 {
-    let validated_paths =
-        validate_download_report_paths_no_follow(cache_root, owned_root, report).await?;
+    prepare_owned_download_report_for_playback_in_place_with_descriptor_budget(
+        report,
+        mode,
+        ffmpeg_path,
+        is_cancel_requested,
+        cache_root,
+        owned_root,
+        bilibili_v2_retained_descriptor_budget(),
+    )
+    .await
+}
+
+async fn prepare_owned_download_report_for_playback_in_place_with_descriptor_budget<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    cache_root: &Path,
+    owned_root: &Path,
+    max_retained_descriptors: usize,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    let validated_paths = validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        max_retained_descriptors,
+    )
+    .await?;
     let published_mux_files = prepare_download_report_for_playback_in_place(
         report,
         mode,
@@ -5365,7 +5531,14 @@ where
         &validated_paths,
     )
     .await?;
-    let rebound = validate_download_report_paths_no_follow(cache_root, owned_root, report).await?;
+    drop(validated_paths);
+    let rebound = validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        max_retained_descriptors,
+    )
+    .await?;
     verify_rebound_mux_file_identities(&published_mux_files, &rebound).await?;
     Ok(rebound)
 }
@@ -6928,7 +7101,7 @@ mod tests {
         std_fs::write(&published_media, b"replacement-media")
             .expect("replacement media should occupy the published name");
 
-        let result = revalidate_download_report_media_after_publication(
+        let result = revalidate_download_report_files_after_publication(
             &cache_root,
             &published_candidate,
             &validated,
@@ -6948,6 +7121,72 @@ mod tests {
                 .expect("replacement should remain confined to unpublished task output")
                 .as_slice()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_report_validation_bounds_retained_media_and_sidecar_descriptors() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let owned_root = cache_root.join("candidate");
+        let entry_directory = owned_root.join("entry");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        let mut files = Vec::new();
+        for index in 0..16_u32 {
+            let path = entry_directory.join(format!("output-{index}"));
+            std_fs::write(&path, format!("output-{index}"))
+                .expect("report output should be written");
+            files.push(DownloadedFile {
+                kind: if index % 2 == 0 {
+                    DownloadFileKind::FlvSegment
+                } else {
+                    DownloadFileKind::Subtitle
+                },
+                path,
+                bytes_written: 8,
+                resumed_from: 0,
+            });
+        }
+        let report = DownloadReport {
+            title: "Descriptor budget".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_directory,
+                files,
+                mux: None,
+            }],
+        };
+
+        let error = match validate_download_report_paths_no_follow_with_descriptor_budget(
+            &cache_root,
+            &owned_root,
+            &report,
+            17,
+        )
+        .await
+        {
+            Ok(_) => panic!("root, entry, and every unique report file must consume the budget"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BilibiliDownloadError::ResourceExhausted(message)
+                if message.contains("file-descriptor budget")
+        ));
+
+        let validated = validate_download_report_paths_no_follow_with_descriptor_budget(
+            &cache_root,
+            &owned_root,
+            &report,
+            18,
+        )
+        .await
+        .expect("the exact descriptor budget should admit the report");
+        assert_eq!(18, validated.descriptor_count());
+        assert_eq!(8, validated.entries[0].media_files.len());
+        assert_eq!(8, validated.entries[0].sidecar_files.len());
     }
 
     fn v2_test_candidate() -> BilibiliTaskCandidateRecord {
@@ -7916,7 +8155,11 @@ mod tests {
     #[tokio::test]
     async fn pr6d_v2_artifact_resources_do_not_publish_local_or_upstream_paths() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
-        let sidecar_path = temp.path().join("private-local-marker.subtitle.srt");
+        let cache_root = temp.path().join("cache");
+        let owned_root = cache_root.join("private-output-marker");
+        let entry_directory = owned_root.join("private-entry-marker");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        let sidecar_path = entry_directory.join("private-local-marker.subtitle.srt");
         std_fs::write(&sidecar_path, b"subtitle").expect("sidecar should be written");
         let server_options = Arc::new(CacheServerOptions {
             root_path: temp.path().join("library"),
@@ -7936,11 +8179,11 @@ mod tests {
         };
         let report = DownloadReport {
             title: "Season".to_owned(),
-            output_dir: temp.path().join("private-output-marker"),
+            output_dir: owned_root.clone(),
             entries: vec![EntryDownloadReport {
                 index: 2,
                 title: "Episode 2".to_owned(),
-                directory: temp.path().join("private-entry-marker"),
+                directory: entry_directory,
                 files: vec![DownloadedFile {
                     kind: DownloadFileKind::Subtitle,
                     path: sidecar_path.clone(),
@@ -7950,6 +8193,9 @@ mod tests {
                 mux: None,
             }],
         };
+        let validated = validate_download_report_paths_no_follow(&cache_root, &owned_root, &report)
+            .await
+            .expect("sidecar output should bind to validated descriptors");
 
         let mapped = adapter
             .map_v2_download_result(
@@ -7958,7 +8204,11 @@ mod tests {
                 &plan,
                 &report,
                 DownloadMode::SubtitleOnly,
-                None,
+                Some(V2PublishedOutputValidation {
+                    cache_root: &cache_root,
+                    published_root: &owned_root,
+                    validated_paths: &validated,
+                }),
             )
             .await
             .expect("sidecar-only result should map without media or network access");
@@ -7991,13 +8241,12 @@ mod tests {
                 .starts_with("/resources/task-resource-")
         }));
 
-        let mut cache_path_bodies = 0;
+        let mut cache_file_bodies = 0;
         let mut metadata_body_found = false;
         for body in &mapped.resource_bodies {
             match &body.source {
-                BilibiliTaskResourceBodySource::CachePath(path) => {
-                    cache_path_bodies += 1;
-                    assert_eq!(path, &sidecar_path);
+                BilibiliTaskResourceBodySource::CacheFile(_) => {
+                    cache_file_bodies += 1;
                 }
                 BilibiliTaskResourceBodySource::Bytes(bytes) => {
                     let text = std::str::from_utf8(bytes).expect("generated JSON should be UTF-8");
@@ -8009,7 +8258,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cache_path_bodies, 1);
+        assert_eq!(cache_file_bodies, 1);
         assert!(metadata_body_found);
 
         let media_artifact = library_media_artifact(
