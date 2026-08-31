@@ -501,7 +501,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
         )
         let serverInfo = try await getServerInfo()
         guard serverInfo.supportsBilibiliExecutionV2 else {
-            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+            throw CacheControlClientUnsupportedOperation.bilibiliExecutionV2
         }
 
         do {
@@ -516,7 +516,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 return CacheTask(response)
             }
         } catch let error as RPCError where error.code == .unimplemented {
-            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+            throw CacheControlClientUnsupportedOperation.bilibiliExecutionV2
         }
     }
 
@@ -563,9 +563,9 @@ public final class GRPCCacheControlClient: CacheControlClient {
         case .unspecified, .all, .videoOnly, .audioOnly:
             return
         case .subtitleOnly, .danmakuOnly, .coverOnly:
-            throw CacheControlClientUnsupportedFeature.bilibiliExecutionV2
+            throw CacheControlClientUnsupportedOperation.bilibiliExecutionV2
         case .unknown:
-            throw CacheControlClientInvalidRequest.invalidBilibiliDownloadMode
+            throw CacheControlClientRequestValidationError.invalidBilibiliDownloadMode
         }
     }
 
@@ -633,21 +633,21 @@ public final class GRPCCacheControlClient: CacheControlClient {
     }
 
     private static func unsupportedFeature(forMissingCapability capability: String)
-        -> CacheControlClientUnsupportedFeature
+        -> any Error
     {
         if capability == CacheServerCapability.bilibiliTaskSelection {
-            return .bilibiliTaskSelection
+            return CacheControlClientUnsupportedFeature.bilibiliTaskSelection
         }
         if capability == CacheServerCapability.bilibiliResolutionV2 {
-            return .bilibiliResolutionV2
+            return CacheControlClientUnsupportedFeature.bilibiliResolutionV2
         }
         if capability == CacheServerCapability.bilibiliPlaybackPolicy {
-            return .bilibiliPlaybackPolicy
+            return CacheControlClientUnsupportedFeature.bilibiliPlaybackPolicy
         }
         if capability == CacheServerCapability.bilibiliExecutionV2 {
-            return .bilibiliExecutionV2
+            return CacheControlClientUnsupportedOperation.bilibiliExecutionV2
         }
-        return .bilibiliResolve
+        return CacheControlClientUnsupportedFeature.bilibiliResolve
     }
 
     public func getTask(id: String) async throws -> CacheTask {
@@ -687,7 +687,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 return CacheTaskResultsPage(response)
             }
         } catch let error as RPCError where error.code == .unimplemented {
-            throw CacheControlClientUnsupportedFeature.taskOutputV2
+            throw CacheControlClientUnsupportedOperation.taskOutputV2
         }
     }
 

@@ -1,7 +1,36 @@
 import XCTest
 @testable import TVOSNetPlayerCacheClient
 
+private func legacyUnsupportedFeatureCode(_ feature: CacheControlClientUnsupportedFeature) -> Int {
+    switch feature {
+    case .healthCheck: 0
+    case .hlsCacheStatus: 1
+    case .bilibiliCredentialStatus: 2
+    case .bilibiliCredentialProfiles: 3
+    case .bilibiliLoginSessions: 4
+    case .bilibiliResolve: 5
+    case .bilibiliResolutionV2: 6
+    case .bilibiliDownloadTask: 7
+    case .bilibiliTaskSelection: 8
+    case .bilibiliPlaybackPolicy: 9
+    case .playbackProgressReporting: 10
+    }
+}
+
+private func legacyInvalidRequestCode(_ request: CacheControlClientInvalidRequest) -> Int {
+    switch request {
+    case .bilibiliResolutionInputRequired: 0
+    case .bilibiliResolutionSessionIDRequired: 1
+    case .invalidBilibiliResolutionSelection: 2
+    }
+}
+
 final class CacheLibraryPaginationTests: XCTestCase {
+    func testLegacyPublicErrorEnumsRemainExhaustivelySwitchable() {
+        XCTAssertEqual(0, legacyUnsupportedFeatureCode(.healthCheck))
+        XCTAssertEqual(2, legacyInvalidRequestCode(.invalidBilibiliResolutionSelection))
+    }
+
     func testGeneratedBilibiliResolveCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliResolve),
@@ -705,7 +734,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
                 XCTFail("Expected sidecar-only legacy download mode to require Bilibili execution v2.")
             } catch {
                 XCTAssertEqual(
-                    error as? CacheControlClientUnsupportedFeature,
+                    error as? CacheControlClientUnsupportedOperation,
                     .bilibiliExecutionV2,
                     "mode: \(mode)"
                 )
@@ -724,7 +753,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             XCTFail("Expected unknown legacy download mode to fail locally.")
         } catch {
             XCTAssertEqual(
-                error as? CacheControlClientInvalidRequest,
+                error as? CacheControlClientRequestValidationError,
                 .invalidBilibiliDownloadMode
             )
         }
@@ -929,7 +958,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             )
             XCTFail("Expected contextual resolution to be unsupported.")
         } catch {
-            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliExecutionV2)
+            XCTAssertEqual(error as? CacheControlClientUnsupportedOperation, .bilibiliExecutionV2)
         }
 
         do {
@@ -940,7 +969,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             )
             XCTFail("Expected CreateBilibiliTaskV2 to be unsupported.")
         } catch {
-            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .bilibiliExecutionV2)
+            XCTAssertEqual(error as? CacheControlClientUnsupportedOperation, .bilibiliExecutionV2)
         }
     }
 
@@ -1042,7 +1071,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
             _ = try await client.listTaskResults(taskID: "task-1")
             XCTFail("Expected ListTaskResults to be unsupported.")
         } catch {
-            XCTAssertEqual(error as? CacheControlClientUnsupportedFeature, .taskOutputV2)
+            XCTAssertEqual(error as? CacheControlClientUnsupportedOperation, .taskOutputV2)
         }
     }
 

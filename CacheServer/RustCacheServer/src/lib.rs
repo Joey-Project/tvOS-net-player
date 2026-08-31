@@ -216,6 +216,7 @@ struct PendingHlsCleanupOverflowScan {
 struct CompletedHlsDeletionPlan {
     session_ids: Vec<String>,
     task_cleanup: Option<(String, String)>,
+    affected_task_ids: Vec<String>,
 }
 
 fn invalidate_task_result_pages_before_library_deletion(
@@ -1256,6 +1257,7 @@ impl AppState {
                     CompletedHlsDeletionPlan {
                         session_ids: pending_session_ids,
                         task_cleanup: None,
+                        affected_task_ids: Vec::new(),
                     }
                 } else {
                     let authorized = self.get_completed_hls_library_item(item_id).is_some();
@@ -1271,6 +1273,11 @@ impl AppState {
                         return Ok(Some(false));
                     }
                     if authorized {
+                        let affected_task_ids = self
+                            .tasks
+                            .playback_task_for_any_hls_session(&session_id)
+                            .map(|task| vec![task.id])
+                            .unwrap_or_default();
                         let session_ids =
                             self.completed_hls_delete_session_ids(&session_id, item_id);
                         let task_cleanup = self
@@ -1279,11 +1286,13 @@ impl AppState {
                         CompletedHlsDeletionPlan {
                             session_ids,
                             task_cleanup: Some(task_cleanup),
+                            affected_task_ids,
                         }
                     } else {
                         CompletedHlsDeletionPlan {
                             session_ids: vec![session_id.clone()],
                             task_cleanup: None,
+                            affected_task_ids: Vec::new(),
                         }
                     }
                 };
@@ -1305,7 +1314,7 @@ impl AppState {
                         &self.tasks,
                         &self.task_result_pages,
                         item_id,
-                        &[],
+                        &plan.affected_task_ids,
                     );
                     self.remove_hls_sessions_for_library_item(item_id, &plan.session_ids)?;
                     return Ok(Some(true));
@@ -2068,6 +2077,11 @@ impl AppState {
             {
                 continue;
             }
+            let affected_task_ids = self
+                .tasks
+                .playback_task_for_any_hls_session(&entry.session_id)
+                .map(|task| vec![task.id])
+                .unwrap_or_default();
             if !self.remove_evicted_completed_hls_task(&entry)? {
                 continue;
             }
@@ -2075,7 +2089,7 @@ impl AppState {
                 &self.tasks,
                 &self.task_result_pages,
                 &entry.library_item_id,
-                &[],
+                &affected_task_ids,
             );
             self.remove_hls_sessions_tracking_failures(&entry.library_item_id, &session_ids)?;
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
@@ -5103,6 +5117,107 @@ mod tests {
             )
             .expect("task should become playable");
         (task_id, session)
+    }
+
+    #[test]
+    fn completed_hls_item_transition_invalidates_result_pages_by_parent_task() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1result-page-transition", None, None)
+            .expect("playback task should be created");
+        let task_id = creation.task.id;
+        let child_session_id = format!("{task_id}-result-2");
+        let result_item = |session_id: &str, index: u32| BilibiliTaskResultItem {
+            id: session_id.to_owned(),
+            selection_id: format!("page:{index}"),
+            title: format!("Part {index}"),
+            source_kind: "video_page".to_owned(),
+            content_id: format!("cid-{index}"),
+            index,
+            state: TaskState::Playable.into(),
+            message: "Playable".to_owned(),
+            playback_source: Some(PlaybackSource {
+                item_id: session_id.to_owned(),
+                variant_id: "h264".to_owned(),
+                protocol: PlaybackProtocol::Hls.into(),
+                uri: format!("http://media.example.test:8080/hls/{session_id}/master.m3u8"),
+                expires_at: None,
+            }),
+            playback_session: Some(sample_playback_session(session_id)),
+            ..Default::default()
+        };
+        state
+            .tasks
+            .complete_playback_results_playable(
+                &task_id,
+                "Playable".to_owned(),
+                "All results are playable.".to_owned(),
+                result_item(&task_id, 1)
+                    .playback_source
+                    .clone()
+                    .expect("primary source should be present"),
+                sample_playback_session(&task_id),
+                vec![result_item(&task_id, 1), result_item(&child_session_id, 2)],
+            )
+            .expect("multi-result task should become playable");
+
+        let snapshot = state
+            .tasks
+            .retain_task_output_snapshot(
+                &task_id,
+                std::time::Instant::now() + Duration::from_secs(60),
+            )
+            .expect("playable task output should be retained");
+        let continuation_token = {
+            let mut pages = state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock poisoned");
+            let token = pages.publish_test_first_page(snapshot, 1);
+            assert!(!token.is_empty());
+            token
+        };
+
+        let completed_item_id = format!("bilibili.hls.{child_session_id}");
+        state
+            .tasks
+            .complete_playback_hls_session_cached(
+                &task_id,
+                &child_session_id,
+                completed_item_id.clone(),
+            )
+            .expect("child session should become a completed cache item");
+
+        invalidate_task_result_pages_before_library_deletion(
+            &state.tasks,
+            &state.task_result_pages,
+            &completed_item_id,
+            &[],
+        );
+        assert!(
+            state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .test_continuation_is_available(&continuation_token, &task_id, 1),
+            "the completed item id does not occur in the earlier playable snapshot"
+        );
+
+        invalidate_task_result_pages_before_library_deletion(
+            &state.tasks,
+            &state.task_result_pages,
+            &completed_item_id,
+            std::slice::from_ref(&task_id),
+        );
+        assert!(
+            !state
+                .task_result_pages
+                .lock()
+                .expect("task result page store lock poisoned")
+                .test_continuation_is_available(&continuation_token, &task_id, 1)
+        );
     }
 
     fn sample_playback_session(session_id: &str) -> BilibiliPlaybackSession {

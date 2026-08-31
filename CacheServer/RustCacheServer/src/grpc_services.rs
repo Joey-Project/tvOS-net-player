@@ -1433,6 +1433,37 @@ impl TaskResultPageStore {
             .retain(|_, cursor| cursor.snapshot_id != snapshot_id);
         resource_lease_id
     }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_first_page(
+        &mut self,
+        snapshot: crate::task_registry::TaskOutputSnapshot,
+        page_size: usize,
+    ) -> String {
+        let (page, released, _, registration) =
+            self.first_page(snapshot, Instant::now(), page_size);
+        assert!(released.is_empty());
+        let token = page
+            .expect("test task result first page should be created")
+            .1
+            .next_page_token;
+        assert!(self.publish_first_page(
+            &registration.expect("test first page should require publication")
+        ));
+        token
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_continuation_is_available(
+        &mut self,
+        token: &str,
+        task_id: &str,
+        page_size: usize,
+    ) -> bool {
+        self.continuation_page(token, task_id, Instant::now(), page_size)
+            .0
+            .is_ok()
+    }
 }
 
 struct FirstTaskResultPage {

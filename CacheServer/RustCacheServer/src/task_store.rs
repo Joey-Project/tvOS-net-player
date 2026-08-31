@@ -49,7 +49,8 @@ const BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION: u32 = 4;
 const FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION: u32 = 5;
 const TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION: u32 = 7;
-const TASK_STATE_SCHEMA_VERSION: u32 = FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION;
+const FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION: u32 = 8;
+const TASK_STATE_SCHEMA_VERSION: u32 = FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 pub(crate) const MAX_PERSISTED_FILE_CLEANUP_INTENTS: usize = 100_000;
@@ -221,6 +222,8 @@ pub(crate) struct PersistedTaskState {
     pub(crate) records: Vec<PersistedTaskRecord>,
     pub(crate) file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
     pub(crate) file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
+    pub(crate) bilibili_cleanup_owner_tombstones: Vec<String>,
+    pub(crate) cleanup_owner_binding_migration_pending: bool,
 }
 
 thread_local! {
@@ -468,6 +471,7 @@ impl TaskStateStore {
                 | BILIBILI_REQUEST_CONTEXT_TASK_STATE_SCHEMA_VERSION
                 | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
                 | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
+                | FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION
                 | TASK_STATE_SCHEMA_VERSION
         ) {
             return Err(io::Error::new(
@@ -497,6 +501,14 @@ impl TaskStateStore {
                 "task state schemas before v7 cannot safely replay file cleanup intents",
             ));
         }
+        if schema_version < FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION
+            && !snapshot.bilibili_cleanup_owner_tombstones.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state schemas before v8 cannot contain cleanup owner tombstones",
+            ));
+        }
         validate_file_cleanup_intents(&snapshot.file_cleanup_intents)?;
         validate_file_cleanup_root_binding(
             &snapshot.file_cleanup_intents,
@@ -509,10 +521,28 @@ impl TaskStateStore {
             .collect::<io::Result<Vec<_>>>()?;
         validate_registered_task_resource_count(&records)?;
         validate_unique_task_record_identities(&records)?;
+        let cleanup_owner_binding_migration_pending = schema_version
+            < FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION
+            && !snapshot.file_cleanup_intents.is_empty();
+        let bilibili_cleanup_owner_tombstones = if cleanup_owner_binding_migration_pending {
+            derive_bilibili_cleanup_owner_tombstones(
+                records.iter().map(|record| record.task.id.as_str()),
+                &snapshot.file_cleanup_intents,
+            )
+        } else {
+            snapshot.bilibili_cleanup_owner_tombstones
+        };
+        validate_bilibili_cleanup_owner_bindings(
+            records.iter().map(|record| record.task.id.as_str()),
+            &snapshot.file_cleanup_intents,
+            &bilibili_cleanup_owner_tombstones,
+        )?;
         Ok(PersistedTaskState {
             records,
             file_cleanup_intents: snapshot.file_cleanup_intents,
             file_cleanup_root_identity: snapshot.file_cleanup_root_identity,
+            bilibili_cleanup_owner_tombstones,
+            cleanup_owner_binding_migration_pending,
         })
     }
 
@@ -527,10 +557,20 @@ impl TaskStateStore {
         file_cleanup_intents: &[PersistedFileCleanupIntent],
         file_cleanup_root_identity: Option<&PersistedFileCleanupRootIdentity>,
     ) -> io::Result<TaskStateSaveOutcome> {
+        let bilibili_cleanup_owner_tombstones = derive_bilibili_cleanup_owner_tombstones(
+            records.iter().map(|record| record.task.id.as_str()),
+            file_cleanup_intents,
+        );
+        validate_bilibili_cleanup_owner_bindings(
+            records.iter().map(|record| record.task.id.as_str()),
+            file_cleanup_intents,
+            &bilibili_cleanup_owner_tombstones,
+        )?;
         let snapshot = serialize_task_snapshot_with_file_cleanup_intents_and_limit(
             records,
             file_cleanup_intents,
             file_cleanup_root_identity,
+            &bilibili_cleanup_owner_tombstones,
             MAX_TASK_STATE_SNAPSHOT_BYTES,
         )?;
         let directories_to_sync = parent_directories_requiring_sync(self.path())?;
@@ -690,6 +730,75 @@ fn validate_file_cleanup_intents(intents: &[PersistedFileCleanupIntent]) -> io::
     Ok(())
 }
 
+fn derive_bilibili_cleanup_owner_tombstones<'a>(
+    task_ids: impl IntoIterator<Item = &'a str>,
+    intents: &[PersistedFileCleanupIntent],
+) -> Vec<String> {
+    let task_ids = task_ids.into_iter().collect::<HashSet<_>>();
+    let mut tombstones = intents
+        .iter()
+        .filter(|intent| {
+            matches!(
+                intent.kind,
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                    | PersistedFileCleanupKind::BilibiliTransientOutput
+            ) && !task_ids.contains(intent.owner_id.as_str())
+        })
+        .map(|intent| intent.owner_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    tombstones.sort();
+    tombstones
+}
+
+fn validate_bilibili_cleanup_owner_bindings<'a>(
+    task_ids: impl IntoIterator<Item = &'a str>,
+    intents: &[PersistedFileCleanupIntent],
+    tombstones: &[String],
+) -> io::Result<()> {
+    validate_collection_len(
+        "Bilibili cleanup owner tombstones",
+        tombstones.len(),
+        MAX_PERSISTED_FILE_CLEANUP_INTENTS,
+    )?;
+    let task_ids = task_ids.into_iter().collect::<HashSet<_>>();
+    let bilibili_owner_ids = intents
+        .iter()
+        .filter(|intent| {
+            matches!(
+                intent.kind,
+                PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                    | PersistedFileCleanupKind::BilibiliTransientOutput
+            )
+        })
+        .map(|intent| intent.owner_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut unique_tombstones = HashSet::with_capacity(tombstones.len());
+    for tombstone in tombstones {
+        if !valid_bilibili_download_task_id(tombstone)
+            || !unique_tombstones.insert(tombstone.as_str())
+            || task_ids.contains(tombstone.as_str())
+            || !bilibili_owner_ids.contains(tombstone.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task state contains an invalid Bilibili cleanup owner tombstone",
+            ));
+        }
+    }
+    if bilibili_owner_ids
+        .iter()
+        .any(|owner_id| !task_ids.contains(owner_id) && !unique_tombstones.contains(owner_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task state contains a Bilibili cleanup intent without proven task ownership",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_file_cleanup_root_binding(
     intents: &[PersistedFileCleanupIntent],
     root_identity: Option<&PersistedFileCleanupRootIdentity>,
@@ -713,13 +822,14 @@ fn serialize_task_snapshot_with_limit<'a, I>(records: I, limit: usize) -> io::Re
 where
     I: IntoIterator<Item = &'a PersistedTaskRecord>,
 {
-    serialize_task_snapshot_with_file_cleanup_intents_and_limit(records, &[], None, limit)
+    serialize_task_snapshot_with_file_cleanup_intents_and_limit(records, &[], None, &[], limit)
 }
 
 fn serialize_task_snapshot_with_file_cleanup_intents_and_limit<'a, I>(
     records: I,
     file_cleanup_intents: &[PersistedFileCleanupIntent],
     file_cleanup_root_identity: Option<&PersistedFileCleanupRootIdentity>,
+    bilibili_cleanup_owner_tombstones: &[String],
     limit: usize,
 ) -> io::Result<Vec<u8>>
 where
@@ -732,6 +842,7 @@ where
         tasks: PersistedTaskSequence::new(records.into_iter()),
         file_cleanup_intents,
         file_cleanup_root_identity,
+        bilibili_cleanup_owner_tombstones,
     };
     let mut serialized = BoundedSnapshotWriter::new(limit);
     serde_json::to_writer_pretty(&mut serialized, &snapshot).map_err(invalid_data)?;
@@ -744,6 +855,7 @@ struct PersistedTaskSnapshotForSave<'a, I> {
     tasks: PersistedTaskSequence<I>,
     file_cleanup_intents: &'a [PersistedFileCleanupIntent],
     file_cleanup_root_identity: Option<&'a PersistedFileCleanupRootIdentity>,
+    bilibili_cleanup_owner_tombstones: &'a [String],
 }
 
 impl<'a, 'b, I> Serialize for PersistedTaskSnapshotForSave<'a, I>
@@ -754,13 +866,17 @@ where
     where
         S: serde::Serializer,
     {
-        let mut snapshot = serializer.serialize_struct("PersistedTaskSnapshot", 4)?;
+        let mut snapshot = serializer.serialize_struct("PersistedTaskSnapshot", 5)?;
         snapshot.serialize_field("schema_version", &self.schema_version)?;
         snapshot.serialize_field("tasks", &self.tasks)?;
         snapshot.serialize_field("file_cleanup_intents", &self.file_cleanup_intents)?;
         snapshot.serialize_field(
             "file_cleanup_root_identity",
             &self.file_cleanup_root_identity,
+        )?;
+        snapshot.serialize_field(
+            "bilibili_cleanup_owner_tombstones",
+            &self.bilibili_cleanup_owner_tombstones,
         )?;
         snapshot.end()
     }
@@ -983,6 +1099,19 @@ where
         deserializer,
         MAX_PERSISTED_FILE_CLEANUP_INTENTS,
         "persisted file cleanup intents",
+    )
+}
+
+fn deserialize_bilibili_cleanup_owner_tombstones<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_PERSISTED_FILE_CLEANUP_INTENTS,
+        "Bilibili cleanup owner tombstones",
     )
 }
 
@@ -1316,6 +1445,11 @@ struct PersistedTaskSnapshot {
     file_cleanup_intents: Vec<PersistedFileCleanupIntent>,
     #[serde(default)]
     file_cleanup_root_identity: Option<PersistedFileCleanupRootIdentity>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bilibili_cleanup_owner_tombstones"
+    )]
+    bilibili_cleanup_owner_tombstones: Vec<String>,
 }
 
 fn validate_collection_len(label: &str, len: usize, limit: usize) -> io::Result<()> {
@@ -2866,6 +3000,11 @@ mod tests {
         let restored = store.load_state().expect("cleanup intent should reload");
         assert_eq!(vec![intent.clone()], restored.file_cleanup_intents);
         assert_eq!(Some(root_identity), restored.file_cleanup_root_identity);
+        assert_eq!(
+            vec![CLEANUP_TASK_ID.to_owned()],
+            restored.bilibili_cleanup_owner_tombstones
+        );
+        assert!(!restored.cleanup_owner_binding_migration_pending);
 
         let snapshot: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("cleanup snapshot should be readable"))
@@ -2885,6 +3024,42 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(io::ErrorKind::InvalidData, duplicate_error.kind());
+
+        let mut missing_owner_tombstone = snapshot.clone();
+        missing_owner_tombstone["bilibili_cleanup_owner_tombstones"] =
+            serde_json::Value::Array(Vec::new());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&missing_owner_tombstone)
+                .expect("missing-owner fixture should serialize"),
+        )
+        .expect("missing-owner fixture should be written");
+        let missing_owner_error = match store.load_state() {
+            Ok(_) => panic!("cleanup intents without a task or tombstone must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidData, missing_owner_error.kind());
+
+        let mut legacy_v7 = snapshot.clone();
+        legacy_v7["schema_version"] =
+            serde_json::Value::from(FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION);
+        legacy_v7
+            .as_object_mut()
+            .expect("snapshot should be an object")
+            .remove("bilibili_cleanup_owner_tombstones");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_v7).expect("v7 fixture should serialize"),
+        )
+        .expect("v7 fixture should be written");
+        let migrated_v7 = store
+            .load_state()
+            .expect("valid v7 cleanup ownership should remain migration-compatible");
+        assert!(migrated_v7.cleanup_owner_binding_migration_pending);
+        assert_eq!(
+            vec![CLEANUP_TASK_ID.to_owned()],
+            migrated_v7.bilibili_cleanup_owner_tombstones
+        );
 
         let mut shared_namespace_cleanup = snapshot.clone();
         shared_namespace_cleanup["file_cleanup_intents"] = serde_json::json!([{
@@ -2922,6 +3097,8 @@ mod tests {
         let mut legacy_without_intent = legacy_with_intent;
         legacy_without_intent["file_cleanup_intents"] = serde_json::Value::Array(Vec::new());
         legacy_without_intent["file_cleanup_root_identity"] = serde_json::Value::Null;
+        legacy_without_intent["bilibili_cleanup_owner_tombstones"] =
+            serde_json::Value::Array(Vec::new());
         fs::write(
             &path,
             serde_json::to_vec_pretty(&legacy_without_intent)
@@ -3168,6 +3345,7 @@ mod tests {
                     .collect(),
                 file_cleanup_intents: Vec::new(),
                 file_cleanup_root_identity: None,
+                bilibili_cleanup_owner_tombstones: Vec::new(),
             };
             std::fs::write(
                 &path,
@@ -3267,6 +3445,7 @@ mod tests {
             ],
             file_cleanup_intents: Vec::new(),
             file_cleanup_root_identity: None,
+            bilibili_cleanup_owner_tombstones: Vec::new(),
         };
         let accepted_bytes = serde_json::to_vec(&accepted).unwrap();
 
@@ -3282,6 +3461,7 @@ mod tests {
             ],
             file_cleanup_intents: Vec::new(),
             file_cleanup_root_identity: None,
+            bilibili_cleanup_owner_tombstones: Vec::new(),
         };
         let rejected_bytes = serde_json::to_vec(&rejected).unwrap();
         let error = match deserialize_task_snapshot_with_resource_limit(&rejected_bytes, 2) {

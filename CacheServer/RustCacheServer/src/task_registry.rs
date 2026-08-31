@@ -517,11 +517,20 @@ impl BilibiliTaskRegistry {
         retention_policy: TaskRetentionPolicy,
         resource_root_path: Option<PathBuf>,
     ) -> Self {
+        let library_publication_gate = resource_root_path.as_ref().map(|root_path| {
+            Arc::new(
+                LibraryPublicationGate::known_empty_for_output_directory(
+                    root_path,
+                    &root_path.join("Bilibili"),
+                )
+                .expect("default Bilibili output directory must be inside the resource root"),
+            )
+        });
         Self::with_persistence_path_retention_resource_root_and_publication_gate(
             path,
             retention_policy,
             resource_root_path,
-            None,
+            library_publication_gate,
         )
     }
 
@@ -4258,6 +4267,8 @@ impl BilibiliTaskRegistry {
                 records,
                 file_cleanup_intents: Vec::new(),
                 file_cleanup_root_identity: None,
+                bilibili_cleanup_owner_tombstones: Vec::new(),
+                cleanup_owner_binding_migration_pending: false,
             },
             store,
             persistence_configured,
@@ -4279,8 +4290,34 @@ impl BilibiliTaskRegistry {
             records,
             file_cleanup_intents,
             file_cleanup_root_identity,
+            bilibili_cleanup_owner_tombstones,
+            cleanup_owner_binding_migration_pending,
         } = state;
         validate_unique_task_record_identities(&records)?;
+        let bilibili_output_root_relative_path = library_publication_gate
+            .as_ref()
+            .and_then(|gate| gate.managed_output_prefix());
+        validate_persisted_bilibili_file_cleanup_paths(
+            &file_cleanup_intents,
+            bilibili_output_root_relative_path.as_deref(),
+        )?;
+        if cleanup_owner_binding_migration_pending
+            && bilibili_cleanup_owner_tombstones.is_empty()
+            && file_cleanup_intents.iter().any(|intent| {
+                matches!(
+                    intent.kind,
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory
+                        | PersistedFileCleanupKind::BilibiliTransientOutput
+                ) && !records
+                    .iter()
+                    .any(|record| record.task.id == intent.owner_id)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy Bilibili cleanup ownership migration is incomplete",
+            ));
+        }
         let file_cleanup_root_identity =
             match (file_cleanup_intents.is_empty(), file_cleanup_root_identity) {
                 (true, None) => None,
@@ -4400,9 +4437,6 @@ impl BilibiliTaskRegistry {
         rebuild_visible_resource_index_locked(&mut inner);
 
         let orphan_resource_scan_pending = resource_root_path.is_some();
-        let bilibili_output_root_relative_path = library_publication_gate
-            .as_ref()
-            .and_then(|gate| gate.managed_output_prefix());
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             mutation_lock: Mutex::new(()),
@@ -4559,6 +4593,10 @@ impl BilibiliTaskRegistry {
             .cloned()
             .collect::<Vec<_>>();
         file_cleanup_intents.sort();
+        validate_persisted_bilibili_file_cleanup_paths(
+            &file_cleanup_intents,
+            self.bilibili_output_root_relative_path.as_deref(),
+        )?;
         Ok(Some(TaskPersistenceSnapshot {
             generation: inner.persistence_generation,
             records,
@@ -6845,20 +6883,67 @@ fn migrate_pending_task_resource_body_identities(
             if !resource.body_identity_migration_pending {
                 continue;
             }
-            let file = open_read_no_follow(resource_root_path, &resource.relative_path())?;
-            let metadata = file.metadata()?;
-            validate_resource_body_size(resource, metadata.len())?;
-            let identity = StagedResourceBodyIdentity::from_metadata(&metadata)?.durable();
-            if identity.mode & 0o222 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "legacy task resource body regained write permission before migration",
-                ));
-            }
+            let identity =
+                migrate_legacy_task_resource_body_identity(resource_root_path, resource)?;
             resource.bind_body_identity(identity);
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn migrate_legacy_task_resource_body_identity(
+    resource_root_path: &Path,
+    resource: &TaskResourceRecord,
+) -> io::Result<TaskResourceBodyIdentity> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let relative_path = resource.relative_path();
+    let file = open_read_no_follow(resource_root_path, &relative_path)?;
+    let initial_identity = StagedResourceBodyIdentity::from_metadata(&file.metadata()?)?;
+    validate_resource_body_size(resource, initial_identity.size_bytes)?;
+
+    // Legacy v5 bodies were published as ordinary 0644 files. Migration protects the existing
+    // regular-file object while reducing its access policy to the current read-only contract.
+    file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+    file.sync_all()?;
+
+    let bound_identity = StagedResourceBodyIdentity::from_metadata(&file.metadata()?)?;
+    if !initial_identity.same_object(bound_identity)
+        || initial_identity.size_bytes != bound_identity.size_bytes
+        || bound_identity.mode & 0o7777 != 0o400
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy task resource body changed while reducing its access policy",
+        ));
+    }
+
+    let reopened = open_read_no_follow(resource_root_path, &relative_path)?;
+    let reopened_identity = StagedResourceBodyIdentity::from_metadata(&reopened.metadata()?)?;
+    if !bound_identity.same_object(reopened_identity)
+        || bound_identity.size_bytes != reopened_identity.size_bytes
+        || bound_identity.mode & 0o7777 != reopened_identity.mode & 0o7777
+        || reopened_identity.mode & 0o222 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "legacy task resource body pathname or access policy changed during migration",
+        ));
+    }
+    validate_resource_body_size(resource, reopened_identity.size_bytes)?;
+    Ok(reopened_identity.durable())
+}
+
+#[cfg(not(unix))]
+fn migrate_legacy_task_resource_body_identity(
+    _resource_root_path: &Path,
+    _resource: &TaskResourceRecord,
+) -> io::Result<TaskResourceBodyIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure legacy task resource migration is not implemented on this platform",
+    ))
 }
 
 fn validate_resource_body_size(resource: &TaskResourceRecord, actual_size: u64) -> io::Result<()> {
@@ -6917,6 +7002,55 @@ fn install_library_publication_gate<'a>(
             })
             .map(|intent| intent.relative_path.as_str()),
     )
+}
+
+fn validate_persisted_bilibili_file_cleanup_paths(
+    intents: &[PersistedFileCleanupIntent],
+    managed_output_prefix: Option<&Path>,
+) -> io::Result<()> {
+    let staging_prefix = Path::new(".tvos-net-player/bbdown-staging");
+    for intent in intents {
+        let relative_path = Path::new(&intent.relative_path);
+        match intent.kind {
+            PersistedFileCleanupKind::BilibiliOwnedOutputDirectory => {
+                let expected_staging_path = staging_prefix.join(&intent.owner_id);
+                let expected_published_path =
+                    managed_output_prefix.map(|prefix| prefix.join(&intent.owner_id));
+                if relative_path != expected_staging_path
+                    && expected_published_path.as_deref() != Some(relative_path)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted Bilibili owned-directory cleanup is outside its configured task roots",
+                    ));
+                }
+            }
+            PersistedFileCleanupKind::BilibiliTransientOutput => {
+                let owner_root = managed_output_prefix
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "persisted Bilibili transient cleanup requires a configured output root",
+                        )
+                    })?
+                    .join(&intent.owner_id);
+                let descendant = relative_path.strip_prefix(&owner_root).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted Bilibili transient cleanup is outside its configured task root",
+                    )
+                })?;
+                if descendant.as_os_str().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted Bilibili transient cleanup cannot target its task directory",
+                    ));
+                }
+            }
+            PersistedFileCleanupKind::LocalLibraryItem => {}
+        }
+    }
+    Ok(())
 }
 
 fn replace_file_cleanup_intents_for_owner_locked(
@@ -11443,6 +11577,82 @@ mod tests {
     }
 
     #[test]
+    fn restored_bilibili_cleanup_rejects_an_unowned_suffix_matched_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-owner-binding",
+                None,
+                None,
+                "Cleanup owner binding".to_owned(),
+                vec![sample_bilibili_task_candidate()],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let published_path = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(&task.id, &[staging_path, published_path])
+            .expect("valid task-owned roots should persist");
+        drop(registry);
+
+        let unrelated_directory = root_path.join("Unrelated").join(&task.id);
+        std::fs::create_dir_all(&unrelated_directory)
+            .expect("unrelated directory should be created");
+        let marker = unrelated_directory.join("keep.txt");
+        std::fs::write(&marker, b"keep").expect("unrelated marker should be written");
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path).expect("task snapshot should be readable"),
+        )
+        .expect("task snapshot should decode");
+        let intents = snapshot["file_cleanup_intents"]
+            .as_array_mut()
+            .expect("cleanup intents should be an array");
+        let external_intent = intents
+            .iter_mut()
+            .find(|intent| {
+                intent["kind"].as_str() == Some("bilibili_owned_output_directory")
+                    && intent["relative_path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("Bilibili/"))
+            })
+            .expect("published-directory cleanup intent should exist");
+        external_intent["relative_path"] =
+            serde_json::Value::String(format!("Unrelated/{}", task.id));
+        let mut snapshot_bytes =
+            serde_json::to_vec_pretty(&snapshot).expect("tampered snapshot should serialize");
+        snapshot_bytes.push(b'\n');
+        std::fs::write(&state_path, snapshot_bytes).expect("tampered snapshot should be written");
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert!(!restored.persistence_available());
+        assert!(marker.is_file());
+        assert_eq!(
+            b"keep",
+            std::fs::read(marker)
+                .expect("unrelated marker must not be replayed as cleanup")
+                .as_slice()
+        );
+    }
+
+    #[test]
     fn cleanup_intent_restart_rejects_a_different_cache_root() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state").join("tasks.json");
@@ -14290,8 +14500,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn schema_v5_resource_body_identity_migrates_from_the_secure_body() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state_path = temp.path().join("state/tasks.json");
         let root_path = temp.path().join("cache");
@@ -14305,6 +14518,7 @@ mod tests {
             .create_bilibili_task("BV1resource-identity-migration", None)
             .expect("task should be created");
         let resource = test_task_resource("legacy-v5-resource", 4);
+        let resource_relative_path = resource.relative_path();
         commit_test_task_output_with_resource(
             &registry,
             &task.id,
@@ -14316,6 +14530,18 @@ mod tests {
             b"test",
         );
         drop(registry);
+
+        let legacy_body_path = root_path.join(&resource_relative_path);
+        std::fs::set_permissions(&legacy_body_path, std::fs::Permissions::from_mode(0o644))
+            .expect("legacy v5 body should use its historical writable mode");
+        assert_eq!(
+            0o644,
+            std::fs::metadata(&legacy_body_path)
+                .expect("legacy v5 body should remain available")
+                .permissions()
+                .mode()
+                & 0o7777
+        );
 
         let mut legacy: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&state_path).expect("schema-v5 snapshot should be readable"),
@@ -14344,12 +14570,20 @@ mod tests {
         std::io::Read::read_to_end(&mut opened.file, &mut body)
             .expect("migrated resource should be readable");
         assert_eq!(b"test", body.as_slice());
+        assert_eq!(
+            0o400,
+            std::fs::metadata(&legacy_body_path)
+                .expect("migrated body should remain available")
+                .permissions()
+                .mode()
+                & 0o7777
+        );
 
         let migrated: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&state_path).expect("migrated snapshot should be readable"),
         )
         .expect("migrated snapshot should decode");
-        assert_eq!(Some(7), migrated["schema_version"].as_u64());
+        assert_eq!(Some(8), migrated["schema_version"].as_u64());
         assert!(migrated["tasks"][0]["output"]["resources"][0]["body_identity"].is_object());
     }
 
