@@ -139,6 +139,10 @@ const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 const BILIBILI_RESOLUTION_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn local_library_item_delete_available(options: &CacheServerOptions) -> bool {
+    options.allow_library_item_delete && cfg!(unix)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
     KeepPlayable,
@@ -209,7 +213,7 @@ impl ServerService for ServerGrpcService {
                 info.media_base_uris.push(base_uri.to_owned());
             }
         }
-        if self.state.options.allow_library_item_delete {
+        if local_library_item_delete_available(&self.state.options) {
             info.capabilities
                 .push(ServerCapability::LibraryItemDelete.into());
         }
@@ -2014,7 +2018,7 @@ impl TaskService for TaskGrpcService {
         let page_token = request_body
             .page
             .as_ref()
-            .map(|page| page.page_token.trim())
+            .map(|page| page.page_token.as_str())
             .unwrap_or_default()
             .to_owned();
         if page_token.len() > MAX_TASK_RESULT_PAGE_TOKEN_BYTES {
@@ -2373,6 +2377,11 @@ impl CacheService for CacheGrpcService {
         if !self.state.options.allow_library_item_delete {
             return Err(Status::permission_denied(
                 "Library item deletion is not enabled on this cache server.",
+            ));
+        }
+        if !local_library_item_delete_available(&self.state.options) {
+            return Err(Status::unimplemented(
+                "Secure local library item deletion is not supported on this platform.",
             ));
         }
 
@@ -5949,6 +5958,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_server_info_advertises_library_delete_only_when_platform_supports_it() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state/tasks.json"),
+            allow_library_item_delete: true,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+
+        let info = ServerGrpcService::new(state)
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert_eq!(
+            cfg!(unix),
+            info.capabilities
+                .contains(&(ServerCapability::LibraryItemDelete as i32))
+        );
+    }
+
+    #[tokio::test]
     async fn bilibili_resolution_v2_requires_durable_task_state() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp.path().join("cache");
@@ -6911,6 +6944,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_task_results_preserves_opaque_page_token_bytes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state/tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let task = state
+            .tasks
+            .create_bilibili_task("BV1opaque-task-result-token", None)
+            .expect("task should be created");
+        state
+            .tasks
+            .replace_task_output(
+                &task.id,
+                vec![
+                    task_result("result-1", TaskState::Completed),
+                    task_result("result-2", TaskState::Completed),
+                ],
+                Vec::new(),
+            )
+            .expect("task output should be replaced");
+        let service = TaskGrpcService::new(state);
+        let first_page = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id.clone(),
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }))
+            .await
+            .expect("first page should load")
+            .into_inner();
+        let token = first_page
+            .page_info
+            .expect("first page should include page info")
+            .next_page_token;
+
+        for edited_token in [format!(" {token}"), format!("{token} "), "   ".to_owned()] {
+            let error = service
+                .list_task_results(Request::new(ListTaskResultsRequest {
+                    task_id: task.id.clone(),
+                    page: Some(PageRequest {
+                        page_size: 1,
+                        page_token: edited_token,
+                    }),
+                }))
+                .await
+                .expect_err("edited opaque page-token bytes should be rejected");
+            assert_eq!(tonic::Code::InvalidArgument, error.code());
+        }
+
+        let continuation = service
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task.id,
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: token,
+                }),
+            }))
+            .await
+            .expect("the exact opaque page token should remain valid")
+            .into_inner();
+        assert_eq!(vec!["result-2"], result_ids(&continuation.results));
+    }
+
+    #[tokio::test]
     async fn task_output_v2_is_not_advertised_when_durable_state_is_unavailable() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let task_state_path = temp.path().join("tasks.json");
@@ -7805,6 +7907,30 @@ mod tests {
 
         assert_eq!(tonic::Code::PermissionDenied, error.code());
         assert!(root_path.join("sample.mp4").exists());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn delete_library_item_rejects_unsupported_platform_when_enabled() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = initialized_cache_root(&temp);
+        let state = AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state/tasks.json"),
+            root_path,
+            allow_library_item_delete: true,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = CacheGrpcService::new(state);
+
+        let error = service
+            .delete_library_item(Request::new(DeleteLibraryItemRequest {
+                id: "local.default.c2FtcGxlLm1wNA".to_owned(),
+            }))
+            .await
+            .expect_err("unsupported local deletion should be rejected");
+
+        assert_eq!(tonic::Code::Unimplemented, error.code());
     }
 
     #[tokio::test]

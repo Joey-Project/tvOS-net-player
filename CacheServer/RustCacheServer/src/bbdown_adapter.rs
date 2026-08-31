@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs::File,
     future::Future,
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -436,16 +436,21 @@ impl BbdownBilibiliAdapter {
         });
         let is_cancel_requested = || context.is_cancel_requested();
         let mut report = report;
-        prepare_download_report_for_playback_in_place(
+        let preparation = prepare_download_report_for_playback_in_place(
             &mut report,
             download_mode,
             &self.ffmpeg_path,
             &is_cancel_requested,
             &validated_paths,
         )
-        .await?;
+        .await;
+        if let Err(error) = preparation {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
+            return Err(error);
+        }
 
         if context.is_cancel_requested() {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled after BBDown muxing completed.".to_owned(),
             ));
@@ -459,6 +464,7 @@ impl BbdownBilibiliAdapter {
         });
 
         if context.is_cancel_requested() {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled after the BBDown download finished.".to_owned(),
             ));
@@ -470,10 +476,15 @@ impl BbdownBilibiliAdapter {
                 self.library.item_id_for_media_path(candidate.clone()).await
             {
                 if context.is_cancel_requested() {
+                    let _ =
+                        cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None)
+                            .await;
                     return Err(BilibiliDownloadError::Cancelled(
                         "Cancelled before committing the BBDown archive.".to_owned(),
                     ));
                 }
+                cleanup_legacy_unretained_media_outputs(&report, &validated_paths, Some(candidate))
+                    .await?;
                 self.save_archive(&archive)?;
                 return Ok(BilibiliDownloadOutput {
                     library_item_id,
@@ -483,6 +494,7 @@ impl BbdownBilibiliAdapter {
             }
         }
 
+        cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await?;
         Err(BilibiliDownloadError::Failed(format!(
             "BBDown finished but produced no playable cache item under {}. Ensure ffmpeg is installed and muxing outputs .mp4 files.",
             self.library.root_path().display()
@@ -4169,6 +4181,7 @@ enum DownloadReportPathKind {
 }
 
 struct ValidatedDownloadReportPaths {
+    owned_root_path: PathBuf,
     owned_root: File,
     entries: Vec<ValidatedDownloadEntryPaths>,
 }
@@ -4263,6 +4276,7 @@ fn validate_download_report_paths_no_follow_blocking(
         });
     }
     Ok(ValidatedDownloadReportPaths {
+        owned_root_path: owned_root.to_path_buf(),
         owned_root: owned_root_directory,
         entries,
     })
@@ -5075,7 +5089,7 @@ where
                 "Cancelled before BBDown muxing started.".to_owned(),
             ));
         }
-        if let Some(mux) = mux_entry_media(
+        if let Some(outcome) = mux_entry_media(
             entry,
             validated_entry,
             &validated_paths.owned_root,
@@ -5084,7 +5098,10 @@ where
         )
         .await?
         {
-            entry.mux = Some(mux);
+            entry
+                .files
+                .retain(|file| !outcome.unavailable_source_paths.contains(&file.path));
+            entry.mux = Some(outcome.report);
         }
     }
     Ok(())
@@ -5101,6 +5118,11 @@ struct PreparedMuxFiles {
     manifest: Option<BoundMuxFile>,
     output: BoundMuxFile,
     output_leaf: OsString,
+}
+
+struct MuxEntryOutcome {
+    report: MuxReport,
+    unavailable_source_paths: HashSet<PathBuf>,
 }
 
 fn direct_entry_leaf(
@@ -5155,6 +5177,7 @@ fn prepare_mux_files_blocking(
         let mut file = create_entry_file_exclusive(entry_directory, &leaf)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
         Some(BoundMuxFile { leaf, file })
     } else {
         None
@@ -5545,7 +5568,7 @@ async fn mux_entry_media<F>(
     owned_root: &File,
     ffmpeg_path: &Path,
     is_cancel_requested: &F,
-) -> Result<Option<MuxReport>, BilibiliDownloadError>
+) -> Result<Option<MuxEntryOutcome>, BilibiliDownloadError>
 where
     F: Fn() -> bool,
 {
@@ -5698,6 +5721,28 @@ where
         ));
     }
 
+    let unavailable_source_paths = match revalidate_mux_source_paths(
+        &validated_entry.media_files,
+        owned_root,
+        &output_path,
+        &mux_output_path,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            cleanup_failed_mux_files(
+                validated_entry,
+                owned_root,
+                &output_path,
+                &mux_output_path,
+                &prepared,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+
     if let Err(error) = publish_bound_mux_file(
         &validated_entry.directory,
         &prepared.output,
@@ -5715,19 +5760,150 @@ where
         .await;
         return Err(failed(error));
     }
-    cleanup_mux_source_files(
-        &validated_entry.media_files,
-        owned_root,
-        &output_path,
-        &mux_output_path,
-    )
-    .await?;
-
-    Ok(Some(MuxReport {
-        output_path,
-        command: command_report(ffmpeg_path, &args),
-        chapter_count: 0,
+    Ok(Some(MuxEntryOutcome {
+        report: MuxReport {
+            output_path,
+            command: command_report(ffmpeg_path, &args),
+            chapter_count: 0,
+        },
+        unavailable_source_paths,
     }))
+}
+
+async fn revalidate_mux_source_paths(
+    media_files: &[ValidatedMediaFile],
+    owned_root: &File,
+    output_path: &Path,
+    mux_output_path: &Path,
+) -> Result<HashSet<PathBuf>, BilibiliDownloadError> {
+    let owned_root = owned_root.try_clone().map_err(failed)?;
+    let media_files = media_files
+        .iter()
+        .map(|media_file| {
+            Ok((
+                media_file.path.clone(),
+                media_file.relative_to_owned_root.clone(),
+                media_file.file.try_clone()?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(failed)?;
+    let output_path = output_path.to_path_buf();
+    let mux_output_path = mux_output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        revalidate_mux_source_paths_blocking(
+            &media_files,
+            &owned_root,
+            &output_path,
+            &mux_output_path,
+        )
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("BBDown source revalidation worker failed.".to_owned())
+    })?
+    .map_err(failed)
+}
+
+#[cfg(unix)]
+fn revalidate_mux_source_paths_blocking(
+    media_files: &[(PathBuf, String, File)],
+    owned_root: &File,
+    output_path: &Path,
+    mux_output_path: &Path,
+) -> io::Result<HashSet<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut unavailable = HashSet::new();
+    for (path, relative_path, bound_file) in media_files {
+        if path == output_path || path == mux_output_path {
+            unavailable.insert(path.clone());
+            continue;
+        }
+
+        // Raw fallback publication protects pathname-to-validated-file object identity only.
+        // Device and inode bind the current name to the descriptor consumed by ffmpeg; timestamps,
+        // link count, and directory metadata are not content-stability signals and are ignored.
+        let bound_metadata = bound_file.metadata()?;
+        match open_read_no_follow_at(owned_root, relative_path) {
+            Ok(current) => {
+                let current_metadata = current.metadata()?;
+                if current_metadata.dev() == bound_metadata.dev()
+                    && current_metadata.ino() == bound_metadata.ino()
+                {
+                    continue;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                unavailable.insert(path.clone());
+                continue;
+            }
+            Err(_) => {}
+        }
+
+        remove_file_no_follow_at(owned_root, relative_path)?;
+        unavailable.insert(path.clone());
+    }
+    Ok(unavailable)
+}
+
+#[cfg(not(unix))]
+fn revalidate_mux_source_paths_blocking(
+    _media_files: &[(PathBuf, String, File)],
+    _owned_root: &File,
+    _output_path: &Path,
+    _mux_output_path: &Path,
+) -> io::Result<HashSet<PathBuf>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure BBDown source revalidation is not implemented on this platform",
+    ))
+}
+
+async fn cleanup_legacy_unretained_media_outputs(
+    report: &DownloadReport,
+    validated_paths: &ValidatedDownloadReportPaths,
+    retained_output_path: Option<&Path>,
+) -> Result<(), BilibiliDownloadError> {
+    if report.entries.len() != validated_paths.entries.len() {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown entry set changed before legacy media cleanup.".to_owned(),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut relative_paths = Vec::new();
+    for (entry, validated_entry) in report.entries.iter().zip(&validated_paths.entries) {
+        for media_file in &validated_entry.media_files {
+            if Some(media_file.path.as_path()) != retained_output_path
+                && seen.insert(media_file.relative_to_owned_root.clone())
+            {
+                relative_paths.push(media_file.relative_to_owned_root.clone());
+            }
+        }
+        if let Some(mux) = entry.mux.as_ref()
+            && Some(mux.output_path.as_path()) != retained_output_path
+        {
+            let relative_path =
+                cache_relative_normal_path(&validated_paths.owned_root_path, &mux.output_path)?;
+            if seen.insert(relative_path.clone()) {
+                relative_paths.push(relative_path);
+            }
+        }
+    }
+
+    let owned_root = validated_paths.owned_root.try_clone().map_err(failed)?;
+    tokio::task::spawn_blocking(move || {
+        for relative_path in relative_paths {
+            remove_file_no_follow_at(&owned_root, &relative_path)?;
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("Legacy BBDown media cleanup worker failed.".to_owned())
+    })?
+    .map_err(failed)
 }
 
 async fn cleanup_downloaded_media_sources(
@@ -6240,6 +6416,10 @@ mod tests {
         assert!(
             !media_path.exists(),
             "the replacement source name is cleanup-owned"
+        );
+        assert!(
+            report.entries[0].files.is_empty(),
+            "a replaced source must not remain eligible for raw fallback publication"
         );
     }
 
@@ -7317,6 +7497,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_media_artifact_uses_the_selected_raw_output_format_when_mux_is_rejected() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -7329,8 +7510,8 @@ mod tests {
         let mux_path = entry_directory.join("Episode 2.mp4");
         let raw_video_path = entry_directory.join("video.m4s");
         std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
-        std_fs::write(&mux_path, b"muxed").expect("mux output should be written");
         std_fs::write(&raw_video_path, b"raw video").expect("raw output should be written");
+        let ffmpeg = write_fake_ffmpeg(temp.path());
         let server_options = Arc::new(CacheServerOptions {
             root_path: library_root,
             allowed_extensions: vec![".m4s".to_owned()],
@@ -7360,13 +7541,17 @@ mod tests {
                     bytes_written: 9,
                     resumed_from: 0,
                 }],
-                mux: Some(MuxReport {
-                    output_path: mux_path.clone(),
-                    command: Vec::new(),
-                    chapter_count: 0,
-                }),
+                mux: None,
             }],
         };
+        let report =
+            prepare_download_report_for_playback(report, DownloadMode::VideoOnly, &ffmpeg, &|| {
+                false
+            })
+            .await
+            .expect("v2 preparation should retain raw media after successful muxing");
+        assert!(mux_path.is_file());
+        assert!(raw_video_path.is_file());
 
         let mapped = adapter
             .map_v2_download_result(
@@ -7396,6 +7581,60 @@ mod tests {
                 .await
                 .as_deref()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_media_cleanup_retains_only_the_selected_raw_fallback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let owned_root = temp.path().join("owned-output");
+        let entry_directory = owned_root.join("entry");
+        let mux_path = entry_directory.join("Episode.mp4");
+        let raw_video_path = entry_directory.join("video.m4s");
+        let raw_audio_path = entry_directory.join("audio.m4s");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        std_fs::write(&mux_path, b"muxed").expect("mux output should be written");
+        std_fs::write(&raw_video_path, b"video").expect("raw video should be written");
+        std_fs::write(&raw_audio_path, b"audio").expect("raw audio should be written");
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Episode".to_owned(),
+                directory: entry_directory,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: raw_video_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: raw_audio_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: Some(MuxReport {
+                    output_path: mux_path.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+        let validated = validate_download_report_paths_no_follow(temp.path(), &owned_root, &report)
+            .await
+            .expect("legacy output paths should validate");
+
+        cleanup_legacy_unretained_media_outputs(&report, &validated, Some(&raw_video_path))
+            .await
+            .expect("legacy cleanup should retain only the selected output");
+
+        assert!(raw_video_path.is_file());
+        assert!(!raw_audio_path.exists());
+        assert!(!mux_path.exists());
     }
 
     #[tokio::test]
@@ -9955,8 +10194,8 @@ mod tests {
         let output_path = entry_dir.join("Entry_ Episode 1.mp4");
         assert_eq!(output_path, mux.output_path);
         assert_eq!(b"muxed", std::fs::read(&output_path).unwrap().as_slice());
-        assert!(!video_path.exists());
-        assert!(!audio_path.exists());
+        assert!(video_path.exists());
+        assert!(audio_path.exists());
         assert!(subtitle_path.exists());
 
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log")).unwrap();
@@ -9979,7 +10218,7 @@ mod tests {
         std::fs::write(&first_segment, b"first").unwrap();
         std::fs::write(&second_segment, b"second").unwrap();
         let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
-        let ffmpeg = write_fake_ffmpeg(temp.path());
+        let ffmpeg = write_concat_reading_fake_ffmpeg(temp.path());
         let report = DownloadReport {
             title: "Example".to_owned(),
             output_dir: temp.path().to_path_buf(),
@@ -10011,8 +10250,17 @@ mod tests {
 
         assert!(report.entries[0].mux.is_some());
         assert!(!concat_list.exists());
-        assert!(!first_segment.exists());
-        assert!(!second_segment.exists());
+        assert!(first_segment.exists());
+        assert!(second_segment.exists());
+        let manifest = std::fs::read_to_string(temp.path().join("ffmpeg-concat.log"))
+            .expect("fake ffmpeg should read the inherited concat manifest");
+        let manifest_lines = manifest.lines().collect::<Vec<_>>();
+        assert_eq!(2, manifest_lines.len());
+        assert!(
+            manifest_lines
+                .iter()
+                .all(|line| line.starts_with("file '/dev/fd/") && line.ends_with('\''))
+        );
     }
 
     #[cfg(unix)]
@@ -10695,6 +10943,39 @@ for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args_log"
   last=$arg
 done
+printf muxed > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_concat_reading_fake_ffmpeg(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("concat-reading-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+input=
+expect_input=0
+last=
+for arg in "$@"; do
+  if [ "$expect_input" -eq 1 ]; then
+    input=$arg
+    expect_input=0
+  elif [ "$arg" = "-i" ]; then
+    expect_input=1
+  fi
+  last=$arg
+done
+cat "$input" > "$script_dir/ffmpeg-concat.log"
 printf muxed > "$last"
 "#,
         )

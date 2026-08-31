@@ -41,7 +41,7 @@ enum LibraryPublicationGateState {
 }
 
 impl LibraryPublicationGate {
-    fn known_empty() -> Self {
+    pub(crate) fn known_empty() -> Self {
         Self {
             state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Known {
                 blocked_paths: HashSet::new(),
@@ -50,21 +50,26 @@ impl LibraryPublicationGate {
         }
     }
 
+    pub(crate) fn known_empty_for_output_directory(
+        cache_root: &Path,
+        output_directory: &Path,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Known {
+                blocked_paths: HashSet::new(),
+            })),
+            managed_output_prefix: Some(publication_gate_output_prefix(
+                cache_root,
+                output_directory,
+            )?),
+        })
+    }
+
     pub(crate) fn unknown_for_output_directory(
         cache_root: &Path,
         output_directory: &Path,
     ) -> io::Result<Self> {
-        let relative_path = output_directory.strip_prefix(cache_root).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Bilibili output directory is outside the cache root",
-            )
-        })?;
-        let blocked_prefix = if relative_path.as_os_str().is_empty() {
-            PathBuf::new()
-        } else {
-            normalized_publication_gate_path(relative_path)?
-        };
+        let blocked_prefix = publication_gate_output_prefix(cache_root, output_directory)?;
         Ok(Self {
             state: StdRwLock::new(Arc::new(LibraryPublicationGateState::Unknown {
                 blocked_prefix: blocked_prefix.clone(),
@@ -134,6 +139,23 @@ impl LibraryPublicationGate {
             }
         }
         None
+    }
+}
+
+fn publication_gate_output_prefix(
+    cache_root: &Path,
+    output_directory: &Path,
+) -> io::Result<PathBuf> {
+    let relative_path = output_directory.strip_prefix(cache_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bilibili output directory is outside the cache root",
+        )
+    })?;
+    if relative_path.as_os_str().is_empty() {
+        Ok(PathBuf::new())
+    } else {
+        normalized_publication_gate_path(relative_path)
     }
 }
 

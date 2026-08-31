@@ -445,11 +445,19 @@ impl AppState {
         let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
         let publication_gate = Arc::new(
-            LibraryPublicationGate::unknown_for_output_directory(
-                &options.root_path,
-                &options.bbdown_output_dir(),
-            )
-            .expect("validated Bilibili output directory must be inside the cache root"),
+            if options.bilibili_worker_enabled || options.bbdown_output_dir.is_some() {
+                LibraryPublicationGate::unknown_for_output_directory(
+                    &options.root_path,
+                    &options.bbdown_output_dir(),
+                )
+                .expect("validated Bilibili output directory must be inside the cache root")
+            } else {
+                LibraryPublicationGate::known_empty_for_output_directory(
+                    &options.root_path,
+                    &options.root_path.join("Bilibili"),
+                )
+                .expect("default Bilibili output directory must be inside the cache root")
+            },
         );
         let library = Arc::new(LocalMediaLibrary::new_with_publication_gate(
             Arc::clone(&options),
@@ -3158,6 +3166,35 @@ mod tests {
                 credential_safe_client_error(true, &wrapped)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabled_worker_starts_with_symlinked_default_bbdown_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache-root");
+        let outside_path = temp.path().join("outside");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        std::fs::create_dir_all(&outside_path).expect("outside directory should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        symlink(&outside_path, root_path.join("Bilibili"))
+            .expect("default BBDown output symlink should be created");
+
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: root_path.join(".state/tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(NoopPlaybackPlanner),
+        );
+
+        assert!(state.tasks.persistence_available());
     }
 
     #[tokio::test]

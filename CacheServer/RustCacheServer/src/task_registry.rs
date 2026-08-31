@@ -3755,7 +3755,11 @@ impl BilibiliTaskRegistry {
             }
 
             let has_successful_result = task_has_successful_media_result(task);
-            if task.kind() == TaskKind::BilibiliDownload && !has_successful_result {
+            if matches!(
+                task.kind(),
+                TaskKind::BilibiliDownload | TaskKind::BilibiliProgressivePlayback
+            ) && !has_successful_result
+            {
                 task.state = TaskState::Failed.into();
                 task.message = LIBRARY_ITEM_DELETED_MESSAGE.to_owned();
             } else {
@@ -8935,6 +8939,67 @@ mod tests {
             .as_ref()
             .expect("restored completed playback should keep a source");
         assert_eq!("bilibili.hls.completed", restored_source.item_id);
+    }
+
+    #[test]
+    fn library_deletion_fails_and_restores_sole_completed_progressive_playback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("cache");
+        let relative_path = "Bilibili/progressive-playback.mp4";
+        let library_item_id = create_item_id(relative_path);
+        let media_path = root_path.join(relative_path);
+        std::fs::create_dir_all(media_path.parent().expect("media should have a parent"))
+            .expect("media directory should be created");
+        std::fs::write(&media_path, b"progressive playback")
+            .expect("playback media should be written");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let created = registry
+            .create_bilibili_playback_task("BV1progressive-delete", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable playback".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        registry
+            .complete_playback_cached(&created.task.id, library_item_id.clone())
+            .expect("playback cache should complete");
+
+        let prepared = registry
+            .tombstone_library_item_before_delete(&library_item_id, relative_path)
+            .expect("progressive playback reference should tombstone durably");
+        let updated = registry
+            .get_task(&created.task.id)
+            .expect("deleted playback task should remain visible");
+        assert_eq!(TaskState::Failed, updated.state());
+        assert!(updated.library_item_id.is_empty());
+        assert!(updated.playback_source.is_none());
+        assert!(updated.playback_session.is_none());
+        assert_eq!(LIBRARY_ITEM_DELETED_MESSAGE, updated.message);
+
+        drop(prepared);
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+        let restored_task = restored
+            .get_task(&created.task.id)
+            .expect("failed playback tombstone should survive restart");
+        assert_eq!(TaskState::Failed, restored_task.state());
+        assert!(restored_task.library_item_id.is_empty());
+        assert!(restored_task.playback_source.is_none());
+        assert!(restored_task.playback_session.is_none());
     }
 
     #[test]
