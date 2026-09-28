@@ -1608,30 +1608,47 @@ mod tests {
         let record = TaskResourceRecord::new(resource).expect("test resource should be valid");
         let resource_id = record.resource.id.clone();
         let resource_path = root_path.join(record.relative_path());
-        fs::create_dir_all(resource_path.parent().unwrap())
-            .expect("resource directory should be created");
-        if let Some(body) = body {
-            fs::write(&resource_path, body).expect("resource body should be written");
-        }
-        state
+        let publication_size: usize = record
+            .resource
+            .size_bytes
+            .try_into()
+            .expect("test resource size should fit in memory");
+        let publication_body = body
+            .filter(|body| body.len() == publication_size)
+            .map_or_else(|| vec![0; publication_size], <[u8]>::to_vec);
+        let results = vec![TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Completed.into(),
+            artifacts: vec![TaskArtifact {
+                id: "artifact-one".to_owned(),
+                kind: TaskArtifactKind::Subtitle.into(),
+                state: TaskArtifactState::Available.into(),
+                resource: Some(record.resource.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let staged = state
             .tasks
-            .replace_task_output(
-                &task.id,
-                vec![TaskResult {
-                    id: "result-one".to_owned(),
-                    state: TaskState::Completed.into(),
-                    artifacts: vec![TaskArtifact {
-                        id: "artifact-one".to_owned(),
-                        kind: TaskArtifactKind::Subtitle.into(),
-                        state: TaskArtifactState::Available.into(),
-                        resource: Some(record.resource.clone()),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                vec![record],
-            )
-            .expect("test task output should be replaced");
+            .stage_task_output_replacement(&task.id, vec![record])
+            .expect("test task output should stage");
+        staged
+            .write_resource_body(&resource_id, &publication_body)
+            .expect("resource body should be written");
+        staged
+            .commit(results)
+            .expect("test task output should be committed");
+        match body {
+            None => fs::remove_file(&resource_path)
+                .expect("missing-body fixture should remove the published body"),
+            Some(body) if body.len() != publication_size => {
+                fs::remove_file(&resource_path)
+                    .expect("mismatched-body fixture should remove the published body");
+                fs::write(&resource_path, body)
+                    .expect("mismatched-body fixture should install replacement bytes");
+            }
+            Some(_) => {}
+        }
 
         TaskResourceFixture {
             temp,
@@ -3390,6 +3407,7 @@ mod tests {
                     library_item_id: String::new(),
                     playback_source: Some(playback_source),
                     playback_session: Some(playback_session),
+                    identity: None,
                 }],
             )
             .expect("playback task should authorize HLS session");

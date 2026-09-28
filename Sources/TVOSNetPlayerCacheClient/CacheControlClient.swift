@@ -35,6 +35,11 @@ public protocol CacheControlClient: Sendable {
     func getPlaybackSource(itemID: String, variantID: String) async throws -> CachePlaybackSource
     func deleteLibraryItem(id: String) async throws -> Bool
     func getTask(id: String) async throws -> CacheTask
+    func listTaskResults(
+        taskID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> CacheTaskResultsPage
     func watchTasks(ids: [String]) async -> AsyncThrowingStream<CacheTask, Error>
     func cancelTask(id: String) async throws -> CacheTask
     func resolveBilibiliInput(
@@ -44,6 +49,12 @@ public protocol CacheControlClient: Sendable {
     func startBilibiliResolution(
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
         pageSize: Int
     ) async throws -> BilibiliResolutionPage
     func listBilibiliResolutionCandidates(
@@ -73,6 +84,11 @@ public protocol CacheControlClient: Sendable {
         sessionID: String,
         selection: BilibiliResolutionSelection
     ) async throws -> CacheTask
+    func createBilibiliTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution
+    ) async throws -> CacheTask
 }
 
 public enum CacheControlClientUnsupportedFeature: Error, Equatable {
@@ -93,6 +109,41 @@ public enum CacheControlClientInvalidRequest: Error, Equatable, Sendable {
     case bilibiliResolutionInputRequired
     case bilibiliResolutionSessionIDRequired
     case invalidBilibiliResolutionSelection
+}
+
+public struct CacheControlClientUnsupportedOperation: Error, Equatable, Sendable {
+    public let code: String
+    public let message: String
+
+    private init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
+
+    public static let bilibiliExecutionV2 = CacheControlClientUnsupportedOperation(
+        code: "bilibili_execution_v2",
+        message: "Bilibili v2 task execution is not supported by this cache server."
+    )
+
+    public static let taskOutputV2 = CacheControlClientUnsupportedOperation(
+        code: "task_output_v2",
+        message: "Paginated task results are not supported by this cache server."
+    )
+}
+
+public struct CacheControlClientRequestValidationError: Error, Equatable, Sendable {
+    public let code: String
+    public let message: String
+
+    private init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
+
+    public static let invalidBilibiliDownloadMode = CacheControlClientRequestValidationError(
+        code: "invalid_bilibili_download_mode",
+        message: "The Bilibili download mode is not recognized."
+    )
 }
 
 public extension CacheControlClient {
@@ -142,6 +193,22 @@ public extension CacheControlClient {
         throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
     }
 
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage {
+        guard context.isDefault else {
+            throw CacheControlClientUnsupportedOperation.bilibiliExecutionV2
+        }
+        return try await startBilibiliResolution(
+            urlOrID: urlOrID,
+            options: options,
+            pageSize: pageSize
+        )
+    }
+
     func listBilibiliResolutionCandidates(
         sessionID: String,
         pageToken: String = "",
@@ -155,6 +222,14 @@ public extension CacheControlClient {
         options: BilibiliDownloadTaskOptions
     ) async throws -> CacheTask {
         throw CacheControlClientUnsupportedFeature.bilibiliDownloadTask
+    }
+
+    func listTaskResults(
+        taskID: String,
+        pageToken: String = "",
+        pageSize: Int = 50
+    ) async throws -> CacheTaskResultsPage {
+        throw CacheControlClientUnsupportedOperation.taskOutputV2
     }
 
     func listLibraryItemsPage(
@@ -209,6 +284,14 @@ public extension CacheControlClient {
         throw CacheControlClientUnsupportedFeature.bilibiliResolutionV2
     }
 
+    func createBilibiliTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution
+    ) async throws -> CacheTask {
+        throw CacheControlClientUnsupportedOperation.bilibiliExecutionV2
+    }
+
     func watchTask(id: String) async -> AsyncThrowingStream<CacheTask, Error> {
         await watchTasks(ids: [id])
     }
@@ -254,4 +337,12 @@ extension CacheControlClientInvalidRequest: LocalizedError {
             return "The Bilibili resolution selection is structurally invalid."
         }
     }
+}
+
+extension CacheControlClientUnsupportedOperation: LocalizedError {
+    public var errorDescription: String? { message }
+}
+
+extension CacheControlClientRequestValidationError: LocalizedError {
+    public var errorDescription: String? { message }
 }

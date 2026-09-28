@@ -1,15 +1,34 @@
-use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    future::Future,
+    io,
+    panic::AssertUnwindSafe,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::FutureExt;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
-    generated::tvos_net_player::v1::{BilibiliDownloadOptions, Task},
+    bilibili_resolution::BilibiliTaskCandidateRecord,
+    generated::tvos_net_player::v1::{
+        BilibiliDownloadOptions, BilibiliRequestContext, Task, TaskResult, TaskState,
+    },
+    library::LibraryItemPublicationLease,
+    task_output::TaskResourceRecord,
     task_registry::{
         BilibiliTaskCancellation, BilibiliTaskProgress, BilibiliTaskRegistry, BilibiliTaskWorkItem,
-        TaskPersistenceRecoveryOutcome,
+        StagedTaskOutputReplacement, TaskPersistenceRecoveryOutcome,
     },
+    task_store::PersistedFileCleanupKind,
 };
+
+const FILE_CLEANUP_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const FILE_CLEANUP_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 pub type BilibiliDownloadFuture<'a> = Pin<
     Box<dyn Future<Output = Result<BilibiliDownloadOutput, BilibiliDownloadError>> + Send + 'a>,
@@ -28,11 +47,115 @@ pub struct BilibiliDownloadRequest {
     pub task_id: String,
     pub source: String,
     pub options: Option<BilibiliDownloadOptions>,
+    pub request_context: Option<BilibiliRequestContext>,
+    pub(crate) candidates: Vec<BilibiliTaskCandidateRecord>,
 }
 
 pub struct BilibiliDownloadOutput {
     pub library_item_id: String,
     pub message: String,
+    pub v2: Option<BilibiliDownloadOutputV2>,
+}
+
+pub struct BilibiliDownloadOutputV2 {
+    pub terminal_state: TaskState,
+    pub results: Vec<TaskResult>,
+    pub(crate) resources: Vec<TaskResourceRecord>,
+    pub resource_bodies: Vec<BilibiliTaskResourceBody>,
+    pub(crate) library_item_leases: Vec<LibraryItemPublicationLease>,
+    pub(crate) transient_output_paths: Vec<PathBuf>,
+    pub(crate) owned_directory_cleanup_paths: Vec<PathBuf>,
+}
+
+pub struct BilibiliTaskResourceBody {
+    pub resource_id: String,
+    pub source: BilibiliTaskResourceBodySource,
+}
+
+pub enum BilibiliTaskResourceBodySource {
+    CacheFile(BilibiliTaskResourceCacheFile),
+    Bytes(Vec<u8>),
+}
+
+pub struct BilibiliTaskResourceCacheFile {
+    file: File,
+    identity: BilibiliTaskResourceCacheFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BilibiliTaskResourceCacheFileIdentity {
+    pub(crate) device_id: u64,
+    pub(crate) inode: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) mode: u32,
+}
+
+impl BilibiliTaskResourceCacheFileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "validated Bilibili task resource source is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            size_bytes: metadata.len(),
+            mode: metadata.mode() & 0o7777,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure Bilibili task resource source validation is not implemented on this platform",
+        ))
+    }
+}
+
+impl BilibiliTaskResourceCacheFile {
+    pub(crate) fn new(
+        file: File,
+        identity: BilibiliTaskResourceCacheFileIdentity,
+    ) -> io::Result<Self> {
+        let source = Self { file, identity };
+        source.revalidate()?;
+        Ok(source)
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        let actual = BilibiliTaskResourceCacheFileIdentity::from_metadata(&self.file.metadata()?)?;
+        if actual != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "validated Bilibili task resource source identity, length, or permission mode changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn copy_into(
+        &self,
+        staged: &StagedTaskOutputReplacement<'_>,
+        resource_id: &str,
+        cancellation: &BilibiliTaskCancellation,
+    ) -> io::Result<()> {
+        // The protected property is this regular-file object's identity, validated length, and
+        // access mode. Path replacement cannot redirect the copy because it uses this descriptor;
+        // timestamps and sibling-directory churn are intentionally ignored.
+        self.revalidate()?;
+        staged.copy_resource_body_from_open_cache_file_with_cancellation(
+            resource_id,
+            &self.file,
+            || cancellation.is_cancel_requested(),
+        )?;
+        self.revalidate()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,12 +183,52 @@ pub struct BilibiliDownloadContext {
 }
 
 impl BilibiliDownloadContext {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        registry: Arc<BilibiliTaskRegistry>,
+        task_id: String,
+        cancellation: BilibiliTaskCancellation,
+    ) -> Self {
+        Self {
+            registry,
+            task_id,
+            cancellation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancellation.request_cancel_for_test();
+    }
+
     pub fn is_cancel_requested(&self) -> bool {
         self.cancellation.is_cancel_requested()
     }
 
     pub fn report_progress(&self, progress: BilibiliTaskProgress) -> bool {
         self.registry.update_task_progress(&self.task_id, progress)
+    }
+
+    pub async fn register_owned_output_directories(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), BilibiliDownloadError> {
+        let registry = Arc::clone(&self.registry);
+        let task_id = self.task_id.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.register_bilibili_owned_output_directories(&task_id, &paths)
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output ownership persistence worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output ownership could not be persisted durably.".to_owned(),
+            )
+        })
     }
 }
 
@@ -91,7 +254,7 @@ pub async fn run_bilibili_task_worker(
             .acquire_owned()
             .await
             .expect("worker semaphore must stay open");
-        let work_item = registry.claim_next_bilibili_task().await;
+        let work_item = claim_next_bilibili_task(Arc::clone(&registry)).await;
         let registry = Arc::clone(&registry);
         let adapter = Arc::clone(&adapter);
         running_tasks.spawn(async move {
@@ -101,16 +264,90 @@ pub async fn run_bilibili_task_worker(
     }
 }
 
+pub(crate) async fn run_pending_file_cleanup_worker(registry: Arc<BilibiliTaskRegistry>) {
+    run_pending_file_cleanup_worker_with_backoff(
+        registry,
+        FILE_CLEANUP_RETRY_INITIAL_DELAY,
+        FILE_CLEANUP_RETRY_MAX_DELAY,
+    )
+    .await;
+}
+
+async fn run_pending_file_cleanup_worker_with_backoff(
+    registry: Arc<BilibiliTaskRegistry>,
+    initial_delay: Duration,
+    max_delay: Duration,
+) {
+    let mut retry_delay = initial_delay;
+    loop {
+        registry.wait_for_retryable_pending_file_cleanups().await;
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_succeeded =
+            tokio::task::spawn_blocking(move || cleanup_registry.retry_pending_file_cleanups())
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Pending file cleanup worker task failed: {error}");
+                    false
+                });
+        if cleanup_succeeded {
+            retry_delay = initial_delay;
+            continue;
+        }
+
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay.saturating_mul(2), max_delay);
+    }
+}
+
+async fn claim_next_bilibili_task(registry: Arc<BilibiliTaskRegistry>) -> BilibiliTaskWorkItem {
+    loop {
+        let queue_changed = registry.bilibili_task_queue_change();
+        if let Some(work_item) = registry.try_claim_next_bilibili_task() {
+            return work_item;
+        }
+        if registry.has_bilibili_v2_task_waiting_for_persistence() {
+            match retry_pending_task_persistence(&registry).await {
+                TaskPersistenceRecoveryOutcome::Durable => continue,
+                TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                TaskPersistenceRecoveryOutcome::PermanentFailure => {
+                    eprintln!(
+                        "Bilibili v2 task creation persistence recovery was rejected permanently; the task will remain queued"
+                    );
+                }
+            }
+        }
+        if registry.has_bilibili_v2_task_waiting_for_output_cleanup() {
+            let cleanup_registry = Arc::clone(&registry);
+            let cleanup_succeeded =
+                tokio::task::spawn_blocking(move || cleanup_registry.retry_pending_file_cleanups())
+                    .await
+                    .unwrap_or(false);
+            if cleanup_succeeded {
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
+        queue_changed.await;
+    }
+}
+
 async fn run_one_bilibili_task(
     registry: Arc<BilibiliTaskRegistry>,
     adapter: Arc<dyn BilibiliDownloadAdapter>,
     work_item: BilibiliTaskWorkItem,
     credentials_configured: bool,
 ) {
+    let is_v2 = !work_item.accepted_candidates.is_empty();
     let request = BilibiliDownloadRequest {
         task_id: work_item.task_id.clone(),
         source: work_item.source,
         options: work_item.options,
+        request_context: work_item.request_context,
+        candidates: work_item.accepted_candidates,
     };
     let context = BilibiliDownloadContext {
         registry: Arc::clone(&registry),
@@ -124,6 +361,7 @@ async fn run_one_bilibili_task(
         Ok(result) => result,
         Err(_) => {
             let task_id = work_item.task_id.clone();
+            let cleanup_task_id = task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_failed(
                     &task_id,
@@ -131,27 +369,58 @@ async fn run_one_bilibili_task(
                 )
             })
             .await;
+            if is_v2 {
+                retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id).await;
+            }
             return;
         }
     };
 
-    if work_item.cancellation.is_cancel_requested() {
+    if work_item.cancellation.is_cancel_requested()
+        && !matches!(
+            &result,
+            Ok(output)
+                if output
+                    .v2
+                    .as_ref()
+                    .is_some_and(|output| output.terminal_state == TaskState::Cancelled)
+        )
+    {
         let message = match result {
+            Err(BilibiliDownloadError::Cancelled(_)) if is_v2 => "Cancelled by request.".to_owned(),
             Err(BilibiliDownloadError::Cancelled(message)) => {
                 crate::credential_safe_client_cancellation(credentials_configured, &message)
             }
             _ => "Cancelled by request.".to_owned(),
         };
         let task_id = work_item.task_id.clone();
+        let cleanup_task_id = task_id.clone();
         complete_terminal_task(&registry, move |registry| {
             registry.complete_task_cancelled(&task_id, message.clone())
         })
         .await;
+        if is_v2 {
+            retry_v2_owned_output_directory_cleanup(&registry, &cleanup_task_id).await;
+        }
         return;
     }
 
     match result {
-        Ok(output) => {
+        Ok(mut output) => {
+            if let Some(mut output_v2) = output.v2.take() {
+                sanitize_download_output_v2(&mut output_v2);
+                complete_v2_terminal_task(
+                    &registry,
+                    work_item.task_id.clone(),
+                    output.library_item_id,
+                    output.message,
+                    output_v2,
+                    work_item.cancellation.clone(),
+                    credentials_configured,
+                )
+                .await;
+                return;
+            }
             let task_id = work_item.task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_succeeded(
@@ -163,8 +432,11 @@ async fn run_one_bilibili_task(
             .await;
         }
         Err(BilibiliDownloadError::Cancelled(message)) => {
-            let message =
-                crate::credential_safe_client_cancellation(credentials_configured, &message);
+            let message = if is_v2 {
+                "Cancelled by request.".to_owned()
+            } else {
+                crate::credential_safe_client_cancellation(credentials_configured, &message)
+            };
             let task_id = work_item.task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_cancelled(&task_id, message.clone())
@@ -176,7 +448,16 @@ async fn run_one_bilibili_task(
             @ (BilibiliDownloadError::Failed(_) | BilibiliDownloadError::ResourceExhausted(_)),
         ) => {
             let detail = error.message();
-            let message = crate::credential_safe_client_error(credentials_configured, &detail);
+            let message = if is_v2 {
+                let detail = crate::error_detail_for_log(credentials_configured, &detail);
+                eprintln!(
+                    "Bilibili v2 task {} failed before result publication: {detail}",
+                    work_item.task_id
+                );
+                "The Bilibili download failed.".to_owned()
+            } else {
+                crate::credential_safe_client_error(credentials_configured, &detail)
+            };
             let task_id = work_item.task_id.clone();
             complete_terminal_task(&registry, move |registry| {
                 registry.complete_task_failed(&task_id, message.clone())
@@ -184,9 +465,283 @@ async fn run_one_bilibili_task(
             .await;
         }
     }
+    if is_v2 {
+        retry_v2_owned_output_directory_cleanup(&registry, &work_item.task_id).await;
+    }
+}
+
+async fn retry_v2_owned_output_directory_cleanup(
+    registry: &Arc<BilibiliTaskRegistry>,
+    task_id: &str,
+) {
+    retry_v2_file_cleanup_intents(
+        registry,
+        task_id,
+        PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+        "Bilibili owned-output directory cleanup",
+        "directory cleanup",
+    )
+    .await;
+}
+
+async fn retry_v2_transient_output_cleanup(registry: &Arc<BilibiliTaskRegistry>, task_id: &str) {
+    retry_v2_file_cleanup_intents(
+        registry,
+        task_id,
+        PersistedFileCleanupKind::BilibiliTransientOutput,
+        "Bilibili transient-output cleanup",
+        "output cleanup",
+    )
+    .await;
+}
+
+async fn retry_v2_file_cleanup_intents(
+    registry: &Arc<BilibiliTaskRegistry>,
+    task_id: &str,
+    kind: PersistedFileCleanupKind,
+    context: &'static str,
+    pending_description: &'static str,
+) {
+    let cleanup_registry = Arc::clone(registry);
+    let cleanup_task_id = task_id.to_owned();
+    let outcome = run_blocking_worker_attempt(context, move || {
+        cleanup_registry.retry_file_cleanup_intents_for_owner(kind, &cleanup_task_id)
+    })
+    .await;
+    if let Some(Err(error)) = outcome {
+        eprintln!(
+            "Bilibili v2 task {task_id} retained pending {pending_description} for retry: {error}"
+        );
+    }
+}
+
+fn sanitize_download_output_v2(output: &mut BilibiliDownloadOutputV2) {
+    for result in &mut output.results {
+        match result.state() {
+            TaskState::Failed => {
+                if let Some(problem) = result.problem.as_mut() {
+                    problem.message = "The Bilibili download failed.".to_owned();
+                }
+                if let Some(progress) = result.progress.as_mut() {
+                    progress.message = "Bilibili download failed.".to_owned();
+                }
+            }
+            TaskState::Cancelled => {
+                if let Some(problem) = result.problem.as_mut() {
+                    problem.message = "Cancelled by request.".to_owned();
+                }
+                if let Some(progress) = result.progress.as_mut() {
+                    progress.message = "Cancelled by request.".to_owned();
+                }
+            }
+            _ => {}
+        }
+        for artifact in &mut result.artifacts {
+            if let Some(problem) = artifact.problem.as_mut() {
+                problem.message = "Task artifact is unavailable.".to_owned();
+            }
+        }
+    }
+}
+
+async fn complete_v2_terminal_task(
+    registry: &Arc<BilibiliTaskRegistry>,
+    task_id: String,
+    library_item_id: String,
+    message: String,
+    output: BilibiliDownloadOutputV2,
+    cancellation: BilibiliTaskCancellation,
+    credentials_configured: bool,
+) {
+    let output = Arc::new(output);
+    let cleanup_task_id = task_id.clone();
+    let publication = complete_terminal_task_with_outcome(registry, {
+        let task_id = task_id.clone();
+        let library_item_id = library_item_id.clone();
+        let message = message.clone();
+        let output = Arc::clone(&output);
+        move |registry| {
+            validate_library_item_publication_leases(
+                &library_item_id,
+                &output.results,
+                &output.library_item_leases,
+            )
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            validate_resource_body_descriptors(&output.resources, &output.resource_bodies)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            let staged =
+                registry.stage_task_output_replacement(&task_id, output.resources.clone())?;
+            create_staged_resource_bodies(&staged, &output.resource_bodies, &cancellation)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && cancellation.is_cancel_requested()
+                    {
+                        tonic::Status::cancelled("Cancelled by request.")
+                    } else {
+                        tonic::Status::internal(error.to_string())
+                    }
+                })?;
+            staged.commit_download_terminal(
+                output.results.clone(),
+                output.terminal_state,
+                library_item_id.clone(),
+                message.clone(),
+                output.transient_output_paths.clone(),
+                output.owned_directory_cleanup_paths.clone(),
+            )
+        }
+    })
+    .await;
+
+    match publication {
+        Ok(()) => {
+            retry_v2_transient_output_cleanup(registry, &task_id).await;
+        }
+        Err(error) => {
+            if error.code() == tonic::Code::Cancelled {
+                complete_terminal_task(registry, move |registry| {
+                    registry.complete_task_cancelled(&task_id, "Cancelled by request.".to_owned())
+                })
+                .await;
+                retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id).await;
+                return;
+            }
+            let detail = crate::error_detail_for_log(credentials_configured, &error);
+            eprintln!("Failed to publish Bilibili v2 task output for {task_id}: {detail}");
+            complete_terminal_task(registry, move |registry| {
+                registry.complete_task_failed(
+                    &task_id,
+                    "Bilibili download output could not be published.".to_owned(),
+                )
+            })
+            .await;
+        }
+    }
+    retry_v2_owned_output_directory_cleanup(registry, &cleanup_task_id).await;
+}
+
+fn validate_library_item_publication_leases(
+    primary_library_item_id: &str,
+    results: &[TaskResult],
+    leases: &[LibraryItemPublicationLease],
+) -> io::Result<()> {
+    let mut expected = results
+        .iter()
+        .flat_map(|result| {
+            std::iter::once(result.library_item_id.as_str()).chain(
+                result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.library_item_id.as_str()),
+            )
+        })
+        .filter(|item_id| !item_id.is_empty())
+        .collect::<HashSet<_>>();
+    if !primary_library_item_id.is_empty() {
+        expected.insert(primary_library_item_id);
+    }
+    let leased = leases
+        .iter()
+        .map(|lease| lease.item_id.as_str())
+        .collect::<HashSet<_>>();
+    if leased != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bilibili task output library backing is not covered by publication leases",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resource_body_descriptors(
+    resources: &[TaskResourceRecord],
+    bodies: &[BilibiliTaskResourceBody],
+) -> io::Result<()> {
+    let resource_ids = resources
+        .iter()
+        .map(|resource| resource.resource.id.as_str())
+        .collect::<HashSet<_>>();
+    if resource_ids.len() != resources.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bilibili task output contains duplicate resource ids",
+        ));
+    }
+    let mut body_ids = HashSet::with_capacity(bodies.len());
+    for body in bodies {
+        if !body_ids.insert(body.resource_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Bilibili task output contains duplicate resource bodies",
+            ));
+        }
+        if !resource_ids.contains(body.resource_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Bilibili task output body has no matching resource",
+            ));
+        }
+    }
+    if body_ids != resource_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bilibili task output resource has no matching body",
+        ));
+    }
+    Ok(())
+}
+
+fn create_staged_resource_bodies(
+    staged: &StagedTaskOutputReplacement<'_>,
+    bodies: &[BilibiliTaskResourceBody],
+    cancellation: &BilibiliTaskCancellation,
+) -> io::Result<()> {
+    let bodies = bodies
+        .iter()
+        .map(|body| (body.resource_id.as_str(), &body.source))
+        .collect::<HashMap<_, _>>();
+    for resource in staged.resources_requiring_body_creation() {
+        if cancellation.is_cancel_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Bilibili task resource publication was cancelled",
+            ));
+        }
+        let source = bodies.get(resource.resource.id.as_str()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Bilibili task output resource has no matching body",
+            )
+        })?;
+        match source {
+            BilibiliTaskResourceBodySource::CacheFile(source) => {
+                source.copy_into(staged, &resource.resource.id, cancellation)?;
+            }
+            BilibiliTaskResourceBodySource::Bytes(bytes) => {
+                staged.write_resource_body(&resource.resource.id, bytes)?;
+            }
+        }
+        if cancellation.is_cancel_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Bilibili task resource publication was cancelled",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn complete_terminal_task<F>(registry: &Arc<BilibiliTaskRegistry>, complete: F)
+where
+    F: Fn(&BilibiliTaskRegistry) -> Result<Task, tonic::Status> + Send + Sync + 'static,
+{
+    let _ = complete_terminal_task_with_outcome(registry, complete).await;
+}
+
+async fn complete_terminal_task_with_outcome<F>(
+    registry: &Arc<BilibiliTaskRegistry>,
+    complete: F,
+) -> Result<(), tonic::Status>
 where
     F: Fn(&BilibiliTaskRegistry) -> Result<Task, tonic::Status> + Send + Sync + 'static,
 {
@@ -194,24 +749,26 @@ where
     loop {
         let completion_registry = Arc::clone(registry);
         let completion = Arc::clone(&complete);
-        let Some(attempt) = run_blocking_terminal_persistence_attempt(
-            "Bilibili terminal task completion",
-            move || completion(&completion_registry),
-        )
-        .await
+        let Some(attempt) =
+            run_blocking_worker_attempt("Bilibili terminal task completion", move || {
+                completion(&completion_registry)
+            })
+            .await
         else {
-            return;
+            return Err(tonic::Status::internal(
+                "Bilibili terminal task completion could not be joined.",
+            ));
         };
         match attempt {
             Ok(_)
                 if !registry.persistence_recovery_supported()
                     || registry.persistence_available() =>
             {
-                return;
+                return Ok(());
             }
             Ok(_) => {}
             Err(error) if error.code() == tonic::Code::Unavailable => {}
-            Err(_) => return,
+            Err(error) => return Err(error),
         }
         loop {
             match retry_pending_task_persistence(registry).await {
@@ -223,7 +780,9 @@ where
                     eprintln!(
                         "Bilibili task persistence recovery was rejected permanently; releasing the worker slot"
                     );
-                    return;
+                    return Err(tonic::Status::unavailable(
+                        "Bilibili task persistence recovery was rejected permanently.",
+                    ));
                 }
             }
         }
@@ -234,14 +793,14 @@ async fn retry_pending_task_persistence(
     registry: &Arc<BilibiliTaskRegistry>,
 ) -> TaskPersistenceRecoveryOutcome {
     let registry = Arc::clone(registry);
-    run_blocking_terminal_persistence_attempt("Bilibili task persistence retry", move || {
+    run_blocking_worker_attempt("Bilibili task persistence retry", move || {
         registry.retry_pending_persistence_outcome()
     })
     .await
     .unwrap_or(TaskPersistenceRecoveryOutcome::PermanentFailure)
 }
 
-async fn run_blocking_terminal_persistence_attempt<T>(
+async fn run_blocking_worker_attempt<T>(
     context: &'static str,
     attempt: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T>
@@ -262,13 +821,23 @@ where
 mod tests {
     use std::{
         sync::{
-            Condvar, Mutex,
+            Barrier, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
 
-    use crate::generated::tvos_net_player::v1::TaskState;
+    use crate::{
+        bilibili_playback::{BilibiliContentIdentity, BilibiliContentKind},
+        config::CacheServerOptions,
+        generated::tvos_net_player::v1::{
+            CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState, TaskProblem,
+            TaskProblemCategory, TaskResult,
+        },
+        library::LocalMediaLibrary,
+        task_registry::TaskRetentionPolicy,
+        task_store::TaskStateStore,
+    };
     use tokio::sync::Notify;
 
     use super::*;
@@ -296,6 +865,410 @@ mod tests {
         assert_eq!(1024, completed.total_bytes);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_bound_sidecar_copy_ignores_same_size_path_replacement() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        let source_directory = root_path.join("Bilibili/task/candidate/entry");
+        std::fs::create_dir_all(&source_directory).expect("sidecar directory should be created");
+        let source_path = source_directory.join("subtitle.srt");
+        std::fs::write(&source_path, b"original").expect("original sidecar should be written");
+        let source_file = std::fs::File::open(&source_path)
+            .expect("original sidecar descriptor should be opened");
+        let identity = BilibiliTaskResourceCacheFileIdentity::from_metadata(
+            &source_file
+                .metadata()
+                .expect("original sidecar metadata should be readable"),
+        )
+        .expect("original sidecar identity should validate");
+        let source = BilibiliTaskResourceCacheFile::new(source_file, identity)
+            .expect("sidecar descriptor should bind to its validated object");
+
+        let displaced_path = source_directory.join("subtitle.original.srt");
+        std::fs::rename(&source_path, &displaced_path)
+            .expect("validated sidecar should be displaced");
+        std::fs::write(&source_path, b"replaced")
+            .expect("same-size replacement sidecar should be written");
+
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            temp.path().join("state/tasks.json"),
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1descriptor-sidecar",
+                None,
+                None,
+                "Descriptor sidecar".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let resource = TaskResourceRecord::new(CacheResourceRef {
+            id: "descriptor-sidecar".to_owned(),
+            content_type: "application/x-subrip".to_owned(),
+            size_bytes: 8,
+            size_known: true,
+            ..Default::default()
+        })
+        .expect("sidecar resource should be valid");
+        let staged = registry
+            .stage_task_output_replacement(&task.id, vec![resource.clone()])
+            .expect("sidecar resource should be staged");
+        create_staged_resource_bodies(
+            &staged,
+            &[BilibiliTaskResourceBody {
+                resource_id: resource.resource.id.clone(),
+                source: BilibiliTaskResourceBodySource::CacheFile(source),
+            }],
+            &BilibiliTaskCancellation::default(),
+        )
+        .expect("descriptor-bound sidecar should be copied");
+
+        assert_eq!(
+            b"original",
+            std::fs::read(root_path.join(resource.relative_path()))
+                .expect("staged sidecar should be readable")
+                .as_slice()
+        );
+        assert_eq!(
+            b"replaced",
+            std::fs::read(source_path)
+                .expect("replacement sidecar should remain separate")
+                .as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_v2_task_waits_for_owned_output_cleanup_before_reclaim() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-before-reclaim",
+                None,
+                None,
+                "Cleanup before reclaim".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let stale_output_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&stale_output_path),
+            )
+            .expect("stale output ownership should be durable");
+        std::fs::create_dir_all(stale_output_path.parent().unwrap())
+            .expect("staging parent should be created");
+        std::fs::write(
+            &stale_output_path,
+            b"temporarily inaccessible as a directory",
+        )
+        .expect("a non-directory fixture should block safe cleanup");
+        drop(registry);
+
+        let restored = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        let claiming_registry = Arc::clone(&restored);
+        let claim = tokio::spawn(async move { claim_next_bilibili_task(claiming_registry).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !claim.is_finished(),
+            "the restored task must remain queued while cleanup is blocked"
+        );
+        std::fs::remove_file(&stale_output_path)
+            .expect("the simulated storage failure should be cleared");
+
+        let work_item = tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .expect("the worker should retry cleanup")
+            .expect("the claim task should not panic");
+        assert_eq!(task.id, work_item.task_id);
+        assert!(!stale_output_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_v2_task_reclaims_when_owned_output_directories_were_never_created() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-before-create",
+                None,
+                None,
+                "Cleanup before output creation".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let staging_output = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        let final_output = root_path.join("Bilibili").join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                &[staging_output.clone(), final_output.clone()],
+            )
+            .expect("pre-creation output ownership should be durable");
+        assert!(!staging_output.exists());
+        assert!(!final_output.exists());
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path),
+        );
+
+        assert_eq!(
+            TaskState::Queued,
+            restored.get_task(&task.id).unwrap().state()
+        );
+        assert!(!restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("the restored task should become claimable after absent-tree cleanup");
+        assert_eq!(task.id, work_item.task_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_output_cleanup_wakes_a_pre_registered_task_queue_waiter() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            &state_path,
+            TaskRetentionPolicy::default(),
+            Some(root_path.clone()),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-queue-notify",
+                None,
+                None,
+                "Cleanup queue notification".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let stale_output_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&stale_output_path),
+            )
+            .expect("stale output ownership should be durable");
+        std::fs::create_dir_all(stale_output_path.parent().unwrap())
+            .expect("staging parent should be created");
+        std::fs::write(&stale_output_path, b"block startup directory cleanup")
+            .expect("a non-directory fixture should block startup cleanup");
+        drop(registry);
+
+        let restored = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        assert!(restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        std::fs::remove_file(&stale_output_path)
+            .expect("the startup cleanup blocker should be removable");
+        std::fs::create_dir(&stale_output_path)
+            .expect("the stale task-owned output directory should be restorable");
+        std::fs::write(stale_output_path.join("partial.m4s"), b"stale")
+            .expect("stale output should be created");
+
+        // Register before the final condition check to model cleanup completing after the failed
+        // claim but before the worker awaits. notify_waiters records this transition in the
+        // already-created future even though it has not been polled yet.
+        let queue_changed = restored.bilibili_task_queue_change();
+        assert!(restored.try_claim_next_bilibili_task().is_none());
+        assert!(restored.retry_pending_file_cleanups());
+        assert!(!restored.has_bilibili_v2_task_waiting_for_output_cleanup());
+        tokio::time::timeout(Duration::from_secs(1), queue_changed)
+            .await
+            .expect("durable cleanup completion should wake the task queue waiter");
+
+        let work_item = restored
+            .try_claim_next_bilibili_task()
+            .expect("the restored task should become claimable");
+        assert_eq!(task.id, work_item.task_id);
+        assert!(!stale_output_path.exists());
+    }
+
+    #[tokio::test]
+    async fn pending_file_cleanup_worker_retries_terminal_task_without_new_queue_work() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1terminal-cleanup-retry",
+                None,
+                None,
+                "Terminal cleanup retry".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let transient_path = root_path
+            .join("Bilibili")
+            .join(&task.id)
+            .join("blocked-subtitle.srt");
+        std::fs::create_dir_all(&transient_path)
+            .expect("directory fixture should block file cleanup");
+        registry
+            .stage_task_output_replacement(&task.id, Vec::new())
+            .expect("terminal output should stage")
+            .commit_download_terminal(
+                vec![TaskResult {
+                    id: task.result_items[0].id.clone(),
+                    state: TaskState::Succeeded.into(),
+                    ..Default::default()
+                }],
+                TaskState::Succeeded,
+                String::new(),
+                "Completed with transient output.".to_owned(),
+                vec![transient_path.clone()],
+                Vec::new(),
+            )
+            .expect("terminal output should commit");
+        assert!(registry.has_pending_file_cleanups());
+        assert!(registry.try_claim_next_bilibili_task().is_none());
+
+        let cleanup = tokio::spawn(run_pending_file_cleanup_worker_with_backoff(
+            Arc::clone(&registry),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(registry.has_pending_file_cleanups());
+        std::fs::remove_dir(&transient_path).expect("cleanup blocker should become removable");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persisted_cleanup_is_empty = TaskStateStore::new(&state_path)
+                    .load_state()
+                    .is_ok_and(|state| state.file_cleanup_intents.is_empty());
+                if !registry.has_pending_file_cleanups() && persisted_cleanup_is_empty {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background worker should clear terminal cleanup ownership");
+        cleanup.abort();
+        let _ = cleanup.await;
+
+        assert!(!transient_path.exists());
+        assert!(
+            TaskStateStore::new(&state_path)
+                .load_state()
+                .expect("persisted task state should load")
+                .file_cleanup_intents
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_terminal_output_requires_a_lease_for_every_library_backing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std::fs::create_dir_all(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let media_path = root_path.join("leased.mp4");
+        std::fs::write(&media_path, b"leased media").expect("media should be written");
+        let library = LocalMediaLibrary::new(Arc::new(CacheServerOptions {
+            root_path,
+            ..CacheServerOptions::default()
+        }));
+        let lease = library
+            .reserve_media_path_for_publication(media_path)
+            .await
+            .expect("media should be reservable");
+        let item_id = lease.item_id.clone();
+        let results = vec![TaskResult {
+            id: "result-one".to_owned(),
+            state: TaskState::Succeeded.into(),
+            library_item_id: item_id.clone(),
+            artifacts: vec![TaskArtifact {
+                id: "media-one".to_owned(),
+                kind: TaskArtifactKind::Media.into(),
+                state: TaskArtifactState::Available.into(),
+                library_item_id: item_id.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        validate_library_item_publication_leases(&item_id, &results, &[lease])
+            .expect("matching library backing should be leased");
+        let error = validate_library_item_publication_leases(&item_id, &results, &[])
+            .expect_err("unleased library backing must be rejected");
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+    }
+
     #[tokio::test]
     async fn worker_marks_adapter_failure() {
         let registry = Arc::new(BilibiliTaskRegistry::default());
@@ -313,6 +1286,256 @@ mod tests {
 
         worker.abort();
         assert_eq!("adapter failed", completed.message);
+    }
+
+    #[tokio::test]
+    async fn worker_publishes_partial_v2_results_with_client_safe_errors_durably() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let resource_root = temp.path().join("library");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(resource_root.clone()),
+            ),
+        );
+        let candidates = vec![test_candidate(1), test_candidate(2)];
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1worker-v2",
+                None,
+                None,
+                "Worker v2".to_owned(),
+                candidates,
+            )
+            .expect("v2 task should be created durably");
+        let transient_output_path = resource_root
+            .join("Bilibili")
+            .join(&task.id)
+            .join("worker-subtitle-source.srt");
+        std::fs::create_dir_all(transient_output_path.parent().unwrap())
+            .expect("task output directory should be created");
+        std::fs::write(&transient_output_path, b"worker subtitle\n")
+            .expect("transient subtitle should be written");
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(PartialV2Adapter {
+                transient_output_path: transient_output_path.clone(),
+            }),
+            1,
+            false,
+        ));
+
+        let completed = wait_for_state(&registry, &task.id, TaskState::Succeeded).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transient_output_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker should remove copied transient output after durable publication");
+        worker.abort();
+        let _ = worker.await;
+        let successful_result_id = format!("{}-result-2", task.id);
+
+        assert!(completed.library_item_id.is_empty());
+        assert_eq!(2, completed.result_items.len());
+        assert_eq!(TaskState::Failed, completed.result_items[0].state());
+        assert_eq!(TaskState::Succeeded, completed.result_items[1].state());
+        assert_eq!(
+            successful_result_id,
+            completed
+                .output_summary
+                .as_ref()
+                .expect("v2 output summary should be present")
+                .primary_result_id
+        );
+        assert!(
+            !completed.result_items[0]
+                .message
+                .contains("sensitive-marker")
+        );
+
+        let snapshot = registry
+            .task_output_snapshot(&task.id)
+            .expect("v2 output should be visible");
+        assert_eq!(2, snapshot.output.record.results.len());
+        assert_eq!(1, snapshot.output.record.resources.len());
+        assert_eq!(
+            successful_result_id,
+            snapshot.output.record.primary_result_id
+        );
+        let failed = &snapshot.output.record.results[0];
+        assert_eq!(TaskState::Failed, failed.state());
+        assert!(
+            failed
+                .problem
+                .as_ref()
+                .is_some_and(|problem| problem.message == "The Bilibili download failed.")
+        );
+        assert!(
+            !failed
+                .problem
+                .as_ref()
+                .is_some_and(|problem| problem.message.contains("sensitive-marker"))
+        );
+        let resource = &snapshot.output.record.resources[0];
+        let resource_path = resource_root.join(resource.relative_path());
+        assert_eq!(
+            b"worker subtitle\n".to_vec(),
+            std::fs::read(&resource_path).expect("resource body should be durable")
+        );
+        assert!(
+            !transient_output_path.exists(),
+            "a sidecar source copied into durable resource storage should be removed"
+        );
+        drop(snapshot);
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+            state_path,
+            TaskRetentionPolicy::default(),
+            Some(resource_root),
+        );
+        let restored_task = restored
+            .get_task(&task.id)
+            .expect("terminal task should survive restart");
+        let restored_output = restored
+            .task_output_snapshot(&task.id)
+            .expect("v2 output should survive restart");
+        assert_eq!(TaskState::Succeeded, restored_task.state());
+        assert_eq!(
+            successful_result_id,
+            restored_task
+                .output_summary
+                .as_ref()
+                .expect("restored v2 output summary should be present")
+                .primary_result_id
+        );
+        assert_eq!(
+            successful_result_id,
+            restored_output.output.record.primary_result_id
+        );
+        assert_eq!(2, restored_output.output.record.results.len());
+        assert_eq!(1, restored_output.output.record.resources.len());
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_v2_success_returned_after_cancellation() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let resource_root = temp.path().join("library");
+        std::fs::create_dir(&resource_root).expect("resource root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(resource_root.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1worker-cancel-race-v2",
+                None,
+                None,
+                "Worker cancellation race".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created durably");
+        let owned_output_directory = resource_root.join("Bilibili").join(&task.id);
+        let unpublished_output_path = owned_output_directory.join("late-success.mp4");
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(LateSuccessAfterCancellationV2Adapter {
+                output_directory: owned_output_directory.clone(),
+            }),
+            1,
+            true,
+        ));
+
+        let cancelled = wait_for_state(&registry, &task.id, TaskState::Cancelled).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owned_output_directory.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled v2 output cleanup should finish before the worker stops");
+        worker.abort();
+        let _ = worker.await;
+        let output = registry
+            .task_output_snapshot(&task.id)
+            .expect("cancelled v2 output should remain visible");
+
+        assert!(cancelled.library_item_id.is_empty());
+        assert_eq!(1, cancelled.result_items.len());
+        assert_eq!(TaskState::Cancelled, cancelled.result_items[0].state());
+        assert_eq!(1, output.output.record.results.len());
+        assert_eq!(
+            TaskState::Cancelled,
+            output.output.record.results[0].state()
+        );
+        assert!(output.output.record.resources.is_empty());
+        assert!(
+            !owned_output_directory.exists(),
+            "a late v2 success rejected by cancellation must remove its owned output tree"
+        );
+        assert!(!unpublished_output_path.exists());
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_start_v2_download_until_creation_is_durable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(&state_path));
+        registry.fail_next_persistence_directory_sync();
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1worker-creation-durability-v2",
+                None,
+                None,
+                "Worker durability".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("the installed v2 download should remain queued");
+        assert!(!registry.persistence_available());
+
+        std::fs::remove_file(&state_path).expect("installed state should be removable");
+        std::fs::create_dir(&state_path).expect("directory should keep persistence unavailable");
+        let adapter = Arc::new(StartCountingAdapter::default());
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::clone(&adapter) as Arc<dyn BilibiliDownloadAdapter>,
+            1,
+            false,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(0, adapter.start_count.load(Ordering::SeqCst));
+        assert_eq!(
+            TaskState::Queued,
+            registry.get_task(&task.id).unwrap().state()
+        );
+
+        std::fs::remove_dir(&state_path).expect("blocking directory should be removable");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let started = adapter.started.notified();
+                if adapter.start_count.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                started.await;
+            }
+        })
+        .await
+        .expect("the adapter should start after persistence recovers");
+        let completed = wait_for_state(&registry, &task.id, TaskState::Succeeded).await;
+
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(TaskState::Succeeded, completed.state());
+        assert!(registry.persistence_available());
     }
 
     #[tokio::test]
@@ -397,6 +1620,86 @@ mod tests {
         assert!(
             progressed_before_release,
             "the async runtime should progress while terminal persistence is blocked"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_output_cleanup_does_not_block_the_async_runtime() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state/tasks.json");
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).expect("library root should be created");
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                &state_path,
+                TaskRetentionPolicy::default(),
+                Some(root_path.clone()),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1cleanup-runtime",
+                None,
+                None,
+                "Cleanup runtime".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+        registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let cleanup_path = root_path
+            .join(".tvos-net-player/bbdown-staging")
+            .join(&task.id);
+        registry
+            .register_bilibili_owned_output_directories(
+                &task.id,
+                std::slice::from_ref(&cleanup_path),
+            )
+            .expect("cleanup ownership should be durable");
+        std::fs::create_dir_all(&cleanup_path).expect("owned output should be created");
+        std::fs::write(cleanup_path.join("partial.m4s"), b"partial")
+            .expect("owned output should contain a file");
+
+        let save_entered = Arc::new(Barrier::new(2));
+        let save_resume = Arc::new(Barrier::new(2));
+        registry.block_next_persistence_save(Arc::clone(&save_entered), Arc::clone(&save_resume));
+        let runtime_progressed = Arc::new(AtomicBool::new(false));
+        let observer_progressed = Arc::clone(&runtime_progressed);
+        let observer_entered = Arc::clone(&save_entered);
+        let observer_resume = Arc::clone(&save_resume);
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            let progress_deadline = Instant::now() + Duration::from_millis(500);
+            while !observer_progressed.load(Ordering::SeqCst) && Instant::now() < progress_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let progressed_before_release = observer_progressed.load(Ordering::SeqCst);
+            observer_resume.wait();
+            progressed_before_release
+        });
+
+        let heartbeat_progressed = Arc::clone(&runtime_progressed);
+        let heartbeat = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            heartbeat_progressed.store(true, Ordering::SeqCst);
+        });
+        retry_v2_owned_output_directory_cleanup(&registry, &task.id).await;
+
+        heartbeat.await.expect("heartbeat should finish cleanly");
+        assert!(
+            observer.join().expect("observer should finish cleanly"),
+            "the async runtime should progress while output cleanup persistence is blocked"
+        );
+        assert!(!cleanup_path.exists());
+        assert!(
+            !registry
+                .retry_file_cleanup_intents_for_owner(
+                    PersistedFileCleanupKind::BilibiliOwnedOutputDirectory,
+                    &task.id,
+                )
+                .expect("the cleanup intent should already be cleared")
         );
     }
 
@@ -715,6 +2018,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_omits_v2_adapter_failure_detail_without_credentials() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let registry = Arc::new(BilibiliTaskRegistry::with_persistence_path(
+            temp.path().join("state").join("tasks.json"),
+        ));
+        let worker = tokio::spawn(run_bilibili_task_worker(
+            Arc::clone(&registry),
+            Arc::new(FailureAdapter),
+            1,
+            false,
+        ));
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1v2-safe-failure",
+                None,
+                None,
+                "Safe failure".to_owned(),
+                vec![test_candidate(1)],
+            )
+            .expect("v2 task should be created");
+
+        let completed = wait_for_state(&registry, &task.id, TaskState::Failed).await;
+
+        worker.abort();
+        assert_eq!("The Bilibili download failed.", completed.message);
+        assert!(!completed.message.contains("adapter failed"));
+    }
+
+    #[tokio::test]
     async fn worker_marks_adapter_panic_as_failure_and_allows_requeue() {
         let registry = Arc::new(BilibiliTaskRegistry::default());
         let worker = tokio::spawn(run_bilibili_task_worker(
@@ -789,6 +2121,129 @@ mod tests {
 
     struct SuccessAdapter;
 
+    struct PartialV2Adapter {
+        transient_output_path: PathBuf,
+    }
+
+    struct LateSuccessAfterCancellationV2Adapter {
+        output_directory: PathBuf,
+    }
+
+    impl BilibiliDownloadAdapter for LateSuccessAfterCancellationV2Adapter {
+        fn run<'a>(
+            &'a self,
+            request: BilibiliDownloadRequest,
+            context: BilibiliDownloadContext,
+        ) -> BilibiliDownloadFuture<'a> {
+            let output_directory = self.output_directory.clone();
+            Box::pin(async move {
+                context
+                    .registry
+                    .register_bilibili_owned_output_directories(
+                        &request.task_id,
+                        std::slice::from_ref(&output_directory),
+                    )
+                    .expect("test output ownership should become durable");
+                std::fs::create_dir_all(&output_directory)
+                    .expect("owned output directory should be created");
+                std::fs::write(output_directory.join("late-success.mp4"), b"late success")
+                    .expect("owned output should be written");
+                context
+                    .registry
+                    .cancel_task(&request.task_id)
+                    .expect("test adapter should request cancellation");
+                let library_item_id = "local.default.cancel-race-v2".to_owned();
+                Ok(BilibiliDownloadOutput {
+                    library_item_id: library_item_id.clone(),
+                    message: "Late success".to_owned(),
+                    v2: Some(BilibiliDownloadOutputV2 {
+                        terminal_state: TaskState::Succeeded,
+                        results: vec![TaskResult {
+                            id: request.task_id,
+                            state: TaskState::Succeeded.into(),
+                            library_item_id: library_item_id.clone(),
+                            artifacts: vec![TaskArtifact {
+                                id: "cancel-race-media".to_owned(),
+                                kind: TaskArtifactKind::Media.into(),
+                                state: TaskArtifactState::Available.into(),
+                                library_item_id,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        resources: Vec::new(),
+                        resource_bodies: Vec::new(),
+                        library_item_leases: Vec::new(),
+                        transient_output_paths: Vec::new(),
+                        owned_directory_cleanup_paths: Vec::new(),
+                    }),
+                })
+            })
+        }
+    }
+
+    impl BilibiliDownloadAdapter for PartialV2Adapter {
+        fn run<'a>(
+            &'a self,
+            request: BilibiliDownloadRequest,
+            _context: BilibiliDownloadContext,
+        ) -> BilibiliDownloadFuture<'a> {
+            let transient_output_path = self.transient_output_path.clone();
+            Box::pin(async move {
+                let body = b"worker subtitle\n".to_vec();
+                let resource = TaskResourceRecord::new(CacheResourceRef {
+                    id: "worker-v2-subtitle".to_owned(),
+                    content_type: "text/vtt; charset=utf-8".to_owned(),
+                    size_bytes: i64::try_from(body.len()).expect("test body should fit in i64"),
+                    size_known: true,
+                    ..Default::default()
+                })
+                .expect("test resource should be valid");
+                let successful_result = TaskResult {
+                    id: format!("{}-result-2", request.task_id),
+                    state: TaskState::Succeeded.into(),
+                    title: request.candidates[1].title.clone(),
+                    artifacts: vec![TaskArtifact {
+                        id: "worker-v2-subtitle".to_owned(),
+                        kind: TaskArtifactKind::Subtitle.into(),
+                        state: TaskArtifactState::Available.into(),
+                        resource: Some(resource.resource.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let failed_result = TaskResult {
+                    id: request.task_id.clone(),
+                    state: TaskState::Failed.into(),
+                    title: request.candidates[0].title.clone(),
+                    problem: Some(TaskProblem {
+                        category: TaskProblemCategory::Upstream.into(),
+                        code: "bilibili.download_failed".to_owned(),
+                        message: "upstream sensitive-marker".to_owned(),
+                        retryable: true,
+                    }),
+                    ..Default::default()
+                };
+                Ok(BilibiliDownloadOutput {
+                    library_item_id: String::new(),
+                    message: "Downloaded 1/2 Bilibili result(s).".to_owned(),
+                    v2: Some(BilibiliDownloadOutputV2 {
+                        terminal_state: TaskState::Succeeded,
+                        results: vec![failed_result, successful_result],
+                        resources: vec![resource],
+                        resource_bodies: vec![BilibiliTaskResourceBody {
+                            resource_id: "worker-v2-subtitle".to_owned(),
+                            source: BilibiliTaskResourceBodySource::Bytes(body),
+                        }],
+                        library_item_leases: Vec::new(),
+                        transient_output_paths: vec![transient_output_path],
+                        owned_directory_cleanup_paths: Vec::new(),
+                    }),
+                })
+            })
+        }
+    }
+
     impl BilibiliDownloadAdapter for SuccessAdapter {
         fn run<'a>(
             &'a self,
@@ -805,8 +2260,28 @@ mod tests {
                 Ok(BilibiliDownloadOutput {
                     library_item_id: "local.default.sample".to_owned(),
                     message: "Downloaded into the cache library.".to_owned(),
+                    v2: None,
                 })
             })
+        }
+    }
+
+    fn test_candidate(index: u32) -> BilibiliTaskCandidateRecord {
+        BilibiliTaskCandidateRecord {
+            selection_id: format!("page:{index}:cid:{}", 2_000 + index),
+            title: format!("Part {index}"),
+            subtitle: format!("Page {index}"),
+            source_kind: "video_page".to_owned(),
+            content_id: (2_000 + index).to_string(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::VideoPage,
+                aid: Some(1_001),
+                bvid: Some("BV1worker-v2".to_owned()),
+                cid: Some(u64::from(2_000 + index)),
+                epid: None,
+            },
+            index,
+            duration_seconds: Some(60),
         }
     }
 
@@ -828,6 +2303,7 @@ mod tests {
                 Ok(BilibiliDownloadOutput {
                     library_item_id: "local.default.sample".to_owned(),
                     message: "Downloaded into the cache library.".to_owned(),
+                    v2: None,
                 })
             })
         }

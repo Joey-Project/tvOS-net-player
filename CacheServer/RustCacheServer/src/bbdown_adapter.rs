@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
+    ffi::{CString, OsStr, OsString},
     fmt::Display,
+    fs::File,
     future::Future,
+    io::{self, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -12,21 +14,20 @@ use std::{
 
 use bbdown_core::{
     BiliClient, ClientConfig, CredentialProfileSelection, CredentialStore, Credentials,
-    DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadOptions,
-    DownloadProgressEvent, DownloadProgressSink, DownloadReport, DuplicateDecision,
-    EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection, Input,
-    MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
+    DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadMode,
+    DownloadOptions, DownloadPlan, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
+    DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
+    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
     PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
     PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode, ResolvedContent,
     RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection, StreamSelection,
     SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
-    fs,
     io::AsyncReadExt,
     process::Command,
-    sync::Mutex,
-    time::{Instant, sleep},
+    sync::{Mutex, Semaphore},
+    time::{Instant, sleep, timeout},
 };
 
 use crate::{
@@ -35,31 +36,75 @@ use crate::{
         BilibiliResolvedCandidate, MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES,
         MAX_BILIBILI_RESOLUTION_STRING_BYTES, MAX_BILIBILI_RESOLVE_CANDIDATE_LIMIT,
     },
+    bilibili_resolution::BilibiliTaskCandidateRecord,
     bilibili_worker::{
         BilibiliDownloadAdapter, BilibiliDownloadContext, BilibiliDownloadError,
-        BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadRequest,
+        BilibiliDownloadFuture, BilibiliDownloadOutput, BilibiliDownloadOutputV2,
+        BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
+        BilibiliTaskResourceCacheFile, BilibiliTaskResourceCacheFileIdentity,
     },
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
         BbdownRestrictedProxy as CacheBbdownRestrictedProxy, CacheServerOptions,
     },
     generated::tvos_net_player::v1::{
-        BilibiliDanmakuFormat, BilibiliDownloadOptions, BilibiliSubtitleAiPolicy,
+        BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity,
+        BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
+        BilibiliRequestContext, BilibiliSubtitleAiPolicy, BilibiliTaskResultDetails,
+        CacheResourceRef, TaskArtifact, TaskArtifactKind, TaskArtifactState, TaskProblem,
+        TaskProblemCategory, TaskResult, TaskResultProgress, TaskResultProviderDetails,
+        TaskResultSubject, TaskState,
     },
-    library::LocalMediaLibrary,
+    library::{
+        LibraryItemPublicationLease, LocalMediaLibrary, create_directory_exclusive_no_follow,
+        ensure_directory_no_follow, open_read_no_follow, open_read_no_follow_at,
+        remove_directory_tree_no_follow, remove_file_no_follow_at,
+        rename_directory_no_replace_no_follow,
+    },
     playback_policy::{
         CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
     },
+    task_output::TaskResourceRecord,
     task_registry::BilibiliTaskProgress,
 };
+use uuid::Uuid;
 
 const DOWNLOAD_PROGRESS_START: f64 = 0.10;
 const DOWNLOAD_PROGRESS_END: f64 = 0.80;
 const ACTIVE_ENTRY_INCOMPLETE_PROGRESS_CAP: f64 = 0.50;
 const BBDOWN_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BBDOWN_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const BBDOWN_CREDENTIAL_LOAD_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const DOWNLOAD_PROGRESS_PUBLISH_MIN_FRACTION: f64 = 0.01;
+const BILIBILI_V2_STAGING_DIRECTORY: &str = ".tvos-net-player/bbdown-staging";
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH: usize = 64;
+const MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 512;
+const FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 128;
+const BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE: u64 = 4;
+
+#[cfg(unix)]
+fn bilibili_v2_retained_descriptor_budget() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the supplied rlimit on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET;
+    }
+    // SAFETY: the successful getrlimit call initialized limit.
+    let soft_limit = unsafe { limit.assume_init() }.rlim_cur;
+    if soft_limit == libc::RLIM_INFINITY {
+        return MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET;
+    }
+    usize::try_from(soft_limit / BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE)
+        .unwrap_or(MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET)
+        .min(MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET)
+}
+
+#[cfg(not(unix))]
+fn bilibili_v2_retained_descriptor_budget() -> usize {
+    FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BilibiliResolveCandidateWindow {
@@ -91,6 +136,7 @@ fn invalid_resolve_candidate_limit(candidate_limit: usize) -> BilibiliDownloadEr
 }
 
 pub struct BbdownBilibiliAdapter {
+    options: Arc<CacheServerOptions>,
     client: BiliClient,
     tv_client: BiliClient,
     library: Arc<LocalMediaLibrary>,
@@ -98,6 +144,33 @@ pub struct BbdownBilibiliAdapter {
     archive_path: PathBuf,
     ffmpeg_path: PathBuf,
     archive_lock: Arc<Mutex<()>>,
+    blocking_operation_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    archive_save_fail_after: StdMutex<Option<usize>>,
+    #[cfg(test)]
+    legacy_post_cleanup_probe: StdMutex<Option<LegacyPostCleanupProbe>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LegacyPostCleanupProbe {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct V2TaskArchive {
+    accepted: DownloadArchive,
+}
+
+impl V2TaskArchive {
+    fn stage_candidate(&self) -> DownloadArchive {
+        self.accepted.clone()
+    }
+
+    fn accept_candidate(&mut self, candidate: DownloadArchive) {
+        self.accepted = candidate;
+    }
 }
 
 #[allow(dead_code)]
@@ -269,7 +342,22 @@ struct SelectedCorePlaybackVariant<'a> {
 }
 
 impl BbdownBilibiliAdapter {
-    pub fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
+    #[cfg(test)]
+    fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
+        Self::new_with_blocking_permits(
+            options,
+            library,
+            Arc::new(Semaphore::new(
+                crate::bilibili_resolution::MAX_BILIBILI_RESOLUTION_BLOCKING_OPERATIONS,
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_blocking_permits(
+        options: Arc<CacheServerOptions>,
+        library: Arc<LocalMediaLibrary>,
+        blocking_operation_permits: Arc<Semaphore>,
+    ) -> Self {
         let client_config = bbdown_client_config(&options, PlayurlMode::Web)
             .unwrap_or_else(|error| panic!("failed to configure BBDown client: {error:?}"));
         let tv_client_config = bbdown_client_config(&options, PlayurlMode::Tv)
@@ -282,6 +370,12 @@ impl BbdownBilibiliAdapter {
             archive_path: options.bbdown_archive_path(),
             ffmpeg_path: options.bbdown_ffmpeg_path.clone(),
             archive_lock: Arc::new(Mutex::new(())),
+            blocking_operation_permits,
+            #[cfg(test)]
+            archive_save_fail_after: StdMutex::new(None),
+            #[cfg(test)]
+            legacy_post_cleanup_probe: StdMutex::new(None),
+            options,
         }
     }
 
@@ -296,10 +390,16 @@ impl BbdownBilibiliAdapter {
             ));
         }
 
-        let input = Input::parse(&request.source).map_err(failed)?;
-        let download_options = self.download_options(request.options.as_ref())?;
-        let client = self.client_for_options(request.options.as_ref());
+        if !request.candidates.is_empty() {
+            return self.run_v2_download(request, context).await;
+        }
 
+        let input = Input::parse(&request.source).map_err(failed)?;
+        let download_mode = download_mode_from_options(request.options.as_ref())?;
+        let download_options = self.download_options(request.options.as_ref())?;
+        let client = self
+            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+            .await?;
         context.report_progress(progress(
             0.02,
             "Planning Bilibili download with BBDown core.",
@@ -348,23 +448,45 @@ impl BbdownBilibiliAdapter {
         .await?;
 
         let downloaded_bytes = report.summary().total_bytes;
+        let cache_root = self.library.root_path();
+        let validated_paths =
+            validate_download_report_paths_no_follow(&cache_root, &self.output_dir, &report)
+                .await?;
         if context.is_cancel_requested() {
-            cleanup_downloaded_media_sources(&report).await;
+            cleanup_downloaded_media_sources(&report, &validated_paths).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled before BBDown muxing started.".to_owned(),
             ));
         }
 
+        let preparing_audio_only = download_mode == DownloadMode::AudioOnly;
         context.report_progress(BilibiliTaskProgress {
             progress: Some(0.80),
             downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
             total_bytes: Some(to_i64_saturating(downloaded_bytes)),
-            message: Some("Muxing downloaded media for local playback.".to_owned()),
+            message: Some(if preparing_audio_only {
+                "Preparing downloaded audio for local playback.".to_owned()
+            } else {
+                "Muxing downloaded media for local playback.".to_owned()
+            }),
         });
         let is_cancel_requested = || context.is_cancel_requested();
-        let report = mux_download_report(report, &self.ffmpeg_path, &is_cancel_requested).await?;
+        let mut report = report;
+        let preparation = prepare_download_report_for_playback_in_place(
+            &mut report,
+            download_mode,
+            &self.ffmpeg_path,
+            &is_cancel_requested,
+            &validated_paths,
+        )
+        .await;
+        if let Err(error) = preparation {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
+            return Err(error);
+        }
 
         if context.is_cancel_requested() {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled after BBDown muxing completed.".to_owned(),
             ));
@@ -378,6 +500,7 @@ impl BbdownBilibiliAdapter {
         });
 
         if context.is_cancel_requested() {
+            let _ = cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await;
             return Err(BilibiliDownloadError::Cancelled(
                 "Cancelled after the BBDown download finished.".to_owned(),
             ));
@@ -389,37 +512,1018 @@ impl BbdownBilibiliAdapter {
                 self.library.item_id_for_media_path(candidate.clone()).await
             {
                 if context.is_cancel_requested() {
+                    let _ =
+                        cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None)
+                            .await;
                     return Err(BilibiliDownloadError::Cancelled(
                         "Cancelled before committing the BBDown archive.".to_owned(),
                     ));
                 }
-                archive.save(&self.archive_path).map_err(failed)?;
+                self.retain_legacy_output_for_archive_commit(
+                    &report,
+                    &validated_paths,
+                    candidate,
+                    &context,
+                )
+                .await?;
+                self.save_archive(&archive)?;
                 return Ok(BilibiliDownloadOutput {
                     library_item_id,
                     message: success_message(&report),
+                    v2: None,
                 });
             }
         }
 
+        cleanup_legacy_unretained_media_outputs(&report, &validated_paths, None).await?;
         Err(BilibiliDownloadError::Failed(format!(
             "BBDown finished but produced no playable cache item under {}. Ensure ffmpeg is installed and muxing outputs .mp4 files.",
             self.library.root_path().display()
         )))
     }
 
+    async fn retain_legacy_output_for_archive_commit(
+        &self,
+        report: &DownloadReport,
+        validated_paths: &ValidatedDownloadReportPaths,
+        retained_output_path: &Path,
+        context: &BilibiliDownloadContext,
+    ) -> Result<(), BilibiliDownloadError> {
+        cleanup_legacy_unretained_media_outputs(
+            report,
+            validated_paths,
+            Some(retained_output_path),
+        )
+        .await?;
+
+        #[cfg(test)]
+        let post_cleanup_probe = self
+            .legacy_post_cleanup_probe
+            .lock()
+            .expect("legacy post-cleanup probe lock poisoned")
+            .clone();
+        #[cfg(test)]
+        if let Some(probe) = post_cleanup_probe {
+            probe.reached.notify_one();
+            probe.resume.notified().await;
+        }
+
+        if context.is_cancel_requested() {
+            cleanup_legacy_unretained_media_outputs(report, validated_paths, None).await?;
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled before committing the BBDown archive.".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn run_v2_download(
+        &self,
+        request: BilibiliDownloadRequest,
+        context: BilibiliDownloadContext,
+    ) -> Result<BilibiliDownloadOutput, BilibiliDownloadError> {
+        let client = self
+            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+            .await?;
+        let download_mode = download_mode_from_options(request.options.as_ref())?;
+        validate_supported_download_options(request.options.as_ref())?;
+        let input = playback_input_for_planning(&request.source)?;
+        let output_directories = self
+            .prepare_v2_output_directories(&request.task_id, &context)
+            .await?;
+        let mut candidate_outcomes = Vec::with_capacity(request.candidates.len());
+        let mut retained_backing = RetainedV2DownloadBacking::default();
+        let mut primary_library_item_id = String::new();
+        let mut successful_results = 0_usize;
+        let mut cancelled = false;
+        let mut output_integrity_error = None;
+        let mut completed_downloaded_bytes = 0_u64;
+        let mut total_bytes_floor = 0_u64;
+        let retained_descriptor_budget = bilibili_v2_retained_descriptor_budget();
+        let mut retained_validation_descriptors = 0_usize;
+
+        // V2 task output is the durable authority. This task-local archive only coordinates
+        // duplicate names between this task's candidates and needs no cross-task lock.
+        let mut archive = V2TaskArchive::default();
+
+        for (offset, candidate) in request.candidates.iter().enumerate() {
+            let result_id = bilibili_v2_result_id(&request.task_id, offset);
+            if cancelled || context.is_cancel_requested() {
+                cancelled = true;
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    cancelled_download_result(result_id, candidate),
+                )));
+                continue;
+            }
+            if let Some(error) = output_integrity_error.as_ref() {
+                candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                    failed_download_result(result_id, candidate, error),
+                )));
+                continue;
+            }
+
+            context.report_progress(progress(
+                v2_candidate_progress(offset, request.candidates.len(), 0.02),
+                format!(
+                    "Planning Bilibili download {}/{}.",
+                    offset + 1,
+                    request.candidates.len()
+                ),
+            ));
+
+            let plan = match self
+                .plan_download_candidate(&client, &input, candidate, || {
+                    context.is_cancel_requested()
+                })
+                .await
+            {
+                Ok(plan) => plan,
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    cancelled = true;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    continue;
+                }
+            };
+
+            let candidate_output = match self
+                .prepare_v2_candidate_output_directory(&output_directories, offset)
+                .await
+            {
+                Ok(candidate_output) => candidate_output,
+                Err(error) => {
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    output_integrity_error = Some(error);
+                    continue;
+                }
+            };
+            let download_options = download_options_for_output_dir(
+                candidate_output.path.clone(),
+                request.options.as_ref(),
+            )?;
+
+            let download_cancellation = DownloadCancellationToken::new();
+            let download_progress = BilibiliBbdownProgressSink::for_v2_candidate(
+                context.clone(),
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
+            let mut candidate_archive = archive.stage_candidate();
+            let report = match run_bbdown_download_until_cancelled(
+                client.download_plan_with_archive_decision_with_progress_and_cancellation(
+                    &plan,
+                    download_options.clone(),
+                    &mut candidate_archive,
+                    DuplicateDecision::KeepBoth,
+                    &download_progress,
+                    &download_cancellation,
+                ),
+                &download_cancellation,
+                || context.is_cancel_requested(),
+                "Cancelled while the BBDown download was running.",
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(BilibiliDownloadError::Cancelled(_)) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
+                    cancelled = true;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        cancelled_download_result(result_id, candidate),
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    let snapshot = download_progress.v2_progress_snapshot();
+                    completed_downloaded_bytes = snapshot.downloaded_bytes;
+                    total_bytes_floor = snapshot.total_bytes;
+                    self.cleanup_failed_v2_candidate_output(
+                        &output_directories,
+                        &candidate_output,
+                        &request.task_id,
+                        &result_id,
+                        &mut output_integrity_error,
+                    )
+                    .await;
+                    log_v2_candidate_error(
+                        &request.task_id,
+                        &result_id,
+                        self.options.bbdown_credential_path.is_some(),
+                        &error,
+                    );
+                    candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                        failed_download_result(result_id, candidate, &error),
+                    )));
+                    report_v2_candidate_finished(
+                        &context,
+                        offset,
+                        request.candidates.len(),
+                        completed_downloaded_bytes,
+                        total_bytes_floor,
+                    );
+                    continue;
+                }
+            };
+            let snapshot = download_progress.v2_progress_snapshot();
+            completed_downloaded_bytes =
+                snapshot.downloaded_bytes.max(report.summary().total_bytes);
+            total_bytes_floor = snapshot.total_bytes.max(completed_downloaded_bytes);
+
+            context.report_progress(BilibiliTaskProgress {
+                progress: Some(v2_candidate_progress(
+                    offset,
+                    request.candidates.len(),
+                    0.85,
+                )),
+                downloaded_bytes: Some(to_i64_saturating(completed_downloaded_bytes)),
+                total_bytes: Some(to_i64_saturating(total_bytes_floor)),
+                message: Some(if download_mode == DownloadMode::AudioOnly {
+                    format!(
+                        "Preparing Bilibili audio download {}/{}.",
+                        offset + 1,
+                        request.candidates.len()
+                    )
+                } else {
+                    format!(
+                        "Muxing Bilibili download {}/{}.",
+                        offset + 1,
+                        request.candidates.len()
+                    )
+                }),
+            });
+
+            let mut report = report;
+            let remaining_descriptor_budget =
+                retained_descriptor_budget.saturating_sub(retained_validation_descriptors);
+            let validated_paths =
+                match prepare_owned_download_report_for_playback_in_place_with_descriptor_budget(
+                    &mut report,
+                    download_mode,
+                    &self.ffmpeg_path,
+                    &|| context.is_cancel_requested(),
+                    &output_directories.cache_root,
+                    &candidate_output.path,
+                    remaining_descriptor_budget,
+                )
+                .await
+                {
+                    Ok(validated_paths) => validated_paths,
+                    Err(BilibiliDownloadError::Cancelled(_)) => {
+                        cancelled = true;
+                        self.cleanup_failed_v2_candidate_output(
+                            &output_directories,
+                            &candidate_output,
+                            &request.task_id,
+                            &result_id,
+                            &mut output_integrity_error,
+                        )
+                        .await;
+                        candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                            cancelled_download_result(result_id, candidate),
+                        )));
+                        continue;
+                    }
+                    Err(error) => {
+                        self.cleanup_failed_v2_candidate_output(
+                            &output_directories,
+                            &candidate_output,
+                            &request.task_id,
+                            &result_id,
+                            &mut output_integrity_error,
+                        )
+                        .await;
+                        log_v2_candidate_error(
+                            &request.task_id,
+                            &result_id,
+                            self.options.bbdown_credential_path.is_some(),
+                            &error,
+                        );
+                        candidate_outcomes.push(V2CandidateDownloadOutcome::Terminal(Box::new(
+                            failed_download_result(result_id, candidate, &error),
+                        )));
+                        report_v2_candidate_finished(
+                            &context,
+                            offset,
+                            request.candidates.len(),
+                            completed_downloaded_bytes,
+                            total_bytes_floor,
+                        );
+                        continue;
+                    }
+                };
+            retained_validation_descriptors = retained_validation_descriptors
+                .checked_add(validated_paths.descriptor_count())
+                .filter(|count| *count <= retained_descriptor_budget)
+                .ok_or_else(|| {
+                    BilibiliDownloadError::ResourceExhausted(
+                        "Bilibili task output exceeded its retained file-descriptor budget."
+                            .to_owned(),
+                    )
+                })?;
+            archive.accept_candidate(candidate_archive);
+            candidate_outcomes.push(V2CandidateDownloadOutcome::Downloaded {
+                result_id,
+                plan,
+                report,
+                validated_paths,
+            });
+            report_v2_candidate_finished(
+                &context,
+                offset,
+                request.candidates.len(),
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            );
+        }
+
+        let has_downloaded_output = candidate_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, V2CandidateDownloadOutcome::Downloaded { .. }));
+        let mut publication_error = output_integrity_error;
+        if publication_error.is_none() && has_downloaded_output {
+            publication_error = self
+                .publish_v2_output_directory(&output_directories)
+                .await
+                .err();
+        }
+        if publication_error.is_none() && has_downloaded_output {
+            for (offset, outcome) in candidate_outcomes.iter_mut().enumerate() {
+                let V2CandidateDownloadOutcome::Downloaded {
+                    report,
+                    validated_paths,
+                    ..
+                } = outcome
+                else {
+                    continue;
+                };
+                let published_candidate =
+                    v2_published_candidate_output_directory(&output_directories, offset)?;
+                if let Err(error) = revalidate_download_report_files_after_publication(
+                    &output_directories.cache_root,
+                    &published_candidate.path,
+                    validated_paths,
+                )
+                .await
+                {
+                    publication_error = Some(error);
+                    break;
+                }
+                match remap_download_report_root(
+                    report.clone(),
+                    &output_directories.staging_path,
+                    &output_directories.published_path,
+                ) {
+                    Ok(remapped) => *report = remapped,
+                    Err(error) => {
+                        publication_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = publication_error.as_ref() {
+            log_v2_candidate_error(
+                &request.task_id,
+                &request.task_id,
+                self.options.bbdown_credential_path.is_some(),
+                error,
+            );
+        }
+
+        let mut results = Vec::with_capacity(request.candidates.len());
+        for (offset, outcome) in candidate_outcomes.into_iter().enumerate() {
+            let candidate = &request.candidates[offset];
+            match outcome {
+                V2CandidateDownloadOutcome::Terminal(result) => results.push(*result),
+                V2CandidateDownloadOutcome::Downloaded {
+                    result_id,
+                    plan,
+                    report,
+                    validated_paths,
+                } => {
+                    if let Some(error) = publication_error.as_ref() {
+                        results.push(failed_download_result(result_id, candidate, error));
+                        continue;
+                    }
+                    let published_candidate =
+                        v2_published_candidate_output_directory(&output_directories, offset)?;
+                    let mapped = self
+                        .finalize_v2_download_result(
+                            result_id.clone(),
+                            candidate,
+                            &plan,
+                            report,
+                            download_mode,
+                            V2DownloadFinalization {
+                                cancel_requested: false,
+                                publication_validation: Some(V2PublishedOutputValidation {
+                                    cache_root: &output_directories.cache_root,
+                                    published_root: &published_candidate.path,
+                                    validated_paths: &validated_paths,
+                                }),
+                            },
+                        )
+                        .await;
+                    match mapped {
+                        Ok(mapped) => retain_v2_success(
+                            mapped,
+                            &mut primary_library_item_id,
+                            &mut successful_results,
+                            &mut results,
+                            &mut retained_backing,
+                        ),
+                        Err(BilibiliDownloadError::Cancelled(_)) => {
+                            let candidate_output = v2_published_candidate_output_directory(
+                                &output_directories,
+                                offset,
+                            )?;
+                            let mut cleanup_error = None;
+                            self.cleanup_failed_v2_candidate_output(
+                                &output_directories,
+                                &candidate_output,
+                                &request.task_id,
+                                &result_id,
+                                &mut cleanup_error,
+                            )
+                            .await;
+                            if let Some(error) = cleanup_error {
+                                return Err(error);
+                            }
+                            cancelled = true;
+                            results.push(cancelled_download_result(result_id, candidate));
+                        }
+                        Err(error) => {
+                            let candidate_output = v2_published_candidate_output_directory(
+                                &output_directories,
+                                offset,
+                            )?;
+                            let mut cleanup_error = None;
+                            self.cleanup_failed_v2_candidate_output(
+                                &output_directories,
+                                &candidate_output,
+                                &request.task_id,
+                                &result_id,
+                                &mut cleanup_error,
+                            )
+                            .await;
+                            if let Some(cleanup_error) = cleanup_error {
+                                return Err(cleanup_error);
+                            }
+                            log_v2_candidate_error(
+                                &request.task_id,
+                                &result_id,
+                                self.options.bbdown_credential_path.is_some(),
+                                &error,
+                            );
+                            results.push(failed_download_result(result_id, candidate, &error));
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = request.candidates.len();
+        let terminal_state = if cancelled {
+            TaskState::Cancelled
+        } else if successful_results > 0 {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        };
+        let message = match terminal_state {
+            TaskState::Cancelled => format!(
+                "Cancelled after completing {successful_results}/{total} Bilibili result(s)."
+            ),
+            TaskState::Succeeded if successful_results == total => {
+                format!("Downloaded all {total} Bilibili result(s).")
+            }
+            TaskState::Succeeded => {
+                format!("Downloaded {successful_results}/{total} Bilibili result(s).")
+            }
+            TaskState::Failed => format!("Failed to download all {total} Bilibili result(s)."),
+            _ => unreachable!("v2 download must finish in a terminal state"),
+        };
+        let owned_directory_cleanup_paths = if primary_library_item_id.is_empty() {
+            vec![
+                output_directories.staging_path,
+                output_directories.published_path,
+            ]
+        } else {
+            vec![output_directories.staging_path]
+        };
+
+        Ok(BilibiliDownloadOutput {
+            library_item_id: primary_library_item_id,
+            message,
+            v2: Some(BilibiliDownloadOutputV2 {
+                terminal_state,
+                results,
+                resources: retained_backing.resources,
+                resource_bodies: retained_backing.resource_bodies,
+                library_item_leases: retained_backing.library_item_leases,
+                transient_output_paths: retained_backing.transient_output_paths,
+                owned_directory_cleanup_paths,
+            }),
+        })
+    }
+
+    async fn prepare_v2_output_directories(
+        &self,
+        task_id: &str,
+        context: &BilibiliDownloadContext,
+    ) -> Result<V2TaskOutputDirectories, BilibiliDownloadError> {
+        let cache_root = self.library.root_path();
+        let staging_path = cache_root.join(BILIBILI_V2_STAGING_DIRECTORY).join(task_id);
+        let published_path = self.output_dir.join(task_id);
+        let staging_relative_path = cache_relative_normal_path(&cache_root, &staging_path)?;
+        let published_relative_path = cache_relative_normal_path(&cache_root, &published_path)?;
+        let output_directory_relative_path =
+            cache_relative_normal_path_allow_empty(&cache_root, &self.output_dir)?;
+        context
+            .register_owned_output_directories(vec![staging_path.clone(), published_path.clone()])
+            .await?;
+
+        let cache_root_for_creation = cache_root.clone();
+        let staging_relative_for_creation = staging_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if !output_directory_relative_path.is_empty() {
+                ensure_directory_no_follow(
+                    &cache_root_for_creation,
+                    &output_directory_relative_path,
+                )?;
+            }
+            create_directory_exclusive_no_follow(
+                &cache_root_for_creation,
+                &staging_relative_for_creation,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output staging directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(V2TaskOutputDirectories {
+            cache_root,
+            staging_path,
+            staging_relative_path,
+            published_path,
+            published_relative_path,
+        })
+    }
+
+    async fn prepare_v2_candidate_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        offset: usize,
+    ) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+        let candidate_output = v2_candidate_output_directory(directories, offset)?;
+        let cache_root = directories.cache_root.clone();
+        let relative_path_for_creation = candidate_output.relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            create_directory_exclusive_no_follow(&cache_root, &relative_path_for_creation)
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory preparation worker failed.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output directory could not be created safely.".to_owned(),
+            )
+        })?;
+
+        Ok(candidate_output)
+    }
+
+    async fn cleanup_failed_v2_candidate_output(
+        &self,
+        directories: &V2TaskOutputDirectories,
+        candidate_output: &V2CandidateOutputDirectory,
+        task_id: &str,
+        result_id: &str,
+        output_integrity_error: &mut Option<BilibiliDownloadError>,
+    ) {
+        let cache_root = directories.cache_root.clone();
+        let relative_path = candidate_output.relative_path.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili candidate output cleanup worker failed.".to_owned(),
+            )
+        })
+        .and_then(|result| {
+            result.map_err(|_| {
+                BilibiliDownloadError::Failed(
+                    "Bilibili candidate output directory could not be cleaned safely.".to_owned(),
+                )
+            })
+        });
+
+        if let Err(error) = cleanup {
+            log_v2_candidate_error(
+                task_id,
+                result_id,
+                self.options.bbdown_credential_path.is_some(),
+                &error,
+            );
+            if output_integrity_error.is_none() {
+                *output_integrity_error = Some(error);
+            }
+        }
+    }
+
+    async fn publish_v2_output_directory(
+        &self,
+        directories: &V2TaskOutputDirectories,
+    ) -> Result<(), BilibiliDownloadError> {
+        let cache_root = directories.cache_root.clone();
+        let staging_relative_path = directories.staging_relative_path.clone();
+        let published_relative_path = directories.published_relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            rename_directory_no_replace_no_follow(
+                &cache_root,
+                &staging_relative_path,
+                &published_relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed("Bilibili output publication worker failed.".to_owned())
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili output directory could not be published safely.".to_owned(),
+            )
+        })
+    }
+
+    fn save_archive(&self, archive: &DownloadArchive) -> Result<(), BilibiliDownloadError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .archive_save_fail_after
+                .lock()
+                .expect("archive save failure hook lock poisoned");
+            if let Some(remaining) = remaining.as_mut() {
+                if *remaining == 0 {
+                    return Err(BilibiliDownloadError::Failed(
+                        "Injected BBDown archive persistence failure.".to_owned(),
+                    ));
+                }
+                *remaining -= 1;
+            }
+        }
+        archive.save(&self.archive_path).map_err(failed)
+    }
+
+    async fn plan_download_candidate(
+        &self,
+        client: &BiliClient,
+        input: &Input,
+        candidate: &BilibiliTaskCandidateRecord,
+        is_cancel_requested: impl Fn() -> bool,
+    ) -> Result<DownloadPlan, BilibiliDownloadError> {
+        let PlaybackInputSelection {
+            input_override,
+            selection,
+            expected_identity,
+        } = playback_selection_from_id(input, Some(&candidate.selection_id))?;
+        let direct_collection_item = input_override.is_some();
+        let selected_input = input_override.unwrap_or_else(|| input.clone());
+        let selection = if direct_collection_item {
+            Some(
+                resolve_direct_collection_item_page(
+                    client,
+                    &selected_input,
+                    expected_identity
+                        .as_ref()
+                        .expect("direct collection item must retain expected identity"),
+                    &is_cancel_requested,
+                )
+                .await?,
+            )
+        } else {
+            selection.or_else(|| default_selection_for_input(&selected_input))
+        };
+        let plan = run_bbdown_until_cancelled(
+            client.plan(selected_input, selection),
+            &is_cancel_requested,
+            "Cancelled while BBDown planning was running.",
+        )
+        .await?;
+        let matching_entries = plan
+            .entries
+            .into_iter()
+            .filter(|entry| download_entry_matches_candidate(entry, candidate))
+            .collect::<Vec<_>>();
+        if matching_entries.len() != 1 {
+            return Err(BilibiliDownloadError::Failed(
+                "Selected Bilibili content no longer matches the accepted resolution snapshot. Resolve the input again and retry."
+                    .to_owned(),
+            ));
+        }
+        Ok(DownloadPlan {
+            title: plan.title,
+            entries: matching_entries,
+        })
+    }
+
+    async fn finalize_v2_download_result(
+        &self,
+        result_id: String,
+        candidate: &BilibiliTaskCandidateRecord,
+        plan: &DownloadPlan,
+        report: DownloadReport,
+        download_mode: DownloadMode,
+        finalization: V2DownloadFinalization<'_>,
+    ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
+        if finalization.cancel_requested {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled after BBDown finished downloading.".to_owned(),
+            ));
+        }
+
+        self.map_v2_download_result(
+            result_id,
+            candidate,
+            plan,
+            &report,
+            download_mode,
+            finalization.publication_validation,
+        )
+        .await
+    }
+
+    async fn map_v2_download_result(
+        &self,
+        result_id: String,
+        candidate: &BilibiliTaskCandidateRecord,
+        plan: &DownloadPlan,
+        report: &DownloadReport,
+        download_mode: DownloadMode,
+        publication_validation: Option<V2PublishedOutputValidation<'_>>,
+    ) -> Result<MappedV2DownloadResult, BilibiliDownloadError> {
+        let entry = report.entries.first().ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown returned no entry for the selected Bilibili result.".to_owned(),
+            )
+        })?;
+        if report.entries.len() != 1 {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown returned an ambiguous multi-entry report for one accepted Bilibili result."
+                    .to_owned(),
+            ));
+        }
+        let plan_entry = plan.entries.first().ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown returned no plan entry for the selected Bilibili result.".to_owned(),
+            )
+        })?;
+
+        let mut library_item_id = String::new();
+        let mut library_item_lease = None;
+        let mut library_output_path = None;
+        for candidate_path in playable_entry_output_candidates(entry) {
+            if let Some(validation) = publication_validation {
+                revalidate_download_report_files_after_publication(
+                    validation.cache_root,
+                    validation.published_root,
+                    validation.validated_paths,
+                )
+                .await?;
+            }
+            if let Some(lease) = self
+                .library
+                .reserve_media_path_for_publication(candidate_path.clone())
+                .await
+            {
+                if let Some(validation) = publication_validation {
+                    revalidate_download_report_files_after_publication(
+                        validation.cache_root,
+                        validation.published_root,
+                        validation.validated_paths,
+                    )
+                    .await?;
+                }
+                library_item_id = lease.item_id.clone();
+                library_item_lease = Some(lease);
+                library_output_path = Some(candidate_path);
+                break;
+            }
+        }
+        if download_mode_requires_media(download_mode) && library_item_id.is_empty() {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown finished but produced no playable cache-library item for the selected result."
+                    .to_owned(),
+            ));
+        }
+
+        let mut artifacts = Vec::new();
+        let mut resources = Vec::new();
+        let mut resource_bodies = Vec::new();
+
+        if let Some(library_output_path) = library_output_path.as_deref() {
+            artifacts.push(library_media_artifact(
+                library_output_path,
+                &library_item_id,
+            ));
+        }
+        for (index, file) in entry
+            .files
+            .iter()
+            .filter(|file| !file.kind.is_media())
+            .enumerate()
+        {
+            let mapped = map_sidecar_artifact(file, index, publication_validation)?;
+            artifacts.push(mapped.artifact);
+            resources.push(mapped.resource);
+            resource_bodies.push(mapped.body);
+        }
+        if let Some(required_kind) = sidecar_only_required_artifact_kind(download_mode)
+            && !artifacts
+                .iter()
+                .any(|artifact| artifact.kind() == required_kind)
+        {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown finished but did not produce the requested sidecar artifact.".to_owned(),
+            ));
+        }
+        if !plan_entry.chapters.is_empty() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "chapters": plan_entry.chapters,
+            }))
+            .map_err(failed)?;
+            let mapped = map_generated_artifact(
+                TaskArtifactKind::Chapters,
+                "Chapters",
+                "json",
+                "application/json",
+                body,
+            )?;
+            artifacts.push(mapped.artifact);
+            resources.push(mapped.resource);
+            resource_bodies.push(mapped.body);
+        }
+
+        let summary = report.summary();
+        let metadata_body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "provider": "bilibili",
+            "subject": {
+                "kind": candidate.source_kind,
+                "id": candidate.content_id,
+                "index": candidate.index,
+                "aid": candidate.identity.aid,
+                "bvid": candidate.identity.bvid,
+                "cid": candidate.identity.cid,
+                "epid": candidate.identity.epid,
+            },
+            "title": candidate.title,
+            "subtitle": candidate.subtitle,
+            "download": {
+                "file_count": summary.file_count,
+                "media_file_count": summary.media_file_count,
+                "sidecar_file_count": summary.sidecar_file_count,
+                "mux_count": summary.mux_count,
+                "total_bytes": summary.total_bytes,
+            },
+        }))
+        .map_err(failed)?;
+        let metadata = map_generated_artifact(
+            TaskArtifactKind::Metadata,
+            "Metadata",
+            "json",
+            "application/json",
+            metadata_body,
+        )?;
+        artifacts.push(metadata.artifact);
+        resources.push(metadata.resource);
+        resource_bodies.push(metadata.body);
+
+        let output_paths = download_report_output_paths(report);
+        let transient_output_paths =
+            transient_download_output_paths(&output_paths, library_output_path.as_deref());
+        Ok(MappedV2DownloadResult {
+            library_item_id: library_item_id.clone(),
+            result: successful_download_result(
+                result_id,
+                candidate,
+                library_item_id,
+                artifacts,
+                summary.total_bytes,
+            ),
+            resources,
+            resource_bodies,
+            library_item_lease,
+            transient_output_paths,
+        })
+    }
+
     fn download_options(
         &self,
         options: Option<&BilibiliDownloadOptions>,
     ) -> Result<DownloadOptions, BilibiliDownloadError> {
+        validate_legacy_download_mode(options)?;
         download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
-    fn client_for_options(&self, options: Option<&BilibiliDownloadOptions>) -> BiliClient {
-        if options.is_some_and(|options| options.prefer_tv_api) {
-            self.tv_client.clone()
-        } else {
-            self.client.clone()
+    async fn client_for_request(
+        &self,
+        options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+    ) -> Result<BiliClient, BilibiliDownloadError> {
+        if request_context.is_none() {
+            return Ok(if options.is_some_and(|options| options.prefer_tv_api) {
+                self.tv_client.clone()
+            } else {
+                self.client.clone()
+            });
         }
+
+        let permit = timeout(
+            BBDOWN_CREDENTIAL_LOAD_ADMISSION_TIMEOUT,
+            Arc::clone(&self.blocking_operation_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili credential operations are busy; retry the request.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili credential operation limiter is unavailable.".to_owned(),
+            )
+        })?;
+        let server_options = Arc::clone(&self.options);
+        let options = options.cloned();
+        let request_context = request_context.cloned();
+        let config = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            bbdown_client_config_for_request(
+                &server_options,
+                options.as_ref(),
+                request_context.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| {
+            BilibiliDownloadError::Failed("Bilibili credential loading worker failed.".to_owned())
+        })??;
+
+        let Some(config) = config else {
+            return Err(BilibiliDownloadError::Failed(
+                "Bilibili request context did not produce a client configuration.".to_owned(),
+            ));
+        };
+        Ok(BiliClient::new(config))
     }
 
     #[allow(dead_code)]
@@ -427,6 +1531,7 @@ impl BbdownBilibiliAdapter {
         &self,
         source: &str,
         options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
         candidate_limit: usize,
         include_candidate_cover_uri: bool,
         is_cancel_requested: impl Fn() -> bool,
@@ -435,7 +1540,7 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input, candidate_window)?;
-        let client = self.client_for_options(options);
+        let client = self.client_for_request(options, request_context).await?;
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
             client.resolve(input.clone(), selection),
@@ -509,6 +1614,7 @@ impl BbdownBilibiliAdapter {
         source: &str,
         selection_id: Option<&str>,
         options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
         policy: PlaybackPolicy,
         is_cancel_requested: impl Fn() -> bool,
     ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
@@ -521,7 +1627,7 @@ impl BbdownBilibiliAdapter {
         } = playback_selection_from_id(&input, selection_id)?;
         let direct_collection_item = input_override.is_some();
         let input = input_override.unwrap_or(input);
-        let client = self.client_for_options(options);
+        let client = self.client_for_request(options, request_context).await?;
         let selection = if direct_collection_item {
             Some(
                 resolve_direct_collection_item_page(
@@ -606,17 +1712,158 @@ fn direct_collection_item_page_selection(
     Ok(Selection::Page(page.index))
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct BbdownCredentialLoadProbe {
+    path: PathBuf,
+    blocking_permits: Arc<Semaphore>,
+    observed_thread: Arc<StdMutex<Option<std::thread::ThreadId>>>,
+    observed_available_permits: Arc<std::sync::atomic::AtomicUsize>,
+    observed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static BBDOWN_CREDENTIAL_LOAD_PROBE: std::sync::OnceLock<
+    StdMutex<Option<BbdownCredentialLoadProbe>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct BbdownCredentialLoadProbeRegistration;
+
+#[cfg(test)]
+impl Drop for BbdownCredentialLoadProbeRegistration {
+    fn drop(&mut self) {
+        *BBDOWN_CREDENTIAL_LOAD_PROBE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .expect("BBDown credential load probe lock poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_bbdown_credential_load_probe(
+    probe: BbdownCredentialLoadProbe,
+) -> BbdownCredentialLoadProbeRegistration {
+    let mut active_probe = BBDOWN_CREDENTIAL_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("BBDown credential load probe lock poisoned");
+    assert!(
+        active_probe.is_none(),
+        "credential load probe already active"
+    );
+    *active_probe = Some(probe);
+    BbdownCredentialLoadProbeRegistration
+}
+
+#[cfg(test)]
+fn observe_bbdown_credential_load(path: &Path) {
+    let probe = BBDOWN_CREDENTIAL_LOAD_PROBE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("BBDown credential load probe lock poisoned")
+        .as_ref()
+        .filter(|probe| probe.path == path)
+        .cloned();
+    let Some(probe) = probe else {
+        return;
+    };
+    *probe
+        .observed_thread
+        .lock()
+        .expect("BBDown credential load observation lock poisoned") =
+        Some(std::thread::current().id());
+    probe.observed_available_permits.store(
+        probe.blocking_permits.available_permits(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    probe.observed.notify_one();
+}
+
 fn bbdown_client_config(
     options: &CacheServerOptions,
     playurl_mode: PlayurlMode,
 ) -> Result<ClientConfig, BilibiliDownloadError> {
-    Ok(ClientConfig::default()
-        .with_credentials(bbdown_credentials(
-            options.bbdown_credential_path.as_deref(),
-            options.bbdown_credential_profile.as_deref(),
-        )?)
+    bbdown_client_config_with_profile(
+        options,
+        playurl_mode,
+        options.bbdown_credential_profile.as_deref(),
+    )
+}
+
+fn bbdown_client_config_for_request(
+    server_options: &CacheServerOptions,
+    options: Option<&BilibiliDownloadOptions>,
+    request_context: Option<&BilibiliRequestContext>,
+) -> Result<Option<ClientConfig>, BilibiliDownloadError> {
+    let explicit_profile = request_context
+        .map(|context| context.credential_profile_id.trim())
+        .filter(|profile| !profile.is_empty());
+    let explicit_mode = request_context
+        .map(|context| BilibiliApiMode::try_from(context.api_mode))
+        .transpose()
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili API mode is unknown to this cache server.".to_owned(),
+            )
+        })?
+        .filter(|mode| *mode != BilibiliApiMode::Unspecified);
+
+    if request_context.is_none() && explicit_profile.is_none() && explicit_mode.is_none() {
+        return Ok(None);
+    }
+
+    let playurl_mode = match explicit_mode {
+        Some(BilibiliApiMode::Web) => PlayurlMode::Web,
+        Some(BilibiliApiMode::Tv) => PlayurlMode::Tv,
+        Some(BilibiliApiMode::App) => PlayurlMode::App,
+        Some(BilibiliApiMode::Unspecified) => unreachable!("unspecified mode was filtered out"),
+        None if options.is_some_and(|options| options.prefer_tv_api) => PlayurlMode::Tv,
+        None => PlayurlMode::Web,
+    };
+    let credentials = match explicit_profile {
+        Some(profile) => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            Some(profile),
+        )?,
+        None if request_context.is_some() => Credentials::default(),
+        None => bbdown_credentials(
+            server_options.bbdown_credential_path.as_deref(),
+            server_options.bbdown_credential_profile.as_deref(),
+        )?,
+    };
+    Ok(Some(bbdown_client_config_with_credentials(
+        server_options,
+        playurl_mode,
+        credentials,
+    )))
+}
+
+fn bbdown_client_config_with_profile(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+    credential_profile: Option<&str>,
+) -> Result<ClientConfig, BilibiliDownloadError> {
+    let credentials = bbdown_credentials(
+        options.bbdown_credential_path.as_deref(),
+        credential_profile,
+    )?;
+    Ok(bbdown_client_config_with_credentials(
+        options,
+        playurl_mode,
+        credentials,
+    ))
+}
+
+fn bbdown_client_config_with_credentials(
+    options: &CacheServerOptions,
+    playurl_mode: PlayurlMode,
+    credentials: Credentials,
+) -> ClientConfig {
+    ClientConfig::default()
+        .with_credentials(credentials)
         .with_restricted_area(bbdown_restricted_area_config(options))
-        .with_playurl_mode(playurl_mode))
+        .with_playurl_mode(playurl_mode)
 }
 
 fn bbdown_credentials(
@@ -624,6 +1871,12 @@ fn bbdown_credentials(
     profile: Option<&str>,
 ) -> Result<Credentials, BilibiliDownloadError> {
     let Some(path) = path else {
+        if profile.is_some() {
+            return Err(BilibiliDownloadError::Failed(
+                "A Bilibili credential profile was selected, but credential storage is not configured."
+                    .to_owned(),
+            ));
+        }
         return Ok(Credentials::default());
     };
     let selection = match profile {
@@ -631,6 +1884,8 @@ fn bbdown_credentials(
         None => CredentialProfileSelection::default_profile(),
     };
     let store = CredentialStore::new(path.to_path_buf());
+    #[cfg(test)]
+    observe_bbdown_credential_load(path);
     let Some(profile) = selection.profile_name() else {
         return store.load().map_err(failed);
     };
@@ -820,6 +2075,7 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
 struct BilibiliBbdownProgressSink {
     context: BilibiliDownloadContext,
     accumulator: StdMutex<BilibiliBbdownProgressAccumulator>,
+    v2_window: Option<BilibiliV2ProgressWindow>,
 }
 
 impl BilibiliBbdownProgressSink {
@@ -827,6 +2083,47 @@ impl BilibiliBbdownProgressSink {
         Self {
             context,
             accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: None,
+        }
+    }
+
+    fn for_v2_candidate(
+        context: BilibiliDownloadContext,
+        offset: usize,
+        total: usize,
+        completed_downloaded_bytes: u64,
+        total_bytes_floor: u64,
+    ) -> Self {
+        Self {
+            context,
+            accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
+            v2_window: Some(BilibiliV2ProgressWindow {
+                offset,
+                total,
+                completed_downloaded_bytes,
+                total_bytes_floor,
+            }),
+        }
+    }
+
+    fn v2_progress_snapshot(&self) -> BilibiliV2ProgressSnapshot {
+        let Some(window) = self.v2_window else {
+            return BilibiliV2ProgressSnapshot::default();
+        };
+        let accumulator = self
+            .accumulator
+            .lock()
+            .expect("BBDown progress accumulator lock poisoned");
+        let (downloaded_bytes, total_bytes) = accumulator.known_bytes_snapshot();
+        BilibiliV2ProgressSnapshot {
+            downloaded_bytes: window
+                .completed_downloaded_bytes
+                .saturating_add(downloaded_bytes),
+            total_bytes: window.total_bytes_floor.max(
+                window
+                    .completed_downloaded_bytes
+                    .saturating_add(total_bytes.unwrap_or(downloaded_bytes)),
+            ),
         }
     }
 }
@@ -838,10 +2135,49 @@ impl DownloadProgressSink for BilibiliBbdownProgressSink {
             .lock()
             .ok()
             .and_then(|mut accumulator| accumulator.record(event));
-        if let Some(progress) = progress {
+        if let Some(mut progress) = progress {
+            if let Some(window) = self.v2_window {
+                window.map(&mut progress);
+            }
             self.context.report_progress(progress);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct BilibiliV2ProgressWindow {
+    offset: usize,
+    total: usize,
+    completed_downloaded_bytes: u64,
+    total_bytes_floor: u64,
+}
+
+impl BilibiliV2ProgressWindow {
+    fn map(self, progress: &mut BilibiliTaskProgress) {
+        if let Some(fraction) = progress.progress.as_mut() {
+            *fraction = v2_candidate_progress(self.offset, self.total, *fraction);
+        }
+        if let Some(downloaded_bytes) = progress.downloaded_bytes.as_mut() {
+            *downloaded_bytes = to_i64_saturating(
+                self.completed_downloaded_bytes
+                    .saturating_add(nonnegative_i64_to_u64(*downloaded_bytes)),
+            );
+        }
+        if let Some(total_bytes) = progress.total_bytes.as_mut() {
+            *total_bytes = to_i64_saturating(
+                self.total_bytes_floor.max(
+                    self.completed_downloaded_bytes
+                        .saturating_add(nonnegative_i64_to_u64(*total_bytes)),
+                ),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BilibiliV2ProgressSnapshot {
+    downloaded_bytes: u64,
+    total_bytes: u64,
 }
 
 #[derive(Default)]
@@ -2779,6 +4115,7 @@ fn download_options_for_output_dir(
 
     let mut download_options = DownloadOptions::new(output_dir)
         .with_stream_selection(stream_selection_from_options(options))
+        .with_download_mode(download_mode_from_options(options)?)
         .with_cover(options.is_some_and(|options| options.download_cover))
         .with_subtitles(options.is_some_and(|options| options.download_subtitles))
         .with_subtitle_ai_policy(subtitle_ai_policy_from_options(options)?)
@@ -2888,6 +4225,1203 @@ fn video_quality_preference(value: &str) -> Option<u32> {
     }
 }
 
+struct V2TaskOutputDirectories {
+    cache_root: PathBuf,
+    staging_path: PathBuf,
+    staging_relative_path: String,
+    published_path: PathBuf,
+    published_relative_path: String,
+}
+
+struct V2CandidateOutputDirectory {
+    path: PathBuf,
+    relative_path: String,
+}
+
+fn v2_candidate_output_directory(
+    directories: &V2TaskOutputDirectories,
+    offset: usize,
+) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+    let directory_name = v2_candidate_output_directory_name(offset)?;
+    let path = directories.staging_path.join(directory_name);
+    let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
+    Ok(V2CandidateOutputDirectory {
+        path,
+        relative_path,
+    })
+}
+
+fn v2_published_candidate_output_directory(
+    directories: &V2TaskOutputDirectories,
+    offset: usize,
+) -> Result<V2CandidateOutputDirectory, BilibiliDownloadError> {
+    let directory_name = v2_candidate_output_directory_name(offset)?;
+    let path = directories.published_path.join(directory_name);
+    let relative_path = cache_relative_normal_path(&directories.cache_root, &path)?;
+    Ok(V2CandidateOutputDirectory {
+        path,
+        relative_path,
+    })
+}
+
+fn v2_candidate_output_directory_name(offset: usize) -> Result<String, BilibiliDownloadError> {
+    let candidate_number = offset.checked_add(1).ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Bilibili candidate output directory index overflowed.".to_owned(),
+        )
+    })?;
+    Ok(format!("candidate-{candidate_number:05}"))
+}
+
+enum V2CandidateDownloadOutcome {
+    Terminal(Box<TaskResult>),
+    Downloaded {
+        result_id: String,
+        plan: DownloadPlan,
+        report: DownloadReport,
+        validated_paths: ValidatedDownloadReportPaths,
+    },
+}
+
+fn cache_relative_normal_path(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = cache_relative_normal_path_allow_empty(cache_root, path)?;
+    if relative.is_empty() {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path cannot equal the cache root.".to_owned(),
+        ));
+    }
+    Ok(relative)
+}
+
+fn cache_relative_normal_path_allow_empty(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<String, BilibiliDownloadError> {
+    let relative = path.strip_prefix(cache_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "Bilibili output path is outside the configured cache root.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili output path is not canonical.".to_owned(),
+        ));
+    }
+    relative.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        BilibiliDownloadError::Failed("Bilibili output path is not valid UTF-8.".to_owned())
+    })
+}
+
+#[derive(Clone, Copy)]
+enum DownloadReportPathKind {
+    Directory,
+    File,
+}
+
+struct ValidatedDownloadReportPaths {
+    owned_root_path: PathBuf,
+    owned_root: File,
+    entries: Vec<ValidatedDownloadEntryPaths>,
+}
+
+impl ValidatedDownloadReportPaths {
+    fn descriptor_count(&self) -> usize {
+        self.entries.iter().fold(1_usize, |count, entry| {
+            count.saturating_add(
+                1_usize
+                    .saturating_add(entry.media_files.len())
+                    .saturating_add(entry.sidecar_files.len()),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V2PublishedOutputValidation<'a> {
+    cache_root: &'a Path,
+    published_root: &'a Path,
+    validated_paths: &'a ValidatedDownloadReportPaths,
+}
+
+struct V2DownloadFinalization<'a> {
+    cancel_requested: bool,
+    publication_validation: Option<V2PublishedOutputValidation<'a>>,
+}
+
+struct ValidatedDownloadEntryPaths {
+    directory: File,
+    media_files: Vec<ValidatedMediaFile>,
+    sidecar_files: Vec<ValidatedMediaFile>,
+}
+
+struct ValidatedMediaFile {
+    path: PathBuf,
+    relative_to_owned_root: String,
+    file: File,
+    identity: ValidatedMediaFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedMediaFileIdentity {
+    device_id: u64,
+    inode: u64,
+    size_bytes: u64,
+    mode: u32,
+}
+
+impl ValidatedMediaFileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "validated BBDown output path is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            size_bytes: metadata.len(),
+            mode: metadata.mode() & 0o7777,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure BBDown output identity validation is not implemented on this platform",
+        ))
+    }
+
+    fn same_object(self, other: Self) -> bool {
+        self.device_id == other.device_id && self.inode == other.inode
+    }
+}
+
+struct RetainedDescriptorBudget {
+    maximum: usize,
+    used: usize,
+}
+
+impl RetainedDescriptorBudget {
+    fn new(maximum: usize) -> Self {
+        Self { maximum, used: 0 }
+    }
+
+    fn claim(&mut self) -> Result<(), BilibiliDownloadError> {
+        self.used = self
+            .used
+            .checked_add(1)
+            .filter(|used| *used <= self.maximum)
+            .ok_or_else(|| {
+                BilibiliDownloadError::ResourceExhausted(
+                    "Bilibili task output exceeded its retained file-descriptor budget.".to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+async fn validate_download_report_paths_no_follow(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
+    validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        bilibili_v2_retained_descriptor_budget(),
+    )
+    .await
+}
+
+async fn validate_download_report_paths_no_follow_with_descriptor_budget(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+    max_retained_descriptors: usize,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
+    let cache_root = cache_root.to_path_buf();
+    let owned_root = owned_root.to_path_buf();
+    let report = report.clone();
+    tokio::task::spawn_blocking(move || {
+        validate_download_report_paths_no_follow_blocking(
+            &cache_root,
+            &owned_root,
+            &report,
+            max_retained_descriptors,
+        )
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("Bilibili download path validation worker failed.".to_owned())
+    })?
+}
+
+fn validate_download_report_paths_no_follow_blocking(
+    cache_root: &Path,
+    owned_root: &Path,
+    report: &DownloadReport,
+    max_retained_descriptors: usize,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError> {
+    let mut descriptor_budget = RetainedDescriptorBudget::new(max_retained_descriptors);
+    descriptor_budget.claim()?;
+    let owned_root_relative = cache_relative_normal_path(cache_root, owned_root)?;
+    let owned_root_directory =
+        open_read_no_follow(cache_root, &owned_root_relative).map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili task-owned output directory could not be bound safely.".to_owned(),
+            )
+        })?;
+    if !owned_root_directory.metadata().map_err(failed)?.is_dir() {
+        return Err(BilibiliDownloadError::Failed(
+            "Bilibili task-owned output path is not a directory.".to_owned(),
+        ));
+    }
+
+    validate_download_report_path_no_follow_at(
+        &owned_root_directory,
+        owned_root,
+        &report.output_dir,
+        DownloadReportPathKind::Directory,
+    )?;
+    let mut entries = Vec::with_capacity(report.entries.len());
+    for entry in &report.entries {
+        descriptor_budget.claim()?;
+        let (_, directory) = validate_download_report_path_no_follow_at(
+            &owned_root_directory,
+            owned_root,
+            &entry.directory,
+            DownloadReportPathKind::Directory,
+        )?;
+        let mut media_files = Vec::new();
+        let mut sidecar_files = Vec::new();
+        let mut media_paths = HashSet::new();
+        let mut sidecar_paths = HashSet::new();
+        for file in &entry.files {
+            let (retained_files, retained_paths) = if is_media_kind(&file.kind) {
+                (&mut media_files, &mut media_paths)
+            } else {
+                (&mut sidecar_files, &mut sidecar_paths)
+            };
+            if !retained_paths.insert(file.path.clone()) {
+                continue;
+            }
+            descriptor_budget.claim()?;
+            let (relative_to_owned_root, opened) = validate_download_report_path_no_follow_at(
+                &owned_root_directory,
+                owned_root,
+                &file.path,
+                DownloadReportPathKind::File,
+            )?;
+            let identity =
+                ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
+                    .map_err(failed)?;
+            retained_files.push(ValidatedMediaFile {
+                path: file.path.clone(),
+                relative_to_owned_root,
+                file: opened,
+                identity,
+            });
+        }
+        if let Some(mux) = &entry.mux
+            && media_paths.insert(mux.output_path.clone())
+        {
+            descriptor_budget.claim()?;
+            let (relative_to_owned_root, opened) = validate_download_report_path_no_follow_at(
+                &owned_root_directory,
+                owned_root,
+                &mux.output_path,
+                DownloadReportPathKind::File,
+            )?;
+            let identity =
+                ValidatedMediaFileIdentity::from_metadata(&opened.metadata().map_err(failed)?)
+                    .map_err(failed)?;
+            media_files.push(ValidatedMediaFile {
+                path: mux.output_path.clone(),
+                relative_to_owned_root,
+                file: opened,
+                identity,
+            });
+        }
+        entries.push(ValidatedDownloadEntryPaths {
+            directory,
+            media_files,
+            sidecar_files,
+        });
+    }
+    Ok(ValidatedDownloadReportPaths {
+        owned_root_path: owned_root.to_path_buf(),
+        owned_root: owned_root_directory,
+        entries,
+    })
+}
+
+fn validate_download_report_path_no_follow_at(
+    owned_root_directory: &File,
+    owned_root: &Path,
+    path: &Path,
+    expected_kind: DownloadReportPathKind,
+) -> Result<(String, File), BilibiliDownloadError> {
+    let relative_to_owned = path.strip_prefix(owned_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an output path outside its task-owned directory.".to_owned(),
+        )
+    })?;
+    if relative_to_owned
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a noncanonical task output path.".to_owned(),
+        ));
+    }
+
+    let relative_to_owned_root = relative_to_owned.to_str().ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned a task output path that is not valid UTF-8.".to_owned(),
+        )
+    })?;
+    let opened = if relative_to_owned_root.is_empty() {
+        owned_root_directory.try_clone()
+    } else {
+        open_read_no_follow_at(owned_root_directory, relative_to_owned_root)
+    }
+    .map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an unsafe or unreadable task output path.".to_owned(),
+        )
+    })?;
+    let metadata = opened.metadata().map_err(|_| {
+        BilibiliDownloadError::Failed("BBDown returned an unreadable task output path.".to_owned())
+    })?;
+    let expected_kind_matches = match expected_kind {
+        DownloadReportPathKind::Directory => metadata.is_dir(),
+        DownloadReportPathKind::File => metadata.is_file(),
+    };
+    if !expected_kind_matches {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a task output path with an unexpected file type.".to_owned(),
+        ));
+    }
+    Ok((relative_to_owned_root.to_owned(), opened))
+}
+
+struct PublishedFileValidation {
+    relative_to_owned_root: String,
+    file: File,
+    identity: ValidatedMediaFileIdentity,
+}
+
+struct ReboundMuxValidationPair {
+    original_file: File,
+    rebound_file: File,
+    identity: ValidatedMediaFileIdentity,
+}
+
+async fn verify_rebound_mux_file_identities(
+    published_mux_files: &[ValidatedPublishedMuxFile],
+    rebound_paths: &ValidatedDownloadReportPaths,
+) -> Result<(), BilibiliDownloadError> {
+    let rebound_media_files = rebound_paths
+        .entries
+        .iter()
+        .flat_map(|entry| &entry.media_files)
+        .collect::<Vec<_>>();
+    let pairs = published_mux_files
+        .iter()
+        .map(|published| {
+            let rebound = rebound_media_files
+                .iter()
+                .find(|media| media.path == published.path)
+                .ok_or_else(|| {
+                    BilibiliDownloadError::Failed(
+                        "Published BBDown mux output disappeared during final validation."
+                            .to_owned(),
+                    )
+                })?;
+            Ok(ReboundMuxValidationPair {
+                original_file: published.file.try_clone().map_err(failed)?,
+                rebound_file: rebound.file.try_clone().map_err(failed)?,
+                identity: published.identity,
+            })
+        })
+        .collect::<Result<Vec<_>, BilibiliDownloadError>>()?;
+    tokio::task::spawn_blocking(move || {
+        for pair in pairs {
+            let original =
+                ValidatedMediaFileIdentity::from_metadata(&pair.original_file.metadata()?)?;
+            let rebound =
+                ValidatedMediaFileIdentity::from_metadata(&pair.rebound_file.metadata()?)?;
+            if original != pair.identity
+                || !pair.identity.same_object(rebound)
+                || pair.identity.size_bytes != rebound.size_bytes
+                || pair.identity.mode != rebound.mode
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "BBDown mux output identity changed before final report validation",
+                ));
+            }
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "Bilibili mux identity verification worker failed.".to_owned(),
+        )
+    })?
+    .map_err(failed)
+}
+
+async fn revalidate_download_report_files_after_publication(
+    cache_root: &Path,
+    published_root: &Path,
+    validated_paths: &ValidatedDownloadReportPaths,
+) -> Result<(), BilibiliDownloadError> {
+    let cache_root = cache_root.to_path_buf();
+    let published_relative_path = cache_relative_normal_path(&cache_root, published_root)?;
+    let expected_root = validated_paths.owned_root.try_clone().map_err(failed)?;
+    let files = validated_paths
+        .entries
+        .iter()
+        .flat_map(|entry| entry.media_files.iter().chain(&entry.sidecar_files))
+        .map(|file| {
+            Ok(PublishedFileValidation {
+                relative_to_owned_root: file.relative_to_owned_root.clone(),
+                file: file.file.try_clone()?,
+                identity: file.identity,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(failed)?;
+    tokio::task::spawn_blocking(move || {
+        revalidate_download_report_files_after_publication_blocking(
+            &cache_root,
+            &published_relative_path,
+            &expected_root,
+            &files,
+        )
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "Bilibili published-output validation worker failed.".to_owned(),
+        )
+    })?
+    .map_err(failed)
+}
+
+#[cfg(unix)]
+fn revalidate_download_report_files_after_publication_blocking(
+    cache_root: &Path,
+    published_relative_path: &str,
+    expected_root: &File,
+    files: &[PublishedFileValidation],
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let published_root = open_read_no_follow(cache_root, published_relative_path)?;
+    let expected_root_metadata = expected_root.metadata()?;
+    let published_root_metadata = published_root.metadata()?;
+    if !expected_root_metadata.file_type().is_dir()
+        || !published_root_metadata.file_type().is_dir()
+        || expected_root_metadata.dev() != published_root_metadata.dev()
+        || expected_root_metadata.ino() != published_root_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "published BBDown candidate directory no longer identifies the validated object",
+        ));
+    }
+
+    for validated in files {
+        // The protected property is the regular-file object identity together with the validated
+        // byte length and access policy. Device/inode detect replacement, while size and mode
+        // detect mutation relevant to publication. Timestamps and directory child churn are not
+        // part of that property and are intentionally ignored.
+        let held_identity = ValidatedMediaFileIdentity::from_metadata(&validated.file.metadata()?)?;
+        if held_identity != validated.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "descriptor-bound BBDown output changed before publication",
+            ));
+        }
+        let published_file =
+            open_read_no_follow_at(&published_root, &validated.relative_to_owned_root)?;
+        let published_identity =
+            ValidatedMediaFileIdentity::from_metadata(&published_file.metadata()?)?;
+        if !validated.identity.same_object(published_identity)
+            || validated.identity.size_bytes != published_identity.size_bytes
+            || validated.identity.mode != published_identity.mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "published BBDown output no longer identifies the validated object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn revalidate_download_report_files_after_publication_blocking(
+    _cache_root: &Path,
+    _published_relative_path: &str,
+    _expected_root: &File,
+    _files: &[PublishedFileValidation],
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure BBDown publication validation is not implemented on this platform",
+    ))
+}
+
+fn remap_download_report_root(
+    mut report: DownloadReport,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<DownloadReport, BilibiliDownloadError> {
+    report.output_dir =
+        remap_download_output_path(&report.output_dir, staging_root, published_root)?;
+    for entry in &mut report.entries {
+        entry.directory =
+            remap_download_output_path(&entry.directory, staging_root, published_root)?;
+        for file in &mut entry.files {
+            file.path = remap_download_output_path(&file.path, staging_root, published_root)?;
+        }
+        if let Some(mux) = entry.mux.as_mut() {
+            mux.output_path =
+                remap_download_output_path(&mux.output_path, staging_root, published_root)?;
+        }
+    }
+    Ok(report)
+}
+
+fn remap_download_output_path(
+    path: &Path,
+    staging_root: &Path,
+    published_root: &Path,
+) -> Result<PathBuf, BilibiliDownloadError> {
+    let relative = path.strip_prefix(staging_root).map_err(|_| {
+        BilibiliDownloadError::Failed(
+            "BBDown returned an output path outside its task-owned staging directory.".to_owned(),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown returned a noncanonical task output path.".to_owned(),
+        ));
+    }
+    Ok(published_root.join(relative))
+}
+
+struct MappedV2DownloadResult {
+    result: TaskResult,
+    library_item_id: String,
+    resources: Vec<TaskResourceRecord>,
+    resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_lease: Option<LibraryItemPublicationLease>,
+    transient_output_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct RetainedV2DownloadBacking {
+    resources: Vec<TaskResourceRecord>,
+    resource_bodies: Vec<BilibiliTaskResourceBody>,
+    library_item_leases: Vec<LibraryItemPublicationLease>,
+    transient_output_paths: Vec<PathBuf>,
+}
+
+struct MappedV2Artifact {
+    artifact: TaskArtifact,
+    resource: TaskResourceRecord,
+    body: BilibiliTaskResourceBody,
+}
+
+fn retain_v2_success(
+    mapped: MappedV2DownloadResult,
+    primary_library_item_id: &mut String,
+    successful_results: &mut usize,
+    results: &mut Vec<TaskResult>,
+    retained_backing: &mut RetainedV2DownloadBacking,
+) {
+    if primary_library_item_id.is_empty() && !mapped.library_item_id.is_empty() {
+        *primary_library_item_id = mapped.library_item_id.clone();
+    }
+    *successful_results = successful_results.saturating_add(1);
+    retained_backing.resources.extend(mapped.resources);
+    retained_backing
+        .resource_bodies
+        .extend(mapped.resource_bodies);
+    retained_backing
+        .library_item_leases
+        .extend(mapped.library_item_lease);
+    retained_backing
+        .transient_output_paths
+        .extend(mapped.transient_output_paths);
+    results.push(mapped.result);
+}
+
+fn log_v2_candidate_error(
+    task_id: &str,
+    result_id: &str,
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) {
+    let detail = v2_candidate_error_detail_for_log(credentials_configured, error);
+    eprintln!("Bilibili v2 task {task_id} candidate {result_id} failed: {detail}");
+}
+
+fn v2_candidate_error_detail_for_log(
+    credentials_configured: bool,
+    error: &BilibiliDownloadError,
+) -> String {
+    let raw_detail = download_error_detail(error);
+    crate::error_detail_for_log(credentials_configured, &raw_detail)
+}
+
+fn report_v2_candidate_finished(
+    context: &BilibiliDownloadContext,
+    offset: usize,
+    total: usize,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+) {
+    context.report_progress(BilibiliTaskProgress {
+        progress: Some(v2_candidate_progress(offset, total, 1.0)),
+        downloaded_bytes: Some(to_i64_saturating(downloaded_bytes)),
+        total_bytes: Some(to_i64_saturating(total_bytes.max(downloaded_bytes))),
+        message: Some(format!(
+            "Finished Bilibili download {}/{}.",
+            offset + 1,
+            total
+        )),
+    });
+}
+
+fn bilibili_v2_result_id(task_id: &str, offset: usize) -> String {
+    if offset == 0 {
+        task_id.to_owned()
+    } else {
+        format!("{task_id}-result-{}", offset + 1)
+    }
+}
+
+fn v2_candidate_progress(offset: usize, total: usize, candidate_progress: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    ((offset as f64) + candidate_progress.clamp(0.0, 1.0)) / total as f64
+}
+
+fn download_entry_matches_candidate(
+    entry: &bbdown_core::DownloadEntry,
+    candidate: &BilibiliTaskCandidateRecord,
+) -> bool {
+    let identity = &candidate.identity;
+    identity.aid.is_none_or(|aid| aid == entry.aid)
+        && identity.cid.is_none_or(|cid| cid == entry.cid)
+        && identity.epid.is_none_or(|epid| entry.epid == Some(epid))
+        && identity.bvid.as_deref().is_none_or(|bvid| {
+            entry
+                .bvid
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(bvid))
+        })
+}
+
+fn playable_entry_output_candidates(entry: &EntryDownloadReport) -> Vec<PathBuf> {
+    let mut candidates = entry
+        .mux
+        .iter()
+        .map(|mux| mux.output_path.clone())
+        .collect::<Vec<_>>();
+    candidates.extend(
+        entry
+            .files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    &file.kind,
+                    DownloadFileKind::Video
+                        | DownloadFileKind::Audio
+                        | DownloadFileKind::FlvSegment
+                )
+            })
+            .map(|file| file.path.clone()),
+    );
+    candidates
+}
+
+fn download_report_output_paths(report: &DownloadReport) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &report.entries {
+        for path in entry
+            .mux
+            .iter()
+            .map(|mux| &mux.output_path)
+            .chain(entry.files.iter().map(|file| &file.path))
+        {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
+fn transient_download_output_paths(
+    output_paths: &[PathBuf],
+    library_output_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    output_paths
+        .iter()
+        .filter(|path| Some(path.as_path()) != library_output_path)
+        .cloned()
+        .collect()
+}
+
+fn successful_download_result(
+    id: String,
+    candidate: &BilibiliTaskCandidateRecord,
+    library_item_id: String,
+    artifacts: Vec<TaskArtifact>,
+    total_bytes: u64,
+) -> TaskResult {
+    TaskResult {
+        id,
+        state: TaskState::Succeeded.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 1.0,
+            completed_bytes: to_i64_saturating(total_bytes),
+            total_bytes: to_i64_saturating(total_bytes),
+            total_bytes_known: true,
+            phase: "completed".to_owned(),
+            message: "Downloaded into the LAN cache.".to_owned(),
+        }),
+        problem: None,
+        library_item_id,
+        playback_source: None,
+        artifacts,
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn failed_download_result(
+    id: String,
+    candidate: &BilibiliTaskCandidateRecord,
+    error: &BilibiliDownloadError,
+) -> TaskResult {
+    let (category, code, message, retryable) = match error {
+        BilibiliDownloadError::ResourceExhausted(_) => (
+            TaskProblemCategory::ResourceLimit,
+            "bilibili.resource_limit",
+            "The Bilibili download exceeded a server resource limit.",
+            true,
+        ),
+        BilibiliDownloadError::Cancelled(_) => (
+            TaskProblemCategory::Cancelled,
+            "task.cancelled",
+            "Cancelled by request.",
+            false,
+        ),
+        BilibiliDownloadError::Failed(_) => (
+            TaskProblemCategory::Upstream,
+            "bilibili.download_failed",
+            "The Bilibili download failed.",
+            true,
+        ),
+    };
+    TaskResult {
+        id,
+        state: TaskState::Failed.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 0.0,
+            completed_bytes: 0,
+            total_bytes: 0,
+            total_bytes_known: false,
+            phase: "failed".to_owned(),
+            message: "Bilibili download failed.".to_owned(),
+        }),
+        problem: Some(TaskProblem {
+            category: category.into(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            retryable,
+        }),
+        library_item_id: String::new(),
+        playback_source: None,
+        artifacts: Vec::new(),
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn cancelled_download_result(id: String, candidate: &BilibiliTaskCandidateRecord) -> TaskResult {
+    TaskResult {
+        id,
+        state: TaskState::Cancelled.into(),
+        title: candidate.title.clone(),
+        subtitle: candidate.subtitle.clone(),
+        progress: Some(TaskResultProgress {
+            fraction: 0.0,
+            completed_bytes: 0,
+            total_bytes: 0,
+            total_bytes_known: false,
+            phase: "cancelled".to_owned(),
+            message: "Cancelled by request.".to_owned(),
+        }),
+        problem: Some(TaskProblem {
+            category: TaskProblemCategory::Cancelled.into(),
+            code: "task.cancelled".to_owned(),
+            message: "Cancelled by request.".to_owned(),
+            retryable: false,
+        }),
+        library_item_id: String::new(),
+        playback_source: None,
+        artifacts: Vec::new(),
+        created_at: None,
+        updated_at: None,
+        subject: Some(task_result_subject(candidate)),
+        provider_details: Some(task_result_provider_details(candidate)),
+    }
+}
+
+fn task_result_subject(candidate: &BilibiliTaskCandidateRecord) -> TaskResultSubject {
+    TaskResultSubject {
+        provider: "bilibili".to_owned(),
+        kind: candidate.source_kind.clone(),
+        id: candidate.content_id.clone(),
+        index: candidate.index,
+    }
+}
+
+fn task_result_provider_details(
+    candidate: &BilibiliTaskCandidateRecord,
+) -> TaskResultProviderDetails {
+    TaskResultProviderDetails {
+        details: Some(
+            crate::generated::tvos_net_player::v1::task_result_provider_details::Details::Bilibili(
+                BilibiliTaskResultDetails {
+                    identity: Some(proto_candidate_identity(candidate)),
+                    playback_session: None,
+                },
+            ),
+        ),
+    }
+}
+
+fn proto_candidate_identity(
+    candidate: &BilibiliTaskCandidateRecord,
+) -> ProtoBilibiliContentIdentity {
+    use crate::generated::tvos_net_player::v1::BilibiliContentKind as ProtoKind;
+    ProtoBilibiliContentIdentity {
+        kind: match candidate.identity.kind {
+            BilibiliContentKind::VideoPage => ProtoKind::VideoPage.into(),
+            BilibiliContentKind::SeasonEpisode => ProtoKind::SeasonEpisode.into(),
+            BilibiliContentKind::CollectionItem => ProtoKind::CollectionItem.into(),
+        },
+        aid: candidate.identity.aid.unwrap_or_default(),
+        bvid: candidate.identity.bvid.clone().unwrap_or_default(),
+        cid: candidate.identity.cid.unwrap_or_default(),
+        epid: candidate.identity.epid.unwrap_or_default(),
+    }
+}
+
+fn library_media_artifact(library_output_path: &Path, library_item_id: &str) -> TaskArtifact {
+    let format = library_output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "media".to_owned());
+    TaskArtifact {
+        id: new_artifact_id(),
+        kind: TaskArtifactKind::Media.into(),
+        state: TaskArtifactState::Available.into(),
+        title: "Media".to_owned(),
+        format,
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: None,
+        problem: None,
+        library_item_id: library_item_id.to_owned(),
+    }
+}
+
+fn map_sidecar_artifact(
+    file: &bbdown_core::DownloadedFile,
+    index: usize,
+    publication_validation: Option<V2PublishedOutputValidation<'_>>,
+) -> Result<MappedV2Artifact, BilibiliDownloadError> {
+    let validation = publication_validation.ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "BBDown sidecar output requires descriptor-bound publication validation.".to_owned(),
+        )
+    })?;
+    if validation.validated_paths.entries.len() != 1 {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown sidecar output does not match one result entry.".to_owned(),
+        ));
+    }
+    let relative_path = cache_relative_normal_path(validation.published_root, &file.path)?;
+    let validated = validation.validated_paths.entries[0]
+        .sidecar_files
+        .iter()
+        .find(|validated| validated.relative_to_owned_root == relative_path)
+        .ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "BBDown sidecar output was not retained by publication validation.".to_owned(),
+            )
+        })?;
+    let identity = BilibiliTaskResourceCacheFileIdentity {
+        device_id: validated.identity.device_id,
+        inode: validated.identity.inode,
+        size_bytes: validated.identity.size_bytes,
+        mode: validated.identity.mode,
+    };
+    let source =
+        BilibiliTaskResourceCacheFile::new(validated.file.try_clone().map_err(failed)?, identity)
+            .map_err(failed)?;
+    let (kind, title, format, content_type) = sidecar_description(&file.kind, &file.path, index);
+    let resource_id = new_resource_id();
+    let resource = task_resource_record(&resource_id, content_type, identity.size_bytes)?;
+    let artifact = TaskArtifact {
+        id: new_artifact_id(),
+        kind: kind.into(),
+        state: TaskArtifactState::Available.into(),
+        title,
+        format,
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: Some(resource.resource.clone()),
+        problem: None,
+        library_item_id: String::new(),
+    };
+    Ok(MappedV2Artifact {
+        artifact,
+        resource,
+        body: BilibiliTaskResourceBody {
+            resource_id,
+            source: BilibiliTaskResourceBodySource::CacheFile(source),
+        },
+    })
+}
+
+fn map_generated_artifact(
+    kind: TaskArtifactKind,
+    title: &str,
+    format: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<MappedV2Artifact, BilibiliDownloadError> {
+    let resource_id = new_resource_id();
+    let size = u64::try_from(body.len()).map_err(failed)?;
+    let resource = task_resource_record(&resource_id, content_type, size)?;
+    let artifact = TaskArtifact {
+        id: new_artifact_id(),
+        kind: kind.into(),
+        state: TaskArtifactState::Available.into(),
+        title: title.to_owned(),
+        format: format.to_owned(),
+        language_tag: String::new(),
+        is_ai_generated: false,
+        resource: Some(resource.resource.clone()),
+        problem: None,
+        library_item_id: String::new(),
+    };
+    Ok(MappedV2Artifact {
+        artifact,
+        resource,
+        body: BilibiliTaskResourceBody {
+            resource_id,
+            source: BilibiliTaskResourceBodySource::Bytes(body),
+        },
+    })
+}
+
+fn task_resource_record(
+    id: &str,
+    content_type: &str,
+    size: u64,
+) -> Result<TaskResourceRecord, BilibiliDownloadError> {
+    let size_bytes = i64::try_from(size).map_err(|_| {
+        BilibiliDownloadError::ResourceExhausted(
+            "Bilibili artifact is too large to publish.".to_owned(),
+        )
+    })?;
+    TaskResourceRecord::new(CacheResourceRef {
+        id: id.to_owned(),
+        uri: String::new(),
+        content_type: content_type.to_owned(),
+        size_bytes,
+        size_known: true,
+        supports_byte_ranges: true,
+        etag: format!("\"{id}\""),
+        expires_at: None,
+    })
+    .map_err(failed)
+}
+
+fn sidecar_description(
+    kind: &DownloadFileKind,
+    path: &Path,
+    index: usize,
+) -> (TaskArtifactKind, String, String, &'static str) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(|| "bin".to_owned());
+    match kind {
+        DownloadFileKind::Cover => (
+            TaskArtifactKind::CoverImage,
+            "Cover".to_owned(),
+            extension.clone(),
+            image_content_type(&extension),
+        ),
+        DownloadFileKind::Subtitle => (
+            TaskArtifactKind::Subtitle,
+            format!("Subtitle {}", index + 1),
+            extension.clone(),
+            text_content_type(&extension),
+        ),
+        DownloadFileKind::Danmaku => (
+            TaskArtifactKind::TimedComments,
+            "Danmaku XML".to_owned(),
+            "xml".to_owned(),
+            "application/xml",
+        ),
+        DownloadFileKind::DanmakuAss => (
+            TaskArtifactKind::TimedComments,
+            "Danmaku ASS".to_owned(),
+            "ass".to_owned(),
+            "text/x-ass; charset=utf-8",
+        ),
+        _ => (
+            TaskArtifactKind::Other,
+            format!("Artifact {}", index + 1),
+            extension,
+            "application/octet-stream",
+        ),
+    }
+}
+
+fn image_content_type(extension: &str) -> &'static str {
+    match extension {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn text_content_type(extension: &str) -> &'static str {
+    match extension {
+        "json" => "application/json",
+        "ass" => "text/x-ass; charset=utf-8",
+        "srt" => "application/x-subrip; charset=utf-8",
+        "vtt" => "text/vtt; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn new_resource_id() -> String {
+    format!("task-resource-{}", Uuid::new_v4().simple())
+}
+
+fn new_artifact_id() -> String {
+    format!("task-artifact-{}", Uuid::new_v4().simple())
+}
+
+fn download_error_detail(error: &BilibiliDownloadError) -> &str {
+    match error {
+        BilibiliDownloadError::Failed(message)
+        | BilibiliDownloadError::ResourceExhausted(message)
+        | BilibiliDownloadError::Cancelled(message) => message,
+    }
+}
+
+fn download_mode_requires_media(mode: DownloadMode) -> bool {
+    matches!(
+        mode,
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly
+    )
+}
+
+fn sidecar_only_required_artifact_kind(mode: DownloadMode) -> Option<TaskArtifactKind> {
+    match mode {
+        DownloadMode::SubtitleOnly => Some(TaskArtifactKind::Subtitle),
+        DownloadMode::DanmakuOnly => Some(TaskArtifactKind::TimedComments),
+        DownloadMode::CoverOnly => Some(TaskArtifactKind::CoverImage),
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly | _ => None,
+    }
+}
+
+fn validate_legacy_download_mode(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<(), BilibiliDownloadError> {
+    let mode = download_mode_from_options(options)?;
+    if sidecar_only_required_artifact_kind(mode).is_some() {
+        return Err(BilibiliDownloadError::Failed(
+            "Sidecar-only Bilibili download modes require the v2 task API.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn download_mode_from_options(
+    options: Option<&BilibiliDownloadOptions>,
+) -> Result<DownloadMode, BilibiliDownloadError> {
+    let mode = options
+        .map(|options| BilibiliDownloadMode::try_from(options.download_mode))
+        .transpose()
+        .map_err(|_| {
+            BilibiliDownloadError::Failed(
+                "Bilibili download mode is unknown to this cache server.".to_owned(),
+            )
+        })?
+        .unwrap_or(BilibiliDownloadMode::Unspecified);
+    Ok(match mode {
+        BilibiliDownloadMode::Unspecified | BilibiliDownloadMode::All => DownloadMode::All,
+        BilibiliDownloadMode::VideoOnly => DownloadMode::VideoOnly,
+        BilibiliDownloadMode::AudioOnly => DownloadMode::AudioOnly,
+        BilibiliDownloadMode::SubtitleOnly => DownloadMode::SubtitleOnly,
+        BilibiliDownloadMode::DanmakuOnly => DownloadMode::DanmakuOnly,
+        BilibiliDownloadMode::CoverOnly => DownloadMode::CoverOnly,
+    })
+}
+
 fn normalized_preference_token(value: &str) -> String {
     value
         .trim()
@@ -2904,10 +5438,12 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     }
     for entry in &report.entries {
         for file in &entry.files {
-            if matches!(
+            let playable = matches!(
                 &file.kind,
                 DownloadFileKind::Video | DownloadFileKind::FlvSegment
-            ) {
+            ) || (entry.mux.is_none()
+                && matches!(&file.kind, DownloadFileKind::Audio));
+            if playable {
                 candidates.push(file.path.clone());
             }
         }
@@ -2915,6 +5451,115 @@ fn playable_output_candidates(report: &DownloadReport) -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(test)]
+async fn prepare_download_report_for_playback<F>(
+    mut report: DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+) -> Result<DownloadReport, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    let owned_root = report.output_dir.clone();
+    let cache_root = owned_root.parent().ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Test download output directory must have a cache parent.".to_owned(),
+        )
+    })?;
+    let validated_paths =
+        validate_download_report_paths_no_follow(cache_root, &owned_root, &report).await?;
+    prepare_download_report_for_playback_in_place(
+        &mut report,
+        mode,
+        ffmpeg_path,
+        is_cancel_requested,
+        &validated_paths,
+    )
+    .await?;
+    Ok(report)
+}
+
+#[cfg(test)]
+async fn prepare_owned_download_report_for_playback_in_place<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    cache_root: &Path,
+    owned_root: &Path,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    prepare_owned_download_report_for_playback_in_place_with_descriptor_budget(
+        report,
+        mode,
+        ffmpeg_path,
+        is_cancel_requested,
+        cache_root,
+        owned_root,
+        bilibili_v2_retained_descriptor_budget(),
+    )
+    .await
+}
+
+async fn prepare_owned_download_report_for_playback_in_place_with_descriptor_budget<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    cache_root: &Path,
+    owned_root: &Path,
+    max_retained_descriptors: usize,
+) -> Result<ValidatedDownloadReportPaths, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    let validated_paths = validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        max_retained_descriptors,
+    )
+    .await?;
+    let published_mux_files = prepare_download_report_for_playback_in_place(
+        report,
+        mode,
+        ffmpeg_path,
+        is_cancel_requested,
+        &validated_paths,
+    )
+    .await?;
+    drop(validated_paths);
+    let rebound = validate_download_report_paths_no_follow_with_descriptor_budget(
+        cache_root,
+        owned_root,
+        report,
+        max_retained_descriptors,
+    )
+    .await?;
+    verify_rebound_mux_file_identities(&published_mux_files, &rebound).await?;
+    Ok(rebound)
+}
+
+async fn prepare_download_report_for_playback_in_place<F>(
+    report: &mut DownloadReport,
+    mode: DownloadMode,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    validated_paths: &ValidatedDownloadReportPaths,
+) -> Result<Vec<ValidatedPublishedMuxFile>, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    if mode == DownloadMode::AudioOnly {
+        return existing_validated_mux_files(report, validated_paths);
+    }
+    mux_download_report_in_place(report, ffmpeg_path, is_cancel_requested, validated_paths).await
+}
+
+#[cfg(test)]
 async fn mux_download_report<F>(
     mut report: DownloadReport,
     ffmpeg_path: &Path,
@@ -2923,8 +5568,45 @@ async fn mux_download_report<F>(
 where
     F: Fn() -> bool,
 {
-    for entry in &mut report.entries {
-        if entry.mux.is_some() {
+    let owned_root = report.output_dir.clone();
+    let cache_root = owned_root.parent().ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Test download output directory must have a cache parent.".to_owned(),
+        )
+    })?;
+    let validated_paths =
+        validate_download_report_paths_no_follow(cache_root, &owned_root, &report).await?;
+    mux_download_report_in_place(
+        &mut report,
+        ffmpeg_path,
+        is_cancel_requested,
+        &validated_paths,
+    )
+    .await?;
+    Ok(report)
+}
+
+async fn mux_download_report_in_place<F>(
+    report: &mut DownloadReport,
+    ffmpeg_path: &Path,
+    is_cancel_requested: &F,
+    validated_paths: &ValidatedDownloadReportPaths,
+) -> Result<Vec<ValidatedPublishedMuxFile>, BilibiliDownloadError>
+where
+    F: Fn() -> bool,
+{
+    if report.entries.len() != validated_paths.entries.len() {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown entry set changed before muxing.".to_owned(),
+        ));
+    }
+    let mut published_mux_files = Vec::new();
+    for (entry, validated_entry) in report.entries.iter_mut().zip(&validated_paths.entries) {
+        if let Some(mux) = entry.mux.as_ref() {
+            published_mux_files.push(validated_mux_file_for_path(
+                validated_entry,
+                &mux.output_path,
+            )?);
             continue;
         }
         if is_cancel_requested() {
@@ -2932,51 +5614,616 @@ where
                 "Cancelled before BBDown muxing started.".to_owned(),
             ));
         }
-        if let Some(mux) = mux_entry_media(entry, ffmpeg_path, is_cancel_requested).await? {
-            entry.mux = Some(mux);
+        if let Some(outcome) = mux_entry_media(
+            entry,
+            validated_entry,
+            &validated_paths.owned_root,
+            ffmpeg_path,
+            is_cancel_requested,
+        )
+        .await?
+        {
+            published_mux_files.push(outcome.published_output);
+            entry
+                .files
+                .retain(|file| !outcome.unavailable_source_paths.contains(&file.path));
+            entry.mux = Some(outcome.report);
         }
     }
-    Ok(report)
+    Ok(published_mux_files)
+}
+
+fn existing_validated_mux_files(
+    report: &DownloadReport,
+    validated_paths: &ValidatedDownloadReportPaths,
+) -> Result<Vec<ValidatedPublishedMuxFile>, BilibiliDownloadError> {
+    if report.entries.len() != validated_paths.entries.len() {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown entry set changed before mux publication.".to_owned(),
+        ));
+    }
+    report
+        .entries
+        .iter()
+        .zip(&validated_paths.entries)
+        .filter_map(|(entry, validated_entry)| {
+            entry
+                .mux
+                .as_ref()
+                .map(|mux| validated_mux_file_for_path(validated_entry, &mux.output_path))
+        })
+        .collect()
+}
+
+fn validated_mux_file_for_path(
+    validated_entry: &ValidatedDownloadEntryPaths,
+    output_path: &Path,
+) -> Result<ValidatedPublishedMuxFile, BilibiliDownloadError> {
+    let validated = validated_entry
+        .media_files
+        .iter()
+        .find(|media| media.path == output_path)
+        .ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "Validated BBDown mux output descriptor is missing.".to_owned(),
+            )
+        })?;
+    Ok(ValidatedPublishedMuxFile {
+        path: output_path.to_path_buf(),
+        file: validated.file.try_clone().map_err(failed)?,
+        identity: validated.identity,
+    })
+}
+
+const FFMPEG_CONCAT_MANIFEST_NAME: &str = "cache-server-ffmpeg-concat.txt";
+
+struct BoundMuxFile {
+    leaf: OsString,
+    file: File,
+}
+
+struct PreparedMuxFiles {
+    manifest: Option<BoundMuxFile>,
+    output: BoundMuxFile,
+    output_leaf: OsString,
+}
+
+struct MuxEntryOutcome {
+    report: MuxReport,
+    unavailable_source_paths: HashSet<PathBuf>,
+    published_output: ValidatedPublishedMuxFile,
+}
+
+struct ValidatedPublishedMuxFile {
+    path: PathBuf,
+    file: File,
+    identity: ValidatedMediaFileIdentity,
+}
+
+fn direct_entry_leaf(
+    entry_directory: &Path,
+    path: &Path,
+) -> Result<OsString, BilibiliDownloadError> {
+    if path.parent() != Some(entry_directory) {
+        return Err(BilibiliDownloadError::Failed(
+            "BBDown mux output is not a direct child of its validated entry directory.".to_owned(),
+        ));
+    }
+    path.file_name().map(OsStr::to_os_string).ok_or_else(|| {
+        BilibiliDownloadError::Failed("BBDown mux output has no file name.".to_owned())
+    })
+}
+
+async fn prepare_mux_files(
+    entry_directory: &File,
+    output_leaf: OsString,
+    mux_output_leaf: OsString,
+    concat_manifest: Option<String>,
+) -> Result<PreparedMuxFiles, BilibiliDownloadError> {
+    let entry_directory = entry_directory.try_clone().map_err(failed)?;
+    tokio::task::spawn_blocking(move || {
+        prepare_mux_files_blocking(
+            &entry_directory,
+            output_leaf,
+            mux_output_leaf,
+            concat_manifest,
+        )
+    })
+    .await
+    .map_err(|_| BilibiliDownloadError::Failed("BBDown mux setup worker failed.".to_owned()))?
+    .map_err(failed)
+}
+
+#[cfg(unix)]
+fn prepare_mux_files_blocking(
+    entry_directory: &File,
+    output_leaf: OsString,
+    mux_output_leaf: OsString,
+    concat_manifest: Option<String>,
+) -> io::Result<PreparedMuxFiles> {
+    remove_stale_regular_entry_file(entry_directory, &mux_output_leaf)?;
+    if concat_manifest.is_some() {
+        remove_stale_regular_entry_file(entry_directory, OsStr::new(FFMPEG_CONCAT_MANIFEST_NAME))?;
+    }
+    remove_stale_regular_entry_file(entry_directory, &output_leaf)?;
+
+    let manifest = if let Some(contents) = concat_manifest {
+        let leaf = OsString::from(FFMPEG_CONCAT_MANIFEST_NAME);
+        let mut file = create_entry_file_exclusive(entry_directory, &leaf)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        Some(BoundMuxFile { leaf, file })
+    } else {
+        None
+    };
+    let output = match create_entry_file_exclusive(entry_directory, &mux_output_leaf) {
+        Ok(file) => BoundMuxFile {
+            leaf: mux_output_leaf,
+            file,
+        },
+        Err(error) => {
+            if let Some(manifest) = manifest.as_ref() {
+                let _ = remove_bound_mux_file_blocking(entry_directory, manifest);
+            }
+            return Err(error);
+        }
+    };
+    entry_directory.sync_all()?;
+    Ok(PreparedMuxFiles {
+        manifest,
+        output,
+        output_leaf,
+    })
+}
+
+#[cfg(not(unix))]
+fn prepare_mux_files_blocking(
+    _entry_directory: &File,
+    _output_leaf: OsString,
+    _mux_output_leaf: OsString,
+    _concat_manifest: Option<String>,
+) -> io::Result<PreparedMuxFiles> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-bound mux files are not implemented on this platform",
+    ))
+}
+
+async fn bound_file_metadata(file: &File) -> io::Result<std::fs::Metadata> {
+    let file = file.try_clone()?;
+    tokio::task::spawn_blocking(move || file.metadata())
+        .await
+        .map_err(|_| io::Error::other("BBDown mux metadata worker failed"))?
+}
+
+async fn remove_bound_mux_file(
+    entry_directory: &File,
+    bound_file: &BoundMuxFile,
+) -> Result<bool, BilibiliDownloadError> {
+    let entry_directory = entry_directory.try_clone().map_err(failed)?;
+    let file = bound_file.file.try_clone().map_err(failed)?;
+    let leaf = bound_file.leaf.clone();
+    tokio::task::spawn_blocking(move || {
+        remove_bound_mux_file_blocking(&entry_directory, &BoundMuxFile { leaf, file })
+    })
+    .await
+    .map_err(|_| BilibiliDownloadError::Failed("BBDown mux cleanup worker failed.".to_owned()))?
+    .map_err(failed)
+}
+
+async fn publish_bound_mux_file(
+    entry_directory: &File,
+    bound_file: &BoundMuxFile,
+    output_leaf: &OsStr,
+) -> io::Result<()> {
+    let entry_directory = entry_directory.try_clone()?;
+    let file = bound_file.file.try_clone()?;
+    let source_leaf = bound_file.leaf.clone();
+    let output_leaf = output_leaf.to_os_string();
+    tokio::task::spawn_blocking(move || {
+        publish_bound_mux_file_blocking(
+            &entry_directory,
+            &BoundMuxFile {
+                leaf: source_leaf,
+                file,
+            },
+            &output_leaf,
+        )
+    })
+    .await
+    .map_err(|_| io::Error::other("BBDown mux publication worker failed"))?
+}
+
+#[cfg(unix)]
+fn entry_leaf_cstring(leaf: &OsStr) -> io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut components = Path::new(leaf).components();
+    let Some(std::path::Component::Normal(component)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mux file name is not a normal path component",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mux file name contains multiple path components",
+        ));
+    }
+    CString::new(component.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mux file name contains NUL"))
+}
+
+#[cfg(unix)]
+fn open_entry_file_no_follow(entry_directory: &File, leaf: &OsStr) -> io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let leaf = entry_leaf_cstring(leaf)?;
+    // SAFETY: the directory descriptor is live and leaf is a NUL-terminated direct child name.
+    let descriptor = unsafe {
+        libc::openat(
+            entry_directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: openat returned a new owned descriptor.
+        return Ok(Some(unsafe { File::from_raw_fd(descriptor) }));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(None)
+    } else if error.raw_os_error() == Some(libc::ELOOP) {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux file name resolves to a symbolic link",
+        ))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn remove_stale_regular_entry_file(entry_directory: &File, leaf: &OsStr) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let Some(existing) = open_entry_file_no_follow(entry_directory, leaf)? else {
+        return Ok(false);
+    };
+    if !existing.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux file name is occupied by a non-regular file",
+        ));
+    }
+    let leaf = entry_leaf_cstring(leaf)?;
+    // The owned entry directory grants cleanup ownership of this logical name. unlinkat removes
+    // only that direct child and never follows a replacement symlink; the old child content
+    // identity is therefore intentionally not protected.
+    // SAFETY: the directory descriptor is live and leaf is NUL-terminated.
+    if unsafe { libc::unlinkat(entry_directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    entry_directory.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn create_entry_file_exclusive(entry_directory: &File, leaf: &OsStr) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let leaf = entry_leaf_cstring(leaf)?;
+    // SAFETY: the directory descriptor is live, leaf is NUL-terminated, and successful openat
+    // returns a new descriptor owned by this function.
+    let descriptor = unsafe {
+        libc::openat(
+            entry_directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn bound_file_name_matches(entry_directory: &File, bound_file: &BoundMuxFile) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Publication protects the temporary file's object identity, so device/inode are the
+    // relevant signals. Content and benign metadata transitions are not compared: ffmpeg is
+    // expected to mutate size and timestamps through the already-bound descriptor. Opening the
+    // name with O_NOFOLLOW separately protects the access policy against symlink replacement.
+    let Some(named_file) = open_entry_file_no_follow(entry_directory, &bound_file.leaf)? else {
+        return Ok(false);
+    };
+    let named_metadata = named_file.metadata()?;
+    let bound_metadata = bound_file.file.metadata()?;
+    Ok(
+        named_metadata.dev() == bound_metadata.dev()
+            && named_metadata.ino() == bound_metadata.ino(),
+    )
+}
+
+#[cfg(unix)]
+fn remove_bound_mux_file_blocking(
+    entry_directory: &File,
+    bound_file: &BoundMuxFile,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    if !bound_file_name_matches(entry_directory, bound_file)? {
+        if open_entry_file_no_follow(entry_directory, &bound_file.leaf)?.is_none() {
+            return Ok(false);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux file name no longer identifies the descriptor-bound file",
+        ));
+    }
+    let leaf = entry_leaf_cstring(&bound_file.leaf)?;
+    // SAFETY: the directory descriptor is live and leaf is NUL-terminated.
+    if unsafe { libc::unlinkat(entry_directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    entry_directory.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn remove_bound_mux_file_blocking(
+    _entry_directory: &File,
+    _bound_file: &BoundMuxFile,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-bound mux cleanup is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn publish_bound_mux_file_blocking(
+    entry_directory: &File,
+    bound_file: &BoundMuxFile,
+    output_leaf: &OsStr,
+) -> io::Result<()> {
+    publish_bound_mux_file_blocking_with_hook(entry_directory, bound_file, output_leaf, || {})
+}
+
+#[cfg(unix)]
+fn publish_bound_mux_file_blocking_with_hook(
+    entry_directory: &File,
+    bound_file: &BoundMuxFile,
+    output_leaf: &OsStr,
+    before_rename: impl FnOnce(),
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if !bound_file_name_matches(entry_directory, bound_file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux temporary file was replaced before publication",
+        ));
+    }
+    before_rename();
+    let source_leaf = entry_leaf_cstring(&bound_file.leaf)?;
+    let published_leaf = output_leaf.to_os_string();
+    let output_leaf = entry_leaf_cstring(output_leaf)?;
+    rename_entry_file_no_replace(entry_directory.as_raw_fd(), &source_leaf, &output_leaf)?;
+    let published_binding = BoundMuxFile {
+        leaf: published_leaf,
+        file: bound_file.file.try_clone()?,
+    };
+    if !bound_file_name_matches(entry_directory, &published_binding)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux output name did not publish the descriptor-bound file",
+        ));
+    }
+    entry_directory.sync_all()?;
+    if !bound_file_name_matches(entry_directory, &published_binding)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mux output name changed before publication completed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_bound_mux_file_blocking(
+    _entry_directory: &File,
+    _bound_file: &BoundMuxFile,
+    _output_leaf: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure descriptor-bound mux publication is not implemented on this platform",
+    ))
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn rename_entry_file_no_replace(
+    directory_fd: i32,
+    source_leaf: &CString,
+    output_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: the descriptor is live and both names are NUL-terminated direct children.
+    let result = unsafe {
+        libc::renameatx_np(
+            directory_fd,
+            source_leaf.as_ptr(),
+            directory_fd,
+            output_leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn rename_entry_file_no_replace(
+    directory_fd: i32,
+    source_leaf: &CString,
+    output_leaf: &CString,
+) -> io::Result<()> {
+    // SAFETY: the descriptor is live and both names are NUL-terminated direct children.
+    let result = unsafe {
+        libc::renameat2(
+            directory_fd,
+            source_leaf.as_ptr(),
+            directory_fd,
+            output_leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux"))))]
+fn rename_entry_file_no_replace(
+    _directory_fd: i32,
+    _source_leaf: &CString,
+    _output_leaf: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace mux publication is not implemented on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn ffmpeg_file_argument(file: &File) -> Result<OsString, BilibiliDownloadError> {
+    use std::os::fd::AsRawFd;
+
+    Ok(OsString::from(format!("/dev/fd/{}", file.as_raw_fd())))
+}
+
+#[cfg(not(unix))]
+fn ffmpeg_file_argument(_file: &File) -> Result<OsString, BilibiliDownloadError> {
+    Err(BilibiliDownloadError::Failed(
+        "Descriptor-bound ffmpeg input is not implemented on this platform.".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn configure_inherited_ffmpeg_files(
+    command: &mut Command,
+    inherited_files: &[&File],
+) -> Result<(), BilibiliDownloadError> {
+    use std::os::fd::AsRawFd;
+
+    let inherited_descriptors = inherited_files
+        .iter()
+        .map(|file| file.as_raw_fd())
+        .collect::<Vec<_>>();
+    // SAFETY: the closure performs only async-signal-safe fcntl operations between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in &inherited_descriptors {
+                let flags = libc::fcntl(*descriptor, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_inherited_ffmpeg_files(
+    _command: &mut Command,
+    _inherited_files: &[&File],
+) -> Result<(), BilibiliDownloadError> {
+    Err(BilibiliDownloadError::Failed(
+        "Descriptor inheritance for ffmpeg is not implemented on this platform.".to_owned(),
+    ))
 }
 
 async fn mux_entry_media<F>(
     entry: &EntryDownloadReport,
+    validated_entry: &ValidatedDownloadEntryPaths,
+    owned_root: &File,
     ffmpeg_path: &Path,
     is_cancel_requested: &F,
-) -> Result<Option<MuxReport>, BilibiliDownloadError>
+) -> Result<Option<MuxEntryOutcome>, BilibiliDownloadError>
 where
     F: Fn() -> bool,
 {
-    let media_files = mux_source_files(entry);
-    if media_files.is_empty() {
+    let media_file_count = entry
+        .files
+        .iter()
+        .filter(|file| is_media_kind(&file.kind))
+        .count();
+    if media_file_count == 0 {
         return Ok(None);
     }
+    if media_file_count != validated_entry.media_files.len() {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown media set changed before muxing.".to_owned(),
+        ));
+    }
 
-    fs::create_dir_all(&entry.directory).await.map_err(failed)?;
     let output_path = playback_output_path(entry);
     let mux_output_path = temporary_mux_output_path(&output_path);
-    remove_file_if_exists(&mux_output_path).await?;
+    let output_leaf = direct_entry_leaf(&entry.directory, &output_path)?;
+    let mux_output_leaf = direct_entry_leaf(&entry.directory, &mux_output_path)?;
+    let source_arguments = validated_entry
+        .media_files
+        .iter()
+        .map(|source| ffmpeg_file_argument(&source.file))
+        .collect::<Result<Vec<_>, _>>()?;
+    let concat_manifest = only_flv_segments(entry).then(|| concat_file_list(&source_arguments));
+    let prepared = prepare_mux_files(
+        &validated_entry.directory,
+        output_leaf,
+        mux_output_leaf,
+        concat_manifest,
+    )
+    .await?;
 
     let mut args = Vec::new();
     args.push(OsString::from("-y"));
     args.push(OsString::from("-nostdin"));
-    if only_flv_segments(entry) {
-        let list_path = entry.directory.join("cache-server-ffmpeg-concat.txt");
-        fs::write(&list_path, concat_file_list(&media_files))
-            .await
-            .map_err(failed)?;
+    if let Some(manifest) = prepared.manifest.as_ref() {
         args.extend([
             OsString::from("-f"),
             OsString::from("concat"),
             OsString::from("-safe"),
             OsString::from("0"),
             OsString::from("-i"),
-            list_path.into_os_string(),
+            ffmpeg_file_argument(&manifest.file)?,
         ]);
     } else {
-        for media_file in &media_files {
+        for media_file in &source_arguments {
             args.push(OsString::from("-i"));
-            args.push(media_file.as_os_str().to_os_string());
+            args.push(media_file.clone());
         }
     }
     args.extend([
@@ -2984,18 +6231,62 @@ where
         OsString::from("copy"),
         OsString::from("-f"),
         OsString::from("mp4"),
-        mux_output_path.as_os_str().to_os_string(),
+        ffmpeg_file_argument(&prepared.output.file)?,
     ]);
+    let mut inherited_files = validated_entry
+        .media_files
+        .iter()
+        .map(|source| &source.file)
+        .collect::<Vec<_>>();
+    if let Some(manifest) = prepared.manifest.as_ref() {
+        inherited_files.push(&manifest.file);
+    }
+    inherited_files.push(&prepared.output.file);
 
-    let output = match run_ffmpeg_mux(ffmpeg_path, &args, is_cancel_requested).await {
+    // Controlled exits remove the descriptor-bound manifest asynchronously. Abrupt future
+    // cancellation leaves its no-follow-created name inside the durably owned candidate directory
+    // for the task cleanup worker to reclaim.
+    let output = run_ffmpeg_mux(ffmpeg_path, &args, &inherited_files, is_cancel_requested).await;
+    let concat_cleanup_error = match prepared.manifest.as_ref() {
+        Some(manifest) => remove_bound_mux_file(&validated_entry.directory, manifest)
+            .await
+            .err(),
+        None => None,
+    };
+    let output = match output {
         Ok(output) => output,
         Err(error) => {
-            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+            cleanup_failed_mux_files(
+                validated_entry,
+                owned_root,
+                &output_path,
+                &mux_output_path,
+                &prepared,
+            )
+            .await;
             return Err(error);
         }
     };
+    if let Some(error) = concat_cleanup_error {
+        cleanup_failed_mux_files(
+            validated_entry,
+            owned_root,
+            &output_path,
+            &mux_output_path,
+            &prepared,
+        )
+        .await;
+        return Err(error);
+    }
     if !output.status.success() {
-        cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+        cleanup_failed_mux_files(
+            validated_entry,
+            owned_root,
+            &output_path,
+            &mux_output_path,
+            &prepared,
+        )
+        .await;
         return Err(BilibiliDownloadError::Failed(format!(
             "BBDown adapter ffmpeg mux failed with status {}: {}",
             output.status.code().map_or_else(
@@ -3006,83 +6297,288 @@ where
         )));
     }
 
-    let metadata = match fs::metadata(&mux_output_path).await {
+    let metadata = match bound_file_metadata(&prepared.output.file).await {
         Ok(metadata) => metadata,
         Err(error) => {
-            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+            cleanup_failed_mux_files(
+                validated_entry,
+                owned_root,
+                &output_path,
+                &mux_output_path,
+                &prepared,
+            )
+            .await;
             return Err(failed(error));
         }
     };
     if !metadata.is_file() || metadata.len() == 0 {
-        cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
+        cleanup_failed_mux_files(
+            validated_entry,
+            owned_root,
+            &output_path,
+            &mux_output_path,
+            &prepared,
+        )
+        .await;
         return Err(BilibiliDownloadError::Failed(
             "BBDown adapter ffmpeg mux produced no playable output.".to_owned(),
         ));
     }
 
-    if let Err(error) = fs::rename(&mux_output_path, &output_path).await {
-        if output_path.exists() {
-            if let Err(error) = fs::remove_file(&output_path).await {
-                cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
-                return Err(failed(error));
-            }
-            if let Err(error) = fs::rename(&mux_output_path, &output_path).await {
-                cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
-                return Err(failed(error));
-            }
-        } else {
-            cleanup_failed_mux_files(&media_files, &output_path, &mux_output_path).await;
-            return Err(failed(error));
+    let unavailable_source_paths = match revalidate_mux_source_paths(
+        &validated_entry.media_files,
+        owned_root,
+        &output_path,
+        &mux_output_path,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            cleanup_failed_mux_files(
+                validated_entry,
+                owned_root,
+                &output_path,
+                &mux_output_path,
+                &prepared,
+            )
+            .await;
+            return Err(error);
         }
-    }
-    cleanup_mux_source_files(&media_files, &output_path, &mux_output_path).await?;
+    };
 
-    Ok(Some(MuxReport {
-        output_path,
-        command: command_report(ffmpeg_path, &args),
-        chapter_count: 0,
+    if let Err(error) = publish_bound_mux_file(
+        &validated_entry.directory,
+        &prepared.output,
+        &prepared.output_leaf,
+    )
+    .await
+    {
+        cleanup_failed_mux_files(
+            validated_entry,
+            owned_root,
+            &output_path,
+            &mux_output_path,
+            &prepared,
+        )
+        .await;
+        return Err(failed(error));
+    }
+    let published_identity = ValidatedMediaFileIdentity::from_metadata(
+        &bound_file_metadata(&prepared.output.file)
+            .await
+            .map_err(failed)?,
+    )
+    .map_err(failed)?;
+    Ok(Some(MuxEntryOutcome {
+        report: MuxReport {
+            output_path: output_path.clone(),
+            command: command_report(ffmpeg_path, &args),
+            chapter_count: 0,
+        },
+        unavailable_source_paths,
+        published_output: ValidatedPublishedMuxFile {
+            path: output_path,
+            file: prepared.output.file.try_clone().map_err(failed)?,
+            identity: published_identity,
+        },
     }))
 }
 
-fn mux_source_files(entry: &EntryDownloadReport) -> Vec<PathBuf> {
-    entry
-        .files
+async fn revalidate_mux_source_paths(
+    media_files: &[ValidatedMediaFile],
+    owned_root: &File,
+    output_path: &Path,
+    mux_output_path: &Path,
+) -> Result<HashSet<PathBuf>, BilibiliDownloadError> {
+    let owned_root = owned_root.try_clone().map_err(failed)?;
+    let media_files = media_files
         .iter()
-        .filter(|file| is_media_kind(&file.kind))
-        .map(|file| file.path.clone())
-        .collect()
+        .map(|media_file| {
+            Ok((
+                media_file.path.clone(),
+                media_file.relative_to_owned_root.clone(),
+                media_file.file.try_clone()?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(failed)?;
+    let output_path = output_path.to_path_buf();
+    let mux_output_path = mux_output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        revalidate_mux_source_paths_blocking(
+            &media_files,
+            &owned_root,
+            &output_path,
+            &mux_output_path,
+        )
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("BBDown source revalidation worker failed.".to_owned())
+    })?
+    .map_err(failed)
 }
 
-async fn cleanup_downloaded_media_sources(report: &DownloadReport) {
-    for entry in &report.entries {
-        let media_files = mux_source_files(entry);
+#[cfg(unix)]
+fn revalidate_mux_source_paths_blocking(
+    media_files: &[(PathBuf, String, File)],
+    owned_root: &File,
+    output_path: &Path,
+    mux_output_path: &Path,
+) -> io::Result<HashSet<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut unavailable = HashSet::new();
+    for (path, relative_path, bound_file) in media_files {
+        if path == output_path || path == mux_output_path {
+            unavailable.insert(path.clone());
+            continue;
+        }
+
+        // Raw fallback publication protects pathname-to-validated-file object identity only.
+        // Device and inode bind the current name to the descriptor consumed by ffmpeg; timestamps,
+        // link count, and directory metadata are not content-stability signals and are ignored.
+        let bound_metadata = bound_file.metadata()?;
+        match open_read_no_follow_at(owned_root, relative_path) {
+            Ok(current) => {
+                let current_metadata = current.metadata()?;
+                if current_metadata.dev() == bound_metadata.dev()
+                    && current_metadata.ino() == bound_metadata.ino()
+                {
+                    continue;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                unavailable.insert(path.clone());
+                continue;
+            }
+            Err(_) => {}
+        }
+
+        remove_file_no_follow_at(owned_root, relative_path)?;
+        unavailable.insert(path.clone());
+    }
+    Ok(unavailable)
+}
+
+#[cfg(not(unix))]
+fn revalidate_mux_source_paths_blocking(
+    _media_files: &[(PathBuf, String, File)],
+    _owned_root: &File,
+    _output_path: &Path,
+    _mux_output_path: &Path,
+) -> io::Result<HashSet<PathBuf>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure BBDown source revalidation is not implemented on this platform",
+    ))
+}
+
+async fn cleanup_legacy_unretained_media_outputs(
+    report: &DownloadReport,
+    validated_paths: &ValidatedDownloadReportPaths,
+    retained_output_path: Option<&Path>,
+) -> Result<(), BilibiliDownloadError> {
+    if report.entries.len() != validated_paths.entries.len() {
+        return Err(BilibiliDownloadError::Failed(
+            "Validated BBDown entry set changed before legacy media cleanup.".to_owned(),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut relative_paths = Vec::new();
+    for (entry, validated_entry) in report.entries.iter().zip(&validated_paths.entries) {
+        for media_file in &validated_entry.media_files {
+            if Some(media_file.path.as_path()) != retained_output_path
+                && seen.insert(media_file.relative_to_owned_root.clone())
+            {
+                relative_paths.push(media_file.relative_to_owned_root.clone());
+            }
+        }
+        if let Some(mux) = entry.mux.as_ref()
+            && Some(mux.output_path.as_path()) != retained_output_path
+        {
+            let relative_path =
+                cache_relative_normal_path(&validated_paths.owned_root_path, &mux.output_path)?;
+            if seen.insert(relative_path.clone()) {
+                relative_paths.push(relative_path);
+            }
+        }
+    }
+
+    let owned_root = validated_paths.owned_root.try_clone().map_err(failed)?;
+    tokio::task::spawn_blocking(move || {
+        for relative_path in relative_paths {
+            remove_file_no_follow_at(&owned_root, &relative_path)?;
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        BilibiliDownloadError::Failed("Legacy BBDown media cleanup worker failed.".to_owned())
+    })?
+    .map_err(failed)
+}
+
+async fn cleanup_downloaded_media_sources(
+    report: &DownloadReport,
+    validated_paths: &ValidatedDownloadReportPaths,
+) {
+    for (entry, validated_entry) in report.entries.iter().zip(&validated_paths.entries) {
         let output_path = playback_output_path(entry);
         let mux_output_path = temporary_mux_output_path(&output_path);
-        let _ = cleanup_mux_source_files(&media_files, &output_path, &mux_output_path).await;
+        let _ = cleanup_mux_source_files(
+            &validated_entry.media_files,
+            &validated_paths.owned_root,
+            &output_path,
+            &mux_output_path,
+        )
+        .await;
     }
 }
 
 async fn cleanup_failed_mux_files(
-    media_files: &[PathBuf],
+    validated_entry: &ValidatedDownloadEntryPaths,
+    owned_root: &File,
     output_path: &Path,
     mux_output_path: &Path,
+    prepared: &PreparedMuxFiles,
 ) {
-    let _ = fs::remove_file(mux_output_path).await;
-    let _ = cleanup_mux_source_files(media_files, output_path, mux_output_path).await;
+    if let Some(manifest) = prepared.manifest.as_ref() {
+        let _ = remove_bound_mux_file(&validated_entry.directory, manifest).await;
+    }
+    let _ = remove_bound_mux_file(&validated_entry.directory, &prepared.output).await;
+    let _ = cleanup_mux_source_files(
+        &validated_entry.media_files,
+        owned_root,
+        output_path,
+        mux_output_path,
+    )
+    .await;
 }
 
 async fn cleanup_mux_source_files(
-    media_files: &[PathBuf],
+    media_files: &[ValidatedMediaFile],
+    owned_root: &File,
     output_path: &Path,
     mux_output_path: &Path,
 ) -> Result<(), BilibiliDownloadError> {
-    for media_file in media_files {
-        if media_file == output_path || media_file == mux_output_path {
-            continue;
+    let owned_root = owned_root.try_clone().map_err(failed)?;
+    let relative_paths = media_files
+        .iter()
+        .filter(|media_file| media_file.path != output_path && media_file.path != mux_output_path)
+        .map(|media_file| media_file.relative_to_owned_root.clone())
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        for relative_path in relative_paths {
+            remove_file_no_follow_at(&owned_root, &relative_path)?;
         }
-        remove_file_if_exists(media_file).await?;
-    }
-    Ok(())
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| BilibiliDownloadError::Failed("BBDown source cleanup worker failed.".to_owned()))?
+    .map_err(failed)
 }
 
 struct FfmpegMuxOutput {
@@ -3093,6 +6589,7 @@ struct FfmpegMuxOutput {
 async fn run_ffmpeg_mux<F>(
     ffmpeg_path: &Path,
     args: &[OsString],
+    inherited_files: &[&File],
     is_cancel_requested: &F,
 ) -> Result<FfmpegMuxOutput, BilibiliDownloadError>
 where
@@ -3104,14 +6601,15 @@ where
         ));
     }
 
-    let mut child = Command::new(ffmpeg_path)
+    let mut command = Command::new(ffmpeg_path);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(failed)?;
+        .kill_on_drop(true);
+    configure_inherited_ffmpeg_files(&mut command, inherited_files)?;
+    let mut child = command.spawn().map_err(failed)?;
 
     let mut stderr = child
         .stderr
@@ -3222,15 +6720,10 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     output
 }
 
-fn concat_file_list(media_files: &[PathBuf]) -> String {
+fn concat_file_list(media_files: &[OsString]) -> String {
     media_files
         .iter()
-        .map(|path| {
-            format!(
-                "file '{}'\n",
-                path.display().to_string().replace('\'', "'\\''")
-            )
-        })
+        .map(|path| format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''")))
         .collect()
 }
 
@@ -3257,16 +6750,12 @@ fn stderr_tail(stderr: &[u8]) -> String {
     )
 }
 
-async fn remove_file_if_exists(path: &Path) -> Result<(), BilibiliDownloadError> {
-    match fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(failed(error)),
-    }
-}
-
 fn to_i64_saturating(value: u64) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    value.try_into().unwrap_or_default()
 }
 
 fn success_message(report: &DownloadReport) -> String {
@@ -3281,10 +6770,495 @@ fn success_message(report: &DownloadReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbdown_core::{DownloadedFile, EntryDownloadReport, MuxReport, RestrictedAreaProxyKind};
+    use crate::task_registry::{BilibiliTaskRegistry, TaskRetentionPolicy};
+    use bbdown_core::{
+        DownloadArchiveRecord, DownloadedFile, EntryDownloadReport, MuxReport,
+        RestrictedAreaProxyKind,
+    };
     use std::fs as std_fs;
 
     const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+
+    #[test]
+    fn v2_candidate_failure_log_uses_credential_safe_detail() {
+        let marker = "https://example.test/video?access_key=credential-sensitive-marker";
+        let error = BilibiliDownloadError::Failed(marker.to_owned());
+
+        assert!(v2_candidate_error_detail_for_log(false, &error).contains(marker));
+        let safe = v2_candidate_error_detail_for_log(true, &error);
+        assert_eq!(crate::CREDENTIAL_SAFE_LOG_DETAIL, safe);
+        assert!(!safe.contains("credential-sensitive-marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_candidate_output_cleanup_is_isolated_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        std_fs::create_dir(&cache_root).unwrap();
+        let staging_relative_path = ".tvos-net-player/bbdown-staging/task-1".to_owned();
+        ensure_directory_no_follow(&cache_root, &staging_relative_path).unwrap();
+        let directories = V2TaskOutputDirectories {
+            staging_path: cache_root.join(&staging_relative_path),
+            staging_relative_path,
+            published_path: cache_root.join("Bilibili/task-1"),
+            published_relative_path: "Bilibili/task-1".to_owned(),
+            cache_root: cache_root.clone(),
+        };
+        let failed = v2_candidate_output_directory(&directories, 0).unwrap();
+        let retained = v2_candidate_output_directory(&directories, 1).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &failed.relative_path).unwrap();
+        create_directory_exclusive_no_follow(&cache_root, &retained.relative_path).unwrap();
+        std_fs::create_dir(failed.path.join("entry")).unwrap();
+        std_fs::write(failed.path.join("entry/video.m4s"), b"partial").unwrap();
+        std_fs::create_dir(retained.path.join("entry")).unwrap();
+        std_fs::write(retained.path.join("entry/video.mp4"), b"retained").unwrap();
+
+        assert!(
+            remove_directory_tree_no_follow(
+                &cache_root,
+                &failed.relative_path,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+                MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+            )
+            .unwrap()
+        );
+        assert!(!failed.path.exists());
+        assert_eq!(
+            b"retained".to_vec(),
+            std_fs::read(retained.path.join("entry/video.mp4")).unwrap()
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00001",
+            failed.relative_path
+        );
+        assert_eq!(
+            ".tvos-net-player/bbdown-staging/task-1/candidate-00002",
+            retained.relative_path
+        );
+    }
+
+    #[test]
+    fn v2_download_report_paths_remap_only_from_the_owned_staging_root() {
+        let staging_root = PathBuf::from("cache/.tvos-net-player/bbdown-staging/task-1");
+        let candidate_root = staging_root.join("candidate-00001");
+        let published_root = PathBuf::from("cache/Bilibili/task-1");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: candidate_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: candidate_root.join("entry/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: candidate_root.join("entry/video.mp4"),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+
+        let remapped = remap_download_report_root(report, &staging_root, &published_root)
+            .expect("owned staging paths should remap");
+        assert_eq!(published_root.join("candidate-00001"), remapped.output_dir);
+        assert_eq!(
+            published_root.join("candidate-00001/entry"),
+            remapped.entries[0].directory
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.m4s"),
+            remapped.entries[0].files[0].path
+        );
+        assert_eq!(
+            published_root.join("candidate-00001/entry/video.mp4"),
+            remapped.entries[0].mux.as_ref().unwrap().output_path
+        );
+
+        let outside_report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: staging_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: staging_root.join("entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: PathBuf::from("cache/outside/video.m4s"),
+                    bytes_written: 10,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        assert!(matches!(
+            remap_download_report_root(outside_report, &staging_root, &published_root),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("outside its task-owned staging directory")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_mux_rejects_symlinked_report_paths_before_invoking_ffmpeg() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        std_fs::create_dir_all(&entry_directory).expect("candidate directory should be created");
+        let cache_root = cache_root
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        let outside_media = temp.path().join("outside-video.m4s");
+        std_fs::write(&outside_media, b"outside").expect("outside media should be written");
+        let reported_media = entry_directory.join("video.m4s");
+        symlink(&outside_media, &reported_media).expect("reported media symlink should be created");
+        let mut report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: reported_media.clone(),
+                    bytes_written: 7,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+
+        let result = prepare_owned_download_report_for_playback_in_place(
+            &mut report,
+            DownloadMode::All,
+            &ffmpeg,
+            &|| false,
+            &cache_root,
+            &candidate_root,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("unsafe or unreadable")
+        ));
+        assert_eq!(b"outside", std_fs::read(&outside_media).unwrap().as_slice());
+        assert!(
+            !temp.path().join("ffmpeg-args.log").exists(),
+            "ffmpeg must not observe an untrusted report path"
+        );
+
+        std_fs::remove_file(&reported_media).expect("reported symlink should be removed");
+        std_fs::write(&reported_media, b"inside").expect("owned media should be written");
+        prepare_owned_download_report_for_playback_in_place(
+            &mut report,
+            DownloadMode::All,
+            &ffmpeg,
+            &|| false,
+            &cache_root,
+            &candidate_root,
+        )
+        .await
+        .expect("validated owned media should be muxed");
+        assert!(candidate_root.join("entry/Entry.mp4").is_file());
+        assert_eq!(b"outside", std_fs::read(&outside_media).unwrap().as_slice());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_mux_uses_validated_source_descriptor_after_path_replacement() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        std_fs::create_dir_all(&entry_directory).expect("candidate directory should be created");
+        let cache_root = cache_root
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let candidate_root = cache_root.join("staging/task-1/candidate-00001");
+        let entry_directory = candidate_root.join("entry");
+        let media_path = entry_directory.join("video.m4s");
+        std_fs::write(&media_path, b"validated-source")
+            .expect("validated source should be written");
+        let ffmpeg = write_source_replacing_fake_ffmpeg(temp.path(), &media_path);
+        let mut report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: candidate_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_directory.clone(),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: media_path.clone(),
+                    bytes_written: 16,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        prepare_owned_download_report_for_playback_in_place(
+            &mut report,
+            DownloadMode::All,
+            &ffmpeg,
+            &|| false,
+            &cache_root,
+            &candidate_root,
+        )
+        .await
+        .expect("mux should consume the descriptor-bound source");
+
+        assert_eq!(
+            b"validated-source",
+            std_fs::read(entry_directory.join("Entry.mp4"))
+                .unwrap()
+                .as_slice()
+        );
+        assert!(
+            !media_path.exists(),
+            "the replacement source name is cleanup-owned"
+        );
+        assert!(
+            report.entries[0].files.is_empty(),
+            "a replaced source must not remain eligible for raw fallback publication"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_publication_rejects_media_replaced_after_task_directory_rename() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let staging_task_relative = ".tvos-net-player/bbdown-staging/task-1";
+        let published_task_relative = "Bilibili/task-1";
+        let staging_candidate = cache_root
+            .join(staging_task_relative)
+            .join("candidate-00001");
+        let staging_entry = staging_candidate.join("entry");
+        std_fs::create_dir_all(&staging_entry).expect("staging entry should be created");
+        std_fs::create_dir_all(cache_root.join("Bilibili"))
+            .expect("published output parent should be created");
+        let cache_root = cache_root
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let staging_candidate = cache_root
+            .join(staging_task_relative)
+            .join("candidate-00001");
+        let staging_entry = staging_candidate.join("entry");
+        let staging_media = staging_entry.join("video.m4s");
+        std_fs::write(&staging_media, b"validated-media")
+            .expect("validated media should be written");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: staging_candidate.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: staging_entry,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: staging_media,
+                    bytes_written: 15,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let validated =
+            validate_download_report_paths_no_follow(&cache_root, &staging_candidate, &report)
+                .await
+                .expect("staging media should bind to its descriptor");
+
+        rename_directory_no_replace_no_follow(
+            &cache_root,
+            staging_task_relative,
+            published_task_relative,
+            MAX_BILIBILI_V2_CANDIDATE_CLEANUP_ENTRIES,
+            MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH,
+        )
+        .expect("task directory should publish");
+        let published_candidate = cache_root
+            .join(published_task_relative)
+            .join("candidate-00001");
+        let published_media = published_candidate.join("entry/video.m4s");
+        let displaced_media = temp.path().join("displaced-validated-media");
+        std_fs::rename(&published_media, &displaced_media)
+            .expect("validated object should be displaced for the race");
+        std_fs::write(&published_media, b"replacement-media")
+            .expect("replacement media should occupy the published name");
+
+        let result = revalidate_download_report_files_after_publication(
+            &cache_root,
+            &published_candidate,
+            &validated,
+        )
+        .await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert_eq!(
+            b"validated-media",
+            std_fs::read(displaced_media)
+                .expect("descriptor-bound media should remain distinguishable")
+                .as_slice()
+        );
+        assert_eq!(
+            b"replacement-media",
+            std_fs::read(published_media)
+                .expect("replacement should remain confined to unpublished task output")
+                .as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_report_validation_bounds_retained_media_and_sidecar_descriptors() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let owned_root = cache_root.join("candidate");
+        let entry_directory = owned_root.join("entry");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        let mut files = Vec::new();
+        for index in 0..16_u32 {
+            let path = entry_directory.join(format!("output-{index}"));
+            std_fs::write(&path, format!("output-{index}"))
+                .expect("report output should be written");
+            files.push(DownloadedFile {
+                kind: if index % 2 == 0 {
+                    DownloadFileKind::FlvSegment
+                } else {
+                    DownloadFileKind::Subtitle
+                },
+                path,
+                bytes_written: 8,
+                resumed_from: 0,
+            });
+        }
+        let report = DownloadReport {
+            title: "Descriptor budget".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_directory,
+                files,
+                mux: None,
+            }],
+        };
+
+        let error = match validate_download_report_paths_no_follow_with_descriptor_budget(
+            &cache_root,
+            &owned_root,
+            &report,
+            17,
+        )
+        .await
+        {
+            Ok(_) => panic!("root, entry, and every unique report file must consume the budget"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BilibiliDownloadError::ResourceExhausted(message)
+                if message.contains("file-descriptor budget")
+        ));
+
+        let validated = validate_download_report_paths_no_follow_with_descriptor_budget(
+            &cache_root,
+            &owned_root,
+            &report,
+            18,
+        )
+        .await
+        .expect("the exact descriptor budget should admit the report");
+        assert_eq!(18, validated.descriptor_count());
+        assert_eq!(8, validated.entries[0].media_files.len());
+        assert_eq!(8, validated.entries[0].sidecar_files.len());
+    }
+
+    fn v2_test_candidate() -> BilibiliTaskCandidateRecord {
+        BilibiliTaskCandidateRecord {
+            selection_id: "episode:33".to_owned(),
+            title: "Episode 2".to_owned(),
+            subtitle: "Season".to_owned(),
+            source_kind: "season_episode".to_owned(),
+            content_id: "33".to_owned(),
+            identity: BilibiliContentIdentity {
+                kind: BilibiliContentKind::SeasonEpisode,
+                aid: Some(11),
+                bvid: Some("BV1Test".to_owned()),
+                cid: Some(22),
+                epid: Some(33),
+            },
+            index: 2,
+            duration_seconds: Some(90),
+        }
+    }
+
+    fn v2_test_download_entry() -> bbdown_core::DownloadEntry {
+        serde_json::from_value(serde_json::json!({
+            "index": 2,
+            "aid": 11,
+            "bvid": "BV1Test",
+            "cid": 22,
+            "epid": 33,
+            "title": "Episode 2",
+            "source": "normal_web",
+            "streams": {
+                "videos": [],
+                "audios": [],
+                "flv_segments": [],
+                "accept_quality": [],
+                "duration_seconds": 90
+            },
+            "subtitles": [],
+            "chapters": [{
+                "title": "Opening",
+                "start_seconds": 0,
+                "end_seconds": 15
+            }],
+            "danmaku": {
+                "cid": 22,
+                "xml_url": "https://upstream.invalid/private/danmaku.xml"
+            }
+        }))
+        .expect("test download entry should deserialize")
+    }
+
+    fn bilibili_options_with_download_mode(mode: BilibiliDownloadMode) -> BilibiliDownloadOptions {
+        BilibiliDownloadOptions {
+            quality_preference: String::new(),
+            encoding_preference: String::new(),
+            prefer_tv_api: false,
+            download_subtitles: false,
+            download_danmaku: false,
+            audio_language: String::new(),
+            subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
+            download_cover: false,
+            danmaku_formats: Vec::new(),
+            download_mode: mode.into(),
+        }
+    }
+
+    fn encoded_message_contains<M: prost::Message>(message: &M, value: &str) -> bool {
+        let encoded = message.encode_to_vec();
+        encoded
+            .windows(value.len())
+            .any(|window| window == value.as_bytes())
+    }
 
     fn assert_progress_near(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("progress should be set");
@@ -3380,6 +7354,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         assert!(validate_supported_download_options(Some(&options)).is_ok());
@@ -3401,6 +7376,7 @@ mod tests {
                 BilibiliDanmakuFormat::Ass.into(),
                 BilibiliDanmakuFormat::Xml.into(),
             ],
+            download_mode: 0,
         };
 
         let download_options =
@@ -3428,6 +7404,72 @@ mod tests {
     }
 
     #[test]
+    fn pr6d_maps_all_v2_download_modes_to_bbdown_core() {
+        let cases = [
+            (BilibiliDownloadMode::Unspecified, DownloadMode::All),
+            (BilibiliDownloadMode::All, DownloadMode::All),
+            (BilibiliDownloadMode::VideoOnly, DownloadMode::VideoOnly),
+            (BilibiliDownloadMode::AudioOnly, DownloadMode::AudioOnly),
+            (
+                BilibiliDownloadMode::SubtitleOnly,
+                DownloadMode::SubtitleOnly,
+            ),
+            (BilibiliDownloadMode::DanmakuOnly, DownloadMode::DanmakuOnly),
+            (BilibiliDownloadMode::CoverOnly, DownloadMode::CoverOnly),
+        ];
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+
+        assert_eq!(download_mode_from_options(None).unwrap(), DownloadMode::All);
+        for (proto_mode, core_mode) in cases {
+            let options = bilibili_options_with_download_mode(proto_mode);
+            assert_eq!(
+                download_mode_from_options(Some(&options)).unwrap(),
+                core_mode
+            );
+            assert_eq!(
+                download_options_for_output_dir(temp.path().to_path_buf(), Some(&options))
+                    .unwrap()
+                    .mode,
+                core_mode
+            );
+        }
+
+        let mut unknown = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        unknown.download_mode = i32::MAX;
+        assert!(matches!(
+            download_mode_from_options(Some(&unknown)),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("download mode is unknown")
+        ));
+    }
+
+    #[test]
+    fn legacy_downloads_reject_sidecar_only_modes_before_execution() {
+        for mode in [
+            BilibiliDownloadMode::SubtitleOnly,
+            BilibiliDownloadMode::DanmakuOnly,
+            BilibiliDownloadMode::CoverOnly,
+        ] {
+            let options = bilibili_options_with_download_mode(mode);
+            assert!(matches!(
+                validate_legacy_download_mode(Some(&options)),
+                Err(BilibiliDownloadError::Failed(message))
+                    if message.contains("require the v2 task API")
+            ));
+        }
+
+        for mode in [
+            BilibiliDownloadMode::All,
+            BilibiliDownloadMode::VideoOnly,
+            BilibiliDownloadMode::AudioOnly,
+        ] {
+            let options = bilibili_options_with_download_mode(mode);
+            validate_legacy_download_mode(Some(&options))
+                .expect("legacy media modes should remain supported");
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_encoding_preference() {
         let options = BilibiliDownloadOptions {
             quality_preference: String::new(),
@@ -3439,6 +7481,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3461,6 +7504,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3479,6 +7523,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::OnlyAi.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3501,6 +7546,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: vec![BilibiliDanmakuFormat::Ass.into()],
+            download_mode: 0,
         };
 
         let result = validate_supported_download_options(Some(&options));
@@ -3618,6 +7664,1165 @@ mod tests {
         assert_eq!(
             Some("living-tv"),
             config.credentials.tv_access_key.as_deref()
+        );
+    }
+
+    #[test]
+    fn pr6d_request_client_config_honors_explicit_api_modes() {
+        let server_options = CacheServerOptions::default();
+        let mut legacy_options = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        legacy_options.prefer_tv_api = true;
+
+        for (api_mode, expected_mode) in [
+            (BilibiliApiMode::Web, PlayurlMode::Web),
+            (BilibiliApiMode::Tv, PlayurlMode::Tv),
+            (BilibiliApiMode::App, PlayurlMode::App),
+        ] {
+            let context = BilibiliRequestContext {
+                api_mode: api_mode.into(),
+                credential_profile_id: String::new(),
+            };
+            let config = bbdown_client_config_for_request(
+                &server_options,
+                Some(&legacy_options),
+                Some(&context),
+            )
+            .expect("explicit API mode should be accepted")
+            .expect("explicit API mode should build a request client");
+            assert_eq!(config.playurl_mode, expected_mode);
+        }
+
+        let legacy_context = BilibiliRequestContext::default();
+        let frozen_context_config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&legacy_context),
+        )
+        .unwrap()
+        .expect("a persisted request context should build an isolated client");
+        assert_eq!(PlayurlMode::Tv, frozen_context_config.playurl_mode);
+        assert_eq!(Credentials::default(), frozen_context_config.credentials);
+
+        let invalid_context = BilibiliRequestContext {
+            api_mode: i32::MAX,
+            credential_profile_id: String::new(),
+        };
+        assert!(matches!(
+            bbdown_client_config_for_request(
+                &server_options,
+                Some(&legacy_options),
+                Some(&invalid_context),
+            ),
+            Err(BilibiliDownloadError::Failed(message))
+                if message.contains("API mode is unknown")
+        ));
+    }
+
+    #[test]
+    fn pr6d_empty_frozen_profile_does_not_adopt_a_later_server_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server_options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        };
+        let context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Web.into(),
+            credential_profile_id: String::new(),
+        };
+
+        let config = bbdown_client_config_for_request(&server_options, None, Some(&context))
+            .expect("frozen no-profile context should be valid")
+            .expect("an explicit API mode should build a request client");
+
+        assert_eq!(PlayurlMode::Web, config.playurl_mode);
+        assert_eq!(Credentials::default(), config.credentials);
+    }
+
+    #[test]
+    fn pr6d_profile_only_request_preserves_legacy_tv_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials_path = temp.path().join("credentials.json");
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "cookie": "SESSDATA=default"
+                    },
+                    "living-room": {
+                        "cookie": "SESSDATA=living-room",
+                        "access_key": "living-access",
+                        "tv_access_key": "living-tv"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server_options = CacheServerOptions {
+            bbdown_credential_path: Some(credentials_path),
+            ..CacheServerOptions::default()
+        };
+        let mut legacy_options = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+        legacy_options.prefer_tv_api = true;
+        let profile_only_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Unspecified.into(),
+            credential_profile_id: "  living-room  ".to_owned(),
+        };
+
+        let config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&profile_only_context),
+        )
+        .expect("profile-only request should build a client")
+        .expect("explicit profile should require a request client");
+
+        assert_eq!(config.playurl_mode, PlayurlMode::Tv);
+        assert_eq!(
+            config.credentials.cookie.as_deref(),
+            Some("SESSDATA=living-room")
+        );
+        assert_eq!(
+            config.credentials.tv_access_key.as_deref(),
+            Some("living-tv")
+        );
+
+        let explicit_app_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::App.into(),
+            credential_profile_id: "living-room".to_owned(),
+        };
+        let app_config = bbdown_client_config_for_request(
+            &server_options,
+            Some(&legacy_options),
+            Some(&explicit_app_context),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(app_config.playurl_mode, PlayurlMode::App);
+        assert_eq!(
+            app_config.credentials.access_key.as_deref(),
+            Some("living-access")
+        );
+    }
+
+    #[test]
+    fn pr6d_accepted_candidate_filter_requires_exact_identity() {
+        let entry = v2_test_download_entry();
+        let candidate = v2_test_candidate();
+        assert!(candidate.identity.is_complete());
+        assert!(download_entry_matches_candidate(&entry, &candidate));
+
+        let mut case_insensitive_bvid = candidate.clone();
+        case_insensitive_bvid.identity.bvid = Some("bv1test".to_owned());
+        assert!(download_entry_matches_candidate(
+            &entry,
+            &case_insensitive_bvid
+        ));
+
+        let mut mismatches = Vec::new();
+        for mutate in [
+            |identity: &mut BilibiliContentIdentity| identity.aid = Some(12),
+            |identity: &mut BilibiliContentIdentity| identity.bvid = Some("BV1Other".to_owned()),
+            |identity: &mut BilibiliContentIdentity| identity.cid = Some(23),
+            |identity: &mut BilibiliContentIdentity| identity.epid = Some(34),
+        ] {
+            let mut mismatch = candidate.clone();
+            mutate(&mut mismatch.identity);
+            mismatches.push(mismatch);
+        }
+        assert!(
+            mismatches
+                .iter()
+                .all(|candidate| !download_entry_matches_candidate(&entry, candidate))
+        );
+
+        let mut missing_bvid = entry.clone();
+        missing_bvid.bvid = None;
+        assert!(!download_entry_matches_candidate(&missing_bvid, &candidate));
+    }
+
+    #[test]
+    fn pr6d_v2_result_maps_generic_subject_and_bilibili_identity() {
+        use crate::generated::tvos_net_player::v1::{
+            BilibiliContentKind as ProtoBilibiliContentKind, task_result_provider_details,
+        };
+
+        let mut candidate = v2_test_candidate();
+        candidate.selection_id = "https://upstream.invalid/private/selection".to_owned();
+        let result = successful_download_result(
+            "task-one".to_owned(),
+            &candidate,
+            "library-one".to_owned(),
+            Vec::new(),
+            42,
+        );
+
+        let subject = result
+            .subject
+            .as_ref()
+            .expect("result subject should exist");
+        assert_eq!(subject.provider, "bilibili");
+        assert_eq!(subject.kind, "season_episode");
+        assert_eq!(subject.id, "33");
+        assert_eq!(subject.index, 2);
+
+        let details = result
+            .provider_details
+            .as_ref()
+            .and_then(|details| details.details.as_ref())
+            .expect("provider details should exist");
+        let task_result_provider_details::Details::Bilibili(details) = details;
+        let identity = details
+            .identity
+            .as_ref()
+            .expect("Bilibili identity should exist");
+        assert_eq!(
+            identity.kind,
+            ProtoBilibiliContentKind::SeasonEpisode as i32
+        );
+        assert_eq!(identity.aid, 11);
+        assert_eq!(identity.bvid, "BV1Test");
+        assert_eq!(identity.cid, 22);
+        assert_eq!(identity.epid, 33);
+        assert!(details.playback_session.is_none());
+        assert!(!encoded_message_contains(
+            &result,
+            "https://upstream.invalid/private/selection"
+        ));
+    }
+
+    #[test]
+    fn pr6d_v2_multi_result_helpers_keep_stable_ids_progress_and_partial_states() {
+        let candidate = v2_test_candidate();
+        assert_eq!(bilibili_v2_result_id("task", 0), "task");
+        assert_eq!(bilibili_v2_result_id("task", 1), "task-result-2");
+        assert_eq!(bilibili_v2_result_id("task", 9), "task-result-10");
+        assert_eq!(v2_candidate_progress(0, 2, 0.5), 0.25);
+        assert_eq!(v2_candidate_progress(1, 2, 0.5), 0.75);
+        assert_eq!(v2_candidate_progress(2, 0, 1.0), 0.0);
+
+        let results = [
+            successful_download_result(
+                bilibili_v2_result_id("task", 0),
+                &candidate,
+                "library-one".to_owned(),
+                Vec::new(),
+                100,
+            ),
+            failed_download_result(
+                bilibili_v2_result_id("task", 1),
+                &candidate,
+                &BilibiliDownloadError::Failed("offline failure".to_owned()),
+            ),
+            cancelled_download_result(bilibili_v2_result_id("task", 2), &candidate),
+        ];
+
+        assert_eq!(results[0].state(), TaskState::Succeeded);
+        assert_eq!(results[1].state(), TaskState::Failed);
+        assert_eq!(results[2].state(), TaskState::Cancelled);
+        assert_eq!(results[0].id, "task");
+        assert_eq!(results[1].id, "task-result-2");
+        assert_eq!(results[2].id, "task-result-3");
+        assert!(results.iter().all(|result| result.subject.is_some()));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.provider_details.is_some())
+        );
+        assert_eq!(
+            "The Bilibili download failed.",
+            results[1]
+                .problem
+                .as_ref()
+                .expect("failed result should include a problem")
+                .message
+        );
+        assert!(!encoded_message_contains(&results[1], "offline failure"));
+    }
+
+    #[test]
+    fn v2_candidate_progress_scales_fraction_and_preserves_aggregate_bytes() {
+        let mut first = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_END),
+            downloaded_bytes: Some(100),
+            total_bytes: Some(120),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 0,
+            total: 2,
+            completed_downloaded_bytes: 0,
+            total_bytes_floor: 0,
+        }
+        .map(&mut first);
+        assert_progress_near(first.progress, 0.40);
+        assert_eq!(Some(100), first.downloaded_bytes);
+        assert_eq!(Some(120), first.total_bytes);
+
+        let mut second = BilibiliTaskProgress {
+            progress: Some(DOWNLOAD_PROGRESS_START),
+            downloaded_bytes: Some(0),
+            total_bytes: Some(0),
+            message: None,
+        };
+        BilibiliV2ProgressWindow {
+            offset: 1,
+            total: 2,
+            completed_downloaded_bytes: 100,
+            total_bytes_floor: 120,
+        }
+        .map(&mut second);
+        assert_progress_near(second.progress, 0.55);
+        assert_eq!(Some(100), second.downloaded_bytes);
+        assert_eq!(Some(120), second.total_bytes);
+    }
+
+    #[test]
+    fn v2_task_archive_only_accepts_successful_candidate_state() {
+        let archive_record = |content_key: &str| DownloadArchiveRecord {
+            content_key: content_key.to_owned(),
+            title: content_key.to_owned(),
+            output_dir: PathBuf::from(content_key),
+            completed_at_unix: 1,
+            entries: Vec::new(),
+        };
+        let mut task_archive = V2TaskArchive::default();
+
+        let mut rejected_candidate = task_archive.stage_candidate();
+        rejected_candidate.records.push(archive_record("rejected"));
+        drop(rejected_candidate);
+        assert!(task_archive.stage_candidate().records.is_empty());
+
+        let mut accepted_candidate = task_archive.stage_candidate();
+        accepted_candidate.records.push(archive_record("accepted"));
+        task_archive.accept_candidate(accepted_candidate);
+        assert_eq!(
+            vec!["accepted"],
+            task_archive
+                .stage_candidate()
+                .records
+                .iter()
+                .map(|record| record.content_key.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn v2_transient_outputs_exclude_the_retained_library_media() {
+        let media_path = PathBuf::from("library/video.mp4");
+        let sidecar_path = PathBuf::from("output/video.srt");
+        let output_paths = vec![media_path.clone(), sidecar_path.clone()];
+
+        assert_eq!(
+            vec![sidecar_path],
+            transient_download_output_paths(&output_paths, Some(&media_path))
+        );
+        assert_eq!(
+            output_paths,
+            transient_download_output_paths(&output_paths, None)
+        );
+    }
+
+    #[test]
+    fn v2_retained_backing_preserves_all_successes() {
+        let candidate = v2_test_candidate();
+        let mut results = Vec::new();
+        let mut retained_backing = RetainedV2DownloadBacking::default();
+        let mut primary_library_item_id = String::new();
+        let mut successful_results = 0;
+
+        for (offset, library_item_id) in ["library-one", "library-two"].into_iter().enumerate() {
+            retain_v2_success(
+                MappedV2DownloadResult {
+                    result: successful_download_result(
+                        bilibili_v2_result_id("task", offset),
+                        &candidate,
+                        library_item_id.to_owned(),
+                        Vec::new(),
+                        100,
+                    ),
+                    library_item_id: library_item_id.to_owned(),
+                    resources: Vec::new(),
+                    resource_bodies: Vec::new(),
+                    library_item_lease: None,
+                    transient_output_paths: Vec::new(),
+                },
+                &mut primary_library_item_id,
+                &mut successful_results,
+                &mut results,
+                &mut retained_backing,
+            );
+        }
+
+        assert_eq!(2, successful_results);
+        assert_eq!(2, results.len());
+        assert!(
+            results
+                .iter()
+                .all(|result| result.state() == TaskState::Succeeded)
+        );
+        assert_eq!("library-one", primary_library_item_id);
+    }
+
+    #[tokio::test]
+    async fn v2_download_does_not_wait_for_the_legacy_archive_lock() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("library");
+        std_fs::create_dir_all(&root_path).expect("library root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("library root should canonicalize");
+        let options = Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bbdown_output_dir: Some(root_path.join("Bilibili")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+        );
+        let registry = Arc::new(
+            BilibiliTaskRegistry::with_persistence_path_retention_and_resource_root(
+                temp.path().join("state/tasks.json"),
+                TaskRetentionPolicy::default(),
+                Some(root_path),
+            ),
+        );
+        let task = registry
+            .create_bilibili_download_task_v2(
+                "BV1xx411c7mD",
+                None,
+                None,
+                "Archive isolation".to_owned(),
+                vec![v2_test_candidate()],
+            )
+            .expect("v2 task should be created");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("v2 task should become running");
+        let context = BilibiliDownloadContext::new_for_test(
+            registry,
+            task.id.clone(),
+            work_item.cancellation,
+        );
+        context.cancel_for_test();
+        let request = BilibiliDownloadRequest {
+            task_id: task.id,
+            source: "BV1xx411c7mD".to_owned(),
+            options: Some(bilibili_options_with_download_mode(
+                BilibiliDownloadMode::All,
+            )),
+            request_context: None,
+            candidates: vec![v2_test_candidate()],
+        };
+        let archive_lock = Arc::clone(&adapter.archive_lock);
+        let _legacy_archive_guard = archive_lock.lock().await;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.run_v2_download(request, context),
+        )
+        .await
+        .expect("a task-local v2 archive must not wait for the legacy archive lock")
+        .expect("a cancelled v2 request should still produce terminal output");
+
+        assert_eq!(
+            TaskState::Cancelled,
+            output
+                .v2
+                .expect("v2 output should be present")
+                .terminal_state
+        );
+    }
+
+    #[tokio::test]
+    async fn pr6d_v2_artifact_resources_do_not_publish_local_or_upstream_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let owned_root = cache_root.join("private-output-marker");
+        let entry_directory = owned_root.join("private-entry-marker");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        let sidecar_path = entry_directory.join("private-local-marker.subtitle.srt");
+        std_fs::write(&sidecar_path, b"subtitle").expect("sidecar should be written");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let mut candidate = v2_test_candidate();
+        candidate.selection_id = "https://upstream.invalid/private/selection".to_owned();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: sidecar_path.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let validated = validate_download_report_paths_no_follow(&cache_root, &owned_root, &report)
+            .await
+            .expect("sidecar output should bind to validated descriptors");
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::SubtitleOnly,
+                Some(V2PublishedOutputValidation {
+                    cache_root: &cache_root,
+                    published_root: &owned_root,
+                    validated_paths: &validated,
+                }),
+            )
+            .await
+            .expect("sidecar-only result should map without media or network access");
+
+        assert!(mapped.library_item_id.is_empty());
+        assert_eq!(vec![sidecar_path.clone()], mapped.transient_output_paths);
+        assert_eq!(mapped.result.state(), TaskState::Succeeded);
+        assert_eq!(mapped.result.artifacts.len(), 3);
+        assert_eq!(mapped.resources.len(), 3);
+        assert_eq!(mapped.resource_bodies.len(), 3);
+        let private_values = [
+            temp.path().to_string_lossy().into_owned(),
+            "private-local-marker".to_owned(),
+            "https://upstream.invalid/private/selection".to_owned(),
+            "https://upstream.invalid/private/danmaku.xml".to_owned(),
+        ];
+        for private_value in &private_values {
+            assert!(!encoded_message_contains(&mapped.result, private_value));
+            assert!(
+                mapped
+                    .resources
+                    .iter()
+                    .all(|resource| !encoded_message_contains(&resource.resource, private_value))
+            );
+        }
+        assert!(mapped.resources.iter().all(|resource| {
+            resource
+                .resource
+                .uri
+                .starts_with("/resources/task-resource-")
+        }));
+
+        let mut cache_file_bodies = 0;
+        let mut metadata_body_found = false;
+        for body in &mapped.resource_bodies {
+            match &body.source {
+                BilibiliTaskResourceBodySource::CacheFile(_) => {
+                    cache_file_bodies += 1;
+                }
+                BilibiliTaskResourceBodySource::Bytes(bytes) => {
+                    let text = std::str::from_utf8(bytes).expect("generated JSON should be UTF-8");
+                    assert!(private_values.iter().all(|value| !text.contains(value)));
+                    let json: serde_json::Value =
+                        serde_json::from_slice(bytes).expect("generated body should be JSON");
+                    metadata_body_found |=
+                        json.get("provider").and_then(|value| value.as_str()) == Some("bilibili");
+                }
+            }
+        }
+        assert_eq!(cache_file_bodies, 1);
+        assert!(metadata_body_found);
+
+        let media_artifact = library_media_artifact(
+            &temp.path().join("private-media-marker.mp4"),
+            "library-media-one",
+        );
+        assert_eq!(media_artifact.format, "mp4");
+        assert_eq!(media_artifact.library_item_id, "library-media-one");
+        assert!(media_artifact.resource.is_none());
+        assert!(!encoded_message_contains(
+            &media_artifact,
+            "private-media-marker"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_media_artifact_uses_the_selected_raw_output_format_when_mux_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let library_root = temp.path().join("library");
+        std_fs::create_dir(&library_root).expect("library root should be created");
+        let library_root = library_root
+            .canonicalize()
+            .expect("library root should be canonical");
+        let entry_directory = library_root.join("Bilibili/task-1/candidate-00001/entry");
+        let mux_path = entry_directory.join("Episode 2.mp4");
+        let raw_video_path = entry_directory.join("video.m4s");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        std_fs::write(&raw_video_path, b"raw video").expect("raw output should be written");
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: library_root,
+            allowed_extensions: vec![".m4s".to_owned()],
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: entry_directory.parent().unwrap().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: raw_video_path.clone(),
+                    bytes_written: 9,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let report =
+            prepare_download_report_for_playback(report, DownloadMode::VideoOnly, &ffmpeg, &|| {
+                false
+            })
+            .await
+            .expect("v2 preparation should retain raw media after successful muxing");
+        assert!(mux_path.is_file());
+        assert!(raw_video_path.is_file());
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::VideoOnly,
+                None,
+            )
+            .await
+            .expect("the allowed raw output should map into the local library");
+
+        let media = mapped
+            .result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind() == TaskArtifactKind::Media)
+            .expect("the selected raw output should publish a media artifact");
+        assert_eq!("m4s", media.format);
+        assert_eq!(mapped.library_item_id, media.library_item_id);
+        assert_eq!(vec![mux_path], mapped.transient_output_paths);
+        assert_eq!(
+            Some(mapped.library_item_id.as_str()),
+            adapter
+                .library
+                .item_id_for_media_path(raw_video_path)
+                .await
+                .as_deref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_media_cleanup_retains_only_the_selected_raw_fallback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let owned_root = temp.path().join("owned-output");
+        let entry_directory = owned_root.join("entry");
+        let mux_path = entry_directory.join("Episode.mp4");
+        let raw_video_path = entry_directory.join("video.m4s");
+        let raw_audio_path = entry_directory.join("audio.m4s");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        std_fs::write(&mux_path, b"muxed").expect("mux output should be written");
+        std_fs::write(&raw_video_path, b"video").expect("raw video should be written");
+        std_fs::write(&raw_audio_path, b"audio").expect("raw audio should be written");
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Episode".to_owned(),
+                directory: entry_directory,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: raw_video_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: raw_audio_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: Some(MuxReport {
+                    output_path: mux_path.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+        let validated = validate_download_report_paths_no_follow(temp.path(), &owned_root, &report)
+            .await
+            .expect("legacy output paths should validate");
+
+        cleanup_legacy_unretained_media_outputs(&report, &validated, Some(&raw_video_path))
+            .await
+            .expect("legacy cleanup should retain only the selected output");
+
+        assert!(raw_video_path.is_file());
+        assert!(!raw_audio_path.exists());
+        assert!(!mux_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_cancellation_after_selected_output_cleanup_prevents_archive_commit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let cache_root = temp.path().join("cache");
+        let owned_root = cache_root.join("legacy-output");
+        let entry_directory = owned_root.join("entry");
+        let retained_video_path = entry_directory.join("video.m4s");
+        let discarded_audio_path = entry_directory.join("audio.m4s");
+        std_fs::create_dir_all(&entry_directory).expect("entry directory should be created");
+        std_fs::write(&retained_video_path, b"video").expect("video should be written");
+        std_fs::write(&discarded_audio_path, b"audio").expect("audio should be written");
+        let report = DownloadReport {
+            title: "Episode".to_owned(),
+            output_dir: owned_root.clone(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Episode".to_owned(),
+                directory: entry_directory,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::Video,
+                        path: retained_video_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::Audio,
+                        path: discarded_audio_path.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+        let validated = validate_download_report_paths_no_follow(&cache_root, &owned_root, &report)
+            .await
+            .expect("legacy report should validate");
+        let options = Arc::new(CacheServerOptions {
+            root_path: cache_root,
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+        );
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *adapter
+            .legacy_post_cleanup_probe
+            .lock()
+            .expect("legacy post-cleanup probe lock poisoned") = Some(LegacyPostCleanupProbe {
+            reached: Arc::clone(&reached),
+            resume: Arc::clone(&resume),
+        });
+
+        let registry = Arc::new(BilibiliTaskRegistry::default());
+        let task = registry
+            .create_bilibili_task("BV1legacy-cancel", None)
+            .expect("legacy task should be created");
+        let work_item = registry
+            .try_claim_next_bilibili_task()
+            .expect("legacy task should become running");
+        let context =
+            BilibiliDownloadContext::new_for_test(registry, task.id, work_item.cancellation);
+        let cancellation_context = context.clone();
+        let cancellation = async move {
+            reached.notified().await;
+            assert!(retained_video_path.is_file());
+            assert!(!discarded_audio_path.exists());
+            cancellation_context.cancel_for_test();
+            resume.notify_one();
+        };
+        let commit = adapter.retain_legacy_output_for_archive_commit(
+            &report,
+            &validated,
+            &report.entries[0].files[0].path,
+            &context,
+        );
+
+        let (result, ()) = tokio::join!(commit, cancellation);
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Cancelled(_))));
+        assert!(!report.entries[0].files[0].path.exists());
+        assert!(!adapter.archive_path.exists());
+    }
+
+    #[tokio::test]
+    async fn v2_audio_only_maps_m4a_as_a_playable_library_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let library_root = temp.path().join("library");
+        std_fs::create_dir(&library_root).expect("library root should be created");
+        let library_root = library_root
+            .canonicalize()
+            .expect("library root should be canonical");
+        let entry_directory = library_root.join("Bilibili/task-1/candidate-00001/entry");
+        let audio_path = entry_directory.join("audio-ja-JP.m4a");
+        std_fs::create_dir_all(&entry_directory).expect("audio directory should be created");
+        std_fs::write(&audio_path, b"audio").expect("audio output should be written");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: library_root,
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+        let report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: entry_directory.parent().unwrap().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: entry_directory,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Audio,
+                    path: audio_path,
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let mapped = adapter
+            .map_v2_download_result(
+                "task-one".to_owned(),
+                &candidate,
+                &plan,
+                &report,
+                DownloadMode::AudioOnly,
+                None,
+            )
+            .await
+            .expect("audio-only output should map into the local library");
+
+        assert!(!mapped.library_item_id.is_empty());
+        assert!(mapped.transient_output_paths.is_empty());
+        let media = mapped
+            .result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind() == TaskArtifactKind::Media)
+            .expect("audio-only output should publish a media artifact");
+        assert_eq!("m4a", media.format);
+        assert_eq!(mapped.library_item_id, media.library_item_id);
+    }
+
+    #[tokio::test]
+    async fn v2_sidecar_only_modes_require_the_requested_artifact() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        for (offset, mode) in [
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let report = DownloadReport {
+                title: "Season".to_owned(),
+                output_dir: temp.path().join(format!("empty-sidecar-{offset}")),
+                entries: vec![EntryDownloadReport {
+                    index: 2,
+                    title: "Episode 2".to_owned(),
+                    directory: temp.path().join(format!("empty-entry-{offset}")),
+                    files: Vec::new(),
+                    mux: None,
+                }],
+            };
+
+            let error = match adapter
+                .map_v2_download_result(
+                    format!("task-sidecar-{offset}"),
+                    &candidate,
+                    &plan,
+                    &report,
+                    mode,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => panic!("an empty sidecar-only result must fail"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, BilibiliDownloadError::Failed(message) if message.contains("requested sidecar artifact"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_finalization_never_unlinks_untrusted_report_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let server_options = Arc::new(CacheServerOptions {
+            root_path: temp.path().join("library"),
+            bbdown_output_dir: Some(temp.path().join("bbdown-output")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            server_options.clone(),
+            Arc::new(LocalMediaLibrary::new(server_options)),
+        );
+        let candidate = v2_test_candidate();
+        let plan = DownloadPlan {
+            title: "Season".to_owned(),
+            entries: vec![v2_test_download_entry()],
+        };
+
+        let cancelled_media = temp.path().join("cancelled.mp4");
+        let cancelled_sidecar = temp.path().join("cancelled.srt");
+        std_fs::write(&cancelled_media, b"media").expect("media should be written");
+        std_fs::write(&cancelled_sidecar, b"subtitle").expect("sidecar should be written");
+        let cancelled_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("cancelled-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("cancelled-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: cancelled_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: Some(MuxReport {
+                    output_path: cancelled_media.clone(),
+                    command: Vec::new(),
+                    chapter_count: 0,
+                }),
+            }],
+        };
+        let cancelled = adapter
+            .finalize_v2_download_result(
+                "task-cancelled".to_owned(),
+                &candidate,
+                &plan,
+                cancelled_report,
+                DownloadMode::All,
+                V2DownloadFinalization {
+                    cancel_requested: true,
+                    publication_validation: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            cancelled,
+            Err(BilibiliDownloadError::Cancelled(_))
+        ));
+        assert!(cancelled_media.exists());
+        assert!(cancelled_sidecar.exists());
+
+        let failed_sidecar = temp.path().join("mapping-failed.srt");
+        std_fs::write(&failed_sidecar, b"subtitle").expect("sidecar should be written");
+        let failed_report = DownloadReport {
+            title: "Season".to_owned(),
+            output_dir: temp.path().join("failed-output"),
+            entries: vec![EntryDownloadReport {
+                index: 2,
+                title: "Episode 2".to_owned(),
+                directory: temp.path().join("failed-entry"),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Subtitle,
+                    path: failed_sidecar.clone(),
+                    bytes_written: 8,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+        let failed = adapter
+            .finalize_v2_download_result(
+                "task-failed".to_owned(),
+                &candidate,
+                &plan,
+                failed_report,
+                DownloadMode::VideoOnly,
+                V2DownloadFinalization {
+                    cancel_requested: false,
+                    publication_validation: None,
+                },
+            )
+            .await;
+        assert!(matches!(failed, Err(BilibiliDownloadError::Failed(_))));
+        assert!(
+            failed_sidecar.exists(),
+            "mapping failures must leave cleanup to the bounded task-owned directory"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_credentials_use_the_shared_bounded_blocking_pool() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().join("cache");
+        std_fs::create_dir(&root_path).expect("cache root should be created");
+        let root_path = root_path
+            .canonicalize()
+            .expect("cache root should canonicalize");
+        let credentials_path = temp.path().join("credentials.json");
+        // Synthetic token catalog id: access-a.
+        std_fs::write(
+            &credentials_path,
+            r#"{
+                "version": 1,
+                "default_profile": "blocking-profile",
+                "profiles": {
+                    "blocking-profile": {
+                        "access_key": "codex_synth_v1_access_a"
+                    }
+                }
+            }"#,
+        )
+        .expect("credential file should be written");
+        let options = Arc::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            bbdown_output_dir: Some(root_path.join("Bilibili")),
+            bbdown_archive_path: Some(temp.path().join("bbdown-archive.json")),
+            bbdown_credential_path: Some(credentials_path.clone()),
+            ..CacheServerOptions::default()
+        });
+        let blocking_permits = Arc::new(Semaphore::new(1));
+        let adapter = Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+            Arc::clone(&blocking_permits),
+        ));
+        let held_permit = Arc::clone(&blocking_permits)
+            .acquire_owned()
+            .await
+            .expect("blocking permit should be acquired");
+        let observed_thread = Arc::new(StdMutex::new(None));
+        let observed_available_permits = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let _probe_registration = install_bbdown_credential_load_probe(BbdownCredentialLoadProbe {
+            path: credentials_path,
+            blocking_permits: Arc::clone(&blocking_permits),
+            observed_thread: Arc::clone(&observed_thread),
+            observed_available_permits: Arc::clone(&observed_available_permits),
+            observed: Arc::clone(&observed),
+        });
+        let async_worker_thread = std::thread::current().id();
+        let request = tokio::spawn(async move {
+            adapter
+                .client_for_request(
+                    None,
+                    Some(&BilibiliRequestContext {
+                        api_mode: BilibiliApiMode::Web.into(),
+                        credential_profile_id: "blocking-profile".to_owned(),
+                    }),
+                )
+                .await
+        });
+
+        assert!(
+            timeout(Duration::from_millis(100), observed.notified())
+                .await
+                .is_err(),
+            "credential loading must wait for blocking admission"
+        );
+        drop(held_permit);
+        timeout(Duration::from_secs(1), observed.notified())
+            .await
+            .expect("credential load should be observed");
+        request
+            .await
+            .expect("credential loading task should not panic")
+            .expect("credential loading should succeed");
+
+        assert_eq!(
+            0,
+            observed_available_permits.load(std::sync::atomic::Ordering::SeqCst),
+            "credential loading must hold the final blocking permit"
+        );
+        let credential_load_thread = observed_thread
+            .lock()
+            .expect("credential load observation lock should not be poisoned")
+            .expect("credential load thread should be recorded");
+        assert_ne!(
+            async_worker_thread, credential_load_thread,
+            "credential loading must not run on the async runtime worker"
         );
     }
 
@@ -5773,6 +10978,45 @@ mod tests {
         assert!(file_name.is_char_boundary(file_name.trim_end_matches(PLAYBACK_EXTENSION).len()));
     }
 
+    #[tokio::test]
+    async fn audio_only_preserves_raw_audio_without_invoking_ffmpeg() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let audio_path = temp.path().join("audio.m4a");
+        std::fs::write(&audio_path, b"audio").expect("audio should be written");
+        let report = DownloadReport {
+            title: "Audio".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Audio".to_owned(),
+                directory: temp.path().to_path_buf(),
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Audio,
+                    path: audio_path.clone(),
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let prepared = prepare_download_report_for_playback(
+            report,
+            DownloadMode::AudioOnly,
+            &temp.path().join("missing-ffmpeg"),
+            &|| false,
+        )
+        .await
+        .expect("audio-only preparation should not require ffmpeg");
+
+        assert!(prepared.entries[0].mux.is_none());
+        assert_eq!(
+            vec![audio_path.clone()],
+            playable_output_candidates(&prepared)
+        );
+        assert!(audio_path.is_file());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn mux_download_report_uses_entry_title_and_non_indexed_temporary_output() {
@@ -5826,26 +11070,291 @@ mod tests {
         let output_path = entry_dir.join("Entry_ Episode 1.mp4");
         assert_eq!(output_path, mux.output_path);
         assert_eq!(b"muxed", std::fs::read(&output_path).unwrap().as_slice());
-        assert!(!video_path.exists());
-        assert!(!audio_path.exists());
+        assert!(video_path.exists());
+        assert!(audio_path.exists());
         assert!(subtitle_path.exists());
 
         let args_log = std::fs::read_to_string(temp.path().join("ffmpeg-args.log")).unwrap();
         let args = args_log.lines().collect::<Vec<_>>();
         let mux_temp_arg = args.last().unwrap();
         assert_eq!(&["-f", "mp4"], &args[args.len() - 3..args.len() - 1]);
-        assert_eq!(
-            Some("cache-server-mux-tmp"),
-            Path::new(mux_temp_arg)
-                .extension()
-                .and_then(|value| value.to_str())
-        );
+        assert!(mux_temp_arg.starts_with("/dev/fd/"));
+        assert_eq!(Some(*mux_temp_arg), mux.command.last().map(String::as_str));
+        assert!(!temporary_mux_output_path(&output_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_download_report_removes_flv_concat_list_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"first").unwrap();
+        std::fs::write(&second_segment, b"second").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
+        let ffmpeg = write_concat_reading_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir.clone(),
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment.clone(),
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment.clone(),
+                        bytes_written: 6,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+
+        let report = mux_download_report(report, &ffmpeg, &|| false)
+            .await
+            .expect("FLV segments should mux successfully");
+
+        assert!(report.entries[0].mux.is_some());
+        assert!(!concat_list.exists());
+        assert!(first_segment.exists());
+        assert!(second_segment.exists());
+        let manifest = std::fs::read_to_string(temp.path().join("ffmpeg-concat.log"))
+            .expect("fake ffmpeg should read the inherited concat manifest");
+        let manifest_lines = manifest.lines().collect::<Vec<_>>();
+        assert_eq!(2, manifest_lines.len());
         assert!(
-            Path::new(mux_temp_arg)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.starts_with('.'))
+            manifest_lines
+                .iter()
+                .all(|line| line.starts_with("file '/dev/fd/") && line.ends_with('\''))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_rejects_a_symlinked_flv_concat_manifest_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let segment = entry_dir.join("segment.flv");
+        std::fs::write(&segment, b"segment").unwrap();
+        let outside = temp.path().join("outside-manifest-target");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, entry_dir.join(FFMPEG_CONCAT_MANIFEST_NAME)).unwrap();
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::FlvSegment,
+                    path: segment,
+                    bytes_written: 7,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let result = mux_download_report(report, &ffmpeg, &|| false).await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert_eq!(b"outside", std::fs::read(outside).unwrap().as_slice());
+        assert!(!temp.path().join("ffmpeg-args.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_rejects_a_symlinked_temporary_output_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let media_path = entry_dir.join("video.m4s");
+        std::fs::write(&media_path, b"video").unwrap();
+        let output_path = entry_dir.join("Entry.mp4");
+        let mux_output_path = temporary_mux_output_path(&output_path);
+        let outside = temp.path().join("outside-output-target");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &mux_output_path).unwrap();
+        let ffmpeg = write_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: media_path,
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let result = mux_download_report(report, &ffmpeg, &|| false).await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert_eq!(b"outside", std::fs::read(outside).unwrap().as_slice());
+        assert!(
+            std::fs::symlink_metadata(mux_output_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!temp.path().join("ffmpeg-args.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_rejects_a_replaced_temporary_output_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let media_path = entry_dir.join("video.m4s");
+        std::fs::write(&media_path, b"video").unwrap();
+        let output_path = entry_dir.join("Entry.mp4");
+        let mux_output_path = temporary_mux_output_path(&output_path);
+        let ffmpeg =
+            write_path_replacing_fake_ffmpeg(temp.path(), &mux_output_path, "replacement-temp");
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: media_path.clone(),
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let result = mux_download_report(report, &ffmpeg, &|| false).await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert!(!output_path.exists());
+        assert_eq!(
+            b"replacement-temp",
+            std::fs::read(mux_output_path).unwrap().as_slice()
+        );
+        assert!(!media_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_rejects_source_replacement_between_identity_check_and_rename() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let entry_path = temp.path().join("entry");
+        std_fs::create_dir(&entry_path).expect("entry directory should be created");
+        let entry_directory = File::open(&entry_path).expect("entry directory should open");
+        let output_leaf = OsString::from("Entry.mp4");
+        let temporary_leaf = OsString::from(".Entry.mp4.cache-server-mux-tmp");
+        let mut prepared = prepare_mux_files_blocking(
+            &entry_directory,
+            output_leaf.clone(),
+            temporary_leaf.clone(),
+            None,
+        )
+        .expect("bound mux output should be prepared");
+        prepared
+            .output
+            .file
+            .write_all(b"descriptor-bound-output")
+            .expect("bound mux output should be written");
+        prepared
+            .output
+            .file
+            .sync_all()
+            .expect("bound mux output should be synchronized");
+        let temporary_path = entry_path.join(&temporary_leaf);
+        let displaced_path = entry_path.join("displaced-bound-output");
+
+        let error = publish_bound_mux_file_blocking_with_hook(
+            &entry_directory,
+            &prepared.output,
+            &output_leaf,
+            || {
+                std_fs::rename(&temporary_path, &displaced_path)
+                    .expect("bound name should be displaced during the race");
+                std_fs::write(&temporary_path, b"replacement-output")
+                    .expect("replacement source should be installed during the race");
+            },
+        )
+        .expect_err("a replacement moved by rename must fail post-publication identity validation");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, error.kind());
+        assert_eq!(
+            b"replacement-output",
+            std_fs::read(entry_path.join(&output_leaf))
+                .expect("replacement should have reached the unpublished final name")
+                .as_slice()
+        );
+        assert_eq!(
+            b"descriptor-bound-output",
+            std_fs::read(displaced_path)
+                .expect("descriptor-bound output should remain separately identifiable")
+                .as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mux_publishes_with_no_replace_when_the_final_name_is_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let media_path = entry_dir.join("video.m4s");
+        std::fs::write(&media_path, b"video").unwrap();
+        let output_path = entry_dir.join("Entry.mp4");
+        let ffmpeg = write_competing_output_fake_ffmpeg(temp.path(), &output_path);
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![DownloadedFile {
+                    kind: DownloadFileKind::Video,
+                    path: media_path.clone(),
+                    bytes_written: 5,
+                    resumed_from: 0,
+                }],
+                mux: None,
+            }],
+        };
+
+        let result = mux_download_report(report, &ffmpeg, &|| false).await;
+
+        assert!(matches!(result, Err(BilibiliDownloadError::Failed(_))));
+        assert_eq!(
+            b"competing-output",
+            std::fs::read(output_path).unwrap().as_slice()
+        );
+        assert!(!media_path.exists());
     }
 
     #[cfg(unix)]
@@ -5859,10 +11368,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let entry_dir = temp.path().join("entry");
         std::fs::create_dir_all(&entry_dir).unwrap();
-        let video_path = entry_dir.join("video.m4s");
-        let audio_path = entry_dir.join("audio.m4s");
-        std::fs::write(&video_path, b"video").unwrap();
-        std::fs::write(&audio_path, b"audio").unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"video").unwrap();
+        std::fs::write(&second_segment, b"audio").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
         let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
         let output_path = entry_dir.join("Entry.mp4");
         let temp_output_path = temporary_mux_output_path(&output_path);
@@ -5875,14 +11385,14 @@ mod tests {
                 directory: entry_dir,
                 files: vec![
                     DownloadedFile {
-                        kind: DownloadFileKind::Video,
-                        path: video_path.clone(),
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
                     DownloadedFile {
-                        kind: DownloadFileKind::Audio,
-                        path: audio_path.clone(),
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment.clone(),
                         bytes_written: 5,
                         resumed_from: 0,
                     },
@@ -5930,9 +11440,78 @@ mod tests {
         ));
         assert!(!output_path.exists());
         assert!(!temp_output_path.exists());
-        assert!(!video_path.exists());
-        assert!(!audio_path.exists());
+        assert!(!first_segment.exists());
+        assert!(!second_segment.exists());
+        assert!(!concat_list.exists());
         wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_mux_leaves_concat_manifest_for_owned_directory_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry_dir = temp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let first_segment = entry_dir.join("segment-1.flv");
+        let second_segment = entry_dir.join("segment-2.flv");
+        std::fs::write(&first_segment, b"video").unwrap();
+        std::fs::write(&second_segment, b"audio").unwrap();
+        let concat_list = entry_dir.join("cache-server-ffmpeg-concat.txt");
+        let ffmpeg = write_blocking_fake_ffmpeg(temp.path());
+        let report = DownloadReport {
+            title: "Example".to_owned(),
+            output_dir: temp.path().to_path_buf(),
+            entries: vec![EntryDownloadReport {
+                index: 1,
+                title: "Entry".to_owned(),
+                directory: entry_dir,
+                files: vec![
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: first_segment,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                    DownloadedFile {
+                        kind: DownloadFileKind::FlvSegment,
+                        path: second_segment,
+                        bytes_written: 5,
+                        resumed_from: 0,
+                    },
+                ],
+                mux: None,
+            }],
+        };
+        let ffmpeg_for_task = ffmpeg.clone();
+        let mux_task =
+            tokio::spawn(
+                async move { mux_download_report(report, &ffmpeg_for_task, &|| false).await },
+            );
+
+        wait_for_path(&temp.path().join("ffmpeg-started")).await;
+        let pid = std::fs::read_to_string(temp.path().join("ffmpeg.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        mux_task.abort();
+        let join_error = tokio::time::timeout(std::time::Duration::from_secs(3), mux_task)
+            .await
+            .expect("aborted mux should leave the runtime promptly")
+            .expect_err("aborted mux should not complete normally");
+
+        assert!(join_error.is_cancelled());
+        assert!(concat_list.is_file());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::task::yield_now(),
+        )
+        .await
+        .expect("aborting mux must not block the current-thread runtime");
+        wait_for_process_exit(pid).await;
+        tokio::fs::remove_file(concat_list)
+            .await
+            .expect("test should emulate the owned-directory cleanup worker");
     }
 
     #[tokio::test]
@@ -6006,6 +11585,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         }
     }
 
@@ -6020,6 +11600,7 @@ mod tests {
             subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
             download_cover: false,
             danmaku_formats: Vec::new(),
+            download_mode: 0,
         }
     }
 
@@ -6296,6 +11877,150 @@ for arg in "$@"; do
   last=$arg
 done
 printf muxed > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_concat_reading_fake_ffmpeg(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("concat-reading-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+input=
+expect_input=0
+last=
+for arg in "$@"; do
+  if [ "$expect_input" -eq 1 ]; then
+    input=$arg
+    expect_input=0
+  elif [ "$arg" = "-i" ]; then
+    expect_input=1
+  fi
+  last=$arg
+done
+cat "$input" > "$script_dir/ffmpeg-concat.log"
+printf muxed > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_source_replacing_fake_ffmpeg(dir: &std::path::Path, source_path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            dir.join("source-mutation-path"),
+            source_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let path = dir.join("source-replacing-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+source_path=$(cat "$script_dir/source-mutation-path")
+first_input=
+expect_input=0
+last=
+for arg in "$@"; do
+  if [ "$expect_input" -eq 1 ]; then
+    if [ -z "$first_input" ]; then
+      first_input=$arg
+    fi
+    expect_input=0
+  elif [ "$arg" = "-i" ]; then
+    expect_input=1
+  fi
+  last=$arg
+done
+rm -f -- "$source_path"
+printf replacement-source > "$source_path"
+cat "$first_input" > "$last"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_path_replacing_fake_ffmpeg(
+        dir: &std::path::Path,
+        mutation_path: &Path,
+        replacement: &str,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            dir.join("mux-mutation-path"),
+            mutation_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("mux-mutation-value"), replacement).unwrap();
+        let path = dir.join("path-replacing-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+mutation_path=$(cat "$script_dir/mux-mutation-path")
+replacement=$(cat "$script_dir/mux-mutation-value")
+last=
+for arg in "$@"; do
+  last=$arg
+done
+printf muxed > "$last"
+rm -f -- "$mutation_path"
+printf '%s' "$replacement" > "$mutation_path"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_competing_output_fake_ffmpeg(dir: &std::path::Path, output_path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            dir.join("competing-output-path"),
+            output_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let path = dir.join("competing-output-fake-ffmpeg");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+output_path=$(cat "$script_dir/competing-output-path")
+last=
+for arg in "$@"; do
+  last=$arg
+done
+printf muxed > "$last"
+printf competing-output > "$output_path"
 "#,
         )
         .unwrap();

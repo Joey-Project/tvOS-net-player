@@ -4,7 +4,8 @@ use crate::{
     bbdown_adapter::{BbdownBilibiliAdapter, BilibiliPlaybackPlan},
     bilibili_worker::BilibiliDownloadError,
     generated::tvos_net_player::v1::{
-        BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliSubtitleAiPolicy,
+        BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliRequestContext,
+        BilibiliSubtitleAiPolicy,
     },
     playback_policy::PlaybackPolicy,
     task_registry::BilibiliTaskCancellation,
@@ -42,6 +43,7 @@ pub(crate) trait BilibiliPlaybackPlanner: Send + Sync + 'static {
 pub(crate) struct BilibiliInputResolveRequest {
     pub source: String,
     pub options: Option<BilibiliPlaybackOptions>,
+    pub request_context: Option<BilibiliRequestContext>,
     pub candidate_limit: usize,
     pub include_candidate_cover_uri: bool,
     pub cancellation: BilibiliTaskCancellation,
@@ -132,6 +134,7 @@ pub(crate) struct BilibiliResolvedCandidate {
 pub(crate) struct BilibiliPlaybackPlanningRequest {
     pub source: String,
     pub options: Option<BilibiliPlaybackOptions>,
+    pub request_context: Option<BilibiliRequestContext>,
     pub selection_id: Option<String>,
     pub cancellation: BilibiliTaskCancellation,
 }
@@ -148,6 +151,7 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
             self.resolve_playback_input(
                 &request.source,
                 download_options.as_ref(),
+                request.request_context.as_ref(),
                 request.candidate_limit,
                 request.include_candidate_cover_uri,
                 || request.cancellation.is_cancel_requested(),
@@ -169,6 +173,7 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
                 &request.source,
                 request.selection_id.as_deref(),
                 download_options.as_ref(),
+                request.request_context.as_ref(),
                 playback_policy,
                 || request.cancellation.is_cancel_requested(),
             )
@@ -188,5 +193,6 @@ fn playback_to_download_options(options: &BilibiliPlaybackOptions) -> BilibiliDo
         subtitle_ai_policy: BilibiliSubtitleAiPolicy::Unspecified.into(),
         download_cover: false,
         danmaku_formats: Vec::new(),
+        download_mode: 0,
     }
 }

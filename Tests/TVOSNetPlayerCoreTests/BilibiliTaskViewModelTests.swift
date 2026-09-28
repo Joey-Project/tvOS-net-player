@@ -61,6 +61,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         let requests = await client.createdRequestsSnapshot()
+        XCTAssertNil(model.errorMessage)
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.urlOrID, "BV1test")
         XCTAssertEqual(requests.first?.selectionID, "page:1")
