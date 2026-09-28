@@ -3,7 +3,7 @@ id: 20260827-d8c4f1
 title: Task Output And Bilibili Schema V2 Roadmap
 status: active
 created: 2026-08-27
-updated: 2026-08-31
+updated: 2026-09-28
 branch:
 pr:
 supersedes: []
@@ -108,13 +108,14 @@ Implementation contract:
 ## Validation Contract
 
 - Start each PR from the updated repository default branch and use a focused `wip/<topic>` branch.
-- Run focused tests plus the full local `just ci` gate for every PR.
-- Require GitHub CI, the repository review gate, an independent fresh-context Codex review, and zero unresolved conversations before merge.
-- Per the repository-specific override, Claude review is not required for this workstream.
+- Run focused tests plus the full local `just ci` gate for every PR. If the host's tvOS simulator is unavailable, run the independent build, test, format, and lint steps locally, record the blocked simulator step, and require the GitHub macOS simulator job to pass.
+- Require GitHub CI, a current-head GitHub PR `@codex review`, and zero unresolved conversations before merge. Local review lanes and Claude review are not required for this repository.
 - Merge one PR at a time, update local `master`, and only then branch the next slice.
 
 ## Current State
 
+- As of 2026-09-28, PR 6A (#57), PR 6B (#58), and PR 6C (#59) are merged into `master`. PR 6D (#60) is open at remote head `12202e176227ec0900f03eb103a6ab0742706b70`; its existing CI and GitHub Codex result apply only to that head. The local signed PR 6D implementation head is `2ef869cc5141ab651a54890615e097f5edf1cf19`, 21 commits ahead of the remote branch, and has not been pushed. PR 6E has not started.
+- The latest local PR 6D validation was performed on 2026-08-31: 856 Rust unit tests, 34 default live-e2e helper tests, 6 Rust integration tests, 294 Swift package tests, Rust release build, generic tvOS/macOS builds, generic tvOS test build, macOS AppShell integration, formatting, lint, and pre-commit checks passed. The real-network Rust case was ignored by default. Local tvOS simulator execution was blocked by CoreSimulator `1051.54.0` versus Xcode's required `1051.55.0`; these results are historical and must be refreshed for delivery.
 - PR 6A provides the additive generic pagination, task output summary, per-result progress/problem, artifact, resource-reference, and paginated task-result contracts plus generated Swift public models.
 - PR 6B implements ordered generic output state in the Rust task registry, derives compact summaries for legacy and v2 reads, and migrates disk snapshots from schema v1 to a fail-closed v2 format that persists results, problems, artifacts, public resource metadata, revisions, snapshot IDs, and primary-result identity.
 - `ListTaskResults` now serves bounded immutable snapshots through random, task-bound continuation tokens. Existing snapshots remain internally consistent across later output revisions, while malformed, cross-task, expired, and evicted tokens fail explicitly.
@@ -246,7 +247,9 @@ Implementation contract:
 
 ## Next Steps
 
-- Implement PR 6E direct-v2 AppCore, tvOS, and macOS workflows plus live macOS validation after PR 6D lands.
+- Finish PR 6D on its current branch: refresh the relevant build/test/lint gate, push the signed implementation head to PR #60, obtain CI and GitHub `@codex review` for the pushed head, address findings, and resolve every conversation. Repeat affected validation and current-head review after fixes, then merge only when all gates pass.
+- Update local `master` after PR 6D merges. Create a new focused branch for PR 6E and move shared AppCore, tvOS, and macOS Bilibili workflows directly to v2 without a legacy RPC fallback. Add paginated candidate/result handling, artifact actions, and explicit upgrade-required diagnostics.
+- Validate PR 6E through macOS interactive/live e2e cases, complete builds/tests/lint, GitHub CI, current-head `@codex review`, and zero unresolved conversations before merging. Physical Apple TV validation remains deferred.
 
 ## Evidence
 
