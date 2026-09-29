@@ -70,6 +70,19 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(requests.first?.options.qualityPreference, "1080p")
         XCTAssertEqual(requests.first?.options.encodingPreference, "h264")
         XCTAssertEqual(requests.first?.options.audioLanguagePreference, "ja-jp")
+        let v2Requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(v2Requests.count, 1)
+        XCTAssertEqual(v2Requests.first?.selection, .single(candidateToken: "page:1"))
+        if case let .playback(spec) = v2Requests.first?.execution {
+            XCTAssertEqual(spec.qualityQN, 80)
+            XCTAssertEqual(spec.codec, .h264)
+            XCTAssertEqual(spec.audioLanguage, "ja-jp")
+        } else {
+            XCTFail("Expected typed playback execution.")
+        }
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.count, 1)
         XCTAssertEqual(resolvedRequests.first?.urlOrID, "BV1test")
@@ -188,14 +201,31 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(downloadRequests.first?.options.danmakuFormats, [.xml, .ass])
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         let playbackRequests = await client.createdRequestsSnapshot()
-        XCTAssertTrue(resolvedRequests.isEmpty)
+        XCTAssertEqual(resolvedRequests.count, 1)
         XCTAssertTrue(playbackRequests.isEmpty)
+        let v2Requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(v2Requests.count, 1)
+        XCTAssertEqual(v2Requests.first?.selection, .single(candidateToken: "page:1"))
+        if case let .download(spec) = v2Requests.first?.execution {
+            XCTAssertEqual(spec.qualityQN, 80)
+            XCTAssertEqual(spec.audioLanguage, "ja-jp")
+            XCTAssertTrue(spec.downloadSubtitles)
+            XCTAssertTrue(spec.downloadDanmaku)
+            XCTAssertTrue(spec.downloadCover)
+            XCTAssertEqual(spec.subtitleAIPolicy, .preferNonAI)
+            XCTAssertEqual(spec.danmakuFormats, [.xml, .ass])
+        } else {
+            XCTFail("Expected typed download execution.")
+        }
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
         XCTAssertEqual(model.currentTask?.id, "bilibili-download-1")
 
         model.clearTask()
     }
 
-    func testSubmitFallsBackToLegacySelectionWhenStructuredSelectionIsUnsupported() async {
+    func testSubmitUsesV2SelectionWhenLegacySelectionIsUnsupported() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [
                 .success(.fixture(source: "BV1legacy-selection", state: "TASK_STATE_PREPARING"))
@@ -213,12 +243,15 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.urlOrID, "BV1legacy-selection")
         XCTAssertEqual(requests.first?.selectionID, "page:1")
-        XCTAssertNil(requests.first?.selection)
+        XCTAssertEqual(requests.first?.selection?.mode, "single")
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
 
         model.clearTask()
     }
 
-    func testSubmitFallsBackToCreateWhenResolveIsUnsupported() async {
+    func testSubmitDoesNotFallBackToLegacyCreateWhenV2ResolutionFails() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
                 .failure(CacheControlClientUnsupportedFeature.bilibiliResolve)
@@ -240,16 +273,99 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.count, 1)
         let requests = await client.createdRequestsSnapshot()
-        XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.urlOrID, "BV1legacy")
-        XCTAssertNil(requests.first?.selectionID)
-        XCTAssertEqual(requests.first?.options.qualityPreference, "720p")
-        XCTAssertEqual(requests.first?.options.encodingPreference, "h265")
-        XCTAssertEqual(requests.first?.options.audioLanguagePreference, "en-US")
-        XCTAssertEqual(model.currentTask?.source, "BV1legacy")
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNotNil(model.errorMessage)
         XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
 
         model.clearTask()
+    }
+
+    func testSubmitRequiresTaskOutputV2BeforeStartingResolution() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1no-output", state: "TASK_STATE_PREPARING"))
+            ],
+            supportsTaskOutputV2: false
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1no-output",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.errorMessage?.contains("Paginated Bilibili task results are unavailable") == true)
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        let resolutions = await client.resolvedRequestsSnapshot()
+        let creates = await client.v2TaskRequestsSnapshot()
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertTrue(resolutions.isEmpty)
+        XCTAssertTrue(creates.isEmpty)
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
+        model.clearTask()
+    }
+
+    func testSubmitRequiresResolutionAndExecutionV2WithoutLegacyFallback() async {
+        for capabilities in [(false, true), (true, false)] {
+            let client = FakeBilibiliCacheControlClient(
+                createResponses: [
+                    .success(.fixture(source: "BV1upgrade", state: "TASK_STATE_PREPARING"))
+                ],
+                supportsBilibiliResolutionV2: capabilities.0,
+                supportsBilibiliExecutionV2: capabilities.1
+            )
+            let model = BilibiliTaskViewModel(
+                sourceText: "BV1upgrade",
+                clientFactory: { _ in client }
+            )
+
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+
+            XCTAssertTrue(model.errorMessage?.contains("Upgrade the cache server") == true)
+            XCTAssertNil(model.currentTask)
+            XCTAssertFalse(model.isResolving)
+            XCTAssertFalse(model.isSubmitting)
+            let resolutions = await client.resolvedRequestsSnapshot()
+            let creates = await client.v2TaskRequestsSnapshot()
+            let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+            XCTAssertTrue(resolutions.isEmpty)
+            XCTAssertTrue(creates.isEmpty)
+            XCTAssertEqual(legacyCalls.resolve, 0)
+            XCTAssertEqual(legacyCalls.create, 0)
+            model.clearTask()
+        }
+    }
+
+    func testUnknownQualityAndCodecPreferencesAreRejectedBeforeResolution() async {
+        for preferences in [("ultra-quality", "h264"), ("1080p", "vp9")] {
+            let client = FakeBilibiliCacheControlClient(createResponses: [])
+            let model = BilibiliTaskViewModel(
+                sourceText: "BV1invalid-preference",
+                qualityPreference: preferences.0,
+                encodingPreference: preferences.1,
+                clientFactory: { _ in client }
+            )
+
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+
+            XCTAssertTrue(model.errorMessage?.contains("not recognized") == true)
+            let resolutions = await client.resolvedRequestsSnapshot()
+            let creates = await client.v2TaskRequestsSnapshot()
+            let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+            XCTAssertTrue(resolutions.isEmpty)
+            XCTAssertTrue(creates.isEmpty)
+            XCTAssertEqual(legacyCalls.resolve, 0)
+            XCTAssertEqual(legacyCalls.create, 0)
+            model.clearTask()
+        }
     }
 
     func testSubmitResolvesCollectionAndFeedInputsBeforeSelection() async {
@@ -561,7 +677,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(requests[1].selection?.selectionIDs, [])
     }
 
-    func testBatchSelectionDoesNotFallbackToLegacySelectionWhenUnsupported() async {
+    func testV2BatchSelectionDoesNotDependOnLegacySelectionCapability() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
                 .success(
@@ -574,7 +690,9 @@ final class BilibiliTaskViewModelTests: XCTestCase {
                         defaultSelectionID: ""
                     ))
             ],
-            createResponses: [],
+            createResponses: [
+                .success(.fixture(source: "BV1unsupported", state: "TASK_STATE_PREPARING"))
+            ],
             supportsTaskSelection: false
         )
         let model = BilibiliTaskViewModel(
@@ -589,23 +707,24 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         let requests = await client.createdRequestsSnapshot()
-        XCTAssertTrue(requests.isEmpty)
-        XCTAssertNil(model.currentTask)
-        XCTAssertEqual(model.statusMessage, "Could not submit Bilibili playback task.")
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selection?.mode, "multiple")
+        XCTAssertEqual(requests.first?.selection?.selectionIDs, ["page:1", "page:2"])
+        XCTAssertNotNil(model.currentTask)
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
     }
 
-    func testAllSelectionIsUnavailableWhenResolvedCandidatesAreTruncated() async {
+    func testAllSelectionIsUnavailableAboveExecutionLimitWithoutLoadingAllCandidates() async {
+        let candidates = makeCandidates(count: 101, prefix: "fav")
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
                 .success(
                     .fixture(
                         source: "fav123",
-                        candidates: [
-                            .fixture(selectionID: "fav:1", title: "Item 1", index: 1),
-                            .fixture(selectionID: "fav:2", title: "Item 2", index: 2),
-                        ],
-                        defaultSelectionID: "",
-                        candidatesTruncated: true
+                        candidates: candidates,
+                        defaultSelectionID: "fav-token-1"
                     ))
             ],
             createResponses: [
@@ -618,6 +737,8 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
         XCTAssertFalse(model.availableCandidateSelectionModes.contains(.all))
         model.candidateSelectionMode = .all
 
@@ -625,28 +746,27 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.selectedCandidateCount, 0)
         XCTAssertEqual(
             model.candidateSelectionSummary,
-            "All selection is unavailable because the resolved item list is truncated."
+            "All selection is available only for lists of up to 100 items."
         )
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         let requests = await client.createdRequestsSnapshot()
         XCTAssertTrue(requests.isEmpty)
+        let pageRequests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertTrue(pageRequests.isEmpty)
     }
 
-    func testTruncatedResolveShowsBoundedWindowNotice() async {
+    func testPagedResolutionShowsLoadMoreNotice() async {
+        let candidates = makeCandidates(count: 60, prefix: "item")
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
                 .success(
                     .fixture(
                         source: "fav123",
                         sourceKind: "favorite",
-                        candidates: [
-                            .fixture(selectionID: "item:1", title: "Item 1", index: 1),
-                            .fixture(selectionID: "item:2", title: "Item 2", index: 2),
-                        ],
-                        defaultSelectionID: "",
-                        candidatesTruncated: true
+                        candidates: candidates,
+                        defaultSelectionID: "item-token-1"
                     ))
             ],
             createResponses: []
@@ -658,26 +778,25 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
-        XCTAssertEqual(model.fetchNotice?.title, "Showing a bounded window")
-        XCTAssertEqual(model.fetchNotice?.tone, .warning)
-        XCTAssertEqual(model.fetchNotice?.actionTitle, "Re-resolve")
-        XCTAssertFalse(model.availableCandidateSelectionModes.contains(.all))
+        XCTAssertEqual(model.fetchNotice?.title, "More items available")
+        XCTAssertEqual(model.fetchNotice?.tone, .info)
+        XCTAssertEqual(model.fetchNotice?.actionTitle, "Load More")
+        XCTAssertTrue(model.availableCandidateSelectionModes.contains(.all))
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
         XCTAssertTrue(model.canReResolve)
     }
 
     func testResolvedFetchNoticeClearsAfterPlaybackTaskSubmission() async {
+        let candidates = makeCandidates(count: 60, prefix: "item")
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
                 .success(
                     .fixture(
                         source: "fav123",
                         sourceKind: "favorite",
-                        candidates: [
-                            .fixture(selectionID: "item:1", title: "Item 1", index: 1),
-                            .fixture(selectionID: "item:2", title: "Item 2", index: 2),
-                        ],
-                        defaultSelectionID: "",
-                        candidatesTruncated: true
+                        candidates: candidates,
+                        defaultSelectionID: "item-token-1"
                     ))
             ],
             createResponses: [
@@ -690,14 +809,141 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
-        XCTAssertEqual(model.fetchNotice?.title, "Showing a bounded window")
+        XCTAssertEqual(model.fetchNotice?.title, "More items available")
 
-        model.selectedCandidateID = "item:1"
+        model.selectedCandidateID = "item-token-1"
         await model.submit(serverAddressText: "mac-mini.local:50051")
 
         XCTAssertEqual(model.currentTask?.source, "fav123")
         XCTAssertNil(model.fetchNotice)
         XCTAssertFalse(model.canReResolve)
+    }
+
+    func testAllSelectionUsesServerSideSelectionWithoutLoadingEveryCandidatePage() async {
+        let candidates = makeCandidates(count: 60, prefix: "all")
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1all-paged",
+                        candidates: candidates,
+                        defaultSelectionID: "all-token-1"
+                    ))
+            ],
+            createResponses: [
+                .success(.fixture(source: "BV1all-paged", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1all-paged",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
+        XCTAssertTrue(model.availableCandidateSelectionModes.contains(.all))
+        model.candidateSelectionMode = .all
+        XCTAssertEqual(model.selectedCandidateCount, 60)
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.selection, .all)
+        let pageRequests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertTrue(pageRequests.isEmpty)
+        model.clearTask()
+    }
+
+    func testPagedLargeDownloadCanSubmitRangeOfAtMost100Candidates() async {
+        let candidates = makeCandidates(count: 101, prefix: "download")
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1download-large",
+                        candidates: candidates,
+                        defaultSelectionID: "download-token-1"
+                    ))
+            ],
+            createResponses: [
+                .success(
+                    .fixture(id: "bilibili-download-large", source: "BV1download-large", state: "TASK_STATE_QUEUED"))
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1download-large",
+            clientFactory: { _ in client }
+        )
+        model.submissionMode = .download
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
+        XCTAssertFalse(model.availableCandidateSelectionModes.contains(.all))
+        let requestsBeforeSelection = await client.v2TaskRequestsSnapshot()
+        XCTAssertTrue(requestsBeforeSelection.isEmpty)
+
+        await model.loadMoreResolvedCandidates(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.resolvedCandidates.count, 100)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
+        model.candidateSelectionMode = .range
+        model.chooseCandidate(model.resolvedCandidates[0])
+        model.chooseCandidate(model.resolvedCandidates[99])
+        XCTAssertEqual(model.selectedCandidateCount, 100)
+        XCTAssertTrue(model.canSubmit)
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        let requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(
+            requests.first?.selection,
+            .range(startCandidateToken: "download-token-1", endCandidateToken: "download-token-100")
+        )
+        if let execution = requests.first?.execution, case let .download(spec) = execution {
+            XCTAssertEqual(spec.qualityQN, 0)
+        } else {
+            XCTFail("Expected typed download execution.")
+        }
+        model.clearTask()
+    }
+
+    func testCandidatePageSnapshotMismatchAndExpiryInvalidateResolution() async {
+        let candidates = makeCandidates(count: 60, prefix: "expiry")
+        for mismatch in [true, false] {
+            let client = FakeBilibiliCacheControlClient(
+                resolveResponses: [
+                    .success(
+                        .fixture(
+                            source: "BV1candidate-expiry",
+                            candidates: candidates,
+                            defaultSelectionID: "expiry-token-1"
+                        ))
+                ],
+                createResponses: []
+            )
+            let model = BilibiliTaskViewModel(
+                sourceText: "BV1candidate-expiry",
+                clientFactory: { _ in client }
+            )
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+            if mismatch {
+                await client.setCandidatePageSnapshotMismatchNext()
+            } else {
+                await client.setCandidatePageFailureNext("Bilibili resolution page token is invalid or expired.")
+            }
+
+            await model.loadMoreResolvedCandidates(serverAddressText: "mac-mini.local:50051")
+
+            XCTAssertNil(model.resolutionSession)
+            XCTAssertFalse(model.hasMoreResolvedCandidates)
+            XCTAssertTrue(model.errorMessage?.contains("resolution expired") == true)
+            XCTAssertEqual(model.statusMessage, "Re-resolve the Bilibili input before submitting.")
+            model.clearTask()
+        }
     }
 
     func testDynamicFeedResolveShowsVolatilityNoticeForServerSourceKinds() async {
@@ -731,7 +977,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             XCTAssertEqual(model.fetchNotice?.tone, .info, sourceKind)
             XCTAssertEqual(
                 model.fetchNotice?.message,
-                "This Bilibili list or feed can reorder between refreshes. Single and multiple selections submit stable item IDs; Range and All follow the refreshed list order.",
+                "This Bilibili list or feed can reorder between refreshes. Selections use candidate tokens from this immutable resolution.",
                 sourceKind
             )
             XCTAssertTrue(model.canReResolve, sourceKind)
@@ -1651,6 +1897,39 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitCleansUpWhenSubmissionModeChangesDuringResolve() async {
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1mode-change", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1mode-change",
+            clientFactory: { _ in client }
+        )
+
+        let submitTask = Task {
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForResolveRequestCount(1)
+        XCTAssertTrue(model.isResolving)
+        XCTAssertTrue(model.isSubmitting)
+
+        model.submissionMode = .download
+        await client.completeNextResolve(with: .success(.fixture(source: "BV1mode-change")))
+        await submitTask.value
+
+        XCTAssertFalse(model.isResolving)
+        XCTAssertFalse(model.isSubmitting)
+        XCTAssertNil(model.resolutionSession)
+        XCTAssertNil(model.currentTask)
+        XCTAssertEqual(model.statusMessage, "Bilibili submission mode changed before resolve completed.")
+        let requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertTrue(requests.isEmpty)
+        model.clearTask()
+    }
+
     func testPlayablePartialTaskKeepsPlaybackEnabledAndShowsFillProgressBadge() async {
         let client = FakeBilibiliCacheControlClient(createResponses: [
             .success(.playableFixture(downloadedBytes: 256, totalBytes: 1_024))
@@ -1810,6 +2089,224 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.statusMessage, "1 of 2 Bilibili results are ready; 1 failed.")
         XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Partial result success")
 
+        model.clearTask()
+    }
+
+    func testV2TaskResultsRefreshByRevisionAppendPagesAndPresentArtifacts() async {
+        let revision1 = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 2,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 1,
+            primaryResultID: "page-1"
+        )
+        let revision2 = CacheTaskOutputSummary(
+            revision: 2,
+            resultCount: 2,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: "revision-2-page-1"
+        )
+        let artifact = CacheTaskArtifact.fixture(
+            id: "subtitle-en",
+            uri: "http://mac-mini.local:8080/results/page-1/subtitle.srt",
+            libraryItemID: "subtitle-library-item"
+        )
+        let page1 = CacheTaskResultsPage(
+            results: [.fixture(id: "page-1", title: "Page One", artifacts: [artifact])],
+            pageInfo: CachePageInfo(totalSize: 2, nextPageToken: "revision-1-next", snapshotID: "snapshot-1"),
+            outputRevision: 1
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1result-pages",
+                        state: "TASK_STATE_PREPARING",
+                        resultItems: [.fixture(id: "legacy-inline", title: "Legacy row")],
+                        outputSummary: revision1
+                    ))
+            ],
+            taskResultPagesByTaskID: ["bilibili-playback-1": [page1]],
+            suspendsTaskResultResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1result-pages",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForTaskResultRequestCount(1)
+        XCTAssertTrue(model.taskResults.isEmpty)
+        XCTAssertTrue(model.isLoadingMoreTaskResults)
+        XCTAssertEqual(model.currentTask?.resultItems.map(\.id), ["legacy-inline"])
+
+        await client.completeNextTaskResult(with: .success(page1))
+        await waitUntil(model.taskResults.map(\.id) == ["page-1"])
+        XCTAssertTrue(model.hasMoreTaskResults)
+        guard let presentedArtifact = model.taskResults.first?.artifacts.first else {
+            XCTFail("Expected a task result artifact.")
+            return
+        }
+        XCTAssertEqual(presentedArtifact.id, "subtitle-en")
+        XCTAssertTrue(presentedArtifact.isAvailable)
+        XCTAssertTrue(presentedArtifact.canOpenResource)
+        XCTAssertTrue(presentedArtifact.canOpenInLibrary)
+        XCTAssertEqual(presentedArtifact.libraryItemID, "subtitle-library-item")
+        XCTAssertEqual(
+            model.artifactURL(for: presentedArtifact)?.absoluteString,
+            "http://mac-mini.local:8080/results/page-1/subtitle.srt"
+        )
+
+        await client.setSuspendsTaskResultResponses(false)
+        let page2 = CacheTaskResultsPage(
+            results: [.fixture(id: "page-2", title: "Page Two")],
+            pageInfo: CachePageInfo(totalSize: 2, nextPageToken: "", snapshotID: "snapshot-1"),
+            outputRevision: 1
+        )
+        await client.enqueueTaskResultPage(
+            taskID: "bilibili-playback-1", pageToken: "revision-1-next", result: .success(page2))
+        await model.loadMoreTaskResults(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.taskResults.map(\.id), ["page-1", "page-2"])
+        XCTAssertFalse(model.hasMoreTaskResults)
+
+        await client.setSuspendsTaskResultResponses(true)
+        let updatedTask = CacheTask.fixture(
+            source: "BV1result-pages",
+            state: "TASK_STATE_PREPARING",
+            resultItems: [.fixture(id: "legacy-revision-2", title: "Stale inline row")],
+            outputSummary: revision2
+        )
+        await client.yield(updatedTask)
+        await waitUntil(model.currentTask?.outputSummary?.revision == 2)
+        XCTAssertTrue(model.taskResults.isEmpty)
+        await client.waitForTaskResultRequestCount(3)
+
+        let revision2Page1 = CacheTaskResultsPage(
+            results: [.fixture(id: "revision-2-page-1", title: "Revision Two")],
+            pageInfo: CachePageInfo(totalSize: 2, nextPageToken: "revision-2-next", snapshotID: "snapshot-2"),
+            outputRevision: 2
+        )
+        await client.completeNextTaskResult(with: .success(revision2Page1))
+        await waitUntil(model.taskResults.map(\.id) == ["revision-2-page-1"])
+
+        await client.setSuspendsTaskResultResponses(false)
+        let revision2Page2 = CacheTaskResultsPage(
+            results: [.fixture(id: "revision-2-page-2", title: "Revision Two Continued")],
+            pageInfo: CachePageInfo(totalSize: 2, nextPageToken: "", snapshotID: "snapshot-2"),
+            outputRevision: 2
+        )
+        await client.enqueueTaskResultPage(
+            taskID: "bilibili-playback-1",
+            pageToken: "revision-2-next",
+            result: .success(revision2Page2)
+        )
+        await model.loadMoreTaskResults(serverAddressText: "mac-mini.local:50051")
+        XCTAssertEqual(model.taskResults.map(\.id), ["revision-2-page-1", "revision-2-page-2"])
+        XCTAssertFalse(model.taskResults.contains { $0.id.hasPrefix("legacy-") })
+        model.clearTask()
+    }
+
+    func testTaskResultsCanRetryTransientFirstPageFailure() async {
+        let summary = CacheTaskOutputSummary(
+            revision: 4,
+            resultCount: 1,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: "result-after-retry"
+        )
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    source: "BV1retry-results",
+                    state: "TASK_STATE_PREPARING",
+                    resultItems: [.fixture(id: "legacy-only")],
+                    outputSummary: summary
+                ))
+        ])
+        let expectedPage = CacheTaskResultsPage(
+            results: [.fixture(id: "result-after-retry", title: "Recovered result")],
+            pageInfo: CachePageInfo(totalSize: 1, nextPageToken: "", snapshotID: "snapshot-retry"),
+            outputRevision: 4
+        )
+        await client.enqueueTaskResultPage(
+            taskID: "bilibili-playback-1",
+            pageToken: "",
+            result: .failure(FakeLocalizedError(message: "Temporary result-page failure."))
+        )
+        await client.enqueueTaskResultPage(
+            taskID: "bilibili-playback-1",
+            pageToken: "",
+            result: .success(expectedPage)
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1retry-results",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await waitUntil(model.taskResultsErrorMessage != nil)
+        XCTAssertTrue(model.taskResults.isEmpty)
+        XCTAssertFalse(model.isLoadingMoreTaskResults)
+
+        await model.retryTaskResults(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.taskResults.map(\.id), ["result-after-retry"])
+        XCTAssertNil(model.taskResultsErrorMessage)
+        let requests = await client.taskResultRequestsSnapshot()
+        XCTAssertEqual(requests.map(\.pageToken), ["", ""])
+        model.clearTask()
+    }
+
+    func testTaskOutputCapabilityLossHasExplicitDiagnosticWithoutLegacyRows() async {
+        let summary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 1,
+            terminalResultCount: 0,
+            successfulResultCount: 0,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: ""
+        )
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .fixture(
+                    source: "BV1output-dropped",
+                    state: "TASK_STATE_PREPARING",
+                    resultItems: [.fixture(id: "legacy-output-row")],
+                    outputSummary: summary
+                ))
+        ])
+        await client.enqueueTaskResultPage(
+            taskID: "bilibili-playback-1",
+            pageToken: "",
+            result: .failure(CacheControlClientUnsupportedOperation.taskOutputV2)
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1output-dropped",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await waitUntil(model.taskResultsErrorMessage != nil)
+
+        XCTAssertNotNil(model.currentTask)
+        XCTAssertTrue(model.taskResults.isEmpty)
+        XCTAssertTrue(
+            model.taskResultsErrorMessage?.contains("Paginated Bilibili task results are unavailable") == true)
+        let legacyCalls = await client.legacyRPCCallCountsSnapshot()
+        XCTAssertEqual(legacyCalls.resolve, 0)
+        XCTAssertEqual(legacyCalls.create, 0)
         model.clearTask()
     }
 
@@ -3103,18 +3600,63 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         XCTAssertTrue(condition(), file: file, line: line)
     }
+
+    private func makeCandidates(count: Int, prefix: String) -> [BilibiliResolvedCandidate] {
+        (1...count).map { index in
+            .fixture(
+                selectionID: "\(prefix)-token-\(index)",
+                title: "Item \(index)",
+                index: index
+            )
+        }
+    }
+}
+
+private struct FakeBilibiliTaskV2Request: Sendable {
+    let sessionID: String
+    let selection: BilibiliResolutionSelection
+    let execution: BilibiliTaskExecution
+}
+
+private struct FakeCandidatePageCursor: Sendable {
+    let sessionID: String
+    let offset: Int
 }
 
 private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var resolveResponses: [Result<BilibiliResolveResult, Error>]
+    private var resolutionStartResponses: [Result<BilibiliResolutionPage, Error>]
     private var createResponses: [Result<CacheTask, Error>]
     private let cancelResponsesByID: [String: CacheTask]
     private let supportsTaskSelection: Bool
+    private let supportsBilibiliResolutionV2: Bool
+    private let supportsBilibiliExecutionV2: Bool
+    private let supportsTaskOutputV2: Bool
     private var suspendsResolveResponses: Bool
     private var suspendsCreateResponses: Bool
+    private var suspendsTaskResultResponses = false
     private var suspendsCancelResponses = false
     private var resolvedRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
     private var downloadRequests: [(urlOrID: String, options: BilibiliDownloadTaskOptions)] = []
+    private var resolutionPageRequests: [(sessionID: String, pageToken: String, pageSize: Int)] = []
+    private var v2TaskRequests: [FakeBilibiliTaskV2Request] = []
+    private var legacyResolveCallCount = 0
+    private var legacyCreateCallCount = 0
+    private var resolutionSessions: [String: BilibiliResolutionSession] = [:]
+    private var resolutionCandidates: [String: [BilibiliResolutionCandidate]] = [:]
+    private var resolutionSnapshots: [String: String] = [:]
+    private var resolutionOptionsBySession: [String: BilibiliPlaybackTaskOptions] = [:]
+    private var resolutionSourcesBySession: [String: String] = [:]
+    private var candidateIndexesBySession: [String: [String: Int]] = [:]
+    private var candidatePageCursors: [String: FakeCandidatePageCursor] = [:]
+    private var candidatePageFailureNext: String?
+    private var candidatePageSnapshotMismatchNext = false
+    private var nextResolutionSessionID = 1
+    private var createdTasksByID: [String: CacheTask] = [:]
+    private var taskResultPagesByRequest: [String: [Result<CacheTaskResultsPage, Error>]] = [:]
+    private var taskResultRequests: [(taskID: String, pageToken: String, pageSize: Int)] = []
+    private var pendingTaskResultContinuations: [CheckedContinuation<CacheTaskResultsPage, Error>] = []
+    private var taskResultRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var createdRequests:
         [(
             urlOrID: String,
@@ -3136,22 +3678,57 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     init(
         resolveResponses: [Result<BilibiliResolveResult, Error>] = [],
+        resolutionStartResponses: [Result<BilibiliResolutionPage, Error>] = [],
         createResponses: [Result<CacheTask, Error>],
         cancelResponsesByID: [String: CacheTask] = [:],
         supportsTaskSelection: Bool = true,
+        supportsBilibiliResolutionV2: Bool = true,
+        supportsBilibiliExecutionV2: Bool = true,
+        supportsTaskOutputV2: Bool = true,
+        taskResultPagesByTaskID: [String: [CacheTaskResultsPage]] = [:],
         suspendsResolveResponses: Bool = false,
-        suspendsCreateResponses: Bool = false
+        suspendsCreateResponses: Bool = false,
+        suspendsTaskResultResponses: Bool = false
     ) {
         self.resolveResponses = resolveResponses
+        self.resolutionStartResponses = resolutionStartResponses
         self.createResponses = createResponses
         self.cancelResponsesByID = cancelResponsesByID
         self.supportsTaskSelection = supportsTaskSelection
+        self.supportsBilibiliResolutionV2 = supportsBilibiliResolutionV2
+        self.supportsBilibiliExecutionV2 = supportsBilibiliExecutionV2
+        self.supportsTaskOutputV2 = supportsTaskOutputV2
+        self.suspendsTaskResultResponses = suspendsTaskResultResponses
         self.suspendsResolveResponses = suspendsResolveResponses
         self.suspendsCreateResponses = suspendsCreateResponses
+        for (taskID, pages) in taskResultPagesByTaskID {
+            var pageToken = ""
+            for page in pages {
+                taskResultPagesByRequest[Self.taskResultRequestKey(taskID: taskID, pageToken: pageToken), default: []]
+                    .append(.success(page))
+                pageToken = page.nextPageToken
+            }
+        }
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
-        throw FakeBilibiliCacheControlClientError.notImplemented
+        var capabilities: [String] = []
+        if supportsBilibiliResolutionV2 {
+            capabilities.append(CacheServerCapability.bilibiliResolutionV2)
+        }
+        if supportsBilibiliExecutionV2 {
+            capabilities.append(CacheServerCapability.bilibiliExecutionV2)
+        }
+        if supportsTaskOutputV2 {
+            capabilities.append(CacheServerCapability.taskOutputV2)
+        }
+        return CacheServerSummary(
+            id: "fake-cache-server",
+            name: "Fake cache server",
+            version: "test",
+            mediaBaseURIs: [],
+            capabilities: capabilities
+        )
     }
 
     func listCacheRoots() async throws -> [CacheRoot] {
@@ -3207,8 +3784,99 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         urlOrID: String,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> BilibiliResolveResult {
+        legacyResolveCallCount += 1
         resolvedRequests.append((urlOrID, options))
         resumeResolveRequestWaiters()
+        return try await nextResolveResult(source: urlOrID)
+    }
+
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage {
+        try await startBilibiliResolution(
+            urlOrID: urlOrID,
+            options: options,
+            context: .default,
+            pageSize: pageSize
+        )
+    }
+
+    func startBilibiliResolution(
+        urlOrID: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage {
+        resolvedRequests.append((urlOrID, options))
+        resumeResolveRequestWaiters()
+        if !resolutionStartResponses.isEmpty {
+            switch resolutionStartResponses.removeFirst() {
+            case let .success(page):
+                resolutionSessions[page.session.id] = page.session
+                resolutionCandidates[page.session.id] = page.candidates
+                resolutionSnapshots[page.session.id] = page.snapshotID
+                resolutionOptionsBySession[page.session.id] = options
+                resolutionSourcesBySession[page.session.id] = urlOrID
+                candidateIndexesBySession[page.session.id] = Dictionary(
+                    uniqueKeysWithValues: page.candidates.map { ($0.candidateToken, $0.index) }
+                )
+                return page
+            case let .failure(error):
+                throw error
+            }
+        }
+
+        let result = try await nextResolveResult(source: urlOrID)
+        return makeResolutionPage(
+            result: result,
+            source: urlOrID,
+            options: options,
+            context: context,
+            pageSize: pageSize
+        )
+    }
+
+    func listBilibiliResolutionCandidates(
+        sessionID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> BilibiliResolutionPage {
+        resolutionPageRequests.append((sessionID, pageToken, pageSize))
+        guard let cursor = candidatePageCursors.removeValue(forKey: pageToken),
+            cursor.sessionID == sessionID,
+            let session = resolutionSessions[sessionID],
+            resolutionSnapshots[sessionID] != nil
+        else {
+            throw FakeLocalizedError(message: "Bilibili resolution page token is invalid or expired.")
+        }
+        if let message = candidatePageFailureNext {
+            candidatePageFailureNext = nil
+            throw FakeLocalizedError(message: message)
+        }
+        let page = makeResolutionPage(
+            session: session,
+            candidates: resolutionCandidates[sessionID] ?? [],
+            offset: cursor.offset,
+            pageSize: pageSize
+        )
+        guard candidatePageSnapshotMismatchNext else {
+            return page
+        }
+        candidatePageSnapshotMismatchNext = false
+        return BilibiliResolutionPage(
+            session: page.session,
+            candidates: page.candidates,
+            pageInfo: CachePageInfo(
+                totalSize: page.totalSize,
+                nextPageToken: page.nextPageToken,
+                snapshotID: "changed-candidate-snapshot"
+            )
+        )
+    }
+
+    private func nextResolveResult(source: String) async throws -> BilibiliResolveResult {
         if suspendsResolveResponses {
             return try await withCheckedThrowingContinuation { continuation in
                 pendingResolveContinuations.append(continuation)
@@ -3216,7 +3884,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         }
 
         if resolveResponses.isEmpty {
-            return .fixture(source: urlOrID)
+            return .fixture(source: source)
         }
 
         switch resolveResponses.removeFirst() {
@@ -3227,28 +3895,85 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         }
     }
 
+    private func makeResolutionPage(
+        result: BilibiliResolveResult,
+        source: String,
+        options: BilibiliPlaybackTaskOptions,
+        context: BilibiliRequestContext,
+        pageSize: Int
+    ) -> BilibiliResolutionPage {
+        let sessionID = "resolution-session-\(nextResolutionSessionID)"
+        nextResolutionSessionID += 1
+        let candidates = result.candidates.map { candidate in
+            let numericID = UInt64(candidate.contentID.filter(\.isNumber)) ?? 0
+            let identity = BilibiliContentIdentity(
+                kind: candidate.sourceKind.localizedCaseInsensitiveContains("episode") ? .seasonEpisode : .videoPage,
+                aid: numericID,
+                bvid: candidate.contentID,
+                cid: numericID,
+                epid: candidate.sourceKind.localizedCaseInsensitiveContains("episode") ? numericID : 0
+            )
+            return BilibiliResolutionCandidate(
+                candidateToken: candidate.selectionID,
+                title: candidate.title,
+                subtitle: candidate.subtitle,
+                sourceKind: candidate.sourceKind,
+                identity: identity,
+                index: candidate.index,
+                durationSeconds: candidate.durationSeconds
+            )
+        }
+        let session = BilibiliResolutionSession(
+            id: sessionID,
+            source: result.source,
+            title: result.title,
+            sourceKind: result.sourceKind,
+            createdAt: nil,
+            expiresAt: nil,
+            defaultCandidateToken: result.defaultSelectionID,
+            context: context
+        )
+        resolutionSessions[sessionID] = session
+        resolutionCandidates[sessionID] = candidates
+        resolutionSnapshots[sessionID] = "candidate-snapshot-\(sessionID)"
+        resolutionOptionsBySession[sessionID] = options
+        resolutionSourcesBySession[sessionID] = source
+        candidateIndexesBySession[sessionID] = Dictionary(
+            uniqueKeysWithValues: candidates.map { ($0.candidateToken, $0.index) }
+        )
+        return makeResolutionPage(session: session, candidates: candidates, offset: 0, pageSize: pageSize)
+    }
+
+    private func makeResolutionPage(
+        session: BilibiliResolutionSession,
+        candidates: [BilibiliResolutionCandidate],
+        offset: Int,
+        pageSize: Int
+    ) -> BilibiliResolutionPage {
+        let start = min(max(offset, 0), candidates.count)
+        let end = min(start + max(pageSize, 1), candidates.count)
+        let nextToken = end < candidates.count ? "opaque-candidate-page-\(session.id)-\(end)" : ""
+        if !nextToken.isEmpty {
+            candidatePageCursors[nextToken] = FakeCandidatePageCursor(sessionID: session.id, offset: end)
+        }
+        return BilibiliResolutionPage(
+            session: session,
+            candidates: Array(candidates[start..<end]),
+            pageInfo: CachePageInfo(
+                totalSize: UInt64(candidates.count),
+                nextPageToken: nextToken,
+                snapshotID: resolutionSnapshots[session.id] ?? "candidate-snapshot-\(session.id)"
+            )
+        )
+    }
+
     func createBilibiliTask(
         urlOrID: String,
         options: BilibiliDownloadTaskOptions
     ) async throws -> CacheTask {
+        legacyCreateCallCount += 1
         downloadRequests.append((urlOrID, options))
-        resumeCreateRequestWaiters()
-        if suspendsCreateResponses {
-            return try await withCheckedThrowingContinuation { continuation in
-                pendingCreateContinuations.append(continuation)
-            }
-        }
-
-        guard !createResponses.isEmpty else {
-            throw FakeBilibiliCacheControlClientError.noCreateResponse
-        }
-
-        switch createResponses.removeFirst() {
-        case let .success(task):
-            return task
-        case let .failure(error):
-            throw error
-        }
+        return try await nextCreateResult()
     }
 
     func createBilibiliPlaybackTask(
@@ -3263,7 +3988,8 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         selectionID: String?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
-        try await recordCreateRequest(
+        legacyCreateCallCount += 1
+        return try await recordCreateRequest(
             urlOrID: urlOrID,
             selectionID: selectionID,
             selection: nil,
@@ -3276,6 +4002,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         selection: BilibiliTaskSelection?,
         options: BilibiliPlaybackTaskOptions
     ) async throws -> CacheTask {
+        legacyCreateCallCount += 1
         guard supportsTaskSelection else {
             throw CacheControlClientUnsupportedFeature.bilibiliTaskSelection
         }
@@ -3286,6 +4013,181 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             selection: selection,
             options: options
         )
+    }
+
+    func createBilibiliPlaybackTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection
+    ) async throws -> CacheTask {
+        try await createBilibiliTaskV2(
+            sessionID: sessionID,
+            selection: selection,
+            execution: .playback(BilibiliPlaybackSpec())
+        )
+    }
+
+    func createBilibiliTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution
+    ) async throws -> CacheTask {
+        v2TaskRequests.append(
+            FakeBilibiliTaskV2Request(
+                sessionID: sessionID,
+                selection: selection,
+                execution: execution
+            ))
+        if let options = resolutionOptionsBySession[sessionID],
+            let source = resolutionSourcesBySession[sessionID]
+        {
+            switch execution {
+            case let .playback(spec):
+                let oldSelection = legacySelection(for: selection, sessionID: sessionID)
+                createdRequests.append((source, oldSelection.legacySingleSelectionID, oldSelection, options))
+                _ = spec
+            case let .download(spec):
+                downloadRequests.append(
+                    (
+                        source,
+                        BilibiliDownloadTaskOptions(
+                            qualityPreference: options.qualityPreference,
+                            encodingPreference: "",
+                            audioLanguagePreference: spec.audioLanguage,
+                            preferTVAPI: options.preferTVAPI,
+                            downloadSubtitles: spec.downloadSubtitles,
+                            downloadDanmaku: spec.downloadDanmaku,
+                            downloadCover: spec.downloadCover,
+                            subtitleAIPolicy: spec.subtitleAIPolicy,
+                            danmakuFormats: spec.danmakuFormats,
+                            downloadMode: spec.mode
+                        )
+                    ))
+            }
+        }
+        resumeCreateRequestWaiters()
+        let task = try await nextCreateResult()
+        createdTasksByID[task.id] = task
+        return task
+    }
+
+    private func legacySelection(
+        for selection: BilibiliResolutionSelection,
+        sessionID: String
+    ) -> BilibiliTaskSelection {
+        switch selection {
+        case let .single(candidateToken):
+            return BilibiliTaskSelection(mode: "single", selectionIDs: [candidateToken])
+        case let .multiple(candidateTokens):
+            return BilibiliTaskSelection(mode: "multiple", selectionIDs: candidateTokens)
+        case let .range(startCandidateToken, endCandidateToken):
+            let indexes = candidateIndexesBySession[sessionID] ?? [:]
+            return BilibiliTaskSelection(
+                mode: "range",
+                rangeStartIndex: indexes[startCandidateToken] ?? 0,
+                rangeEndIndex: indexes[endCandidateToken] ?? 0
+            )
+        case .all:
+            return BilibiliTaskSelection(mode: "all")
+        }
+    }
+
+    private func nextCreateResult() async throws -> CacheTask {
+        if suspendsCreateResponses {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingCreateContinuations.append(continuation)
+            }
+        }
+        guard !createResponses.isEmpty else {
+            throw FakeBilibiliCacheControlClientError.noCreateResponse
+        }
+        switch createResponses.removeFirst() {
+        case let .success(task):
+            return task
+        case let .failure(error):
+            throw error
+        }
+    }
+
+    func listTaskResults(
+        taskID: String,
+        pageToken: String,
+        pageSize: Int
+    ) async throws -> CacheTaskResultsPage {
+        taskResultRequests.append((taskID, pageToken, pageSize))
+        resumeTaskResultRequestWaiters()
+        if suspendsTaskResultResponses {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingTaskResultContinuations.append(continuation)
+            }
+        }
+        let key = Self.taskResultRequestKey(taskID: taskID, pageToken: pageToken)
+        if var responses = taskResultPagesByRequest[key], !responses.isEmpty {
+            let response = responses.removeFirst()
+            taskResultPagesByRequest[key] = responses
+            return try response.get()
+        }
+        return CacheTaskResultsPage(
+            results: [],
+            pageInfo: CachePageInfo(totalSize: 0, nextPageToken: "", snapshotID: "empty-\(taskID)"),
+            outputRevision: createdTasksByID[taskID]?.outputSummary?.revision ?? 0
+        )
+    }
+
+    private static func taskResultRequestKey(taskID: String, pageToken: String) -> String {
+        "\(taskID)\u{1F}\(pageToken)"
+    }
+
+    func enqueueTaskResultPage(
+        taskID: String,
+        pageToken: String,
+        result: Result<CacheTaskResultsPage, Error>
+    ) {
+        taskResultPagesByRequest[Self.taskResultRequestKey(taskID: taskID, pageToken: pageToken), default: []]
+            .append(result)
+    }
+
+    func setSuspendsTaskResultResponses(_ suspends: Bool) {
+        suspendsTaskResultResponses = suspends
+    }
+
+    func completeNextTaskResult(with result: Result<CacheTaskResultsPage, Error>) {
+        guard !pendingTaskResultContinuations.isEmpty else {
+            return
+        }
+        pendingTaskResultContinuations.removeFirst().resume(with: result)
+    }
+
+    func waitForTaskResultRequestCount(_ count: Int) async {
+        guard taskResultRequests.count < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            taskResultRequestWaiters.append((count, continuation))
+        }
+    }
+
+    func taskResultRequestsSnapshot() -> [(taskID: String, pageToken: String, pageSize: Int)] {
+        taskResultRequests
+    }
+
+    func setCandidatePageFailureNext(_ message: String) {
+        candidatePageFailureNext = message
+    }
+
+    func setCandidatePageSnapshotMismatchNext() {
+        candidatePageSnapshotMismatchNext = true
+    }
+
+    func resolutionPageRequestsSnapshot() -> [(sessionID: String, pageToken: String, pageSize: Int)] {
+        resolutionPageRequests
+    }
+
+    func v2TaskRequestsSnapshot() -> [FakeBilibiliTaskV2Request] {
+        v2TaskRequests
+    }
+
+    func legacyRPCCallCountsSnapshot() -> (resolve: Int, create: Int) {
+        (legacyResolveCallCount, legacyCreateCallCount)
     }
 
     private func recordCreateRequest(
@@ -3382,7 +4284,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     }
 
     func waitForCreateRequestCount(_ count: Int) async {
-        guard createdRequests.count < count else {
+        guard v2TaskRequests.count < count else {
             return
         }
 
@@ -3438,8 +4340,14 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     }
 
     private func resumeCreateRequestWaiters() {
-        let ready = createRequestWaiters.filter { $0.count <= createdRequests.count }
-        createRequestWaiters.removeAll { $0.count <= createdRequests.count }
+        let ready = createRequestWaiters.filter { $0.count <= v2TaskRequests.count }
+        createRequestWaiters.removeAll { $0.count <= v2TaskRequests.count }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    private func resumeTaskResultRequestWaiters() {
+        let ready = taskResultRequestWaiters.filter { $0.count <= taskResultRequests.count }
+        taskResultRequestWaiters.removeAll { $0.count <= taskResultRequests.count }
         ready.forEach { $0.continuation.resume() }
     }
 
@@ -3575,6 +4483,59 @@ private extension BilibiliTaskResultItem {
                     selectedVariant: nil,
                     variants: []
                 )
+        )
+    }
+}
+
+private extension CacheTaskArtifact {
+    static func fixture(
+        id: String,
+        state: String = "TASK_ARTIFACT_STATE_AVAILABLE",
+        uri: String,
+        libraryItemID: String = ""
+    ) -> Self {
+        Self(
+            id: id,
+            kind: "subtitle",
+            state: state,
+            title: "English subtitles",
+            format: "srt",
+            languageTag: "en",
+            isAIGenerated: false,
+            resource: CacheResourceReference(
+                id: "resource-\(id)",
+                uri: uri,
+                contentType: "text/plain",
+                sizeBytes: 256,
+                sizeKnown: true,
+                supportsByteRanges: false,
+                etag: "fixture-etag",
+                expiresAt: nil
+            ),
+            problem: nil,
+            libraryItemID: libraryItemID
+        )
+    }
+}
+
+private extension CacheTaskResult {
+    static func fixture(
+        id: String,
+        title: String,
+        artifacts: [CacheTaskArtifact] = []
+    ) -> Self {
+        Self(
+            id: id,
+            state: "TASK_RESULT_STATE_COMPLETED",
+            title: title,
+            subtitle: "Bilibili result",
+            progress: nil,
+            problem: nil,
+            libraryItemID: "",
+            playbackSource: nil,
+            artifacts: artifacts,
+            createdAt: nil,
+            updatedAt: nil
         )
     }
 }

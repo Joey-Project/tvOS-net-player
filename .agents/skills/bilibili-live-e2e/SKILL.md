@@ -1,6 +1,6 @@
 ---
 name: bilibili-live-e2e
-description: Run this repository's opt-in real Bilibili live e2e smoke tests for the macOS/tvOS LAN cache playback path, including restricted-area Bangumi cases. Use when Joey asks to validate real Bilibili URLs, run live e2e, test bbdown-rust integration, verify macOS client playback readiness, or investigate live progressive HLS playback failures in tvOS-net-player.
+description: Run or update this repository's opt-in Bilibili V2 live e2e smoke tests for macOS/tvOS LAN cache playback, including restricted-area Bangumi and authenticated collection cases. Use when Joey asks to validate real Bilibili URLs, exercise resolution/result pagination, test bbdown-rust integration, verify macOS client playback readiness, or investigate progressive HLS playback failures in tvOS-net-player.
 ---
 
 # Bilibili Live E2E
@@ -13,10 +13,11 @@ Validate the real Bilibili path through the repo-owned Rust LAN cache server and
 
 1. Read `references/live-cases.json` before running or modifying the live suite. It contains the canonical real URLs and their expected intent.
 2. Read `references/restricted-api-proxies.json` before restricted-area validation. It records BiliRoaming public reverse proxies, sorted by latest known successful playback validation.
-3. Run the deterministic local gate first when changing code:
+3. Keep live execution opt-in. The ignored integration test is not part of default CI. For harness changes, run deterministic formatting and focused integration-target checks first:
 
 ```bash
-just test-cache-server
+cargo fmt --check
+cargo test --manifest-path Cargo.toml --package tvos-net-player-cache-server --test bilibili_live_e2e --locked
 ```
 
 4. Run the live smoke suite explicitly:
@@ -50,7 +51,7 @@ BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1 \
 just test-bilibili-live
 ```
 
-Explicit `BILIBILI_LIVE_E2E_CASES` filters bypass the default skip policy and are useful for investigating a committed sample or upstream failure, but stable smoke validation should provide URL overrides for `requires_live_sample_override` cases. These cases assert that the LAN server resolves list candidates with bounded stable `item:` selection ids containing a canonical collection-source token plus BVID/AID/CID identity, and that generated HLS URLs stay on the LAN media listener. `space-videos` and `homepage-recommendations` currently require a BBDown web cookie in local validation.
+Explicit `BILIBILI_LIVE_E2E_CASES` filters bypass the default skip policy and are useful for investigating a committed sample or upstream failure, but stable smoke validation should provide URL overrides for `requires_live_sample_override` cases. The harness uses the V2 path: `StartBilibiliResolution`, opaque-token pagination through `ListBilibiliResolutionCandidates`, `CreateBilibiliTaskV2`, then `ListTaskResults`. Candidate and result pages use small page sizes and must retain one snapshot identity across continuation pages. Collection cases validate structured collection-item identity (CID plus BVID or AID) and bounded candidate indexes; candidate tokens and page tokens remain opaque and must not be logged or inspected. Selected playback sources and any listed result playback sources must be HLS served by the LAN media listener. Generic artifact resource references, when present, must also resolve to the server-owned LAN listener and must not reveal upstream URLs, local filesystem paths, URL credentials, query data, or fragments. `space-videos` and `homepage-recommendations` currently require a BBDown web cookie in local validation.
 
 7. Default runs skip `requires_authentication` cases. Run authenticated cases explicitly with `BILIBILI_LIVE_E2E_CASES`, or include all authenticated cases in an unfiltered local run with `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1`. These cases require a BBDown credential file containing a web cookie; `access_key` alone is not enough for web-page fetch coverage. `authenticated-space-dynamic` defaults to `https://space.bilibili.com/2/dynamic`, but local validation should usually override it with an account-relevant uploader dynamic URL:
 
@@ -85,7 +86,7 @@ The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `a
 
 ## Scope
 
-- The live suite starts an isolated local Rust cache server for each selected case, resolves the Bilibili input, creates a progressive playback task, waits for a playable HLS source, and fetches the generated master playlist. A failing case does not prevent later selected cases from running.
+- The live suite starts an isolated local Rust cache server for each selected case, starts a V2 resolution session, pages through its immutable candidate snapshot, creates a progressive playback task from server-issued candidate tokens, waits for playable HLS sources, and pages through `ListTaskResults`. It fetches task and result HLS master playlists and checks generic artifact resource references when available. A failing case does not prevent later selected cases from running.
 - The suite does not run in default `just ci` or GitHub Actions.
 - The suite is for macOS/local development first. Physical Apple TV validation is intentionally outside the current plan.
 - The media plane must remain HTTP/HLS through the LAN cache server. Do not make the Swift app fetch Bilibili media URLs directly to satisfy this test.
@@ -95,5 +96,5 @@ The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `a
 
 - `references/live-cases.json`: canonical real Bilibili e2e inputs.
 - `references/restricted-api-proxies.json`: BiliRoaming public reverse-proxy registry with latest known local validation status.
-- `scripts/test-bilibili-live.sh`: repo command used by the skill.
+- `../../../scripts/test-bilibili-live.sh`: repo command used by the skill.
 - `CacheServer/RustCacheServer/tests/bilibili_live_e2e.rs`: ignored Rust integration test run by the script.

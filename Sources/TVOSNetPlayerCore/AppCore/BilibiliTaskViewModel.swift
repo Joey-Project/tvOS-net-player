@@ -136,7 +136,9 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
     public let message: String
     public let libraryItemID: String
     public let playbackLibraryItemID: String
+    public let playbackVariantID: String
     public let playbackURL: URL?
+    public let artifacts: [BilibiliTaskArtifactPresentation]
     public let isReady: Bool
     public let isCached: Bool
     public let isFailed: Bool
@@ -175,6 +177,38 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
     }
 }
 
+public struct BilibiliTaskArtifactPresentation: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let kind: String
+    public let state: String
+    public let title: String
+    public let format: String
+    public let languageTag: String
+    public let isAIGenerated: Bool
+    public let resourceURL: URL?
+    public let contentType: String
+    public let sizeBytes: Int64
+    public let sizeKnown: Bool
+    public let expiresAt: Date?
+    public let libraryItemID: String
+    public let message: String
+
+    public var isAvailable: Bool {
+        state.normalizedBilibiliState.contains("available")
+    }
+
+    public var canOpenResource: Bool {
+        guard isAvailable, resourceURL != nil else {
+            return false
+        }
+        return expiresAt.map { $0 > Date() } ?? true
+    }
+
+    public var canOpenInLibrary: Bool {
+        !libraryItemID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 private struct BilibiliResolvedInputContext: Equatable {
     let source: String
     let endpoint: CacheServerEndpoint
@@ -196,8 +230,37 @@ private struct BilibiliPlaybackResolutionOptions: Equatable {
 }
 
 private struct BilibiliCandidateSelectionRequest {
-    let selection: BilibiliTaskSelection
-    let legacySelectionID: String?
+    let selection: BilibiliResolutionSelection
+}
+
+private enum BilibiliTaskViewModelError: LocalizedError {
+    case upgradeRequired
+    case taskOutputUnavailable
+    case invalidQuality
+    case invalidCodec
+    case tooManyCandidates
+    case resolutionExpired
+    case candidateSnapshotChanged
+
+    var errorDescription: String? {
+        switch self {
+        case .upgradeRequired:
+            return "Upgrade the cache server to a version that supports Bilibili v2 resolution and task execution."
+        case .taskOutputUnavailable:
+            return
+                "Paginated Bilibili task results are unavailable. Restore task-output v2 support or upgrade the cache server."
+        case .invalidQuality:
+            return "The Bilibili quality preference is not recognized."
+        case .invalidCodec:
+            return "The Bilibili codec preference is not recognized."
+        case .tooManyCandidates:
+            return "A Bilibili task cannot include more than 100 items. Narrow the selection and try again."
+        case .resolutionExpired:
+            return "The Bilibili resolution expired. Re-resolve the input before submitting."
+        case .candidateSnapshotChanged:
+            return "The Bilibili candidate snapshot changed. Re-resolve the input before submitting."
+        }
+    }
 }
 
 private enum BilibiliRetryIntent {
@@ -357,10 +420,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
     @Published public var submissionMode: BilibiliTaskSubmissionMode = .playback {
         didSet {
-            if submissionMode == .download {
-                resolvedInput = nil
-                resolvedInputContext = nil
-                clearCandidateSelection()
+            if oldValue != submissionMode {
+                operationSequence += 1
+                isSubmitting = false
+                isResolving = false
+                clearResolutionSession()
             }
         }
     }
@@ -389,6 +453,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
     @Published public private(set) var isWatching = false
     @Published public private(set) var isCancelling = false
     @Published public private(set) var resolvedInput: BilibiliResolveResult?
+    @Published public private(set) var resolutionSession: BilibiliResolutionSession?
+    @Published public private(set) var isLoadingMoreCandidates = false
     @Published public var candidateSelectionMode: BilibiliCandidateSelectionMode = .single {
         didSet {
             normalizeCandidateSelectionForMode()
@@ -428,6 +494,23 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var retryIntent: BilibiliRetryIntent?
     private var isNormalizingCandidateSelection = false
     private var isChoosingRangeEnd = false
+    private var resolutionPageToken = ""
+    private var resolutionSnapshotID = ""
+    private var resolutionTotalSize: UInt64 = 0
+    private var candidatePageSequence = 0
+    private var taskResultItems: [CacheTaskResult] = []
+    private var taskResultPageToken = ""
+    private var taskResultSnapshotID = ""
+    private var taskResultOutputRevision: UInt64?
+    private var taskResultPageSequence = 0
+    private var taskResultRefreshTask: Task<Void, Never>?
+    private var requestedTaskResultRevision: UInt64?
+    @Published public private(set) var isLoadingMoreTaskResults = false
+    @Published public private(set) var taskResultsErrorMessage: String?
+
+    private static let resolutionPageSize = 50
+    private static let taskResultPageSize = 50
+    private static let maxExecutionCandidateCount: UInt64 = 100
 
     public init(
         sourceText: String = "",
@@ -519,14 +602,22 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return nil
         }
 
-        return currentTask
-            .bilibiliTaskResults
-            .first { $0.id == result.id }?
-            .playbackURL
+        return taskResults.first { $0.id == result.id }?.playbackURL
+    }
+
+    public func artifactURL(for artifact: BilibiliTaskArtifactPresentation) -> URL? {
+        guard
+            taskResults.contains(where: { result in
+                result.artifacts.contains { $0.id == artifact.id }
+            }), artifact.canOpenResource
+        else {
+            return nil
+        }
+        return artifact.resourceURL
     }
 
     public var canClear: Bool {
-        currentTask != nil || errorMessage != nil || resolvedInput != nil
+        currentTask != nil || errorMessage != nil || resolvedInput != nil || resolutionSession != nil
     }
 
     public var canReResolve: Bool {
@@ -563,7 +654,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var isWaitingForCandidateSelection: Bool {
-        resolvedInputMatchesSource && resolvedInput?.requiresSelection == true && currentTask == nil
+        resolvedInputMatchesSource
+            && resolutionTotalSize > 1
+            && currentTask == nil
     }
 
     public var selectedCandidate: BilibiliResolvedCandidate? {
@@ -595,13 +688,15 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         switch candidateSelectionMode {
         case .single:
-            return selectedCandidate == nil ? 0 : 1
+            return selectedCandidateToken == nil ? 0 : 1
         case .multiple:
             return orderedSelectedCandidateIDs.count
         case .range:
             return selectedRangeCandidateIDs.count
         case .all:
-            return canSelectAllResolvedCandidates ? resolvedCandidates.count : 0
+            return canSelectAllResolvedCandidates
+                ? Int(resolutionTotalSize)
+                : 0
         }
     }
 
@@ -618,18 +713,26 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return "Selected \(selectedCandidate.displayTitle)."
         case .multiple:
             let count = orderedSelectedCandidateIDs.count
+            if count > Int(Self.maxExecutionCandidateCount) {
+                return "Select no more than 100 Bilibili items."
+            }
             return count == 1 ? "1 Bilibili item selected." : "\(count) Bilibili items selected."
         case .range:
             guard let start = rangeStartCandidate, let end = rangeEndCandidate else {
                 return "Select a start and end item."
             }
             let count = selectedRangeCandidateIDs.count
+            if let bounds = selectedRangeBounds,
+                bounds.end - bounds.start + 1 > Int(Self.maxExecutionCandidateCount)
+            {
+                return "Select a range of no more than 100 Bilibili items."
+            }
             return "Range \(start.displayTitle) to \(end.displayTitle) selects \(count) item\(count == 1 ? "" : "s")."
         case .all:
             guard canSelectAllResolvedCandidates else {
-                return "All selection is unavailable because the resolved item list is truncated."
+                return "All selection is available only for lists of up to 100 items."
             }
-            let count = resolvedCandidates.count
+            let count = Int(resolutionTotalSize)
             return "All \(count) Bilibili item\(count == 1 ? "" : "s") selected."
         }
     }
@@ -641,20 +744,20 @@ public final class BilibiliTaskViewModel: ObservableObject {
         if isSubmitting {
             return "Submitting"
         }
-        if submissionMode == .download {
-            return "Download"
-        }
         if isWaitingForCandidateSelection {
             switch candidateSelectionMode {
             case .single:
-                return "Submit Selected"
+                return submissionMode == .download ? "Download Selected" : "Submit Selected"
             case .multiple:
-                return "Submit Multiple"
+                return submissionMode == .download ? "Download Multiple" : "Submit Multiple"
             case .range:
-                return "Submit Range"
+                return submissionMode == .download ? "Download Range" : "Submit Range"
             case .all:
-                return "Submit All"
+                return submissionMode == .download ? "Download All" : "Submit All"
             }
+        }
+        if submissionMode == .download {
+            return "Download"
         }
         return "Submit"
     }
@@ -672,7 +775,35 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var taskResults: [BilibiliTaskResultPresentation] {
-        currentTask?.bilibiliTaskResults ?? []
+        guard let currentTask else {
+            return []
+        }
+
+        if let outputSummary = currentTask.outputSummary {
+            guard let taskResultOutputRevision,
+                taskResultOutputRevision >= outputSummary.revision
+            else {
+                return []
+            }
+            return taskResultItems.map { $0.bilibiliPresentation(endpoint: activeEndpoint) }
+        }
+
+        return currentTask.bilibiliTaskResults
+    }
+
+    public var hasMoreResolvedCandidates: Bool {
+        !resolutionPageToken.isEmpty && resolutionSession != nil
+    }
+
+    public var hasMoreTaskResults: Bool {
+        guard !taskResultPageToken.isEmpty,
+            let currentTask,
+            let outputSummary = currentTask.outputSummary
+        else {
+            return false
+        }
+
+        return taskResultOutputRevision == outputSummary.revision
     }
 
     public var taskResultSummary: BilibiliTaskResultSummary? {
@@ -708,12 +839,11 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         if resolvedInput.candidatesTruncated {
             return BilibiliFetchNotice(
-                title: "Showing a bounded window",
-                message:
-                    "Only the first \(resolvedInput.candidates.count) resolved items are shown. Use a narrower URL or re-resolve before submitting a large batch.",
-                systemImage: "rectangle.stack.badge.exclamationmark",
-                tone: .warning,
-                actionTitle: "Re-resolve"
+                title: "More items available",
+                message: "Load more candidates to browse the immutable Bilibili resolution.",
+                systemImage: "arrow.down.to.line",
+                tone: .info,
+                actionTitle: "Load More"
             )
         }
 
@@ -721,7 +851,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return BilibiliFetchNotice(
                 title: "List may change",
                 message:
-                    "This Bilibili list or feed can reorder between refreshes. Single and multiple selections submit stable item IDs; Range and All follow the refreshed list order.",
+                    "This Bilibili list or feed can reorder between refreshes. Selections use candidate tokens from this immutable resolution.",
                 systemImage: "arrow.triangle.2.circlepath",
                 tone: .info,
                 actionTitle: "Re-resolve"
@@ -793,10 +923,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         for result: BilibiliTaskResultPresentation,
         serverAddressText: String
     ) -> PlayerPlaybackProgressContext? {
-        guard let currentTask,
+        guard currentTask != nil,
             let endpoint = playbackProgressEndpoint(serverAddressText: serverAddressText),
-            let resultItem = currentTask.resultItems.first(where: { $0.id == result.id }),
-            let playbackURL = resultItem.playableBilibiliURL
+            let resultItem = taskResults.first(where: { $0.id == result.id }),
+            let playbackURL = resultItem.playbackURL
         else {
             return nil
         }
@@ -804,8 +934,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return PlayerPlaybackProgressContext(
             endpoint: endpoint,
             playbackURI: playbackURL.absoluteString,
-            libraryItemID: resultItem.playableBilibiliLibraryItemID ?? resultItem.playbackSource?.itemID ?? "",
-            variantID: resultItem.playbackSource?.variantID ?? ""
+            libraryItemID: resultItem.playbackLibraryItemID,
+            variantID: resultItem.playbackVariantID
         )
     }
 
@@ -826,6 +956,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard canSubmit else {
             return
         }
+        let submittedMode = submissionMode
         retryIntent = nil
 
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
@@ -841,47 +972,65 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
-        if submissionMode == .download {
-            await createDownloadTask(
-                source: source,
-                endpoint: endpoint,
-                options: currentDownloadOptions
-            )
+        let options = currentPlaybackOptions
+        let playbackSpec: BilibiliPlaybackSpec?
+        let downloadSpec: BilibiliDownloadSpec?
+        do {
+            _ = try Self.playbackCodec(from: options.encodingPreference)
+            playbackSpec = submittedMode == .playback ? try Self.playbackSpec(from: options) : nil
+            downloadSpec = submittedMode == .download ? try Self.downloadSpec(from: currentDownloadOptions) : nil
+        } catch {
+            errorMessage = Self.userFacingMessage(for: error)
+            statusMessage = "Bilibili preferences are invalid."
             return
         }
 
-        let options = currentPlaybackOptions
-
-        if currentTask == nil, resolvedInputMatches(source: source, endpoint: endpoint, options: options) {
-            if let selectionRequest = cachedResolvedPlaybackRequest {
-                await createPlaybackTask(
-                    source: source,
-                    selection: selectionRequest.selection,
-                    legacySelectionID: selectionRequest.legacySelectionID,
-                    endpoint: endpoint,
-                    options: options
-                )
-                return
-            }
-
-            if isWaitingForCandidateSelection {
-                errorMessage = "Select Bilibili items before submitting playback."
+        if currentTask == nil,
+            resolvedInputMatches(source: source, endpoint: endpoint, options: options),
+            cachedResolvedPlaybackRequest != nil
+        {
+            guard let selectionRequest = cachedResolvedPlaybackRequest,
+                let resolutionSession
+            else {
+                errorMessage =
+                    submittedMode == .download
+                    ? "Select Bilibili items before downloading."
+                    : "Select Bilibili items before submitting playback."
                 statusMessage = "Bilibili item selection is required."
                 return
             }
+            let execution: BilibiliTaskExecution
+            switch submittedMode {
+            case .playback:
+                guard let playbackSpec else { return }
+                execution = .playback(playbackSpec)
+            case .download:
+                guard let downloadSpec else { return }
+                execution = .download(downloadSpec)
+            }
+            await createTaskV2(
+                sessionID: resolutionSession.id,
+                selection: selectionRequest.selection,
+                execution: execution,
+                endpoint: endpoint,
+                sequence: operationSequence,
+                client: clientFactory(endpoint),
+                isPlayback: submittedMode == .playback
+            )
+            return
         }
 
         operationSequence += 1
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
+        activePlaybackLibraryItemID = nil
         let sequence = operationSequence
 
         stopWatching()
+        stopTaskResultPaging()
         activeEndpoint = endpoint
         currentTask = nil
-        resolvedInput = nil
-        resolvedInputContext = nil
-        clearCandidateSelection()
+        clearResolutionSession()
         isSubmitting = true
         isResolving = true
         errorMessage = nil
@@ -890,10 +1039,21 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let client = clientFactory(endpoint)
 
         do {
-            let resolved = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.resolveBilibiliInput(urlOrID: source, options: options)
-            }
+            let page = try await Self.startBilibiliResolution(
+                client: client,
+                source: source,
+                options: options,
+                operationTimeout: operationTimeout
+            )
 
+            guard submissionMode == submittedMode else {
+                if operationSequence == sequence + 1 {
+                    discardStaleResolveSubmission(
+                        statusMessage: "Bilibili submission mode changed before resolve completed."
+                    )
+                }
+                return
+            }
             guard sequence == operationSequence else {
                 return
             }
@@ -903,66 +1063,84 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
-            resolvedInput = resolved
-            resolvedInputContext = BilibiliResolvedInputContext(
+            installResolutionPage(
+                page,
                 source: source,
                 endpoint: endpoint,
-                options: BilibiliPlaybackResolutionOptions(options)
+                options: options,
+                resetSelection: true
             )
-            applyResolvedCandidateDefaults(resolved)
             isResolving = false
 
-            guard let candidate = selectedCandidate else {
+            guard page.totalSize > 0,
+                !page.session.defaultCandidateToken.isEmpty || !page.candidates.isEmpty
+            else {
                 isSubmitting = false
                 errorMessage = "Bilibili input did not resolve to a playable item."
                 statusMessage = "No selectable Bilibili item was found."
                 return
             }
 
-            guard !resolved.requiresSelection else {
+            if page.totalSize > 1 {
                 isSubmitting = false
-                statusMessage = "Select a Bilibili item to play."
+                statusMessage =
+                    submittedMode == .download
+                    ? "Select Bilibili items to download."
+                    : "Select a Bilibili item to play."
                 return
             }
 
-            await createPlaybackTask(
-                source: source,
-                selection: Self.singleSelection(for: candidate.selectionID),
-                legacySelectionID: candidate.selectionID,
+            let execution: BilibiliTaskExecution
+            switch submittedMode {
+            case .playback:
+                guard let playbackSpec else { return }
+                execution = .playback(playbackSpec)
+            case .download:
+                guard let downloadSpec else { return }
+                execution = .download(downloadSpec)
+            }
+            guard
+                let defaultCandidateToken = page.session.defaultCandidateToken.nilIfEmpty
+                    ?? page.candidates.first?.candidateToken
+            else {
+                isSubmitting = false
+                errorMessage = "Bilibili input did not resolve to a playable item."
+                statusMessage = "No selectable Bilibili item was found."
+                return
+            }
+            await createTaskV2(
+                sessionID: page.session.id,
+                selection: .single(candidateToken: defaultCandidateToken),
+                execution: execution,
                 endpoint: endpoint,
                 sequence: sequence,
                 client: client,
-                options: currentPlaybackOptions
+                isPlayback: submittedMode == .playback
             )
         } catch {
+            guard submissionMode == submittedMode else {
+                if operationSequence == sequence + 1 {
+                    discardStaleResolveSubmission(
+                        statusMessage: "Bilibili submission mode changed before resolve completed."
+                    )
+                }
+                return
+            }
             guard sequence == operationSequence else {
                 return
             }
-
-            if Self.isBilibiliResolveUnsupported(error) {
-                guard currentSubmissionMatches(source: source, options: options) else {
-                    discardStaleResolveSubmission()
-                    return
-                }
-
-                await createPlaybackTask(
-                    source: source,
-                    selection: nil,
-                    legacySelectionID: nil,
-                    endpoint: endpoint,
-                    sequence: sequence,
-                    client: client,
-                    options: currentPlaybackOptions
-                )
+            guard currentSubmissionMatches(source: source, options: options) else {
+                discardStaleResolveSubmission()
                 return
             }
 
             currentTask = nil
-            resolvedInput = nil
-            resolvedInputContext = nil
-            clearCandidateSelection()
-            errorMessage = error.localizedDescription
-            statusMessage = "Could not resolve Bilibili input."
+            clearResolutionSession()
+            errorMessage = Self.userFacingMessage(for: error)
+            statusMessage =
+                submittedMode == .download
+                ? "Could not resolve Bilibili download input."
+                : "Could not resolve Bilibili input."
             isResolving = false
             isSubmitting = false
         }
@@ -1010,10 +1188,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
         operationSequence += 1
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
+        candidatePageSequence += 1
+        isLoadingMoreCandidates = false
         let sequence = operationSequence
 
         stopWatching()
-        currentTask = nil
+        stopTaskResultPaging()
+        activeEndpoint = endpoint
         isResolving = true
         isSubmitting = false
         errorMessage = nil
@@ -1022,9 +1203,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let client = clientFactory(endpoint)
 
         do {
-            let resolved = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.resolveBilibiliInput(urlOrID: source, options: options)
-            }
+            _ = try Self.playbackSpec(from: options)
+            let page = try await Self.startBilibiliResolution(
+                client: client,
+                source: source,
+                options: options,
+                operationTimeout: operationTimeout
+            )
 
             guard sequence == operationSequence else {
                 return
@@ -1036,18 +1221,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             activeEndpoint = endpoint
-            resolvedInput = resolved
-            resolvedInputContext = BilibiliResolvedInputContext(
+            installResolutionPage(
+                page,
                 source: source,
                 endpoint: endpoint,
-                options: BilibiliPlaybackResolutionOptions(options)
+                options: options,
+                resetSelection: true
             )
-            applyResolvedCandidateDefaults(resolved)
             isResolving = false
 
-            if resolved.candidates.isEmpty {
+            if page.totalSize == 0 {
                 statusMessage = "No selectable Bilibili item was found."
-            } else if resolved.requiresSelection {
+            } else if page.totalSize > 1 {
                 statusMessage = "Select a Bilibili item to play."
             } else {
                 statusMessage = "Bilibili input resolved."
@@ -1063,11 +1248,171 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             currentTask = nil
-            errorMessage = error.localizedDescription
+            errorMessage = Self.userFacingMessage(for: error)
             statusMessage = "Could not resolve Bilibili input."
             retryIntent = .reResolve
             isResolving = false
             isSubmitting = false
+        }
+    }
+
+    public func loadMoreResolvedCandidates(serverAddressText: String) async {
+        guard !isLoadingMoreCandidates,
+            hasMoreResolvedCandidates,
+            let session = resolutionSession,
+            let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
+        else {
+            return
+        }
+
+        candidatePageSequence += 1
+        let pageSequence = candidatePageSequence
+        let operation = operationSequence
+        let pageToken = resolutionPageToken
+        let snapshotID = resolutionSnapshotID
+        isLoadingMoreCandidates = true
+        errorMessage = nil
+
+        defer {
+            if candidatePageSequence == pageSequence {
+                isLoadingMoreCandidates = false
+            }
+        }
+
+        do {
+            let client = clientFactory(endpoint)
+            let page = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listBilibiliResolutionCandidates(
+                    sessionID: session.id,
+                    pageToken: pageToken,
+                    pageSize: Self.resolutionPageSize
+                )
+            }
+
+            guard operation == operationSequence,
+                pageSequence == candidatePageSequence,
+                resolutionSession?.id == session.id
+            else {
+                return
+            }
+
+            guard page.session.id == session.id,
+                page.snapshotID == snapshotID
+            else {
+                invalidateResolutionForExpiry()
+                return
+            }
+
+            appendResolutionPage(page)
+            errorMessage = nil
+        } catch {
+            guard operation == operationSequence,
+                pageSequence == candidatePageSequence,
+                resolutionSession?.id == session.id
+            else {
+                return
+            }
+
+            if Self.isResolutionPageExpired(error) {
+                invalidateResolutionForExpiry()
+            } else {
+                errorMessage = Self.userFacingMessage(for: error)
+                statusMessage = "Could not load more Bilibili candidates."
+            }
+        }
+    }
+
+    public func loadMoreTaskResults(serverAddressText: String) async {
+        guard !isLoadingMoreTaskResults,
+            hasMoreTaskResults,
+            let task = currentTask,
+            let expectedRevision = taskResultOutputRevision,
+            let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
+        else {
+            return
+        }
+
+        taskResultPageSequence += 1
+        let pageSequence = taskResultPageSequence
+        let operation = operationSequence
+        let snapshotID = taskResultSnapshotID
+        let pageToken = taskResultPageToken
+        isLoadingMoreTaskResults = true
+        taskResultsErrorMessage = nil
+
+        defer {
+            if taskResultPageSequence == pageSequence {
+                isLoadingMoreTaskResults = false
+            }
+        }
+
+        do {
+            let client = clientFactory(endpoint)
+            let page = try await Self.withOperationTimeout(operationTimeout) {
+                try await client.listTaskResults(
+                    taskID: task.id,
+                    pageToken: pageToken,
+                    pageSize: Self.taskResultPageSize
+                )
+            }
+
+            guard operation == operationSequence,
+                pageSequence == taskResultPageSequence,
+                currentTask?.id == task.id
+            else {
+                return
+            }
+
+            guard page.outputRevision == expectedRevision,
+                page.snapshotID == snapshotID,
+                currentTask?.outputSummary?.revision == expectedRevision
+            else {
+                refreshTaskResults(for: currentTask, force: true)
+                return
+            }
+
+            let existingIDs = Set(taskResultItems.map(\.id))
+            guard page.results.allSatisfy({ !existingIDs.contains($0.id) }) else {
+                refreshTaskResults(for: task, force: true)
+                return
+            }
+
+            taskResultItems.append(contentsOf: page.results)
+            taskResultPageToken = page.nextPageToken
+            taskResultsErrorMessage = nil
+        } catch {
+            guard operation == operationSequence,
+                pageSequence == taskResultPageSequence,
+                currentTask?.id == task.id
+            else {
+                return
+            }
+
+            if Self.isTaskResultPageExpired(error) {
+                taskResultPageToken = ""
+                refreshTaskResults(for: currentTask, force: true)
+            } else {
+                taskResultsErrorMessage = Self.userFacingMessage(for: error)
+            }
+        }
+    }
+
+    public func retryTaskResults(serverAddressText: String) async {
+        guard !isLoadingMoreTaskResults,
+            let task = currentTask,
+            task.outputSummary != nil
+        else {
+            return
+        }
+        guard let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText) else {
+            taskResultsErrorMessage = Self.cacheServerAddressGuidance
+            return
+        }
+
+        activeEndpoint = endpoint
+        refreshTaskResults(for: task, force: true)
+        if let refreshTask = taskResultRefreshTask {
+            await refreshTask.value
         }
     }
 
@@ -1175,7 +1520,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     public func finishPreparedPlayback(result: BilibiliTaskResultPresentation, didStartPlayback: Bool) {
         guard let currentTask,
-            let currentResult = currentTask.bilibiliTaskResults.first(where: { $0.id == result.id })
+            let currentResult = taskResults.first(where: { $0.id == result.id })
         else {
             return
         }
@@ -1223,14 +1568,13 @@ public final class BilibiliTaskViewModel: ObservableObject {
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
         retryIntent = nil
+        stopTaskResultPaging()
         currentTask = nil
         errorMessage = nil
         isSubmitting = false
         isResolving = false
         isCancelling = false
-        resolvedInput = nil
-        resolvedInputContext = nil
-        clearCandidateSelection()
+        clearResolutionSession()
         stopWatching()
         statusMessage = "No Bilibili playback task submitted."
     }
@@ -1317,13 +1661,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private var selectedRangeCandidateIDs: Set<String> {
-        guard let start = rangeStartCandidate,
-            let end = rangeEndCandidate
-        else {
+        guard let bounds = selectedRangeBounds else {
             return []
         }
-
-        let bounds = sortedRangeBounds(start: start, end: end)
         return Set(
             resolvedCandidates
                 .filter { candidate in
@@ -1334,29 +1674,37 @@ public final class BilibiliTaskViewModel: ObservableObject {
         )
     }
 
+    private var selectedRangeBounds: (start: Int, end: Int)? {
+        guard let start = rangeStartCandidate,
+            let end = rangeEndCandidate
+        else {
+            return nil
+        }
+        return sortedRangeBounds(start: start, end: end)
+    }
+
     private var canSelectAllResolvedCandidates: Bool {
-        resolvedInput?.candidatesTruncated != true && !resolvedCandidates.isEmpty
+        resolvedInputMatchesSource
+            && resolutionSession != nil
+            && resolutionTotalSize > 0
+            && resolutionTotalSize <= Self.maxExecutionCandidateCount
     }
 
     private var candidateSelectionRequest: BilibiliCandidateSelectionRequest? {
         switch candidateSelectionMode {
         case .single:
-            guard let candidate = selectedCandidate else {
+            guard let candidateToken = selectedCandidateToken else {
                 return nil
             }
-            return BilibiliCandidateSelectionRequest(
-                selection: Self.singleSelection(for: candidate.selectionID),
-                legacySelectionID: candidate.selectionID
-            )
+            return BilibiliCandidateSelectionRequest(selection: .single(candidateToken: candidateToken))
         case .multiple:
-            let selectionIDs = orderedSelectedCandidateIDs
-            guard !selectionIDs.isEmpty else {
+            let candidateTokens = orderedSelectedCandidateIDs
+            guard !candidateTokens.isEmpty,
+                candidateTokens.count <= Int(Self.maxExecutionCandidateCount)
+            else {
                 return nil
             }
-            return BilibiliCandidateSelectionRequest(
-                selection: Self.multipleSelection(for: selectionIDs),
-                legacySelectionID: nil
-            )
+            return BilibiliCandidateSelectionRequest(selection: .multiple(candidateTokens: candidateTokens))
         case .range:
             guard let start = rangeStartCandidate,
                 let end = rangeEndCandidate
@@ -1364,38 +1712,57 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return nil
             }
             let bounds = sortedRangeBounds(start: start, end: end)
+            guard bounds.end - bounds.start + 1 <= Int(Self.maxExecutionCandidateCount) else {
+                return nil
+            }
+            let orderedCandidates = resolvedCandidates.sorted {
+                candidateSelectionIndex($0) < candidateSelectionIndex($1)
+            }
+            guard let first = orderedCandidates.first(where: { candidateSelectionIndex($0) == bounds.start }),
+                let last = orderedCandidates.first(where: { candidateSelectionIndex($0) == bounds.end })
+            else {
+                return nil
+            }
             return BilibiliCandidateSelectionRequest(
-                selection: Self.rangeSelection(startIndex: bounds.start, endIndex: bounds.end),
-                legacySelectionID: nil
+                selection: .range(
+                    startCandidateToken: first.selectionID,
+                    endCandidateToken: last.selectionID
+                )
             )
         case .all:
             guard canSelectAllResolvedCandidates else {
                 return nil
             }
-            return BilibiliCandidateSelectionRequest(
-                selection: Self.allSelection(),
-                legacySelectionID: nil
-            )
+            return BilibiliCandidateSelectionRequest(selection: .all)
         }
     }
 
     private var cachedResolvedPlaybackRequest: BilibiliCandidateSelectionRequest? {
-        guard let resolvedInput else {
+        guard resolvedInput != nil else {
             return nil
         }
 
-        if resolvedInput.requiresSelection {
+        if isWaitingForCandidateSelection {
             return candidateSelectionRequest
         }
 
-        guard let candidate = selectedCandidate else {
+        guard let candidateToken = selectedCandidateToken ?? resolutionSession?.defaultCandidateToken,
+            !candidateToken.isEmpty
+        else {
             return nil
         }
 
-        return BilibiliCandidateSelectionRequest(
-            selection: Self.singleSelection(for: candidate.selectionID),
-            legacySelectionID: candidate.selectionID
-        )
+        return BilibiliCandidateSelectionRequest(selection: .single(candidateToken: candidateToken))
+    }
+
+    private var selectedCandidateToken: String? {
+        if let selectedCandidateID,
+            !selectedCandidateID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return selectedCandidateID
+        }
+
+        return resolutionSession?.defaultCandidateToken.nilIfEmpty
     }
 
     private func candidate(withID id: String?) -> BilibiliResolvedCandidate? {
@@ -1540,69 +1907,37 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
     }
 
-    private func createPlaybackTask(
-        source: String,
-        selectionID: String?,
-        endpoint: CacheServerEndpoint,
-        options: BilibiliPlaybackTaskOptions
-    ) async {
-        await createPlaybackTask(
-            source: source,
-            selection: nil,
-            legacySelectionID: selectionID,
-            endpoint: endpoint,
-            options: options
-        )
-    }
-
-    private func createPlaybackTask(
-        source: String,
-        selection: BilibiliTaskSelection?,
-        legacySelectionID: String?,
-        endpoint: CacheServerEndpoint,
-        options: BilibiliPlaybackTaskOptions
-    ) async {
-        operationSequence += 1
-        activePlaybackTaskID = nil
-        activePlaybackResultID = nil
-        let sequence = operationSequence
-        let client = clientFactory(endpoint)
-        await createPlaybackTask(
-            source: source,
-            selection: selection,
-            legacySelectionID: legacySelectionID,
-            endpoint: endpoint,
-            sequence: sequence,
-            client: client,
-            options: options
-        )
-    }
-
-    private func createPlaybackTask(
-        source: String,
-        selection: BilibiliTaskSelection?,
-        legacySelectionID: String?,
+    private func createTaskV2(
+        sessionID: String,
+        selection: BilibiliResolutionSelection,
+        execution: BilibiliTaskExecution,
         endpoint: CacheServerEndpoint,
         sequence: Int,
         client: any CacheControlClient,
-        options: BilibiliPlaybackTaskOptions
+        isPlayback: Bool
     ) async {
+        guard sequence == operationSequence else {
+            return
+        }
+
         stopWatching()
+        stopTaskResultPaging()
         activeEndpoint = endpoint
         retryIntent = nil
         isSubmitting = true
         isResolving = false
         errorMessage = nil
-        statusMessage = "Submitting Bilibili playback task..."
+        statusMessage =
+            isPlayback
+            ? "Submitting Bilibili playback task..."
+            : "Submitting Bilibili download task..."
 
         do {
             let task = try await Self.withOperationTimeout(operationTimeout) {
-                try await Self.createBilibiliPlaybackTask(
-                    client: client,
-                    source: source,
+                try await client.createBilibiliTaskV2(
+                    sessionID: sessionID,
                     selection: selection,
-                    legacySelectionID: legacySelectionID,
-                    options: options
+                    execution: execution
                 )
             }
 
@@ -1621,111 +1956,359 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             currentTask = nil
-            errorMessage = error.localizedDescription
-            statusMessage = "Could not submit Bilibili playback task."
+            if Self.isResolutionPageExpired(error) {
+                invalidateResolutionForExpiry()
+                return
+            }
+            errorMessage = Self.userFacingMessage(for: error)
+            statusMessage =
+                isPlayback
+                ? "Could not submit Bilibili playback task."
+                : "Could not submit Bilibili download task."
             isSubmitting = false
         }
     }
 
-    private func createDownloadTask(
+    private func installResolutionPage(
+        _ page: BilibiliResolutionPage,
         source: String,
         endpoint: CacheServerEndpoint,
-        options: BilibiliDownloadTaskOptions
-    ) async {
-        operationSequence += 1
-        activePlaybackTaskID = nil
-        activePlaybackResultID = nil
-        activePlaybackLibraryItemID = nil
-        let sequence = operationSequence
-        let client = clientFactory(endpoint)
+        options: BilibiliPlaybackTaskOptions,
+        resetSelection: Bool
+    ) {
+        resolutionSession = page.session
+        resolutionPageToken = page.nextPageToken
+        resolutionSnapshotID = page.snapshotID
+        resolutionTotalSize = page.totalSize
+        resolvedInputContext = BilibiliResolvedInputContext(
+            source: source,
+            endpoint: endpoint,
+            options: BilibiliPlaybackResolutionOptions(options)
+        )
+        resolvedInput = BilibiliResolveResult(
+            source: page.session.source,
+            title: page.session.title,
+            sourceKind: page.session.sourceKind,
+            candidates: page.candidates.map(\.resolvedCandidate),
+            defaultSelectionID: page.session.defaultCandidateToken,
+            candidatesTruncated: page.hasMoreCandidates
+        )
+        if resetSelection {
+            applyResolvedCandidateDefaults(resolvedInput!)
+        } else {
+            normalizeCandidateSelectionForMode()
+        }
+    }
 
-        stopWatching()
-        activeEndpoint = endpoint
-        retryIntent = nil
-        currentTask = nil
+    private func appendResolutionPage(_ page: BilibiliResolutionPage) {
+        guard let session = resolutionSession,
+            page.session.id == session.id,
+            page.snapshotID == resolutionSnapshotID,
+            let resolvedInput
+        else {
+            invalidateResolutionForExpiry()
+            return
+        }
+
+        let existingTokens = Set(resolvedInput.candidates.map(\.selectionID))
+        guard page.candidates.allSatisfy({ !existingTokens.contains($0.candidateToken) }) else {
+            invalidateResolutionForExpiry()
+            return
+        }
+
+        self.resolvedInput = BilibiliResolveResult(
+            source: resolvedInput.source,
+            title: resolvedInput.title,
+            sourceKind: resolvedInput.sourceKind,
+            candidates: resolvedInput.candidates + page.candidates.map(\.resolvedCandidate),
+            defaultSelectionID: resolvedInput.defaultSelectionID,
+            candidatesTruncated: page.hasMoreCandidates
+        )
+        resolutionPageToken = page.nextPageToken
+        normalizeCandidateSelectionForMode()
+    }
+
+    private func clearResolutionSession() {
+        candidatePageSequence += 1
+        resolutionSession = nil
+        resolutionPageToken = ""
+        resolutionSnapshotID = ""
+        resolutionTotalSize = 0
+        isLoadingMoreCandidates = false
         resolvedInput = nil
         resolvedInputContext = nil
         clearCandidateSelection()
-        isSubmitting = true
-        isResolving = false
-        errorMessage = nil
-        statusMessage = "Submitting Bilibili download task..."
-
-        do {
-            let task = try await Self.withOperationTimeout(operationTimeout) {
-                try await client.createBilibiliTask(urlOrID: source, options: options)
-            }
-
-            guard sequence == operationSequence else {
-                return
-            }
-
-            applyTaskUpdate(task)
-            isSubmitting = false
-            if task.shouldKeepWatchingBilibiliTask {
-                startWatching(taskID: task.id, endpoint: endpoint, sequence: sequence)
-            }
-        } catch {
-            guard sequence == operationSequence else {
-                return
-            }
-
-            currentTask = nil
-            errorMessage = error.localizedDescription
-            statusMessage = "Could not submit Bilibili download task."
-            isSubmitting = false
-        }
     }
 
-    private static func createBilibiliPlaybackTask(
+    private func invalidateResolutionForExpiry() {
+        clearResolutionSession()
+        errorMessage = Self.userFacingMessage(for: BilibiliTaskViewModelError.resolutionExpired)
+        statusMessage = "Re-resolve the Bilibili input before submitting."
+        retryIntent = .reResolve
+        isResolving = false
+        isSubmitting = false
+    }
+
+    private static func startBilibiliResolution(
         client: any CacheControlClient,
         source: String,
-        selection: BilibiliTaskSelection?,
-        legacySelectionID: String?,
-        options: BilibiliPlaybackTaskOptions
-    ) async throws -> CacheTask {
-        guard let selection else {
-            return try await client.createBilibiliPlaybackTask(
-                urlOrID: source,
-                selectionID: legacySelectionID,
-                options: options
-            )
-        }
-
+        options: BilibiliPlaybackTaskOptions,
+        operationTimeout: Duration
+    ) async throws -> BilibiliResolutionPage {
         do {
-            return try await client.createBilibiliPlaybackTask(
-                urlOrID: source,
-                selection: selection,
-                options: options
-            )
-        } catch let unsupported as CacheControlClientUnsupportedFeature
-            where unsupported == .bilibiliTaskSelection
-        {
-            let normalizedLegacySelectionID =
-                legacySelectionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !normalizedLegacySelectionID.isEmpty else {
-                throw unsupported
+            let serverInfo = try await withOperationTimeout(operationTimeout) {
+                try await client.getServerInfo()
             }
-
-            return try await client.createBilibiliPlaybackTask(
-                urlOrID: source,
-                selectionID: normalizedLegacySelectionID,
-                options: options
-            )
+            guard serverInfo.supportsBilibiliResolutionV2,
+                serverInfo.supportsBilibiliExecutionV2
+            else {
+                throw BilibiliTaskViewModelError.upgradeRequired
+            }
+            guard serverInfo.supportsTaskOutputV2 else {
+                throw BilibiliTaskViewModelError.taskOutputUnavailable
+            }
+            return try await withOperationTimeout(operationTimeout) {
+                try await client.startBilibiliResolution(
+                    urlOrID: source,
+                    options: options,
+                    pageSize: resolutionPageSize
+                )
+            }
+        } catch {
+            if isV2UpgradeError(error) {
+                throw BilibiliTaskViewModelError.upgradeRequired
+            }
+            throw error
         }
     }
 
-    private static func isBilibiliResolveUnsupported(_ error: Error) -> Bool {
+    private static func playbackSpec(from options: BilibiliPlaybackTaskOptions) throws -> BilibiliPlaybackSpec {
+        BilibiliPlaybackSpec(
+            qualityQN: try qualityQN(from: options.qualityPreference),
+            codec: try playbackCodec(from: options.encodingPreference),
+            audioLanguage: options.audioLanguagePreference,
+            policy: options.playbackPolicy
+        )
+    }
+
+    private static func downloadSpec(from options: BilibiliDownloadTaskOptions) throws -> BilibiliDownloadSpec {
+        BilibiliDownloadSpec(
+            qualityQN: try qualityQN(from: options.qualityPreference),
+            audioLanguage: options.audioLanguagePreference,
+            mode: options.downloadMode,
+            downloadSubtitles: options.downloadSubtitles,
+            subtitleAIPolicy: options.subtitleAIPolicy,
+            downloadDanmaku: options.downloadDanmaku,
+            danmakuFormats: options.danmakuFormats,
+            downloadCover: options.downloadCover
+        )
+    }
+
+    private static func qualityQN(from value: String) throws -> UInt32 {
+        let normalized = normalizedPreferenceToken(value)
+        switch normalized {
+        case "", "auto", "default", "best":
+            return 0
+        case "360", "360p":
+            return 16
+        case "480", "480p":
+            return 32
+        case "720", "720p":
+            return 64
+        case "1080", "1080p", "fullhd", "fhd":
+            return 80
+        case "1080p+", "1080plus", "1080pplus":
+            return 112
+        case "1080p60", "108060":
+            return 116
+        case "4k", "2160", "2160p":
+            return 120
+        case "hdr":
+            return 125
+        case "dolby":
+            return 126
+        case "8k", "4320", "4320p":
+            return 127
+        default:
+            guard let value = UInt32(normalized) else {
+                throw BilibiliTaskViewModelError.invalidQuality
+            }
+            return value
+        }
+    }
+
+    private static func playbackCodec(from value: String) throws -> BilibiliVideoCodec {
+        switch normalizedPreferenceToken(value) {
+        case "", "auto", "default", "best":
+            return .auto
+        case "h264", "avc", "avc1":
+            return .h264
+        case "hevc", "h265", "hev1", "hvc1":
+            return .hevc
+        case "av1", "av01":
+            return .av1
+        default:
+            throw BilibiliTaskViewModelError.invalidCodec
+        }
+    }
+
+    private static func normalizedPreferenceToken(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+    }
+
+    private static func isV2UpgradeError(_ error: Error) -> Bool {
         if let unsupported = error as? CacheControlClientUnsupportedFeature {
-            return unsupported == .bilibiliResolve
+            return unsupported == .bilibiliResolutionV2
+        }
+        if let unsupported = error as? CacheControlClientUnsupportedOperation {
+            return unsupported == .bilibiliExecutionV2
         }
         return false
+    }
+
+    private static func userFacingMessage(for error: Error) -> String {
+        if isV2UpgradeError(error) {
+            return BilibiliTaskViewModelError.upgradeRequired.localizedDescription
+        }
+        if let unsupported = error as? CacheControlClientUnsupportedOperation,
+            unsupported == .taskOutputV2
+        {
+            return BilibiliTaskViewModelError.taskOutputUnavailable.localizedDescription
+        }
+        let message = error.localizedDescription
+        if isCredentialFailureMessage(message.lowercased()) {
+            return "Bilibili credentials are required or invalid on the cache server."
+        }
+        return message
+    }
+
+    private static func isResolutionPageExpired(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return (message.contains("page token") && (message.contains("expired") || message.contains("invalid")))
+            || (message.contains("candidate token") && (message.contains("expired") || message.contains("invalid")))
+            || message.contains("resolution session expired")
+            || message.contains("resolution session was not found")
+            || message.contains("does not belong to this snapshot")
+    }
+
+    private static func isTaskResultPageExpired(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return (message.contains("page token") && (message.contains("expired") || message.contains("invalid")))
+            || message.contains("snapshot is no longer available")
+            || message.contains("snapshot expired")
     }
 
     private func stopWatching() {
         taskWatcher?.cancel()
         taskWatcher = nil
         isWatching = false
+    }
+
+    private func stopTaskResultPaging() {
+        taskResultRefreshTask?.cancel()
+        taskResultRefreshTask = nil
+        taskResultPageSequence += 1
+        taskResultItems = []
+        taskResultPageToken = ""
+        taskResultSnapshotID = ""
+        taskResultOutputRevision = nil
+        requestedTaskResultRevision = nil
+        isLoadingMoreTaskResults = false
+        taskResultsErrorMessage = nil
+    }
+
+    private func refreshTaskResults(for task: CacheTask?, force: Bool = false) {
+        guard let task,
+            let revision = task.outputSummary?.revision,
+            let endpoint = activeEndpoint
+        else {
+            return
+        }
+        if !force {
+            if let taskResultOutputRevision, taskResultOutputRevision >= revision {
+                return
+            }
+            if requestedTaskResultRevision == revision {
+                return
+            }
+        }
+
+        taskResultRefreshTask?.cancel()
+        taskResultPageSequence += 1
+        let pageSequence = taskResultPageSequence
+        let operation = operationSequence
+        requestedTaskResultRevision = revision
+        taskResultPageToken = ""
+        if force {
+            taskResultItems = []
+            taskResultSnapshotID = ""
+            taskResultOutputRevision = nil
+        }
+        isLoadingMoreTaskResults = true
+        taskResultsErrorMessage = nil
+        let client = clientFactory(endpoint)
+
+        taskResultRefreshTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let page = try await Self.withOperationTimeout(self.operationTimeout) {
+                    try await client.listTaskResults(
+                        taskID: task.id,
+                        pageToken: "",
+                        pageSize: Self.taskResultPageSize
+                    )
+                }
+
+                guard operation == self.operationSequence,
+                    pageSequence == self.taskResultPageSequence,
+                    self.currentTask?.id == task.id
+                else {
+                    return
+                }
+                guard page.outputRevision >= (self.currentTask?.outputSummary?.revision ?? revision) else {
+                    self.isLoadingMoreTaskResults = false
+                    self.taskResultsErrorMessage = "Waiting for the latest Bilibili result snapshot."
+                    self.requestedTaskResultRevision = nil
+                    self.taskResultRefreshTask = nil
+                    return
+                }
+
+                self.taskResultItems = page.results
+                self.taskResultPageToken = page.nextPageToken
+                self.taskResultSnapshotID = page.snapshotID
+                self.taskResultOutputRevision = page.outputRevision
+                self.requestedTaskResultRevision = page.outputRevision
+                self.taskResultsErrorMessage = nil
+                self.isLoadingMoreTaskResults = false
+                self.taskResultRefreshTask = nil
+            } catch {
+                guard operation == self.operationSequence,
+                    pageSequence == self.taskResultPageSequence,
+                    self.currentTask?.id == task.id
+                else {
+                    return
+                }
+                self.taskResultPageToken = ""
+                self.isLoadingMoreTaskResults = false
+                if self.requestedTaskResultRevision == revision {
+                    self.requestedTaskResultRevision = nil
+                }
+                if let unsupported = error as? CacheControlClientUnsupportedOperation,
+                    unsupported == .taskOutputV2
+                {
+                    self.taskResultsErrorMessage = BilibiliTaskViewModelError.taskOutputUnavailable.localizedDescription
+                } else {
+                    self.taskResultsErrorMessage = Self.userFacingMessage(for: error)
+                }
+                self.taskResultRefreshTask = nil
+            }
+        }
     }
 
     private func applyWatchedTask(_ task: CacheTask, sequence: Int) {
@@ -1737,6 +2320,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     private func applyTaskUpdate(_ task: CacheTask) {
+        if currentTask?.id != task.id {
+            stopTaskResultPaging()
+        }
         currentTask = task
         if activePlaybackTaskID == task.id {
             updateActivePlaybackTracking(for: task)
@@ -1758,6 +2344,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         if !task.shouldKeepWatchingBilibiliTask {
             stopWatching()
         }
+        refreshTaskResults(for: task)
     }
 
     private func updateActivePlaybackTracking(for task: CacheTask) {
@@ -1771,7 +2358,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         if let activePlaybackResultID {
-            guard let result = task.bilibiliTaskResults.first(where: { $0.id == activePlaybackResultID }),
+            guard let result = taskResults.first(where: { $0.id == activePlaybackResultID }),
                 result.playbackURL != nil
             else {
                 activePlaybackTaskID = nil
@@ -1789,7 +2376,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
     private func activePlaybackStatusMessage(for task: CacheTask) -> String {
         if let activePlaybackResultID,
-            let result = task.bilibiliTaskResults.first(where: { $0.id == activePlaybackResultID })
+            let result = taskResults.first(where: { $0.id == activePlaybackResultID })
         {
             return "Playing \(result.title)."
         }
@@ -1804,7 +2391,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
         isWatching = false
         if let error, !Task.isCancelled {
-            errorMessage = error.localizedDescription
+            errorMessage = Self.userFacingMessage(for: error)
             if let currentTask {
                 statusMessage = "Lost task updates for \(currentTask.bilibiliDisplayTitle)."
             } else {
@@ -2085,22 +2672,6 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return ""
     }
 
-    private static func singleSelection(for selectionID: String) -> BilibiliTaskSelection {
-        BilibiliTaskSelection(mode: "single", selectionIDs: [selectionID])
-    }
-
-    private static func multipleSelection(for selectionIDs: [String]) -> BilibiliTaskSelection {
-        BilibiliTaskSelection(mode: "multiple", selectionIDs: selectionIDs)
-    }
-
-    private static func rangeSelection(startIndex: Int, endIndex: Int) -> BilibiliTaskSelection {
-        BilibiliTaskSelection(mode: "range", rangeStartIndex: startIndex, rangeEndIndex: endIndex)
-    }
-
-    private static func allSelection() -> BilibiliTaskSelection {
-        BilibiliTaskSelection(mode: "all")
-    }
-
     private static func isVolatileResolvedSourceKind(_ sourceKind: String) -> Bool {
         switch normalizedBilibiliSourceKind(sourceKind) {
         case "favorite", "space", "collection", "series", "history", "watchlater", "following", "dynamic",
@@ -2247,7 +2818,9 @@ private extension CacheTask {
                 message: item.message,
                 libraryItemID: item.libraryItemID,
                 playbackLibraryItemID: item.playableBilibiliLibraryItemID ?? "",
+                playbackVariantID: item.playbackSource?.variantID ?? "",
                 playbackURL: item.playableBilibiliURL,
+                artifacts: [],
                 isReady: item.isReadyBilibiliResultState,
                 isCached: item.isCompletedBilibiliResultState,
                 isFailed: item.isFailedBilibiliResultState,
@@ -2507,6 +3080,122 @@ private extension BilibiliTaskResultItem {
     }
 }
 
+private extension BilibiliResolutionCandidate {
+    var resolvedCandidate: BilibiliResolvedCandidate {
+        let contentID: String
+        if !identity.bvid.isEmpty {
+            contentID = identity.bvid
+        } else if identity.aid > 0 {
+            contentID = "av\(identity.aid)"
+        } else if identity.epid > 0 {
+            contentID = "ep\(identity.epid)"
+        } else {
+            contentID = "cid\(identity.cid)"
+        }
+
+        return BilibiliResolvedCandidate(
+            selectionID: candidateToken,
+            title: title,
+            subtitle: subtitle,
+            sourceKind: sourceKind,
+            contentID: contentID,
+            index: index,
+            durationSeconds: durationSeconds,
+            coverURI: ""
+        )
+    }
+}
+
+private extension CacheTaskResult {
+    func bilibiliPresentation(endpoint: CacheServerEndpoint?) -> BilibiliTaskResultPresentation {
+        let normalizedState = state.normalizedBilibiliState
+        let message = problem?.message ?? ""
+        let isFailed = normalizedState.contains("failed")
+        let isCancelled = normalizedState.contains("cancelled")
+        let isCached = normalizedState.contains("completed") || normalizedState.contains("succeeded")
+        let isReady = isCached || normalizedState.contains("playable") || normalizedState.contains("ready")
+        let expectedItemID = isCached ? libraryItemID : id
+        let url =
+            isReady || (isFailed && message.localizedCaseInsensitiveContains("offline cache fill failed"))
+            ? playbackSource.flatMap { source in
+                expectedItemID.isEmpty ? nil : playableURL(for: source, expectedItemID: expectedItemID)
+            }
+            : nil
+        let artifacts = self.artifacts.map { artifact in
+            let resource = artifact.resource
+            return BilibiliTaskArtifactPresentation(
+                id: artifact.id,
+                kind: artifact.kind,
+                state: artifact.state,
+                title: artifact.title,
+                format: artifact.format,
+                languageTag: artifact.languageTag,
+                isAIGenerated: artifact.isAIGenerated,
+                resourceURL: resource.flatMap { serverOwnedResourceURL($0.uri, endpoint: endpoint) },
+                contentType: resource?.contentType ?? "",
+                sizeBytes: resource?.sizeBytes ?? 0,
+                sizeKnown: resource?.sizeKnown ?? false,
+                expiresAt: resource?.expiresAt,
+                libraryItemID: artifact.libraryItemID,
+                message: artifact.problem?.message ?? ""
+            )
+        }
+
+        return BilibiliTaskResultPresentation(
+            id: id,
+            selectionID: id,
+            title: title,
+            subtitle: subtitle,
+            state: state,
+            message: message,
+            libraryItemID: libraryItemID,
+            playbackLibraryItemID: url != nil && isCached ? libraryItemID : "",
+            playbackVariantID: playbackSource?.variantID ?? "",
+            playbackURL: url,
+            artifacts: artifacts,
+            isReady: isReady,
+            isCached: isCached,
+            isFailed: isFailed,
+            isCancelled: isCancelled
+        )
+    }
+}
+
+private extension String {
+    var normalizedBilibiliState: String {
+        lowercased().filter(\.isLetter)
+    }
+}
+
+private func serverOwnedResourceURL(_ uri: String, endpoint: CacheServerEndpoint?) -> URL? {
+    guard !uri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    if let components = URLComponents(string: uri),
+        let scheme = components.scheme?.lowercased(),
+        ["http", "https"].contains(scheme),
+        components.host != nil
+    {
+        return components.url
+    }
+
+    guard let endpoint,
+        uri.hasPrefix("/"),
+        !uri.hasPrefix("//")
+    else {
+        return nil
+    }
+
+    var components = URLComponents()
+    components.scheme = endpoint.scheme.rawValue
+    components.host = endpoint.host
+    components.port = endpoint.port
+    guard let baseURL = components.url else {
+        return nil
+    }
+    return URL(string: uri, relativeTo: baseURL)?.absoluteURL
+}
+
 private extension BilibiliResolvedCandidate {
     var displayTitle: String {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2613,13 +3302,13 @@ private extension BilibiliTaskViewModel {
                 == BilibiliPlaybackResolutionOptions(options)
     }
 
-    func discardStaleResolveSubmission() {
+    func discardStaleResolveSubmission(
+        statusMessage: String = "Bilibili input changed before resolve completed."
+    ) {
         currentTask = nil
-        resolvedInput = nil
-        resolvedInputContext = nil
-        clearCandidateSelection()
+        clearResolutionSession()
         errorMessage = nil
-        statusMessage = "Bilibili input changed before resolve completed."
+        self.statusMessage = statusMessage
         isResolving = false
         isSubmitting = false
     }

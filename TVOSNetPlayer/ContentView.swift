@@ -22,6 +22,9 @@ struct ContentView: View {
         case cacheLoadMoreButton
         case bilibiliField
         case bilibiliSubmitButton
+        case bilibiliCandidateLoadMoreButton
+        case bilibiliTaskResultsLoadMoreButton
+        case bilibiliTaskResultsRetryButton
         case urlField
         case playButton
     }
@@ -382,6 +385,10 @@ struct ContentView: View {
                         .lineLimit(2)
                 }
 
+                Text(candidatePaginationSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack(spacing: 12) {
                     bilibiliReResolveButton
 
@@ -425,6 +432,26 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxHeight: 260)
+
+                if bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates {
+                    Button {
+                        Task {
+                            await bilibiliModel.loadMoreResolvedCandidates(
+                                serverAddressText: cacheModel.serverAddressText
+                            )
+                        }
+                    } label: {
+                        Label(
+                            bilibiliModel.isLoadingMoreCandidates ? "Loading Candidates" : "Load More Candidates",
+                            systemImage: bilibiliModel.isLoadingMoreCandidates
+                                ? "hourglass"
+                                : "chevron.down.circle"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!bilibiliModel.hasMoreResolvedCandidates || bilibiliModel.isLoadingMoreCandidates)
+                    .focused($focusedControl, equals: .bilibiliCandidateLoadMoreButton)
+                }
             }
 
             if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
@@ -614,28 +641,98 @@ struct ContentView: View {
 
     @ViewBuilder
     private var bilibiliTaskResults: some View {
-        if !bilibiliModel.taskResults.isEmpty {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(bilibiliModel.taskResults) { result in
-                        HStack(alignment: .center, spacing: 10) {
-                            BilibiliTaskResultRow(result: result)
+        if !bilibiliModel.taskResults.isEmpty
+            || bilibiliModel.taskResultsErrorMessage != nil
+            || bilibiliModel.hasMoreTaskResults
+        {
+            if let summary = bilibiliModel.taskResultSummary {
+                Text(taskResultsPaginationSummary(totalCount: summary.totalCount))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let errorMessage = bilibiliModel.taskResultsErrorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if bilibiliModel.taskResultsErrorMessage != nil && !bilibiliModel.hasMoreTaskResults {
+                Button {
+                    Task {
+                        await bilibiliModel.retryTaskResults(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label("Retry Results", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(bilibiliModel.isLoadingMoreTaskResults)
+                .focused($focusedControl, equals: .bilibiliTaskResultsRetryButton)
+            }
+            if !bilibiliModel.taskResults.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(bilibiliModel.taskResults) { result in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .center, spacing: 10) {
+                                    BilibiliTaskResultRow(result: result)
 
-                            Button {
-                                Task {
-                                    await playBilibiliTaskResult(result)
+                                    Button {
+                                        Task {
+                                            await playBilibiliTaskResult(result)
+                                        }
+                                    } label: {
+                                        Label("Play", systemImage: "play.fill")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(!bilibiliModel.canPlay(result: result))
                                 }
-                            } label: {
-                                Label("Play", systemImage: "play.fill")
+
+                                ForEach(result.artifacts) { artifact in
+                                    BilibiliTaskArtifactRow(artifact: artifact)
+                                }
                             }
-                            .buttonStyle(.bordered)
-                            .disabled(!bilibiliModel.canPlay(result: result))
                         }
                     }
                 }
+                .frame(maxHeight: 220)
             }
-            .frame(maxHeight: 220)
+
+            if bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults {
+                Button {
+                    Task {
+                        await bilibiliModel.loadMoreTaskResults(
+                            serverAddressText: cacheModel.serverAddressText
+                        )
+                    }
+                } label: {
+                    Label(
+                        bilibiliModel.isLoadingMoreTaskResults ? "Loading Results" : "Load More Results",
+                        systemImage: bilibiliModel.isLoadingMoreTaskResults
+                            ? "hourglass"
+                            : "chevron.down.circle"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .disabled(!bilibiliModel.hasMoreTaskResults || bilibiliModel.isLoadingMoreTaskResults)
+                .focused($focusedControl, equals: .bilibiliTaskResultsLoadMoreButton)
+            }
         }
+    }
+
+    private var candidatePaginationSummary: String {
+        let count = bilibiliModel.resolvedCandidates.count
+        let noun = count == 1 ? "candidate" : "candidates"
+        return bilibiliModel.hasMoreResolvedCandidates
+            ? "\(count) \(noun) loaded | more available"
+            : "\(count) \(noun) loaded | all available"
+    }
+
+    private func taskResultsPaginationSummary(totalCount: Int) -> String {
+        let loadedCount = bilibiliModel.taskResults.count
+        let noun = totalCount == 1 ? "result" : "results"
+        if totalCount > loadedCount || bilibiliModel.hasMoreTaskResults {
+            return "Showing \(loadedCount) of \(totalCount) \(noun) | next page available"
+        }
+        return "Showing \(loadedCount) of \(totalCount) \(noun)"
     }
 
     private var playbackArea: some View {
@@ -929,6 +1026,42 @@ private struct BilibiliTaskResultRow: View {
             Image(systemName: result.statusSystemImage)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct BilibiliTaskArtifactRow: View {
+    let artifact: BilibiliTaskArtifactPresentation
+
+    private var detail: String {
+        [artifact.kind, artifact.state, artifact.format, artifact.languageTag]
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+    }
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(artifact.title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if !artifact.message.isEmpty {
+                    Text(artifact.message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        } icon: {
+            Image(systemName: artifact.isAvailable ? "doc.text" : "doc.text.magnifyingglass")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 28)
     }
 }
 
