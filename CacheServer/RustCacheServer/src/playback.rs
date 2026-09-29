@@ -71,7 +71,7 @@ impl PlaybackUriFactory {
         )
     }
 
-    fn create_base_uri<T>(&self, request: &Request<T>) -> String {
+    pub(crate) fn create_base_uri<T>(&self, request: &Request<T>) -> String {
         let candidate = self
             .options
             .public_media_base_uri

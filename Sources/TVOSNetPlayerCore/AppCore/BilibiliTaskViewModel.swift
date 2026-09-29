@@ -485,6 +485,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
     private var activeEndpoint: CacheServerEndpoint?
+    private var mediaBaseURIs: [String] = []
     private var resolvedInputContext: BilibiliResolvedInputContext?
     private var taskWatcher: Task<Void, Never>?
     private var operationSequence = 0
@@ -785,7 +786,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             else {
                 return []
             }
-            return taskResultItems.map { $0.bilibiliPresentation(endpoint: activeEndpoint) }
+            return taskResultItems.map { $0.bilibiliPresentation(mediaBaseURIs: mediaBaseURIs) }
         }
 
         return currentTask.bilibiliTaskResults
@@ -972,11 +973,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
-        let options = currentPlaybackOptions
+        let options = currentResolutionOptions
         let playbackSpec: BilibiliPlaybackSpec?
         let downloadSpec: BilibiliDownloadSpec?
         do {
-            _ = try Self.playbackCodec(from: options.encodingPreference)
             playbackSpec = submittedMode == .playback ? try Self.playbackSpec(from: options) : nil
             downloadSpec = submittedMode == .download ? try Self.downloadSpec(from: currentDownloadOptions) : nil
         } catch {
@@ -1029,6 +1029,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopWatching()
         stopTaskResultPaging()
         activeEndpoint = endpoint
+        mediaBaseURIs = []
         currentTask = nil
         clearResolutionSession()
         isSubmitting = true
@@ -1039,7 +1040,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let client = clientFactory(endpoint)
 
         do {
-            let page = try await Self.startBilibiliResolution(
+            let (page, serverInfo) = try await Self.startBilibiliResolution(
                 client: client,
                 source: source,
                 options: options,
@@ -1063,6 +1064,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 return
             }
 
+            mediaBaseURIs = serverInfo.mediaBaseURIs
             installResolutionPage(
                 page,
                 source: source,
@@ -1183,7 +1185,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             return
         }
 
-        let options = currentPlaybackOptions
+        let options = currentResolutionOptions
 
         operationSequence += 1
         activePlaybackTaskID = nil
@@ -1195,6 +1197,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         stopWatching()
         stopTaskResultPaging()
         activeEndpoint = endpoint
+        mediaBaseURIs = []
         isResolving = true
         isSubmitting = false
         errorMessage = nil
@@ -1203,8 +1206,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let client = clientFactory(endpoint)
 
         do {
-            _ = try Self.playbackSpec(from: options)
-            let page = try await Self.startBilibiliResolution(
+            if submissionMode == .playback {
+                _ = try Self.playbackSpec(from: options)
+            }
+            let (page, serverInfo) = try await Self.startBilibiliResolution(
                 client: client,
                 source: source,
                 options: options,
@@ -1221,6 +1226,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             }
 
             activeEndpoint = endpoint
+            mediaBaseURIs = serverInfo.mediaBaseURIs
             installResolutionPage(
                 page,
                 source: source,
@@ -1564,6 +1570,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     public func clearTask() {
         operationSequence += 1
         activeEndpoint = nil
+        mediaBaseURIs = []
         activePlaybackTaskID = nil
         activePlaybackResultID = nil
         activePlaybackLibraryItemID = nil
@@ -2054,7 +2061,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         source: String,
         options: BilibiliPlaybackTaskOptions,
         operationTimeout: Duration
-    ) async throws -> BilibiliResolutionPage {
+    ) async throws -> (BilibiliResolutionPage, CacheServerSummary) {
         do {
             let serverInfo = try await withOperationTimeout(operationTimeout) {
                 try await client.getServerInfo()
@@ -2067,13 +2074,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
             guard serverInfo.supportsTaskOutputV2 else {
                 throw BilibiliTaskViewModelError.taskOutputUnavailable
             }
-            return try await withOperationTimeout(operationTimeout) {
+            let page = try await withOperationTimeout(operationTimeout) {
                 try await client.startBilibiliResolution(
                     urlOrID: source,
                     options: options,
                     pageSize: resolutionPageSize
                 )
             }
+            return (page, serverInfo)
         } catch {
             if isV2UpgradeError(error) {
                 throw BilibiliTaskViewModelError.upgradeRequired
@@ -3107,7 +3115,7 @@ private extension BilibiliResolutionCandidate {
 }
 
 private extension CacheTaskResult {
-    func bilibiliPresentation(endpoint: CacheServerEndpoint?) -> BilibiliTaskResultPresentation {
+    func bilibiliPresentation(mediaBaseURIs: [String]) -> BilibiliTaskResultPresentation {
         let normalizedState = state.normalizedBilibiliState
         let message = problem?.message ?? ""
         let isFailed = normalizedState.contains("failed")
@@ -3131,7 +3139,7 @@ private extension CacheTaskResult {
                 format: artifact.format,
                 languageTag: artifact.languageTag,
                 isAIGenerated: artifact.isAIGenerated,
-                resourceURL: resource.flatMap { serverOwnedResourceURL($0.uri, endpoint: endpoint) },
+                resourceURL: resource.flatMap { serverOwnedResourceURL($0.uri, mediaBaseURIs: mediaBaseURIs) },
                 contentType: resource?.contentType ?? "",
                 sizeBytes: resource?.sizeBytes ?? 0,
                 sizeKnown: resource?.sizeKnown ?? false,
@@ -3167,33 +3175,61 @@ private extension String {
     }
 }
 
-private func serverOwnedResourceURL(_ uri: String, endpoint: CacheServerEndpoint?) -> URL? {
-    guard !uri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return nil
-    }
-    if let components = URLComponents(string: uri),
-        let scheme = components.scheme?.lowercased(),
-        ["http", "https"].contains(scheme),
-        components.host != nil
-    {
-        return components.url
-    }
-
-    guard let endpoint,
-        uri.hasPrefix("/"),
-        !uri.hasPrefix("//")
+private func serverOwnedResourceURL(_ uri: String, mediaBaseURIs: [String]) -> URL? {
+    guard let resource = URLComponents(string: uri),
+        resource.user == nil,
+        resource.password == nil,
+        resource.query == nil,
+        resource.fragment == nil
     else {
         return nil
     }
 
-    var components = URLComponents()
-    components.scheme = endpoint.scheme.rawValue
-    components.host = endpoint.host
-    components.port = endpoint.port
-    guard let baseURL = components.url else {
-        return nil
+    for baseURI in mediaBaseURIs {
+        guard let base = URLComponents(string: baseURI),
+            let baseScheme = base.scheme?.lowercased(),
+            ["http", "https"].contains(baseScheme),
+            let baseHost = base.host, !baseHost.isEmpty,
+            base.user == nil, base.password == nil,
+            base.query == nil, base.fragment == nil
+        else {
+            continue
+        }
+
+        var basePath = base.percentEncodedPath
+        while basePath.hasSuffix("/") {
+            basePath.removeLast()
+        }
+        let resourcePrefix = basePath + "/resources/"
+        var candidate = resource
+        if resource.scheme == nil, resource.host == nil,
+            uri.hasPrefix("/resources/"), !uri.hasPrefix("//")
+        {
+            candidate = base
+            candidate.percentEncodedPath = basePath + resource.percentEncodedPath
+        } else if resource.scheme?.lowercased() != baseScheme
+            || resource.host?.lowercased() != baseHost.lowercased()
+            || resource.port != base.port
+        {
+            continue
+        }
+
+        guard candidate.percentEncodedPath.hasPrefix(resourcePrefix) else {
+            continue
+        }
+        let resourceID = String(candidate.percentEncodedPath.dropFirst(resourcePrefix.count))
+        guard !resourceID.isEmpty, resourceID.utf8.count <= 200,
+            resourceID.utf8.allSatisfy({ byte in
+                (65...90).contains(byte) || (97...122).contains(byte)
+                    || (48...57).contains(byte) || byte == 45 || byte == 95
+            })
+        else {
+            continue
+        }
+        return candidate.url
     }
-    return URL(string: uri, relativeTo: baseURL)?.absoluteURL
+
+    return nil
 }
 
 private extension BilibiliResolvedCandidate {
@@ -3257,6 +3293,16 @@ private extension BilibiliTaskViewModel {
         )
     }
 
+    var currentResolutionOptions: BilibiliPlaybackTaskOptions {
+        guard submissionMode == .download else {
+            return currentPlaybackOptions
+        }
+        return BilibiliPlaybackTaskOptions(
+            qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
+            audioLanguagePreference: audioLanguagePreference.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
     var currentDownloadOptions: BilibiliDownloadTaskOptions {
         BilibiliDownloadTaskOptions(
             qualityPreference: qualityPreference.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3274,7 +3320,7 @@ private extension BilibiliTaskViewModel {
         resolvedInputMatches(
             source: Self.normalizedBilibiliSource(sourceText),
             endpoint: nil,
-            options: currentPlaybackOptions
+            options: currentResolutionOptions
         )
     }
 
@@ -3298,7 +3344,7 @@ private extension BilibiliTaskViewModel {
 
     func currentSubmissionMatches(source: String, options: BilibiliPlaybackTaskOptions) -> Bool {
         Self.normalizedBilibiliSource(sourceText) == source
-            && BilibiliPlaybackResolutionOptions(currentPlaybackOptions)
+            && BilibiliPlaybackResolutionOptions(currentResolutionOptions)
                 == BilibiliPlaybackResolutionOptions(options)
     }
 

@@ -225,6 +225,33 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testSubmitDownloadIgnoresInvalidPlaybackCodec() async {
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(.fixture(id: "bilibili-download-vp9", state: "TASK_STATE_QUEUED"))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1download-vp9",
+            encodingPreference: "vp9",
+            clientFactory: { _ in client }
+        )
+        model.submissionMode = .download
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.currentTask?.id, "bilibili-download-vp9")
+        let requests = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(requests.count, 1)
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.first?.options.encodingPreference, "")
+        if case .download = requests.first?.execution {
+            // Download execution does not use the playback codec preference.
+        } else {
+            XCTFail("Expected typed download execution.")
+        }
+        model.clearTask()
+    }
+
     func testSubmitUsesV2SelectionWhenLegacySelectionIsUnsupported() async {
         let client = FakeBilibiliCacheControlClient(
             createResponses: [
@@ -1329,6 +1356,50 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testReResolveDownloadIgnoresInvalidPlaybackCodec() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1download-reresolve-vp9",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    )),
+                .success(
+                    .fixture(
+                        source: "BV1download-reresolve-vp9",
+                        candidates: [
+                            .fixture(selectionID: "page:1", title: "Part 1 refreshed", index: 1),
+                            .fixture(selectionID: "page:2", title: "Part 2 refreshed", index: 2),
+                        ],
+                        defaultSelectionID: "page:1"
+                    )),
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1download-reresolve-vp9",
+            encodingPreference: "vp9",
+            clientFactory: { _ in client }
+        )
+        model.submissionMode = .download
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await model.reResolve(serverAddressText: "mac-mini.local:50051")
+
+        let resolvedRequests = await client.resolvedRequestsSnapshot()
+        XCTAssertEqual(resolvedRequests.count, 2)
+        XCTAssertEqual(resolvedRequests.map(\.options.encodingPreference), ["", ""])
+        XCTAssertEqual(model.resolvedCandidates.map(\.title), ["Part 1 refreshed", "Part 2 refreshed"])
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isResolving)
+        let taskRequests = await client.v2TaskRequestsSnapshot()
+        XCTAssertTrue(taskRequests.isEmpty)
+    }
+
     func testSubmitUsesSingleCandidateFromReResolveWithoutResolvingAgain() async {
         let client = FakeBilibiliCacheControlClient(
             resolveResponses: [
@@ -1716,17 +1787,21 @@ final class BilibiliTaskViewModelTests: XCTestCase {
 
         let resolvedRequests = await client.resolvedRequestsSnapshot()
         XCTAssertEqual(resolvedRequests.count, 1)
-        let requests = await client.createdRequestsSnapshot()
+        let requests = await client.v2TaskRequestsSnapshot()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.selectionID, "page:2")
-        XCTAssertEqual(
-            requests.first?.options.playbackPolicy,
-            BilibiliPlaybackPolicy(
-                transcodingPreference: .force,
-                compatibleVariantPreference: .preferRequested,
-                weakNetworkPreference: .holdDowngrade
+        XCTAssertEqual(requests.first?.selection, .single(candidateToken: "page:2"))
+        if case let .playback(spec) = requests.first?.execution {
+            XCTAssertEqual(
+                spec.policy,
+                BilibiliPlaybackPolicy(
+                    transcodingPreference: .force,
+                    compatibleVariantPreference: .preferRequested,
+                    weakNetworkPreference: .holdDowngrade
+                )
             )
-        )
+        } else {
+            XCTFail("Expected typed playback execution.")
+        }
 
         model.clearTask()
     }
@@ -2115,7 +2190,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         )
         let artifact = CacheTaskArtifact.fixture(
             id: "subtitle-en",
-            uri: "http://mac-mini.local:8080/results/page-1/subtitle.srt",
+            uri: "http://mac-mini.local:8080/resources/subtitle-en",
             libraryItemID: "subtitle-library-item"
         )
         let page1 = CacheTaskResultsPage(
@@ -2161,7 +2236,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(presentedArtifact.libraryItemID, "subtitle-library-item")
         XCTAssertEqual(
             model.artifactURL(for: presentedArtifact)?.absoluteString,
-            "http://mac-mini.local:8080/results/page-1/subtitle.srt"
+            "http://mac-mini.local:8080/resources/subtitle-en"
         )
 
         await client.setSuspendsTaskResultResponses(false)
@@ -2211,6 +2286,109 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(model.taskResults.map(\.id), ["revision-2-page-1", "revision-2-page-2"])
         XCTAssertFalse(model.taskResults.contains { $0.id.hasPrefix("legacy-") })
         model.clearTask()
+    }
+
+    func testArtifactURLsAreRestrictedToAdvertisedMediaBases() async {
+        let uris = [
+            "http://mac-mini.local:8080/resources/valid",
+            "https://media.example.test/cache/resources/https-valid",
+            "/resources/relative-valid",
+            "http://attacker.example/resources/off-origin",
+            "http://user:password@mac-mini.local:8080/resources/credentials",
+            "http://mac-mini.local:8080/resources/query?download=1",
+            "http://mac-mini.local:8080/resources/fragment#part",
+            "http://mac-mini.local:8080/resources/id%2Fprivate",
+            "http://mac-mini.local:8080/resources/%2e%2e/private",
+            "http://mac-mini.local:8081/resources/different-port",
+        ]
+        let artifacts = uris.enumerated().map { index, uri in
+            CacheTaskArtifact.fixture(id: "artifact-\(index)", uri: uri)
+        }
+        let page = CacheTaskResultsPage(
+            results: [.fixture(id: "page-1", title: "Artifacts", artifacts: artifacts)],
+            pageInfo: CachePageInfo(totalSize: 1, nextPageToken: "", snapshotID: "artifact-snapshot"),
+            outputRevision: 1
+        )
+        let outputSummary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 1,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: UInt64(artifacts.count),
+            primaryResultID: "page-1"
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(state: "TASK_STATE_PREPARING", outputSummary: outputSummary))
+            ],
+            taskResultPagesByTaskID: ["bilibili-playback-1": [page]],
+            mediaBaseURIs: [
+                "http://mac-mini.local:8080",
+                "https://media.example.test/cache/",
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1artifact-allowlist",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForTaskResultRequestCount(1)
+        await waitUntil(model.taskResults.count == 1)
+
+        let presentedArtifacts = model.taskResults[0].artifacts
+        XCTAssertEqual(model.artifactURL(for: presentedArtifacts[0])?.absoluteString, uris[0])
+        XCTAssertEqual(model.artifactURL(for: presentedArtifacts[1])?.absoluteString, uris[1])
+        XCTAssertEqual(
+            model.artifactURL(for: presentedArtifacts[2])?.absoluteString,
+            "http://mac-mini.local:8080/resources/relative-valid"
+        )
+        for artifact in presentedArtifacts.dropFirst(3) {
+            XCTAssertNil(model.artifactURL(for: artifact), "Unexpectedly allowed \(artifact.id)")
+        }
+        model.clearTask()
+
+        let relativePage = CacheTaskResultsPage(
+            results: [
+                .fixture(
+                    id: "page-1",
+                    title: "Relative artifact",
+                    artifacts: [
+                        .fixture(id: "relative", uri: "/resources/relative-id")
+                    ]
+                )
+            ],
+            pageInfo: CachePageInfo(totalSize: 1, nextPageToken: "", snapshotID: "relative-snapshot"),
+            outputRevision: 1
+        )
+        let relativeOutputSummary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 1,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 1,
+            primaryResultID: "page-1"
+        )
+        let noBaseClient = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(state: "TASK_STATE_PREPARING", outputSummary: relativeOutputSummary))
+            ],
+            taskResultPagesByTaskID: ["bilibili-playback-1": [relativePage]],
+            mediaBaseURIs: []
+        )
+        let noBaseModel = BilibiliTaskViewModel(
+            sourceText: "BV1artifact-no-base",
+            clientFactory: { _ in noBaseClient }
+        )
+        await noBaseModel.submit(serverAddressText: "mac-mini.local:50051")
+        await noBaseClient.waitForTaskResultRequestCount(1)
+        await waitUntil(noBaseModel.taskResults.count == 1)
+        XCTAssertNil(noBaseModel.artifactURL(for: noBaseModel.taskResults[0].artifacts[0]))
+        noBaseModel.clearTask()
     }
 
     func testTaskResultsCanRetryTransientFirstPageFailure() async {
@@ -3632,6 +3810,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private let supportsBilibiliResolutionV2: Bool
     private let supportsBilibiliExecutionV2: Bool
     private let supportsTaskOutputV2: Bool
+    private let mediaBaseURIs: [String]
     private var suspendsResolveResponses: Bool
     private var suspendsCreateResponses: Bool
     private var suspendsTaskResultResponses = false
@@ -3686,6 +3865,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         supportsBilibiliExecutionV2: Bool = true,
         supportsTaskOutputV2: Bool = true,
         taskResultPagesByTaskID: [String: [CacheTaskResultsPage]] = [:],
+        mediaBaseURIs: [String] = ["http://mac-mini.local:8080"],
         suspendsResolveResponses: Bool = false,
         suspendsCreateResponses: Bool = false,
         suspendsTaskResultResponses: Bool = false
@@ -3698,6 +3878,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         self.supportsBilibiliResolutionV2 = supportsBilibiliResolutionV2
         self.supportsBilibiliExecutionV2 = supportsBilibiliExecutionV2
         self.supportsTaskOutputV2 = supportsTaskOutputV2
+        self.mediaBaseURIs = mediaBaseURIs
         self.suspendsTaskResultResponses = suspendsTaskResultResponses
         self.suspendsResolveResponses = suspendsResolveResponses
         self.suspendsCreateResponses = suspendsCreateResponses
@@ -3726,7 +3907,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             id: "fake-cache-server",
             name: "Fake cache server",
             version: "test",
-            mediaBaseURIs: [],
+            mediaBaseURIs: mediaBaseURIs,
             capabilities: capabilities
         )
     }

@@ -172,7 +172,7 @@ impl ServerGrpcService {
 impl ServerService for ServerGrpcService {
     async fn get_server_info(
         &self,
-        _request: Request<GetServerInfoRequest>,
+        request: Request<GetServerInfoRequest>,
     ) -> Result<Response<ServerInfo>, Status> {
         recover_task_output_v2_for_read(&self.state).await;
         let mut info = ServerInfo {
@@ -203,15 +203,8 @@ impl ServerService for ServerGrpcService {
                 info.capabilities
                     .push(ServerCapability::BilibiliExecutionV2.into());
             }
-            if let Some(base_uri) = self
-                .state
-                .options
-                .public_media_base_uri
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                info.media_base_uris.push(base_uri.to_owned());
-            }
+            info.media_base_uris
+                .push(self.state.playback_uri_factory.create_base_uri(&request));
         }
         if local_library_item_delete_available(&self.state.options) {
             info.capabilities
@@ -5986,6 +5979,68 @@ mod tests {
             info.capabilities
                 .contains(&(ServerCapability::BilibiliExecutionV2 as i32))
         );
+    }
+
+    #[tokio::test]
+    async fn get_server_info_advertises_request_derived_media_base_uri() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state/tasks.json"),
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: None,
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+        let mut request = Request::new(GetServerInfoRequest {});
+        request
+            .metadata_mut()
+            .insert("host", "cache.example.test:50051".parse().unwrap());
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: Some("10.0.0.5:50051".parse().unwrap()),
+                remote_addr: None,
+            });
+
+        let info = service
+            .get_server_info(request)
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert_eq!(vec!["http://10.0.0.5:8080"], info.media_base_uris);
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::HttpRange as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_server_info_preserves_configured_path_prefixed_media_base_uri() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state/tasks.json"),
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: Some("https://atri.ink/cache".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state);
+        let mut request = Request::new(GetServerInfoRequest {});
+        request
+            .metadata_mut()
+            .insert("host", "cache.example.test:50051".parse().unwrap());
+
+        let info = service
+            .get_server_info(request)
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert_eq!(vec!["https://atri.ink/cache"], info.media_base_uris);
     }
 
     #[tokio::test]
