@@ -441,6 +441,11 @@ struct ContentView: View {
                             .lineLimit(2)
                     }
 
+                    Text(candidatePageSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+
                     HStack(spacing: 10) {
                         bilibiliReResolveButton
 
@@ -483,6 +488,22 @@ struct ContentView: View {
                         }
                     }
                     .frame(maxHeight: 220)
+
+                    if bilibiliModel.hasMoreResolvedCandidates {
+                        Button {
+                            Task {
+                                await bilibiliModel.loadMoreResolvedCandidates(
+                                    serverAddressText: cacheModel.serverAddressText
+                                )
+                            }
+                        } label: {
+                            Label(
+                                bilibiliModel.isLoadingMoreCandidates ? "Loading Candidates" : "Load More Candidates",
+                                systemImage: "arrow.down.circle"
+                            )
+                        }
+                        .disabled(bilibiliModel.isLoadingMoreCandidates)
+                    }
                 }
 
                 if bilibiliModel.currentTask != nil || bilibiliModel.isSubmitting || bilibiliModel.isResolving {
@@ -628,6 +649,14 @@ struct ContentView: View {
             && !bilibiliModel.isWaitingForCandidateSelection
     }
 
+    private var candidatePageSummary: String {
+        let count = bilibiliModel.resolvedCandidates.count
+        let noun = count == 1 ? "candidate" : "candidates"
+        return bilibiliModel.hasMoreResolvedCandidates
+            ? "\(count) \(noun) loaded | more available"
+            : "\(count) \(noun) loaded | all available"
+    }
+
     private var bilibiliReResolveButton: some View {
         Button {
             Task {
@@ -684,26 +713,94 @@ struct ContentView: View {
 
     @ViewBuilder
     private var bilibiliTaskResults: some View {
-        if !bilibiliModel.taskResults.isEmpty {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(bilibiliModel.taskResults) { result in
-                        HStack(alignment: .center, spacing: 10) {
-                            BilibiliTaskResultRow(result: result)
+        if bilibiliModel.taskResultSummary != nil
+            || !bilibiliModel.taskResults.isEmpty
+            || bilibiliModel.taskResultsErrorMessage != nil
+        {
+            if let summary = bilibiliModel.taskResultSummary {
+                Text(taskResultPageSummary(totalCount: summary.totalCount))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-                            Button {
-                                Task {
-                                    await playBilibiliTaskResult(result)
+            if !bilibiliModel.taskResults.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(bilibiliModel.taskResults) { result in
+                            HStack(alignment: .center, spacing: 10) {
+                                BilibiliTaskResultRow(
+                                    result: result,
+                                    resourceURL: { artifact in bilibiliModel.artifactURL(for: artifact) },
+                                    isLibraryItemAvailable: { libraryItemID in
+                                        cacheModel.items.contains { $0.id == libraryItemID }
+                                    },
+                                    openLibraryItem: openBilibiliArtifactInLibrary
+                                )
+
+                                Button {
+                                    Task {
+                                        await playBilibiliTaskResult(result)
+                                    }
+                                } label: {
+                                    Label("Play", systemImage: "play.fill")
                                 }
-                            } label: {
-                                Label("Play", systemImage: "play.fill")
+                                .disabled(!bilibiliModel.canPlay(result: result))
                             }
-                            .disabled(!bilibiliModel.canPlay(result: result))
                         }
                     }
                 }
+                .frame(maxHeight: 180)
             }
-            .frame(maxHeight: 180)
+
+            if let errorMessage = bilibiliModel.taskResultsErrorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+            }
+
+            if bilibiliModel.taskResultsErrorMessage != nil && !bilibiliModel.hasMoreTaskResults {
+                Button {
+                    Task {
+                        await bilibiliModel.retryTaskResults(serverAddressText: cacheModel.serverAddressText)
+                    }
+                } label: {
+                    Label("Retry Results", systemImage: "arrow.clockwise")
+                }
+                .disabled(bilibiliModel.isLoadingMoreTaskResults)
+            }
+
+            if bilibiliModel.hasMoreTaskResults {
+                Button {
+                    Task {
+                        await bilibiliModel.loadMoreTaskResults(
+                            serverAddressText: cacheModel.serverAddressText
+                        )
+                    }
+                } label: {
+                    Label(
+                        bilibiliModel.isLoadingMoreTaskResults ? "Loading Results" : "Load More Results",
+                        systemImage: "arrow.down.circle"
+                    )
+                }
+                .disabled(bilibiliModel.isLoadingMoreTaskResults)
+            }
+        }
+    }
+
+    private func taskResultPageSummary(totalCount: Int) -> String {
+        let count = bilibiliModel.taskResults.count
+        let noun = totalCount == 1 ? "result" : "results"
+        return "Showing \(count) of \(totalCount) \(noun)"
+    }
+
+    private func openBilibiliArtifactInLibrary(_ libraryItemID: String) {
+        guard let item = cacheModel.items.first(where: { $0.id == libraryItemID }) else {
+            return
+        }
+        selectedItemID = item.id
+        Task {
+            await playCachedItem(item)
         }
     }
 
@@ -1030,6 +1127,9 @@ private struct CacheLibraryMetadata: View {
 
 private struct BilibiliTaskResultRow: View {
     let result: BilibiliTaskResultPresentation
+    let resourceURL: (BilibiliTaskArtifactPresentation) -> URL?
+    let isLibraryItemAvailable: (String) -> Bool
+    let openLibraryItem: (String) -> Void
 
     var body: some View {
         Label {
@@ -1050,11 +1150,54 @@ private struct BilibiliTaskResultRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+
+                ForEach(result.artifacts) { artifact in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(artifact.title.isEmpty ? artifact.kind : artifact.title)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                            Text(artifactDetails(artifact))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            if !artifact.message.isEmpty {
+                                Text(artifact.message)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        if let url = resourceURL(artifact) {
+                            Link(destination: url) {
+                                Label("Open", systemImage: "arrow.up.right.square")
+                            }
+                            .font(.caption)
+                        }
+                        if artifact.canOpenInLibrary {
+                            Button {
+                                openLibraryItem(artifact.libraryItemID)
+                            } label: {
+                                Label("Play Cached", systemImage: "play.rectangle")
+                            }
+                            .font(.caption)
+                            .disabled(!isLibraryItemAvailable(artifact.libraryItemID))
+                        }
+                    }
+                    .padding(.leading, 24)
+                }
             }
         } icon: {
             Image(systemName: result.statusSystemImage)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func artifactDetails(_ artifact: BilibiliTaskArtifactPresentation) -> String {
+        [artifact.state, artifact.format, artifact.languageTag]
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
     }
 }
 

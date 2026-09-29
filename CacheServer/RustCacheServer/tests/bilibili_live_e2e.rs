@@ -18,19 +18,21 @@ use tvos_net_player_cache_server::{
     AppState,
     config::CacheServerOptions,
     generated::tvos_net_player::v1::{
-        BilibiliCredentialStatus, BilibiliPlaybackOptions, BilibiliResolveResult,
-        BilibiliResolvedCandidate, BilibiliTaskResultItem, BilibiliTaskSelection,
-        CreateBilibiliPlaybackTaskRequest, GetBilibiliCredentialStatusRequest, GetTaskRequest,
-        PlaybackProtocol, PlaybackSource, ResolveBilibiliInputRequest, Task, TaskState,
+        BilibiliContentIdentity, BilibiliContentKind, BilibiliCredentialStatus,
+        BilibiliPlaybackOptions, BilibiliPlaybackSpec, BilibiliResolutionCandidate,
+        BilibiliResolutionPage, BilibiliResolutionSelection, BilibiliResolutionSelectionMode,
+        BilibiliTaskResultItem, BilibiliVideoCodec, CacheResourceRef, CreateBilibiliTaskV2Request,
+        GetBilibiliCredentialStatusRequest, GetTaskRequest,
+        ListBilibiliResolutionCandidatesRequest, ListTaskResultsRequest, PageRequest,
+        PlaybackProtocol, PlaybackSource, StartBilibiliResolutionRequest, Task, TaskArtifact,
+        TaskResult, TaskState, create_bilibili_task_v2_request::Execution as BilibiliExecutionV2,
         server_service_client::ServerServiceClient, task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
 };
 
-const BILIBILI_TASK_SELECTION_MODE_SINGLE: i32 = 3;
-const BILIBILI_TASK_SELECTION_MODE_MULTIPLE: i32 = 4;
-const BILIBILI_TASK_SELECTION_MODE_RANGE: i32 = 5;
-const BILIBILI_TASK_SELECTION_MODE_ALL: i32 = 6;
+const BILIBILI_RESOLUTION_PAGE_SIZE: u32 = 1;
+const BILIBILI_TASK_RESULT_PAGE_SIZE: u32 = 1;
 const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
@@ -109,34 +111,55 @@ async fn run_live_case(
     assert_authenticated_case_ready(case, credential_status);
 
     let mut task_client = TaskServiceClient::new(channel);
-    let options = case.playback_options.to_proto();
     let source = case.source();
 
-    let resolved = task_client
-        .resolve_bilibili_input(Request::new(ResolveBilibiliInputRequest {
+    let first_page = task_client
+        .start_bilibili_resolution(Request::new(StartBilibiliResolutionRequest {
             url_or_id: source.clone(),
-            options: Some(options.clone()),
+            options: Some(case.playback_options.to_proto()),
+            page: Some(PageRequest {
+                page_size: BILIBILI_RESOLUTION_PAGE_SIZE,
+                page_token: String::new(),
+            }),
+            context: None,
         }))
         .await
         .unwrap_or_else(|error| {
             panic!(
                 "{}",
-                live_failure_message(case, "resolve", &error.to_string(), credential_status)
+                live_failure_message(
+                    case,
+                    "start resolution",
+                    &error.to_string(),
+                    credential_status
+                )
             )
         })
         .into_inner();
 
+    let session = first_page
+        .session
+        .clone()
+        .unwrap_or_else(|| panic!("{}: resolution did not return a session", case.id));
     assert!(
-        !resolved.title.trim().is_empty(),
+        !session.id.trim().is_empty(),
+        "{}: resolution session id is empty",
+        case.id
+    );
+    assert!(
+        !session.title.trim().is_empty(),
         "{}: resolved title is empty",
         case.id
     );
     assert_eq!(
-        case.expected_source_kind, resolved.source_kind,
+        case.expected_source_kind, session.source_kind,
         "{}: unexpected source kind",
         case.id
     );
-    if resolved.candidates.len() < case.minimum_candidates {
+
+    let (candidates, candidate_snapshot_id) =
+        collect_resolution_candidates(&mut task_client, case, first_page, credential_status).await;
+    if candidates.len() < case.minimum_candidates {
         panic!(
             "{}",
             live_failure_message(
@@ -145,21 +168,30 @@ async fn run_live_case(
                 &format!(
                     "expected at least {} candidates, got {}",
                     case.minimum_candidates,
-                    resolved.candidates.len()
+                    candidates.len()
                 ),
                 credential_status,
             )
         );
     }
-    assert_resolved_candidate_contract(case, &resolved);
+    let page_snapshot = candidate_snapshot_id
+        .as_deref()
+        .unwrap_or_else(|| panic!("{}: candidate pages omitted snapshot identity", case.id));
+    assert!(
+        !page_snapshot.is_empty(),
+        "{}: candidate snapshot identity is empty",
+        case.id
+    );
+    assert_resolution_candidate_contract(case, &candidates);
 
-    let selection = case.selection_request(&resolved);
+    let selection = case.selection_request(&candidates, &session.default_candidate_token);
     let created = task_client
-        .create_bilibili_playback_task(Request::new(CreateBilibiliPlaybackTaskRequest {
-            url_or_id: source,
-            options: Some(options),
-            selection_id: selection.legacy_selection_id.clone(),
+        .create_bilibili_task_v2(Request::new(CreateBilibiliTaskV2Request {
+            session_id: session.id,
             selection: Some(selection.selection.clone()),
+            execution: Some(BilibiliExecutionV2::Playback(
+                case.playback_options.to_playback_spec(),
+            )),
         }))
         .await
         .unwrap_or_else(|error| {
@@ -167,7 +199,7 @@ async fn run_live_case(
                 "{}",
                 live_failure_message(
                     case,
-                    "create playback task",
+                    "create v2 playback task",
                     &error.to_string(),
                     credential_status,
                 )
@@ -215,6 +247,261 @@ async fn run_live_case(
         )
         .await;
     }
+
+    let listed_results = list_all_task_results(
+        &mut task_client,
+        case,
+        &created.id,
+        http,
+        media_url,
+        credential_status,
+    )
+    .await;
+    assert_eq!(
+        selection.expected_result_items,
+        listed_results.len(),
+        "{}: unexpected ListTaskResults item count",
+        case.id
+    );
+}
+
+async fn collect_resolution_candidates(
+    task_client: &mut TaskServiceClient<tonic::transport::Channel>,
+    case: &LiveCase,
+    first_page: BilibiliResolutionPage,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> (Vec<BilibiliResolutionCandidate>, Option<String>) {
+    let session = first_page
+        .session
+        .clone()
+        .unwrap_or_else(|| panic!("{}: resolution page omitted session", case.id));
+    let first_page_info = first_page
+        .page_info
+        .clone()
+        .unwrap_or_else(|| panic!("{}: resolution page omitted pagination metadata", case.id));
+    let snapshot_id = first_page_info.snapshot_id.clone();
+    let total_size = first_page_info.total_size;
+    let mut candidates = first_page.candidates;
+    let mut page_token = first_page_info.next_page_token;
+
+    while !page_token.is_empty() {
+        let page = task_client
+            .list_bilibili_resolution_candidates(Request::new(
+                ListBilibiliResolutionCandidatesRequest {
+                    session_id: session.id.clone(),
+                    page: Some(PageRequest {
+                        page_size: BILIBILI_RESOLUTION_PAGE_SIZE,
+                        page_token,
+                    }),
+                },
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}",
+                    live_failure_message(
+                        case,
+                        "list resolution candidates",
+                        &error.to_string(),
+                        credential_status
+                    )
+                )
+            })
+            .into_inner();
+        assert_resolution_session_consistent(case, &session, page.session.as_ref());
+        let page_info = page
+            .page_info
+            .unwrap_or_else(|| panic!("{}: candidate page omitted pagination metadata", case.id));
+        assert_eq!(
+            snapshot_id, page_info.snapshot_id,
+            "{}: candidate snapshot changed between pages",
+            case.id
+        );
+        assert_eq!(
+            total_size, page_info.total_size,
+            "{}: candidate total changed between pages",
+            case.id
+        );
+        candidates.extend(page.candidates);
+        page_token = page_info.next_page_token;
+    }
+    assert_eq!(
+        total_size as usize,
+        candidates.len(),
+        "{}: candidate pagination did not cover the snapshot",
+        case.id
+    );
+    (candidates, Some(snapshot_id))
+}
+
+fn assert_resolution_session_consistent(
+    case: &LiveCase,
+    expected: &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolutionSession,
+    actual: Option<
+        &tvos_net_player_cache_server::generated::tvos_net_player::v1::BilibiliResolutionSession,
+    >,
+) {
+    let actual = actual.unwrap_or_else(|| panic!("{}: candidate page omitted session", case.id));
+    assert_eq!(
+        expected.id, actual.id,
+        "{}: resolution session changed between pages",
+        case.id
+    );
+    assert_eq!(
+        expected.source_kind, actual.source_kind,
+        "{}: resolution source kind changed between pages",
+        case.id
+    );
+    assert_eq!(
+        expected.title, actual.title,
+        "{}: resolution title changed between pages",
+        case.id
+    );
+}
+
+async fn list_all_task_results(
+    task_client: &mut TaskServiceClient<tonic::transport::Channel>,
+    case: &LiveCase,
+    task_id: &str,
+    http: &reqwest::Client,
+    media_url: &str,
+    credential_status: Option<&BilibiliCredentialStatus>,
+) -> Vec<TaskResult> {
+    let mut page_token = String::new();
+    let mut snapshot_id = None;
+    let mut total_size = None;
+    let mut output_revision = None;
+    let mut results = Vec::new();
+    loop {
+        let page = task_client
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task_id.to_owned(),
+                page: Some(PageRequest {
+                    page_size: BILIBILI_TASK_RESULT_PAGE_SIZE,
+                    page_token,
+                }),
+            }))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}",
+                    live_failure_message(
+                        case,
+                        "list task results",
+                        &error.to_string(),
+                        credential_status
+                    )
+                )
+            })
+            .into_inner();
+        let page_info = page
+            .page_info
+            .unwrap_or_else(|| panic!("{}: task result page omitted pagination metadata", case.id));
+        if let Some(expected) = snapshot_id.as_deref() {
+            assert_eq!(
+                expected, page_info.snapshot_id,
+                "{}: task result snapshot changed between pages",
+                case.id
+            );
+            assert_eq!(
+                total_size,
+                Some(page_info.total_size),
+                "{}: task result total changed between pages",
+                case.id
+            );
+            assert_eq!(
+                output_revision,
+                Some(page.output_revision),
+                "{}: task output revision changed between pages",
+                case.id
+            );
+        } else {
+            assert!(
+                !page_info.snapshot_id.is_empty(),
+                "{}: task result snapshot identity is empty",
+                case.id
+            );
+            snapshot_id = Some(page_info.snapshot_id.clone());
+            total_size = Some(page_info.total_size);
+            output_revision = Some(page.output_revision);
+        }
+        for result in &page.results {
+            if let Some(source) = result.playback_source.as_ref() {
+                assert_hls_master(
+                    case,
+                    http,
+                    source,
+                    "listed task result playback source",
+                    media_url,
+                )
+                .await;
+            }
+            for artifact in &result.artifacts {
+                assert_artifact_reference_safe(case, artifact, media_url);
+            }
+        }
+        results.extend(page.results);
+        page_token = page_info.next_page_token;
+        if page_token.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        total_size.unwrap_or_default() as usize,
+        results.len(),
+        "{}: task result pagination did not cover the snapshot",
+        case.id
+    );
+    results
+}
+
+fn assert_artifact_reference_safe(case: &LiveCase, artifact: &TaskArtifact, media_url: &str) {
+    let Some(resource) = artifact.resource.as_ref() else {
+        return;
+    };
+    assert!(
+        !resource.id.trim().is_empty(),
+        "{}: task artifact resource id is empty",
+        case.id
+    );
+    let url = Url::parse(&resource.uri).unwrap_or_else(|_| {
+        panic!(
+            "{}: task artifact resource URI is not an absolute server URL",
+            case.id
+        )
+    });
+    let expected = Url::parse(media_url).expect("configured media listener URL should parse");
+    assert_eq!(
+        (
+            expected.scheme(),
+            expected.host_str(),
+            expected.port_or_known_default()
+        ),
+        (url.scheme(), url.host_str(), url.port_or_known_default()),
+        "{}: task artifact reference is not owned by the LAN media listener",
+        case.id
+    );
+    assert!(
+        url.username().is_empty() && url.password().is_none(),
+        "{}: task artifact reference contains URL credentials",
+        case.id
+    );
+    assert!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{}: task artifact reference contains query or fragment data",
+        case.id
+    );
+    assert!(
+        !url.path().contains(".."),
+        "{}: task artifact reference contains traversal syntax",
+        case.id
+    );
+    let path = url.path().to_ascii_lowercase();
+    assert!(
+        !path.contains("/users/") && !path.contains("/private/") && !path.contains("\\"),
+        "{}: task artifact reference exposes a filesystem path",
+        case.id
+    );
 }
 
 async fn wait_for_playable_task(
@@ -535,8 +822,6 @@ struct LiveCase {
     requires_stable_item_selection: bool,
     #[serde(default)]
     requires_live_sample_override: bool,
-    #[serde(default)]
-    expected_candidates_truncated: Option<bool>,
     playback_options: LivePlaybackOptions,
     timeout_seconds: Option<u64>,
 }
@@ -558,80 +843,78 @@ impl LiveCase {
             .is_some_and(|value| !value.trim().is_empty())
     }
 
-    fn selection_request(&self, resolved: &BilibiliResolveResult) -> LiveSelectionRequest {
+    fn selection_request(
+        &self,
+        candidates: &[BilibiliResolutionCandidate],
+        default_candidate_token: &str,
+    ) -> LiveSelectionRequest {
         match self.selection {
             SelectionPolicy::DefaultOrFirst => {
-                let selection_id = resolved
-                    .default_selection_id
-                    .trim()
-                    .to_owned()
-                    .if_empty_then(|| first_candidate_id(self, resolved));
-                LiveSelectionRequest::single(selection_id)
+                let candidate_token = if default_candidate_token.trim().is_empty() {
+                    first_candidate_token(self, candidates)
+                } else {
+                    default_candidate_token.to_owned()
+                };
+                LiveSelectionRequest::single(candidate_token)
             }
             SelectionPolicy::First => {
-                LiveSelectionRequest::single(first_candidate_id(self, resolved))
+                LiveSelectionRequest::single(first_candidate_token(self, candidates))
             }
             SelectionPolicy::MultipleFirstTwo => {
-                LiveSelectionRequest::multiple(first_candidate_ids(self, resolved, 2))
+                LiveSelectionRequest::multiple(first_candidate_tokens(self, candidates, 2))
             }
             SelectionPolicy::RangeFirstTwo => {
-                let candidates = first_candidates(self, resolved, 2);
-                LiveSelectionRequest::range(
-                    candidates[0].index.max(1),
-                    candidates[1].index.max(1),
-                    2,
-                )
+                let candidates = first_candidates(self, candidates, 2);
+                LiveSelectionRequest::range(candidates[0], candidates[1], 2)
             }
-            SelectionPolicy::All => LiveSelectionRequest::all(resolved.candidates.len()),
+            SelectionPolicy::All => LiveSelectionRequest::all(candidates.len()),
         }
     }
 }
 
 struct LiveSelectionRequest {
-    legacy_selection_id: String,
-    selection: BilibiliTaskSelection,
+    selection: BilibiliResolutionSelection,
     expected_result_items: usize,
     expected_playable_results: usize,
 }
 
 impl LiveSelectionRequest {
-    fn single(selection_id: String) -> Self {
+    fn single(candidate_token: String) -> Self {
         Self {
-            legacy_selection_id: String::new(),
-            selection: BilibiliTaskSelection {
-                mode: BILIBILI_TASK_SELECTION_MODE_SINGLE,
-                selection_ids: vec![selection_id],
-                range_start_index: 0,
-                range_end_index: 0,
+            selection: BilibiliResolutionSelection {
+                mode: BilibiliResolutionSelectionMode::Single.into(),
+                candidate_tokens: vec![candidate_token],
+                ..Default::default()
             },
             expected_result_items: 1,
             expected_playable_results: 1,
         }
     }
 
-    fn multiple(selection_ids: Vec<String>) -> Self {
-        let expected_playable_results = selection_ids.len();
+    fn multiple(candidate_tokens: Vec<String>) -> Self {
+        let expected_playable_results = candidate_tokens.len();
         Self {
-            legacy_selection_id: String::new(),
-            selection: BilibiliTaskSelection {
-                mode: BILIBILI_TASK_SELECTION_MODE_MULTIPLE,
-                selection_ids,
-                range_start_index: 0,
-                range_end_index: 0,
+            selection: BilibiliResolutionSelection {
+                mode: BilibiliResolutionSelectionMode::Multiple.into(),
+                candidate_tokens,
+                ..Default::default()
             },
             expected_result_items: expected_playable_results,
             expected_playable_results,
         }
     }
 
-    fn range(start_index: u32, end_index: u32, expected_playable_results: usize) -> Self {
+    fn range(
+        start: &BilibiliResolutionCandidate,
+        end: &BilibiliResolutionCandidate,
+        expected_playable_results: usize,
+    ) -> Self {
         Self {
-            legacy_selection_id: String::new(),
-            selection: BilibiliTaskSelection {
-                mode: BILIBILI_TASK_SELECTION_MODE_RANGE,
-                selection_ids: Vec::new(),
-                range_start_index: start_index,
-                range_end_index: end_index,
+            selection: BilibiliResolutionSelection {
+                mode: BilibiliResolutionSelectionMode::Range.into(),
+                range_start_candidate_token: start.candidate_token.clone(),
+                range_end_candidate_token: end.candidate_token.clone(),
+                ..Default::default()
             },
             expected_result_items: expected_playable_results,
             expected_playable_results,
@@ -640,12 +923,9 @@ impl LiveSelectionRequest {
 
     fn all(expected_playable_results: usize) -> Self {
         Self {
-            legacy_selection_id: String::new(),
-            selection: BilibiliTaskSelection {
-                mode: BILIBILI_TASK_SELECTION_MODE_ALL,
-                selection_ids: Vec::new(),
-                range_start_index: 0,
-                range_end_index: 0,
+            selection: BilibiliResolutionSelection {
+                mode: BilibiliResolutionSelectionMode::All.into(),
+                ..Default::default()
             },
             expected_result_items: expected_playable_results,
             expected_playable_results,
@@ -682,114 +962,111 @@ impl LivePlaybackOptions {
             playback_policy: None,
         }
     }
-}
 
-trait EmptyStringExt {
-    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String;
-}
-
-impl EmptyStringExt for String {
-    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String {
-        if self.is_empty() { fallback() } else { self }
+    fn to_playback_spec(&self) -> BilibiliPlaybackSpec {
+        BilibiliPlaybackSpec {
+            quality_qn: match self.quality_preference.as_str() {
+                "360p" => 16,
+                "480p" => 32,
+                "720p" => 64,
+                "720p60" => 74,
+                "1080p" => 80,
+                "1080p+" => 112,
+                _ => 0,
+            },
+            codec: match self.encoding_preference.as_str() {
+                "h264" => BilibiliVideoCodec::H264.into(),
+                "hevc" => BilibiliVideoCodec::Hevc.into(),
+                "av1" => BilibiliVideoCodec::Av1.into(),
+                _ => BilibiliVideoCodec::Auto.into(),
+            },
+            audio_language: self.audio_language.clone(),
+            policy: None,
+        }
     }
 }
 
-fn first_candidate_id(case: &LiveCase, resolved: &BilibiliResolveResult) -> String {
-    resolved
-        .candidates
+fn first_candidate_token(case: &LiveCase, candidates: &[BilibiliResolutionCandidate]) -> String {
+    candidates
         .first()
         .unwrap_or_else(|| panic!("{}: resolved no selectable candidates", case.id))
-        .selection_id
+        .candidate_token
         .clone()
 }
 
-fn first_candidate_ids(
+fn first_candidate_tokens(
     case: &LiveCase,
-    resolved: &BilibiliResolveResult,
+    candidates: &[BilibiliResolutionCandidate],
     count: usize,
 ) -> Vec<String> {
-    first_candidates(case, resolved, count)
+    first_candidates(case, candidates, count)
         .into_iter()
-        .map(|candidate| candidate.selection_id.clone())
+        .map(|candidate| candidate.candidate_token.clone())
         .collect()
 }
 
 fn first_candidates<'a>(
     case: &LiveCase,
-    resolved: &'a BilibiliResolveResult,
+    candidates: &'a [BilibiliResolutionCandidate],
     count: usize,
-) -> Vec<&'a BilibiliResolvedCandidate> {
+) -> Vec<&'a BilibiliResolutionCandidate> {
     assert!(
-        resolved.candidates.len() >= count,
+        candidates.len() >= count,
         "{}: expected at least {} candidates, got {}",
         case.id,
         count,
-        resolved.candidates.len()
+        candidates.len()
     );
-    resolved.candidates.iter().take(count).collect()
+    candidates.iter().take(count).collect()
 }
 
-fn assert_resolved_candidate_contract(case: &LiveCase, resolved: &BilibiliResolveResult) {
-    if let Some(expected) = case.expected_candidates_truncated {
-        assert_eq!(
-            expected, resolved.candidates_truncated,
-            "{}: unexpected candidates_truncated value",
-            case.id
-        );
-    }
-
+fn assert_resolution_candidate_contract(
+    case: &LiveCase,
+    candidates: &[BilibiliResolutionCandidate],
+) {
     if let Some(expected_source_kind) = case.expected_candidate_source_kind.as_deref() {
-        for candidate in &resolved.candidates {
+        for candidate in candidates {
             assert_eq!(
                 expected_source_kind, candidate.source_kind,
-                "{}: candidate {} has unexpected source kind",
-                case.id, candidate.selection_id
+                "{}: candidate has unexpected source kind",
+                case.id
             );
         }
     }
 
     if case.requires_stable_item_selection {
-        for candidate in &resolved.candidates {
+        for candidate in candidates {
             assert_stable_item_candidate(case, candidate);
         }
     }
 }
 
-fn assert_stable_item_candidate(case: &LiveCase, candidate: &BilibiliResolvedCandidate) {
-    let selection_id = candidate.selection_id.as_str();
-    assert!(
-        selection_id.starts_with("item:"),
-        "{}: candidate selection id is not a stable collection item id: {}",
-        case.id,
-        selection_id
-    );
-    assert!(
-        selection_id.contains(":source:"),
-        "{}: stable collection item selection lacks source binding: {}",
-        case.id,
-        selection_id
-    );
-    assert!(
-        selection_id.contains(":cid:"),
-        "{}: stable collection item id is missing cid: {}",
-        case.id,
-        selection_id
-    );
-    assert!(
-        selection_id.contains(":aid:") || selection_id.contains(":bvid:"),
-        "{}: stable collection item id is missing video identity: {}",
-        case.id,
-        selection_id
-    );
+fn assert_stable_item_candidate(case: &LiveCase, candidate: &BilibiliResolutionCandidate) {
     assert!(
         (1..=100).contains(&candidate.index),
-        "{}: stable collection item index is outside the bounded candidate window: {}",
-        case.id,
-        candidate.index
+        "{}: stable collection item index is outside the bounded candidate window",
+        case.id
+    );
+    let identity = candidate.identity.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{}: stable collection item candidate omitted content identity",
+            case.id
+        )
+    });
+    assert_eq!(
+        BilibiliContentKind::CollectionItem,
+        identity.kind(),
+        "{}: candidate identity is not a collection item",
+        case.id
     );
     assert!(
-        !candidate.content_id.trim().is_empty(),
-        "{}: stable collection item candidate has empty content id",
+        identity.cid > 0,
+        "{}: stable collection item candidate omitted cid",
+        case.id
+    );
+    assert!(
+        identity.aid > 0 || !identity.bvid.trim().is_empty(),
+        "{}: stable collection item candidate omitted video identity",
         case.id
     );
 }
@@ -1635,16 +1912,57 @@ mod tests {
     #[test]
     fn stable_item_candidate_contract_accepts_complete_identity() {
         let case = test_case("space-videos", false, false);
-        let valid = BilibiliResolvedCandidate {
-            selection_id: "item:1:source:space-videos-123:cid:270001:bvid:BV1xx411c7mD:aid:170001"
-                .to_owned(),
+        let valid = BilibiliResolutionCandidate {
+            candidate_token: "opaque-server-token".to_owned(),
             source_kind: "space".to_owned(),
-            content_id: "BV1xx411c7mD".to_owned(),
+            identity: Some(BilibiliContentIdentity {
+                kind: BilibiliContentKind::CollectionItem.into(),
+                aid: 170001,
+                bvid: "BV1xx411c7mD".to_owned(),
+                cid: 270001,
+                ..Default::default()
+            }),
             index: 1,
             ..Default::default()
         };
 
         assert_stable_item_candidate(&case, &valid);
+    }
+
+    #[test]
+    fn generic_artifact_reference_must_be_server_owned_and_credential_free() {
+        let case = test_case("ordinary-video-playlist", false, false);
+        let media_url = "http://127.0.0.1:41000";
+        let accepted = TaskArtifact {
+            resource: Some(CacheResourceRef {
+                id: "resource-opaque-id".to_owned(),
+                uri: format!("{media_url}/resources/resource-opaque-id"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_artifact_reference_safe(&case, &accepted, media_url);
+
+        for uri in [
+            "https://upstream.example.test/video.m4s",
+            "http://127.0.0.1:41000/resources/id?token=value",
+        ] {
+            let artifact = TaskArtifact {
+                resource: Some(CacheResourceRef {
+                    id: "resource-opaque-id".to_owned(),
+                    uri: uri.to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert_artifact_reference_safe(&case, &artifact, media_url)
+                })
+                .is_err(),
+                "unsafe artifact reference should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2124,7 +2442,6 @@ mod tests {
             requires_collection_list_validation: false,
             requires_stable_item_selection: false,
             requires_live_sample_override: false,
-            expected_candidates_truncated: None,
             playback_options: LivePlaybackOptions {
                 quality_preference: "360p".to_owned(),
                 encoding_preference: "h264".to_owned(),

@@ -16,7 +16,7 @@
 
 - Xcode 26 或更新版本。
 - Rust 1.95.0 toolchain with `rustfmt` and `clippy`; `rust-toolchain.toml` pins this for Cargo/rustup.
-- `ffmpeg` 可执行文件；真实 Bilibili task worker 会调用 BBDown Rust core 下载媒体，并用 `ffmpeg` remux 成当前 library 可索引的 `.mp4`。
+- `ffmpeg` 可执行文件；真实 Bilibili task worker 会调用 BBDown Rust core 下载媒体，需要合并音视频流时再用 `ffmpeg` remux。audio-only 输出保留可播放的 `.m4a`。
 - `just` task runner。
 - Apple TV 开启开发者模式，并在 Xcode / Devices and Simulators 中和这台 Mac 配对。
 - Xcode 里登录 Apple ID；物理设备安装时需要能生成 tvOS development provisioning profile。
@@ -57,7 +57,7 @@ BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 ```
 
-collection/list cases 默认跳过，需要通过 `BILIBILI_LIVE_E2E_CASES` 或 `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 显式运行，因为这些 Bilibili list/feed API 可能需要 cookie、为空、被限流或随上游状态波动。稳定公开 collection smoke 优先使用 `BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live`；`BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 会把符合条件的非认证 collection/list case 加入更宽的未过滤本地 sweep，但该 sweep 仍可能受上游可用性影响。`space-videos` 和 `homepage-recommendations` 还需要 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 以及 web-cookie credential，`favorite-list` 和 `space-series` 需要用 `BILIBILI_LIVE_E2E_FAVORITE_URL` / `BILIBILI_LIVE_E2E_SERIES_URL` 指向当前可用样例后才加入未过滤 sweep。测试会确认候选项使用 LAN server 生成的 stable `item:` selection id，并且 HLS master/media playlist 不会逃逸到 Bilibili 源站 URL。
+collection/list cases 默认跳过，需要通过 `BILIBILI_LIVE_E2E_CASES` 或 `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 显式运行，因为这些 Bilibili list/feed API 可能需要 cookie、为空、被限流或随上游状态波动。稳定公开 collection smoke 优先使用 `BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live`；`BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` 会把符合条件的非认证 collection/list case 加入更宽的未过滤本地 sweep，但该 sweep 仍可能受上游可用性影响。`space-videos` 和 `homepage-recommendations` 还需要 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 以及 web-cookie credential，`favorite-list` 和 `space-series` 需要用 `BILIBILI_LIVE_E2E_FAVORITE_URL` / `BILIBILI_LIVE_E2E_SERIES_URL` 指向当前可用样例后才加入未过滤 sweep。测试会通过 v2 RPC 分页读取候选项和任务结果，并确认选择使用 server 生成的不透明 token，HLS master/media playlist 不会逃逸到 Bilibili 源站 URL。
 
 默认 live suite 会跳过标记为 `requires_restricted_area_path` 的番剧 case、`requires_collection_list_validation` 的 collection/list case、`requires_live_sample_override` 且未设置 URL override 的 case，以及 `requires_authentication` 的账号 case；显式指定这些 case 时会真正访问它们。番剧 restricted-area 验证可以把 BBDown runtime 覆盖传给测试启动的本地 cache server：
 
@@ -65,13 +65,12 @@ collection/list cases 默认跳过，需要通过 `BILIBILI_LIVE_E2E_CASES` 或 
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=family-room \
 BILIBILI_LIVE_E2E_RESTRICTED_AREA=hk \
-BILIBILI_LIVE_E2E_RESTRICTED_AREA_PROXY='hk=https://proxy.example/playurl' \
 BILIBILI_LIVE_E2E_RESTRICTED_API_PROXY='hk=https://proxy.example/api' \
 BILIBILI_LIVE_E2E_CASES=bangumi-media-series,bangumi-episode \
 just test-bilibili-live
 ```
 
-账号页面 fetch 验证需要 BBDown credential 文件里包含 web cookie；`access_key` 只能覆盖 TV API 路径，不能满足 web/反代路径。可以指定单个账号 case，或用 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 批量包含账号 case：
+公共 restricted-area 反代只走 Web API，不能配合 TV API mode 使用；配置的 `access_key` 可能随请求送到该反代。账号页面 fetch 验证需要 BBDown credential 文件里包含 web cookie，单独的 `access_key` 不能替代它。可以指定单个账号 case，或用 `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` 批量包含账号 case：
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -101,7 +100,7 @@ cargo run --package tvos-net-player-cache-server -- \
 
 `0.0.0.0`、`[::]`、`*` 和 `+` 都会尝试展开为 IPv4/IPv6 双栈 wildcard listener；如果系统不支持某个地址族，只要另一个地址族可用就会继续启动。如果只想暴露某个地址族或某个网卡，请改用具体 LAN IP。非 loopback gRPC listener 加上 LAN 可达的 media listener（或非 localhost/loopback 的 `Cache:PublicMediaBaseUri`）默认会发布 Bonjour `_tvos-net-player._tcp`，客户端可自动发现；如需关闭 discovery，设置 `--Cache:BonjourEnabled false`。
 
-当前第一片只支持 cleartext `http://` listener，HTTP Range 媒体服务先面向 Mac mini/macOS；认证、TLS 和其他服务端平台的安全媒体打开都是后续工作。Rust server 默认启动真实 Bilibili worker：worker 消费已提交的 task，调用 pin 到指定 commit 的 `bbdown-core`，把输出下载到 cache root 下的 `Bilibili/`，用 `ffmpeg` mux 成 `.mp4`，再把 mux 输出映射成 stable library item id。高频 progress 更新会通过内存状态和 watch 事件暴露，不逐次强制写盘；BBDown core 当前没有逐 chunk callback，所以真实下载中的 progress 是 coarse-grained 阶段状态。tvOS/macOS 客户端可以展示 cache root 容量，并把 completed Bilibili HLS 项标记为 offline HLS；可见 local cache/离线 HLS 库项删除默认关闭，需要显式设置 `--Cache:AllowLibraryItemDelete true` 后 server 才声明能力，客户端才显示删除入口。只在 loopback 或可信受控 LAN 上开启删除能力，例如：
+当前 server 只支持 cleartext `http://` listener；认证和 TLS 是后续工作。Rust server 默认启动真实 Bilibili worker：worker 消费已提交的 task，调用 pin 到指定 commit 的 `bbdown-core`，把选中的多项结果下载到 cache root 下的 `Bilibili/`，按需 mux，并把可播放输出映射成独立的 library item ID。高频 progress 更新会通过内存状态和 watch 事件暴露，不逐次强制写盘；BBDown core 当前没有逐 chunk callback，所以真实下载中的 progress 是 coarse-grained 阶段状态。tvOS/macOS 客户端可以展示 cache root 容量，并把 completed Bilibili HLS 项标记为 offline HLS；可见 local cache/离线 HLS 库项删除默认关闭，需要显式设置 `--Cache:AllowLibraryItemDelete true` 后 server 才声明能力，客户端才显示删除入口。只在 loopback 或可信受控 LAN 上开启删除能力，例如：
 
 ```bash
 cargo run --package tvos-net-player-cache-server -- \
@@ -125,7 +124,7 @@ cargo run --package tvos-net-player-cache-server -- \
 BBDown adapter 相关配置：
 
 - `Cache:BilibiliWorkerEnabled`: 是否启动真实 worker。默认 `true`；测试或只想保留排队 control-plane 时可设为 `false`。
-- `Cache:BilibiliWorkerMaxConcurrentTasks`: worker 最大并发 task 数。默认 `1`。当前真实 BBDown adapter 会把有效并发限制为 `1`，避免并发写同一个 archive；更高并发等 BBDown archive 语义明确后再放开。
+- `Cache:BilibiliWorkerMaxConcurrentTasks`: worker 最大并发 task 数。默认 `1`。v2 task 使用 task-local archive 管理同一任务内的重复输出，legacy task 仍使用共享 archive。
 - `Cache:TaskRetentionMaxTerminalTasks`: 持久化 task snapshot 里最多保留的普通 terminal task 数。默认 `200`；设为 `0` 可关闭数量限制。
 - `Cache:TaskRetentionTerminalAgeDays`: 持久化 task snapshot 里普通 terminal task 的最长保留天数。默认 `30`；设为 `0` 可关闭时间限制。
 - `Cache:AllowLibraryItemDelete`: 是否允许 gRPC control-plane 删除可见 local cache 和 completed Bilibili HLS library item。默认 `false`，因为当前 control-plane 是 cleartext 且未鉴权；只在可信 LAN 或 loopback-only 部署中显式打开。
@@ -144,7 +143,7 @@ BBDown adapter 相关配置：
 
 启动时 server 会把 `Cache:RootPath` 和启用中的 BBDown output 的已存在路径前缀 canonicalize，再交给 media library 和 BBDown adapter 使用，避免 symlink ancestor 造成下载路径和索引边界不一致。
 
-当前 task result 仍然只有一个 `library_item_id`。因此 adapter 默认把普通 BV/av 输入解析为当前/第一页，把 `ss`/`md` 输入解析为最新一集；全集缓存需要后续扩展 task options 或 result schema。
+新客户端使用 v2 Bilibili resolution session 读取分页候选项，以 server 生成的不透明 token 选择单项、多项、范围或全部，并用 `CreateBilibiliTaskV2` 提交播放或下载。`ListTaskResults` 分页返回每项的状态、播放或 library 引用及可用 artifact；媒体和 sidecar 字节仍由 LAN server 的 HTTP/HLS/Range endpoint 提供。一次任务最多接受 100 个候选项，较大列表需要分批选择；旧 RPC 和单结果字段仅保留给旧客户端兼容。没有 v2 能力的 server 需要升级，客户端不会回退到旧提交路径。
 
 tvOS app 目前只在刷新时请求首屏 library preview（最多 200 条），避免在服务端每页重新扫描本地 cache root 的第一片实现上触发多次全量目录枚举。cache client contract 已暴露 page token 和 search text；完整分页浏览和搜索会随后续 library UI 一起补齐。
 
