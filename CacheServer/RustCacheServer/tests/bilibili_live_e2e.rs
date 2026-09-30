@@ -34,6 +34,10 @@ use tvos_net_player_cache_server::{
 const BILIBILI_RESOLUTION_PAGE_SIZE: u32 = 1;
 const BILIBILI_TASK_RESULT_PAGE_SIZE: u32 = 1;
 const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const SUSTAINED_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+const SUSTAINED_READ_LIMIT: u64 = 64 * 1024;
+const SUSTAINED_PLAYLIST_LIMIT: usize = 1024 * 1024;
+const SUSTAINED_MAX_CHILD_PLAYLISTS: usize = 32;
 const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
     "Bilibili error detail omitted because credential material is configured.";
@@ -44,6 +48,14 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     let fixture_set = LiveFixtureSet::load();
     let run_policy = LiveRunPolicy::from_env();
     let http = reqwest::Client::new();
+    let sustained_probe = run_policy.sustained_duration.map(|duration| {
+        let client = reqwest::Client::builder()
+            .timeout(SUSTAINED_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("sustained probe client should build");
+        SustainedProbeContext { client, duration }
+    });
     let mut ran_cases = 0usize;
     let mut failed_cases = Vec::new();
 
@@ -74,6 +86,7 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
                 &server.media_url,
                 Some(&credential_status),
                 &task_tracker,
+                sustained_probe.as_ref(),
             )
             .await;
         })
@@ -107,6 +120,7 @@ async fn run_live_case(
     media_url: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
     task_tracker: &LiveTaskTracker,
+    sustained_probe: Option<&SustainedProbeContext>,
 ) {
     assert_authenticated_case_ready(case, credential_status);
 
@@ -222,6 +236,9 @@ async fn run_live_case(
         .unwrap_or_else(|| panic!("{}: playable task has no playback source", case.id));
     assert_task_playback_source_item_id(case, &playable, source);
     assert_hls_master(case, http, source, "task playback source", media_url).await;
+    if let Some(probe) = sustained_probe {
+        sustain_hls_probe(case, &probe.client, source, media_url, probe.duration).await;
+    }
 
     let result_sources = playable_result_sources(&playable);
     assert_eq!(
@@ -705,6 +722,454 @@ async fn assert_hls_master(
     }
 }
 
+async fn sustain_hls_probe(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    source: &PlaybackSource,
+    media_url: &str,
+    duration: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    let source_url =
+        assert_lan_media_url(case, &source.uri, media_url, "sustained playback source");
+    let master = fetch_sustained_playlist(case, http, &source_url, media_url, "master").await;
+    let child_urls = assert_playlist_stays_on_lan(
+        case,
+        &source_url,
+        &master,
+        media_url,
+        "sustained master playlist",
+    );
+    let mut playlists =
+        SustainedPlaylistSet::new(unique_child_playlist_urls(child_urls, &source_url));
+    assert!(
+        playlists.len() <= SUSTAINED_MAX_CHILD_PLAYLISTS,
+        "{}: sustained master playlist exceeded the child playlist limit",
+        case.id
+    );
+
+    let mut probes = 0usize;
+    for index in 0..playlists.len() {
+        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        playlists.record_range(index);
+        probes += 1;
+    }
+    assert!(
+        playlists.all_initial_children_ranged(),
+        "{}: not every initial child playlist received a media range probe",
+        case.id
+    );
+
+    while tokio::time::Instant::now() < deadline {
+        let master = fetch_sustained_playlist(case, http, &source_url, media_url, "master").await;
+        assert_playlist_stays_on_lan(
+            case,
+            &source_url,
+            &master,
+            media_url,
+            "sustained master playlist",
+        );
+        let index = playlists.next_index().unwrap_or_else(|| {
+            panic!(
+                "{}: sustained master playlist had no child playlists",
+                case.id
+            )
+        });
+        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        playlists.record_range(index);
+        probes += 1;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert!(probes > 0, "{}: sustained probe did not run", case.id);
+    println!(
+        "{}: sustained LAN HLS probe completed ({probes} rounds)",
+        case.id
+    );
+}
+
+async fn probe_sustained_child_playlist(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    media_url: &str,
+    playlist: &mut SustainedChildPlaylist,
+) {
+    let media_playlist =
+        fetch_sustained_playlist(case, http, &playlist.url, media_url, "media").await;
+    assert_playlist_stays_on_lan(
+        case,
+        &playlist.url,
+        &media_playlist,
+        media_url,
+        "sustained media playlist",
+    );
+    let resources = hls_probe_resources(&media_playlist).unwrap_or_else(|_| {
+        panic!(
+            "{}: sustained media playlist has invalid byte ranges",
+            case.id
+        )
+    });
+    let request =
+        next_sustained_probe_request(&resources, &mut playlist.cursor).unwrap_or_else(|| {
+            panic!(
+                "{}: sustained media playlist has no media segments",
+                case.id
+            )
+        });
+    let url = playlist.url.join(&request.uri).unwrap_or_else(|_| {
+        panic!(
+            "{}: sustained media playlist contains an invalid segment URI",
+            case.id
+        )
+    });
+    assert_lan_media_url(case, url.as_str(), media_url, "sustained media segment");
+    fetch_sustained_media_bytes(case, http, &url, &request.range).await;
+}
+
+fn unique_child_playlist_urls(urls: Vec<Url>, fallback: &Url) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    let urls = if urls.is_empty() {
+        vec![fallback.clone()]
+    } else {
+        urls
+    };
+    urls.into_iter()
+        .filter(|url| seen.insert(url.as_str().to_owned()))
+        .collect()
+}
+
+async fn fetch_sustained_playlist(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    url: &Url,
+    media_url: &str,
+    label: &str,
+) -> String {
+    assert_lan_media_url(case, url.as_str(), media_url, "sustained playlist");
+    let origin = lan_media_origin_for_diagnostic(url);
+    let response = http.get(url.clone()).send().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: sustained {label} playlist request failed for origin={origin}: {}",
+            case.id,
+            error.without_url()
+        )
+    });
+    assert_eq!(
+        StatusCode::OK,
+        response.status(),
+        "{}: sustained {label} playlist returned non-OK status for origin={origin}",
+        case.id
+    );
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.unwrap_or_else(|error| {
+        panic!(
+            "{}: sustained {label} playlist body failed for origin={origin}: {}",
+            case.id,
+            error.without_url()
+        )
+    }) {
+        assert!(
+            body.len().saturating_add(chunk.len()) <= SUSTAINED_PLAYLIST_LIMIT,
+            "{}: sustained {label} playlist exceeded the size limit for origin={origin}",
+            case.id
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let playlist = String::from_utf8(body).unwrap_or_else(|_| {
+        panic!(
+            "{}: sustained {label} playlist is not UTF-8 for origin={origin}",
+            case.id
+        )
+    });
+    assert!(
+        playlist.starts_with("#EXTM3U"),
+        "{}: sustained {label} response is not an HLS playlist for origin={origin}",
+        case.id
+    );
+    playlist
+}
+
+async fn fetch_sustained_media_bytes(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    url: &Url,
+    range: &ByteRangeRequest,
+) {
+    let origin = lan_media_origin_for_diagnostic(url);
+    let response = http
+        .get(url.clone())
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", range.start, range.end),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}: sustained media range request failed for origin={origin}: {}",
+                case.id,
+                error.without_url()
+            )
+        });
+    assert_eq!(
+        StatusCode::PARTIAL_CONTENT,
+        response.status(),
+        "{}: sustained media range did not return partial content for origin={origin}",
+        case.id,
+    );
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_range_bounds)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: sustained media range omitted a valid Content-Range for origin={origin}",
+                case.id
+            )
+        });
+    assert_eq!(
+        (range.start, range.end),
+        content_range,
+        "{}: sustained media range bounds differed from the requested interval for origin={origin}",
+        case.id
+    );
+    let mut response = response;
+    let expected_bytes = usize::try_from(range.end - range.start + 1)
+        .expect("sustained range is bounded by the 64 KiB read limit");
+    let mut received_bytes = 0usize;
+    while received_bytes < expected_bytes {
+        let Some(chunk) = response.chunk().await.unwrap_or_else(|error| {
+            panic!(
+                "{}: sustained media bytes failed for origin={origin}: {}",
+                case.id,
+                error.without_url()
+            )
+        }) else {
+            break;
+        };
+        received_bytes = received_bytes
+            .checked_add(chunk.len())
+            .expect("received media byte count should fit in memory bounds");
+        assert!(
+            received_bytes <= expected_bytes,
+            "{}: sustained media range returned more than the requested byte count for origin={origin}",
+            case.id
+        );
+    }
+    assert_eq!(
+        expected_bytes, received_bytes,
+        "{}: sustained media range returned fewer than the requested bytes for origin={origin}",
+        case.id
+    );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ByteRangeRequest {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HlsProbeResource {
+    uri: String,
+    range: Option<ByteRangeRequest>,
+    initialization: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SustainedProbeRequest {
+    uri: String,
+    range: ByteRangeRequest,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SustainedProbeCursor {
+    resource_index: usize,
+    window_offset: u64,
+}
+
+struct SustainedChildPlaylist {
+    url: Url,
+    cursor: SustainedProbeCursor,
+    ranged: bool,
+}
+
+struct SustainedPlaylistSet {
+    children: Vec<SustainedChildPlaylist>,
+    next_child_index: usize,
+}
+
+impl SustainedPlaylistSet {
+    fn new(urls: Vec<Url>) -> Self {
+        Self {
+            children: urls
+                .into_iter()
+                .map(|url| SustainedChildPlaylist {
+                    url,
+                    cursor: SustainedProbeCursor::default(),
+                    ranged: false,
+                })
+                .collect(),
+            next_child_index: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.children.len()
+    }
+
+    fn playlist_mut(&mut self, index: usize) -> &mut SustainedChildPlaylist {
+        &mut self.children[index]
+    }
+
+    fn record_range(&mut self, index: usize) {
+        self.children[index].ranged = true;
+    }
+
+    fn all_initial_children_ranged(&self) -> bool {
+        !self.children.is_empty() && self.children.iter().all(|child| child.ranged)
+    }
+
+    fn next_index(&mut self) -> Option<usize> {
+        if self.children.is_empty() {
+            return None;
+        }
+        let index = self.next_child_index % self.children.len();
+        self.next_child_index = (index + 1) % self.children.len();
+        Some(index)
+    }
+}
+
+fn next_sustained_probe_request(
+    resources: &[HlsProbeResource],
+    cursor: &mut SustainedProbeCursor,
+) -> Option<SustainedProbeRequest> {
+    let media_resources = resources
+        .iter()
+        .filter(|resource| !resource.initialization && !resource.uri.ends_with(".m3u8"))
+        .collect::<Vec<_>>();
+    if media_resources.is_empty() {
+        return None;
+    }
+
+    cursor.resource_index %= media_resources.len();
+    let resource = media_resources[cursor.resource_index];
+    let (range, has_more_windows) = match &resource.range {
+        Some(resource_range) => {
+            let length = resource_range.end - resource_range.start + 1;
+            if cursor.window_offset >= length {
+                cursor.window_offset = 0;
+            }
+            let start = resource_range.start + cursor.window_offset;
+            let end = resource_range
+                .end
+                .min(start.saturating_add(SUSTAINED_READ_LIMIT - 1));
+            (ByteRangeRequest { start, end }, end < resource_range.end)
+        }
+        None => (
+            ByteRangeRequest {
+                start: 0,
+                end: SUSTAINED_READ_LIMIT - 1,
+            },
+            false,
+        ),
+    };
+
+    if has_more_windows {
+        cursor.window_offset += SUSTAINED_READ_LIMIT;
+    } else {
+        cursor.resource_index = (cursor.resource_index + 1) % media_resources.len();
+        cursor.window_offset = 0;
+    }
+
+    Some(SustainedProbeRequest {
+        uri: resource.uri.clone(),
+        range,
+    })
+}
+
+fn hls_probe_resources(playlist: &str) -> Result<Vec<HlsProbeResource>, ()> {
+    let mut resources = Vec::new();
+    let mut pending_range = None;
+    let mut range_end_by_uri = std::collections::HashMap::<String, u64>::new();
+
+    for line in playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.starts_with("#EXT-X-BYTERANGE:") {
+            pending_range = Some(parse_hls_byte_range(
+                line.trim_start_matches("#EXT-X-BYTERANGE:"),
+            )?);
+            continue;
+        }
+        let (uri, range) = if line.starts_with("#EXT-X-MAP:") {
+            let uri = hls_attribute_value(line, "URI").ok_or(())?;
+            let range = hls_attribute_value(line, "BYTERANGE")
+                .map(|value| parse_hls_byte_range(&value))
+                .transpose()?;
+            (uri, range)
+        } else if !line.starts_with('#') {
+            (line.to_owned(), pending_range.take())
+        } else {
+            continue;
+        };
+
+        let resolved_range = if let Some((length, offset)) = range {
+            let start = offset
+                .or_else(|| range_end_by_uri.get(&uri).copied())
+                .unwrap_or(0);
+            let end = start
+                .checked_add(length.checked_sub(1).ok_or(())?)
+                .ok_or(())?;
+            range_end_by_uri.insert(uri.clone(), end.checked_add(1).ok_or(())?);
+            Some(ByteRangeRequest { start, end })
+        } else {
+            None
+        };
+        resources.push(HlsProbeResource {
+            uri,
+            range: resolved_range,
+            initialization: line.starts_with("#EXT-X-MAP:"),
+        });
+    }
+    Ok(resources)
+}
+
+fn parse_hls_byte_range(value: &str) -> Result<(u64, Option<u64>), ()> {
+    let (length, offset) = value
+        .split_once('@')
+        .map_or((value, None), |(length, offset)| (length, Some(offset)));
+    let length = length.parse::<u64>().map_err(|_| ())?;
+    if length == 0 {
+        return Err(());
+    }
+    let offset = offset.map(str::parse::<u64>).transpose().map_err(|_| ())?;
+    Ok((length, offset))
+}
+
+fn hls_attribute_value(line: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = line.find(&needle)? + needle.len();
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_owned())
+}
+
+fn content_range_bounds(value: &str) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, _) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (end >= start).then_some((start, end))
+}
+
 fn assert_playlist_stays_on_lan(
     case: &LiveCase,
     base_url: &Url,
@@ -1088,6 +1553,12 @@ struct LiveRunPolicy {
     filter: Option<HashSet<String>>,
     include_authenticated: bool,
     include_collection_list: bool,
+    sustained_duration: Option<Duration>,
+}
+
+struct SustainedProbeContext {
+    client: reqwest::Client,
+    duration: Duration,
 }
 
 impl LiveRunPolicy {
@@ -1096,6 +1567,7 @@ impl LiveRunPolicy {
             filter: case_filter_from_env(),
             include_authenticated: env_flag("BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED"),
             include_collection_list: env_flag("BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST"),
+            sustained_duration: sustained_duration_from_env(),
         }
     }
 
@@ -1120,6 +1592,25 @@ impl LiveRunPolicy {
         }
         LiveRunDecision::Run
     }
+}
+
+fn sustained_duration_from_env() -> Option<Duration> {
+    let value = env::var("BILIBILI_LIVE_E2E_SUSTAINED_SECONDS").ok();
+    parse_sustained_duration(value.as_deref())
+        .unwrap_or_else(|message| panic!("BILIBILI_LIVE_E2E_SUSTAINED_SECONDS {message}"))
+}
+
+fn parse_sustained_duration(value: Option<&str>) -> Result<Option<Duration>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "must be a positive integer when set")?;
+    if seconds == 0 {
+        return Err("must be greater than zero when set");
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 fn case_filter_from_env() -> Option<HashSet<String>> {
@@ -1728,6 +2219,161 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sustained_duration_is_opt_in_and_requires_positive_integer_seconds() {
+        assert_eq!(None, parse_sustained_duration(None).unwrap());
+        assert_eq!(
+            Some(Duration::from_secs(17)),
+            parse_sustained_duration(Some("17")).unwrap()
+        );
+        assert!(parse_sustained_duration(Some("0")).is_err());
+        assert!(parse_sustained_duration(Some("1.5")).is_err());
+        assert!(parse_sustained_duration(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn sustained_playlist_parser_tracks_explicit_and_implicit_byte_ranges() {
+        let playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"media.m4s\",BYTERANGE=\"16@0\"\n#EXT-X-BYTERANGE:32\n#EXTINF:1.0,\nmedia.m4s\n#EXT-X-ENDLIST\n";
+
+        let resources = hls_probe_resources(playlist).unwrap();
+
+        assert_eq!(
+            vec![
+                HlsProbeResource {
+                    uri: "media.m4s".to_owned(),
+                    range: Some(ByteRangeRequest { start: 0, end: 15 }),
+                    initialization: true,
+                },
+                HlsProbeResource {
+                    uri: "media.m4s".to_owned(),
+                    range: Some(ByteRangeRequest { start: 16, end: 47 }),
+                    initialization: false,
+                },
+            ],
+            resources
+        );
+        assert_eq!(Some((16, 47)), content_range_bounds("bytes 16-47/128"));
+        assert_eq!(None, content_range_bounds("bytes */128"));
+    }
+
+    #[test]
+    fn content_range_parser_returns_exact_validated_bounds() {
+        assert_eq!(
+            Some((0, 65_535)),
+            content_range_bounds("bytes 0-65535/90000")
+        );
+        assert_eq!(Some((128, 255)), content_range_bounds("bytes 128-255/*"));
+        assert_eq!(None, content_range_bounds("bytes 256-255/90000"));
+        assert_eq!(None, content_range_bounds("0-127/90000"));
+    }
+
+    #[test]
+    fn sustained_probe_advances_large_ranges_then_wraps_without_reading_init_bytes() {
+        let media_start = 32;
+        let media_end = media_start + 2 * SUSTAINED_READ_LIMIT + 8;
+        let resources = vec![
+            HlsProbeResource {
+                uri: "combined.m4s".to_owned(),
+                range: Some(ByteRangeRequest {
+                    start: 0,
+                    end: media_start - 1,
+                }),
+                initialization: true,
+            },
+            HlsProbeResource {
+                uri: "combined.m4s".to_owned(),
+                range: Some(ByteRangeRequest {
+                    start: media_start,
+                    end: media_end,
+                }),
+                initialization: false,
+            },
+        ];
+        let mut cursor = SustainedProbeCursor::default();
+
+        let first = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+        let second = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+        let last = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+        let wrapped = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+
+        assert_eq!("combined.m4s", first.uri);
+        assert_eq!(media_start, first.range.start);
+        assert_eq!(media_start + SUSTAINED_READ_LIMIT - 1, first.range.end);
+        assert_eq!(media_start + SUSTAINED_READ_LIMIT, second.range.start);
+        assert_eq!(media_start + 2 * SUSTAINED_READ_LIMIT - 1, second.range.end);
+        assert_eq!(media_start + 2 * SUSTAINED_READ_LIMIT, last.range.start);
+        assert_eq!(media_end, last.range.end);
+        assert_eq!(media_start, wrapped.range.start);
+        assert_eq!(media_start + SUSTAINED_READ_LIMIT - 1, wrapped.range.end);
+    }
+
+    #[test]
+    fn sustained_probe_steps_through_media_segments_and_wraps() {
+        let resources = vec![
+            HlsProbeResource {
+                uri: "init.m4s".to_owned(),
+                range: None,
+                initialization: true,
+            },
+            HlsProbeResource {
+                uri: "segment-1.m4s".to_owned(),
+                range: None,
+                initialization: false,
+            },
+            HlsProbeResource {
+                uri: "segment-2.m4s".to_owned(),
+                range: None,
+                initialization: false,
+            },
+        ];
+        let mut cursor = SustainedProbeCursor::default();
+
+        let first = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+        let second = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+        let wrapped = next_sustained_probe_request(&resources, &mut cursor).unwrap();
+
+        assert_eq!("segment-1.m4s", first.uri);
+        assert_eq!("segment-2.m4s", second.uri);
+        assert_eq!("segment-1.m4s", wrapped.uri);
+        assert_eq!(0, first.range.start);
+        assert_eq!(SUSTAINED_READ_LIMIT - 1, first.range.end);
+    }
+
+    #[test]
+    fn sustained_probe_covers_and_rotates_audio_and_video_children() {
+        let fallback = Url::parse("http://127.0.0.1:41000/master.m3u8").unwrap();
+        let video = Url::parse("http://127.0.0.1:41000/video.m3u8").unwrap();
+        let audio = Url::parse("http://127.0.0.1:41000/audio.m3u8").unwrap();
+        let urls = unique_child_playlist_urls(
+            vec![video.clone(), audio.clone(), video.clone()],
+            &fallback,
+        );
+        let mut playlists = SustainedPlaylistSet::new(urls);
+
+        assert_eq!(2, playlists.len());
+        assert_eq!("/video.m3u8", playlists.children[0].url.path());
+        assert_eq!("/audio.m3u8", playlists.children[1].url.path());
+        assert!(!playlists.all_initial_children_ranged());
+
+        for index in 0..playlists.len() {
+            playlists.record_range(index);
+        }
+
+        assert!(playlists.all_initial_children_ranged());
+        assert_eq!(Some(0), playlists.next_index());
+        assert_eq!(Some(1), playlists.next_index());
+        assert_eq!(Some(0), playlists.next_index());
+        assert_eq!(Some(1), playlists.next_index());
+    }
+
+    #[test]
+    fn sustained_playlist_parser_rejects_invalid_byte_ranges() {
+        assert!(hls_probe_resources("#EXTM3U\n#EXT-X-BYTERANGE:0@0\nseg.m4s\n").is_err());
+        assert!(
+            hls_probe_resources("#EXTM3U\n#EXT-X-MAP:URI=\"seg.m4s\",BYTERANGE=\"bad\"\n").is_err()
+        );
+    }
+
+    #[test]
     fn lan_media_origin_diagnostic_omits_credential_query() {
         // Synthetic token fixture: joey-private-v3/access-a.
         let synthetic_access_token = "codex_synth_v1_access_a";
@@ -1982,6 +2628,7 @@ mod tests {
             filter: None,
             include_authenticated: true,
             include_collection_list: false,
+            sustained_duration: None,
         };
         let case = test_case("authenticated-history", true, false);
 
@@ -1994,6 +2641,7 @@ mod tests {
             filter: Some(parse_case_filter("authenticated-history".to_owned())),
             include_authenticated: false,
             include_collection_list: false,
+            sustained_duration: None,
         };
         let case = test_case("authenticated-history", true, false);
 
@@ -2018,6 +2666,7 @@ mod tests {
             filter: None,
             include_authenticated: false,
             include_collection_list: true,
+            sustained_duration: None,
         };
         let mut case = test_case("space-collection", false, false);
         case.requires_collection_list_validation = true;
@@ -2031,6 +2680,7 @@ mod tests {
             filter: None,
             include_authenticated: false,
             include_collection_list: true,
+            sustained_duration: None,
         };
         let mut case = test_case("space-videos", true, false);
         case.requires_collection_list_validation = true;
@@ -2047,6 +2697,7 @@ mod tests {
             filter: None,
             include_authenticated: true,
             include_collection_list: true,
+            sustained_duration: None,
         };
         let mut case = test_case("space-videos", true, false);
         case.requires_collection_list_validation = true;
@@ -2060,6 +2711,7 @@ mod tests {
             filter: None,
             include_authenticated: false,
             include_collection_list: true,
+            sustained_duration: None,
         };
         let mut case = test_case("favorite-list", false, false);
         case.url_env = Some("BILIBILI_LIVE_E2E_TEST_SOURCE_OVERRIDE_DO_NOT_SET".to_owned());
@@ -2078,6 +2730,7 @@ mod tests {
             filter: Some(parse_case_filter("favorite-list".to_owned())),
             include_authenticated: false,
             include_collection_list: false,
+            sustained_duration: None,
         };
         let mut case = test_case("favorite-list", false, false);
         case.requires_collection_list_validation = true;
@@ -2092,6 +2745,7 @@ mod tests {
             filter: Some(parse_case_filter("space-collection".to_owned())),
             include_authenticated: false,
             include_collection_list: false,
+            sustained_duration: None,
         };
         let mut case = test_case("space-collection", false, false);
         case.requires_collection_list_validation = true;
