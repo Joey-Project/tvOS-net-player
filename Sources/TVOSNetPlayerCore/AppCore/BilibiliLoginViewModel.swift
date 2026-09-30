@@ -85,9 +85,13 @@ public final class BilibiliLoginViewModel: ObservableObject {
         self.serverAddressText = serverAddressText
         active = true
         if changedAddress {
+            operationSequence += 1
+            isStartingLogin = false
             stopPolling()
             activeSession = nil
             verificationQRPayload = nil
+        } else if isStartingLogin {
+            return
         } else if let session = activeSession, status == .sessionPending {
             if session.expiresAt.map({ $0 > Date() }) ?? true {
                 startPolling()
@@ -106,6 +110,8 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
     public func deactivate() {
         active = false
+        operationSequence += 1
+        isStartingLogin = false
         stopPolling()
     }
 
@@ -151,6 +157,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
     private func refreshCredentialStatus() async {
         operationSequence += 1
+        isStartingLogin = false
         let requestSequence = operationSequence
         guard let endpoint = CacheServerEndpoint.normalized(from: serverAddressText) else {
             status = .disconnected

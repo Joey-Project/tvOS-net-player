@@ -256,6 +256,69 @@ final class BilibiliLoginViewModelTests: XCTestCase {
         XCTAssertFalse(model.statusMessage.contains("secret"))
         model.deactivate()
     }
+
+    @MainActor
+    func testChangingServerWhileStartIsPendingAllowsRetry() async {
+        let client = LoginClient(
+            serverInfo: .fixture(capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliLoginSessions,
+            ]),
+            credentialStatus: .fixture(),
+            startDelay: .milliseconds(100)
+        )
+        let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+        await model.activate(serverAddressText: "first.local")
+        let oldStart = Task { await model.startLogin() }
+        for _ in 0..<50 {
+            if await client.loginStartCount > 0 { break }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertTrue(model.isStartingLogin)
+
+        await model.activate(serverAddressText: "second.local")
+        XCTAssertEqual(model.status, .loginRequired)
+        XCTAssertFalse(model.isStartingLogin)
+        XCTAssertTrue(model.canStartLogin)
+
+        await oldStart.value
+        XCTAssertEqual(model.status, .loginRequired)
+        XCTAssertTrue(model.canStartLogin)
+        model.deactivate()
+    }
+
+    @MainActor
+    func testLeavingViewWhileStartIsPendingAllowsRetryOnReturn() async {
+        let client = LoginClient(
+            serverInfo: .fixture(capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliLoginSessions,
+            ]),
+            credentialStatus: .fixture(),
+            startDelay: .milliseconds(100)
+        )
+        let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+        await model.activate(serverAddressText: "mac-mini.local")
+        let oldStart = Task { await model.startLogin() }
+        for _ in 0..<50 {
+            if await client.loginStartCount > 0 { break }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertTrue(model.isStartingLogin)
+
+        model.deactivate()
+        XCTAssertFalse(model.isStartingLogin)
+        await model.activate(serverAddressText: "mac-mini.local")
+        XCTAssertEqual(model.status, .loginRequired)
+        XCTAssertTrue(model.canStartLogin)
+
+        await oldStart.value
+        XCTAssertEqual(model.status, .loginRequired)
+        XCTAssertTrue(model.canStartLogin)
+        model.deactivate()
+    }
 }
 
 private actor LoginClient: CacheControlClient {
@@ -265,6 +328,7 @@ private actor LoginClient: CacheControlClient {
     let credentialStatusFails: Bool
     let newSession: BilibiliLoginSession
     let polledSession: BilibiliLoginSession?
+    let startDelay: Duration
     private(set) var credentialStatusCallCount = 0
     private(set) var loginStartCount = 0
     private(set) var loginPollCount = 0
@@ -276,7 +340,8 @@ private actor LoginClient: CacheControlClient {
         credentialStatusAfterLogin: BilibiliCredentialStatus? = nil,
         credentialStatusFails: Bool = false,
         newSession: BilibiliLoginSession = .fixture(state: "pending"),
-        polledSession: BilibiliLoginSession? = nil
+        polledSession: BilibiliLoginSession? = nil,
+        startDelay: Duration = .zero
     ) {
         self.serverInfo = serverInfo
         self.credentialStatus = credentialStatus
@@ -284,6 +349,7 @@ private actor LoginClient: CacheControlClient {
         self.credentialStatusFails = credentialStatusFails
         self.newSession = newSession
         self.polledSession = polledSession
+        self.startDelay = startDelay
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
@@ -307,6 +373,9 @@ private actor LoginClient: CacheControlClient {
     ) async throws -> BilibiliLoginSession {
         loginStartCount += 1
         requestedProfileID = profileID
+        if startDelay > .zero {
+            try await Task.sleep(for: startDelay)
+        }
         return newSession
     }
 
