@@ -37,6 +37,7 @@ const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const SUSTAINED_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const SUSTAINED_READ_LIMIT: u64 = 64 * 1024;
 const SUSTAINED_PLAYLIST_LIMIT: usize = 1024 * 1024;
+const SUSTAINED_MAX_CHILD_PLAYLISTS: usize = 32;
 const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
     "Bilibili error detail omitted because credential material is configured.";
@@ -731,52 +732,51 @@ async fn sustain_hls_probe(
     let deadline = tokio::time::Instant::now() + duration;
     let source_url =
         assert_lan_media_url(case, &source.uri, media_url, "sustained playback source");
-    let mut probes = 0usize;
-    let mut cursor = SustainedProbeCursor::default();
+    let master = fetch_sustained_playlist(case, http, &source_url, media_url, "master").await;
+    let child_urls = assert_playlist_stays_on_lan(
+        case,
+        &source_url,
+        &master,
+        media_url,
+        "sustained master playlist",
+    );
+    let mut playlists =
+        SustainedPlaylistSet::new(unique_child_playlist_urls(child_urls, &source_url));
+    assert!(
+        playlists.len() <= SUSTAINED_MAX_CHILD_PLAYLISTS,
+        "{}: sustained master playlist exceeded the child playlist limit",
+        case.id
+    );
 
-    loop {
+    let mut probes = 0usize;
+    for index in 0..playlists.len() {
+        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        playlists.record_range(index);
+        probes += 1;
+    }
+    assert!(
+        playlists.all_initial_children_ranged(),
+        "{}: not every initial child playlist received a media range probe",
+        case.id
+    );
+
+    while tokio::time::Instant::now() < deadline {
         let master = fetch_sustained_playlist(case, http, &source_url, media_url, "master").await;
-        let nested_playlists = assert_playlist_stays_on_lan(
+        assert_playlist_stays_on_lan(
             case,
             &source_url,
             &master,
             media_url,
             "sustained master playlist",
         );
-        let media_playlist_url = nested_playlists.first().unwrap_or(&source_url);
-        let media_playlist = if nested_playlists.is_empty() {
-            master
-        } else {
-            fetch_sustained_playlist(case, http, media_playlist_url, media_url, "media").await
-        };
-        assert_playlist_stays_on_lan(
-            case,
-            media_playlist_url,
-            &media_playlist,
-            media_url,
-            "sustained media playlist",
-        );
-        let resources = hls_probe_resources(&media_playlist).unwrap_or_else(|_| {
+        let index = playlists.next_index().unwrap_or_else(|| {
             panic!(
-                "{}: sustained media playlist has invalid byte ranges",
+                "{}: sustained master playlist had no child playlists",
                 case.id
             )
         });
-        let request = next_sustained_probe_request(&resources, &mut cursor).unwrap_or_else(|| {
-            panic!(
-                "{}: sustained media playlist has no media segments",
-                case.id
-            )
-        });
-        let url = media_playlist_url.join(&request.uri).unwrap_or_else(|_| {
-            panic!(
-                "{}: sustained media playlist contains an invalid segment URI",
-                case.id
-            )
-        });
-        assert_lan_media_url(case, url.as_str(), media_url, "sustained media segment");
-        fetch_sustained_media_bytes(case, http, &url, &request.range).await;
-
+        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        playlists.record_range(index);
         probes += 1;
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -789,6 +789,56 @@ async fn sustain_hls_probe(
         "{}: sustained LAN HLS probe completed ({probes} rounds)",
         case.id
     );
+}
+
+async fn probe_sustained_child_playlist(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    media_url: &str,
+    playlist: &mut SustainedChildPlaylist,
+) {
+    let media_playlist =
+        fetch_sustained_playlist(case, http, &playlist.url, media_url, "media").await;
+    assert_playlist_stays_on_lan(
+        case,
+        &playlist.url,
+        &media_playlist,
+        media_url,
+        "sustained media playlist",
+    );
+    let resources = hls_probe_resources(&media_playlist).unwrap_or_else(|_| {
+        panic!(
+            "{}: sustained media playlist has invalid byte ranges",
+            case.id
+        )
+    });
+    let request =
+        next_sustained_probe_request(&resources, &mut playlist.cursor).unwrap_or_else(|| {
+            panic!(
+                "{}: sustained media playlist has no media segments",
+                case.id
+            )
+        });
+    let url = playlist.url.join(&request.uri).unwrap_or_else(|_| {
+        panic!(
+            "{}: sustained media playlist contains an invalid segment URI",
+            case.id
+        )
+    });
+    assert_lan_media_url(case, url.as_str(), media_url, "sustained media segment");
+    fetch_sustained_media_bytes(case, http, &url, &request.range).await;
+}
+
+fn unique_child_playlist_urls(urls: Vec<Url>, fallback: &Url) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    let urls = if urls.is_empty() {
+        vec![fallback.clone()]
+    } else {
+        urls
+    };
+    urls.into_iter()
+        .filter(|url| seen.insert(url.as_str().to_owned()))
+        .collect()
 }
 
 async fn fetch_sustained_playlist(
@@ -941,6 +991,58 @@ struct SustainedProbeRequest {
 struct SustainedProbeCursor {
     resource_index: usize,
     window_offset: u64,
+}
+
+struct SustainedChildPlaylist {
+    url: Url,
+    cursor: SustainedProbeCursor,
+    ranged: bool,
+}
+
+struct SustainedPlaylistSet {
+    children: Vec<SustainedChildPlaylist>,
+    next_child_index: usize,
+}
+
+impl SustainedPlaylistSet {
+    fn new(urls: Vec<Url>) -> Self {
+        Self {
+            children: urls
+                .into_iter()
+                .map(|url| SustainedChildPlaylist {
+                    url,
+                    cursor: SustainedProbeCursor::default(),
+                    ranged: false,
+                })
+                .collect(),
+            next_child_index: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.children.len()
+    }
+
+    fn playlist_mut(&mut self, index: usize) -> &mut SustainedChildPlaylist {
+        &mut self.children[index]
+    }
+
+    fn record_range(&mut self, index: usize) {
+        self.children[index].ranged = true;
+    }
+
+    fn all_initial_children_ranged(&self) -> bool {
+        !self.children.is_empty() && self.children.iter().all(|child| child.ranged)
+    }
+
+    fn next_index(&mut self) -> Option<usize> {
+        if self.children.is_empty() {
+            return None;
+        }
+        let index = self.next_child_index % self.children.len();
+        self.next_child_index = (index + 1) % self.children.len();
+        Some(index)
+    }
 }
 
 fn next_sustained_probe_request(
@@ -2234,6 +2336,33 @@ mod tests {
         assert_eq!("segment-1.m4s", wrapped.uri);
         assert_eq!(0, first.range.start);
         assert_eq!(SUSTAINED_READ_LIMIT - 1, first.range.end);
+    }
+
+    #[test]
+    fn sustained_probe_covers_and_rotates_audio_and_video_children() {
+        let fallback = Url::parse("http://127.0.0.1:41000/master.m3u8").unwrap();
+        let video = Url::parse("http://127.0.0.1:41000/video.m3u8").unwrap();
+        let audio = Url::parse("http://127.0.0.1:41000/audio.m3u8").unwrap();
+        let urls = unique_child_playlist_urls(
+            vec![video.clone(), audio.clone(), video.clone()],
+            &fallback,
+        );
+        let mut playlists = SustainedPlaylistSet::new(urls);
+
+        assert_eq!(2, playlists.len());
+        assert_eq!("/video.m3u8", playlists.children[0].url.path());
+        assert_eq!("/audio.m3u8", playlists.children[1].url.path());
+        assert!(!playlists.all_initial_children_ranged());
+
+        for index in 0..playlists.len() {
+            playlists.record_range(index);
+        }
+
+        assert!(playlists.all_initial_children_ranged());
+        assert_eq!(Some(0), playlists.next_index());
+        assert_eq!(Some(1), playlists.next_index());
+        assert_eq!(Some(0), playlists.next_index());
+        assert_eq!(Some(1), playlists.next_index());
     }
 
     #[test]
