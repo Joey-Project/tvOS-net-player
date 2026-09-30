@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs::{self, OpenOptions},
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -259,7 +261,9 @@ impl BilibiliLoginManager {
             .state
             .lock()
             .map_err(|_| Status::internal("Bilibili login session store is unavailable."))?;
-        expire_sessions(&mut state, Instant::now());
+        let now = Instant::now();
+        expire_sessions(&mut state, now);
+        prune_terminal_sessions(&mut state, now);
         state
             .sessions
             .get(session_id)
@@ -398,6 +402,8 @@ impl BilibiliLoginManager {
 
                 let mut secrets: CredentialProfileSecrets =
                     profiles.profile_secrets(&store_profile_id)?;
+                // Core normalization drops cookie refresh secrets without a cookie; carrying one
+                // across a new QR login could attach the prior account's token to another user.
                 let cookie_secret = refresh_token
                     .filter(|value| !value.trim().is_empty())
                     .map_or_else(CredentialRefreshSecret::default, |value| {
@@ -440,6 +446,7 @@ impl BilibiliLoginManager {
             };
             record.public.verification_uri.clear();
             record.ticket_key.clear();
+            record.finishing = false;
             record.completed_at = Some(Instant::now());
         }
         self.release_profile_locked(&mut state, profile_id, session_id);
@@ -518,11 +525,7 @@ pub(crate) fn credential_login_available(path: Option<&Path>, profile: Option<&s
     let Some(path) = path else {
         return false;
     };
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() || path.is_dir() {
+    if !credential_store_parent_is_writable(path) {
         return false;
     }
     if !path.exists() {
@@ -532,6 +535,33 @@ pub(crate) fn credential_login_available(path: Option<&Path>, profile: Option<&s
         return false;
     };
     profile.is_none_or(|profile| profiles.profile(profile).is_ok())
+}
+
+fn credential_store_parent_is_writable(path: &Path) -> bool {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() || path.is_dir() {
+        return false;
+    }
+
+    let probe_path = parent.join(format!(".bbdown-write-check-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let Ok(mut probe) = options.open(&probe_path) else {
+        return false;
+    };
+    let write_succeeded = probe.write_all(&[0]).is_ok() && probe.sync_all().is_ok();
+    drop(probe);
+    let cleanup_succeeded = fs::remove_file(&probe_path).is_ok();
+    write_succeeded && cleanup_succeeded
 }
 
 fn prune_terminal_sessions(state: &mut LoginState, now: Instant) {
@@ -955,6 +985,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_prunes_terminal_sessions_past_completion_ttl() {
+        let manager = manager(PollResult::Waiting);
+        let session = BilibiliLoginSession {
+            id: "completed".to_owned(),
+            profile_id: "default".to_owned(),
+            method: 1,
+            state: BilibiliLoginSessionState::Ready.into(),
+            message: "done".to_owned(),
+            verification_uri: String::new(),
+            created_at: None,
+            expires_at: None,
+        };
+        manager.state.lock().expect("state lock").sessions.insert(
+            session.id.clone(),
+            SessionRecord {
+                public: session,
+                ticket_key: String::new(),
+                deadline: Instant::now(),
+                finishing: false,
+                completed_at: Some(Instant::now() - TERMINAL_SESSION_TTL - Duration::from_secs(1)),
+            },
+        );
+
+        assert_eq!(
+            Code::NotFound,
+            manager
+                .get("completed")
+                .expect_err("expired terminal record")
+                .code()
+        );
+        assert!(
+            !manager
+                .state
+                .lock()
+                .expect("state lock")
+                .sessions
+                .contains_key("completed")
+        );
+    }
+
     #[tokio::test]
     async fn completed_session_remains_queryable_when_another_profile_starts() {
         let (_temp, path) = temp_store();
@@ -1133,12 +1204,79 @@ mod tests {
 
     #[test]
     fn login_capability_requires_usable_configured_store() {
-        let (_temp, path) = temp_store();
+        let (temp, path) = temp_store();
         assert!(credential_login_available(Some(&path), None));
+        assert_eq!(
+            0,
+            fs::read_dir(temp.path())
+                .expect("credential parent should remain readable")
+                .count()
+        );
         assert!(!credential_login_available(None, None));
         assert!(!credential_login_available(
             Some(Path::new("/missing-parent/credentials.json")),
             None
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_capability_rejects_read_only_credential_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, path) = temp_store();
+        let parent = temp.path();
+        let original = fs::metadata(parent)
+            .expect("credential parent metadata")
+            .permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(original.mode() & !0o222);
+        fs::set_permissions(parent, read_only).expect("make credential parent read-only");
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission assertion when running as root");
+        } else {
+            assert!(!credential_login_available(Some(&path), None));
+        }
+
+        fs::set_permissions(parent, original).expect("restore credential parent permissions");
+    }
+
+    #[test]
+    fn credential_store_drops_cookie_refresh_secret_without_cookie() {
+        let (_temp, path) = temp_store();
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "default_profile": "default",
+  "profiles": {
+    "default": { "access_key": "access-key-fixture" }
+  },
+  "profile_secrets": {
+    "default": { "cookie": { "refresh_token": "stale-refresh-fixture" } }
+  }
+}"#,
+        )
+        .expect("write raw credential profile");
+
+        let profiles = CredentialStore::new(path)
+            .load_profiles()
+            .expect("load normalized profiles");
+        assert_eq!(
+            Some("access-key-fixture"),
+            profiles
+                .profile("default")
+                .expect("default profile")
+                .access_key
+                .as_deref()
+        );
+        assert!(
+            profiles
+                .profile_secrets("default")
+                .expect("profile secrets")
+                .cookie()
+                .is_none()
+        );
     }
 }
