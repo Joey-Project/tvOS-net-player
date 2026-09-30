@@ -7,6 +7,7 @@ struct MacOSNetPlayerApp: App {
     @StateObject private var cacheModel = CacheLibraryViewModel()
     @StateObject private var discoveryModel = CacheServerDiscoveryViewModel()
     @StateObject private var bilibiliModel = BilibiliTaskViewModel()
+    @StateObject private var bilibiliLoginModel = BilibiliLoginViewModel()
     @StateObject private var diagnosticsModel = CacheServerDiagnosticsViewModel()
 
     var body: some Scene {
@@ -16,7 +17,8 @@ struct MacOSNetPlayerApp: App {
                 cacheModel: cacheModel,
                 discoveryModel: discoveryModel,
                 bilibiliModel: bilibiliModel,
-                diagnosticsModel: diagnosticsModel
+                diagnosticsModel: diagnosticsModel,
+                bilibiliLoginModel: bilibiliLoginModel
             )
         }
         .commands {

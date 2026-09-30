@@ -27,6 +27,7 @@ use crate::{
         BilibiliPlaybackPlan, BilibiliPlaybackVariant as AdapterPlaybackVariant,
         BilibiliPlaybackVariantKind, recover_stable_collection_candidate,
     },
+    bilibili_login::{BilibiliLoginManager, credential_login_available},
     bilibili_playback::{
         BilibiliContentIdentity as AdapterBilibiliContentIdentity,
         BilibiliContentKind as AdapterBilibiliContentKind, BilibiliInputResolution,
@@ -47,8 +48,8 @@ use crate::{
         BilibiliContentKind, BilibiliCredentialProfile, BilibiliCredentialState,
         BilibiliCredentialStatus, BilibiliDanmakuFormat, BilibiliDownloadMode,
         BilibiliDownloadOptions, BilibiliDownloadSpec, BilibiliLoginMethod, BilibiliLoginSession,
-        BilibiliLoginSessionState, BilibiliPlaybackOptions, BilibiliPlaybackSession,
-        BilibiliPlaybackSpec, BilibiliPlaybackVariant, BilibiliRequestContext,
+        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackSpec,
+        BilibiliPlaybackVariant, BilibiliRequestContext,
         BilibiliResolutionCandidate as ProtoBilibiliResolutionCandidate, BilibiliResolutionPage,
         BilibiliResolutionSession, BilibiliResolveResult,
         BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliSubtitleAiPolicy,
@@ -143,6 +144,18 @@ fn local_library_item_delete_available(options: &CacheServerOptions) -> bool {
     options.allow_library_item_delete && cfg!(unix)
 }
 
+fn bilibili_login_sessions_opted_in(options: &CacheServerOptions) -> bool {
+    options.allow_bilibili_login_sessions
+}
+
+fn bilibili_login_sessions_enabled(options: &CacheServerOptions) -> bool {
+    bilibili_login_sessions_opted_in(options)
+        && credential_login_available(
+            options.bbdown_credential_path.as_deref(),
+            options.bbdown_credential_profile.as_deref(),
+        )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsCacheFinalizationFailureMode {
     KeepPlayable,
@@ -152,18 +165,17 @@ pub(crate) enum HlsCacheFinalizationFailureMode {
 #[derive(Clone)]
 pub struct ServerGrpcService {
     state: AppState,
-    login_sessions: Arc<StdMutex<VecDeque<BilibiliLoginSession>>>,
+    login_manager: BilibiliLoginManager,
 }
 
-const MAX_BILIBILI_LOGIN_SESSIONS: usize = 64;
 const MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES: usize = 256;
 
 impl ServerGrpcService {
     pub fn new(state: AppState) -> Self {
-        let login_sessions = Arc::clone(&state.bilibili_login_sessions);
+        let login_manager = state.bilibili_login.clone();
         Self {
             state,
-            login_sessions,
+            login_manager,
         }
     }
 }
@@ -190,6 +202,12 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::Hls.into(),
             ],
         };
+
+        if bilibili_login_sessions_enabled(&self.state.options) {
+            // The verification URI can itself carry a short-lived QR bearer.
+            info.capabilities
+                .push(ServerCapability::BilibiliLoginSessions.into());
+        }
 
         if self.state.tasks.persistence_available() {
             info.capabilities
@@ -268,24 +286,23 @@ impl ServerService for ServerGrpcService {
             method => method,
         };
         let profile_id = normalize_login_profile_id(&request.profile_id, &self.state.options)?;
-        let session = BilibiliLoginSession {
-            id: uuid::Uuid::new_v4().to_string(),
-            profile_id,
-            method: method.into(),
-            state: BilibiliLoginSessionState::Unsupported.into(),
-            message: "Bilibili login session control-plane is available, but server-side QR login is not implemented in this slice.".to_owned(),
-            verification_uri: String::new(),
-            created_at: Some(current_timestamp()),
-            expires_at: None,
-        };
-        let mut login_sessions = self
-            .login_sessions
-            .lock()
-            .map_err(|_| Status::internal("Bilibili login session store is unavailable."))?;
-        if login_sessions.len() >= MAX_BILIBILI_LOGIN_SESSIONS {
-            login_sessions.pop_front();
+        if method != BilibiliLoginMethod::WebQr {
+            return Err(Status::invalid_argument(
+                "Only Bilibili Web QR login is supported.",
+            ));
         }
-        login_sessions.push_back(session.clone());
+        if !bilibili_login_sessions_enabled(&self.state.options) {
+            return Err(Status::failed_precondition(
+                "Enable Cache:AllowBilibiliLoginSessions and set Cache:BBDownCredentialPath to writable server-side storage.",
+            ));
+        }
+        let session = self
+            .login_manager
+            .start(
+                profile_id,
+                self.state.options.bbdown_credential_path.clone(),
+            )
+            .await?;
         Ok(Response::new(session))
     }
 
@@ -293,15 +310,13 @@ impl ServerService for ServerGrpcService {
         &self,
         request: Request<GetBilibiliLoginSessionRequest>,
     ) -> Result<Response<BilibiliLoginSession>, Status> {
+        if !bilibili_login_sessions_opted_in(&self.state.options) {
+            return Err(Status::failed_precondition(
+                "Bilibili login sessions are not enabled on this server.",
+            ));
+        }
         let session_id = request.into_inner().session_id;
-        let session = self
-            .login_sessions
-            .lock()
-            .map_err(|_| Status::internal("Bilibili login session store is unavailable."))?
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("Bilibili login session not found."))?;
+        let session = self.login_manager.get(&session_id)?;
         Ok(Response::new(session))
     }
 }
@@ -7757,61 +7772,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bilibili_login_session_foundation_shares_unsupported_session_across_services() {
+    async fn bilibili_login_session_requires_server_credential_storage() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
-        let credentials_path = temp.path().join("credentials.json");
-        fs::write(
-            &credentials_path,
-            r#"{
-                "version": 1,
-                "default_profile": "living-room",
-                "profiles": {
-                    "living-room": {
-                        "cookie": "SESSDATA=living-room"
-                    }
-                }
-            }"#,
-        )
-        .expect("credential file should be written");
         let state = AppState::new(CacheServerOptions {
             task_state_path: root_path.join(".state").join("tasks.json"),
-            root_path,
+            root_path: root_path.clone(),
+            allow_bilibili_login_sessions: true,
             bilibili_worker_enabled: false,
-            bbdown_credential_path: Some(credentials_path),
             ..CacheServerOptions::default()
         });
-        let creator = ServerGrpcService::new(state.clone());
-        let reader = ServerGrpcService::new(state);
+        let service = ServerGrpcService::new(state);
 
-        let session = creator
+        let error = service
             .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
                 profile_id: String::new(),
                 method: BilibiliLoginMethod::WebQr.into(),
             }))
             .await
-            .expect("login session start should succeed")
-            .into_inner();
+            .expect_err("missing credential path must be rejected");
+        assert_eq!(tonic::Code::FailedPrecondition, error.code());
+        assert!(error.message().contains("Cache:AllowBilibiliLoginSessions"));
+        assert!(error.message().contains("Cache:BBDownCredentialPath"));
+        assert!(
+            !error
+                .message()
+                .contains(root_path.to_string_lossy().as_ref())
+        );
+    }
 
-        assert!(!session.id.is_empty());
-        assert_eq!("living-room", session.profile_id);
-        assert_eq!(BilibiliLoginMethod::WebQr, session.method());
-        assert_eq!(BilibiliLoginSessionState::Unsupported, session.state());
-        assert!(session.verification_uri.is_empty());
-        assert!(!session.message.contains("cookie"));
+    #[tokio::test]
+    async fn bilibili_login_get_remains_available_when_storage_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().to_path_buf();
+        let credentials_path = root_path.join("missing-parent").join("credentials.json");
+        let service = ServerGrpcService::new(AppState::new(CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            root_path,
+            bbdown_credential_path: Some(credentials_path),
+            allow_bilibili_login_sessions: true,
+            ..CacheServerOptions::default()
+        }));
 
-        let fetched = reader
+        let error = service
             .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
-                session_id: session.id.clone(),
+                session_id: "in-flight-session".to_owned(),
             }))
             .await
-            .expect("login session get should succeed")
-            .into_inner();
+            .expect_err("unknown session should reach the session manager");
+        assert_eq!(tonic::Code::NotFound, error.code());
+    }
 
-        assert_eq!(session, fetched);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_login_capability_and_start_require_writable_storage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().to_path_buf();
+        let credentials_path = root_path.join("credentials.json");
+        let original = fs::metadata(&root_path)
+            .expect("credential parent metadata")
+            .permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(original.mode() & !0o222);
+        fs::set_permissions(&root_path, read_only).expect("make credential parent read-only");
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission assertions when running as root");
+        } else {
+            let service = ServerGrpcService::new(AppState::new(CacheServerOptions {
+                task_state_path: root_path.join(".state").join("tasks.json"),
+                root_path: root_path.clone(),
+                bbdown_credential_path: Some(credentials_path),
+                allow_bilibili_login_sessions: true,
+                ..CacheServerOptions::default()
+            }));
+            let info = service
+                .get_server_info(Request::new(GetServerInfoRequest {}))
+                .await
+                .expect("server info")
+                .into_inner();
+            assert!(
+                !info
+                    .capabilities
+                    .contains(&(ServerCapability::BilibiliLoginSessions as i32))
+            );
+
+            let error = service
+                .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                    profile_id: String::new(),
+                    method: BilibiliLoginMethod::WebQr.into(),
+                }))
+                .await
+                .expect_err("Start must reject read-only storage before QR creation");
+            assert_eq!(tonic::Code::FailedPrecondition, error.code());
+        }
+
+        fs::set_permissions(&root_path, original).expect("restore credential parent permissions");
+    }
+
+    #[tokio::test]
+    async fn bilibili_login_session_capability_and_rpc_require_explicit_opt_in() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp.path().to_path_buf();
+        let credentials_path = root_path.join("credentials.json");
+        let options = CacheServerOptions {
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            root_path: root_path.clone(),
+            bbdown_credential_path: Some(credentials_path.clone()),
+            ..CacheServerOptions::default()
+        };
+        let disabled = ServerGrpcService::new(AppState::new(options.clone()));
+        let info = disabled
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info")
+            .into_inner();
+        assert!(
+            !info
+                .capabilities
+                .contains(&(ServerCapability::BilibiliLoginSessions as i32))
+        );
+        let start_error = disabled
+            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                profile_id: String::new(),
+                method: BilibiliLoginMethod::WebQr.into(),
+            }))
+            .await
+            .expect_err("Start must share the capability opt-in gate");
+        assert_eq!(tonic::Code::FailedPrecondition, start_error.code());
+        let get_error = disabled
+            .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
+                session_id: "unknown".to_owned(),
+            }))
+            .await
+            .expect_err("Get must share the capability opt-in gate");
+        assert_eq!(tonic::Code::FailedPrecondition, get_error.code());
+
+        fs::write(&credentials_path, "{}").expect("credential store should be usable");
+        let enabled = ServerGrpcService::new(AppState::new(CacheServerOptions {
+            allow_bilibili_login_sessions: true,
+            ..options
+        }));
+        let info = enabled
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info")
+            .into_inner();
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::BilibiliLoginSessions as i32))
+        );
     }
 
     #[tokio::test]
@@ -7841,7 +7956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bilibili_login_session_rejects_oversized_profile_without_mutating_store() {
+    async fn bilibili_login_session_rejects_oversized_profile() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -7854,19 +7969,6 @@ mod tests {
             ..CacheServerOptions::default()
         });
         let service = ServerGrpcService::new(state);
-
-        service
-            .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
-                profile_id: "a".repeat(MAX_BILIBILI_LOGIN_PROFILE_ID_BYTES),
-                method: BilibiliLoginMethod::WebQr.into(),
-            }))
-            .await
-            .expect("maximum-length profile ID should be accepted");
-        let sessions_before = service
-            .login_sessions
-            .lock()
-            .expect("session store should be available")
-            .clone();
 
         let error = service
             .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
@@ -7877,60 +7979,6 @@ mod tests {
             .expect_err("oversized profile ID should be rejected");
 
         assert_eq!(tonic::Code::InvalidArgument, error.code());
-        assert_eq!(
-            sessions_before,
-            *service
-                .login_sessions
-                .lock()
-                .expect("session store should be available")
-        );
-    }
-
-    #[tokio::test]
-    async fn bilibili_login_session_store_evicts_oldest_session_at_capacity() {
-        let temp = tempfile::tempdir().expect("temp dir should be created");
-        let root_path = temp
-            .path()
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(temp.path()));
-        let state = AppState::new(CacheServerOptions {
-            task_state_path: root_path.join(".state").join("tasks.json"),
-            root_path,
-            bilibili_worker_enabled: false,
-            ..CacheServerOptions::default()
-        });
-        let service = ServerGrpcService::new(state);
-        let mut oldest_session_id = String::new();
-
-        for index in 0..=MAX_BILIBILI_LOGIN_SESSIONS {
-            let session = service
-                .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
-                    profile_id: format!("profile-{index}"),
-                    method: BilibiliLoginMethod::WebQr.into(),
-                }))
-                .await
-                .expect("login session start should succeed")
-                .into_inner();
-            if index == 0 {
-                oldest_session_id = session.id;
-            }
-        }
-
-        assert_eq!(
-            MAX_BILIBILI_LOGIN_SESSIONS,
-            service
-                .login_sessions
-                .lock()
-                .expect("session store should be available")
-                .len()
-        );
-        let error = service
-            .get_bilibili_login_session(Request::new(GetBilibiliLoginSessionRequest {
-                session_id: oldest_session_id,
-            }))
-            .await
-            .expect_err("oldest session should be evicted");
-        assert_eq!(tonic::Code::NotFound, error.code());
     }
 
     #[tokio::test]

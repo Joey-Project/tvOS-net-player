@@ -137,6 +137,8 @@ BBDown adapter 相关配置：
 - `Cache:BBDownFfmpegPath`: `ffmpeg` 可执行文件路径。默认从 `PATH` 查找 `ffmpeg`。
 - `Cache:BBDownCredentialPath`: BBDown credential JSON 文件路径，字段兼容 `bbdown-core` 的 `cookie`、`access_key` 和 `tv_access_key`。不要把这个文件提交到仓库。
 - `Cache:BBDownCredentialProfile`: 可选 BBDown credential profile 名称；设置后 server 会从 `Cache:BBDownCredentialPath` 指向的 profile store 读取该 profile。未设置时继续使用 credential store 的默认 profile。
+- `Cache:AllowBilibiliLoginSessions`: 是否允许 LAN 客户端发起 Web QR 登录。默认 `false`；仅在可信 LAN 上显式设为 `true`，并同时配置 `Cache:BBDownCredentialPath` 指向不纳入版本控制的私有 JSON 路径。Mac mini 上的 cache server 创建和轮询会话，tvOS/macOS 只展示短时二维码和脱敏状态；扫码成功只补充所选 profile 的 Web cookie，不替换已有 `access_key`。server 会保存 QR 返回的 refresh token，但当前尚不会自动续期 Web cookie。未配置路径时不能从客户端通过登录 RPC 创建凭证文件。二维码 URL 包含短时登录票据，不要直接向公网暴露当前未鉴权的明文 gRPC 登录接口。
+- BiliPlus/BALH 通用 `access_key` 授权不能靠 Web QR 轮询完成；在可信的 Mac 侧浏览器回调闭环完成前，仍需由 Mac mini 本地私有 credential 文件提供。客户端没有写入 cookie、`access_key` 或 refresh token 的 RPC。
 - `Cache:BBDownRestrictedArea`: restricted-area 优先区域，可选 `cn`、`th`、`hk` 或 `tw`。
 - `Cache:BBDownRestrictedAreaProxy`: restricted-area playurl proxy 列表，格式为逗号分隔的 `[area=]URL`，例如 `hk=https://proxy.example/playurl,https://fallback.example/playurl`。
 - `Cache:BBDownRestrictedApiProxy`: restricted-area Bilibili API proxy 列表，格式同上。

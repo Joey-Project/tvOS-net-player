@@ -32,6 +32,7 @@ pub struct CacheServerOptions {
     pub hls_cache_high_watermark_percent: u8,
     pub hls_cache_low_watermark_percent: u8,
     pub lan_transcoding_enabled: bool,
+    pub allow_bilibili_login_sessions: bool,
     pub lan_transcoding_ffmpeg_path: PathBuf,
     pub lan_transcoding_max_concurrent_jobs: usize,
     pub bilibili_worker_enabled: bool,
@@ -96,6 +97,7 @@ impl Default for CacheServerOptions {
             hls_cache_high_watermark_percent: 90,
             hls_cache_low_watermark_percent: 80,
             lan_transcoding_enabled: false,
+            allow_bilibili_login_sessions: false,
             lan_transcoding_ffmpeg_path: PathBuf::from("ffmpeg"),
             lan_transcoding_max_concurrent_jobs: 1,
             bilibili_worker_enabled: true,
@@ -327,6 +329,9 @@ impl CacheServerOptions {
                     .collect();
             }
             "Cache:AllowLibraryItemDelete" => self.allow_library_item_delete = parse_bool(&value)?,
+            "Cache:AllowBilibiliLoginSessions" => {
+                self.allow_bilibili_login_sessions = parse_bool(&value)?;
+            }
             "Cache:HlsCacheMaxBytes" => {
                 self.hls_cache_max_bytes = value.parse().map_err(|_| {
                     ConfigError::new(format!(
@@ -876,6 +881,26 @@ mod tests {
         .expect("options should parse");
 
         assert!(!options.bonjour_enabled);
+    }
+
+    #[test]
+    fn bilibili_login_sessions_require_explicit_opt_in() {
+        let defaults = CacheServerOptions::default();
+        assert!(!defaults.allow_bilibili_login_sessions);
+
+        let enabled = CacheServerOptions::from_args([
+            "--Cache:AllowBilibiliLoginSessions".to_owned(),
+            "true".to_owned(),
+        ])
+        .expect("login-session opt-in should parse");
+        assert!(enabled.allow_bilibili_login_sessions);
+
+        let disabled = CacheServerOptions::from_args([
+            "--Cache:AllowBilibiliLoginSessions".to_owned(),
+            "false".to_owned(),
+        ])
+        .expect("login-session opt-out should parse");
+        assert!(!disabled.allow_bilibili_login_sessions);
     }
 
     #[test]

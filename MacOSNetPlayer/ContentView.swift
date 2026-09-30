@@ -1,5 +1,7 @@
 import AVKit
 import SwiftUI
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import TVOSNetPlayerCacheClient
 import TVOSNetPlayerCore
 
@@ -9,6 +11,7 @@ struct ContentView: View {
     @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
     @ObservedObject var diagnosticsModel: CacheServerDiagnosticsViewModel
+    @ObservedObject var bilibiliLoginModel: BilibiliLoginViewModel
     @State private var selectedItemID: CacheLibraryItem.ID?
     @State private var pendingDeleteItem: CacheLibraryItem?
     @State private var isAutoDiscoveryConnecting = false
@@ -25,6 +28,9 @@ struct ContentView: View {
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onAppear {
             discoveryModel.start()
+            Task {
+                await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+            }
             diagnosticsModel.useServerAddressText(cacheModel.serverAddressText)
             Task {
                 if cacheModel.hasServerAddress {
@@ -33,8 +39,14 @@ struct ContentView: View {
                 await autoConnectDiscoveredServerIfNeeded()
             }
         }
+        .onDisappear {
+            bilibiliLoginModel.deactivate()
+        }
         .onChange(of: cacheModel.serverAddressText) { _, newValue in
             diagnosticsModel.useServerAddressText(newValue)
+            Task {
+                await bilibiliLoginModel.activate(serverAddressText: newValue)
+            }
         }
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
@@ -248,11 +260,52 @@ struct ContentView: View {
 
             manualStreamControls
             operatorDiagnostics
+            bilibiliLoginControls
             bilibiliControls
             selectedCacheItemControls
             playbackArea
         }
         .padding(24)
+    }
+
+    private var bilibiliLoginControls: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(bilibiliLoginModel.statusMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+
+                    if bilibiliLoginModel.canStartLogin {
+                        Button {
+                            Task {
+                                await bilibiliLoginModel.startLogin()
+                            }
+                        } label: {
+                            Label(
+                                bilibiliLoginModel.isStartingLogin ? "Starting Login" : "Sign In with QR Code",
+                                systemImage: "qrcode"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(bilibiliLoginModel.isStartingLogin)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                if let payload = bilibiliLoginModel.verificationQRPayload {
+                    BilibiliLoginQRCode(payload: payload)
+                        .frame(width: 240, height: 240)
+                        .accessibilityLabel("Bilibili Web login QR code")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        } label: {
+            Label("Bilibili Login", systemImage: "qrcode")
+        }
     }
 
     private var manualStreamControls: some View {
@@ -1060,6 +1113,40 @@ struct ContentView: View {
         if cacheModel.hasServerAddress {
             await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
         }
+    }
+}
+
+private struct BilibiliLoginQRCode: View {
+    let payload: String
+    private static let context = CIContext()
+
+    var body: some View {
+        Group {
+            if let image = qrImage {
+                Image(decorative: image, scale: 1)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(24)
+                    .background(Color.white)
+            } else {
+                Image(systemName: "qrcode")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var qrImage: CGImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else {
+            return nil
+        }
+        return Self.context.createCGImage(output, from: output.extent)
     }
 }
 

@@ -1,4 +1,5 @@
 mod bbdown_adapter;
+mod bilibili_login;
 mod bilibili_playback;
 mod bilibili_resolution;
 pub mod bilibili_worker;
@@ -23,7 +24,7 @@ mod task_store;
 mod transcoding;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt::Display,
     io,
     net::SocketAddr,
@@ -41,7 +42,7 @@ use bilibili_worker::{
     BilibiliDownloadAdapter, run_bilibili_task_worker, run_pending_file_cleanup_worker,
 };
 use generated::tvos_net_player::v1::{
-    BilibiliLoginSession, LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
+    LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
     cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
     server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
 };
@@ -126,7 +127,7 @@ pub struct AppState {
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
-    pub(crate) bilibili_login_sessions: Arc<Mutex<VecDeque<BilibiliLoginSession>>>,
+    pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
     pub(crate) bilibili_resolutions: Arc<Mutex<BilibiliResolutionStore>>,
     pub(crate) bilibili_resolution_blocking_permits: Arc<Semaphore>,
     pub(crate) task_result_pages: Arc<Mutex<TaskResultPageStore>>,
@@ -652,7 +653,7 @@ impl AppState {
             hls_fill_scheduler,
             hls_network_policy,
             hls_playback_progress,
-            bilibili_login_sessions: Arc::new(Mutex::new(VecDeque::new())),
+            bilibili_login: bilibili_login::BilibiliLoginManager::default(),
             bilibili_resolutions: Arc::new(Mutex::new(BilibiliResolutionStore::default())),
             bilibili_resolution_blocking_permits,
             task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
