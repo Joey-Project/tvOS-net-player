@@ -115,7 +115,10 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 var request = TvosNetPlayer_V1_StartBilibiliLoginSessionRequest()
                 request.profileID = profileID
                 request.method = TvosNetPlayer_V1_BilibiliLoginMethod(method)
-                let response = try await service.startBilibiliLoginSession(request, options: callOptions)
+                let response = try await service.startBilibiliLoginSession(
+                    request,
+                    options: loginStartCallOptions
+                )
                 return BilibiliLoginSession(response)
             }
         } catch let error as RPCError where error.code == .unimplemented {
@@ -740,6 +743,12 @@ public final class GRPCCacheControlClient: CacheControlClient {
     private var callOptions: CallOptions {
         var options = CallOptions.defaults
         options.timeout = rpcTimeout
+        return options
+    }
+
+    var loginStartCallOptions: CallOptions {
+        var options = callOptions
+        options.timeout = max(rpcTimeout, .seconds(20))
         return options
     }
 

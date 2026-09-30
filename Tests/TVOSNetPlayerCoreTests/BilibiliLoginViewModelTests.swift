@@ -156,6 +156,30 @@ final class BilibiliLoginViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testLoginStartCanOutlastOrdinaryStatusTimeout() async {
+        let client = LoginClient(
+            serverInfo: .fixture(capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliLoginSessions,
+            ]),
+            credentialStatus: .fixture(),
+            startDelay: .milliseconds(75)
+        )
+        let model = BilibiliLoginViewModel(
+            operationTimeout: .milliseconds(20),
+            pollInterval: .seconds(2),
+            clientFactory: { _ in client }
+        )
+
+        await model.activate(serverAddressText: "mac-mini.local")
+        await model.startLogin()
+
+        XCTAssertEqual(model.status, .sessionPending)
+        XCTAssertNotNil(model.verificationQRPayload)
+        model.deactivate()
+    }
+
+    @MainActor
     func testReactivatingSameServerResumesLiveSessionWithoutClearingQR() async {
         let client = LoginClient(
             serverInfo: .fixture(capabilities: [

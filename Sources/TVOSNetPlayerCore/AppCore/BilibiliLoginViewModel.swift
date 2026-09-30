@@ -130,7 +130,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
         let profileID = activeProfileID
 
         do {
-            let session = try await Self.withTimeout(operationTimeout) {
+            let session = try await Self.withTimeout(max(operationTimeout, .seconds(20))) {
                 try await client.startBilibiliLoginSession(
                     profileID: profileID,
                     method: .webQR
