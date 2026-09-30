@@ -1,5 +1,7 @@
 import SwiftUI
 import AVKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import TVOSNetPlayerCore
 import TVOSNetPlayerCacheClient
 
@@ -8,7 +10,9 @@ struct ContentView: View {
     @ObservedObject var cacheModel: CacheLibraryViewModel
     @ObservedObject var discoveryModel: CacheServerDiscoveryViewModel
     @ObservedObject var bilibiliModel: BilibiliTaskViewModel
+    @ObservedObject var bilibiliLoginModel: BilibiliLoginViewModel
     @State private var pendingDeleteItem: CacheLibraryItem?
+    @State private var isLoginQRPresented = false
     @State private var isAutoDiscoveryConnecting = false
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
     @FocusState private var focusedControl: FocusedControl?
@@ -57,6 +61,9 @@ struct ContentView: View {
         }
         .onAppear {
             discoveryModel.start()
+            Task {
+                await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+            }
             focusedControl =
                 cacheModel.serverAddressText.isEmpty
                 ? .cacheServerField
@@ -64,6 +71,17 @@ struct ContentView: View {
             Task {
                 await autoConnectDiscoveredServerIfNeeded()
             }
+        }
+        .onDisappear {
+            bilibiliLoginModel.deactivate()
+        }
+        .onChange(of: cacheModel.serverAddressText) { _, newValue in
+            Task {
+                await bilibiliLoginModel.activate(serverAddressText: newValue)
+            }
+        }
+        .onChange(of: bilibiliLoginModel.verificationQRPayload) { _, payload in
+            isLoginQRPresented = payload != nil
         }
         .onChange(of: discoveryModel.discoveredServers) { _, _ in
             Task {
@@ -96,6 +114,9 @@ struct ContentView: View {
             }
         } message: { item in
             Text("Delete \(item.displayTitle) from the cache server.")
+        }
+        .sheet(isPresented: $isLoginQRPresented) {
+            bilibiliLoginQRSheet
         }
     }
 
@@ -139,6 +160,8 @@ struct ContentView: View {
             }
 
             discoveryControls
+
+            bilibiliLoginControls
 
             if !cacheModel.cacheRoots.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -241,6 +264,66 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var bilibiliLoginControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Bilibili Login")
+                .font(.headline)
+            Text(bilibiliLoginModel.statusMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+
+            if bilibiliLoginModel.canStartLogin {
+                Button {
+                    Task {
+                        await bilibiliLoginModel.startLogin()
+                    }
+                } label: {
+                    Label(
+                        bilibiliLoginModel.isStartingLogin ? "Starting Login" : "Sign In with QR Code",
+                        systemImage: "qrcode"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .disabled(bilibiliLoginModel.isStartingLogin)
+            } else if bilibiliLoginModel.verificationQRPayload != nil {
+                Button {
+                    isLoginQRPresented = true
+                } label: {
+                    Label("Show Login QR Code", systemImage: "qrcode")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var bilibiliLoginQRSheet: some View {
+        VStack(spacing: 24) {
+            Text("Bilibili Web Login")
+                .font(.title2.weight(.semibold))
+            Text(bilibiliLoginModel.statusMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+
+            if let payload = bilibiliLoginModel.verificationQRPayload {
+                BilibiliLoginQRCode(payload: payload)
+                    .frame(width: 360, height: 360)
+                    .accessibilityLabel("Bilibili Web login QR code")
+            }
+
+            Button("Close") {
+                isLoginQRPresented = false
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.ignoresSafeArea())
+        .presentationDetents([.large])
     }
 
     @ViewBuilder
@@ -962,6 +1045,40 @@ struct ContentView: View {
     private func refreshPlaybackProgressStatus() async {
         await model.flushPlaybackProgressReports()
         await cacheModel.refreshHLSCacheStatus()
+    }
+}
+
+private struct BilibiliLoginQRCode: View {
+    let payload: String
+    private static let context = CIContext()
+
+    var body: some View {
+        Group {
+            if let image = qrImage {
+                Image(decorative: image, scale: 1)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(24)
+                    .background(Color.white)
+            } else {
+                Image(systemName: "qrcode")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var qrImage: CGImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else {
+            return nil
+        }
+        return Self.context.createCGImage(output, from: output.extent)
     }
 }
 
