@@ -14,7 +14,8 @@
 - [completed] Next PR 5：扩展 authenticated/restricted live validation，覆盖 history、watch-later、recommendations、space videos、restricted Bangumi 和 collection/list cases，并安全识别 following/dynamic 的外部 schema compatibility failure。
 - [completed] Next PR 7：增加 per-request transcoding/ABR policy controls、兼容变体选择、弱网降级/恢复模式，以及 tvOS/macOS 共享设置。
 - [completed] Deferred/non-sequential Next PR 6：按 PR6A 到 PR6E 实现通用 task output/artifact/resource、分页 Bilibili resolution、v2 BBDown 映射，以及直接使用 v2 的 tvOS/macOS 客户端。
-- [pending] 跟进 `bbdown-core` dynamic feed timestamp compatibility：接受整数或 numeric-string `module_author.pub_ts`，升级依赖后重跑 following/dynamic live cases。
+- [completed] `bbdown-core` dynamic feed timestamp compatibility：通过 `BBDown-rust` PR #78 接受整数或 numeric-string `module_author.pub_ts`。
+- [pending] 使用有效 Web cookie 重跑 authenticated following/dynamic live cases，确认 `pub_ts` 修复后的真实页面路径。
 - [completed] PR 9：推进 segment-level fill / prefetch。
 - [completed] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [completed] PR 11：增加 LAN transcoding foundation。

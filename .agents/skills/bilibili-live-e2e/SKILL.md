@@ -34,6 +34,14 @@ BILIBILI_LIVE_E2E_CASES=bangumi-media-series just test-bilibili-live
 BILIBILI_LIVE_E2E_CASES=space-collection just test-bilibili-live
 ```
 
+For an opt-in sustained LAN HLS/Range probe, set a positive duration in seconds. The probe walks media segments or advances through large byte ranges instead of rereading only the initialization bytes. It checks continuing LAN media readability; it does not prove AVPlayer decoding or full offline completion.
+
+```bash
+BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist \
+BILIBILI_LIVE_E2E_SUSTAINED_SECONDS=300 \
+just test-bilibili-live
+```
+
 6. Default runs skip `requires_collection_list_validation` cases. Collection/list cases cover favorite lists, uploader space videos, uploader collections, uploader series, and homepage recommendations; they are explicit because public-looking Bilibili list/feed APIs can require cookies, become empty, be rate-limited, or change availability independently of the app. Prefer `BILIBILI_LIVE_E2E_CASES=space-collection` for the stable public collection smoke. `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` adds eligible unauthenticated collection/list cases to a broader unfiltered local sweep, but that sweep can still fail on upstream availability/rate limits. Authenticated collection/list cases require `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` and a web-cookie credential, and cases marked `requires_live_sample_override` need a current URL override before they join the unfiltered sweep:
 
 ```bash
@@ -87,7 +95,7 @@ The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `a
 ## Scope
 
 - The live suite starts an isolated local Rust cache server for each selected case, starts a V2 resolution session, pages through its immutable candidate snapshot, creates a progressive playback task from server-issued candidate tokens, waits for playable HLS sources, and pages through `ListTaskResults`. It fetches task and result HLS master playlists and checks generic artifact resource references when available. A failing case does not prevent later selected cases from running.
-- The suite does not run in default `just ci` or GitHub Actions.
+- The suite, including its sustained probe, does not run in default `just ci` or GitHub Actions.
 - The suite is for macOS/local development first. Physical Apple TV validation is intentionally outside the current plan.
 - The media plane must remain HTTP/HLS through the LAN cache server. Do not make the Swift app fetch Bilibili media URLs directly to satisfy this test.
 - Public reverse proxies cannot be used with BBDown TV playurl mode. TV login remains useful for direct TV API checks, but restricted-area public proxy validation should use web/app planning paths. Treat public hosts as untrusted by default because restricted API proxy requests can include an `access_key`.
