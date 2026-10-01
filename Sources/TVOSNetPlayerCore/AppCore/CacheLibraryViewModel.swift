@@ -36,6 +36,8 @@ public final class CacheLibraryViewModel: ObservableObject {
     @Published public private(set) var hlsCacheStatus: HLSCacheStatus?
     @Published public private(set) var deletingItemIDs: Set<String> = []
     @Published public private(set) var canDeleteLibraryItems = false
+    @Published public private(set) var supportsResolverSettingsWrite = false
+    @Published public private(set) var resolverSettingsEndpoint: CacheServerEndpoint?
 
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
@@ -225,6 +227,8 @@ public final class CacheLibraryViewModel: ObservableObject {
             loadedEndpoint = endpoint
             serverName = serverInfo.name.isEmpty ? endpoint.displayAddress : serverInfo.name
             canDeleteLibraryItems = serverInfo.supportsLibraryItemDelete
+            supportsResolverSettingsWrite = serverInfo.supportsResolverSettingsWrite
+            resolverSettingsEndpoint = serverInfo.supportsResolverSettingsWrite ? endpoint : nil
             self.cacheRoots = cacheRoots
             hlsCacheStatus = nil
             items = libraryPage.items
@@ -246,6 +250,8 @@ public final class CacheLibraryViewModel: ObservableObject {
             }
 
             loadedEndpoint = nil
+            supportsResolverSettingsWrite = false
+            resolverSettingsEndpoint = nil
             items = []
             cacheRoots = []
             hlsCacheStatus = nil
@@ -750,6 +756,8 @@ public final class CacheLibraryViewModel: ObservableObject {
     private func clearLoadedLibrary(statusMessage: String, errorMessage: String?) {
         invalidateHLSCacheStatusRefresh()
         loadedEndpoint = nil
+        supportsResolverSettingsWrite = false
+        resolverSettingsEndpoint = nil
         loadMoreSequence += 1
         pendingPlaybackItemID = nil
         activePlaybackItemID = nil

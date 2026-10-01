@@ -14,6 +14,7 @@ private func legacyUnsupportedFeatureCode(_ feature: CacheControlClientUnsupport
     case .bilibiliTaskSelection: 8
     case .bilibiliPlaybackPolicy: 9
     case .playbackProgressReporting: 10
+    case .resolverSettings: 11
     }
 }
 
@@ -66,6 +67,22 @@ final class CacheLibraryPaginationTests: XCTestCase {
             capabilities: [CacheServerCapability.bilibiliExecutionV2]
         )
         XCTAssertTrue(summary.supportsBilibiliExecutionV2)
+    }
+
+    func testGeneratedResolverSettingsWriteCapabilityMatchesPublicConstant() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.resolverSettingsWrite),
+            CacheServerCapability.resolverSettingsWrite
+        )
+        XCTAssertTrue(
+            CacheServerSummary(
+                id: "server-1",
+                name: "Cache server",
+                version: "1.0.0",
+                mediaBaseURIs: [],
+                capabilities: [CacheServerCapability.resolverSettingsWrite]
+            ).supportsResolverSettingsWrite
+        )
     }
 
     func testGeneratedBilibiliCredentialStatusCapabilityMatchesPublicConstant() {

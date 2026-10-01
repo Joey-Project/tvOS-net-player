@@ -63,8 +63,165 @@ final class CacheLibraryViewModelTests: XCTestCase {
         XCTAssertEqual(model.serverAddressText, "mac-mini.local:50051")
         XCTAssertEqual(model.serverName, "Mac mini cache")
         XCTAssertEqual(model.items.map(\.id), ["item-1"])
+        XCTAssertFalse(model.supportsResolverSettingsWrite)
+        XCTAssertNil(model.resolverSettingsEndpoint)
         XCTAssertEqual(defaults.string(forKey: CacheLibraryViewModel.serverAddressDefaultsKey), "mac-mini.local:50051")
         XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testResolverSettingsCapabilityIsExposedOnlyForLoadedEndpointAndClearedOnDisconnect() async {
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(capabilities: [CacheServerCapability.resolverSettingsWrite]),
+            items: [],
+            playbackSource: .fixture()
+        )
+        let model = CacheLibraryViewModel(
+            defaultServerAddressText: "resolver.local",
+            defaults: defaults,
+            clientFactory: { _ in client }
+        )
+
+        let result = await model.refresh()
+        XCTAssertEqual(result, .succeeded)
+        XCTAssertTrue(model.supportsResolverSettingsWrite)
+        XCTAssertEqual(model.resolverSettingsEndpoint?.displayAddress, "resolver.local:50051")
+
+        model.serverAddressText = ""
+
+        XCTAssertFalse(model.supportsResolverSettingsWrite)
+        XCTAssertNil(model.resolverSettingsEndpoint)
+    }
+
+    @MainActor
+    func testResolverSettingsRevisionConflictReloadsAndDiscardsDraft() async throws {
+        let original = resolverSettingsFixture(revision: 4)
+        let latest = ResolverSettingsSnapshot(
+            builtin: original.builtin,
+            disabledBuiltinHostIDs: ["builtin.example"],
+            custom: [
+                ResolverCustomEndpoint(
+                    name: "Server edit",
+                    origin: "https://server.example/",
+                    regions: [.hk],
+                    enabled: true
+                )
+            ],
+            revision: 5
+        )
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(capabilities: [CacheServerCapability.resolverSettingsWrite]),
+            items: [],
+            playbackSource: .fixture(),
+            resolverSettings: original,
+            resolverSettingsAfterConflict: latest
+        )
+        let model = ResolverSettingsViewModel(client: client)
+        await model.load()
+        try model.addCustom(name: "Local draft", origin: "https://draft.example", regions: [.all])
+
+        await model.save()
+
+        XCTAssertEqual(model.snapshot, latest)
+        XCTAssertEqual(model.customEndpoints, latest.custom)
+        XCTAssertEqual(model.disabledBuiltinHostIDs, Set(latest.disabledBuiltinHostIDs))
+        XCTAssertFalse(model.hasChanges)
+        XCTAssertTrue(model.errorMessage?.contains("unsaved edits were discarded") == true)
+    }
+
+    @MainActor
+    func testResolverSettingsValidationAndUnknownRegionPreservation() async throws {
+        let original = resolverSettingsFixture(revision: 2)
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(capabilities: [CacheServerCapability.resolverSettingsWrite]),
+            items: [],
+            playbackSource: .fixture(),
+            resolverSettings: original
+        )
+        let model = ResolverSettingsViewModel(client: client)
+        await model.load()
+
+        XCTAssertThrowsError(
+            try model.addCustom(name: "bad\u{0001}name", origin: "https://bad.example", regions: [.all]))
+        XCTAssertThrowsError(try model.addCustom(name: "No TLS", origin: "http://plain.example", regions: [.all]))
+        XCTAssertThrowsError(try model.addCustom(name: "Bad port", origin: "https://bad.example:port", regions: [.all]))
+        XCTAssertThrowsError(try model.addCustom(name: "IP literal", origin: "https://192.0.2.1", regions: [.all]))
+        XCTAssertThrowsError(try model.addCustom(name: "No region", origin: "https://region.example", regions: []))
+        XCTAssertThrowsError(try model.addCustom(name: "Duplicate", origin: "https://builtin.example", regions: [.all]))
+        XCTAssertEqual(model.customEndpoints.first?.regions, [ResolverRegion(rawValue: "future-region")])
+        XCTAssertTrue(
+            ResolverSettingsViewModel.securityWarning.contains("including bundled built-ins and custom resolvers"))
+        XCTAssertFalse(ResolverSettingsViewModel.securityWarning.contains("access_key="))
+    }
+
+    @MainActor
+    func testResolverSettingsSaveSendsExactDraftAndAdvancesRevision() async throws {
+        let original = resolverSettingsFixture(revision: 9)
+        let client = FakeCacheControlClient(
+            serverInfo: .fixture(capabilities: [CacheServerCapability.resolverSettingsWrite]),
+            items: [],
+            playbackSource: .fixture(),
+            resolverSettings: original
+        )
+        let model = ResolverSettingsViewModel(client: client)
+        await model.load()
+        model.setBuiltin(original.builtin[0], enabled: false)
+        try model.updateCustom(
+            at: 0,
+            name: "Edited custom",
+            origin: "https://edited.example",
+            regions: [.hk, .tw],
+            enabled: false
+        )
+        try model.addCustom(name: "New custom", origin: "https://new.example", regions: [.cn])
+
+        await model.save()
+
+        let expectedCustom = [
+            ResolverCustomEndpoint(
+                name: "Edited custom",
+                origin: "https://edited.example/",
+                regions: [.hk, .tw],
+                enabled: false
+            ),
+            ResolverCustomEndpoint(
+                name: "New custom",
+                origin: "https://new.example/",
+                regions: [.cn],
+                enabled: true
+            ),
+        ]
+        let request = await client.lastResolverSettingsUpdateRequest
+        XCTAssertEqual(request?.disabledBuiltinHostIDs, ["builtin.example"])
+        XCTAssertEqual(request?.custom, expectedCustom)
+        XCTAssertEqual(request?.expectedRevision, 9)
+        XCTAssertEqual(model.snapshot?.revision, 10)
+        XCTAssertEqual(model.snapshot?.custom, expectedCustom)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.hasChanges)
+    }
+
+    private func resolverSettingsFixture(revision: UInt64) -> ResolverSettingsSnapshot {
+        ResolverSettingsSnapshot(
+            builtin: [
+                ResolverEndpoint(
+                    hostID: "builtin.example",
+                    name: "Built-in",
+                    origin: "https://builtin.example/",
+                    regions: [.all]
+                )
+            ],
+            disabledBuiltinHostIDs: [],
+            custom: [
+                ResolverCustomEndpoint(
+                    name: "Future config",
+                    origin: "https://future.example/",
+                    regions: [ResolverRegion(rawValue: "future-region")],
+                    enabled: true
+                )
+            ],
+            revision: revision
+        )
     }
 
     @MainActor
@@ -2432,6 +2589,8 @@ private actor FakeCacheControlClient: CacheControlClient {
     let suspendedLibraryPageTokens: Set<String>
     let suspendedPlaybackItemIDs: Set<String>
     let suspendedDeleteItemIDs: Set<String>
+    let resolverSettings: ResolverSettingsSnapshot?
+    let resolverSettingsAfterConflict: ResolverSettingsSnapshot?
 
     private(set) var getServerInfoCallCount = 0
     private(set) var hlsCacheStatusCallCount = 0
@@ -2469,6 +2628,8 @@ private actor FakeCacheControlClient: CacheControlClient {
     private var deleteWaiters: [(itemID: String, continuation: CheckedContinuation<Void, Never>)] = []
     private var deleteReleaseContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var releasedDeleteItemIDs: Set<String> = []
+    private var resolverSettingsConflictObserved = false
+    private(set) var lastResolverSettingsUpdateRequest: UpdateResolverSettingsRequest?
 
     init(
         serverInfo: CacheServerSummary,
@@ -2495,7 +2656,9 @@ private actor FakeCacheControlClient: CacheControlClient {
         suspendedCacheRootCallCounts: Set<Int> = [],
         suspendedLibraryPageTokens: Set<String> = [],
         suspendedPlaybackItemIDs: Set<String> = [],
-        suspendedDeleteItemIDs: Set<String> = []
+        suspendedDeleteItemIDs: Set<String> = [],
+        resolverSettings: ResolverSettingsSnapshot? = nil,
+        resolverSettingsAfterConflict: ResolverSettingsSnapshot? = nil
     ) {
         self.serverInfo = serverInfo
         self.items = items
@@ -2522,6 +2685,8 @@ private actor FakeCacheControlClient: CacheControlClient {
         self.suspendedLibraryPageTokens = suspendedLibraryPageTokens
         self.suspendedPlaybackItemIDs = suspendedPlaybackItemIDs
         self.suspendedDeleteItemIDs = suspendedDeleteItemIDs
+        self.resolverSettings = resolverSettings
+        self.resolverSettingsAfterConflict = resolverSettingsAfterConflict
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
@@ -2545,6 +2710,33 @@ private actor FakeCacheControlClient: CacheControlClient {
             throw getServerInfoError
         }
         return serverInfo
+    }
+
+    func getResolverSettings() async throws -> ResolverSettingsSnapshot {
+        if resolverSettingsConflictObserved, let resolverSettingsAfterConflict {
+            return resolverSettingsAfterConflict
+        }
+        guard let resolverSettings else {
+            throw CacheControlClientUnsupportedFeature.resolverSettings
+        }
+        return resolverSettings
+    }
+
+    func updateResolverSettings(_ request: UpdateResolverSettingsRequest) async throws -> ResolverSettingsSnapshot {
+        lastResolverSettingsUpdateRequest = request
+        if resolverSettingsAfterConflict != nil {
+            resolverSettingsConflictObserved = true
+            throw CacheControlClientRevisionConflict()
+        }
+        guard let resolverSettings else {
+            throw CacheControlClientUnsupportedFeature.resolverSettings
+        }
+        return ResolverSettingsSnapshot(
+            builtin: resolverSettings.builtin,
+            disabledBuiltinHostIDs: request.disabledBuiltinHostIDs,
+            custom: request.custom,
+            revision: resolverSettings.revision + 1
+        )
     }
 
     func listCacheRoots() async throws -> [CacheRoot] {

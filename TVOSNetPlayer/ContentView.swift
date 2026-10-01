@@ -13,6 +13,7 @@ struct ContentView: View {
     @ObservedObject var bilibiliLoginModel: BilibiliLoginViewModel
     @State private var pendingDeleteItem: CacheLibraryItem?
     @State private var isLoginQRPresented = false
+    @State private var isResolverSettingsPresented = false
     @State private var isAutoDiscoveryConnecting = false
     @State private var failedAutoDiscoveryServerIDs: Set<String> = []
     @FocusState private var focusedControl: FocusedControl?
@@ -118,6 +119,11 @@ struct ContentView: View {
         .sheet(isPresented: $isLoginQRPresented) {
             bilibiliLoginQRSheet
         }
+        .sheet(isPresented: $isResolverSettingsPresented) {
+            if let endpoint = cacheModel.resolverSettingsEndpoint {
+                ResolverSettingsSheet(endpoint: endpoint)
+            }
+        }
     }
 
     private var cacheControls: some View {
@@ -157,6 +163,17 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!cacheModel.canRefresh)
                 .focused($focusedControl, equals: .refreshButton)
+
+                if cacheModel.supportsResolverSettingsWrite,
+                    cacheModel.resolverSettingsEndpoint != nil
+                {
+                    Button {
+                        isResolverSettingsPresented = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
 
             discoveryControls
@@ -1263,5 +1280,297 @@ private struct CacheRootRow: View {
             }
         }
         .foregroundStyle(.secondary)
+    }
+}
+
+private struct ResolverSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model: ResolverSettingsViewModel
+    @State private var isEditorPresented = false
+    @State private var editingEndpointID: String?
+    @State private var showingDiscardConfirmation = false
+
+    init(endpoint: CacheServerEndpoint) {
+        _model = StateObject(
+            wrappedValue: ResolverSettingsViewModel(client: GRPCCacheControlClient(endpoint: endpoint))
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Label(ResolverSettingsViewModel.securityWarning, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if model.isLoading && model.snapshot == nil {
+                    Section {
+                        ProgressView("Loading resolver settings")
+                    }
+                }
+
+                if !model.builtinEndpoints.isEmpty {
+                    Section("Built-in Resolvers") {
+                        ForEach(model.builtinEndpoints) { endpoint in
+                            Toggle(
+                                isOn: Binding(
+                                    get: { !model.disabledBuiltinHostIDs.contains(endpoint.hostID) },
+                                    set: { model.setBuiltin(endpoint, enabled: $0) }
+                                )
+                            ) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(endpoint.name)
+                                    Text(
+                                        "\(endpoint.origin) · \(endpoint.regions.map(\.rawValue).joined(separator: ", "))"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Custom Resolvers") {
+                    ForEach(model.customEndpoints) { endpoint in
+                        HStack(spacing: 16) {
+                            Button {
+                                editingEndpointID = endpoint.id
+                                isEditorPresented = true
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(endpoint.name)
+                                        .foregroundStyle(.primary)
+                                    Text(
+                                        "\(endpoint.origin) · \(endpoint.regions.map(\.rawValue).joined(separator: ", "))"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            Toggle(
+                                "Enabled",
+                                isOn: Binding(
+                                    get: {
+                                        model.customEndpoints.first(where: { $0.id == endpoint.id })?.enabled ?? false
+                                    },
+                                    set: { enabled in
+                                        update(endpointID: endpoint.id, enabled: enabled)
+                                    }
+                                )
+                            )
+
+                            Button(role: .destructive) {
+                                remove(endpointID: endpoint.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .accessibilityLabel("Remove \(endpoint.name)")
+                        }
+                    }
+
+                    Button {
+                        editingEndpointID = nil
+                        isEditorPresented = true
+                    } label: {
+                        Label("Add Resolver", systemImage: "plus")
+                    }
+                    .disabled(model.customEndpoints.count >= 32)
+                }
+
+                if let errorMessage = model.errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if let statusMessage = model.statusMessage {
+                    Section {
+                        Text(statusMessage)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Resolver Settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        if model.hasChanges {
+                            showingDiscardConfirmation = true
+                        } else {
+                            dismiss()
+                        }
+                    }
+                    .accessibilityHint("Close resolver settings")
+                }
+                ToolbarItem(placement: .automatic) {
+                    Button {
+                        Task { await model.reload() }
+                    } label: {
+                        Label("Reload", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isLoading || model.isSaving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        Task { await model.save() }
+                    } label: {
+                        Label(model.isSaving ? "Saving" : "Save", systemImage: "checkmark")
+                    }
+                    .disabled(!model.isAvailable || !model.hasChanges || model.isLoading || model.isSaving)
+                }
+            }
+            .task { await model.load() }
+            .confirmationDialog(
+                "Discard Unsaved Changes?",
+                isPresented: $showingDiscardConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Discard Changes", role: .destructive) { dismiss() }
+                Button("Keep Editing", role: .cancel) {}
+            } message: {
+                Text("Your resolver changes have not been saved.")
+            }
+            .sheet(isPresented: $isEditorPresented) {
+                ResolverCustomEndpointEditor(
+                    endpoint: editingEndpointID.flatMap { id in model.customEndpoints.first { $0.id == id } }
+                ) { name, origin, regions in
+                    do {
+                        if let editingEndpointID,
+                            let index = model.customEndpoints.firstIndex(where: { $0.id == editingEndpointID })
+                        {
+                            try model.updateCustom(
+                                at: index,
+                                name: name,
+                                origin: origin,
+                                regions: regions,
+                                enabled: model.customEndpoints[index].enabled
+                            )
+                        } else if editingEndpointID != nil {
+                            return Self.message(for: .missingEntry)
+                        } else {
+                            try model.addCustom(name: name, origin: origin, regions: regions)
+                        }
+                        return nil
+                    } catch let error as ResolverSettingsValidationError {
+                        return Self.message(for: error)
+                    } catch {
+                        return error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    private func update(endpointID: String, enabled: Bool) {
+        guard let index = model.customEndpoints.firstIndex(where: { $0.id == endpointID }) else { return }
+        let endpoint = model.customEndpoints[index]
+        try? model.updateCustom(
+            at: index,
+            name: endpoint.name,
+            origin: endpoint.origin,
+            regions: endpoint.regions,
+            enabled: enabled
+        )
+    }
+
+    private func remove(endpointID: String) {
+        guard let index = model.customEndpoints.firstIndex(where: { $0.id == endpointID }) else { return }
+        model.removeCustom(at: index)
+    }
+
+    private static func message(for error: ResolverSettingsValidationError) -> String {
+        switch error {
+        case .invalidName: "Enter a name without control characters (128 bytes maximum)."
+        case .invalidOrigin: "Enter an HTTPS origin with no path, credentials, query, or fragment."
+        case .invalidRegions: "Select at least one region."
+        case .duplicateHost: "That hostname is already used by another resolver."
+        case .missingEntry: "This resolver is no longer available. Reload settings and try again."
+        case .tooManyEntries: "A maximum of 32 custom resolvers is supported."
+        }
+    }
+}
+
+private struct ResolverCustomEndpointEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var origin: String
+    @State private var selectedRegions: Set<ResolverRegion>
+    @State private var validationMessage: String?
+
+    let onSave: (String, String, [ResolverRegion]) -> String?
+
+    init(
+        endpoint: ResolverCustomEndpoint?,
+        onSave: @escaping (String, String, [ResolverRegion]) -> String?
+    ) {
+        _name = State(initialValue: endpoint?.name ?? "")
+        _origin = State(initialValue: endpoint?.origin ?? "https://")
+        _selectedRegions = State(initialValue: Set(endpoint?.regions ?? [.all]))
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Resolver") {
+                    TextField("Name", text: $name)
+                    TextField("HTTPS origin", text: $origin)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+
+                Section("Regions") {
+                    ForEach(ResolverRegion.allCases) { region in
+                        Toggle(
+                            region.rawValue.uppercased(),
+                            isOn: Binding(
+                                get: { selectedRegions.contains(region) },
+                                set: { isSelected in
+                                    if isSelected {
+                                        selectedRegions.insert(region)
+                                    } else {
+                                        selectedRegions.remove(region)
+                                    }
+                                }
+                            )
+                        )
+                    }
+                    ForEach(
+                        selectedRegions.filter { !ResolverRegion.allCases.contains($0) }.sorted {
+                            $0.rawValue < $1.rawValue
+                        }
+                    ) { region in
+                        Label("Preserved region: \(region.rawValue)", systemImage: "lock")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let validationMessage {
+                    Section {
+                        Text(validationMessage)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle(name.isEmpty ? "Add Resolver" : "Edit Resolver")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        validationMessage = onSave(name, origin, selectedRegions.sorted { $0.rawValue < $1.rawValue })
+                        if validationMessage == nil { dismiss() }
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedRegions.isEmpty)
+                }
+            }
+        }
     }
 }

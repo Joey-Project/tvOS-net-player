@@ -18,6 +18,10 @@ pub mod media;
 mod mp4_segments;
 pub mod playback;
 mod playback_policy;
+mod resolver_catalog;
+mod resolver_health;
+mod resolver_routing;
+mod resolver_settings;
 mod task_output;
 pub mod task_registry;
 mod task_store;
@@ -128,6 +132,9 @@ pub struct AppState {
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
+    pub(crate) resolver_settings: Arc<resolver_settings::ResolverSettingsStore>,
+    pub(crate) resolver_routing: Arc<resolver_routing::ResolverRoutingState>,
+    pub(crate) resolver_settings_write_permits: Arc<Semaphore>,
     pub(crate) bilibili_resolutions: Arc<Mutex<BilibiliResolutionStore>>,
     pub(crate) bilibili_resolution_blocking_permits: Arc<Semaphore>,
     pub(crate) task_result_pages: Arc<Mutex<TaskResultPageStore>>,
@@ -384,13 +391,18 @@ impl Drop for HlsCacheEvictionProtectionGuard {
 
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
-        Self::new_with_playback_planner_factory(options, |options, library, blocking_permits| {
-            Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
-                options,
-                library,
-                blocking_permits,
-            ))
-        })
+        Self::new_with_playback_planner_factory(
+            options,
+            |options, library, blocking_permits, resolver_settings, resolver_routing| {
+                Arc::new(BbdownBilibiliAdapter::new_with_resolver_routing(
+                    options,
+                    library,
+                    blocking_permits,
+                    resolver_settings,
+                    resolver_routing,
+                ))
+            },
+        )
     }
 
     #[cfg(test)]
@@ -398,9 +410,10 @@ impl AppState {
         options: CacheServerOptions,
         playback_planner: Arc<dyn BilibiliPlaybackPlanner>,
     ) -> Self {
-        Self::new_with_playback_planner_factory(options, |_options, _library, _blocking_permits| {
-            playback_planner
-        })
+        Self::new_with_playback_planner_factory(
+            options,
+            |_options, _library, _blocking_permits, _settings, _routing| playback_planner,
+        )
     }
 
     #[cfg(test)]
@@ -411,7 +424,7 @@ impl AppState {
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
             options,
-            |_options, _library, _blocking_permits| playback_planner,
+            |_options, _library, _blocking_permits, _settings, _routing| playback_planner,
             Some(hls_cache),
         )
     }
@@ -422,6 +435,8 @@ impl AppState {
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
             Arc<Semaphore>,
+            Arc<resolver_settings::ResolverSettingsStore>,
+            Arc<resolver_routing::ResolverRoutingState>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
@@ -437,6 +452,8 @@ impl AppState {
             Arc<CacheServerOptions>,
             Arc<LocalMediaLibrary>,
             Arc<Semaphore>,
+            Arc<resolver_settings::ResolverSettingsStore>,
+            Arc<resolver_routing::ResolverRoutingState>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
         hls_cache_override: Option<HlsCacheStore>,
     ) -> Self {
@@ -444,6 +461,21 @@ impl AppState {
         let options = options.normalized_for_runtime();
         options.validate().expect("invalid cache server options");
         let task_state_path = options.task_state_path();
+        let resolver_settings_path = task_state_path
+            .parent()
+            .expect("task state path must have a parent")
+            .join("resolver-settings.json");
+        let resolver_settings = Arc::new(
+            resolver_settings::ResolverSettingsStore::load(resolver_settings_path)
+                .expect("resolver settings are malformed or unavailable"),
+        );
+        let resolver_memory_path = task_state_path
+            .parent()
+            .expect("task state path must have a parent")
+            .join("resolver-routing-memory.json");
+        let resolver_routing = Arc::new(resolver_routing::ResolverRoutingState::load(
+            resolver_memory_path,
+        ));
         let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
         let publication_output_directory =
@@ -594,6 +626,8 @@ impl AppState {
             Arc::clone(&options),
             Arc::clone(&library),
             Arc::clone(&bilibili_resolution_blocking_permits),
+            Arc::clone(&resolver_settings),
+            Arc::clone(&resolver_routing),
         );
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
@@ -654,6 +688,9 @@ impl AppState {
             hls_network_policy,
             hls_playback_progress,
             bilibili_login: bilibili_login::BilibiliLoginManager::default(),
+            resolver_settings,
+            resolver_routing,
+            resolver_settings_write_permits: Arc::new(Semaphore::new(1)),
             bilibili_resolutions: Arc::new(Mutex::new(BilibiliResolutionStore::default())),
             bilibili_resolution_blocking_permits,
             task_result_pages: Arc::new(Mutex::new(TaskResultPageStore::default())),
@@ -1050,10 +1087,12 @@ impl AppState {
         }
 
         Some(self.spawn_bilibili_task_worker(
-            Arc::new(BbdownBilibiliAdapter::new_with_blocking_permits(
+            Arc::new(BbdownBilibiliAdapter::new_with_resolver_routing(
                 Arc::clone(&self.options),
                 Arc::clone(&self.library),
                 Arc::clone(&self.bilibili_resolution_blocking_permits),
+                Arc::clone(&self.resolver_settings),
+                Arc::clone(&self.resolver_routing),
             )),
             BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
         ))

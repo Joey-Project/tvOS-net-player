@@ -59,8 +59,8 @@ use crate::{
         CreateBilibiliTaskV2Request, DeleteLibraryItemRequest, DeleteLibraryItemResponse,
         GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
         GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
-        GetServerInfoRequest, GetTaskRequest, HealthState, HealthStatus,
-        HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus,
+        GetResolverSettingsRequest, GetServerInfoRequest, GetTaskRequest, HealthState,
+        HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus,
         HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackProgressStatus,
         HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan, LanTranscodingPlanState,
         LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
@@ -70,9 +70,11 @@ use crate::{
         ListLibraryItemsResponse, ListTaskResultsRequest, ListTaskResultsResponse, PageInfo,
         PlaybackProgressIntent as ProtoPlaybackProgressIntent, PlaybackProtocol, PlaybackSource,
         ReportPlaybackProgressRequest, ReportPlaybackProgressResponse, RescanLibraryRequest,
-        RescanLibraryResponse, ResolveBilibiliInputRequest, ServerCapability, ServerInfo,
-        StartBilibiliLoginSessionRequest, StartBilibiliResolutionRequest, Task, TaskEvent,
-        TaskKind, TaskState, WatchTasksRequest, cache_service_server::CacheService,
+        RescanLibraryResponse, ResolveBilibiliInputRequest, ResolverCustomEndpoint,
+        ResolverEndpoint, ResolverSettingsSnapshot as ProtoResolverSettingsSnapshot,
+        ServerCapability, ServerInfo, StartBilibiliLoginSessionRequest,
+        StartBilibiliResolutionRequest, Task, TaskEvent, TaskKind, TaskState,
+        UpdateResolverSettingsRequest, WatchTasksRequest, cache_service_server::CacheService,
         library_service_server::LibraryService, server_service_server::ServerService,
         task_service_server::TaskService,
     },
@@ -91,6 +93,10 @@ use crate::{
     },
     library::ROOT_ID,
     playback_policy::PlaybackPolicy,
+    resolver_catalog::{self, Region},
+    resolver_settings::{
+        CustomResolver, ResolverSettings, ResolverSettingsSnapshot, ResolverSettingsUpdateError,
+    },
     task_output::{
         MAX_TASK_ARTIFACTS, MAX_TASK_RESULT_ENCODED_BYTES, projected_task_result_encoded_bytes,
     },
@@ -139,6 +145,8 @@ const TASK_RESULT_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_OUTPUT_READ_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const TASK_OUTPUT_READ_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 const BILIBILI_RESOLUTION_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const RESOLVER_SETTINGS_BLOCKING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const RESOLVER_SETTINGS_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn local_library_item_delete_available(options: &CacheServerOptions) -> bool {
     options.allow_library_item_delete && cfg!(unix)
@@ -200,6 +208,7 @@ impl ServerService for ServerGrpcService {
                 ServerCapability::BilibiliCredentialProfiles.into(),
                 ServerCapability::BilibiliPlaybackPolicy.into(),
                 ServerCapability::Hls.into(),
+                ServerCapability::ResolverSettingsWrite.into(),
             ],
         };
 
@@ -254,6 +263,64 @@ impl ServerService for ServerGrpcService {
             },
             checked_at: Some(current_timestamp()),
         }))
+    }
+
+    async fn get_resolver_settings(
+        &self,
+        _request: Request<GetResolverSettingsRequest>,
+    ) -> Result<Response<ProtoResolverSettingsSnapshot>, Status> {
+        Ok(Response::new(proto_resolver_settings_snapshot(
+            &self.state.resolver_settings.snapshot(),
+        )?))
+    }
+
+    async fn update_resolver_settings(
+        &self,
+        request: Request<UpdateResolverSettingsRequest>,
+    ) -> Result<Response<ProtoResolverSettingsSnapshot>, Status> {
+        let request = request.into_inner();
+        if request.encoded_len() > crate::resolver_settings::MAX_SETTINGS_BYTES {
+            return Err(Status::invalid_argument(
+                "Resolver settings request exceeds the size limit.",
+            ));
+        }
+        if request.custom.len() > 32 {
+            return Err(Status::invalid_argument("Too many custom resolvers."));
+        }
+        let settings = resolver_settings_from_proto(&request)?;
+        let permit = timeout(
+            RESOLVER_SETTINGS_BLOCKING_ADMISSION_TIMEOUT,
+            Arc::clone(&self.state.resolver_settings_write_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::resource_exhausted("Resolver settings writes are busy."))?
+        .map_err(|_| Status::unavailable("Resolver settings writes are unavailable."))?;
+        let store = Arc::clone(&self.state.resolver_settings);
+        let expected_revision = request.expected_revision;
+        let snapshot = timeout(
+            RESOLVER_SETTINGS_WRITE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                store.update(settings, expected_revision)
+            }),
+        )
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(
+                "Resolver settings write timed out; query the current revision before retrying.",
+            )
+        })?
+        .map_err(|_| Status::unavailable("Resolver settings write failed."))?
+        .map_err(|error| match error {
+            ResolverSettingsUpdateError::StaleRevision => {
+                Status::aborted("Resolver settings revision is stale.")
+            }
+            ResolverSettingsUpdateError::Invalid(message) => Status::invalid_argument(message),
+            ResolverSettingsUpdateError::Persistence => {
+                Status::unavailable("Resolver settings could not be persisted.")
+            }
+        })?;
+        Ok(Response::new(proto_resolver_settings_snapshot(&snapshot)?))
     }
 
     async fn get_bilibili_credential_status(
@@ -435,6 +502,96 @@ fn bilibili_credential_status(
             status
         }
     }
+}
+
+fn resolver_settings_from_proto(
+    request: &UpdateResolverSettingsRequest,
+) -> Result<ResolverSettings, Status> {
+    let custom = request
+        .custom
+        .iter()
+        .map(|entry| {
+            Ok(CustomResolver {
+                name: entry.name.clone(),
+                origin: entry.origin.clone(),
+                regions: entry
+                    .regions
+                    .iter()
+                    .map(|region| parse_resolver_region(region))
+                    .collect::<Result<Vec<_>, _>>()?,
+                enabled: entry.enabled,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(ResolverSettings {
+        version: 1,
+        disabled_builtin_host_ids: request.disabled_builtin_host_ids.clone(),
+        custom,
+    })
+}
+
+fn parse_resolver_region(region: &str) -> Result<Region, Status> {
+    match region {
+        "all" => Ok(Region::All),
+        "cn" => Ok(Region::Cn),
+        "hk" => Ok(Region::Hk),
+        "tw" => Ok(Region::Tw),
+        "th" => Ok(Region::Th),
+        _ => Err(Status::invalid_argument("Invalid resolver region.")),
+    }
+}
+
+fn resolver_region_label(region: Region) -> &'static str {
+    match region {
+        Region::All => "all",
+        Region::Cn => "cn",
+        Region::Hk => "hk",
+        Region::Tw => "tw",
+        Region::Th => "th",
+    }
+}
+
+fn proto_resolver_settings_snapshot(
+    snapshot: &ResolverSettingsSnapshot,
+) -> Result<ProtoResolverSettingsSnapshot, Status> {
+    let builtin = resolver_catalog::embedded_catalog()
+        .map_err(|_| Status::internal("Resolver catalog is unavailable."))?
+        .into_iter()
+        .map(|entry| ResolverEndpoint {
+            host_id: resolver_catalog::normalize_host_id(&entry.host)
+                .expect("validated embedded resolver host"),
+            name: entry.name,
+            origin: format!("https://{}/", entry.host),
+            regions: entry
+                .regions
+                .into_iter()
+                .map(resolver_region_label)
+                .map(str::to_owned)
+                .collect(),
+        })
+        .collect();
+    Ok(ProtoResolverSettingsSnapshot {
+        builtin,
+        disabled_builtin_host_ids: snapshot.settings.disabled_builtin_host_ids.clone(),
+        custom: snapshot
+            .settings
+            .custom
+            .iter()
+            .map(|entry| ResolverCustomEndpoint {
+                name: entry.name.clone(),
+                origin: entry.origin.clone(),
+                regions: entry
+                    .regions
+                    .iter()
+                    .copied()
+                    .map(resolver_region_label)
+                    .map(str::to_owned)
+                    .collect(),
+                enabled: entry.enabled,
+            })
+            .collect(),
+        revision: snapshot.revision,
+    })
 }
 
 fn bilibili_credential_profiles(
@@ -5275,10 +5432,12 @@ mod tests {
             BilibiliVideoCodec, CreateBilibiliPlaybackTaskRequest,
             CreateBilibiliPlaybackTaskV2Request, CreateBilibiliTaskV2Request,
             DeleteLibraryItemRequest, GetBilibiliCredentialStatusRequest, GetLibraryItemRequest,
-            GetPlaybackSourceRequest, GetServerInfoRequest, LibraryFilter, LibrarySource,
-            ListBilibiliResolutionCandidatesRequest, ListLibraryItemsRequest,
-            ListTaskResultsRequest, PageRequest, ResolveBilibiliInputRequest,
+            GetPlaybackSourceRequest, GetResolverSettingsRequest, GetServerInfoRequest,
+            LibraryFilter, LibrarySource, ListBilibiliResolutionCandidatesRequest,
+            ListLibraryItemsRequest, ListTaskResultsRequest, PageRequest,
+            ResolveBilibiliInputRequest, ResolverCustomEndpoint, ServerCapability,
             StartBilibiliResolutionRequest, TaskKind, TaskResult, TaskState,
+            UpdateResolverSettingsRequest,
             create_bilibili_task_v2_request::Execution as BilibiliExecutionV2,
         },
         hls_cache::sanitized_completed_session,
@@ -5925,6 +6084,69 @@ mod tests {
         assert!(released_resource_lease_ids.is_empty());
         let status = page.expect_err("reaped continuation token should be rejected");
         assert_eq!(tonic::Code::InvalidArgument, status.code());
+    }
+
+    #[tokio::test]
+    async fn resolver_settings_rpc_roundtrips_and_rejects_stale_revision() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = AppState::new(CacheServerOptions {
+            root_path: initialized_cache_root(&temp),
+            task_state_path: temp.path().join("state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let service = ServerGrpcService::new(state.clone());
+        let initial = service
+            .get_resolver_settings(Request::new(GetResolverSettingsRequest {}))
+            .await
+            .expect("settings should be readable")
+            .into_inner();
+        assert_eq!(0, initial.revision);
+        assert_eq!(43, initial.builtin.len());
+        let info = service
+            .get_server_info(Request::new(GetServerInfoRequest {}))
+            .await
+            .expect("server info should be readable")
+            .into_inner();
+        assert!(
+            info.capabilities
+                .contains(&(ServerCapability::ResolverSettingsWrite as i32))
+        );
+
+        let request = UpdateResolverSettingsRequest {
+            disabled_builtin_host_ids: vec!["api.bili.plus".to_owned()],
+            custom: vec![ResolverCustomEndpoint {
+                name: "custom".to_owned(),
+                origin: "https://custom.example/".to_owned(),
+                regions: vec!["cn".to_owned()],
+                enabled: true,
+            }],
+            expected_revision: 0,
+        };
+        let updated = service
+            .update_resolver_settings(Request::new(request.clone()))
+            .await
+            .expect("settings should be updated")
+            .into_inner();
+        assert_eq!(1, updated.revision);
+        assert_eq!(1, updated.custom.len());
+        assert_eq!("custom", updated.custom[0].name);
+        assert_eq!(
+            tonic::Code::Aborted,
+            service
+                .update_resolver_settings(Request::new(request))
+                .await
+                .unwrap_err()
+                .code()
+        );
+        assert!(
+            state
+                .resolver_settings
+                .effective_candidates()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.host_id == "custom.example")
+        );
     }
 
     #[tokio::test]

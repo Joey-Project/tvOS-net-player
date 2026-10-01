@@ -16,6 +16,8 @@ public struct CacheLibraryItemsPage: Equatable, Sendable {
 
 public protocol CacheControlClient: Sendable {
     func getServerInfo() async throws -> CacheServerSummary
+    func getResolverSettings() async throws -> ResolverSettingsSnapshot
+    func updateResolverSettings(_ request: UpdateResolverSettingsRequest) async throws -> ResolverSettingsSnapshot
     func checkHealth() async throws -> CacheHealthStatus
     func getBilibiliCredentialStatus() async throws -> BilibiliCredentialStatus
     func listBilibiliCredentialProfiles() async throws -> BilibiliCredentialProfilesSummary
@@ -103,6 +105,11 @@ public enum CacheControlClientUnsupportedFeature: Error, Equatable {
     case bilibiliTaskSelection
     case bilibiliPlaybackPolicy
     case playbackProgressReporting
+    case resolverSettings
+}
+
+public struct CacheControlClientRevisionConflict: Error, Equatable, Sendable {
+    public init() {}
 }
 
 public enum CacheControlClientInvalidRequest: Error, Equatable, Sendable {
@@ -147,6 +154,14 @@ public struct CacheControlClientRequestValidationError: Error, Equatable, Sendab
 }
 
 public extension CacheControlClient {
+    func getResolverSettings() async throws -> ResolverSettingsSnapshot {
+        throw CacheControlClientUnsupportedFeature.resolverSettings
+    }
+
+    func updateResolverSettings(_ request: UpdateResolverSettingsRequest) async throws -> ResolverSettingsSnapshot {
+        throw CacheControlClientUnsupportedFeature.resolverSettings
+    }
+
     func checkHealth() async throws -> CacheHealthStatus {
         throw CacheControlClientUnsupportedFeature.healthCheck
     }
@@ -322,6 +337,8 @@ extension CacheControlClientUnsupportedFeature: LocalizedError {
             return "Bilibili playback policy controls are not supported by this cache server."
         case .playbackProgressReporting:
             return "Playback progress reporting is not supported by this cache server."
+        case .resolverSettings:
+            return "Resolver settings are not supported by this cache server."
         }
     }
 }

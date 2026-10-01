@@ -40,6 +40,51 @@ public final class GRPCCacheControlClient: CacheControlClient {
         }
     }
 
+    public func getResolverSettings() async throws -> ResolverSettingsSnapshot {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                let response = try await service.getResolverSettings(
+                    TvosNetPlayer_V1_GetResolverSettingsRequest(),
+                    options: callOptions
+                )
+                return ResolverSettingsSnapshot(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.resolverSettings
+        }
+    }
+
+    public func updateResolverSettings(
+        _ settings: UpdateResolverSettingsRequest
+    ) async throws -> ResolverSettingsSnapshot {
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_ServerService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_UpdateResolverSettingsRequest()
+                request.disabledBuiltinHostIds = settings.disabledBuiltinHostIDs
+                request.custom = settings.custom.map(TvosNetPlayer_V1_ResolverCustomEndpoint.init)
+                request.expectedRevision = settings.expectedRevision
+                let response = try await service.updateResolverSettings(request, options: callOptions)
+                return ResolverSettingsSnapshot(response)
+            }
+        } catch let error as RPCError where error.code == .unimplemented {
+            throw CacheControlClientUnsupportedFeature.resolverSettings
+        } catch let error as RPCError where error.code == .aborted || error.code == .failedPrecondition {
+            throw CacheControlClientRevisionConflict()
+        }
+    }
+
     public func checkHealth() async throws -> CacheHealthStatus {
         do {
             return try await withGRPCClient(
@@ -966,6 +1011,50 @@ extension CacheServerSummary {
             mediaBaseURIs: proto.mediaBaseUris,
             capabilities: proto.capabilities.map { String(describing: $0) }
         )
+    }
+}
+
+extension ResolverSettingsSnapshot {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ResolverSettingsSnapshot) {
+        self.init(
+            builtin: proto.builtin.map(ResolverEndpoint.init),
+            disabledBuiltinHostIDs: proto.disabledBuiltinHostIds,
+            custom: proto.custom.map(ResolverCustomEndpoint.init),
+            revision: proto.revision
+        )
+    }
+}
+
+extension ResolverEndpoint {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ResolverEndpoint) {
+        self.init(
+            hostID: proto.hostID,
+            name: proto.name,
+            origin: proto.origin,
+            regions: proto.regions.compactMap(ResolverRegion.init(rawValue:))
+        )
+    }
+}
+
+extension ResolverCustomEndpoint {
+    fileprivate init(_ proto: TvosNetPlayer_V1_ResolverCustomEndpoint) {
+        self.init(
+            name: proto.name,
+            origin: proto.origin,
+            regions: proto.regions.compactMap(ResolverRegion.init(rawValue:)),
+            enabled: proto.enabled
+        )
+    }
+
+}
+
+extension TvosNetPlayer_V1_ResolverCustomEndpoint {
+    fileprivate init(_ model: ResolverCustomEndpoint) {
+        self.init()
+        name = model.name
+        origin = model.origin
+        regions = model.regions.map(\.rawValue)
+        enabled = model.enabled
     }
 }
 

@@ -266,6 +266,93 @@ public struct CacheServerSummary: Equatable, Sendable {
     public var supportsTaskOutputV2: Bool {
         capabilities.contains(CacheServerCapability.taskOutputV2)
     }
+
+    public var supportsResolverSettingsWrite: Bool {
+        capabilities.contains(CacheServerCapability.resolverSettingsWrite)
+    }
+}
+
+public struct ResolverRegion: RawRepresentable, CaseIterable, Equatable, Hashable, Identifiable, Sendable {
+    public static let all = Self(rawValue: "all")
+    public static let cn = Self(rawValue: "cn")
+    public static let hk = Self(rawValue: "hk")
+    public static let tw = Self(rawValue: "tw")
+    public static let th = Self(rawValue: "th")
+    public static let allCases = [all, cn, hk, tw, th]
+
+    public let rawValue: String
+    public var id: String { rawValue }
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+}
+
+public struct ResolverEndpoint: Equatable, Identifiable, Sendable {
+    public let hostID: String
+    public let name: String
+    public let origin: String
+    public let regions: [ResolverRegion]
+
+    public var id: String { hostID }
+
+    public init(hostID: String, name: String, origin: String, regions: [ResolverRegion]) {
+        self.hostID = hostID
+        self.name = name
+        self.origin = origin
+        self.regions = regions
+    }
+}
+
+public struct ResolverCustomEndpoint: Equatable, Identifiable, Sendable {
+    public let name: String
+    public let origin: String
+    public let regions: [ResolverRegion]
+    public let enabled: Bool
+
+    public var id: String { origin }
+
+    public init(name: String, origin: String, regions: [ResolverRegion], enabled: Bool) {
+        self.name = name
+        self.origin = origin
+        self.regions = regions
+        self.enabled = enabled
+    }
+}
+
+public struct ResolverSettingsSnapshot: Equatable, Sendable {
+    public let builtin: [ResolverEndpoint]
+    public let disabledBuiltinHostIDs: [String]
+    public let custom: [ResolverCustomEndpoint]
+    public let revision: UInt64
+
+    public init(
+        builtin: [ResolverEndpoint],
+        disabledBuiltinHostIDs: [String],
+        custom: [ResolverCustomEndpoint],
+        revision: UInt64
+    ) {
+        self.builtin = builtin
+        self.disabledBuiltinHostIDs = disabledBuiltinHostIDs
+        self.custom = custom
+        self.revision = revision
+    }
+}
+
+public struct UpdateResolverSettingsRequest: Equatable, Sendable {
+    public let disabledBuiltinHostIDs: [String]
+    public let custom: [ResolverCustomEndpoint]
+    public let expectedRevision: UInt64
+
+    public init(
+        disabledBuiltinHostIDs: [String],
+        custom: [ResolverCustomEndpoint],
+        expectedRevision: UInt64
+    ) {
+        self.disabledBuiltinHostIDs = disabledBuiltinHostIDs
+        self.custom = custom
+        self.expectedRevision = expectedRevision
+    }
 }
 
 public struct CacheHealthStatus: Equatable, Sendable {
@@ -304,6 +391,7 @@ public enum CacheServerCapability {
     public static let lanTranscoding = "lanTranscoding"
     public static let libraryItemDelete = "libraryItemDelete"
     public static let taskOutputV2 = "taskOutputV2"
+    public static let resolverSettingsWrite = "resolverSettingsWrite"
 }
 
 public struct BilibiliCredentialProfile: Equatable, Sendable {

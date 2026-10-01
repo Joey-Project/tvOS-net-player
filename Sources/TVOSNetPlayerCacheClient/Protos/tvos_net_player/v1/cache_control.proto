@@ -17,6 +17,8 @@ service ServerService {
   rpc ListBilibiliCredentialProfiles(ListBilibiliCredentialProfilesRequest) returns (ListBilibiliCredentialProfilesResponse);
   rpc StartBilibiliLoginSession(StartBilibiliLoginSessionRequest) returns (BilibiliLoginSession);
   rpc GetBilibiliLoginSession(GetBilibiliLoginSessionRequest) returns (BilibiliLoginSession);
+  rpc GetResolverSettings(GetResolverSettingsRequest) returns (ResolverSettingsSnapshot);
+  rpc UpdateResolverSettings(UpdateResolverSettingsRequest) returns (ResolverSettingsSnapshot);
 }
 
 service LibraryService {
@@ -74,6 +76,36 @@ enum ServerCapability {
   SERVER_CAPABILITY_TASK_OUTPUT_V2 = 13;
   SERVER_CAPABILITY_BILIBILI_RESOLUTION_V2 = 14;
   SERVER_CAPABILITY_BILIBILI_EXECUTION_V2 = 15;
+  SERVER_CAPABILITY_RESOLVER_SETTINGS_WRITE = 16;
+}
+
+message GetResolverSettingsRequest {}
+
+message ResolverEndpoint {
+  string host_id = 1;
+  string name = 2;
+  string origin = 3;
+  repeated string regions = 4;
+}
+
+message ResolverCustomEndpoint {
+  string name = 1;
+  string origin = 2;
+  repeated string regions = 3;
+  bool enabled = 4;
+}
+
+message ResolverSettingsSnapshot {
+  repeated ResolverEndpoint builtin = 1;
+  repeated string disabled_builtin_host_ids = 2;
+  repeated ResolverCustomEndpoint custom = 3;
+  uint64 revision = 4;
+}
+
+message UpdateResolverSettingsRequest {
+  repeated string disabled_builtin_host_ids = 1;
+  repeated ResolverCustomEndpoint custom = 2;
+  uint64 expected_revision = 3;
 }
 
 message CheckHealthRequest {}
@@ -102,6 +134,7 @@ message BilibiliCredentialStatus {
   bool access_key_present = 6;
   bool tv_access_key_present = 7;
   string restricted_area = 8;
+  // Counts only proxies configured through the BBDown CLI options; runtime resolver endpoints are reported separately.
   uint32 restricted_playurl_proxy_count = 9;
   uint32 restricted_api_proxy_count = 10;
   google.protobuf.Timestamp checked_at = 11;
