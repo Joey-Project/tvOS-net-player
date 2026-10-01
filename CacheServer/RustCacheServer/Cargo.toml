@@ -7,7 +7,7 @@ rust-version.workspace = true
 [dependencies]
 axum = { version = "0.8.9", features = ["http1", "tokio"] }
 base64 = "0.22.1"
-bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "fe79961c15d38e32b2e9c0d9e5bf9291edb440a4", package = "bbdown-core" }
+bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "b53d8cd9e8967d78c1fc9809000c9fd86ca9d588", package = "bbdown-core" }
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 http = "1.3.1"

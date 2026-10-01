@@ -17,11 +17,11 @@ use bbdown_core::{
     DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadMode,
     DownloadOptions, DownloadPlan, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
     DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
-    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PlaybackAbrGroup,
-    PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
-    PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode, ResolvedContent,
-    RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection, StreamSelection,
-    SubtitleAiPolicy, VideoCollectionKind,
+    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PgcWebPlayurlRoute,
+    PlaybackAbrGroup, PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata,
+    PlaybackCodecPreference, PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode,
+    ResolvedContent, RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection,
+    StreamSelection, SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
     io::AsyncReadExt,
@@ -64,6 +64,9 @@ use crate::{
     playback_policy::{
         CompatibleVariantPreference, PlaybackPolicy, variant_is_avplayer_h264_aac_hls_compatible,
     },
+    resolver_catalog::Region,
+    resolver_routing::{ResolverRoutingState, infer_region},
+    resolver_settings::{ResolverCandidate, ResolverSettingsStore},
     task_output::TaskResourceRecord,
     task_registry::BilibiliTaskProgress,
 };
@@ -83,6 +86,7 @@ const MAX_BILIBILI_V2_CANDIDATE_CLEANUP_DEPTH: usize = 64;
 const MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 512;
 const FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 128;
 const BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE: u64 = 4;
+const RESOLVER_ROUTE_OPERATION_BUDGET: Duration = Duration::from_secs(90);
 
 #[cfg(unix)]
 fn bilibili_v2_retained_descriptor_budget() -> usize {
@@ -137,8 +141,10 @@ fn invalid_resolve_candidate_limit(candidate_limit: usize) -> BilibiliDownloadEr
 
 pub struct BbdownBilibiliAdapter {
     options: Arc<CacheServerOptions>,
-    client: BiliClient,
-    tv_client: BiliClient,
+    web_client_config: ClientConfig,
+    tv_client_config: ClientConfig,
+    resolver_settings: Option<Arc<ResolverSettingsStore>>,
+    resolver_routing: Option<Arc<ResolverRoutingState>>,
     library: Arc<LocalMediaLibrary>,
     output_dir: PathBuf,
     archive_path: PathBuf,
@@ -341,6 +347,76 @@ struct SelectedCorePlaybackVariant<'a> {
     selection: BilibiliPlaybackVariantSelection,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PgcPlanKind {
+    Download,
+    Playback,
+}
+
+enum PlannedPgcPlan {
+    Download(DownloadPlan),
+    Playback(PlaybackPlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PgcEpisodeIdentity {
+    aid: u64,
+    cid: u64,
+    epid: u64,
+}
+
+impl PgcEpisodeIdentity {
+    fn content_key(self) -> String {
+        format!("epid:{}", self.epid)
+    }
+
+    fn matches(self, aid: u64, cid: u64, epid: Option<u64>) -> bool {
+        self.aid == aid && self.cid == cid && epid == Some(self.epid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PgcPlanRoute {
+    Official,
+    Proxy,
+}
+
+impl PlannedPgcPlan {
+    fn has_single_identity(&self, expected: PgcEpisodeIdentity, route: PgcPlanRoute) -> bool {
+        let Some((aid, cid, epid, source)) = self.single_entry_identity() else {
+            return false;
+        };
+        let expected_source = match route {
+            PgcPlanRoute::Official => matches!(source, bbdown_core::StreamSource::PgcWeb),
+            PgcPlanRoute::Proxy => matches!(source, bbdown_core::StreamSource::PgcProxy),
+        };
+        expected.matches(aid, cid, epid) && expected_source
+    }
+
+    fn single_entry_identity(&self) -> Option<(u64, u64, Option<u64>, &bbdown_core::StreamSource)> {
+        match self {
+            Self::Download(plan) => {
+                let [entry] = plan.entries.as_slice() else {
+                    return None;
+                };
+                Some((entry.aid, entry.cid, entry.epid, &entry.source))
+            }
+            Self::Playback(plan) => {
+                let [entry] = plan.entries.as_slice() else {
+                    return None;
+                };
+                Some((entry.aid, entry.cid, entry.epid, &entry.source))
+            }
+        }
+    }
+}
+
+struct PgcRouteMetadata {
+    identity: PgcEpisodeIdentity,
+    series_keys: Vec<String>,
+    area_hint: Option<Region>,
+}
+
 impl BbdownBilibiliAdapter {
     #[cfg(test)]
     fn new(options: Arc<CacheServerOptions>, library: Arc<LocalMediaLibrary>) -> Self {
@@ -353,18 +429,53 @@ impl BbdownBilibiliAdapter {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_blocking_permits(
         options: Arc<CacheServerOptions>,
         library: Arc<LocalMediaLibrary>,
         blocking_operation_permits: Arc<Semaphore>,
+    ) -> Self {
+        Self::new_with_optional_resolver_routing(
+            options,
+            library,
+            blocking_operation_permits,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_resolver_routing(
+        options: Arc<CacheServerOptions>,
+        library: Arc<LocalMediaLibrary>,
+        blocking_operation_permits: Arc<Semaphore>,
+        resolver_settings: Arc<ResolverSettingsStore>,
+        resolver_routing: Arc<ResolverRoutingState>,
+    ) -> Self {
+        Self::new_with_optional_resolver_routing(
+            options,
+            library,
+            blocking_operation_permits,
+            Some(resolver_settings),
+            Some(resolver_routing),
+        )
+    }
+
+    fn new_with_optional_resolver_routing(
+        options: Arc<CacheServerOptions>,
+        library: Arc<LocalMediaLibrary>,
+        blocking_operation_permits: Arc<Semaphore>,
+        resolver_settings: Option<Arc<ResolverSettingsStore>>,
+        resolver_routing: Option<Arc<ResolverRoutingState>>,
     ) -> Self {
         let client_config = bbdown_client_config(&options, PlayurlMode::Web)
             .unwrap_or_else(|error| panic!("failed to configure BBDown client: {error:?}"));
         let tv_client_config = bbdown_client_config(&options, PlayurlMode::Tv)
             .unwrap_or_else(|error| panic!("failed to configure BBDown TV client: {error:?}"));
         Self {
-            client: BiliClient::new(client_config),
-            tv_client: BiliClient::new(tv_client_config),
+            web_client_config: client_config,
+            tv_client_config,
+            resolver_settings,
+            resolver_routing,
             library,
             output_dir: options.bbdown_output_dir(),
             archive_path: options.bbdown_archive_path(),
@@ -397,20 +508,28 @@ impl BbdownBilibiliAdapter {
         let input = Input::parse(&request.source).map_err(failed)?;
         let download_mode = download_mode_from_options(request.options.as_ref())?;
         let download_options = self.download_options(request.options.as_ref())?;
-        let client = self
-            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+        let client_config = self
+            .client_config_for_request(request.options.as_ref(), request.request_context.as_ref())
             .await?;
+        let client = BiliClient::new(client_config.clone());
         context.report_progress(progress(
             0.02,
             "Planning Bilibili download with BBDown core.",
         ));
         let selection = default_selection_for_input(&input);
-        let plan = run_bbdown_until_cancelled(
-            client.plan(input, selection),
-            || context.is_cancel_requested(),
-            "Cancelled while BBDown planning was running.",
-        )
-        .await?;
+        let plan = match self
+            .plan_with_resolver_routing(
+                client_config,
+                input,
+                selection,
+                PgcPlanKind::Download,
+                &|| context.is_cancel_requested(),
+            )
+            .await?
+        {
+            PlannedPgcPlan::Download(plan) => plan,
+            PlannedPgcPlan::Playback(_) => unreachable!("download planning returned playback"),
+        };
 
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -582,9 +701,10 @@ impl BbdownBilibiliAdapter {
         request: BilibiliDownloadRequest,
         context: BilibiliDownloadContext,
     ) -> Result<BilibiliDownloadOutput, BilibiliDownloadError> {
-        let client = self
-            .client_for_request(request.options.as_ref(), request.request_context.as_ref())
+        let client_config = self
+            .client_config_for_request(request.options.as_ref(), request.request_context.as_ref())
             .await?;
+        let client = BiliClient::new(client_config.clone());
         let download_mode = download_mode_from_options(request.options.as_ref())?;
         validate_supported_download_options(request.options.as_ref())?;
         let input = playback_input_for_planning(&request.source)?;
@@ -601,7 +721,6 @@ impl BbdownBilibiliAdapter {
         let mut total_bytes_floor = 0_u64;
         let retained_descriptor_budget = bilibili_v2_retained_descriptor_budget();
         let mut retained_validation_descriptors = 0_usize;
-
         // V2 task output is the durable authority. This task-local archive only coordinates
         // duplicate names between this task's candidates and needs no cross-task lock.
         let mut archive = V2TaskArchive::default();
@@ -632,7 +751,7 @@ impl BbdownBilibiliAdapter {
             ));
 
             let plan = match self
-                .plan_download_candidate(&client, &input, candidate, || {
+                .plan_download_candidate(&client_config, &input, candidate, || {
                     context.is_cancel_requested()
                 })
                 .await
@@ -1224,7 +1343,7 @@ impl BbdownBilibiliAdapter {
 
     async fn plan_download_candidate(
         &self,
-        client: &BiliClient,
+        client_config: &ClientConfig,
         input: &Input,
         candidate: &BilibiliTaskCandidateRecord,
         is_cancel_requested: impl Fn() -> bool,
@@ -1236,10 +1355,11 @@ impl BbdownBilibiliAdapter {
         } = playback_selection_from_id(input, Some(&candidate.selection_id))?;
         let direct_collection_item = input_override.is_some();
         let selected_input = input_override.unwrap_or_else(|| input.clone());
+        let client = BiliClient::new(client_config.clone());
         let selection = if direct_collection_item {
             Some(
                 resolve_direct_collection_item_page(
-                    client,
+                    &client,
                     &selected_input,
                     expected_identity
                         .as_ref()
@@ -1251,12 +1371,19 @@ impl BbdownBilibiliAdapter {
         } else {
             selection.or_else(|| default_selection_for_input(&selected_input))
         };
-        let plan = run_bbdown_until_cancelled(
-            client.plan(selected_input, selection),
-            &is_cancel_requested,
-            "Cancelled while BBDown planning was running.",
-        )
-        .await?;
+        let plan = match self
+            .plan_with_resolver_routing(
+                client_config.clone(),
+                selected_input,
+                selection,
+                PgcPlanKind::Download,
+                &is_cancel_requested,
+            )
+            .await?
+        {
+            PlannedPgcPlan::Download(plan) => plan,
+            PlannedPgcPlan::Playback(_) => unreachable!("download planning returned playback"),
+        };
         let matching_entries = plan
             .entries
             .into_iter()
@@ -1474,16 +1601,28 @@ impl BbdownBilibiliAdapter {
         download_options_for_output_dir(self.output_dir.clone(), options)
     }
 
+    #[cfg(test)]
     async fn client_for_request(
         &self,
         options: Option<&BilibiliDownloadOptions>,
         request_context: Option<&BilibiliRequestContext>,
     ) -> Result<BiliClient, BilibiliDownloadError> {
+        Ok(BiliClient::new(
+            self.client_config_for_request(options, request_context)
+                .await?,
+        ))
+    }
+
+    async fn client_config_for_request(
+        &self,
+        options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+    ) -> Result<ClientConfig, BilibiliDownloadError> {
         if request_context.is_none() {
             return Ok(if options.is_some_and(|options| options.prefer_tv_api) {
-                self.tv_client.clone()
+                self.tv_client_config.clone()
             } else {
-                self.client.clone()
+                self.web_client_config.clone()
             });
         }
 
@@ -1519,11 +1658,9 @@ impl BbdownBilibiliAdapter {
         })??;
 
         let Some(config) = config else {
-            return Err(BilibiliDownloadError::Failed(
-                "Bilibili request context did not produce a client configuration.".to_owned(),
-            ));
+            return Ok(self.web_client_config.clone());
         };
-        Ok(BiliClient::new(config))
+        Ok(config)
     }
 
     #[allow(dead_code)]
@@ -1540,7 +1677,10 @@ impl BbdownBilibiliAdapter {
         let _preferences = playback_variant_preferences_from_options(options)?;
         let input = playback_input_for_planning(source)?;
         let selection = resolve_selection_for_input(&input, candidate_window)?;
-        let client = self.client_for_request(options, request_context).await?;
+        let client_config = self
+            .client_config_for_request(options, request_context)
+            .await?;
+        let client = BiliClient::new(client_config.clone());
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
             client.resolve(input.clone(), selection),
@@ -1608,6 +1748,356 @@ impl BbdownBilibiliAdapter {
         best_resolved.ok_or_else(|| failed(last_error))
     }
 
+    async fn plan_with_resolver_routing(
+        &self,
+        base_config: ClientConfig,
+        input: Input,
+        selection: Option<Selection>,
+        plan_kind: PgcPlanKind,
+        is_cancel_requested: &impl Fn() -> bool,
+    ) -> Result<PlannedPgcPlan, BilibiliDownloadError> {
+        let use_settings = base_config.playurl_mode == PlayurlMode::Web
+            && matches!(
+                input,
+                Input::Episode(_) | Input::Season(_) | Input::Media(_)
+            )
+            && !has_explicit_restricted_area_configuration(&self.options)
+            && self.resolver_settings.is_some()
+            && self.resolver_routing.is_some();
+        if !use_settings {
+            return self
+                .run_default_plan(
+                    base_config,
+                    input,
+                    selection,
+                    plan_kind,
+                    is_cancel_requested,
+                )
+                .await;
+        }
+        let settings_store = self
+            .resolver_settings
+            .as_ref()
+            .expect("settings routing was checked above");
+        let routing = self
+            .resolver_routing
+            .as_ref()
+            .expect("routing state was checked above");
+        let settings_snapshot = settings_store.snapshot();
+        let candidates = settings_snapshot
+            .settings
+            .effective_candidates()
+            .map_err(failed)?;
+        let permit_future = routing.acquire_route_permit();
+        let operation = async {
+            let _routing_permit = permit_future.await.map_err(|_| {
+                BilibiliDownloadError::Failed(
+                    "Resolver routing admission is unavailable; retry the request.".to_owned(),
+                )
+            })?;
+            let official_future = execute_pgc_plan(
+                base_config
+                    .clone()
+                    .with_pgc_web_playurl_route(PgcWebPlayurlRoute::OfficialOnly),
+                input.clone(),
+                selection.clone(),
+                plan_kind,
+            );
+            let metadata_client = BiliClient::new(base_config.clone());
+            let metadata_future = metadata_client.resolve(input.clone(), selection.clone());
+            tokio::pin!(official_future);
+            tokio::pin!(metadata_future);
+            let initial = initial_pgc_plan_or_metadata(
+                official_future.as_mut(),
+                metadata_future.as_mut(),
+                |plan| trusted_official_episode_matches_input(&input, plan),
+            )
+            .await;
+            let (resolved, mut official_result) = match initial {
+                InitialPgcPlan::TrustedOfficial(plan) => return Ok(plan),
+                InitialPgcPlan::MetadataReady {
+                    metadata,
+                    official_result,
+                } => (metadata, official_result),
+                InitialPgcPlan::MetadataFailed {
+                    official_result: Err(official_error),
+                    ..
+                } => return Err(failed(official_error)),
+                InitialPgcPlan::MetadataFailed {
+                    official_result: Ok(_),
+                    metadata_error: _,
+                } if matches!(input, Input::Episode(_)) => {
+                    return Err(failed(BbdownError::MissingField(
+                        "a single official PGC entry matching the requested episode input",
+                    )));
+                }
+                InitialPgcPlan::MetadataFailed { metadata_error, .. } => {
+                    return Err(failed(metadata_error));
+                }
+            };
+            let Some(route_metadata) = pgc_route_metadata(&input, resolved) else {
+                return match official_result.take() {
+                    Some(result) => result.map_err(failed),
+                    None => official_future.await.map_err(failed),
+                };
+            };
+            let content_key = route_metadata.identity.content_key();
+            let affinity = routing.lookup(&content_key, &route_metadata.series_keys);
+            let target_area = route_target_area(
+                affinity.as_ref().map(|entry| entry.area),
+                route_metadata.area_hint,
+            );
+            let has_area_affinity = route_metadata.area_hint.is_some() || affinity.is_some();
+
+            match official_result.take() {
+                Some(Ok(plan))
+                    if plan
+                        .has_single_identity(route_metadata.identity, PgcPlanRoute::Official) =>
+                {
+                    return Ok(plan);
+                }
+                Some(Ok(_)) => {
+                    official_result = Some(Err(BbdownError::MissingField(
+                        "a single official PGC entry matching the resolved episode identity",
+                    )));
+                }
+                result => official_result = result,
+            }
+            if official_result.as_ref().is_some_and(|result| {
+                matches!(result, Err(error) if !has_area_affinity && !is_genuine_region_restriction(error))
+            }) && let Some(Err(error)) = official_result.take()
+            {
+                return Err(failed(error));
+            }
+
+            let preferred_host = affinity.as_ref().map(|entry| entry.host_id.as_str());
+            let mut probe_future = Box::pin(routing.probe_candidates(
+                &candidates,
+                target_area,
+                preferred_host,
+                is_cancel_requested,
+            ));
+            let probed = loop {
+                if official_result.as_ref().is_some_and(|result| {
+                    matches!(result, Err(error) if !has_area_affinity && !is_genuine_region_restriction(error))
+                }) && let Some(Err(error)) = official_result.take()
+                {
+                    return Err(failed(error));
+                }
+                tokio::select! {
+                    biased;
+                    result = &mut official_future, if official_result.is_none() => {
+                        match result {
+                            Ok(plan) if plan.has_single_identity(
+                                route_metadata.identity,
+                                PgcPlanRoute::Official,
+                            ) => return Ok(plan),
+                            Ok(_) => official_result = Some(Err(BbdownError::MissingField(
+                                "a single official PGC entry matching the resolved episode identity",
+                            ))),
+                            Err(error) => official_result = Some(Err(error)),
+                        }
+                    }
+                    result = &mut probe_future => {
+                        break result.map_err(|()| BilibiliDownloadError::Cancelled(
+                            "Cancelled while probing resolver connectivity.".to_owned(),
+                        ))?;
+                    }
+                }
+            };
+
+            if probed.is_empty() {
+                let official_error = match official_result.take() {
+                    Some(Ok(plan)) => {
+                        return validate_route_plan(
+                            plan,
+                            route_metadata.identity,
+                            PgcPlanRoute::Official,
+                        );
+                    }
+                    Some(Err(error)) => error,
+                    None => match official_future.await {
+                        Ok(plan) => {
+                            return validate_route_plan(
+                                plan,
+                                route_metadata.identity,
+                                PgcPlanRoute::Official,
+                            );
+                        }
+                        Err(error) => error,
+                    },
+                };
+                return Err(failed(official_error));
+            }
+
+            if has_area_affinity {
+                let primary = &probed[0];
+                let proxy = resolver_api_proxy(primary, target_area)?;
+                let proxy_config = pgc_web_route_config(
+                    base_config.clone(),
+                    target_area,
+                    PgcWebPlayurlRoute::ProxyOnly(proxy),
+                )?
+                .with_request_timeout(Duration::from_secs(8));
+                let proxy_future =
+                    execute_pgc_plan(proxy_config, input.clone(), selection.clone(), plan_kind);
+                let observed_result = official_result.take();
+                let official_race_future = async {
+                    match observed_result {
+                        Some(result) => result,
+                        None => official_future.await,
+                    }
+                };
+                let race =
+                    first_valid_plan_race(official_race_future, proxy_future, |plan, route| {
+                        plan.has_single_identity(route_metadata.identity, route)
+                    })
+                    .await;
+                let official_error = match race {
+                    FirstValidRace::Winner {
+                        plan,
+                        route: PgcPlanRoute::Official,
+                        ..
+                    } => return Ok(plan),
+                    FirstValidRace::Winner {
+                        plan,
+                        route: PgcPlanRoute::Proxy,
+                        observed_official_error,
+                    } => {
+                        if should_train_route(observed_official_error.as_ref())
+                            && is_resolver_settings_current(
+                                settings_store,
+                                settings_snapshot.revision,
+                            )
+                        {
+                            routing.record_region_route(
+                                &content_key,
+                                &route_metadata.series_keys,
+                                &primary.host_id,
+                                target_area,
+                            );
+                        }
+                        return Ok(plan);
+                    }
+                    FirstValidRace::Exhausted {
+                        official_error,
+                        proxy_error,
+                        invalid_plan,
+                    } => match official_error {
+                        Some(error) => error,
+                        None if invalid_plan => BbdownError::MissingField(
+                            "a single PGC route entry matching the resolved episode identity",
+                        ),
+                        None => proxy_error
+                            .unwrap_or(BbdownError::MissingField("a valid PGC route result")),
+                    },
+                };
+
+                if !is_genuine_region_restriction(&official_error) {
+                    return Err(failed(official_error));
+                }
+                for candidate in probed.iter().skip(1) {
+                    let proxy = resolver_api_proxy(candidate, target_area)?;
+                    let config = pgc_web_route_config(
+                        base_config.clone(),
+                        target_area,
+                        PgcWebPlayurlRoute::ProxyOnly(proxy),
+                    )?
+                    .with_request_timeout(Duration::from_secs(8));
+                    if let Ok(plan) =
+                        execute_pgc_plan(config, input.clone(), selection.clone(), plan_kind).await
+                        && plan.has_single_identity(route_metadata.identity, PgcPlanRoute::Proxy)
+                    {
+                        if is_resolver_settings_current(settings_store, settings_snapshot.revision)
+                        {
+                            routing.record_region_route(
+                                &content_key,
+                                &route_metadata.series_keys,
+                                &candidate.host_id,
+                                target_area,
+                            );
+                        }
+                        return Ok(plan);
+                    }
+                }
+                return Err(failed(official_error));
+            }
+
+            let official_error = match official_result.take() {
+                Some(Err(error)) => error,
+                Some(Ok(plan)) => {
+                    return validate_route_plan(
+                        plan,
+                        route_metadata.identity,
+                        PgcPlanRoute::Official,
+                    );
+                }
+                None => match official_future.await {
+                    Ok(plan) => {
+                        return validate_route_plan(
+                            plan,
+                            route_metadata.identity,
+                            PgcPlanRoute::Official,
+                        );
+                    }
+                    Err(error) => error,
+                },
+            };
+            if !is_genuine_region_restriction(&official_error) {
+                return Err(failed(official_error));
+            }
+            for candidate in &probed {
+                let proxy = resolver_api_proxy(candidate, target_area)?;
+                let config = pgc_web_route_config(
+                    base_config.clone(),
+                    target_area,
+                    PgcWebPlayurlRoute::ProxyOnly(proxy),
+                )?
+                .with_request_timeout(Duration::from_secs(8));
+                if let Ok(plan) =
+                    execute_pgc_plan(config, input.clone(), selection.clone(), plan_kind).await
+                    && plan.has_single_identity(route_metadata.identity, PgcPlanRoute::Proxy)
+                {
+                    if is_resolver_settings_current(settings_store, settings_snapshot.revision) {
+                        routing.record_region_route(
+                            &content_key,
+                            &route_metadata.series_keys,
+                            &candidate.host_id,
+                            target_area,
+                        );
+                    }
+                    return Ok(plan);
+                }
+            }
+            Err(failed(official_error))
+        };
+
+        run_resolver_future_until_current(
+            operation,
+            is_cancel_requested,
+            settings_store,
+            settings_snapshot.revision,
+            "Cancelled while resolving PGC Web playback routes.",
+        )
+        .await
+    }
+
+    async fn run_default_plan(
+        &self,
+        config: ClientConfig,
+        input: Input,
+        selection: Option<Selection>,
+        plan_kind: PgcPlanKind,
+        is_cancel_requested: &impl Fn() -> bool,
+    ) -> Result<PlannedPgcPlan, BilibiliDownloadError> {
+        run_bbdown_until_cancelled(
+            execute_pgc_plan(config, input, selection, plan_kind),
+            is_cancel_requested,
+            "Cancelled while BBDown planning was running.",
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn plan_playback(
         &self,
@@ -1627,7 +2117,10 @@ impl BbdownBilibiliAdapter {
         } = playback_selection_from_id(&input, selection_id)?;
         let direct_collection_item = input_override.is_some();
         let input = input_override.unwrap_or(input);
-        let client = self.client_for_request(options, request_context).await?;
+        let client_config = self
+            .client_config_for_request(options, request_context)
+            .await?;
+        let client = BiliClient::new(client_config.clone());
         let selection = if direct_collection_item {
             Some(
                 resolve_direct_collection_item_page(
@@ -1643,18 +2136,380 @@ impl BbdownBilibiliAdapter {
         } else {
             selection.or_else(|| default_selection_for_input(&input))
         };
-        let plan = run_bbdown_until_cancelled(
-            client.plan_playback_input(input, selection),
-            is_cancel_requested,
-            "Cancelled while BBDown playback planning was running.",
-        )
-        .await?;
+        let plan = match self
+            .plan_with_resolver_routing(
+                client_config,
+                input,
+                selection,
+                PgcPlanKind::Playback,
+                &is_cancel_requested,
+            )
+            .await?
+        {
+            PlannedPgcPlan::Playback(plan) => plan,
+            PlannedPgcPlan::Download(_) => unreachable!("playback planning returned download"),
+        };
         let plan = BilibiliPlaybackPlan::from_core_with_preferences(plan, &preferences)?;
         if let Some(expected_identity) = expected_identity.as_ref() {
             plan.validate_expected_identity(expected_identity)?;
         }
         Ok(plan)
     }
+}
+
+fn has_explicit_restricted_area_configuration(options: &CacheServerOptions) -> bool {
+    options.bbdown_restricted_area.is_some()
+        || !options.bbdown_restricted_area_proxies.is_empty()
+        || !options.bbdown_restricted_api_proxies.is_empty()
+}
+
+fn pgc_route_metadata(input: &Input, resolved: ResolvedContent) -> Option<PgcRouteMetadata> {
+    if !matches!(
+        input,
+        Input::Episode(_) | Input::Season(_) | Input::Media(_)
+    ) {
+        return None;
+    }
+    let ResolvedContent::Season(season) = resolved else {
+        return None;
+    };
+    let [episode] = season.selected_episodes.as_slice() else {
+        return None;
+    };
+    if episode.aid == 0 || episode.cid == 0 || episode.epid == 0 {
+        return None;
+    }
+    let area_hint = season
+        .season
+        .areas
+        .iter()
+        .find_map(|area| infer_region(area))
+        .or_else(|| infer_region(&season.season.title))
+        .or_else(|| infer_region(&episode.title))
+        .or_else(|| episode.long_title.as_deref().and_then(infer_region));
+    let series_keys = season
+        .season
+        .season_id
+        .map(|id| format!("season:{id}"))
+        .into_iter()
+        .chain(season.season.media_id.map(|id| format!("media:{id}")))
+        .collect();
+    Some(PgcRouteMetadata {
+        identity: PgcEpisodeIdentity {
+            aid: episode.aid,
+            cid: episode.cid,
+            epid: episode.epid,
+        },
+        series_keys,
+        area_hint,
+    })
+}
+
+fn trusted_official_episode_matches_input(input: &Input, plan: &PlannedPgcPlan) -> bool {
+    let Input::Episode(expected_epid) = input else {
+        return false;
+    };
+    official_pgc_identity_matches_episode_input(*expected_epid, plan.single_entry_identity())
+}
+
+fn official_pgc_identity_matches_episode_input(
+    expected_epid: u64,
+    identity: Option<(u64, u64, Option<u64>, &bbdown_core::StreamSource)>,
+) -> bool {
+    let Some((aid, cid, epid, source)) = identity else {
+        return false;
+    };
+    aid != 0
+        && cid != 0
+        && epid == Some(expected_epid)
+        && matches!(source, bbdown_core::StreamSource::PgcWeb)
+}
+
+fn core_area_for_region(region: Region) -> Result<RestrictedArea, BilibiliDownloadError> {
+    match region {
+        Region::Cn => Ok(RestrictedArea::Cn),
+        Region::Hk => Ok(RestrictedArea::Hk),
+        Region::Tw => Ok(RestrictedArea::Tw),
+        Region::Th => Ok(RestrictedArea::Th),
+        Region::All => Err(BilibiliDownloadError::Failed(
+            "A concrete region is required for PGC Web proxy routing.".to_owned(),
+        )),
+    }
+}
+
+fn pgc_web_route_config(
+    config: ClientConfig,
+    area: Region,
+    route: PgcWebPlayurlRoute,
+) -> Result<ClientConfig, BilibiliDownloadError> {
+    let area = core_area_for_region(area)?;
+    Ok(config
+        .with_restricted_area(RestrictedAreaConfig::new(Some(area), []))
+        .with_pgc_web_playurl_route(route))
+}
+
+fn resolver_api_proxy(
+    candidate: &ResolverCandidate,
+    area: Region,
+) -> Result<RestrictedAreaProxy, BilibiliDownloadError> {
+    Ok(RestrictedAreaProxy::bilibili_api(
+        candidate.origin.clone(),
+        Some(core_area_for_region(area)?),
+    ))
+}
+
+fn route_target_area(affinity: Option<Region>, title_hint: Option<Region>) -> Region {
+    affinity
+        .filter(|area| *area != Region::All)
+        .or_else(|| title_hint.filter(|area| *area != Region::All))
+        .unwrap_or(Region::Cn)
+}
+
+fn is_genuine_region_restriction(error: &BbdownError) -> bool {
+    let message = match error {
+        BbdownError::Api { message, .. } | BbdownError::AccessRestricted(message) => message,
+        _ => return false,
+    };
+    // Keep this marker set aligned with BBDown's conservative Web-route classifier; codes alone
+    // are insufficient because the same API codes can represent account or entitlement failures.
+    let lower = message.to_ascii_lowercase();
+    [
+        "area restricted",
+        "area limit",
+        "region restricted",
+        "region limit",
+        "not available in your region",
+        "地区限制",
+        "地區限制",
+        "区域限制",
+        "區域限制",
+        "所在地区不可观看",
+        "所在地區不可觀看",
+        "所在地区无法观看",
+        "所在地區無法觀看",
+        "所在的地区不可观看",
+        "所在的地區不可觀看",
+        "所在的地区无法观看",
+        "所在的地區無法觀看",
+        "地区不可观看",
+        "地區不可觀看",
+        "地区无法观看",
+        "地區無法觀看",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn should_train_route(observed_official_error: Option<&BbdownError>) -> bool {
+    observed_official_error.is_some_and(is_genuine_region_restriction)
+}
+
+enum FirstValidRace<T, E> {
+    Winner {
+        plan: T,
+        route: PgcPlanRoute,
+        observed_official_error: Option<E>,
+    },
+    Exhausted {
+        official_error: Option<E>,
+        proxy_error: Option<E>,
+        invalid_plan: bool,
+    },
+}
+
+enum InitialPgcPlan<T, M, E> {
+    TrustedOfficial(T),
+    MetadataReady {
+        metadata: M,
+        official_result: Option<Result<T, E>>,
+    },
+    MetadataFailed {
+        official_result: Result<T, E>,
+        metadata_error: E,
+    },
+}
+
+async fn initial_pgc_plan_or_metadata<Official, Metadata, T, M, E, IsTrusted>(
+    mut official_future: std::pin::Pin<&mut Official>,
+    mut metadata_future: std::pin::Pin<&mut Metadata>,
+    mut is_trusted: IsTrusted,
+) -> InitialPgcPlan<T, M, E>
+where
+    Official: Future<Output = Result<T, E>>,
+    Metadata: Future<Output = Result<M, E>>,
+    IsTrusted: FnMut(&T) -> bool,
+{
+    let mut official_result = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut official_future, if official_result.is_none() => {
+                match result {
+                    Ok(plan) if is_trusted(&plan) => {
+                        return InitialPgcPlan::TrustedOfficial(plan);
+                    }
+                    result => official_result = Some(result),
+                }
+            }
+            result = &mut metadata_future => match result {
+                Ok(metadata) => {
+                    return InitialPgcPlan::MetadataReady {
+                        metadata,
+                        official_result,
+                    };
+                }
+                Err(metadata_error) => {
+                    let official_result = match official_result.take() {
+                        Some(result) => result,
+                        None => official_future.as_mut().await,
+                    };
+                    match official_result {
+                        Ok(plan) if is_trusted(&plan) => {
+                            return InitialPgcPlan::TrustedOfficial(plan);
+                        }
+                        official_result => {
+                            return InitialPgcPlan::MetadataFailed {
+                                official_result,
+                                metadata_error,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn first_valid_plan_race<Official, Proxy, T, E, IsValid>(
+    official_future: Official,
+    proxy_future: Proxy,
+    mut is_valid: IsValid,
+) -> FirstValidRace<T, E>
+where
+    Official: Future<Output = Result<T, E>>,
+    Proxy: Future<Output = Result<T, E>>,
+    IsValid: FnMut(&T, PgcPlanRoute) -> bool,
+{
+    tokio::pin!(official_future);
+    tokio::pin!(proxy_future);
+    let mut official_done = false;
+    let mut proxy_done = false;
+    let mut official_error = None;
+    let mut proxy_error = None;
+    let mut invalid_plan = false;
+
+    loop {
+        if official_done && proxy_done {
+            return FirstValidRace::Exhausted {
+                official_error,
+                proxy_error,
+                invalid_plan,
+            };
+        }
+        tokio::select! {
+            biased;
+            result = &mut official_future, if !official_done => {
+                official_done = true;
+                match result {
+                    Ok(plan) if is_valid(&plan, PgcPlanRoute::Official) => {
+                        return FirstValidRace::Winner {
+                            plan,
+                            route: PgcPlanRoute::Official,
+                            observed_official_error: None,
+                        };
+                    }
+                    Ok(_) => invalid_plan = true,
+                    Err(error) => official_error = Some(error),
+                }
+            }
+            result = &mut proxy_future, if !proxy_done => {
+                proxy_done = true;
+                match result {
+                    Ok(plan) if is_valid(&plan, PgcPlanRoute::Proxy) => {
+                        return FirstValidRace::Winner {
+                            plan,
+                            route: PgcPlanRoute::Proxy,
+                            observed_official_error: official_error,
+                        };
+                    }
+                    Ok(_) => invalid_plan = true,
+                    Err(error) => proxy_error = Some(error),
+                }
+            }
+        }
+    }
+}
+
+async fn execute_pgc_plan(
+    config: ClientConfig,
+    input: Input,
+    selection: Option<Selection>,
+    plan_kind: PgcPlanKind,
+) -> Result<PlannedPgcPlan, BbdownError> {
+    let client = BiliClient::new(config);
+    match plan_kind {
+        PgcPlanKind::Download => client
+            .plan(input, selection)
+            .await
+            .map(PlannedPgcPlan::Download),
+        PgcPlanKind::Playback => client
+            .plan_playback_input(input, selection)
+            .await
+            .map(PlannedPgcPlan::Playback),
+    }
+}
+
+fn validate_route_plan(
+    plan: PlannedPgcPlan,
+    expected: PgcEpisodeIdentity,
+    route: PgcPlanRoute,
+) -> Result<PlannedPgcPlan, BilibiliDownloadError> {
+    if plan.has_single_identity(expected, route) {
+        Ok(plan)
+    } else {
+        Err(BilibiliDownloadError::Failed(
+            "PGC route result did not match the resolved episode identity.".to_owned(),
+        ))
+    }
+}
+
+async fn run_resolver_future_until_current<T>(
+    future: impl Future<Output = Result<T, BilibiliDownloadError>>,
+    is_cancel_requested: &impl Fn() -> bool,
+    settings_store: &ResolverSettingsStore,
+    expected_revision: u64,
+    cancellation_message: &'static str,
+) -> Result<T, BilibiliDownloadError> {
+    tokio::pin!(future);
+    let deadline = tokio::time::sleep(RESOLVER_ROUTE_OPERATION_BUDGET);
+    tokio::pin!(deadline);
+    loop {
+        if is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                cancellation_message.to_owned(),
+            ));
+        }
+        if !is_resolver_settings_current(settings_store, expected_revision) {
+            return Err(resolver_settings_changed());
+        }
+        tokio::select! {
+            result = &mut future => return result,
+            () = sleep(Duration::from_millis(100)) => {}
+            () = &mut deadline => return Err(BilibiliDownloadError::Failed(
+                "Resolver routing exceeded its planning deadline; retry the request.".to_owned(),
+            )),
+        }
+    }
+}
+
+fn is_resolver_settings_current(store: &ResolverSettingsStore, expected_revision: u64) -> bool {
+    store.snapshot().revision == expected_revision
+}
+
+fn resolver_settings_changed() -> BilibiliDownloadError {
+    BilibiliDownloadError::Failed(
+        "Resolver settings changed during planning; retry the request.".to_owned(),
+    )
 }
 
 async fn resolve_direct_collection_item_page(
@@ -6772,12 +7627,463 @@ mod tests {
     use super::*;
     use crate::task_registry::{BilibiliTaskRegistry, TaskRetentionPolicy};
     use bbdown_core::{
-        DownloadArchiveRecord, DownloadedFile, EntryDownloadReport, MuxReport,
-        RestrictedAreaProxyKind,
+        DownloadArchiveRecord, DownloadedFile, EndpointConfig, EntryDownloadReport, MuxReport,
+        PgcWebPlayurlRoute, RestrictedAreaProxyKind, StreamSource,
     };
     use std::fs as std_fs;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     const LEGACY_RESOLVE_CANDIDATE_LIMIT: usize = 100;
+    const ACCESS_KEY_ACCESS_A: &str = "codex_synth_v1_access_a";
+
+    #[derive(Clone, Copy)]
+    struct RaceTestPlan {
+        identity: u64,
+        route: PgcPlanRoute,
+    }
+
+    struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            if stream.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("mock HTTP request should be UTF-8")
+    }
+
+    async fn write_mock_response(stream: &mut tokio::net::TcpStream, status: u16, body: &[u8]) {
+        let reason = if status == 200 { "OK" } else { "Not Found" };
+        let header = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_api_proxy_uses_web_compatibility_paths_and_shared_access_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let mock_server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_mock_request(&mut stream).await;
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .expect("mock request should include a target")
+                    .to_owned();
+                let lower_headers = request.to_ascii_lowercase();
+                let path = target.split('?').next().unwrap_or_default();
+                let (status, body) = if path == "/pgc/view/web/season" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "code": 0,
+                            "result": {
+                                "season_id": 123,
+                                "title": "A Season",
+                                "episodes": [{
+                                    "aid": 10,
+                                    "bvid": "BV1aa",
+                                    "cid": 100,
+                                    "id": 1000,
+                                    "ep_id": 1000,
+                                    "title": "1",
+                                    "long_title": "Start"
+                                }]
+                            }
+                        })
+                        .to_string(),
+                    )
+                } else if path == "/resolver/pgc/player/web/v2/playurl" {
+                    (
+                        200,
+                        serde_json::json!({
+                            "code": 0,
+                            "result": {"video_info": {"dash": {
+                                "duration": 456,
+                                "video": [{
+                                    "id": 64,
+                                    "baseUrl": "https://media.example/proxy.m4s",
+                                    "base_url": "https://media.example/proxy.m4s"
+                                }],
+                                "audio": []
+                            }}}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (404, "{}".to_owned())
+                };
+                requests.push((target, lower_headers));
+                write_mock_response(&mut stream, status, body.as_bytes()).await;
+            }
+            requests
+        });
+
+        let candidate = ResolverCandidate {
+            host_id: "resolver.example:8443".to_owned(),
+            origin: format!("{base}/resolver"),
+            name: "local mock".to_owned(),
+            regions: vec![Region::Cn],
+        };
+        let route =
+            PgcWebPlayurlRoute::ProxyOnly(resolver_api_proxy(&candidate, Region::Cn).unwrap());
+        let config = ClientConfig::default()
+            .with_endpoints(EndpointConfig::default().with_pgc_base(base))
+            .with_credentials(Credentials::default().with_access_key(ACCESS_KEY_ACCESS_A))
+            .with_playurl_mode(PlayurlMode::Web)
+            .with_pgc_web_playurl_route(route);
+        let plan = tokio::time::timeout(
+            Duration::from_secs(3),
+            BiliClient::new(config).plan_playback("ep1000", None),
+        )
+        .await
+        .expect("mock route should complete within its test deadline")
+        .expect("mock PGC Web plan should resolve");
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].source, StreamSource::PgcProxy);
+
+        let requests = mock_server.await.unwrap();
+        let paths = requests
+            .iter()
+            .map(|(target, _)| target.split('?').next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "/pgc/view/web/season",
+                "/resolver/pgc/player/web/playurl",
+                "/resolver/pgc/player/web/v2/playurl",
+            ]
+        );
+        for (target, headers) in requests
+            .iter()
+            .filter(|(target, _)| target.starts_with("/resolver/pgc/player/web/"))
+        {
+            assert!(target.contains(&format!("access_key={ACCESS_KEY_ACCESS_A}")));
+            assert!(!headers.lines().any(|line| line.starts_with("cookie:")));
+            assert!(!target.contains("/app/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_valid_route_returns_early_and_cancels_the_loser() {
+        let proxy_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&proxy_dropped));
+        let official = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        };
+        let proxy = async move {
+            let _drop_signal = drop_signal;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Proxy,
+            })
+        };
+        let race = tokio::time::timeout(
+            Duration::from_millis(200),
+            first_valid_plan_race(official, proxy, |plan, route| {
+                plan.identity == 77 && plan.route == route
+            }),
+        )
+        .await
+        .expect("fast official winner must not wait for proxy");
+        assert!(matches!(
+            race,
+            FirstValidRace::Winner {
+                route: PgcPlanRoute::Official,
+                ..
+            }
+        ));
+        assert!(proxy_dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn trusted_official_plan_cancels_stalled_auxiliary_metadata() {
+        let metadata_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let metadata_signal = DropSignal(Arc::clone(&metadata_dropped));
+        let metadata = async move {
+            let _metadata_signal = metadata_signal;
+            std::future::pending::<Result<(), ()>>().await
+        };
+        let official = async {
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        };
+        let mut official = Box::pin(official);
+        let mut metadata = Box::pin(metadata);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            initial_pgc_plan_or_metadata(official.as_mut(), metadata.as_mut(), |plan| {
+                plan.identity == 77 && plan.route == PgcPlanRoute::Official
+            }),
+        )
+        .await
+        .expect("trusted official plan must not wait for auxiliary metadata");
+        assert!(matches!(
+            outcome,
+            InitialPgcPlan::TrustedOfficial(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        ));
+        drop(metadata);
+        assert!(metadata_dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failed_auxiliary_metadata_waits_for_pending_trusted_official_plan() {
+        let official = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        };
+        let metadata = async { Err::<(), _>(()) };
+        let mut official = Box::pin(official);
+        let mut metadata = Box::pin(metadata);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            initial_pgc_plan_or_metadata(official.as_mut(), metadata.as_mut(), |plan| {
+                plan.identity == 77 && plan.route == PgcPlanRoute::Official
+            }),
+        )
+        .await
+        .expect("metadata failure must not abort the pending official plan");
+        assert!(matches!(
+            outcome,
+            InitialPgcPlan::TrustedOfficial(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn mismatched_official_episode_or_source_waits_for_metadata_identity() {
+        let official = async {
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 78,
+                route: PgcPlanRoute::Proxy,
+            })
+        };
+        let metadata = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, ()>("resolved candidate")
+        };
+        let mut official = Box::pin(official);
+        let mut metadata = Box::pin(metadata);
+        let outcome = initial_pgc_plan_or_metadata(official.as_mut(), metadata.as_mut(), |plan| {
+            plan.identity == 77 && plan.route == PgcPlanRoute::Official
+        })
+        .await;
+        assert!(matches!(
+            outcome,
+            InitialPgcPlan::MetadataReady {
+                metadata: "resolved candidate",
+                official_result: Some(Ok(RaceTestPlan {
+                    identity: 78,
+                    route: PgcPlanRoute::Proxy,
+                })),
+            }
+        ));
+    }
+
+    #[test]
+    fn trusted_official_short_circuit_requires_matching_web_episode_identity() {
+        let web_source = StreamSource::PgcWeb;
+        let proxy_source = StreamSource::PgcProxy;
+        assert!(official_pgc_identity_matches_episode_input(
+            77,
+            Some((10, 20, Some(77), &web_source))
+        ));
+        for identity in [
+            Some((10, 20, Some(78), &web_source)),
+            Some((10, 20, Some(77), &proxy_source)),
+            Some((0, 20, Some(77), &web_source)),
+            Some((10, 0, Some(77), &web_source)),
+            None,
+        ] {
+            assert!(!official_pgc_identity_matches_episode_input(77, identity));
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_proxy_wins_without_waiting_for_official_and_cannot_train_affinity() {
+        let official_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&official_dropped));
+        let official = async move {
+            let _drop_signal = drop_signal;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        };
+        let proxy = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Proxy,
+            })
+        };
+        let race = tokio::time::timeout(
+            Duration::from_millis(200),
+            first_valid_plan_race(official, proxy, |plan, route| {
+                plan.identity == 77 && plan.route == route
+            }),
+        )
+        .await
+        .expect("fast proxy winner must not wait for official");
+        match race {
+            FirstValidRace::Winner {
+                route: PgcPlanRoute::Proxy,
+                observed_official_error,
+                ..
+            } => assert!(observed_official_error.is_none()),
+            _ => panic!("expected proxy winner"),
+        }
+        assert!(official_dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn invalid_fast_proxy_is_rejected_in_favor_of_matching_official_plan() {
+        let official = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 77,
+                route: PgcPlanRoute::Official,
+            })
+        };
+        let proxy = async {
+            Ok::<_, ()>(RaceTestPlan {
+                identity: 78,
+                route: PgcPlanRoute::Proxy,
+            })
+        };
+        let race = first_valid_plan_race(official, proxy, |plan, route| {
+            plan.identity == 77 && plan.route == route
+        })
+        .await;
+        assert!(matches!(
+            race,
+            FirstValidRace::Winner {
+                route: PgcPlanRoute::Official,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn defaults_to_mainland_and_only_region_messages_train_affinity() {
+        assert_eq!(route_target_area(None, None), Region::Cn);
+        let mainland_resolver = crate::resolver_settings::ResolverSettings::default()
+            .effective_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.regions.contains(&Region::Cn) || candidate.regions.contains(&Region::All)
+            });
+        assert!(mainland_resolver.is_some());
+
+        let api_area_limit = BbdownError::Api {
+            code: -10403,
+            message: "area limit: unavailable in this region".to_owned(),
+        };
+        assert!(is_genuine_region_restriction(&api_area_limit));
+        assert!(should_train_route(Some(&api_area_limit)));
+        assert!(is_genuine_region_restriction(
+            &BbdownError::AccessRestricted("您所在地区不可观看".to_owned())
+        ));
+        assert!(!is_genuine_region_restriction(&BbdownError::Api {
+            code: -10403,
+            message: "authentication required".to_owned(),
+        }));
+        let entitlement = BbdownError::AccessRestricted("member entitlement required".to_owned());
+        assert!(!is_genuine_region_restriction(&entitlement));
+        assert!(!should_train_route(Some(&entitlement)));
+        assert!(!should_train_route(None));
+        let timeout_like = BbdownError::InvalidInput("request timed out".to_owned());
+        assert!(!is_genuine_region_restriction(&timeout_like));
+    }
+
+    #[tokio::test]
+    async fn resolver_revision_change_cancels_the_active_route_future() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            ResolverSettingsStore::load(temp.path().join("resolver-settings.json")).unwrap();
+        let snapshot = store.snapshot();
+        let task_store = store.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&dropped));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            let _drop_signal = drop_signal;
+            let _ = started_tx.send(());
+            std::future::pending::<Result<(), BilibiliDownloadError>>().await
+        };
+        let task = tokio::spawn(async move {
+            run_resolver_future_until_current(
+                operation,
+                &|| false,
+                &task_store,
+                snapshot.revision,
+                "cancelled",
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        store
+            .update(
+                crate::resolver_settings::ResolverSettings {
+                    disabled_builtin_host_ids: vec!["future.example".to_owned()],
+                    ..crate::resolver_settings::ResolverSettings::default()
+                },
+                snapshot.revision,
+            )
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BilibiliDownloadError::Failed(message) if message.contains("settings changed")
+        ));
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn v2_candidate_failure_log_uses_credential_safe_detail() {

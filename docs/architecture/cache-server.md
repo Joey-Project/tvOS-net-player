@@ -40,7 +40,7 @@ tvOS should not talk to SMB directly in the first design. Keeping SMB behind the
 
 ## BBDown Adapter
 
-The cache server integrates the Rust `bbdown-core` crate from `https://github.com/Joey-Project/BBDown-rust` behind the server-local `BilibiliDownloadAdapter` trait. The dependency is pinned to the `v0.5.0` release commit in `CacheServer/RustCacheServer/Cargo.toml` so CI does not float with the upstream `master` branch.
+The cache server integrates the Rust `bbdown-core` crate from `https://github.com/Joey-Project/BBDown-rust` behind the server-local `BilibiliDownloadAdapter` trait. `CacheServer/RustCacheServer/Cargo.toml` and the workspace lockfile pin an exact verified upstream commit, so CI does not float with upstream `master` or depend on a mutable version label.
 
 For this project, BBDown remains an adapter behind the LAN cache server rather than an API the tvOS app talks to directly. The Rust crate runs inside the Mac mini cache server process. CLI execution should remain a fallback or diagnostic path, not the primary app integration model.
 
@@ -71,6 +71,15 @@ Current Rust crate adapter behavior:
 - `BilibiliDownloadOptions.quality_preference` maps common labels such as `720p`, `1080p`, `1080p60`, `4k`, and raw Bilibili qn values into BBDown stream selection. `audio_language` maps to BBDown stream selection for complete-download tasks and is carried by progressive playback control-plane requests for later ABR/audio selection work. Download tasks still reject non-empty `encoding_preference`; `prefer_tv_api` selects BBDown core's TV playurl mode for both download planning and progressive playback planning.
 - Complete-download Bilibili options expose BBDown `v0.5.0` sidecar controls for cover, subtitles, danmaku, danmaku format selection, and AI subtitle filtering. Non-default subtitle AI policy requires `download_subtitles`, and explicit danmaku formats require `download_danmaku`, so unsupported combinations fail in the control-plane adapter instead of being silently ignored.
 - Complete-download Bilibili tasks use `BBDown-rust` `v0.5.0` native download progress and cancellation APIs. The adapter maps coalesced `DownloadProgressEvent` file-level byte updates into the existing task `progress`, `downloaded_bytes`, `total_bytes`, and `message` fields, and bridges running task cancellation into `DownloadCancellationToken` so BBDown can unwind partial downloads through its own cancellation path. Planning cancellation still uses the cache-server polling helper because the planning API has no standalone cancellation token in this release.
+
+Resolver settings and PGC routing:
+
+- `SERVER_CAPABILITY_RESOLVER_SETTINGS_WRITE` gates `ServerService.GetResolverSettings` and `UpdateResolverSettings`. The shared tvOS/macOS settings editor can disable bundled endpoints or add credential-free HTTPS origins, including optional ports. Updates use an optimistic revision; settings live beside `Cache:TaskStatePath` in `resolver-settings.json`, not in client preferences.
+- The bundled BBDown catalog is a candidate list, not a claim of current availability. Credential-free, redirect-disabled connection probes and recent host health select a small bounded subset instead of contacting every enabled endpoint during playback.
+- PGC Web planning can independently try the official route and a selected Web API proxy. Mainland routing is the default; metadata/title hints and confirmed content/series affinity can select HK/TW routes. Explicit TV/APP modes and operator-configured restricted routes keep their existing behavior.
+- A single official Web result matching a direct episode input can return without waiting for auxiliary affinity metadata. Failed auxiliary metadata cannot veto that result. Season/media inputs and proxy results still require the resolved identity checks; all planning remains cancellation-aware and bounded by the operation deadline.
+- Only a genuine official region restriction plus a successful same-episode proxy result trains expiring content/series affinity in `resolver-routing-memory.json`. Login, membership, timeout, and generic server errors do not establish a region block. Fresh planning revalidates episode identity and settings revision; cancelled or obsolete attempts cannot update affinity.
+- The control API is currently unauthenticated. A client that can reach it can redirect resolver requests and the selected profile's shared `access_key` to an enabled third-party endpoint. Both clients display this warning. Proxy calls remain Web-only and do not forward the Web cookie; clients never read or write raw credentials through these RPCs. Exposing the control listener outside a trusted boundary requires separate transport/access protection.
 
 Playback planning foundation:
 
