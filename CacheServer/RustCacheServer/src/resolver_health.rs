@@ -25,10 +25,18 @@ struct HostHealth {
     last_probe: Option<Instant>,
     last_success: Option<Instant>,
     last_failure: Option<Instant>,
+    latest_outcome: Option<ProbeOutcome>,
+    revalidation_due: bool,
     last_updated: Instant,
     first_response_ewma_micros: Option<u64>,
     consecutive_connectivity_failures: u32,
     cooldown_until: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeOutcome {
+    Success,
+    TransportFailure,
 }
 
 #[derive(Default)]
@@ -45,6 +53,9 @@ impl ResolverHealthTracker {
         if health.cooldown_until.is_some_and(|until| now < until) {
             return false;
         }
+        if health.revalidation_due {
+            return true;
+        }
         health.last_probe.is_none_or(|probe| {
             now.checked_duration_since(probe)
                 .is_none_or(|age| age.as_secs() >= PROBE_REFRESH_SECS)
@@ -54,10 +65,12 @@ impl ResolverHealthTracker {
     pub(crate) fn recently_healthy(&mut self, host_id: &str, now: Instant) -> bool {
         self.expire_old(now);
         self.hosts.get(host_id).is_some_and(|health| {
-            health.last_success.is_some_and(|success| {
-                now.checked_duration_since(success)
-                    .is_some_and(|age| age.as_secs() < PROBE_REFRESH_SECS)
-            }) && health.cooldown_until.is_none_or(|until| now >= until)
+            health.latest_outcome == Some(ProbeOutcome::Success)
+                && health.last_success.is_some_and(|success| {
+                    now.checked_duration_since(success)
+                        .is_some_and(|age| age.as_secs() < PROBE_REFRESH_SECS)
+                })
+                && health.cooldown_until.is_none_or(|until| now >= until)
         })
     }
 
@@ -76,6 +89,8 @@ impl ResolverHealthTracker {
             last_probe: None,
             last_success: None,
             last_failure: None,
+            latest_outcome: None,
+            revalidation_due: false,
             last_updated: now,
             first_response_ewma_micros: None,
             consecutive_connectivity_failures: 0,
@@ -88,6 +103,8 @@ impl ResolverHealthTracker {
         });
         entry.last_probe = Some(now);
         entry.last_success = Some(now);
+        entry.latest_outcome = Some(ProbeOutcome::Success);
+        entry.revalidation_due = false;
         entry.last_updated = now;
         entry.consecutive_connectivity_failures = 0;
         entry.cooldown_until = None;
@@ -115,6 +132,8 @@ impl ResolverHealthTracker {
             last_probe: None,
             last_success: None,
             last_failure: None,
+            latest_outcome: None,
+            revalidation_due: false,
             last_updated: now,
             first_response_ewma_micros: None,
             consecutive_connectivity_failures: 0,
@@ -122,6 +141,8 @@ impl ResolverHealthTracker {
         });
         entry.last_probe = Some(now);
         entry.last_failure = Some(now);
+        entry.latest_outcome = Some(ProbeOutcome::TransportFailure);
+        entry.revalidation_due = true;
         entry.last_updated = now;
         entry.consecutive_connectivity_failures =
             entry.consecutive_connectivity_failures.saturating_add(1);
@@ -144,12 +165,15 @@ impl ResolverHealthTracker {
             last_probe: None,
             last_success: None,
             last_failure: None,
+            latest_outcome: None,
+            revalidation_due: false,
             last_updated: now,
             first_response_ewma_micros: None,
             consecutive_connectivity_failures: 0,
             cooldown_until: None,
         });
         entry.last_probe = Some(now);
+        entry.revalidation_due = false;
         entry.last_updated = now;
         true
     }
@@ -212,7 +236,9 @@ fn validate_host_id(host_id: &str) -> Result<String, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_HOSTS, ProbeFailure, RECORD_TTL_SECS, ResolverHealthTracker};
+    use super::{
+        MAX_HOSTS, PROBE_REFRESH_SECS, ProbeFailure, RECORD_TTL_SECS, ResolverHealthTracker,
+    };
     use std::time::{Duration, Instant};
 
     fn host(name: &str) -> String {
@@ -281,6 +307,73 @@ mod tests {
         }
         assert!(tracker.hosts.is_empty());
         assert!(tracker.record_failure("real-failure.example", now, ProbeFailure::Tls));
+    }
+
+    #[test]
+    fn connectivity_failures_invalidate_cached_success_and_are_reprobed_after_cooldown() {
+        for failure in [
+            ProbeFailure::Connectivity,
+            ProbeFailure::Tls,
+            ProbeFailure::Timeout,
+        ] {
+            let now = Instant::now();
+            let mut tracker = ResolverHealthTracker::default();
+            tracker.record_success("resolver.example", now, Duration::from_millis(10));
+            assert!(tracker.recently_healthy("resolver.example", now));
+            assert!(!tracker.probe_due("resolver.example", now));
+
+            tracker.record_failure("resolver.example", now, failure);
+            assert!(!tracker.recently_healthy("resolver.example", now));
+            assert!(!tracker.probe_due("resolver.example", now + Duration::from_secs(4)));
+            assert!(tracker.probe_due("resolver.example", now + Duration::from_secs(5)));
+
+            let revalidated_at = now + Duration::from_secs(5);
+            tracker.record_success(
+                "resolver.example",
+                revalidated_at,
+                Duration::from_millis(12),
+            );
+            assert!(tracker.recently_healthy("resolver.example", revalidated_at));
+            assert!(!tracker.probe_due("resolver.example", revalidated_at));
+            assert!(tracker.probe_due(
+                "resolver.example",
+                revalidated_at + Duration::from_secs(PROBE_REFRESH_SECS)
+            ));
+        }
+    }
+
+    #[test]
+    fn same_instant_outcomes_follow_recording_order() {
+        let now = Instant::now();
+        let mut tracker = ResolverHealthTracker::default();
+        tracker.record_success("resolver.example", now, Duration::from_millis(10));
+        tracker.record_failure("resolver.example", now, ProbeFailure::Connectivity);
+        assert!(!tracker.recently_healthy("resolver.example", now));
+        assert!(tracker.probe_due("resolver.example", now + Duration::from_secs(5)));
+
+        tracker.record_success("resolver.example", now, Duration::from_millis(12));
+        assert!(tracker.recently_healthy("resolver.example", now));
+        assert!(!tracker.probe_due("resolver.example", now));
+    }
+
+    #[test]
+    fn neutral_probe_preserves_failure_invalidation_and_refresh_interval() {
+        let now = Instant::now();
+        let mut tracker = ResolverHealthTracker::default();
+        tracker.record_success("resolver.example", now, Duration::from_millis(10));
+        tracker.record_failure("resolver.example", now, ProbeFailure::Connectivity);
+        let neutral_probe_at = now + Duration::from_secs(5);
+        tracker.record_neutral_probe("resolver.example", neutral_probe_at);
+
+        assert!(!tracker.recently_healthy("resolver.example", neutral_probe_at));
+        assert!(!tracker.probe_due(
+            "resolver.example",
+            neutral_probe_at + Duration::from_secs(PROBE_REFRESH_SECS - 1)
+        ));
+        assert!(tracker.probe_due(
+            "resolver.example",
+            neutral_probe_at + Duration::from_secs(PROBE_REFRESH_SECS)
+        ));
     }
 
     #[test]

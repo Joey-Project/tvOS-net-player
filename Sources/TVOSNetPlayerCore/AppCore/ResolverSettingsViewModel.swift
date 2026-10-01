@@ -260,7 +260,12 @@ public final class ResolverSettingsViewModel: ObservableObject {
     }
 
     private func hostID(for origin: String) -> String {
-        URLComponents(string: origin)?.host?.lowercased() ?? origin.lowercased()
+        guard let components = URLComponents(string: origin), let host = components.host else {
+            return origin.lowercased()
+        }
+        let normalizedHost = host.lowercased()
+        guard let port = components.port, port != 443 else { return normalizedHost }
+        return "\(normalizedHost):\(port)"
     }
 
     private static func message(for error: Error) -> String {

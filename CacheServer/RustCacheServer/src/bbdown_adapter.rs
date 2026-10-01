@@ -2493,7 +2493,17 @@ async fn run_resolver_future_until_current<T>(
             return Err(resolver_settings_changed());
         }
         tokio::select! {
-            result = &mut future => return result,
+            result = &mut future => {
+                if is_cancel_requested() {
+                    return Err(BilibiliDownloadError::Cancelled(
+                        cancellation_message.to_owned(),
+                    ));
+                }
+                if !is_resolver_settings_current(settings_store, expected_revision) {
+                    return Err(resolver_settings_changed());
+                }
+                return result;
+            }
             () = sleep(Duration::from_millis(100)) => {}
             () = &mut deadline => return Err(BilibiliDownloadError::Failed(
                 "Resolver routing exceeded its planning deadline; retry the request.".to_owned(),
@@ -8083,6 +8093,88 @@ mod tests {
             BilibiliDownloadError::Failed(message) if message.contains("settings changed")
         ));
         assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn resolver_ready_result_is_rejected_when_revision_changes_during_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            ResolverSettingsStore::load(temp.path().join("resolver-settings.json")).unwrap();
+        let snapshot = store.snapshot();
+        let operation_store = store.clone();
+        let operation_revision = snapshot.revision;
+        let operation = std::future::poll_fn(move |_| {
+            operation_store
+                .update(
+                    crate::resolver_settings::ResolverSettings {
+                        disabled_builtin_host_ids: vec!["future.example".to_owned()],
+                        ..crate::resolver_settings::ResolverSettings::default()
+                    },
+                    operation_revision,
+                )
+                .unwrap();
+            std::task::Poll::Ready(Ok::<_, BilibiliDownloadError>(42))
+        });
+
+        let error = run_resolver_future_until_current(
+            operation,
+            &|| false,
+            &store,
+            snapshot.revision,
+            "cancelled",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BilibiliDownloadError::Failed(message) if message.contains("settings changed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolver_ready_result_is_rejected_when_cancelled_during_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            ResolverSettingsStore::load(temp.path().join("resolver-settings.json")).unwrap();
+        let snapshot = store.snapshot();
+        let cancel_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_cancel = Arc::clone(&cancel_requested);
+        let operation = std::future::poll_fn(move |_| {
+            operation_cancel.store(true, std::sync::atomic::Ordering::Release);
+            std::task::Poll::Ready(Ok::<_, BilibiliDownloadError>(42))
+        });
+
+        let error = run_resolver_future_until_current(
+            operation,
+            &|| cancel_requested.load(std::sync::atomic::Ordering::Acquire),
+            &store,
+            snapshot.revision,
+            "cancelled during poll",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BilibiliDownloadError::Cancelled(message) if message == "cancelled during poll"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolver_ready_result_is_accepted_when_revision_and_cancellation_are_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            ResolverSettingsStore::load(temp.path().join("resolver-settings.json")).unwrap();
+        let snapshot = store.snapshot();
+        let result = run_resolver_future_until_current(
+            async { Ok::<_, BilibiliDownloadError>(42) },
+            &|| false,
+            &store,
+            snapshot.revision,
+            "cancelled",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
     }
 
     #[test]

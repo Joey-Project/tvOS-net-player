@@ -180,6 +180,61 @@ final class ResolverSettingsViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCustomEndpointIdentityIncludesNonDefaultPortAndCanonicalizes443() async throws {
+        let model = ResolverSettingsViewModel(
+            client: ResolverSettingsClient(settingsResults: [.success(resolverSnapshot(revision: 1))])
+        )
+        await model.load()
+
+        try model.addCustom(name: "8443", origin: "https://builtin.example:8443", regions: [.all])
+        try model.addCustom(name: "9443", origin: "https://builtin.example:9443", regions: [.all])
+        XCTAssertThrowsError(
+            try model.addCustom(name: "Duplicate 8443", origin: "https://BUILTIN.example:8443/", regions: [.all])
+        ) { error in
+            XCTAssertEqual(error as? ResolverSettingsValidationError, .duplicateHost)
+        }
+
+        try model.addCustom(name: "Default port", origin: "https://default-port.example:443", regions: [.all])
+        XCTAssertEqual(model.customEndpoints.last?.origin, "https://default-port.example/")
+        XCTAssertThrowsError(
+            try model.addCustom(name: "Duplicate default port", origin: "https://default-port.example", regions: [.all])
+        ) { error in
+            XCTAssertEqual(error as? ResolverSettingsValidationError, .duplicateHost)
+        }
+    }
+
+    @MainActor
+    func testPersistedPortedBuiltinHostnameCanBeEditedAndToggled() async throws {
+        let initial = ResolverSettingsSnapshot(
+            builtin: resolverBuiltinFixture,
+            disabledBuiltinHostIDs: [],
+            custom: [
+                ResolverCustomEndpoint(
+                    name: "Ported custom",
+                    origin: "https://builtin.example:8443/",
+                    regions: [.all],
+                    enabled: true
+                )
+            ],
+            revision: 1
+        )
+        let model = ResolverSettingsViewModel(client: ResolverSettingsClient(settingsResults: [.success(initial)]))
+        await model.load()
+
+        try model.updateCustom(
+            at: 0,
+            name: "Updated ported custom",
+            origin: "https://builtin.example:8443",
+            regions: [.hk],
+            enabled: false
+        )
+
+        XCTAssertEqual(model.customEndpoints.first?.name, "Updated ported custom")
+        XCTAssertEqual(model.customEndpoints.first?.origin, "https://builtin.example:8443/")
+        XCTAssertFalse(model.customEndpoints.first?.enabled ?? true)
+    }
+
+    @MainActor
     func testSecurityWarningNamesUnauthenticatedControlAndSharedKeyDisclosure() {
         let warning = ResolverSettingsViewModel.securityWarning.lowercased()
         XCTAssertTrue(warning.contains("no authentication"))
@@ -308,6 +363,13 @@ final class ResolverSettingsViewModelTests: XCTestCase {
             ],
             revision: revision
         )
+    }
+
+    private var resolverBuiltinFixture: [ResolverEndpoint] {
+        [
+            ResolverEndpoint(
+                hostID: "builtin.example", name: "Bundled", origin: "https://builtin.example/", regions: [.all])
+        ]
     }
 }
 
