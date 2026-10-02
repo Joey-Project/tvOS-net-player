@@ -765,7 +765,7 @@ async fn send_hls_upstream_request(
         || declared_body_bytes
             .zip(expected_body_bytes)
             .is_some_and(|(declared, expected)| declared != expected);
-    if status.is_success() && !head_only && body_length_invalid {
+    if status.is_success() && body_length_invalid {
         if let Some(observation_url) = observation_url.as_deref() {
             record_cdn_observation(
                 &context.state.state.cdn_history,
@@ -780,13 +780,15 @@ async fn send_hls_upstream_request(
                 ),
             );
         }
-        return Ok(HlsUpstreamResponse {
-            response: text_response(
-                StatusCode::BAD_GATEWAY,
-                "HLS upstream returned inconsistent byte-range headers.\n",
-                head_only,
-            ),
-        });
+        if !head_only {
+            return Ok(HlsUpstreamResponse {
+                response: text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "HLS upstream returned inconsistent byte-range headers.\n",
+                    head_only,
+                ),
+            });
+        }
     }
 
     if !status.is_success()
@@ -806,6 +808,7 @@ async fn send_hls_upstream_request(
 
     if head_only
         && status.is_success()
+        && !body_length_invalid
         && let Some(observation_url) = observation_url.as_deref()
     {
         record_cdn_observation(
@@ -825,7 +828,7 @@ async fn send_hls_upstream_request(
     let mut response = Response::builder()
         .status(status)
         .body(if head_only {
-            if status.is_success() {
+            if status.is_success() && !body_length_invalid {
                 context
                     .policy_recorder
                     .record_upstream_success(context.variant_id, response_time);
@@ -1775,7 +1778,7 @@ async fn build_prewarmed_spliced_file_response(
                 observation_candidate_url(&context.resource.request, &tail.final_url),
                 tail.started_at,
                 Some(true),
-                Some(range.length()),
+                Some(tail.length),
                 tail.content_length_validated,
             ),
         )
@@ -1815,6 +1818,7 @@ struct HlsUpstreamTailResponse {
     response_time: Duration,
     started_at: Instant,
     final_url: String,
+    length: u64,
     content_length_validated: bool,
 }
 
@@ -1940,6 +1944,7 @@ async fn open_hls_upstream_tail_response(
             response_time,
             started_at,
             final_url,
+            length: expected_range.length(),
             content_length_validated: declared_body_bytes
                 .is_some_and(|length| length == expected_range.length()),
         });
@@ -3457,7 +3462,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let mut session = hls_session("session-1", &upstream_url);
+        let backup_url = "https://backup.example/video.m4s".to_owned();
+        let mut session =
+            hls_session_with_backups("session-1", &upstream_url, vec![backup_url.clone()]);
         session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
         session.variant.video.request.bandwidth = Some(0);
         state
@@ -3472,7 +3479,23 @@ mod tests {
             .prewarmed_resource(&session.id, "video.m4s")
             .expect("prewarm metadata should load");
         assert!(prewarmed.prefix_length < prewarmed.total_length);
-        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
+        let request = session.variant.video.request.clone();
+        state.cdn_history.record_request(
+            &request,
+            &upstream_url,
+            CdnObservation::playback_complete(
+                4096,
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+                Some(true),
+            ),
+        );
+        assert_eq!(
+            upstream_url,
+            state.cdn_history.rank_request(&request)[0],
+            "known-healthy primary should be selected ahead of an unknown backup"
+        );
+        insert_authorized_hls_session(&state, session);
 
         let initialization_length = prewarmed.initialization_length;
         let mut headers = HeaderMap::new();
@@ -3485,7 +3508,7 @@ mod tests {
             .expect("range header should be valid"),
         );
         let response = hls_segment_get(
-            State(MediaState::new(state)),
+            State(MediaState::new(state.clone())),
             Path(("session-1".to_owned(), "video.m4s".to_owned())),
             headers,
         )
@@ -3505,6 +3528,97 @@ mod tests {
             &large_fake_mp4()[usize::try_from(initialization_length).unwrap()..],
             &body[..]
         );
+        assert_eq!(
+            upstream_url,
+            state.cdn_history.rank_request(&request)[0],
+            "fully consumed valid tail should keep the primary ahead of the backup"
+        );
+        let snapshot = state.hls_network_policy.snapshot();
+        assert_eq!(0, snapshot.retrying_variant_count);
+        assert_eq!(0, snapshot.degraded_session_count);
+    }
+
+    #[tokio::test]
+    async fn hls_segment_spliced_truncated_upstream_tail_is_quarantined() {
+        let (prewarm_url, _prewarm_task) = start_hls_large_mp4_upstream().await;
+        let (truncated_url, _truncated_task) = start_hls_truncated_tail_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let backup_url = "https://backup.example/video.m4s".to_owned();
+        let mut prewarm_session =
+            hls_session_with_backups("session-1", &prewarm_url, vec![backup_url.clone()]);
+        prewarm_session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
+        prewarm_session.variant.video.request.bandwidth = Some(0);
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(
+                &state.hls_upstream_client,
+                &prewarm_session,
+                || crate::hls_cache::HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("session should prewarm");
+        let mut playback_session =
+            hls_session_with_backups("session-1", &truncated_url, vec![backup_url.clone()]);
+        playback_session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
+        playback_session.variant.video.request.bandwidth = Some(0);
+        let request = playback_session.variant.video.request.clone();
+        state.cdn_history.record_request(
+            &request,
+            &truncated_url,
+            CdnObservation::playback_complete(
+                4096,
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+                Some(true),
+            ),
+        );
+        assert_eq!(truncated_url, state.cdn_history.rank_request(&request)[0]);
+        insert_authorized_hls_session(&state, playback_session);
+
+        let prewarmed = state
+            .hls_cache
+            .prewarmed_resource("session-1", "video.m4s")
+            .expect("prewarm metadata should load");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes={}-{}",
+                prewarmed.initialization_length,
+                prewarmed.total_length - 1
+            ))
+            .expect("range header should be valid"),
+        );
+        let response = hls_segment_get(
+            State(MediaState::new(state.clone())),
+            Path(("session-1".to_owned(), "video.m4s".to_owned())),
+            headers,
+        )
+        .await;
+
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("short but cleanly terminated tail should reach the client");
+        assert!(
+            body.len()
+                < usize::try_from(prewarmed.total_length - prewarmed.initialization_length)
+                    .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.cdn_history.rank_request(&request)[0] != backup_url {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("truncated tail should quarantine its CDN representation");
     }
 
     #[tokio::test]
@@ -3831,6 +3945,141 @@ mod tests {
         );
         assert_eq!(0, snapshot.retrying_variant_count);
         assert_eq!(0, snapshot.degraded_session_count);
+    }
+
+    #[tokio::test]
+    async fn hls_head_with_conflicting_length_does_not_clear_cdn_quarantine() {
+        let (wrong_url, _wrong_task) = start_hls_conflicting_head_upstream().await;
+        let (correct_url, _correct_task) = start_hls_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let backup_url = correct_url.clone();
+        let wrong_request = media_request(&wrong_url, vec![backup_url.clone()]);
+        state.cdn_history.record_request(
+            &wrong_request,
+            &wrong_url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::IntegrityMismatch,
+            ),
+        );
+        let wrong_session =
+            hls_session_with_backups("session-1", &wrong_url, vec![backup_url.clone()]);
+        let wrong_resource = wrong_session.variant.video.clone();
+        let wrong_generation = insert_authorized_hls_session(&state, wrong_session);
+        let wrong_media_state = MediaState::new(state.clone());
+        let wrong_policy_recorder = HlsNetworkPolicyRecorder::new(
+            &wrong_media_state,
+            "session-1".to_owned(),
+            wrong_generation,
+            WeakNetworkPreference::Adaptive,
+        );
+        let before_wrong_head = state.cdn_history.rank_request(&wrong_request);
+        assert_eq!(backup_url, before_wrong_head[0]);
+
+        let wrong_response = send_hls_upstream_request(
+            HlsMediaProxyContext {
+                state: &wrong_media_state,
+                variant_id: "h264",
+                resource: &wrong_resource,
+                policy_recorder: &wrong_policy_recorder,
+            },
+            &wrong_url,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .expect("wrong HEAD response should arrive")
+        .response;
+
+        assert_eq!(StatusCode::OK, wrong_response.status());
+        assert_eq!(
+            Some(&HeaderValue::from_static("999")),
+            wrong_response.headers().get(CONTENT_LENGTH)
+        );
+        assert!(
+            to_bytes(wrong_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            before_wrong_head,
+            state.cdn_history.rank_request(&wrong_request),
+            "conflicting HEAD metadata must not clear representation quarantine"
+        );
+        let correct_state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("correct-tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let correct_request = media_request(
+            &correct_url,
+            vec!["http://127.0.0.1:9/backup.m4s".to_owned()],
+        );
+        correct_state.cdn_history.record_request(
+            &correct_request,
+            &correct_url,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::IntegrityMismatch,
+            ),
+        );
+        assert_eq!(
+            "http://127.0.0.1:9/backup.m4s",
+            correct_state.cdn_history.rank_request(&correct_request)[0],
+            "the quarantined representation should rank behind the unknown control"
+        );
+        let correct_session = hls_session_with_backups(
+            "session-1",
+            &correct_url,
+            vec!["http://127.0.0.1:9/backup.m4s".to_owned()],
+        );
+        let correct_resource = correct_session.variant.video.clone();
+        let correct_generation = insert_authorized_hls_session(&correct_state, correct_session);
+        let correct_media_state = MediaState::new(correct_state.clone());
+        let correct_policy_recorder = HlsNetworkPolicyRecorder::new(
+            &correct_media_state,
+            "session-1".to_owned(),
+            correct_generation,
+            WeakNetworkPreference::Adaptive,
+        );
+        let correct_response = send_hls_upstream_request(
+            HlsMediaProxyContext {
+                state: &correct_media_state,
+                variant_id: "h264",
+                resource: &correct_resource,
+                policy_recorder: &correct_policy_recorder,
+            },
+            &correct_url,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .expect("consistent HEAD response should arrive")
+        .response;
+
+        assert_eq!(StatusCode::OK, correct_response.status());
+        assert_eq!(
+            Some(fake_mp4().len() as u64),
+            correct_response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        );
+        assert_eq!(
+            correct_url,
+            correct_state.cdn_history.rank_request(&correct_request)[0],
+            "a consistent HEAD should clear quarantine as the control"
+        );
     }
 
     #[tokio::test]
@@ -4170,6 +4419,40 @@ mod tests {
         (format!("http://{addr}/video.m4s"), task)
     }
 
+    async fn start_hls_truncated_tail_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/video.m4s", get(upstream_truncated_tail_get)),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
+    async fn start_hls_conflicting_head_upstream() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/video.m4s", axum::routing::head(upstream_conflicting_head)),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        (format!("http://{addr}/video.m4s"), task)
+    }
+
     async fn start_hls_range_ignored_upstream() -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4322,6 +4605,40 @@ mod tests {
 
     async fn upstream_large_mp4_head(headers: HeaderMap) -> Response<Body> {
         upstream_large_mp4_response(headers, true)
+    }
+
+    async fn upstream_truncated_tail_get(headers: HeaderMap) -> Response<Body> {
+        let data = large_fake_mp4();
+        let Some(range_header) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
+            return upstream_large_mp4_response(headers, false);
+        };
+        let Some((start, end)) = parse_test_range(range_header, data.len()) else {
+            return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+        };
+        if start == 0 {
+            return upstream_large_mp4_response(headers, false);
+        }
+
+        let truncated = Bytes::from(data[start..=(start + 63).min(end)].to_vec());
+        let body = Body::from_stream(futures_util::stream::iter([Ok::<_, Infallible>(truncated)]));
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{}", data.len()))
+            .body(body)
+            .expect("truncated range response should build")
+    }
+
+    async fn upstream_conflicting_head(headers: HeaderMap) -> Response<Body> {
+        if headers.get("referer") != Some(&HeaderValue::from_static("https://www.bilibili.com")) {
+            return empty_response(StatusCode::FORBIDDEN);
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_LENGTH, "999")
+            .body(Body::empty())
+            .expect("conflicting HEAD response should build")
     }
 
     async fn upstream_forbidden() -> Response<Body> {
