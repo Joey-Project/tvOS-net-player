@@ -1974,7 +1974,16 @@ impl LiveTestServer {
     async fn shutdown(mut self, task_tracker: &LiveTaskTracker) -> Result<(), String> {
         let listener_result = self.stop_listeners().await;
         let background_result = self.cancel_case_tasks_and_wait(task_tracker).await;
-        self.finish_teardown(combine_teardown_results(listener_result, background_result))
+        let history_result = tokio::time::timeout(
+            LIVE_CASE_TEARDOWN_TIMEOUT,
+            self.state.shutdown_cdn_history_writer(),
+        )
+        .await
+        .map_err(|_| "CDN history persistence did not become idle".to_owned());
+        self.finish_teardown(combine_teardown_results(
+            combine_teardown_results(listener_result, background_result),
+            history_result,
+        ))
     }
 
     fn temp_root_path(&self) -> &Path {

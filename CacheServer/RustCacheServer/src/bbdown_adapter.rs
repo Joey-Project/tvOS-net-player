@@ -43,6 +43,7 @@ use crate::{
         BilibiliDownloadRequest, BilibiliTaskResourceBody, BilibiliTaskResourceBodySource,
         BilibiliTaskResourceCacheFile, BilibiliTaskResourceCacheFileIdentity,
     },
+    cdn_history::{CdnHistory, CdnObservation},
     config::{
         BbdownRestrictedArea as CacheBbdownRestrictedArea,
         BbdownRestrictedProxy as CacheBbdownRestrictedProxy, CacheServerOptions,
@@ -70,6 +71,7 @@ use crate::{
     task_output::TaskResourceRecord,
     task_registry::BilibiliTaskProgress,
 };
+use url::Url;
 use uuid::Uuid;
 
 const DOWNLOAD_PROGRESS_START: f64 = 0.10;
@@ -145,6 +147,7 @@ pub struct BbdownBilibiliAdapter {
     tv_client_config: ClientConfig,
     resolver_settings: Option<Arc<ResolverSettingsStore>>,
     resolver_routing: Option<Arc<ResolverRoutingState>>,
+    cdn_history: Option<Arc<CdnHistory>>,
     library: Arc<LocalMediaLibrary>,
     output_dir: PathBuf,
     archive_path: PathBuf,
@@ -460,6 +463,11 @@ impl BbdownBilibiliAdapter {
         )
     }
 
+    pub(crate) fn with_cdn_history(mut self, history: Arc<CdnHistory>) -> Self {
+        self.cdn_history = Some(history);
+        self
+    }
+
     fn new_with_optional_resolver_routing(
         options: Arc<CacheServerOptions>,
         library: Arc<LocalMediaLibrary>,
@@ -476,6 +484,7 @@ impl BbdownBilibiliAdapter {
             tv_client_config,
             resolver_settings,
             resolver_routing,
+            cdn_history: None,
             library,
             output_dir: options.bbdown_output_dir(),
             archive_path: options.bbdown_archive_path(),
@@ -517,7 +526,7 @@ impl BbdownBilibiliAdapter {
             "Planning Bilibili download with BBDown core.",
         ));
         let selection = default_selection_for_input(&input);
-        let plan = match self
+        let mut plan = match self
             .plan_with_resolver_routing(
                 client_config,
                 input,
@@ -530,6 +539,9 @@ impl BbdownBilibiliAdapter {
             PlannedPgcPlan::Download(plan) => plan,
             PlannedPgcPlan::Playback(_) => unreachable!("download planning returned playback"),
         };
+        if let Some(history) = &self.cdn_history {
+            rank_download_plan_candidates(&mut plan, history);
+        }
 
         if context.is_cancel_requested() {
             return Err(BilibiliDownloadError::Cancelled(
@@ -550,7 +562,11 @@ impl BbdownBilibiliAdapter {
 
         let mut archive = DownloadArchive::load(&self.archive_path).map_err(failed)?;
         let download_cancellation = DownloadCancellationToken::new();
-        let download_progress = BilibiliBbdownProgressSink::new(context.clone());
+        let download_progress = BilibiliBbdownProgressSink::new(
+            context.clone(),
+            self.cdn_history.clone(),
+            download_origin_candidates(&plan),
+        );
         let report = run_bbdown_download_until_cancelled(
             client.download_plan_with_archive_decision_with_progress_and_cancellation(
                 &plan,
@@ -750,7 +766,7 @@ impl BbdownBilibiliAdapter {
                 ),
             ));
 
-            let plan = match self
+            let mut plan = match self
                 .plan_download_candidate(&client_config, &input, candidate, || {
                     context.is_cancel_requested()
                 })
@@ -771,6 +787,9 @@ impl BbdownBilibiliAdapter {
                     continue;
                 }
             };
+            if let Some(history) = &self.cdn_history {
+                rank_download_plan_candidates(&mut plan, history);
+            }
 
             let candidate_output = match self
                 .prepare_v2_candidate_output_directory(&output_directories, offset)
@@ -794,6 +813,8 @@ impl BbdownBilibiliAdapter {
             let download_options = download_options_for_output_dir(
                 candidate_output.path.clone(),
                 request.options.as_ref(),
+                self.options.bbdown_cdn_probe,
+                self.options.bbdown_cdn_parallelism,
             )?;
 
             let download_cancellation = DownloadCancellationToken::new();
@@ -803,6 +824,8 @@ impl BbdownBilibiliAdapter {
                 request.candidates.len(),
                 completed_downloaded_bytes,
                 total_bytes_floor,
+                self.cdn_history.clone(),
+                download_origin_candidates(&plan),
             );
             let mut candidate_archive = archive.stage_candidate();
             let report = match run_bbdown_download_until_cancelled(
@@ -1598,7 +1621,12 @@ impl BbdownBilibiliAdapter {
         options: Option<&BilibiliDownloadOptions>,
     ) -> Result<DownloadOptions, BilibiliDownloadError> {
         validate_legacy_download_mode(options)?;
-        download_options_for_output_dir(self.output_dir.clone(), options)
+        download_options_for_output_dir(
+            self.output_dir.clone(),
+            options,
+            self.options.bbdown_cdn_probe,
+            self.options.bbdown_cdn_parallelism,
+        )
     }
 
     #[cfg(test)]
@@ -2929,6 +2957,224 @@ fn failed(error: impl Display) -> BilibiliDownloadError {
     BilibiliDownloadError::Failed(format!("BBDown adapter failed: {error}"))
 }
 
+#[derive(Clone)]
+struct DownloadOriginCandidate {
+    entry_index: u32,
+    kind: DownloadFileKind,
+    urls: Vec<String>,
+}
+
+fn rank_download_plan_candidates(plan: &mut DownloadPlan, history: &CdnHistory) {
+    let playback_plan = PlaybackPlan::from_download_plan(plan, &[]);
+    for (entry, playback_entry) in plan.entries.iter_mut().zip(&playback_plan.entries) {
+        if entry.aid != playback_entry.aid || entry.cid != playback_entry.cid {
+            continue;
+        }
+        for variant in &playback_entry.variants {
+            for request in variant
+                .video
+                .iter()
+                .chain(variant.audio.iter())
+                .chain(variant.flv_segments.iter())
+            {
+                let app_request = BilibiliMediaRequest::from_core(request);
+                let ranked = history.rank_request(&app_request);
+                match request.kind {
+                    MediaRequestKind::Video => {
+                        let matches = entry
+                            .streams
+                            .videos
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, stream)| {
+                                Some(stream.id) == request.stream_id
+                                    && stream.base_url == request.url
+                                    && stream.backup_urls == request.backup_urls
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        if let [index] = matches.as_slice() {
+                            let stream = &mut entry.streams.videos[*index];
+                            reorder_candidate_urls(
+                                &mut stream.base_url,
+                                &mut stream.backup_urls,
+                                ranked,
+                            );
+                        }
+                    }
+                    MediaRequestKind::Audio => {
+                        let matches = entry
+                            .streams
+                            .audios
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, stream)| {
+                                Some(stream.id) == request.stream_id
+                                    && stream.base_url == request.url
+                                    && stream.backup_urls == request.backup_urls
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        if let [index] = matches.as_slice() {
+                            let stream = &mut entry.streams.audios[*index];
+                            reorder_candidate_urls(
+                                &mut stream.base_url,
+                                &mut stream.backup_urls,
+                                ranked,
+                            );
+                        }
+                    }
+                    MediaRequestKind::FlvSegment => {
+                        let matches = entry
+                            .streams
+                            .flv_segments
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, segment)| {
+                                segment.url == request.url
+                                    && segment.backup_urls == request.backup_urls
+                                    && segment.size == request.size
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        if let [index] = matches.as_slice() {
+                            let segment = &mut entry.streams.flv_segments[*index];
+                            reorder_candidate_urls(
+                                &mut segment.url,
+                                &mut segment.backup_urls,
+                                ranked,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reorder_candidate_urls(primary: &mut String, backups: &mut Vec<String>, ranked: Vec<String>) {
+    let mut seen = HashSet::new();
+    let original = std::iter::once(primary.clone())
+        .chain(backups.iter().cloned())
+        .filter(|url| seen.insert(url.clone()))
+        .collect::<Vec<_>>();
+    if original.is_empty() {
+        return;
+    }
+
+    let original_set = original.iter().cloned().collect::<HashSet<_>>();
+    let mut ordered = Vec::with_capacity(original.len());
+    seen.clear();
+    for url in ranked {
+        if original_set.contains(&url) && seen.insert(url.clone()) {
+            ordered.push(url);
+        }
+    }
+    ordered.extend(original.into_iter().filter(|url| seen.insert(url.clone())));
+    *primary = ordered.remove(0);
+    *backups = ordered;
+}
+
+fn download_origin_candidates(plan: &DownloadPlan) -> Vec<DownloadOriginCandidate> {
+    let mut candidates = Vec::new();
+    for entry in &plan.entries {
+        for (kind, streams) in [
+            (
+                DownloadFileKind::Video,
+                entry
+                    .streams
+                    .videos
+                    .iter()
+                    .map(|stream| (stream.base_url.as_str(), stream.backup_urls.as_slice()))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DownloadFileKind::Audio,
+                entry
+                    .streams
+                    .audios
+                    .iter()
+                    .map(|stream| (stream.base_url.as_str(), stream.backup_urls.as_slice()))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DownloadFileKind::FlvSegment,
+                entry
+                    .streams
+                    .flv_segments
+                    .iter()
+                    .map(|segment| (segment.url.as_str(), segment.backup_urls.as_slice()))
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            for (primary, backups) in streams {
+                candidates.push(DownloadOriginCandidate {
+                    entry_index: entry.index,
+                    kind: kind.clone(),
+                    urls: std::iter::once(primary.to_owned())
+                        .chain(backups.iter().cloned())
+                        .collect(),
+                });
+            }
+        }
+    }
+    candidates
+}
+
+fn unique_shard_origin_url(
+    candidates: &[DownloadOriginCandidate],
+    entry_index: u32,
+    kind: &DownloadFileKind,
+    host: &str,
+) -> Option<String> {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut origins = HashMap::<String, String>::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.entry_index == entry_index && &candidate.kind == kind)
+    {
+        for source in &candidate.urls {
+            let Ok(url) = Url::parse(source) else {
+                continue;
+            };
+            if !matches!(url.scheme(), "http" | "https")
+                || !url
+                    .host_str()
+                    .is_some_and(|url_host| url_host.eq_ignore_ascii_case(host))
+            {
+                continue;
+            }
+            origins
+                .entry(url.origin().ascii_serialization())
+                .or_insert_with(|| source.clone());
+        }
+    }
+    (origins.len() == 1)
+        .then(|| origins.into_values().next())
+        .flatten()
+}
+
+fn record_cdn_shard_observation(
+    history: &CdnHistory,
+    candidates: &[DownloadOriginCandidate],
+    event: &DownloadProgressEvent,
+) {
+    let DownloadProgressEvent::CdnShardCompleted {
+        entry_index,
+        kind,
+        host,
+        bytes,
+        ..
+    } = event
+    else {
+        return;
+    };
+    let Some(url) = unique_shard_origin_url(candidates, *entry_index, kind, host) else {
+        return;
+    };
+    history.record_origin(&url, CdnObservation::download_shard(*bytes));
+}
+
 fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
     BilibiliTaskProgress {
         progress: Some(progress),
@@ -2939,14 +3185,22 @@ fn progress(progress: f64, message: impl Into<String>) -> BilibiliTaskProgress {
 
 struct BilibiliBbdownProgressSink {
     context: BilibiliDownloadContext,
+    cdn_history: Option<Arc<CdnHistory>>,
+    origin_candidates: Vec<DownloadOriginCandidate>,
     accumulator: StdMutex<BilibiliBbdownProgressAccumulator>,
     v2_window: Option<BilibiliV2ProgressWindow>,
 }
 
 impl BilibiliBbdownProgressSink {
-    fn new(context: BilibiliDownloadContext) -> Self {
+    fn new(
+        context: BilibiliDownloadContext,
+        cdn_history: Option<Arc<CdnHistory>>,
+        origin_candidates: Vec<DownloadOriginCandidate>,
+    ) -> Self {
         Self {
             context,
+            cdn_history,
+            origin_candidates,
             accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
             v2_window: None,
         }
@@ -2958,9 +3212,13 @@ impl BilibiliBbdownProgressSink {
         total: usize,
         completed_downloaded_bytes: u64,
         total_bytes_floor: u64,
+        cdn_history: Option<Arc<CdnHistory>>,
+        origin_candidates: Vec<DownloadOriginCandidate>,
     ) -> Self {
         Self {
             context,
+            cdn_history,
+            origin_candidates,
             accumulator: StdMutex::new(BilibiliBbdownProgressAccumulator::default()),
             v2_window: Some(BilibiliV2ProgressWindow {
                 offset,
@@ -2995,6 +3253,9 @@ impl BilibiliBbdownProgressSink {
 
 impl DownloadProgressSink for BilibiliBbdownProgressSink {
     fn on_download_progress(&self, event: &DownloadProgressEvent) {
+        if let Some(history) = &self.cdn_history {
+            record_cdn_shard_observation(history, &self.origin_candidates, event);
+        }
         let progress = self
             .accumulator
             .lock()
@@ -4975,6 +5236,8 @@ fn validate_supported_download_options(
 fn download_options_for_output_dir(
     output_dir: PathBuf,
     options: Option<&BilibiliDownloadOptions>,
+    cdn_probe: bool,
+    cdn_parallelism: usize,
 ) -> Result<DownloadOptions, BilibiliDownloadError> {
     validate_supported_download_options(options)?;
 
@@ -4985,6 +5248,8 @@ fn download_options_for_output_dir(
         .with_subtitles(options.is_some_and(|options| options.download_subtitles))
         .with_subtitle_ai_policy(subtitle_ai_policy_from_options(options)?)
         .with_danmaku(options.is_some_and(|options| options.download_danmaku))
+        .with_cdn_probe(cdn_probe)
+        .with_cdn_parallelism(cdn_parallelism)
         .with_mux(MuxOptions::Disabled);
 
     if let Some(danmaku_formats) = danmaku_formats_from_options(options)? {
@@ -8777,9 +9042,13 @@ mod tests {
             download_mode: 0,
         };
 
-        let download_options =
-            download_options_for_output_dir(temp.path().join("bbdown-output"), Some(&options))
-                .expect("extended options should be supported");
+        let download_options = download_options_for_output_dir(
+            temp.path().join("bbdown-output"),
+            Some(&options),
+            true,
+            4,
+        )
+        .expect("extended options should be supported");
 
         assert_eq!(download_options.stream_selection.video_quality, Some(80));
         assert_eq!(
@@ -8795,9 +9064,78 @@ mod tests {
         assert!(download_options.sidecars.cover);
         assert!(download_options.sidecars.subtitles);
         assert!(download_options.sidecars.danmaku);
+        assert!(download_options.cdn_probe);
+        assert_eq!(download_options.cdn_parallelism, 4);
         assert_eq!(
             download_options.danmaku_formats.as_slice(),
             &[DanmakuFormat::Xml, DanmakuFormat::Ass]
+        );
+    }
+
+    #[test]
+    fn bbdown_download_options_keep_probe_opt_in_and_parallelism_default() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let download_options =
+            download_options_for_output_dir(temp.path().to_path_buf(), None, false, 2)
+                .expect("default download options should be supported");
+
+        assert!(!download_options.cdn_probe);
+        assert_eq!(2, download_options.cdn_parallelism);
+    }
+
+    #[test]
+    fn cdn_candidate_ranking_keeps_every_fresh_fallback_url() {
+        let original = "https://cdn-a.example.test/video?token=one".to_owned();
+        let preferred = "https://cdn-b.example.test/video?token=two".to_owned();
+        let mut primary = original.clone();
+        let mut backups = vec![preferred.clone()];
+
+        reorder_candidate_urls(
+            &mut primary,
+            &mut backups,
+            vec![
+                preferred.clone(),
+                "https://unplanned.example.test/".to_owned(),
+            ],
+        );
+
+        assert_eq!(preferred, primary);
+        assert_eq!(vec![original], backups);
+    }
+
+    #[test]
+    fn ambiguous_shard_host_does_not_choose_a_scheme_or_port() {
+        let candidates = vec![
+            DownloadOriginCandidate {
+                entry_index: 1,
+                kind: DownloadFileKind::Video,
+                urls: vec!["https://cdn.example.test/video?token=a".to_owned()],
+            },
+            DownloadOriginCandidate {
+                entry_index: 1,
+                kind: DownloadFileKind::Video,
+                urls: vec!["http://cdn.example.test:8080/video?token=b".to_owned()],
+            },
+        ];
+
+        assert_eq!(
+            None,
+            unique_shard_origin_url(&candidates, 1, &DownloadFileKind::Video, "cdn.example.test")
+        );
+    }
+
+    #[test]
+    fn unique_shard_origin_preserves_the_fresh_request_url() {
+        let source = "https://cdn.example.test:8443/video?token=original";
+        let candidates = vec![DownloadOriginCandidate {
+            entry_index: 1,
+            kind: DownloadFileKind::Video,
+            urls: vec![source.to_owned()],
+        }];
+
+        assert_eq!(
+            Some(source.to_owned()),
+            unique_shard_origin_url(&candidates, 1, &DownloadFileKind::Video, "CDN.EXAMPLE.TEST")
         );
     }
 
@@ -8825,9 +9163,14 @@ mod tests {
                 core_mode
             );
             assert_eq!(
-                download_options_for_output_dir(temp.path().to_path_buf(), Some(&options))
-                    .unwrap()
-                    .mode,
+                download_options_for_output_dir(
+                    temp.path().to_path_buf(),
+                    Some(&options),
+                    false,
+                    2
+                )
+                .unwrap()
+                .mode,
                 core_mode
             );
         }
@@ -11909,6 +12252,43 @@ mod tests {
             })
             .expect("plan complete should report progress");
         assert_eq!(Some(DOWNLOAD_PROGRESS_END), plan_completed.progress);
+    }
+
+    #[test]
+    fn cdn_shard_events_do_not_replace_file_progress_forwarding() {
+        let mut accumulator = BilibiliBbdownProgressAccumulator::default();
+        accumulator.record(&DownloadProgressEvent::PlanStarted {
+            title: "Example".to_owned(),
+            output_dir: PathBuf::from("out"),
+            entry_count: 1,
+        });
+
+        assert!(
+            accumulator
+                .record(&DownloadProgressEvent::CdnShardCompleted {
+                    entry_index: 1,
+                    entry_title: "Entry".to_owned(),
+                    kind: DownloadFileKind::Video,
+                    host: "cdn.example.test".to_owned(),
+                    bytes: 64,
+                })
+                .is_none()
+        );
+        let forwarded = accumulator
+            .record(&DownloadProgressEvent::FileProgress {
+                entry_index: 1,
+                entry_title: "Entry".to_owned(),
+                kind: DownloadFileKind::Video,
+                path: PathBuf::from("out/entry/video.m4s"),
+                bytes_delta: 64,
+                bytes_written: 64,
+                resumed_from: 0,
+                expected_size: Some(128),
+            })
+            .expect("file progress should still be forwarded");
+
+        assert_eq!(Some(0), forwarded.downloaded_bytes);
+        assert!(forwarded.progress.is_some());
     }
 
     #[test]
