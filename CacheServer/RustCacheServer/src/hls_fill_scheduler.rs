@@ -20,7 +20,7 @@ pub(crate) struct HlsFillScheduler {
 #[derive(Default)]
 struct HlsFillSchedulerInner {
     foreground: VecDeque<HlsFillJob>,
-    demoted: Vec<HlsFillJob>,
+    demoted: VecDeque<HlsFillJob>,
     current: Option<HlsFillCurrentJob>,
     worker_started: bool,
     closed: bool,
@@ -113,7 +113,11 @@ impl HlsFillScheduler {
                 if inner.closed {
                     return None;
                 }
-                if let Some(job) = inner.foreground.pop_back().or_else(|| inner.demoted.pop()) {
+                if let Some(job) = inner
+                    .foreground
+                    .pop_back()
+                    .or_else(|| inner.demoted.pop_front())
+                {
                     inner.current = Some(HlsFillCurrentJob { job: job.clone() });
                     return Some(job);
                 }
@@ -140,7 +144,7 @@ impl HlsFillScheduler {
             && !inner.has_queued_session(&current.job.session.id);
         if should_requeue {
             let job = inner.refresh_job(current.job, HlsFillPriority::Demoted);
-            inner.demoted.push(job);
+            inner.demoted.push_back(job);
         }
         drop(inner);
         self.current_finished.notify_waiters();
@@ -251,7 +255,7 @@ impl HlsFillScheduler {
             inner.foreground.clear();
             inner.demoted.clear();
             if let Some(current) = inner.current.as_ref() {
-                current.job.token.cancel();
+                current.job.token.preempt();
             }
         }
         self.notify.notify_waiters();
@@ -366,7 +370,7 @@ impl HlsFillScheduler {
         let job = inner.create_job(task_id, session, failure_mode, priority);
         match priority {
             HlsFillPriority::Foreground => inner.foreground.push_back(job),
-            HlsFillPriority::Demoted => inner.demoted.push(job),
+            HlsFillPriority::Demoted => inner.demoted.push_back(job),
         }
 
         let should_start_worker = !inner.worker_started;
@@ -424,7 +428,7 @@ impl HlsFillSchedulerInner {
             .demoted
             .iter()
             .position(|job| job.session.id == session_id)?;
-        Some(self.demoted.remove(index))
+        self.demoted.remove(index)
     }
 
     fn has_queued_session(&self, session_id: &str) -> bool {
@@ -521,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demoted_fill_queue_is_lifo() {
+    async fn demoted_fill_queue_is_fifo_when_foreground_is_idle() {
         let scheduler = HlsFillScheduler::default();
         assert!(scheduler.enqueue_demoted(
             "older-task".to_owned(),
@@ -537,12 +541,41 @@ mod tests {
         assert!(scheduler.owns_session("newer-task"));
 
         let first = scheduler.next_job().await;
-        assert_eq!("newer-task", first.task_id);
-        assert!(scheduler.owns_session("newer-task"));
+        assert_eq!("older-task", first.task_id);
+        assert!(scheduler.owns_session("older-task"));
         scheduler.finish_current(&first, false);
-        assert!(!scheduler.owns_session("newer-task"));
+        assert!(!scheduler.owns_session("older-task"));
         let second = scheduler.next_job().await;
-        assert_eq!("older-task", second.task_id);
+        assert_eq!("newer-task", second.task_id);
+    }
+
+    #[tokio::test]
+    async fn foreground_work_remains_newest_first_ahead_of_fifo_demoted_work() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_demoted(
+            "old-background".to_owned(),
+            sample_session("old-background"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!scheduler.enqueue_foreground(
+            "older-foreground".to_owned(),
+            sample_session("older-foreground"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        assert!(!scheduler.enqueue_foreground(
+            "newest-foreground".to_owned(),
+            sample_session("newest-foreground"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+
+        let newest = scheduler.next_job().await;
+        assert_eq!("newest-foreground", newest.task_id);
+        scheduler.finish_current(&newest, false);
+        let older = scheduler.next_job().await;
+        assert_eq!("older-foreground", older.task_id);
+        scheduler.finish_current(&older, false);
+        let background = scheduler.next_job().await;
+        assert_eq!("old-background", background.task_id);
     }
 
     #[tokio::test]
@@ -662,6 +695,33 @@ mod tests {
             sample_session("session-b"),
             HlsCacheFinalizationFailureMode::KeepPlayable,
         ));
+        assert!(scheduler.is_idle());
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_preempts_current_fill_without_cancelling_it() {
+        let scheduler = HlsFillScheduler::default();
+        assert!(scheduler.enqueue_foreground(
+            "task-a".to_owned(),
+            sample_session("session-a"),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let current = scheduler.next_job().await;
+        let worker_scheduler = scheduler.clone();
+        let worker_job = current.clone();
+        let worker = tokio::spawn(async move {
+            let _guard = worker_scheduler.worker_guard();
+            while !worker_job.token.is_preempted() {
+                tokio::task::yield_now().await;
+            }
+            assert!(!worker_job.token.is_cancelled());
+            worker_scheduler.finish_current(&worker_job, true);
+        });
+
+        scheduler.shutdown_and_wait_for_worker().await;
+        worker.await.expect("graceful fill worker should stop");
+        assert!(current.token.is_preempted());
+        assert!(!current.token.is_cancelled());
         assert!(scheduler.is_idle());
     }
 

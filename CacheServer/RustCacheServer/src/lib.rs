@@ -14,6 +14,7 @@ mod hls_cache;
 mod hls_fill_scheduler;
 mod hls_network_policy;
 mod hls_playback_progress;
+mod hls_range_cache;
 pub mod library;
 pub mod media;
 mod mp4_segments;
@@ -47,9 +48,10 @@ use bilibili_worker::{
     BilibiliDownloadAdapter, run_bilibili_task_worker, run_pending_file_cleanup_worker,
 };
 use generated::tvos_net_player::v1::{
-    LibraryItem, PlaybackProtocol, PlaybackSource, Task, TaskKind, TaskState,
-    cache_service_server::CacheServiceServer, library_service_server::LibraryServiceServer,
-    server_service_server::ServerServiceServer, task_service_server::TaskServiceServer,
+    HlsCacheFillFailureKind, HlsCacheFillState, LibraryItem, PlaybackProtocol, PlaybackSource,
+    Task, TaskKind, TaskState, cache_service_server::CacheServiceServer,
+    library_service_server::LibraryServiceServer, server_service_server::ServerServiceServer,
+    task_service_server::TaskServiceServer,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
@@ -70,8 +72,8 @@ use crate::{
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheSessionDirectoryScan, HlsCacheStatusSnapshot, HlsCacheStore,
-        HlsTranscodingExecutionConfig, completed_runtime_session, sanitized_completed_session,
-        source_completed_session_for_restore,
+        HlsTranscodingExecutionConfig, completed_runtime_session, hls_session_declared_size_bytes,
+        sanitized_completed_session, source_completed_session_for_restore,
     },
     hls_fill_scheduler::HlsFillScheduler,
     hls_network_policy::{HlsNetworkPolicy, HlsWeakNetworkSnapshot},
@@ -392,6 +394,59 @@ impl Drop for HlsCacheEvictionProtectionGuard {
     }
 }
 
+fn hls_fill_status_needs_verified_completion_repair(
+    task: &Task,
+    session_id: &str,
+    representation_id: &str,
+) -> bool {
+    let item_status = task
+        .result_items
+        .iter()
+        .find(|item| {
+            item.playback_session
+                .as_ref()
+                .is_some_and(|session| session.id == session_id)
+        })
+        .and_then(|item| {
+            item.hls_cache_fill_status.as_ref().and_then(|status| {
+                TaskState::try_from(item.state)
+                    .ok()
+                    .map(|state| (status, state))
+            })
+        });
+    let primary_status = task
+        .playback_session
+        .as_ref()
+        .is_some_and(|session| session.id == session_id)
+        .then_some(
+            task.hls_cache_fill_status
+                .as_ref()
+                .map(|status| (status, task.state())),
+        )
+        .flatten();
+    item_status
+        .or(primary_status)
+        .is_some_and(|(status, owner_state)| {
+            if status.representation_id != representation_id {
+                return false;
+            }
+            match (
+                owner_state,
+                HlsCacheFillState::try_from(status.state).unwrap_or_default(),
+            ) {
+                (TaskState::Completed, HlsCacheFillState::Completed) => !status.total_bytes_known,
+                (
+                    TaskState::Playable | TaskState::Completed,
+                    HlsCacheFillState::Queued
+                    | HlsCacheFillState::Filling
+                    | HlsCacheFillState::Preempted
+                    | HlsCacheFillState::Retrying,
+                ) => true,
+                _ => false,
+            }
+        })
+}
+
 impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
         Self::new_with_playback_planner_factory(
@@ -530,7 +585,9 @@ impl AppState {
         let hls_sessions = HlsPlaybackRegistry::default();
         let hls_cache = hls_cache_override
             .unwrap_or_else(|| HlsCacheStore::new(library.root_path()))
-            .with_cdn_history(Arc::clone(&cdn_history));
+            .with_cdn_history(Arc::clone(&cdn_history))
+            .with_range_parallelism(options.bbdown_cdn_parallelism)
+            .with_range_budget(options.hls_cache_max_bytes);
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
         {
             Ok(sessions) => (sessions, true),
@@ -573,12 +630,18 @@ impl AppState {
                 if !source_completed_restore_session_ids.contains(&session.id) {
                     continue;
                 }
-                *session = source_completed_session_for_restore(session);
-                if let Err(error) = hls_cache.save_completed_session(session) {
-                    eprintln!(
+                let completed_session = source_completed_session_for_restore(session);
+                let completed_library_item_id =
+                    HlsCacheStore::completed_library_item_id(&session.id);
+                match hls_cache.save_restored_source_completed_session(
+                    &completed_session,
+                    &completed_library_item_id,
+                ) {
+                    Ok(()) => *session = completed_session,
+                    Err(error) => eprintln!(
                         "Failed to migrate restored completed HLS source session {}: {error}",
                         session.id
-                    );
+                    ),
                 }
             }
         }
@@ -856,8 +919,24 @@ impl AppState {
                             continue;
                         }
 
+                        let removal_guard = match hls_cache.try_begin_session_removal(&session.id) {
+                            Ok(Some(guard)) => guard,
+                            Ok(None) => {
+                                retry_sessions.push(session);
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to guard unauthorized HLS session {} during startup reconciliation; retrying: {error}",
+                                    session.id
+                                );
+                                retry_sessions.push(session);
+                                continue;
+                            }
+                        };
                         match hls_cache.remove_session(&session.id) {
                             Ok(()) => {
+                                removal_guard.commit();
                                 hls_sessions.remove_with_generation_update(
                                     &session.id,
                                     |generation| {
@@ -868,6 +947,7 @@ impl AppState {
                                 hls_playback_progress.remove_session(&session.id);
                             }
                             Err(error) => {
+                                drop(removal_guard);
                                 eprintln!(
                                     "Failed to remove unauthorized HLS session {} during startup reconciliation; retrying: {error}",
                                     session.id
@@ -939,7 +1019,8 @@ impl AppState {
         }
 
         for session in restored_sessions {
-            let Some(task_id) = self.tasks.playable_task_id_for_hls_session(&session.id) else {
+            let Some(task_id) = self.startup_hls_finalizer_task_id(session, completed_session_ids)
+            else {
                 continue;
             };
             if session.transcoding.state == HlsTranscodingPlanState::Ready
@@ -957,41 +1038,49 @@ impl AppState {
             if completed_session_ids.contains(&session.id) && self.tasks.persistence_available() {
                 let completion = {
                     let _lifecycle_guard = self.hls_task_lifecycle_guard();
-                    if self
-                        .tasks
-                        .playable_task_id_for_hls_session(&session.id)
-                        .as_deref()
-                        != Some(task_id.as_str())
-                    {
+                    if !self.startup_hls_finalizer_task_is_current(
+                        &task_id,
+                        session,
+                        completed_session_ids,
+                    ) {
                         owned_session_ids.remove(&session.id);
                         continue;
                     }
                     self.hls_sessions
                         .insert(sanitized_completed_session(session));
-                    match self.hls_cache.save_completed_session(session) {
-                        Ok(()) => {
-                            let completed_playback_session =
-                                playback_session_from_hls_cache_session(session);
-                            let library_item_id =
-                                HlsCacheStore::completed_library_item_id(&session.id);
-                            let _deletion_guard = self.completed_hls_mutation_guard();
-                            Some((
-                                self.tasks
-                                    .complete_playback_hls_session_cached_with_metadata(
-                                        &task_id,
-                                        &session.id,
-                                        library_item_id.clone(),
-                                        completed_playback_session,
-                                    ),
-                                library_item_id,
-                            ))
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
-                                session.id
-                            );
-                            None
+                    if let Err(status) =
+                        self.repair_restored_completed_hls_fill_total(&task_id, session)
+                    {
+                        Some((
+                            Err(status),
+                            HlsCacheStore::completed_library_item_id(&session.id),
+                        ))
+                    } else {
+                        match self.hls_cache.save_completed_session(session) {
+                            Ok(()) => {
+                                let completed_playback_session =
+                                    playback_session_from_hls_cache_session(session);
+                                let library_item_id =
+                                    HlsCacheStore::completed_library_item_id(&session.id);
+                                let _deletion_guard = self.completed_hls_mutation_guard();
+                                Some((
+                                    self.tasks
+                                        .complete_playback_hls_session_cached_with_metadata(
+                                            &task_id,
+                                            &session.id,
+                                            library_item_id.clone(),
+                                            completed_playback_session,
+                                        ),
+                                    library_item_id,
+                                ))
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to sanitize completed HLS cache session {} during startup restore: {error}",
+                                    session.id
+                                );
+                                None
+                            }
                         }
                     }
                 };
@@ -1032,12 +1121,11 @@ impl AppState {
 
             {
                 let _lifecycle_guard = self.hls_task_lifecycle_guard();
-                if self
-                    .tasks
-                    .playable_task_id_for_hls_session(&session.id)
-                    .as_deref()
-                    != Some(task_id.as_str())
-                {
+                if !self.startup_hls_finalizer_task_is_current(
+                    &task_id,
+                    session,
+                    completed_session_ids,
+                ) {
                     owned_session_ids.remove(&session.id);
                     continue;
                 }
@@ -1051,6 +1139,103 @@ impl AppState {
         owned_session_ids
     }
 
+    fn startup_hls_finalizer_task_id(
+        &self,
+        session: &HlsPlaybackSession,
+        completed_session_ids: &HashSet<String>,
+    ) -> Option<String> {
+        if completed_session_ids.contains(&session.id)
+            && let Some(task) = self.tasks.playback_task_for_any_hls_session(&session.id)
+        {
+            let library_item_id = HlsCacheStore::completed_library_item_id(&session.id);
+            if self.tasks.playback_task_has_completed_hls_cache_item(
+                &task,
+                &session.id,
+                &library_item_id,
+            ) && hls_fill_status_needs_verified_completion_repair(
+                &task,
+                &session.id,
+                &session.variant.id,
+            ) {
+                return Some(task.id);
+            }
+        }
+        self.tasks.playable_task_id_for_hls_session(&session.id)
+    }
+
+    fn startup_hls_finalizer_task_is_current(
+        &self,
+        task_id: &str,
+        session: &HlsPlaybackSession,
+        completed_session_ids: &HashSet<String>,
+    ) -> bool {
+        if completed_session_ids.contains(&session.id) {
+            if self
+                .tasks
+                .playable_task_id_for_hls_session(&session.id)
+                .as_deref()
+                == Some(task_id)
+            {
+                return true;
+            }
+            let Some(task) = self.tasks.playback_task_for_any_hls_session(&session.id) else {
+                return false;
+            };
+            return task.id == task_id
+                && self.tasks.playback_task_has_completed_hls_cache_item(
+                    &task,
+                    &session.id,
+                    &HlsCacheStore::completed_library_item_id(&session.id),
+                );
+        }
+        self.tasks
+            .playable_task_id_for_hls_session(&session.id)
+            .as_deref()
+            == Some(task_id)
+    }
+
+    fn repair_restored_completed_hls_fill_total(
+        &self,
+        task_id: &str,
+        session: &HlsPlaybackSession,
+    ) -> Result<(), Status> {
+        let task = self.tasks.get_task(task_id)?;
+        if !hls_fill_status_needs_verified_completion_repair(
+            &task,
+            &session.id,
+            &session.variant.id,
+        ) {
+            return Ok(());
+        }
+        let total_bytes = self
+            .hls_cache
+            .completed_primary_resource_bytes(session)
+            .ok()
+            .filter(|total_bytes| *total_bytes > 0)
+            .ok_or_else(|| {
+                Status::unavailable(
+                    "Verified completed HLS media byte total is not currently available.",
+                )
+            })?;
+        let status = crate::grpc_services::hls_cache_fill_status(
+            session,
+            HlsCacheFillState::Completed,
+            HlsCacheFillFailureKind::Unspecified,
+            total_bytes,
+            Some(total_bytes),
+            "Selected video and audio are complete for offline playback.",
+        );
+        match self
+            .tasks
+            .update_hls_cache_fill_status_from_verified_completion(task_id, &session.id, status)?
+        {
+            Some(_) => Ok(()),
+            None => Err(Status::unavailable(
+                "Completed HLS fill status repair is waiting for task-state recovery.",
+            )),
+        }
+    }
+
     pub(crate) fn enqueue_hls_cache_fill_foreground(
         &self,
         task_id: String,
@@ -1061,9 +1246,24 @@ impl AppState {
             eprintln!("HLS cache fill worker could not start outside a Tokio runtime.");
             return;
         };
+        let session_task_id = task_id.clone();
         let should_start_worker =
             self.hls_fill_scheduler
-                .enqueue_foreground(task_id, session, failure_mode);
+                .enqueue_foreground(task_id, session.clone(), failure_mode);
+        if self.hls_fill_scheduler.owns_session(&session.id) {
+            let _ = self.tasks.update_hls_cache_fill_status(
+                &session_task_id,
+                &session.id,
+                crate::grpc_services::hls_cache_fill_status(
+                    &session,
+                    crate::generated::tvos_net_player::v1::HlsCacheFillState::Queued,
+                    crate::generated::tvos_net_player::v1::HlsCacheFillFailureKind::Unspecified,
+                    0,
+                    hls_session_declared_size_bytes(&session),
+                    "Queued for offline filling.",
+                ),
+            );
+        }
         if should_start_worker {
             handle.spawn(crate::grpc_services::run_hls_cache_fill_worker(
                 self.clone(),
@@ -1081,9 +1281,24 @@ impl AppState {
             eprintln!("HLS cache fill worker could not start outside a Tokio runtime.");
             return;
         };
+        let session_task_id = task_id.clone();
         let should_start_worker =
             self.hls_fill_scheduler
-                .enqueue_demoted(task_id, session, failure_mode);
+                .enqueue_demoted(task_id, session.clone(), failure_mode);
+        if self.hls_fill_scheduler.owns_session(&session.id) {
+            let _ = self.tasks.update_hls_cache_fill_status(
+                &session_task_id,
+                &session.id,
+                crate::grpc_services::hls_cache_fill_status(
+                    &session,
+                    crate::generated::tvos_net_player::v1::HlsCacheFillState::Queued,
+                    crate::generated::tvos_net_player::v1::HlsCacheFillFailureKind::Unspecified,
+                    0,
+                    hls_session_declared_size_bytes(&session),
+                    "Queued for offline filling.",
+                ),
+            );
+        }
         if should_start_worker {
             handle.spawn(crate::grpc_services::run_hls_cache_fill_worker(
                 self.clone(),
@@ -1531,6 +1746,49 @@ impl AppState {
         Ok(())
     }
 
+    pub(crate) async fn remove_task_hls_sessions_after_cancel(
+        &self,
+        task_id: &str,
+        session_ids: &[String],
+    ) -> io::Result<()> {
+        let mut visited = HashSet::new();
+        let mut failed_session_ids = Vec::new();
+        let mut first_error = None;
+        for session_id in session_ids {
+            if !visited.insert(session_id.as_str()) {
+                continue;
+            }
+            let guard = match self.hls_cache.begin_session_removal(session_id).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    failed_session_ids.push(session_id.clone());
+                    first_error.get_or_insert_with(|| io::Error::other(error.to_string()));
+                    continue;
+                }
+            };
+            match self.hls_cache.remove_session(session_id) {
+                Ok(()) => {
+                    guard.commit();
+                    self.remove_hls_playback_session(session_id);
+                }
+                Err(error) => {
+                    drop(guard);
+                    failed_session_ids.push(session_id.clone());
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let cleanup_key = format!("task-terminal:{task_id}");
+        self.pending_hls_session_cleanups
+            .lock()
+            .expect("pending HLS cleanup lock poisoned")
+            .record(cleanup_key, failed_session_ids);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn remove_hls_sessions_tracking_failures(
         &self,
         cleanup_key: &str,
@@ -1614,10 +1872,32 @@ impl AppState {
                 scan.retry_required = true;
                 break;
             }
-            self.remove_hls_playback_session(&session_id);
-            if let Err(error) = self.hls_cache.remove_session(&session_id) {
-                scan.retry_required = true;
-                eprintln!("Failed to retry overflow HLS cache cleanup for {session_id}: {error}");
+            let guard = match self.hls_cache.try_begin_session_removal(&session_id) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    scan.retry_required = true;
+                    continue;
+                }
+                Err(error) => {
+                    scan.retry_required = true;
+                    eprintln!(
+                        "Failed to guard overflow HLS cache cleanup for {session_id}: {error}"
+                    );
+                    continue;
+                }
+            };
+            match self.hls_cache.remove_session(&session_id) {
+                Ok(()) => {
+                    guard.commit();
+                    self.remove_hls_playback_session(&session_id);
+                }
+                Err(error) => {
+                    drop(guard);
+                    scan.retry_required = true;
+                    eprintln!(
+                        "Failed to retry overflow HLS cache cleanup for {session_id}: {error}"
+                    );
+                }
             }
         }
 
@@ -1659,9 +1939,31 @@ impl AppState {
             if !removed.insert(session_id) {
                 continue;
             }
-            match self.hls_cache.remove_session(session_id) {
-                Ok(()) => self.remove_hls_playback_session(session_id),
+            let guard = match self.hls_cache.try_begin_session_removal(session_id) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    failed_session_ids.push(session_id.clone());
+                    first_error.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "HLS session has active range work",
+                        )
+                    });
+                    continue;
+                }
                 Err(error) => {
+                    failed_session_ids.push(session_id.clone());
+                    first_error.get_or_insert_with(|| io::Error::other(error.to_string()));
+                    continue;
+                }
+            };
+            match self.hls_cache.remove_session(session_id) {
+                Ok(()) => {
+                    guard.commit();
+                    self.remove_hls_playback_session(session_id);
+                }
+                Err(error) => {
+                    drop(guard);
                     failed_session_ids.push(session_id.clone());
                     first_error.get_or_insert(error);
                 }
@@ -1763,6 +2065,7 @@ impl AppState {
 
     #[doc(hidden)]
     pub fn background_work_is_idle(&self) -> bool {
+        let (range_active, range_reservations) = self.hls_cache.range_activity_counts();
         self.playback_planning_active_jobs.load(Ordering::SeqCst) == 0
             && self.playback_planning_permits.available_permits()
                 == self.options.bilibili_worker_max_concurrent_tasks.max(1)
@@ -1774,6 +2077,8 @@ impl AppState {
                 == self.options.lan_transcoding_max_concurrent_jobs.max(1)
             && self.lan_transcoding_active_job_count() == 0
             && self.hls_fill_scheduler.is_idle()
+            && range_active == 0
+            && range_reservations == 0
     }
 
     #[doc(hidden)]
@@ -1789,6 +2094,7 @@ impl AppState {
     #[doc(hidden)]
     pub async fn shutdown_hls_fill_worker(&self) {
         self.hls_fill_scheduler.shutdown_and_wait_for_worker().await;
+        self.hls_cache.drain_range_writers().await;
     }
 
     #[doc(hidden)]
@@ -1800,8 +2106,9 @@ impl AppState {
     pub fn background_work_diagnostics(&self) -> String {
         let (hls_fill_current, hls_fill_foreground, hls_fill_demoted) =
             self.hls_fill_scheduler.diagnostic_counts();
+        let (range_active, range_reservations) = self.hls_cache.range_activity_counts();
         format!(
-            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, library_deletion_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}",
+            "planning_active={}, planning_permits={}/{}, finalization_permits={}/{}, library_deletion_permits={}/{}, transcoding_active={}, transcoding_permits={}/{}, hls_fill_current={}, hls_fill_foreground={}, hls_fill_demoted={}, range_active={}, range_reservations={}",
             self.playback_planning_active_jobs.load(Ordering::SeqCst),
             self.playback_planning_permits.available_permits(),
             self.options.bilibili_worker_max_concurrent_tasks.max(1),
@@ -1815,6 +2122,8 @@ impl AppState {
             hls_fill_current,
             hls_fill_foreground,
             hls_fill_demoted,
+            range_active,
+            range_reservations,
         )
     }
 
@@ -2156,6 +2465,24 @@ impl AppState {
             {
                 continue;
             }
+            let mut removal_guards = HashMap::new();
+            let mut removal_busy = false;
+            for session_id in &session_ids {
+                match self.hls_cache.try_begin_session_removal(session_id) {
+                    Ok(Some(guard)) => {
+                        removal_guards.insert(session_id.clone(), guard);
+                    }
+                    Ok(None) => {
+                        removal_busy = true;
+                        break;
+                    }
+                    Err(error) => return Err(io::Error::other(error.to_string())),
+                }
+            }
+            if removal_busy {
+                drop(removal_guards);
+                continue;
+            }
             let affected_task_ids = self
                 .tasks
                 .playback_task_for_any_hls_session(&entry.session_id)
@@ -2170,7 +2497,31 @@ impl AppState {
                 &entry.library_item_id,
                 &affected_task_ids,
             );
-            self.remove_hls_sessions_tracking_failures(&entry.library_item_id, &session_ids)?;
+            let mut failed_session_ids = Vec::new();
+            let mut first_remove_error = None;
+            for session_id in &session_ids {
+                let guard = removal_guards
+                    .remove(session_id)
+                    .expect("completed HLS session removal guard missing");
+                match self.hls_cache.remove_session(session_id) {
+                    Ok(()) => {
+                        guard.commit();
+                        self.remove_hls_playback_session(session_id);
+                    }
+                    Err(error) => {
+                        drop(guard);
+                        failed_session_ids.push(session_id.clone());
+                        first_remove_error.get_or_insert(error);
+                    }
+                }
+            }
+            self.pending_hls_session_cleanups
+                .lock()
+                .expect("pending HLS cleanup lock poisoned")
+                .record(entry.library_item_id.clone(), failed_session_ids);
+            if let Some(error) = first_remove_error {
+                return Err(error);
+            }
             let removed_bytes = session_ids.iter().fold(0_u64, |total, session_id| {
                 total.saturating_add(
                     completed_entry_sizes_by_session_id
@@ -2216,8 +2567,19 @@ impl AppState {
             ) {
                 continue;
             }
-            self.hls_cache
-                .remove_session_managed_resources_for_eviction(&entry.session_id)?;
+            let removal_guard = match self.hls_cache.try_begin_session_removal(&entry.session_id) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => continue,
+                Err(error) => return Err(io::Error::other(error.to_string())),
+            };
+            if let Err(error) = self
+                .hls_cache
+                .remove_session_managed_resources_for_eviction(&entry.session_id)
+            {
+                drop(removal_guard);
+                return Err(error);
+            }
+            drop(removal_guard);
             finished_used_bytes = finished_used_bytes.saturating_sub(entry.size_bytes);
             evicted_bytes = evicted_bytes.saturating_add(entry.size_bytes);
             if evicted_session_id_set.insert(entry.session_id.clone()) {
@@ -2846,12 +3208,30 @@ fn filter_authorized_restored_hls_sessions(
             continue;
         }
 
+        let removal_guard = match hls_cache.try_begin_session_removal(&session.id) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                retry_deletion_sessions.push(session);
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Failed to guard unauthorized restored HLS session {}; retrying: {error}",
+                    session.id
+                );
+                retry_deletion_sessions.push(session);
+                continue;
+            }
+        };
         if let Err(error) = hls_cache.remove_session(&session.id) {
+            drop(removal_guard);
             eprintln!(
                 "Failed to remove unauthorized restored HLS session {}; retrying: {error}",
                 session.id
             );
             retry_deletion_sessions.push(session);
+        } else {
+            removal_guard.commit();
         }
     }
     (authorized_sessions, retry_deletion_sessions)
@@ -2904,6 +3284,7 @@ pub async fn run_with_state(
         result = wait_for_server_result(&mut media_servers) => result,
         _ = shutdown_signal() => Ok(()),
     };
+    state.shutdown_hls_fill_worker().await;
     state.shutdown_cdn_history_writer().await;
     result
 }
@@ -3326,7 +3707,7 @@ mod tests {
         let task_state_path = root_path.join(".state").join("tasks.json");
         let response_body = axum::body::Bytes::from(test_fake_mp4());
         let response_size = response_body.len() as u64;
-        let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+        let (request_started_tx, mut request_started_rx) = tokio::sync::oneshot::channel();
         let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
         let release_upstream = Arc::new(tokio::sync::Notify::new());
         let upstream_released = Arc::new(AtomicBool::new(false));
@@ -3375,15 +3756,12 @@ mod tests {
         };
         let initial =
             AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
-        let (task_id, mut session) =
-            create_playable_hls_task(&initial, "BV1startup-finalizer-pending");
-        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
-        session.variant.video.request.size = Some(response_size);
-        initial
-            .hls_cache
-            .save_session(&session)
-            .expect("updated HLS session should persist");
-        initial.hls_sessions.insert(session);
+        let (task_id, _session) = create_playable_hls_task_with_video_source(
+            &initial,
+            "BV1startup-finalizer-pending",
+            &format!("http://{upstream_addr}/video.m4s"),
+            response_size,
+        );
         drop(initial);
 
         let task_state_temp_path = task_state_path.with_file_name("tasks.json.tmp");
@@ -3392,10 +3770,11 @@ mod tests {
         let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
 
         assert!(!restored.tasks.persistence_available());
-        tokio::time::timeout(Duration::from_secs(2), request_started_rx)
-            .await
-            .expect("restored finalizer should retain and start the incomplete HLS session")
-            .expect("request-start sender should remain available");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(matches!(
+            request_started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         assert_eq!(
             TaskState::Playable,
             restored.tasks.get_task(&task_id).unwrap().state()
@@ -3407,6 +3786,10 @@ mod tests {
 
         std::fs::remove_dir(&task_state_temp_path)
             .expect("task persistence blocker should be removable");
+        tokio::time::timeout(Duration::from_secs(2), &mut request_started_rx)
+            .await
+            .expect("restored finalizer should start after task-state durability recovers")
+            .expect("request-start sender should remain available");
         upstream_released.store(true, Ordering::Release);
         release_upstream.notify_waiters();
         let completed = wait_for_test_task_state(&restored, &task_id, TaskState::Completed).await;
@@ -3455,15 +3838,12 @@ mod tests {
         };
         let initial =
             AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
-        let (task_id, mut session) =
-            create_playable_hls_task(&initial, "BV1startup-finalizer-completed");
-        session.variant.video.request.url = format!("http://{upstream_addr}/video.m4s");
-        session.variant.video.request.size = Some(response_size);
-        initial
-            .hls_cache
-            .save_session(&session)
-            .expect("updated HLS session should persist");
-        initial.hls_sessions.insert(session.clone());
+        let (task_id, session) = create_playable_hls_task_with_video_source(
+            &initial,
+            "BV1startup-finalizer-completed",
+            &format!("http://{upstream_addr}/video.m4s"),
+            response_size,
+        );
         let expected_item_id = initial
             .hls_cache
             .cache_session_resources(&initial.hls_upstream_client, &session)
@@ -3513,6 +3893,273 @@ mod tests {
                 .is_some()
         );
         restored.shutdown_hls_fill_worker().await;
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_persisted_fill_status_from_verified_completed_media() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().to_path_buf());
+        let response_body = axum::body::Bytes::from(test_fake_mp4());
+        let upstream = Router::new().route(
+            "/video.m4s",
+            get(move || {
+                let response_body = response_body.clone();
+                async move { response_body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("test upstream should run");
+        });
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(NoopPlaybackPlanner));
+        let upstream_url = format!("http://{upstream_addr}/video.m4s");
+
+        async fn create_completed_task(
+            state: &AppState,
+            source: &str,
+            upstream_url: &str,
+            known_total: bool,
+        ) -> (
+            String,
+            crate::generated::tvos_net_player::v1::HlsCacheFillStatus,
+        ) {
+            let creation = state
+                .tasks
+                .create_bilibili_playback_task(source, None, None)
+                .expect("playback task should be created");
+            let task_id = creation.task.id;
+            let mut session = sample_hls_session(&task_id);
+            session.variant.video.request.url = upstream_url.to_owned();
+            session.variant.video.request.size = None;
+            state
+                .hls_cache
+                .save_session(&session)
+                .expect("unknown-size session should persist");
+            state.hls_sessions.insert(session.clone());
+            state
+                .tasks
+                .complete_playback_playable(
+                    &task_id,
+                    session.title.clone(),
+                    PlaybackSource {
+                        item_id: task_id.clone(),
+                        variant_id: session.variant.id.clone(),
+                        protocol: PlaybackProtocol::Hls.into(),
+                        uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+                        expires_at: None,
+                    },
+                    sample_playback_session(&task_id),
+                )
+                .expect("task should become playable");
+            let library_item_id = state
+                .hls_cache
+                .cache_session_resources(&state.hls_upstream_client, &session)
+                .await
+                .expect("selected resource should be cached");
+            let total_bytes = state
+                .hls_cache
+                .completed_primary_resource_bytes(&session)
+                .expect("completed selected resource size should be verified");
+            let fill_status = crate::grpc_services::hls_cache_fill_status(
+                &session,
+                HlsCacheFillState::Completed,
+                HlsCacheFillFailureKind::Unspecified,
+                if known_total { total_bytes } else { 0 },
+                known_total.then_some(total_bytes),
+                "Selected video and audio are complete for offline playback.",
+            );
+            state
+                .tasks
+                .update_hls_cache_fill_status(&task_id, &session.id, fill_status.clone())
+                .expect("legacy fill status should persist")
+                .expect("playable task should receive fill status");
+            state
+                .tasks
+                .complete_playback_hls_session_cached_with_metadata(
+                    &task_id,
+                    &session.id,
+                    library_item_id,
+                    playback_session_from_hls_cache_session(&session),
+                )
+                .expect("task should persist as completed");
+            (task_id, fill_status)
+        }
+
+        let (legacy_task_id, legacy_status) =
+            create_completed_task(&state, "BV1startup-missing-total", &upstream_url, false).await;
+        let (known_task_id, known_status) =
+            create_completed_task(&state, "BV1startup-known-total", &upstream_url, true).await;
+        let progress_creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1startup-in-progress-fill", None, None)
+            .expect("in-progress playback task should be created");
+        let progress_task_id = progress_creation.task.id;
+        let mut progress_session = sample_hls_session(&progress_task_id);
+        progress_session.variant.video.request.url = upstream_url.clone();
+        progress_session.variant.video.request.size = None;
+        state
+            .hls_cache
+            .save_session(&progress_session)
+            .expect("in-progress HLS plan should persist");
+        state.hls_sessions.insert(progress_session.clone());
+        state
+            .tasks
+            .complete_playback_playable(
+                &progress_task_id,
+                progress_session.title.clone(),
+                PlaybackSource {
+                    item_id: progress_task_id.clone(),
+                    variant_id: progress_session.variant.id.clone(),
+                    protocol: PlaybackProtocol::Hls.into(),
+                    uri: format!(
+                        "http://media.example.test:8080/hls/{progress_task_id}/master.m3u8"
+                    ),
+                    expires_at: None,
+                },
+                sample_playback_session(&progress_task_id),
+            )
+            .expect("in-progress playback task should become playable");
+        state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, &progress_session)
+            .await
+            .expect("in-progress playback media should finish caching before restart");
+        let progress_total_bytes = state
+            .hls_cache
+            .completed_primary_resource_bytes(&progress_session)
+            .expect("completed media total should be verified");
+        let progress_status = crate::grpc_services::hls_cache_fill_status(
+            &progress_session,
+            HlsCacheFillState::Filling,
+            HlsCacheFillFailureKind::Unspecified,
+            0,
+            None,
+            "Filling selected video and audio for offline playback.",
+        );
+        state
+            .tasks
+            .update_hls_cache_fill_status(
+                &progress_task_id,
+                &progress_session.id,
+                progress_status.clone(),
+            )
+            .expect("in-progress fill status should persist")
+            .expect("playable task should accept its fill status");
+        let legacy_task = state.tasks.get_task(&legacy_task_id).unwrap();
+        assert_eq!(TaskState::Completed, legacy_task.state());
+        assert!(!legacy_status.total_bytes_known);
+        assert!(known_status.total_bytes_known);
+        assert!(hls_fill_status_needs_verified_completion_repair(
+            &legacy_task,
+            &legacy_task_id,
+            "h264"
+        ));
+        let persisted_sessions = state.hls_cache.load_sessions().unwrap();
+        assert!(
+            state
+                .hls_cache
+                .completed_session_ids(&persisted_sessions)
+                .contains(&legacy_task_id)
+        );
+        let completed_owner = state
+            .tasks
+            .playback_task_for_any_hls_session(&legacy_task_id)
+            .expect("completed task should still own its HLS session");
+        assert_eq!(legacy_task_id, completed_owner.id);
+        assert!(state.tasks.playback_task_has_completed_hls_cache_item(
+            &completed_owner,
+            &legacy_task_id,
+            &HlsCacheStore::completed_library_item_id(&legacy_task_id)
+        ));
+        assert!(state.tasks.persistence_available());
+        state.shutdown_hls_fill_worker().await;
+        drop(state);
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(NoopPlaybackPlanner));
+        let repaired_task = restored
+            .tasks
+            .get_task(&legacy_task_id)
+            .expect("legacy completed task should restore");
+        assert_eq!(TaskState::Completed, repaired_task.state());
+        assert!(restored.hls_sessions.get(&legacy_task_id).is_some());
+        let repaired_status = repaired_task
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("legacy fill status should remain present");
+        assert_eq!(HlsCacheFillState::Completed as i32, repaired_status.state);
+        assert!(repaired_status.total_bytes_known);
+        assert!(repaired_status.total_bytes > 0);
+        assert_eq!(repaired_status.total_bytes, repaired_status.completed_bytes);
+        assert_eq!("h264", repaired_status.representation_id);
+        let repaired_output = restored
+            .tasks
+            .task_output_snapshot(&legacy_task_id)
+            .unwrap();
+        let Some(
+            crate::generated::tvos_net_player::v1::task_result_provider_details::Details::Bilibili(
+                details,
+            ),
+        ) = repaired_output.output.record.results[0]
+            .provider_details
+            .as_ref()
+            .and_then(|provider| provider.details.as_ref())
+        else {
+            panic!("repaired v2 result should retain Bilibili fill details");
+        };
+        assert_eq!(
+            Some(repaired_status),
+            details.hls_cache_fill_status.as_ref()
+        );
+
+        let known_task = restored
+            .tasks
+            .get_task(&known_task_id)
+            .expect("known completed task should restore");
+        assert_eq!(TaskState::Completed, known_task.state());
+        assert_eq!(
+            Some(&known_status),
+            known_task.hls_cache_fill_status.as_ref()
+        );
+        let repaired_progress_task = restored
+            .tasks
+            .get_task(&progress_task_id)
+            .expect("in-progress playback task should restore");
+        assert_eq!(TaskState::Completed, repaired_progress_task.state());
+        let repaired_progress_status = repaired_progress_task
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("completed media should repair its persisted in-progress fill status");
+        assert_eq!(
+            HlsCacheFillState::Completed as i32,
+            repaired_progress_status.state
+        );
+        assert!(repaired_progress_status.total_bytes_known);
+        assert_eq!(progress_total_bytes, repaired_progress_status.total_bytes);
+        assert_eq!(
+            progress_total_bytes,
+            repaired_progress_status.completed_bytes
+        );
+        assert_eq!(
+            progress_status.representation_id,
+            repaired_progress_status.representation_id
+        );
         upstream_task.abort();
     }
 
@@ -3869,6 +4516,7 @@ mod tests {
                     playback_source: Some(playback_source),
                     playback_session: Some(sample_playback_session(&child_session_id)),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("preparing task should publish its planned child result");
@@ -4924,6 +5572,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = test_app_state(&temp);
         assert!(state.background_work_is_idle());
+        let diagnostics = state.background_work_diagnostics();
+        assert!(diagnostics.contains("range_active=0"));
+        assert!(diagnostics.contains("range_reservations=0"));
 
         let planning_activity = state.begin_playback_planning();
         assert!(!state.background_work_is_idle());
@@ -4991,6 +5642,7 @@ mod tests {
         })
         .await
         .expect("HLS fill worker should finish the rejected job");
+        assert!(!state.hls_fill_scheduler.owns_session("shutdown-worker"));
         assert!(state.hls_fill_scheduler.worker_started_for_tests());
 
         tokio::time::timeout(Duration::from_secs(1), state.shutdown_hls_fill_worker())
@@ -5225,12 +5877,37 @@ mod tests {
     }
 
     fn create_playable_hls_task(state: &AppState, source: &str) -> (String, HlsPlaybackSession) {
+        create_playable_hls_task_with_video_source_inner(state, source, None)
+    }
+
+    fn create_playable_hls_task_with_video_source(
+        state: &AppState,
+        source: &str,
+        video_url: &str,
+        video_size: u64,
+    ) -> (String, HlsPlaybackSession) {
+        create_playable_hls_task_with_video_source_inner(
+            state,
+            source,
+            Some((video_url, video_size)),
+        )
+    }
+
+    fn create_playable_hls_task_with_video_source_inner(
+        state: &AppState,
+        source: &str,
+        video_source: Option<(&str, u64)>,
+    ) -> (String, HlsPlaybackSession) {
         let creation = state
             .tasks
             .create_bilibili_playback_task(source, None, None)
             .expect("playback task should be created");
         let task_id = creation.task.id;
-        let session = sample_hls_session(&task_id);
+        let mut session = sample_hls_session(&task_id);
+        if let Some((video_url, video_size)) = video_source {
+            session.variant.video.request.url = video_url.to_owned();
+            session.variant.video.request.size = Some(video_size);
+        }
         state
             .hls_cache
             .save_session(&session)

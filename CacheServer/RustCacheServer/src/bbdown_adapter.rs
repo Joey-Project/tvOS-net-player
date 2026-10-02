@@ -6260,6 +6260,7 @@ fn task_result_provider_details(
                 BilibiliTaskResultDetails {
                     identity: Some(proto_candidate_identity(candidate)),
                     playback_session: None,
+                    hls_cache_fill_status: None,
                 },
             ),
         ),

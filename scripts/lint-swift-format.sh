@@ -20,4 +20,5 @@ xcrun swift-format lint \
   "${ROOT_DIR}/MacOSNetPlayer" \
   "${ROOT_DIR}/MacOSNetPlayerTests" \
   "${ROOT_DIR}/TVOSNetPlayer" \
-  "${ROOT_DIR}/TVOSNetPlayerTests"
+  "${ROOT_DIR}/TVOSNetPlayerTests" \
+  "${ROOT_DIR}/scripts/probe-lan-playback.swift"

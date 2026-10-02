@@ -576,6 +576,37 @@ message CancelTaskRequest {
   string id = 1;
 }
 
+enum HlsCacheFillState {
+  HLS_CACHE_FILL_STATE_UNSPECIFIED = 0;
+  HLS_CACHE_FILL_STATE_QUEUED = 1;
+  HLS_CACHE_FILL_STATE_FILLING = 2;
+  HLS_CACHE_FILL_STATE_PREEMPTED = 3;
+  HLS_CACHE_FILL_STATE_RETRYING = 4;
+  HLS_CACHE_FILL_STATE_BLOCKED_QUOTA = 5;
+  HLS_CACHE_FILL_STATE_COMPLETED = 6;
+  HLS_CACHE_FILL_STATE_SOURCE_UNAVAILABLE = 7;
+  HLS_CACHE_FILL_STATE_FAILED = 8;
+  HLS_CACHE_FILL_STATE_CANCELLED = 9;
+}
+
+enum HlsCacheFillFailureKind {
+  HLS_CACHE_FILL_FAILURE_KIND_UNSPECIFIED = 0;
+  HLS_CACHE_FILL_FAILURE_KIND_SAFETY = 1;
+  HLS_CACHE_FILL_FAILURE_KIND_PERSISTENCE = 2;
+  HLS_CACHE_FILL_FAILURE_KIND_NETWORK = 3;
+  HLS_CACHE_FILL_FAILURE_KIND_SOURCE_UNAVAILABLE = 4;
+}
+
+message HlsCacheFillStatus {
+  HlsCacheFillState state = 1;
+  HlsCacheFillFailureKind failure_kind = 2;
+  uint64 completed_bytes = 3;
+  uint64 total_bytes = 4;
+  bool total_bytes_known = 5;
+  string representation_id = 6;
+  string message = 7;
+}
+
 message Task {
   string id = 1;
   TaskKind kind = 2;
@@ -595,6 +626,7 @@ message Task {
   BilibiliTaskSelection bilibili_selection = 16;
   repeated BilibiliTaskResultItem result_items = 17;
   TaskOutputSummary output_summary = 18;
+  HlsCacheFillStatus hls_cache_fill_status = 19;
 }
 
 // Compact output metadata for task snapshots and watch events. Detailed
@@ -667,6 +699,7 @@ message TaskResultProviderDetails {
 message BilibiliTaskResultDetails {
   BilibiliContentIdentity identity = 1;
   BilibiliPlaybackSession playback_session = 2;
+  HlsCacheFillStatus hls_cache_fill_status = 3;
 }
 
 message TaskResultProgress {
@@ -766,6 +799,7 @@ message BilibiliTaskResultItem {
   PlaybackSource playback_source = 11;
   BilibiliPlaybackSession playback_session = 12;
   BilibiliContentIdentity identity = 13;
+  HlsCacheFillStatus hls_cache_fill_status = 14;
 }
 
 message BilibiliPlaybackSession {

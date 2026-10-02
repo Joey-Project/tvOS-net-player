@@ -21,8 +21,9 @@ use crate::{
     generated::tvos_net_player::v1::{
         BilibiliApiMode, BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
         BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliRequestContext,
-        BilibiliSubtitleAiPolicy, BilibiliTaskResultItem, BilibiliTaskSelection, PlaybackSource,
-        Task, TaskArtifactState, TaskKind, TaskResult, TaskState,
+        BilibiliSubtitleAiPolicy, BilibiliTaskResultItem, BilibiliTaskSelection,
+        HlsCacheFillFailureKind, HlsCacheFillState, HlsCacheFillStatus, PlaybackSource, Task,
+        TaskArtifactState, TaskKind, TaskResult, TaskState,
     },
     hls_cache::HlsCacheStore,
     library::{
@@ -41,6 +42,9 @@ use crate::{
         validate_unique_task_record_identities,
     },
 };
+
+#[cfg(test)]
+use crate::generated::tvos_net_player::v1::task_result_provider_details;
 
 const QUEUED_MESSAGE: &str = "Queued for the BBDown adapter.";
 const RUNNING_MESSAGE: &str = "Running Bilibili download adapter.";
@@ -754,6 +758,7 @@ impl BilibiliTaskRegistry {
             playback_source: None,
             playback_session: None,
             identity: None,
+            hls_cache_fill_status: None,
         }];
     }
 
@@ -817,6 +822,7 @@ impl BilibiliTaskRegistry {
             bilibili_selection: None,
             result_items: Vec::new(),
             output_summary: None,
+            hls_cache_fill_status: None,
         };
         let output = TaskOutputRecord::from_legacy_task(&task);
         task.output_summary = Some(output.summary());
@@ -903,6 +909,7 @@ impl BilibiliTaskRegistry {
                 QUEUED_MESSAGE,
             ),
             output_summary: None,
+            hls_cache_fill_status: None,
         };
         let output = TaskOutputRecord::from_legacy_task(&task);
         task.output_summary = Some(output.summary());
@@ -1047,6 +1054,7 @@ impl BilibiliTaskRegistry {
             bilibili_selection: selection,
             result_items,
             output_summary: None,
+            hls_cache_fill_status: None,
         };
         let output = TaskOutputRecord::from_legacy_task(&task);
         task.output_summary = Some(output.summary());
@@ -2280,6 +2288,25 @@ impl BilibiliTaskRegistry {
             .get(&normalized_id)
             .map(playback_hls_session_ids)
             .unwrap_or_default();
+        let fill_status_result_ids = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .map(|task| {
+                let mut result_ids = task
+                    .result_items
+                    .iter()
+                    .flat_map(|item| {
+                        result_item_hls_session_ids(item)
+                            .into_iter()
+                            .map(|session_id| (session_id, item.id.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(session_id) = primary_hls_session_id(task) {
+                    result_ids.push((session_id, task.id.clone()));
+                }
+                result_ids
+            })
+            .unwrap_or_default();
         let task = {
             let Some(task) = inner.tasks_by_id.get_mut(&normalized_id) else {
                 return Err(task_not_found());
@@ -2292,6 +2319,30 @@ impl BilibiliTaskRegistry {
             task.finished_at = Some(updated_at);
             task.library_item_id.clear();
             if task.kind() == TaskKind::BilibiliProgressivePlayback {
+                let cancelled_status = |previous: Option<&HlsCacheFillStatus>| HlsCacheFillStatus {
+                    state: HlsCacheFillState::Cancelled.into(),
+                    failure_kind: HlsCacheFillFailureKind::Unspecified.into(),
+                    completed_bytes: previous.map_or(0, |status| status.completed_bytes),
+                    total_bytes: previous.map_or(0, |status| status.total_bytes),
+                    total_bytes_known: previous.is_some_and(|status| status.total_bytes_known),
+                    representation_id: previous
+                        .map_or_else(String::new, |status| status.representation_id.clone()),
+                    message: "Offline cache fill was cancelled.".to_owned(),
+                };
+                if task.hls_cache_fill_status.is_some() || !hls_session_ids.is_empty() {
+                    task.hls_cache_fill_status =
+                        Some(cancelled_status(task.hls_cache_fill_status.as_ref()));
+                }
+                for item in &mut task.result_items {
+                    if fill_status_result_ids
+                        .iter()
+                        .any(|(_, result_id)| result_id == &item.id)
+                        && item.hls_cache_fill_status.is_some()
+                    {
+                        item.hls_cache_fill_status =
+                            Some(cancelled_status(item.hls_cache_fill_status.as_ref()));
+                    }
+                }
                 task.playback_source = None;
                 task.playback_session = None;
             }
@@ -2303,6 +2354,57 @@ impl BilibiliTaskRegistry {
 
             task.clone()
         };
+        if task.kind() == TaskKind::BilibiliProgressivePlayback {
+            let output = inner
+                .outputs_by_task_id
+                .get_mut(&normalized_id)
+                .expect("playback task output should be registered");
+            let output_update = if task.result_items.is_empty() {
+                match task.hls_cache_fill_status.as_ref() {
+                    Some(status) => {
+                        output.update_bilibili_cache_fill_status_for_task(&task, &task.id, status)
+                    }
+                    None => Ok(false),
+                }
+            } else {
+                let mut output_changed = false;
+                for (_, result_id) in &fill_status_result_ids {
+                    let Some(status) = task
+                        .result_items
+                        .iter()
+                        .find(|item| item.id == *result_id)
+                        .and_then(|item| item.hls_cache_fill_status.as_ref())
+                    else {
+                        continue;
+                    };
+                    output_changed |= output.update_bilibili_cache_fill_status(result_id, status);
+                }
+                Ok(output_changed)
+            };
+            let output_changed = match output_update {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.restore(&mut inner);
+                    }
+                    return Err(Status::failed_precondition(format!(
+                        "Cancelled HLS cache fill status could not be reconciled with task output: {error}"
+                    )));
+                }
+            };
+            if output_changed {
+                inner
+                    .tasks_by_id
+                    .get_mut(&normalized_id)
+                    .expect("cancelled task should remain present")
+                    .output_summary = Some(output.summary());
+            }
+        }
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_id)
+            .expect("cancelled task should remain present")
+            .clone();
         let terminal_task = Self::terminal_task_locked(&inner, &task);
 
         Self::clear_active_task_locked(&mut inner, &terminal_task);
@@ -2566,79 +2668,224 @@ impl BilibiliTaskRegistry {
         true
     }
 
-    pub fn fail_hls_cache_fill_for_playback_session(
+    pub fn update_hls_cache_fill_status(
         &self,
         task_id: &str,
         session_id: &str,
-        message: String,
+        status: HlsCacheFillStatus,
+    ) -> Result<Option<Task>, Status> {
+        self.update_hls_cache_fill_status_inner(task_id, session_id, status, false)
+    }
+
+    pub(crate) fn update_hls_cache_fill_status_from_verified_completion(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        status: HlsCacheFillStatus,
+    ) -> Result<Option<Task>, Status> {
+        if HlsCacheFillState::try_from(status.state).unwrap_or_default()
+            != HlsCacheFillState::Completed
+            || !status.total_bytes_known
+            || status.total_bytes == 0
+            || status.completed_bytes != status.total_bytes
+            || status.representation_id.is_empty()
+        {
+            return Err(Status::failed_precondition(
+                "Verified HLS cache completion requires an exact positive byte total.",
+            ));
+        }
+        self.update_hls_cache_fill_status_inner(task_id, session_id, status, true)
+    }
+
+    fn update_hls_cache_fill_status_inner(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        mut status: HlsCacheFillStatus,
+        verified_completion: bool,
     ) -> Result<Option<Task>, Status> {
         let normalized_task_id = normalize_required_id(task_id)?;
         let normalized_session_id = normalize_required_id(session_id)?;
         let _mutation_guard = self.mutation_guard();
         let mut inner = self.inner.lock().expect("task registry lock poisoned");
-        if self.persistence.is_some() && !self.persistence_available() {
-            let outcome = self.persist_and_publish_pending(inner, true, None);
-            if !outcome.is_durable() {
-                return Err(Status::unavailable(
-                    "Pending task state could not be persisted before recording HLS cache fill failure.",
-                ));
-            }
-            inner = self.inner.lock().expect("task registry lock poisoned");
-        }
-        let durability_required = self.persistence.is_some();
-        let task = {
-            let Some(task) = inner.tasks_by_id.get_mut(&normalized_task_id) else {
-                return Err(task_not_found());
-            };
-            if task.kind() != TaskKind::BilibiliProgressivePlayback {
-                return Err(Status::failed_precondition(
-                    "Task is not a Bilibili progressive playback task.",
-                ));
-            }
-
-            if task_uses_hls_session_as_primary(task, &normalized_session_id) {
-                if task.state() != TaskState::Playable {
-                    return Ok(None);
-                }
-                task.message = message;
-                if mark_result_cache_fill_failed_for_session(
-                    &mut task.result_items,
-                    &normalized_session_id,
-                    &task.message,
-                ) {
-                    task.progress = result_items_progress(&task.result_items);
-                }
-                task.updated_at = Some(current_timestamp());
-            } else if matches!(task.state(), TaskState::Playable | TaskState::Completed)
-                && mark_result_cache_fill_failed_for_session(
-                    &mut task.result_items,
-                    &normalized_session_id,
-                    &message,
-                )
-            {
-                task.progress = result_items_progress(&task.result_items);
-                task.message = match task.state() {
-                    TaskState::Completed => {
-                        "Completed offline; some Bilibili playback results failed to cache offline."
-                            .to_owned()
-                    }
-                    _ => "Playable online; some Bilibili playback results failed to cache offline."
-                        .to_owned(),
-                };
-                task.updated_at = Some(current_timestamp());
-            } else {
-                return Ok(None);
-            }
-
-            task.clone()
+        let Some(existing) = inner.tasks_by_id.get(&normalized_task_id) else {
+            return Err(task_not_found());
         };
-        let outcome = self.persist_task_and_publish(inner, task.clone(), durability_required, None);
+        if existing.kind() != TaskKind::BilibiliProgressivePlayback {
+            return Err(Status::failed_precondition(
+                "Task is not a Bilibili progressive playback task.",
+            ));
+        }
+        let is_primary = task_uses_hls_session_as_primary(existing, &normalized_session_id);
+        let matching_item = existing
+            .result_items
+            .iter()
+            .find(|item| result_item_uses_hls_session(item, &normalized_session_id));
+        let child_is_playable_while_preparing = existing.state() == TaskState::Preparing
+            && matching_item
+                .is_some_and(|item| result_item_state(item) == Some(TaskState::Playable));
+        let verified_child_is_completed_while_preparing = verified_completion
+            && existing.state() == TaskState::Preparing
+            && matching_item
+                .is_some_and(|item| result_item_state(item) == Some(TaskState::Completed));
+        if !matches!(existing.state(), TaskState::Playable | TaskState::Completed)
+            && !child_is_playable_while_preparing
+            && !verified_child_is_completed_while_preparing
+        {
+            return Ok(None);
+        }
+        let result_id = matching_item
+            .map(|item| item.id.clone())
+            .or_else(|| is_primary.then(|| normalized_task_id.clone()));
+        let Some(result_id) = result_id else {
+            return Ok(None);
+        };
+        let item_status = existing
+            .result_items
+            .iter()
+            .find(|item| result_item_uses_hls_session(item, &normalized_session_id))
+            .and_then(|item| item.hls_cache_fill_status.as_ref());
+        let current_status = item_status.or(if is_primary {
+            existing.hls_cache_fill_status.as_ref()
+        } else {
+            None
+        });
+        if let Some(previous) = current_status {
+            let previous_state = HlsCacheFillState::try_from(previous.state).unwrap_or_default();
+            let same_representation = !status.representation_id.is_empty()
+                && previous.representation_id == status.representation_id;
+            let safety_failure = HlsCacheFillState::try_from(status.state).unwrap_or_default()
+                == HlsCacheFillState::Failed
+                && HlsCacheFillFailureKind::try_from(status.failure_kind).unwrap_or_default()
+                    == HlsCacheFillFailureKind::Safety;
+            let repair_missing_completed_total = verified_completion
+                && same_representation
+                && previous_state == HlsCacheFillState::Completed
+                && !previous.total_bytes_known;
+            if previous_state == HlsCacheFillState::Completed
+                && !repair_missing_completed_total
+                && !(same_representation && safety_failure)
+            {
+                return Ok(Some(existing.clone()));
+            }
+            if !same_representation && previous_state == HlsCacheFillState::Completed {
+                return Ok(Some(existing.clone()));
+            }
+            if !same_representation {
+                // A newly completed representation may replace an in-progress status (for
+                // example, a transcoded output), but ordinary updates cannot claim completion.
+                if !verified_completion
+                    && HlsCacheFillState::try_from(status.state).unwrap_or_default()
+                        == HlsCacheFillState::Completed
+                {
+                    return Ok(Some(existing.clone()));
+                }
+            } else {
+                status.completed_bytes = status.completed_bytes.max(previous.completed_bytes);
+                if !status.total_bytes_known && previous.total_bytes_known {
+                    status.total_bytes = previous.total_bytes;
+                    status.total_bytes_known = true;
+                }
+                if verified_completion && status.total_bytes_known {
+                    status.completed_bytes = status.completed_bytes.min(status.total_bytes);
+                }
+            }
+        }
+        status.message = hls_cache_fill_status_client_message(&status).to_owned();
+        if current_status == Some(&status) {
+            return Ok(Some(existing.clone()));
+        }
+        let checkpoint = RegistryMutationCheckpoint::capture(&inner);
+        {
+            let task = inner
+                .tasks_by_id
+                .get_mut(&normalized_task_id)
+                .expect("validated playback task should remain present");
+            if is_primary {
+                task.hls_cache_fill_status = Some(status.clone());
+            }
+            if let Some(item) = task
+                .result_items
+                .iter_mut()
+                .find(|item| result_item_uses_hls_session(item, &normalized_session_id))
+            {
+                item.hls_cache_fill_status = Some(status.clone());
+            }
+            task.updated_at = Some(current_timestamp());
+        }
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_task_id)
+            .expect("playback task should remain present")
+            .clone();
+        let output_update = {
+            let output = inner
+                .outputs_by_task_id
+                .get_mut(&normalized_task_id)
+                .expect("playback task output should be registered");
+            output.update_bilibili_cache_fill_status_for_task(&task, &result_id, &status)
+        };
+        let output_changed = match output_update {
+            Ok(changed) => changed,
+            Err(error) => {
+                checkpoint.restore(&mut inner);
+                return Err(Status::failed_precondition(format!(
+                    "HLS cache fill status could not be reconciled with task output: {error}"
+                )));
+            }
+        };
+        if !output_changed {
+            checkpoint.restore(&mut inner);
+            return Err(Status::failed_precondition(
+                "HLS cache fill status has no matching Bilibili v2 result.",
+            ));
+        }
+        let output_summary = inner
+            .outputs_by_task_id
+            .get(&normalized_task_id)
+            .expect("playback task output should be registered")
+            .summary();
+        inner
+            .tasks_by_id
+            .get_mut(&normalized_task_id)
+            .expect("playback task should remain present")
+            .output_summary = Some(output_summary);
+        let task = inner
+            .tasks_by_id
+            .get(&normalized_task_id)
+            .expect("playback task should remain present")
+            .clone();
+        let durability_required = self.persistence.is_some();
+        let outcome = self.persist_task_and_publish(
+            inner,
+            task.clone(),
+            self.persistence.is_some(),
+            Some(checkpoint),
+        );
         if durability_required && !outcome.is_durable() {
             return Err(Status::unavailable(
-                "HLS cache fill failure could not be persisted durably.",
+                "HLS cache fill status could not be persisted durably.",
             ));
         }
         Ok(Some(task))
+    }
+
+    pub fn fail_hls_cache_fill_for_playback_session(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        _message: String,
+    ) -> Result<Option<Task>, Status> {
+        self.update_hls_cache_fill_status(
+            task_id,
+            session_id,
+            HlsCacheFillStatus {
+                state: HlsCacheFillState::Failed.into(),
+                failure_kind: HlsCacheFillFailureKind::Network.into(),
+                message: "Offline cache fill failed; online playback remains available.".to_owned(),
+                ..Default::default()
+            },
+        )
     }
 
     pub fn complete_task_succeeded(
@@ -4024,13 +4271,7 @@ impl BilibiliTaskRegistry {
             .get(&normalized_task_id)
             .is_some_and(|task| {
                 task.kind() == TaskKind::BilibiliProgressivePlayback
-                    && (task_has_online_playback_after_cache_fill_failure(
-                        task,
-                        &normalized_session_id,
-                    ) || task.result_items.iter().any(|item| {
-                        result_item_uses_hls_session(item, &normalized_session_id)
-                            && result_item_has_online_playback_after_cache_fill_failure(item)
-                    }))
+                    && hls_cache_fill_status_is_terminal_failure(task, &normalized_session_id)
             })
     }
 
@@ -6107,6 +6348,7 @@ fn initial_bilibili_result_items(
             playback_source: None,
             playback_session: None,
             identity: Some(candidate.proto_identity()),
+            hls_cache_fill_status: None,
         })
         .collect()
 }
@@ -6210,9 +6452,32 @@ fn completed_task_has_playable_result_session(task: &Task, session_id: &str) -> 
     task.state() == TaskState::Completed
         && task.result_items.iter().any(|item| {
             result_item_uses_hls_session(item, session_id)
-                && (result_item_state(item) == Some(TaskState::Playable)
-                    || result_item_has_online_playback_after_cache_fill_failure(item))
+                && matches!(
+                    result_item_state(item),
+                    Some(TaskState::Playable | TaskState::Completed)
+                )
+                || result_item_uses_hls_session(item, session_id)
+                    && result_item_has_online_playback_after_cache_fill_failure(item)
         })
+}
+
+fn hls_cache_fill_status_is_terminal_failure(task: &Task, session_id: &str) -> bool {
+    let status = task
+        .result_items
+        .iter()
+        .find(|item| result_item_uses_hls_session(item, session_id))
+        .and_then(|item| item.hls_cache_fill_status.as_ref())
+        .or_else(|| {
+            task_uses_hls_session_as_primary(task, session_id)
+                .then_some(task.hls_cache_fill_status.as_ref())
+                .flatten()
+        });
+    status.is_some_and(|status| {
+        matches!(
+            HlsCacheFillState::try_from(status.state).unwrap_or_default(),
+            HlsCacheFillState::SourceUnavailable | HlsCacheFillState::Failed
+        )
+    })
 }
 
 fn result_item_has_online_playback_after_cache_fill_failure(item: &BilibiliTaskResultItem) -> bool {
@@ -6220,14 +6485,6 @@ fn result_item_has_online_playback_after_cache_fill_failure(item: &BilibiliTaskR
         && item.message.contains("offline cache fill failed")
         && item.playback_source.is_some()
         && item.playback_session.is_some()
-}
-
-fn task_has_online_playback_after_cache_fill_failure(task: &Task, session_id: &str) -> bool {
-    task.state() == TaskState::Playable
-        && task.message.contains("offline cache fill failed")
-        && task.playback_source.is_some()
-        && task.playback_session.is_some()
-        && task_uses_hls_session_as_primary(task, session_id)
 }
 
 fn result_item_can_serve_online_playback_after_task_completion(
@@ -6290,6 +6547,37 @@ fn playback_source_uri_for_session(task: &Task, session_id: &str) -> Option<Stri
                 .and_then(|item| item.playback_source.as_ref())
                 .map(|source| source.uri.clone())
         })
+}
+
+fn hls_cache_fill_status_client_message(status: &HlsCacheFillStatus) -> &'static str {
+    let state = HlsCacheFillState::try_from(status.state).unwrap_or_default();
+    let failure_kind = HlsCacheFillFailureKind::try_from(status.failure_kind).unwrap_or_default();
+    match state {
+        HlsCacheFillState::Queued => "Queued for offline filling.",
+        HlsCacheFillState::Filling => "Filling selected video and audio for offline playback.",
+        HlsCacheFillState::Preempted => {
+            "Offline fill paused; verified partial cache data is retained."
+        }
+        HlsCacheFillState::Retrying if failure_kind == HlsCacheFillFailureKind::Persistence => {
+            "Offline fill will retry after durable task-state recovery."
+        }
+        HlsCacheFillState::Retrying => "Offline fill will retry after a temporary network error.",
+        HlsCacheFillState::BlockedQuota => "Offline fill is waiting for cache quota.",
+        HlsCacheFillState::Completed => {
+            "Selected video and audio are complete for offline playback."
+        }
+        HlsCacheFillState::SourceUnavailable => {
+            "The current source is unavailable; verified partial cache data is retained."
+        }
+        HlsCacheFillState::Failed if failure_kind == HlsCacheFillFailureKind::Safety => {
+            "Offline fill stopped because the source response failed validation."
+        }
+        HlsCacheFillState::Failed => {
+            "Offline cache fill failed; online playback remains available."
+        }
+        HlsCacheFillState::Cancelled => "Offline cache fill was cancelled.",
+        HlsCacheFillState::Unspecified => "Offline cache fill status is unavailable.",
+    }
 }
 
 fn result_item_state(item: &BilibiliTaskResultItem) -> Option<TaskState> {
@@ -6370,27 +6658,6 @@ fn clear_unrestorable_result_playback_metadata_for_session(
         item.library_item_id.clear();
         item.playback_source = None;
         item.playback_session = None;
-        changed = true;
-    }
-    changed
-}
-
-fn mark_result_cache_fill_failed_for_session(
-    items: &mut [BilibiliTaskResultItem],
-    session_id: &str,
-    message: &str,
-) -> bool {
-    let mut changed = false;
-    for item in items {
-        if !result_item_state(item)
-            .is_some_and(|state| matches!(state, TaskState::Playable | TaskState::Completed))
-            || !result_item_uses_hls_session(item, session_id)
-        {
-            continue;
-        }
-        item.state = TaskState::Failed.into();
-        item.message = message.to_owned();
-        item.library_item_id.clear();
         changed = true;
     }
     changed
@@ -9409,6 +9676,7 @@ mod tests {
                 playback_source: None,
                 playback_session: None,
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9424,6 +9692,7 @@ mod tests {
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(child_session.clone()),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9487,6 +9756,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9502,6 +9772,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9559,6 +9830,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9574,6 +9846,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9636,6 +9909,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9651,6 +9925,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9727,6 +10002,7 @@ mod tests {
                 playback_source: None,
                 playback_session: None,
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9742,6 +10018,7 @@ mod tests {
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(child_session.clone()),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9801,6 +10078,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -9816,6 +10094,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -9877,9 +10156,10 @@ mod tests {
             .expect("cache fill failure should update task");
 
         assert_eq!(TaskState::Playable, playable.state());
+        assert_eq!(PLAYBACK_PLAYABLE_MESSAGE, playable.message);
         assert_eq!(
-            "Playable online; offline cache fill failed: upstream failed",
-            playable.message
+            HlsCacheFillState::Failed as i32,
+            playable.hls_cache_fill_status.as_ref().unwrap().state
         );
         assert!(playable.playback_source.is_some());
         assert!(playable.playback_session.is_some());
@@ -9888,6 +10168,499 @@ mod tests {
                 &created.task.id,
                 &created.task.id,
             )
+        );
+    }
+
+    #[test]
+    fn cache_fill_status_redacts_signed_url_from_task_and_v2_details() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-redaction", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        let before_task = registry.get_task(&created.task.id).unwrap();
+        let before = registry.task_output_snapshot(&created.task.id).unwrap();
+        let signed_url = "https://cdn.example.test/video.m4s?auth_key=credential-free-secret";
+
+        let updated = registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::SourceUnavailable.into(),
+                    failure_kind: HlsCacheFillFailureKind::SourceUnavailable.into(),
+                    message: format!("upstream failed for {signed_url}"),
+                    ..Default::default()
+                },
+            )
+            .expect("cache status should persist")
+            .expect("playable task should receive cache status");
+        let after = registry.task_output_snapshot(&created.task.id).unwrap();
+
+        assert_eq!(TaskState::Playable, updated.state());
+        assert_eq!(before_task.playback_source, updated.playback_source);
+        assert_eq!(before.revision + 1, after.revision);
+        assert!(
+            !updated
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(signed_url)
+        );
+        let result = after
+            .output
+            .record
+            .results
+            .iter()
+            .find(|result| result.id == created.task.id)
+            .expect("primary v2 result should remain present");
+        let Some(task_result_provider_details::Details::Bilibili(details)) = result
+            .provider_details
+            .as_ref()
+            .and_then(|provider| provider.details.as_ref())
+        else {
+            panic!("primary result should contain Bilibili provider details");
+        };
+        let status = details
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("v2 provider details should expose fill status");
+        assert_eq!(HlsCacheFillState::SourceUnavailable as i32, status.state);
+        assert!(!status.message.contains(signed_url));
+    }
+
+    #[test]
+    fn cache_fill_status_preserves_same_representation_completion_on_requeue() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-completed", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Completed.into(),
+                    completed_bytes: 500,
+                    total_bytes: 500,
+                    total_bytes_known: true,
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let revision = registry
+            .task_output_snapshot(&created.task.id)
+            .unwrap()
+            .revision;
+        let requeued = registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Queued.into(),
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            HlsCacheFillState::Completed as i32,
+            requeued.hls_cache_fill_status.as_ref().unwrap().state
+        );
+        assert_eq!(
+            500,
+            requeued
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .completed_bytes
+        );
+        assert_eq!(
+            revision,
+            registry
+                .task_output_snapshot(&created.task.id)
+                .unwrap()
+                .revision
+        );
+    }
+
+    #[test]
+    fn verified_completion_repairs_only_missing_total_for_same_representation() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-repair-total", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Completed.into(),
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("legacy completed status should persist")
+            .expect("playable task should receive status");
+        let before = registry.task_output_snapshot(&created.task.id).unwrap();
+
+        let repaired = registry
+            .update_hls_cache_fill_status_from_verified_completion(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Completed.into(),
+                    completed_bytes: 750,
+                    total_bytes: 750,
+                    total_bytes_known: true,
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("verified completion should repair missing total")
+            .expect("playable task should receive repaired status");
+        let after = registry.task_output_snapshot(&created.task.id).unwrap();
+        let repaired_status = repaired.hls_cache_fill_status.as_ref().unwrap();
+        assert!(repaired_status.total_bytes_known);
+        assert_eq!(750, repaired_status.total_bytes);
+        assert_eq!(750, repaired_status.completed_bytes);
+        assert_eq!(before.revision + 1, after.revision);
+        let result = &after.output.record.results[0];
+        let Some(task_result_provider_details::Details::Bilibili(details)) = result
+            .provider_details
+            .as_ref()
+            .and_then(|provider| provider.details.as_ref())
+        else {
+            panic!("v2 result should expose Bilibili fill status");
+        };
+        assert_eq!(
+            Some(repaired_status),
+            details.hls_cache_fill_status.as_ref()
+        );
+
+        let stable_revision = after.revision;
+        let ignored = registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    representation_id: "transcoded".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("ordinary update should leave completion intact")
+            .unwrap();
+        assert_eq!(
+            repaired_status,
+            ignored.hls_cache_fill_status.as_ref().unwrap()
+        );
+        assert_eq!(
+            stable_revision,
+            registry
+                .task_output_snapshot(&created.task.id)
+                .unwrap()
+                .revision
+        );
+    }
+
+    #[test]
+    fn ordinary_progress_keeps_existing_merge_while_verified_new_representation_resets_it() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-representation-reset", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    completed_bytes: 300,
+                    total_bytes: 500,
+                    total_bytes_known: true,
+                    representation_id: "source-h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let ordinary = registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    completed_bytes: 250,
+                    total_bytes: 200,
+                    total_bytes_known: true,
+                    representation_id: "source-h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let ordinary_status = ordinary.hls_cache_fill_status.as_ref().unwrap();
+        assert_eq!(300, ordinary_status.completed_bytes);
+        assert_eq!(200, ordinary_status.total_bytes);
+
+        let completed = registry
+            .update_hls_cache_fill_status_from_verified_completion(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Completed.into(),
+                    completed_bytes: 100,
+                    total_bytes: 100,
+                    total_bytes_known: true,
+                    representation_id: "transcoded-output".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let completed_status = completed.hls_cache_fill_status.as_ref().unwrap();
+        assert_eq!(100, completed_status.completed_bytes);
+        assert_eq!(100, completed_status.total_bytes);
+        assert_eq!("transcoded-output", completed_status.representation_id);
+    }
+
+    #[test]
+    fn playable_child_cache_status_updates_while_parent_is_preparing() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-child", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "A child result is playable.".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: created.task.id.clone(),
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(playback_source(&created.task.id)),
+                        playback_session: Some(playback_session(&created.task.id)),
+                        ..Default::default()
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_session_id.clone(),
+                        source_kind: "video_page".to_owned(),
+                        content_id: "cid-2".to_owned(),
+                        index: 2,
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(playback_source(&child_session_id)),
+                        playback_session: Some(playback_session(&child_session_id)),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .expect("child result should become playable");
+        {
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            inner.tasks_by_id.get_mut(&created.task.id).unwrap().state =
+                TaskState::Preparing.into();
+        }
+
+        let updated = registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &child_session_id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("playable child cache status should update")
+            .expect("matching playable child should be authorized");
+
+        assert_eq!(TaskState::Preparing, updated.state());
+        assert!(updated.hls_cache_fill_status.is_none());
+        assert_eq!(
+            HlsCacheFillState::Filling as i32,
+            updated.result_items[1]
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .state
+        );
+    }
+
+    #[test]
+    fn verified_completion_repairs_completed_child_fill_while_parent_is_preparing() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-completed-child", None, None)
+            .expect("playback task should be created");
+        let child_session_id = format!("{}-result-2", created.task.id);
+        registry
+            .complete_playback_results_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                "A child result is playable.".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: created.task.id.clone(),
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(playback_source(&created.task.id)),
+                        playback_session: Some(playback_session(&created.task.id)),
+                        ..Default::default()
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_session_id.clone(),
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(playback_source(&child_session_id)),
+                        playback_session: Some(playback_session(&child_session_id)),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .expect("child result should become playable");
+        {
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            inner.tasks_by_id.get_mut(&created.task.id).unwrap().state =
+                TaskState::Preparing.into();
+        }
+        registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &child_session_id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("playable child fill status should persist")
+            .expect("matching playable child should be authorized");
+        {
+            let mut inner = registry.inner.lock().expect("task registry lock poisoned");
+            let parent = inner.tasks_by_id.get_mut(&created.task.id).unwrap();
+            parent.result_items[1].state = TaskState::Completed.into();
+            parent.result_items[1].library_item_id = format!("bilibili.hls.{child_session_id}");
+        }
+
+        let updated = registry
+            .update_hls_cache_fill_status_from_verified_completion(
+                &created.task.id,
+                &child_session_id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Completed.into(),
+                    completed_bytes: 750,
+                    total_bytes: 750,
+                    total_bytes_known: true,
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("verified completed child status should repair while parent prepares")
+            .expect("completed child should retain its authoritative status");
+
+        assert_eq!(TaskState::Preparing, updated.state());
+        assert_eq!(
+            TaskState::Completed,
+            TaskState::try_from(updated.result_items[1].state).unwrap()
+        );
+        let child_status = updated.result_items[1]
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("completed child should expose fill status");
+        assert_eq!(HlsCacheFillState::Completed as i32, child_status.state);
+        assert_eq!(750, child_status.total_bytes);
+        assert!(child_status.total_bytes_known);
+    }
+
+    #[test]
+    fn explicit_playback_cancellation_marks_existing_fill_status_cancelled() {
+        let registry = BilibiliTaskRegistry::default();
+        let created = registry
+            .create_bilibili_playback_task("BV1cache-status-cancel", None, None)
+            .expect("playback task should be created");
+        registry
+            .complete_playback_playable(
+                &created.task.id,
+                "Playable".to_owned(),
+                playback_source(&created.task.id),
+                playback_session(&created.task.id),
+            )
+            .expect("playback should become playable");
+        registry
+            .update_hls_cache_fill_status(
+                &created.task.id,
+                &created.task.id,
+                HlsCacheFillStatus {
+                    state: HlsCacheFillState::Filling.into(),
+                    representation_id: "h264".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .expect("fill status should persist");
+
+        let cancelled = registry
+            .cancel_task_with_hls_session_ids(&created.task.id)
+            .expect("explicit cancel should persist");
+        let output = registry.task_output_snapshot(&created.task.id).unwrap();
+
+        assert_eq!(TaskState::Cancelled, cancelled.task.state());
+        assert_eq!(
+            HlsCacheFillState::Cancelled as i32,
+            cancelled.task.hls_cache_fill_status.as_ref().unwrap().state
+        );
+        let Some(task_result_provider_details::Details::Bilibili(details)) =
+            output.output.record.results[0]
+                .provider_details
+                .as_ref()
+                .and_then(|provider| provider.details.as_ref())
+        else {
+            panic!("cancelled v2 result should retain fill status details");
+        };
+        assert_eq!(
+            HlsCacheFillState::Cancelled as i32,
+            details.hls_cache_fill_status.as_ref().unwrap().state
         );
     }
 
@@ -9920,6 +10693,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -9935,6 +10709,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -9961,11 +10736,11 @@ mod tests {
             "Playable online; selected Bilibili playback results are cached offline.",
             updated.message
         );
-        assert_eq!(i32::from(TaskState::Failed), updated.result_items[0].state);
         assert_eq!(
-            "Playable online; offline cache fill failed: upstream failed",
-            updated.result_items[0].message
+            i32::from(TaskState::Playable),
+            updated.result_items[0].state
         );
+        assert_eq!("Playable", updated.result_items[0].message);
         assert!(updated.result_items[0].playback_source.is_some());
         assert!(updated.result_items[0].playback_session.is_some());
         assert_eq!(
@@ -9982,7 +10757,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_fill_failure_marks_completed_secondary_result_failed_but_keeps_playback() {
+    fn cache_fill_failure_keeps_completed_task_and_secondary_result_state() {
         let registry = BilibiliTaskRegistry::default();
         let created = registry
             .create_bilibili_playback_task("BV1cache-fill-secondary-failed", None, None)
@@ -10010,6 +10785,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -10025,6 +10801,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -10036,6 +10813,10 @@ mod tests {
                 format!("bilibili.hls.{}", created.task.id),
             )
             .expect("primary session should become completed");
+        let parent_message_before_fill_failure = registry
+            .get_task(&created.task.id)
+            .expect("completed task should remain readable")
+            .message;
 
         let updated = registry
             .fail_hls_cache_fill_for_playback_session(
@@ -10047,19 +10828,16 @@ mod tests {
             .expect("secondary cache fill failure should update task");
 
         assert_eq!(TaskState::Completed, updated.state());
-        assert_eq!(
-            "Completed offline; some Bilibili playback results failed to cache offline.",
-            updated.message
-        );
+        assert_eq!(parent_message_before_fill_failure, updated.message);
         assert_eq!(
             i32::from(TaskState::Completed),
             updated.result_items[0].state
         );
-        assert_eq!(i32::from(TaskState::Failed), updated.result_items[1].state);
         assert_eq!(
-            "Playable online; offline cache fill failed: upstream failed",
-            updated.result_items[1].message
+            i32::from(TaskState::Playable),
+            updated.result_items[1].state
         );
+        assert_eq!("Playable", updated.result_items[1].message);
         assert!(updated.result_items[1].library_item_id.is_empty());
         assert!(updated.result_items[1].playback_source.is_some());
         assert!(updated.result_items[1].playback_session.is_some());
@@ -10085,11 +10863,11 @@ mod tests {
 
         assert!(changed_ids.is_empty());
         assert_eq!(TaskState::Completed, restored.state());
-        assert_eq!(i32::from(TaskState::Failed), restored.result_items[1].state);
         assert_eq!(
-            "Playable online; offline cache fill failed: upstream failed",
-            restored.result_items[1].message
+            i32::from(TaskState::Playable),
+            restored.result_items[1].state
         );
+        assert_eq!("Playable", restored.result_items[1].message);
         assert!(restored.result_items[1].playback_source.is_some());
         assert!(restored.result_items[1].playback_session.is_some());
 
@@ -10146,6 +10924,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -10161,6 +10940,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -10225,6 +11005,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -10240,6 +11021,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -10312,6 +11094,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -10327,6 +11110,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -10405,6 +11189,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -10420,6 +11205,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -10493,6 +11279,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -10508,6 +11295,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -10594,6 +11382,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -10609,6 +11398,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -10680,6 +11470,7 @@ mod tests {
                 playback_source: Some(playback_source(&created.task.id)),
                 playback_session: Some(playback_session(&created.task.id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -10695,6 +11486,7 @@ mod tests {
                 playback_source: Some(playback_source(&child_session_id)),
                 playback_session: Some(playback_session(&child_session_id)),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         registry
@@ -10757,6 +11549,7 @@ mod tests {
                     playback_source: Some(playback_source(result_session_id)),
                     playback_session: Some(playback_session(result_session_id)),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("playback results should become playable");
@@ -10794,6 +11587,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -10809,6 +11603,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -10871,6 +11666,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                         ..Default::default()
                     },
                     BilibiliTaskResultItem {
@@ -10879,6 +11675,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                         ..Default::default()
                     },
                 ],
@@ -11013,6 +11810,7 @@ mod tests {
                         playback_source: Some(playback_source(&created.task.id)),
                         playback_session: Some(playback_session(&created.task.id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -11028,6 +11826,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -11210,6 +12009,7 @@ mod tests {
                         playback_source: Some(playback_source(&primary_session_id)),
                         playback_session: Some(playback_session(&primary_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -11225,6 +12025,7 @@ mod tests {
                         playback_source: Some(playback_source(&child_session_id)),
                         playback_session: Some(playback_session(&child_session_id)),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -12844,6 +13645,7 @@ mod tests {
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -12982,6 +13784,7 @@ mod tests {
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -13243,7 +14046,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_fill_failure_remains_pending_until_persistence_recovers() {
+    fn cache_fill_failure_status_retries_after_persistence_recovers() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let path = temp.path().join("state").join("tasks.json");
         let registry = BilibiliTaskRegistry::with_persistence_path(&path);
@@ -13278,12 +14081,20 @@ mod tests {
 
         std::fs::remove_dir(&path).expect("blocking directory should be removable");
         assert!(registry.retry_pending_persistence());
+        registry
+            .fail_hls_cache_fill_for_playback_session(
+                &created.task.id,
+                &created.task.id,
+                "Playable online; offline cache fill failed.".to_owned(),
+            )
+            .expect("fill status should persist after storage recovers");
         let persisted = registry
             .get_task(&created.task.id)
             .expect("task should remain readable");
+        assert_eq!(PLAYBACK_PLAYABLE_MESSAGE, persisted.message);
         assert_eq!(
-            "Playable online; offline cache fill failed.",
-            persisted.message
+            HlsCacheFillState::Failed as i32,
+            persisted.hls_cache_fill_status.as_ref().unwrap().state
         );
         assert!(registry.persistence_available());
     }
@@ -14772,7 +15583,7 @@ mod tests {
             &std::fs::read(&state_path).expect("migrated snapshot should be readable"),
         )
         .expect("migrated snapshot should decode");
-        assert_eq!(Some(8), migrated["schema_version"].as_u64());
+        assert_eq!(Some(9), migrated["schema_version"].as_u64());
         assert!(migrated["tasks"][0]["output"]["resources"][0]["body_identity"].is_object());
     }
 
@@ -15443,6 +16254,7 @@ mod tests {
             playback_source: None,
             playback_session: None,
             identity: None,
+            hls_cache_fill_status: None,
         };
 
         let error = registry
@@ -15545,6 +16357,7 @@ mod tests {
                     playback_source: Some(playback_source(&child_session_id)),
                     playback_session: Some(playback_session(&child_session_id)),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect_err("an unpersistable playback publication must be rejected");
@@ -15847,6 +16660,7 @@ mod tests {
             finished_at,
             playback_source: None,
             playback_session: None,
+            hls_cache_fill_status: None,
             bilibili_selection: None,
             result_items: Vec::new(),
             output_summary: None,

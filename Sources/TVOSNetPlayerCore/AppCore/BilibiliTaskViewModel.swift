@@ -143,6 +143,7 @@ public struct BilibiliTaskResultPresentation: Identifiable, Equatable, Sendable 
     public let isCached: Bool
     public let isFailed: Bool
     public let isCancelled: Bool
+    public let hlsCacheFillStatus: HlsCacheFillStatus?
 
     public var statusLabel: String {
         if isCached {
@@ -772,7 +773,22 @@ public final class BilibiliTaskViewModel: ObservableObject {
     }
 
     public var progressiveCacheStatusBadge: ProgressiveCacheStatusBadge? {
-        currentTask.flatMap(Self.progressiveCacheStatusBadge(for:))
+        currentTask.flatMap { task in
+            Self.progressiveCacheStatusBadge(
+                for: task,
+                additionalFillStatuses: taskResultItems.compactMap(\.bilibiliCacheFillStatus)
+            )
+        }
+    }
+
+    public var progressiveCacheFillStatus: HlsCacheFillStatus? {
+        guard let currentTask else {
+            return nil
+        }
+        return Self.cacheFillStatus(
+            for: currentTask,
+            additionalFillStatuses: taskResultItems.compactMap(\.bilibiliCacheFillStatus)
+        )
     }
 
     public var taskResults: [BilibiliTaskResultPresentation] {
@@ -2529,9 +2545,20 @@ public final class BilibiliTaskViewModel: ObservableObject {
         return nil
     }
 
-    private static func progressiveCacheStatusBadge(for task: CacheTask) -> ProgressiveCacheStatusBadge? {
+    private static func progressiveCacheStatusBadge(
+        for task: CacheTask,
+        additionalFillStatuses: [HlsCacheFillStatus] = []
+    ) -> ProgressiveCacheStatusBadge? {
         guard task.isProgressivePlayback else {
             return nil
+        }
+
+        let fillStatus = cacheFillStatus(for: task, additionalFillStatuses: additionalFillStatuses)
+        if let fillStatus {
+            return ProgressiveCacheStatusBadge(
+                label: fillStatus.displayLabel,
+                systemImage: fillStatus.systemImage
+            )
         }
 
         if let summary = task.bilibiliTaskResultSummary,
@@ -2624,6 +2651,40 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
 
         return nil
+    }
+
+    private static func cacheFillStatus(
+        for task: CacheTask,
+        additionalFillStatuses: [HlsCacheFillStatus]
+    ) -> HlsCacheFillStatus? {
+        if let status = task.hlsCacheFillStatus, status.state != .unspecified {
+            return status
+        }
+
+        let statuses = task.resultItems.compactMap(\.hlsCacheFillStatus) + additionalFillStatuses
+        return statuses.min { fillStatePriority($0.state) < fillStatePriority($1.state) }
+            ?? task.hlsCacheFillStatus
+    }
+
+    private static func fillStatePriority(_ state: HlsCacheFillState) -> Int {
+        switch state {
+        case .blockedQuota, .failed, .sourceUnavailable:
+            0
+        case .retrying:
+            1
+        case .filling:
+            2
+        case .queued:
+            3
+        case .preempted:
+            4
+        case .cancelled:
+            5
+        case .completed:
+            6
+        case .unspecified:
+            7
+        }
     }
 
     private static func multiResultOfflineCacheFailureBadge(
@@ -2832,7 +2893,8 @@ private extension CacheTask {
                 isReady: item.isReadyBilibiliResultState,
                 isCached: item.isCompletedBilibiliResultState,
                 isFailed: item.isFailedBilibiliResultState,
-                isCancelled: item.isCancelledBilibiliResultState
+                isCancelled: item.isCancelledBilibiliResultState,
+                hlsCacheFillStatus: item.hlsCacheFillStatus
             )
         }
     }
@@ -2983,7 +3045,8 @@ private extension CacheTask {
             playbackSession: playbackSession,
             bilibiliSelection: bilibiliSelection,
             resultItems: updatedResultItems,
-            outputSummary: outputSummary
+            outputSummary: outputSummary,
+            hlsCacheFillStatus: hlsCacheFillStatus
         )
     }
 }
@@ -3012,7 +3075,8 @@ private extension BilibiliTaskResultItem {
             message: "Cached Bilibili result was deleted.",
             libraryItemID: "",
             playbackSource: nil,
-            playbackSession: nil
+            playbackSession: nil,
+            hlsCacheFillStatus: hlsCacheFillStatus
         )
     }
 
@@ -3164,8 +3228,16 @@ private extension CacheTaskResult {
             isReady: isReady,
             isCached: isCached,
             isFailed: isFailed,
-            isCancelled: isCancelled
+            isCancelled: isCancelled,
+            hlsCacheFillStatus: bilibiliCacheFillStatus
         )
+    }
+
+    var bilibiliCacheFillStatus: HlsCacheFillStatus? {
+        guard case .bilibili(let details)? = providerDetails else {
+            return nil
+        }
+        return details.hlsCacheFillStatus
     }
 }
 

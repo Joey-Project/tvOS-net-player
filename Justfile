@@ -15,7 +15,7 @@ build-cache-server:
 build-for-testing:
     scripts/build-for-testing.sh
 
-ci: lint build build-macos build-cache-server build-for-testing test-tvos test test-macos test-cache-server
+ci: lint build build-macos build-cache-server build-for-testing test-tvos test test-macos test-lan-playback test-cache-server
 
 deploy:
     scripts/deploy-lan.sh
@@ -43,6 +43,9 @@ test-bilibili-live:
 
 test-macos:
     scripts/test-macos.sh
+
+test-lan-playback:
+    bash scripts/test-lan-playback.sh
 
 test-tvos:
     scripts/test-tvos-simulator.sh

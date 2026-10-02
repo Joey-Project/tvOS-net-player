@@ -577,6 +577,16 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        if let fillStatus = bilibiliModel.progressiveCacheFillStatus,
+                            let fillProgress = fillStatus.progressFraction
+                        {
+                            ProgressView(value: fillProgress)
+                            Text(
+                                "Offline fill: \(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
                         bilibiliTaskResults
                     }
                 }
@@ -1237,6 +1247,20 @@ private struct BilibiliTaskResultRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+
+                if let fillStatus = result.hlsCacheFillStatus {
+                    Label(fillStatus.displayLabel, systemImage: fillStatus.systemImage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let fillProgress = fillStatus.progressFraction {
+                        ProgressView(value: fillProgress)
+                        Text(
+                            "\(fillStatus.progressBytes ?? 0) / \(fillStatus.totalBytes) bytes (\(fillStatus.progressPercentLabel ?? ""))"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    }
+                }
 
                 ForEach(result.artifacts) { artifact in
                     HStack(spacing: 8) {

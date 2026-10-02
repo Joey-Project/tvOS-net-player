@@ -20,6 +20,7 @@ xcrun swift-format format \
   "${ROOT_DIR}/MacOSNetPlayer" \
   "${ROOT_DIR}/MacOSNetPlayerTests" \
   "${ROOT_DIR}/TVOSNetPlayer" \
-  "${ROOT_DIR}/TVOSNetPlayerTests"
+  "${ROOT_DIR}/TVOSNetPlayerTests" \
+  "${ROOT_DIR}/scripts/probe-lan-playback.swift"
 
 "${ROOT_DIR}/scripts/format-rust.sh"
