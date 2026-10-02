@@ -42,6 +42,8 @@ pub struct CacheServerOptions {
     pub bbdown_ffmpeg_path: PathBuf,
     pub bbdown_credential_path: Option<PathBuf>,
     pub bbdown_credential_profile: Option<String>,
+    pub bbdown_cdn_probe: bool,
+    pub bbdown_cdn_parallelism: usize,
     pub bbdown_restricted_area: Option<BbdownRestrictedArea>,
     pub bbdown_restricted_area_proxies: Vec<BbdownRestrictedProxy>,
     pub bbdown_restricted_api_proxies: Vec<BbdownRestrictedProxy>,
@@ -107,6 +109,9 @@ impl Default for CacheServerOptions {
             bbdown_ffmpeg_path: PathBuf::from("ffmpeg"),
             bbdown_credential_path: None,
             bbdown_credential_profile: None,
+            bbdown_cdn_probe: false,
+            // BBDown probes candidate compatibility independently when parallelism exceeds one.
+            bbdown_cdn_parallelism: 2,
             bbdown_restricted_area: None,
             bbdown_restricted_area_proxies: Vec::new(),
             bbdown_restricted_api_proxies: Vec::new(),
@@ -149,6 +154,11 @@ impl CacheServerOptions {
         if self.bilibili_worker_max_concurrent_tasks == 0 {
             return Err(ConfigError::new(
                 "Bilibili worker max concurrent tasks must be greater than zero.",
+            ));
+        }
+        if !(1..=8).contains(&self.bbdown_cdn_parallelism) {
+            return Err(ConfigError::new(
+                "BBDown CDN parallelism must be between 1 and 8.",
             ));
         }
         if self.hls_cache_high_watermark_percent == 0 || self.hls_cache_high_watermark_percent > 100
@@ -380,6 +390,14 @@ impl CacheServerOptions {
             }
             "Cache:BBDownCredentialProfile" => {
                 self.bbdown_credential_profile = Some(parse_bbdown_credential_profile(&value)?);
+            }
+            "Cache:BBDownCdnProbe" => self.bbdown_cdn_probe = parse_bool(&value)?,
+            "Cache:BBDownCdnParallelism" => {
+                self.bbdown_cdn_parallelism = value.parse().map_err(|_| {
+                    ConfigError::new(format!(
+                        "invalid integer for --Cache:BBDownCdnParallelism: {value}"
+                    ))
+                })?;
             }
             "Cache:BBDownRestrictedArea" => {
                 self.bbdown_restricted_area = Some(parse_bbdown_restricted_area(&value)?);
@@ -787,6 +805,35 @@ mod tests {
             "127.0.0.1:51000".parse::<SocketAddr>().unwrap(),
             options.grpc_listen_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn bbdown_cdn_options_default_to_probe_off_and_parallelism_two() {
+        let options = CacheServerOptions::default();
+
+        assert!(!options.bbdown_cdn_probe);
+        assert_eq!(2, options.bbdown_cdn_parallelism);
+    }
+
+    #[test]
+    fn parses_and_validates_bbdown_cdn_options() {
+        let options = CacheServerOptions::from_args([
+            "--Cache:BBDownCdnProbe".to_owned(),
+            "true".to_owned(),
+            "--Cache:BBDownCdnParallelism".to_owned(),
+            "8".to_owned(),
+        ])
+        .expect("valid CDN options should parse");
+
+        assert!(options.bbdown_cdn_probe);
+        assert_eq!(8, options.bbdown_cdn_parallelism);
+        for parallelism in [0, 9] {
+            let options = CacheServerOptions {
+                bbdown_cdn_parallelism: parallelism,
+                ..CacheServerOptions::default()
+            };
+            assert!(options.validate().is_err());
+        }
     }
 
     #[test]

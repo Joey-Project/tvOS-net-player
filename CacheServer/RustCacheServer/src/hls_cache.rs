@@ -24,6 +24,7 @@ use crate::{
         BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest, BilibiliMediaRequestKind,
         BilibiliPlaybackVariantKind,
     },
+    cdn_history::{CdnHistory, CdnObservation, CdnObservationOutcome, CdnObservationSource},
     generated::tvos_net_player::v1::{
         LibraryItem, LibrarySource, MediaVariant, PlaybackProtocol, PlaybackSource,
     },
@@ -67,6 +68,7 @@ const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
     root_path: Arc<PathBuf>,
+    cdn_history: Arc<CdnHistory>,
     #[cfg(test)]
     remove_session_failures: Arc<Mutex<HashSet<String>>>,
 }
@@ -167,9 +169,15 @@ impl HlsCacheStore {
     pub(crate) fn new(root_path: impl Into<PathBuf>) -> Self {
         Self {
             root_path: Arc::new(root_path.into()),
+            cdn_history: Arc::new(CdnHistory::default()),
             #[cfg(test)]
             remove_session_failures: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub(crate) fn with_cdn_history(mut self, cdn_history: Arc<CdnHistory>) -> Self {
+        self.cdn_history = cdn_history;
+        self
     }
 
     pub(crate) fn save_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
@@ -1002,11 +1010,22 @@ impl HlsCacheStore {
         let prewarm_path = self.resource_prewarm_path(session_id, &resource.id)?;
         let temp_path = prewarm_path.with_extension("tmp");
         let mut last_error = None;
-        for url in resource_urls(resource) {
+        for url in self.cdn_history.rank_request(&resource.request) {
+            if url.trim().is_empty() {
+                continue;
+            }
             check_fill_control(control)?;
             self.prepare_temp_path(&temp_path)?;
-            match download_resource_prefix(client, resource, &url, &temp_path, target, control)
-                .await
+            match download_resource_prefix(
+                client,
+                resource,
+                &url,
+                &temp_path,
+                target,
+                control,
+                &self.cdn_history,
+            )
+            .await
             {
                 Ok(prefix) => {
                     if prefix.initialization_length == 0
@@ -1017,6 +1036,17 @@ impl HlsCacheStore {
                         last_error = Some(HlsCacheError::InvalidResource(
                             "prewarmed HLS MP4 initialization range was invalid".to_owned(),
                         ));
+                        self.record_cdn_observation(
+                            resource,
+                            &prefix.final_url,
+                            passive_cache_observation(
+                                CdnObservationOutcome::IntegrityMismatch,
+                                prefix.prefix_length,
+                                None,
+                                None,
+                                Some(false),
+                            ),
+                        );
                         continue;
                     }
                     if let Err(error) = check_fill_control(control) {
@@ -1045,6 +1075,17 @@ impl HlsCacheStore {
                         &self.resource_prewarm_metadata_path(session_id, &resource.id)?,
                         &metadata,
                     )?;
+                    self.record_cdn_observation(
+                        resource,
+                        &prefix.final_url,
+                        passive_cache_observation(
+                            CdnObservationOutcome::Partial,
+                            prefix.prefix_length,
+                            None,
+                            None,
+                            Some(true),
+                        ),
+                    );
                     check_fill_control(control)?;
                     return Ok(());
                 }
@@ -1364,22 +1405,58 @@ impl HlsCacheStore {
         let resource_path = self.resource_path(session_id, &resource.id)?;
         let temp_path = resource_path.with_extension("tmp");
         let mut last_error = None;
-        for url in resource_urls(resource) {
+        for url in self.cdn_history.rank_request(&resource.request) {
+            if url.trim().is_empty() {
+                continue;
+            }
             check_fill_control(control)?;
             self.prepare_temp_path(&temp_path)?;
-            match download_resource(client, resource, &url, &temp_path, control, &progress).await {
-                Ok(total_length) => {
+            match download_resource(
+                client,
+                resource,
+                &url,
+                &temp_path,
+                control,
+                &progress,
+                &self.cdn_history,
+            )
+            .await
+            {
+                Ok(download) => {
+                    let total_length = download.total_length;
                     let initialization_length =
                         match cached_mp4_initialization_length(&temp_path).await {
                             Ok(length) => length,
                             Err(error) => {
                                 let _ = tokio::fs::remove_file(&temp_path).await;
+                                self.record_cdn_observation(
+                                    resource,
+                                    &download.final_url,
+                                    passive_cache_observation(
+                                        CdnObservationOutcome::IntegrityMismatch,
+                                        total_length,
+                                        Some(download.elapsed),
+                                        download.first_byte_latency,
+                                        None,
+                                    ),
+                                );
                                 last_error = Some(error);
                                 continue;
                             }
                         };
                     if initialization_length == 0 || initialization_length >= total_length {
                         let _ = tokio::fs::remove_file(&temp_path).await;
+                        self.record_cdn_observation(
+                            resource,
+                            &download.final_url,
+                            passive_cache_observation(
+                                CdnObservationOutcome::IntegrityMismatch,
+                                total_length,
+                                Some(download.elapsed),
+                                download.first_byte_latency,
+                                None,
+                            ),
+                        );
                         last_error = Some(HlsCacheError::InvalidResource(
                             "cached HLS MP4 initialization range was invalid".to_owned(),
                         ));
@@ -1417,6 +1494,17 @@ impl HlsCacheStore {
                         &metadata,
                     )?;
                     self.remove_prewarmed_resource(session_id, &resource.id)?;
+                    self.record_cdn_observation(
+                        resource,
+                        &download.final_url,
+                        passive_cache_observation(
+                            CdnObservationOutcome::Complete,
+                            total_length,
+                            Some(download.elapsed),
+                            download.first_byte_latency,
+                            None,
+                        ),
+                    );
                     check_fill_control(control)?;
                     return Ok(total_length);
                 }
@@ -1430,6 +1518,20 @@ impl HlsCacheStore {
         Err(last_error.unwrap_or_else(|| {
             HlsCacheError::InvalidResource("HLS media request did not contain a URL".to_owned())
         }))
+    }
+
+    fn record_cdn_observation(
+        &self,
+        resource: &HlsMediaResource,
+        final_url: &str,
+        observation: CdnObservation,
+    ) {
+        let attribution_url = response_candidate_url(&resource.request, final_url);
+        let Some(attribution_url) = attribution_url else {
+            return;
+        };
+        self.cdn_history
+            .record_request(&resource.request, &attribution_url, observation);
     }
 
     fn read_resource_metadata(
@@ -2004,7 +2106,9 @@ async fn download_resource(
     temp_path: &Path,
     control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
     progress: &(impl Fn(u64) + Send + Sync),
-) -> Result<u64, HlsCacheError> {
+    history: &CdnHistory,
+) -> Result<DownloadedHlsResource, HlsCacheError> {
+    let started_at = Instant::now();
     check_fill_control(control)?;
     let mut request = client.get(url);
     let mut requested_range = false;
@@ -2022,13 +2126,59 @@ async fn download_resource(
             "offline HLS cache does not support range-only media requests".to_owned(),
         ));
     }
-    let response = send_request_with_control(request, control).await?;
+    let response = match send_request_with_control(request, control).await {
+        Ok(response) => response,
+        Err(HlsCacheError::Network(error)) => {
+            if let Some(error_url) = error.url() {
+                record_response_observation(
+                    history,
+                    resource,
+                    error_url.as_str(),
+                    passive_cache_observation(
+                        cache_outcome_for_transport(&error),
+                        0,
+                        None,
+                        None,
+                        None,
+                    ),
+                );
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error),
+    };
+    let final_url = response.url().as_str().to_owned();
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(cache_outcome_for_status(status), 0, None, None, None),
+        );
         return Err(HlsCacheError::UpstreamStatus(status));
     }
     if status == StatusCode::PARTIAL_CONTENT {
+        let range_total_matches =
+            parse_content_range_header(response.headers()).is_some_and(|(_, _, total)| {
+                resource
+                    .request
+                    .size
+                    .is_none_or(|expected| expected == total)
+            });
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(range_total_matches),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(
             "offline HLS cache received partial content for a full media resource".to_owned(),
         ));
@@ -2037,11 +2187,29 @@ async fn download_resource(
     if let (Some(expected), Some(declared)) = (resource.request.size, declared_length)
         && declared != expected
     {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                None,
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS resource Content-Length {declared} did not match expected size {expected}"
         )));
     }
     let Some(maximum_length) = resource.request.size.or(declared_length) else {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(CdnObservationOutcome::Partial, 0, None, None, None),
+        );
         return Err(HlsCacheError::InvalidResource(
             "HLS resource length was unknown".to_owned(),
         ));
@@ -2054,28 +2222,87 @@ async fn download_resource(
         .await?;
     let mut stream = response.bytes_stream();
     let mut total_length = 0_u64;
+    let mut first_byte_latency = None;
     loop {
-        check_fill_control(control)?;
+        if let Err(error) = check_fill_control(control) {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::Cancelled,
+                    total_length,
+                    None,
+                    first_byte_latency,
+                    None,
+                ),
+            );
+            return Err(error);
+        }
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
             () = tokio::time::sleep(Duration::from_millis(100)) => {
                 continue;
             }
         };
-        let Some(chunk) = chunk else {
-            break;
+        let chunk = match chunk {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => {
+                record_response_observation(
+                    history,
+                    resource,
+                    &final_url,
+                    passive_cache_observation(
+                        cache_outcome_for_transport(&error),
+                        total_length,
+                        None,
+                        first_byte_latency,
+                        None,
+                    ),
+                );
+                return Err(error.into());
+            }
+            None => break,
         };
-        let chunk = chunk?;
-        check_fill_control(control)?;
+        if let Err(error) = check_fill_control(control) {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::Cancelled,
+                    total_length,
+                    None,
+                    first_byte_latency,
+                    None,
+                ),
+            );
+            return Err(error);
+        }
         total_length = total_length
             .checked_add(chunk.len().try_into().unwrap_or(u64::MAX))
             .ok_or_else(|| {
                 HlsCacheError::InvalidResource("HLS resource is too large".to_owned())
             })?;
         if total_length > maximum_length {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::IntegrityMismatch,
+                    total_length,
+                    None,
+                    first_byte_latency,
+                    None,
+                ),
+            );
             return Err(HlsCacheError::InvalidResource(format!(
                 "HLS resource body length exceeded expected size {maximum_length}"
             )));
+        }
+        if !chunk.is_empty() && first_byte_latency.is_none() {
+            first_byte_latency = Some(started_at.elapsed());
         }
         file.write_all(&chunk).await?;
         progress(total_length);
@@ -2084,6 +2311,18 @@ async fn download_resource(
     if let Some(declared) = declared_length
         && total_length != declared
     {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                total_length,
+                None,
+                first_byte_latency,
+                None,
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS resource body length {total_length} did not match Content-Length {declared}"
         )));
@@ -2091,12 +2330,36 @@ async fn download_resource(
     if let Some(expected) = resource.request.size
         && total_length != expected
     {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                total_length,
+                None,
+                first_byte_latency,
+                None,
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS resource body length {total_length} did not match expected size {expected}"
         )));
     }
 
-    Ok(total_length)
+    Ok(DownloadedHlsResource {
+        total_length,
+        elapsed: started_at.elapsed(),
+        first_byte_latency,
+        final_url,
+    })
+}
+
+struct DownloadedHlsResource {
+    total_length: u64,
+    elapsed: Duration,
+    first_byte_latency: Option<Duration>,
+    final_url: String,
 }
 
 struct DownloadedResourcePrefix {
@@ -2105,6 +2368,7 @@ struct DownloadedResourcePrefix {
     target_window_seconds: u64,
     total_length: u64,
     initialization_length: u64,
+    final_url: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2134,6 +2398,7 @@ async fn download_resource_prefix(
     temp_path: &Path,
     target: HlsPrefetchPrefixTarget,
     control: &(impl Fn() -> HlsCacheFillControl + Send + Sync),
+    history: &CdnHistory,
 ) -> Result<DownloadedResourcePrefix, HlsCacheError> {
     check_fill_control(control)?;
     let target_prefix_length = target.prefix_bytes;
@@ -2158,27 +2423,121 @@ async fn download_resource_prefix(
         ));
     }
 
-    let response = send_request_with_control(request, control).await?;
+    let response = match send_request_with_control(request, control).await {
+        Ok(response) => response,
+        Err(HlsCacheError::Network(error)) => {
+            if let Some(error_url) = error.url() {
+                record_response_observation(
+                    history,
+                    resource,
+                    error_url.as_str(),
+                    passive_cache_observation(
+                        cache_outcome_for_transport(&error),
+                        0,
+                        None,
+                        None,
+                        Some(false),
+                    ),
+                );
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error),
+    };
+    let final_url = response.url().as_str().to_owned();
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if status != StatusCode::PARTIAL_CONTENT {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                if status.is_success() {
+                    CdnObservationOutcome::IntegrityMismatch
+                } else {
+                    cache_outcome_for_status(status)
+                },
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS prewarm expected partial content, got {status}"
         )));
     }
     let headers = response.headers().clone();
-    let (start, end, total_length) = parse_content_range_header(&headers).ok_or_else(|| {
-        HlsCacheError::InvalidResource(
+    let Some((start, end, total_length)) = parse_content_range_header(&headers) else {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
+        return Err(HlsCacheError::InvalidResource(
             "HLS prewarm response did not include Content-Range".to_owned(),
-        )
-    })?;
+        ));
+    };
     if start != 0 || end < start || end >= total_length {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(
             "HLS prewarm Content-Range was invalid".to_owned(),
         ));
     }
     let prefix_length = end.saturating_add(1);
+    if resource
+        .request
+        .size
+        .is_some_and(|expected_total| expected_total != total_length)
+    {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
+        return Err(HlsCacheError::InvalidResource(
+            "HLS prewarm Content-Range total did not match expected size".to_owned(),
+        ));
+    }
     if prefix_length > target_prefix_length {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(
             "HLS prewarm response exceeded bounded prefix length".to_owned(),
         ));
@@ -2186,6 +2545,18 @@ async fn download_resource_prefix(
     if let Some(declared_length) = response.content_length()
         && declared_length != prefix_length
     {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                0,
+                None,
+                None,
+                Some(false),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS prewarm Content-Length {declared_length} did not match prefix length {prefix_length}"
         )));
@@ -2199,39 +2570,120 @@ async fn download_resource_prefix(
     let mut bytes = Vec::with_capacity(prefix_length.try_into().unwrap_or(usize::MAX));
     let mut stream = response.bytes_stream();
     loop {
-        check_fill_control(control)?;
+        if let Err(error) = check_fill_control(control) {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::Cancelled,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    None,
+                    None,
+                    Some(true),
+                ),
+            );
+            return Err(error);
+        }
         let chunk = tokio::select! {
             chunk = stream.next() => chunk,
             () = tokio::time::sleep(Duration::from_millis(100)) => {
                 continue;
             }
         };
-        let Some(chunk) = chunk else {
-            break;
+        let chunk = match chunk {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => {
+                record_response_observation(
+                    history,
+                    resource,
+                    &final_url,
+                    passive_cache_observation(
+                        cache_outcome_for_transport(&error),
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        None,
+                        None,
+                        Some(true),
+                    ),
+                );
+                return Err(error.into());
+            }
+            None => break,
         };
-        let chunk = chunk?;
         let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
             HlsCacheError::InvalidResource("HLS prewarm prefix is too large".to_owned())
         })?;
         if u64::try_from(next_len).unwrap_or(u64::MAX) > prefix_length {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::IntegrityMismatch,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    None,
+                    None,
+                    Some(false),
+                ),
+            );
             return Err(HlsCacheError::InvalidResource(
                 "HLS prewarm body exceeded Content-Range length".to_owned(),
             ));
         }
-        check_fill_control(control)?;
+        if let Err(error) = check_fill_control(control) {
+            record_response_observation(
+                history,
+                resource,
+                &final_url,
+                passive_cache_observation(
+                    CdnObservationOutcome::Cancelled,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    None,
+                    None,
+                    Some(true),
+                ),
+            );
+            return Err(error);
+        }
         file.write_all(&chunk).await?;
         bytes.extend_from_slice(&chunk);
     }
     file.sync_all().await?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != prefix_length {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                None,
+                None,
+                Some(false),
+            ),
+        );
         return Err(HlsCacheError::InvalidResource(format!(
             "HLS prewarm body length {} did not match Content-Range length {prefix_length}",
             bytes.len()
         )));
     }
-    let initialization_length = mp4_initialization_length(&bytes).ok_or_else(|| {
-        HlsCacheError::InvalidResource("prewarmed HLS MP4 init box not found".to_owned())
-    })?;
+    let Some(initialization_length) = mp4_initialization_length(&bytes) else {
+        record_response_observation(
+            history,
+            resource,
+            &final_url,
+            passive_cache_observation(
+                CdnObservationOutcome::IntegrityMismatch,
+                prefix_length,
+                None,
+                None,
+                Some(false),
+            ),
+        );
+        return Err(HlsCacheError::InvalidResource(
+            "prewarmed HLS MP4 init box not found".to_owned(),
+        ));
+    };
 
     Ok(DownloadedResourcePrefix {
         prefix_length,
@@ -2239,6 +2691,7 @@ async fn download_resource_prefix(
         target_window_seconds: target.window_seconds,
         total_length,
         initialization_length,
+        final_url,
     })
 }
 
@@ -2622,13 +3075,67 @@ fn transcoded_cache_key(session: &HlsPlaybackSession, codecs: &[String]) -> Bili
     }
 }
 
-fn resource_urls(resource: &HlsMediaResource) -> Vec<String> {
-    let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
-    if !resource.request.url.trim().is_empty() {
-        urls.push(resource.request.url.clone());
+fn response_candidate_url(request: &BilibiliMediaRequest, final_url: &str) -> Option<String> {
+    let final_origin = reqwest::Url::parse(final_url).ok()?.origin();
+    std::iter::once(request.url.as_str())
+        .chain(request.backup_urls.iter().map(String::as_str))
+        .find(|candidate| {
+            reqwest::Url::parse(candidate)
+                .ok()
+                .is_some_and(|candidate| candidate.origin() == final_origin)
+        })
+        .map(str::to_owned)
+}
+
+fn record_response_observation(
+    history: &CdnHistory,
+    resource: &HlsMediaResource,
+    final_url: &str,
+    observation: CdnObservation,
+) {
+    let Some(url) = response_candidate_url(&resource.request, final_url) else {
+        return;
+    };
+    history.record_request(&resource.request, &url, observation);
+}
+
+fn passive_cache_observation(
+    outcome: CdnObservationOutcome,
+    bytes: u64,
+    elapsed: Option<Duration>,
+    first_byte_latency: Option<Duration>,
+    range_supported: Option<bool>,
+) -> CdnObservation {
+    CdnObservation {
+        source: CdnObservationSource::Playback,
+        outcome,
+        bytes,
+        elapsed,
+        first_byte_latency,
+        range_supported,
     }
-    urls.extend(resource.request.backup_urls.clone());
-    urls
+}
+
+fn cache_outcome_for_status(status: StatusCode) -> CdnObservationOutcome {
+    if status.is_server_error() {
+        CdnObservationOutcome::ServerFailure
+    } else if status == StatusCode::REQUEST_TIMEOUT || status == StatusCode::GATEWAY_TIMEOUT {
+        CdnObservationOutcome::Timeout
+    } else {
+        CdnObservationOutcome::SourceUnavailable
+    }
+}
+
+fn cache_outcome_for_transport(error: &reqwest::Error) -> CdnObservationOutcome {
+    if error.is_timeout() {
+        CdnObservationOutcome::Timeout
+    } else if error.is_connect() {
+        CdnObservationOutcome::ConnectionFailure
+    } else if error.is_body() || error.is_decode() {
+        CdnObservationOutcome::IntegrityMismatch
+    } else {
+        CdnObservationOutcome::SourceUnavailable
+    }
 }
 
 fn completed_variant_audio_codec(variant: &HlsVariant) -> String {
@@ -3956,6 +4463,54 @@ mod tests {
         assert_eq!(PlaybackProtocol::Hls as i32, item.variants[0].protocol);
         assert_eq!(fake_mp4().len() as u64, cached.total_length);
         assert_eq!(28, cached.initialization_length);
+    }
+
+    #[tokio::test]
+    async fn full_cache_fetch_measurement_ranks_refreshed_url_by_observed_speed() {
+        let (failed_url, _failed_task) = start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(upstream_server_failure)),
+        )
+        .await;
+        let (working_url, _working_task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let history = Arc::new(CdnHistory::default());
+        let store = temp_store(&temp).with_cdn_history(Arc::clone(&history));
+        let mut session = sample_session("cdn-full-fetch", &failed_url);
+        session.variant.video.request.backup_urls = vec![working_url.clone()];
+        let client = reqwest::Client::new();
+        let request = &session.variant.video.request;
+        let slow_candidate = "https://slow-cdn.example/video.m4s?version=1";
+        history.record_request(
+            request,
+            slow_candidate,
+            CdnObservation::playback_complete(
+                fake_mp4().len() as u64,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+                Some(true),
+            ),
+        );
+
+        store
+            .cache_session_resources(&client, &session)
+            .await
+            .expect("backup should complete the full resource download");
+
+        let mut refreshed_request = request.clone();
+        refreshed_request.url = format!("{failed_url}?expires=2");
+        refreshed_request.backup_urls = vec![
+            format!("{working_url}?expires=2"),
+            "https://slow-cdn.example/video.m4s?version=2".to_owned(),
+        ];
+        assert_eq!(
+            refreshed_request.backup_urls[0],
+            history.rank_request(&refreshed_request)[0],
+            "validated cache transfer metrics should promote the fast refreshed origin"
+        );
+        let cached = store
+            .cached_resource(&session.id, &session.variant.video.id)
+            .expect("validated resource should be committed");
+        assert_eq!(fake_mp4().len() as u64, cached.total_length);
     }
 
     #[cfg(unix)]
@@ -6682,6 +7237,13 @@ mod tests {
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "video/mp4")
             .body(Body::from(fake_mp4()))
+            .unwrap()
+    }
+
+    async fn upstream_server_failure() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
             .unwrap()
     }
 

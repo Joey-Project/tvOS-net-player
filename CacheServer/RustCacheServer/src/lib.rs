@@ -4,6 +4,7 @@ mod bilibili_playback;
 mod bilibili_resolution;
 pub mod bilibili_worker;
 mod bonjour;
+mod cdn_history;
 mod codecs;
 pub mod config;
 pub mod generated;
@@ -59,6 +60,7 @@ use tonic::{Status, transport::Server};
 
 use crate::{
     bilibili_playback::BilibiliPlaybackPlanner,
+    cdn_history::CdnHistory,
     config::CacheServerOptions,
     grpc_services::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
@@ -134,6 +136,7 @@ pub struct AppState {
     pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
     pub(crate) resolver_settings: Arc<resolver_settings::ResolverSettingsStore>,
     pub(crate) resolver_routing: Arc<resolver_routing::ResolverRoutingState>,
+    pub(crate) cdn_history: Arc<CdnHistory>,
     pub(crate) resolver_settings_write_permits: Arc<Semaphore>,
     pub(crate) bilibili_resolutions: Arc<Mutex<BilibiliResolutionStore>>,
     pub(crate) bilibili_resolution_blocking_permits: Arc<Semaphore>,
@@ -393,14 +396,22 @@ impl AppState {
     pub fn new(options: CacheServerOptions) -> Self {
         Self::new_with_playback_planner_factory(
             options,
-            |options, library, blocking_permits, resolver_settings, resolver_routing| {
-                Arc::new(BbdownBilibiliAdapter::new_with_resolver_routing(
-                    options,
-                    library,
-                    blocking_permits,
-                    resolver_settings,
-                    resolver_routing,
-                ))
+            |options,
+             library,
+             blocking_permits,
+             resolver_settings,
+             resolver_routing,
+             cdn_history| {
+                Arc::new(
+                    BbdownBilibiliAdapter::new_with_resolver_routing(
+                        options,
+                        library,
+                        blocking_permits,
+                        resolver_settings,
+                        resolver_routing,
+                    )
+                    .with_cdn_history(cdn_history),
+                )
             },
         )
     }
@@ -412,7 +423,9 @@ impl AppState {
     ) -> Self {
         Self::new_with_playback_planner_factory(
             options,
-            |_options, _library, _blocking_permits, _settings, _routing| playback_planner,
+            |_options, _library, _blocking_permits, _settings, _routing, _cdn_history| {
+                playback_planner
+            },
         )
     }
 
@@ -424,7 +437,9 @@ impl AppState {
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
             options,
-            |_options, _library, _blocking_permits, _settings, _routing| playback_planner,
+            |_options, _library, _blocking_permits, _settings, _routing, _cdn_history| {
+                playback_planner
+            },
             Some(hls_cache),
         )
     }
@@ -437,6 +452,7 @@ impl AppState {
             Arc<Semaphore>,
             Arc<resolver_settings::ResolverSettingsStore>,
             Arc<resolver_routing::ResolverRoutingState>,
+            Arc<CdnHistory>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
     ) -> Self {
         Self::new_with_playback_planner_factory_and_hls_cache(
@@ -454,6 +470,7 @@ impl AppState {
             Arc<Semaphore>,
             Arc<resolver_settings::ResolverSettingsStore>,
             Arc<resolver_routing::ResolverRoutingState>,
+            Arc<CdnHistory>,
         ) -> Arc<dyn BilibiliPlaybackPlanner>,
         hls_cache_override: Option<HlsCacheStore>,
     ) -> Self {
@@ -475,6 +492,12 @@ impl AppState {
             .join("resolver-routing-memory.json");
         let resolver_routing = Arc::new(resolver_routing::ResolverRoutingState::load(
             resolver_memory_path,
+        ));
+        let cdn_history = Arc::new(CdnHistory::load(
+            task_state_path
+                .parent()
+                .expect("task state path must have a parent")
+                .join("cdn-history.json"),
         ));
         let task_retention_policy = options.task_retention_policy();
         let options = Arc::new(options);
@@ -505,8 +528,9 @@ impl AppState {
             ),
         );
         let hls_sessions = HlsPlaybackRegistry::default();
-        let hls_cache =
-            hls_cache_override.unwrap_or_else(|| HlsCacheStore::new(library.root_path()));
+        let hls_cache = hls_cache_override
+            .unwrap_or_else(|| HlsCacheStore::new(library.root_path()))
+            .with_cdn_history(Arc::clone(&cdn_history));
         let (mut restored_hls_sessions, hls_cache_scan_succeeded) = match hls_cache.load_sessions()
         {
             Ok(sessions) => (sessions, true),
@@ -628,6 +652,7 @@ impl AppState {
             Arc::clone(&bilibili_resolution_blocking_permits),
             Arc::clone(&resolver_settings),
             Arc::clone(&resolver_routing),
+            Arc::clone(&cdn_history),
         );
         let playback_planning_permits = Arc::new(Semaphore::new(
             options.bilibili_worker_max_concurrent_tasks.max(1),
@@ -690,6 +715,7 @@ impl AppState {
             bilibili_login: bilibili_login::BilibiliLoginManager::default(),
             resolver_settings,
             resolver_routing,
+            cdn_history,
             resolver_settings_write_permits: Arc::new(Semaphore::new(1)),
             bilibili_resolutions: Arc::new(Mutex::new(BilibiliResolutionStore::default())),
             bilibili_resolution_blocking_permits,
@@ -1086,16 +1112,21 @@ impl AppState {
             return None;
         }
 
-        Some(self.spawn_bilibili_task_worker(
-            Arc::new(BbdownBilibiliAdapter::new_with_resolver_routing(
-                Arc::clone(&self.options),
-                Arc::clone(&self.library),
-                Arc::clone(&self.bilibili_resolution_blocking_permits),
-                Arc::clone(&self.resolver_settings),
-                Arc::clone(&self.resolver_routing),
-            )),
-            BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
-        ))
+        Some(
+            self.spawn_bilibili_task_worker(
+                Arc::new(
+                    BbdownBilibiliAdapter::new_with_resolver_routing(
+                        Arc::clone(&self.options),
+                        Arc::clone(&self.library),
+                        Arc::clone(&self.bilibili_resolution_blocking_permits),
+                        Arc::clone(&self.resolver_settings),
+                        Arc::clone(&self.resolver_routing),
+                    )
+                    .with_cdn_history(Arc::clone(&self.cdn_history)),
+                ),
+                BBDOWN_WORKER_MAX_CONCURRENT_TASKS,
+            ),
+        )
     }
 
     /// Ensures one cleanup worker is active for this shared application state.
@@ -1758,6 +1789,11 @@ impl AppState {
     #[doc(hidden)]
     pub async fn shutdown_hls_fill_worker(&self) {
         self.hls_fill_scheduler.shutdown_and_wait_for_worker().await;
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_cdn_history_writer(&self) {
+        self.cdn_history.shutdown_and_wait().await;
     }
 
     #[doc(hidden)]
@@ -2863,11 +2899,13 @@ pub async fn run_with_state(
     let _bilibili_worker_task = state.spawn_configured_bilibili_task_worker();
     let _hls_cache_quota_monitor = state.spawn_hls_cache_quota_monitor();
 
-    tokio::select! {
+    let result = tokio::select! {
         result = wait_for_server_result(&mut grpc_servers) => result,
         result = wait_for_server_result(&mut media_servers) => result,
         _ = shutdown_signal() => Ok(()),
-    }
+    };
+    state.shutdown_cdn_history_writer().await;
+    result
 }
 
 pub async fn run_grpc_servers(

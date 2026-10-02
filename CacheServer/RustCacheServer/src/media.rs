@@ -21,6 +21,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState,
+    cdn_history::{CdnObservation, CdnObservationOutcome, CdnObservationSource},
     hls::{
         HlsMediaResource, HlsMediaSegment, HlsPlaybackSession, mp4_initialization_length,
         should_forward_media_request_header,
@@ -635,9 +636,7 @@ async fn proxy_hls_media_resource(
     headers: &HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
-    urls.push(resource.request.url.clone());
-    urls.extend(resource.request.backup_urls.clone());
+    let urls = state.state.cdn_history.rank_request(&resource.request);
     let context = HlsMediaProxyContext {
         state,
         variant_id,
@@ -653,7 +652,24 @@ async fn proxy_hls_media_resource(
                 last_retryable_response = Some(upstream.response);
             }
             Ok(upstream) => return upstream.response,
-            Err(_) => {
+            Err(error) => {
+                if let Some(error_url) = error.url()
+                    && let Some(observation_url) =
+                        observation_candidate_url(&resource.request, error_url.as_str())
+                {
+                    record_cdn_observation(
+                        &state.state.cdn_history,
+                        &resource.request,
+                        &observation_url,
+                        playback_observation(
+                            cdn_outcome_for_transport(&error),
+                            0,
+                            None,
+                            None,
+                            None,
+                        ),
+                    );
+                }
                 policy_recorder.record_upstream_retry(variant_id);
                 continue;
             }
@@ -700,8 +716,29 @@ async fn send_hls_upstream_request(
     let response_time = started_at.elapsed();
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let observation_url =
+        observation_candidate_url(&context.resource.request, upstream.url().as_str());
     let upstream_headers = upstream.headers().clone();
-    if range_response_invalid(headers.get(RANGE), status, &upstream_headers) {
+    if range_response_invalid(
+        headers.get(RANGE),
+        status,
+        &upstream_headers,
+        context.resource.request.size,
+    ) {
+        if let Some(observation_url) = observation_url.as_deref() {
+            record_cdn_observation(
+                &context.state.state.cdn_history,
+                &context.resource.request,
+                observation_url,
+                playback_observation(
+                    CdnObservationOutcome::IntegrityMismatch,
+                    0,
+                    None,
+                    None,
+                    Some(status == StatusCode::PARTIAL_CONTENT),
+                ),
+            );
+        }
         return Ok(HlsUpstreamResponse {
             response: text_response(
                 StatusCode::BAD_GATEWAY,
@@ -709,6 +746,80 @@ async fn send_hls_upstream_request(
                 head_only,
             ),
         });
+    }
+
+    let expected_body_bytes = expected_media_body_bytes(
+        &upstream_headers,
+        status,
+        headers.get(RANGE),
+        context.resource.request.size,
+    );
+    let declared_body_bytes = upstream_headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let content_length_validated = declared_body_bytes
+        .zip(expected_body_bytes)
+        .is_some_and(|(declared, expected)| declared == expected);
+    let body_length_invalid = headers.get(RANGE).is_some() && expected_body_bytes.is_none()
+        || declared_body_bytes
+            .zip(expected_body_bytes)
+            .is_some_and(|(declared, expected)| declared != expected);
+    if status.is_success() && !head_only && body_length_invalid {
+        if let Some(observation_url) = observation_url.as_deref() {
+            record_cdn_observation(
+                &context.state.state.cdn_history,
+                &context.resource.request,
+                observation_url,
+                playback_observation(
+                    CdnObservationOutcome::IntegrityMismatch,
+                    0,
+                    None,
+                    None,
+                    Some(status == StatusCode::PARTIAL_CONTENT),
+                ),
+            );
+        }
+        return Ok(HlsUpstreamResponse {
+            response: text_response(
+                StatusCode::BAD_GATEWAY,
+                "HLS upstream returned inconsistent byte-range headers.\n",
+                head_only,
+            ),
+        });
+    }
+
+    if !status.is_success()
+        && let Some(observation_url) = observation_url.as_deref()
+    {
+        record_cdn_observation(
+            &context.state.state.cdn_history,
+            &context.resource.request,
+            observation_url,
+            playback_observation(cdn_outcome_for_status(status), 0, None, None, None),
+        );
+    }
+
+    let range_supported = headers
+        .get(RANGE)
+        .map(|_| status == StatusCode::PARTIAL_CONTENT);
+
+    if head_only
+        && status.is_success()
+        && let Some(observation_url) = observation_url.as_deref()
+    {
+        record_cdn_observation(
+            &context.state.state.cdn_history,
+            &context.resource.request,
+            observation_url,
+            playback_observation(
+                CdnObservationOutcome::Complete,
+                0,
+                None,
+                None,
+                range_supported,
+            ),
+        );
     }
 
     let mut response = Response::builder()
@@ -726,6 +837,15 @@ async fn send_hls_upstream_request(
                 context.policy_recorder.clone(),
                 context.variant_id.to_owned(),
                 response_time,
+                CdnBodyObservation::new(
+                    Arc::clone(&context.state.state.cdn_history),
+                    context.resource.request.clone(),
+                    observation_url,
+                    started_at,
+                    range_supported,
+                    expected_body_bytes,
+                    content_length_validated,
+                ),
             )
         } else {
             Body::from_stream(upstream.bytes_stream())
@@ -750,12 +870,14 @@ fn hls_policy_recording_body(
     policy_recorder: HlsNetworkPolicyRecorder,
     variant_id: String,
     response_time: Duration,
+    observation: CdnBodyObservation,
 ) -> Body {
     Body::from_stream(hls_policy_recording_stream(
         upstream,
         policy_recorder,
         variant_id,
         response_time,
+        observation,
     ))
 }
 
@@ -764,34 +886,275 @@ fn hls_policy_recording_stream(
     policy_recorder: HlsNetworkPolicyRecorder,
     variant_id: String,
     response_time: Duration,
+    observation: CdnBodyObservation,
 ) -> impl futures_core::Stream<Item = Result<Bytes, reqwest::Error>> {
     let stream = Box::pin(upstream.bytes_stream());
     futures_util::stream::unfold(
-        (stream, policy_recorder, variant_id, response_time, false),
-        |(mut stream, policy_recorder, variant_id, response_time, failed)| async move {
+        (
+            stream,
+            policy_recorder,
+            variant_id,
+            response_time,
+            observation,
+            false,
+        ),
+        |(mut stream, policy_recorder, variant_id, response_time, mut observation, failed)| async move {
             match stream.next().await {
-                Some(Ok(bytes)) => Some((
-                    Ok::<_, reqwest::Error>(bytes),
-                    (stream, policy_recorder, variant_id, response_time, failed),
-                )),
+                Some(Ok(bytes)) => {
+                    observation.observe_chunk(&bytes);
+                    Some((
+                        Ok::<_, reqwest::Error>(bytes),
+                        (
+                            stream,
+                            policy_recorder,
+                            variant_id,
+                            response_time,
+                            observation,
+                            failed,
+                        ),
+                    ))
+                }
                 Some(Err(error)) => {
                     if !failed {
                         policy_recorder.record_upstream_failure(&variant_id);
+                        observation.finish(cdn_outcome_for_transport(&error));
                     }
                     Some((
                         Err(error),
-                        (stream, policy_recorder, variant_id, response_time, true),
+                        (
+                            stream,
+                            policy_recorder,
+                            variant_id,
+                            response_time,
+                            observation,
+                            true,
+                        ),
                     ))
                 }
                 None => {
                     if !failed {
-                        policy_recorder.record_upstream_success(&variant_id, response_time);
+                        let outcome = observation.finish(CdnObservationOutcome::Complete);
+                        if outcome == CdnObservationOutcome::Complete {
+                            policy_recorder.record_upstream_success(&variant_id, response_time);
+                        } else {
+                            policy_recorder.record_upstream_failure(&variant_id);
+                        }
                     }
                     None
                 }
             }
         },
     )
+}
+
+struct CdnBodyObservation {
+    history: Arc<crate::cdn_history::CdnHistory>,
+    request: crate::bbdown_adapter::BilibiliMediaRequest,
+    url: Option<String>,
+    started_at: Instant,
+    range_supported: Option<bool>,
+    expected_body_bytes: Option<u64>,
+    content_length_validated: bool,
+    bytes: u64,
+    first_byte_latency: Option<Duration>,
+    runtime: Option<tokio::runtime::Handle>,
+    finished: bool,
+}
+
+impl CdnBodyObservation {
+    fn new(
+        history: Arc<crate::cdn_history::CdnHistory>,
+        request: crate::bbdown_adapter::BilibiliMediaRequest,
+        url: Option<String>,
+        started_at: Instant,
+        range_supported: Option<bool>,
+        expected_body_bytes: Option<u64>,
+        content_length_validated: bool,
+    ) -> Self {
+        Self {
+            history,
+            request,
+            url,
+            started_at,
+            range_supported,
+            expected_body_bytes,
+            content_length_validated,
+            bytes: 0,
+            first_byte_latency: None,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            finished: false,
+        }
+    }
+
+    fn observe_chunk(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        self.first_byte_latency
+            .get_or_insert_with(|| self.started_at.elapsed());
+    }
+
+    fn finish(&mut self, outcome: CdnObservationOutcome) -> CdnObservationOutcome {
+        if self.finished {
+            return outcome;
+        }
+        let outcome = if outcome == CdnObservationOutcome::Complete
+            && self
+                .expected_body_bytes
+                .is_some_and(|expected| expected != self.bytes)
+        {
+            CdnObservationOutcome::IntegrityMismatch
+        } else {
+            outcome
+        };
+        if let Some(url) = self.url.as_deref() {
+            record_cdn_observation(
+                &self.history,
+                &self.request,
+                url,
+                playback_observation(
+                    outcome,
+                    self.bytes,
+                    Some(self.started_at.elapsed()),
+                    self.first_byte_latency,
+                    self.range_supported,
+                ),
+            );
+        }
+        self.finished = true;
+        outcome
+    }
+}
+
+impl Drop for CdnBodyObservation {
+    fn drop(&mut self) {
+        if self.finished || (self.bytes == 0 && !self.content_length_validated) {
+            return;
+        }
+        let (Some(runtime), Some(url)) = (self.runtime.take(), self.url.take()) else {
+            return;
+        };
+        let history = Arc::clone(&self.history);
+        let request = self.request.clone();
+        let bytes = self.bytes;
+        let elapsed = self.started_at.elapsed();
+        let first_byte_latency = self.first_byte_latency;
+        let range_supported = self.range_supported;
+        let outcome = match self.expected_body_bytes {
+            Some(expected) if self.bytes > expected => CdnObservationOutcome::IntegrityMismatch,
+            Some(expected) if self.content_length_validated && self.bytes == expected => {
+                CdnObservationOutcome::Complete
+            }
+            _ => CdnObservationOutcome::Partial,
+        };
+        runtime.spawn_blocking(move || {
+            record_cdn_observation(
+                &history,
+                &request,
+                &url,
+                playback_observation(
+                    outcome,
+                    bytes,
+                    Some(elapsed),
+                    first_byte_latency,
+                    range_supported,
+                ),
+            );
+        });
+    }
+}
+
+fn record_cdn_observation(
+    history: &crate::cdn_history::CdnHistory,
+    request: &crate::bbdown_adapter::BilibiliMediaRequest,
+    url: &str,
+    observation: CdnObservation,
+) {
+    history.record_request(request, url, observation);
+}
+
+fn playback_observation(
+    outcome: CdnObservationOutcome,
+    bytes: u64,
+    elapsed: Option<Duration>,
+    first_byte_latency: Option<Duration>,
+    range_supported: Option<bool>,
+) -> CdnObservation {
+    CdnObservation {
+        source: CdnObservationSource::Playback,
+        outcome,
+        bytes,
+        elapsed,
+        first_byte_latency,
+        range_supported,
+    }
+}
+
+fn cdn_outcome_for_status(status: StatusCode) -> CdnObservationOutcome {
+    if status.is_server_error() {
+        CdnObservationOutcome::ServerFailure
+    } else if status == StatusCode::REQUEST_TIMEOUT || status == StatusCode::GATEWAY_TIMEOUT {
+        CdnObservationOutcome::Timeout
+    } else {
+        CdnObservationOutcome::SourceUnavailable
+    }
+}
+
+fn cdn_outcome_for_transport(error: &reqwest::Error) -> CdnObservationOutcome {
+    if error.is_timeout() {
+        CdnObservationOutcome::Timeout
+    } else if error.is_connect() {
+        CdnObservationOutcome::ConnectionFailure
+    } else if error.is_body() || error.is_decode() {
+        CdnObservationOutcome::IntegrityMismatch
+    } else {
+        CdnObservationOutcome::SourceUnavailable
+    }
+}
+
+fn expected_media_body_bytes(
+    headers: &HeaderMap,
+    status: StatusCode,
+    requested_range: Option<&HeaderValue>,
+    known_total_length: Option<u64>,
+) -> Option<u64> {
+    let declared_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(requested_range) = requested_range {
+        let (returned_range, total_length) = content_range_byte_range(headers)?;
+        if status != StatusCode::PARTIAL_CONTENT
+            || known_total_length.is_some_and(|known| known != total_length)
+            || parse_range(Some(requested_range), total_length)
+                .ok()
+                .flatten()?
+                != returned_range
+        {
+            return None;
+        }
+        let expected = returned_range.length();
+        return Some(expected);
+    }
+    known_total_length.or(declared_length)
+}
+
+fn observation_candidate_url(
+    request: &crate::bbdown_adapter::BilibiliMediaRequest,
+    final_url: &str,
+) -> Option<String> {
+    let final_origin = reqwest::Url::parse(final_url).ok()?.origin();
+    std::iter::once(request.url.as_str())
+        .chain(request.backup_urls.iter().map(String::as_str))
+        .find(|candidate| {
+            reqwest::Url::parse(candidate)
+                .ok()
+                .is_some_and(|candidate| candidate.origin() == final_origin)
+        })
+        .map(str::to_owned)
 }
 
 fn hls_upstream_request_builder(
@@ -825,6 +1188,7 @@ fn range_response_invalid(
     requested_range: Option<&HeaderValue>,
     status: StatusCode,
     headers: &HeaderMap,
+    expected_total_length: Option<u64>,
 ) -> bool {
     let Some(requested_range) = requested_range else {
         return false;
@@ -839,6 +1203,9 @@ fn range_response_invalid(
     let Some((returned_range, total_length)) = content_range_byte_range(headers) else {
         return true;
     };
+    if expected_total_length.is_some_and(|expected| expected != total_length) {
+        return true;
+    }
     let Ok(Some(expected_range)) = parse_range(Some(requested_range), total_length) else {
         return true;
     };
@@ -856,6 +1223,8 @@ struct Mp4Initialization {
 struct Mp4InitializationProbe {
     initialization: Mp4Initialization,
     response_time: Duration,
+    prefix_bytes: u64,
+    final_url: String,
 }
 
 async fn load_hls_mp4_initialization(
@@ -864,13 +1233,33 @@ async fn load_hls_mp4_initialization(
     variant_id: &str,
     resource: &HlsMediaResource,
 ) -> Result<Mp4Initialization, ()> {
-    let mut urls = Vec::with_capacity(resource.request.backup_urls.len() + 1);
-    urls.push(resource.request.url.clone());
-    urls.extend(resource.request.backup_urls.clone());
+    let urls = state
+        .state
+        .cdn_history
+        .rank_request(&resource.request)
+        .into_iter()
+        .filter(|url| !url.trim().is_empty())
+        .collect::<Vec<_>>();
 
     for url in urls {
         match load_hls_mp4_initialization_from_url(state, resource, &url).await {
             Ok(probe) => {
+                if let Some(observation_url) =
+                    observation_candidate_url(&resource.request, &probe.final_url)
+                {
+                    state.state.cdn_history.record_request(
+                        &resource.request,
+                        &observation_url,
+                        CdnObservation {
+                            source: CdnObservationSource::Playback,
+                            outcome: CdnObservationOutcome::Partial,
+                            bytes: probe.prefix_bytes,
+                            elapsed: None,
+                            first_byte_latency: None,
+                            range_supported: Some(true),
+                        },
+                    );
+                }
                 policy_recorder.record_upstream_success(variant_id, probe.response_time);
                 return Ok(probe.initialization);
             }
@@ -896,6 +1285,7 @@ async fn load_hls_mp4_initialization_from_url(
         .await
         .map_err(|_| ())?;
     let response_time = started_at.elapsed();
+    let final_url = upstream.url().as_str().to_owned();
     let status = StatusCode::from_u16(upstream.status().as_u16()).map_err(|_| ())?;
     if should_retry_hls_upstream_status(status) || !status.is_success() {
         return Err(());
@@ -925,6 +1315,8 @@ async fn load_hls_mp4_initialization_from_url(
             segments: Vec::new(),
         },
         response_time,
+        prefix_bytes: u64::try_from(bytes.len()).map_err(|_| ())?,
+        final_url,
     })
 }
 
@@ -1377,6 +1769,15 @@ async fn build_prewarmed_spliced_file_response(
             context.policy_recorder.clone(),
             context.variant_id.to_owned(),
             tail.response_time,
+            CdnBodyObservation::new(
+                Arc::clone(&context.state.state.cdn_history),
+                context.resource.request.clone(),
+                observation_candidate_url(&context.resource.request, &tail.final_url),
+                tail.started_at,
+                Some(true),
+                Some(range.length()),
+                tail.content_length_validated,
+            ),
         )
         .map_err(|error| -> BoxError { Box::new(error) });
         Body::from_stream(local_stream.chain(upstream_stream))
@@ -1412,6 +1813,9 @@ async fn build_prewarmed_spliced_file_response(
 struct HlsUpstreamTailResponse {
     upstream: reqwest::Response,
     response_time: Duration,
+    started_at: Instant,
+    final_url: String,
+    content_length_validated: bool,
 }
 
 async fn open_hls_upstream_tail_response(
@@ -1421,9 +1825,14 @@ async fn open_hls_upstream_tail_response(
     total_length: u64,
 ) -> Result<HlsUpstreamTailResponse, ()> {
     let tail_range = HeaderValue::from_str(&format!("bytes={start}-{end}")).map_err(|_| ())?;
-    let mut urls = Vec::with_capacity(context.resource.request.backup_urls.len() + 1);
-    urls.push(context.resource.request.url.clone());
-    urls.extend(context.resource.request.backup_urls.clone());
+    let urls = context
+        .state
+        .state
+        .cdn_history
+        .rank_request(&context.resource.request)
+        .into_iter()
+        .filter(|url| !url.trim().is_empty())
+        .collect::<Vec<_>>();
 
     for url in urls {
         let started_at = Instant::now();
@@ -1434,7 +1843,24 @@ async fn open_hls_upstream_tail_response(
                 .await
             {
                 Ok(upstream) => upstream,
-                Err(_) => {
+                Err(error) => {
+                    if let Some(error_url) = error.url()
+                        && let Some(observation_url) =
+                            observation_candidate_url(&context.resource.request, error_url.as_str())
+                    {
+                        record_cdn_observation(
+                            &context.state.state.cdn_history,
+                            &context.resource.request,
+                            &observation_url,
+                            playback_observation(
+                                cdn_outcome_for_transport(&error),
+                                0,
+                                None,
+                                None,
+                                None,
+                            ),
+                        );
+                    }
                     context
                         .policy_recorder
                         .record_upstream_retry(context.variant_id);
@@ -1444,15 +1870,40 @@ async fn open_hls_upstream_tail_response(
         let response_time = started_at.elapsed();
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let final_url = upstream.url().as_str().to_owned();
+        let observation_url = observation_candidate_url(&context.resource.request, &final_url);
         if should_retry_hls_upstream_status(status) || !status.is_success() {
+            if let Some(observation_url) = observation_url.as_deref() {
+                record_cdn_observation(
+                    &context.state.state.cdn_history,
+                    &context.resource.request,
+                    observation_url,
+                    playback_observation(cdn_outcome_for_status(status), 0, None, None, None),
+                );
+            }
             context
                 .policy_recorder
                 .record_upstream_retry(context.variant_id);
             continue;
         }
         let headers = upstream.headers();
+        let declared_body_bytes = upstream.content_length();
         let Some((returned_range, returned_total_length)) = content_range_byte_range(headers)
         else {
+            if let Some(observation_url) = observation_url.as_deref() {
+                record_cdn_observation(
+                    &context.state.state.cdn_history,
+                    &context.resource.request,
+                    observation_url,
+                    playback_observation(
+                        CdnObservationOutcome::IntegrityMismatch,
+                        0,
+                        None,
+                        None,
+                        Some(false),
+                    ),
+                );
+            }
             context
                 .policy_recorder
                 .record_upstream_retry(context.variant_id);
@@ -1462,7 +1913,22 @@ async fn open_hls_upstream_tail_response(
         if status != StatusCode::PARTIAL_CONTENT
             || returned_range != expected_range
             || returned_total_length != total_length
+            || declared_body_bytes.is_some_and(|length| length != expected_range.length())
         {
+            if let Some(observation_url) = observation_url.as_deref() {
+                record_cdn_observation(
+                    &context.state.state.cdn_history,
+                    &context.resource.request,
+                    observation_url,
+                    playback_observation(
+                        CdnObservationOutcome::IntegrityMismatch,
+                        0,
+                        None,
+                        None,
+                        Some(status == StatusCode::PARTIAL_CONTENT),
+                    ),
+                );
+            }
             context
                 .policy_recorder
                 .record_upstream_retry(context.variant_id);
@@ -1472,6 +1938,10 @@ async fn open_hls_upstream_tail_response(
         return Ok(HlsUpstreamTailResponse {
             upstream,
             response_time,
+            started_at,
+            final_url,
+            content_length_validated: declared_body_bytes
+                .is_some_and(|length| length == expected_range.length()),
         });
     }
 
@@ -1558,6 +2028,7 @@ mod tests {
             BilibiliHttpHeader, BilibiliMediaCacheKey, BilibiliMediaRequest,
             BilibiliMediaRequestKind,
         },
+        cdn_history::CdnHistory,
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
             BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem,
@@ -1573,6 +2044,179 @@ mod tests {
         state: MediaState,
         resource_id: String,
         resource_path: PathBuf,
+    }
+
+    #[test]
+    fn cdn_ranking_keeps_refreshed_candidate_urls_and_is_variant_scoped() {
+        let history = CdnHistory::default();
+        let mut request = media_request(
+            "https://cdn-a.example/video.m4s?expires=1",
+            vec!["https://cdn-b.example/video.m4s?expires=1".to_owned()],
+        );
+        history.record_request(
+            &request,
+            &request.backup_urls[0],
+            CdnObservation::playback_complete(
+                4096,
+                Duration::from_millis(50),
+                Duration::from_millis(8),
+                Some(true),
+            ),
+        );
+
+        request.url = "https://cdn-a.example/video.m4s?expires=2".to_owned();
+        request.backup_urls[0] = "https://cdn-b.example/video.m4s?expires=2".to_owned();
+        assert_eq!(
+            request.backup_urls[0],
+            history.rank_request(&request)[0],
+            "history should rank the fresh URL without rewriting its query"
+        );
+
+        let mut other_variant = request.clone();
+        other_variant.codecs = Some("hev1.1.6.L120.90".to_owned());
+        other_variant.cache_key.codecs = other_variant.codecs.clone();
+        other_variant.url = "https://variant-c.example/other.m4s?version=2".to_owned();
+        other_variant.backup_urls.clear();
+        assert_eq!(
+            vec![other_variant.url.clone()],
+            history.rank_request(&other_variant)
+        );
+    }
+
+    #[test]
+    fn cdn_conflicting_length_headers_do_not_disable_body_validation() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("3"));
+        assert_eq!(
+            expected_media_body_bytes(&headers, StatusCode::OK, None, Some(8)),
+            Some(8)
+        );
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 2-5/8"));
+        let range = HeaderValue::from_static("bytes=2-5");
+        assert_eq!(
+            expected_media_body_bytes(&headers, StatusCode::PARTIAL_CONTENT, Some(&range), Some(8)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn cdn_redirected_observation_uses_only_a_matching_fresh_candidate_origin() {
+        let request = media_request(
+            "https://cdn-a.example/video.m4s?expires=2",
+            vec!["https://cdn-b.example/video.m4s?expires=2".to_owned()],
+        );
+
+        assert_eq!(
+            Some(request.backup_urls[0].clone()),
+            observation_candidate_url(
+                &request,
+                "https://cdn-b.example/redirected/signed?expires=9"
+            )
+        );
+        assert_eq!(
+            None,
+            observation_candidate_url(&request, "https://unlisted.example/redirected/video")
+        );
+    }
+
+    #[test]
+    fn cdn_body_integrity_observation_does_not_cool_down_shared_cdn_host() {
+        let history = CdnHistory::default();
+        let request = media_request(
+            "https://cdn-a.example/video.m4s?expires=2",
+            vec!["https://cdn-b.example/video.m4s?expires=2".to_owned()],
+        );
+        let mut observation = CdnBodyObservation::new(
+            Arc::new(history.clone()),
+            request.clone(),
+            Some(request.url.clone()),
+            Instant::now(),
+            None,
+            Some(10),
+            false,
+        );
+        observation.observe_chunk(b"short");
+        observation.finish(CdnObservationOutcome::Complete);
+        assert_eq!(request.backup_urls[0], history.rank_request(&request)[0]);
+
+        let mut unrelated = media_request(
+            "https://cdn-a.example/other.m4s?expires=3",
+            vec!["https://cdn-c.example/other.m4s?expires=3".to_owned()],
+        );
+        unrelated.cache_key.content_id = "other-content".to_owned();
+        assert_eq!(
+            CdnHistory::default().rank_request(&unrelated),
+            history.rank_request(&unrelated)
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_consumed_http_proxy_body_updates_shared_cdn_ranking() {
+        let (upstream_url, _upstream_task) = start_hls_upstream().await;
+        let backup_url = "http://127.0.0.1:9/backup.m4s".to_owned();
+        let temp = TempDir::new().expect("temp dir should be created");
+        let root_path = temp.path().canonicalize().unwrap();
+        let state = AppState::new(CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        });
+        let mut session =
+            hls_session_with_backups("session-1", &upstream_url, vec![backup_url.clone()]);
+        session.variant.video.request.size = Some(b"video-data".len() as u64);
+        insert_authorized_hls_session(&state, session);
+
+        let mut ranking_request = media_request(&backup_url, vec![upstream_url.clone()]);
+        ranking_request.size = Some(b"video-data".len() as u64);
+        assert_eq!(
+            vec![backup_url.clone(), upstream_url.clone()],
+            state.cdn_history.rank_request(&ranking_request)
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy listener should bind");
+        let proxy_address = listener.local_addr().unwrap();
+        let proxy = Router::new()
+            .route(
+                "/hls/{session_id}/segments/{segment_id}",
+                get(hls_segment_get),
+            )
+            .with_state(MediaState::new(state.clone()));
+        let _proxy_task = tokio::spawn(async move {
+            axum::serve(listener, proxy)
+                .await
+                .expect("proxy server should run");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{proxy_address}/hls/session-1/segments/video.m4s"
+            ))
+            .send()
+            .await
+            .expect("proxied HTTP response should arrive");
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(Some(10), response.content_length());
+        assert_eq!(
+            b"video-data",
+            &response
+                .bytes()
+                .await
+                .expect("proxied body should be fully consumed")[..]
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.cdn_history.rank_request(&ranking_request)[0] == upstream_url {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fully consumed ordinary body should update shared CDN ranking");
     }
 
     fn test_resource(id: &str, body: &[u8]) -> CacheResourceRef {
@@ -2158,7 +2802,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(b"video-data".len() as u64);
+        insert_authorized_hls_session(&state, session);
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
@@ -2695,7 +3341,8 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let session = hls_session("session-1", &upstream_url);
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(fake_mp4().len() as u64);
         state
             .hls_cache
             .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
@@ -2732,7 +3379,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let session = hls_session("session-1", &upstream_url);
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(0);
         state
             .hls_cache
             .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
@@ -2808,7 +3457,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        let session = hls_session("session-1", &upstream_url);
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(large_fake_mp4().len() as u64);
+        session.variant.video.request.bandwidth = Some(0);
         state
             .hls_cache
             .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, || {
@@ -3063,9 +3714,14 @@ mod tests {
             ..CacheServerOptions::default()
         });
         let mut session = hls_session_with_alternate("session-1", &upstream_url);
+        assert_eq!(
+            Some(fake_mp4().len() as u64),
+            session.alternate_variants[0].video.request.size
+        );
         let mut audio_request = media_request(&upstream_url, Vec::new());
         audio_request.kind = BilibiliMediaRequestKind::Audio;
         audio_request.mime_type = Some("audio/mp4".to_owned());
+        assert_eq!(Some(fake_mp4().len() as u64), audio_request.size);
         session.alternate_variants[0]
             .codecs
             .push("mp4a.40.2".to_owned());
@@ -3127,10 +3783,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        insert_authorized_hls_session(
-            &state,
-            hls_session_with_backups("session-1", &primary_url, vec![backup_url]),
-        );
+        let mut session = hls_session_with_backups("session-1", &primary_url, vec![backup_url]);
+        session.variant.video.request.size = Some(b"video-data".len() as u64);
+        insert_authorized_hls_session(&state, session);
 
         let response = hls_segment_get(
             State(MediaState::new(state)),
@@ -3155,7 +3810,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        insert_authorized_hls_session(&state, hls_session("session-1", &upstream_url));
+        let mut session = hls_session("session-1", &upstream_url);
+        session.variant.video.request.size = Some(b"video-data".len() as u64);
+        insert_authorized_hls_session(&state, session);
 
         let response = hls_segment_get(
             State(MediaState::new(state.clone())),
@@ -3188,10 +3845,9 @@ mod tests {
             bilibili_worker_enabled: false,
             ..CacheServerOptions::default()
         });
-        insert_authorized_hls_session(
-            &state,
-            hls_session_with_backups("session-1", &primary_url, vec![backup_url]),
-        );
+        let mut session = hls_session_with_backups("session-1", &primary_url, vec![backup_url]);
+        session.variant.video.request.size = Some(b"video-data".len() as u64);
+        insert_authorized_hls_session(&state, session);
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_static("bytes=1-3"));
 
