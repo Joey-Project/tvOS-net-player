@@ -1458,6 +1458,134 @@ public enum BilibiliResolutionSelection: Equatable, Sendable {
     case all
 }
 
+public enum HlsCacheFillState: String, Equatable, Sendable {
+    case unspecified
+    case queued
+    case filling
+    case preempted
+    case retrying
+    case blockedQuota
+    case completed
+    case sourceUnavailable
+    case failed
+    case cancelled
+}
+
+public enum HlsCacheFillFailureKind: String, Equatable, Sendable {
+    case unspecified
+    case safety
+    case persistence
+    case network
+    case sourceUnavailable
+}
+
+public struct HlsCacheFillStatus: Equatable, Sendable {
+    public let state: HlsCacheFillState
+    public let failureKind: HlsCacheFillFailureKind
+    public let completedBytes: UInt64
+    public let totalBytes: UInt64
+    public let totalBytesKnown: Bool
+    public let representationID: String
+    public let message: String
+
+    public init(
+        state: HlsCacheFillState,
+        failureKind: HlsCacheFillFailureKind = .unspecified,
+        completedBytes: UInt64 = 0,
+        totalBytes: UInt64 = 0,
+        totalBytesKnown: Bool = false,
+        representationID: String = "",
+        message: String = ""
+    ) {
+        self.state = state
+        self.failureKind = failureKind
+        self.completedBytes = completedBytes
+        self.totalBytes = totalBytes
+        self.totalBytesKnown = totalBytesKnown
+        self.representationID = representationID
+        self.message = message
+    }
+
+    public var progressFraction: Double? {
+        guard totalBytesKnown, totalBytes > 0 else {
+            return nil
+        }
+
+        let fraction = Double(completedBytes) / Double(totalBytes)
+        guard fraction.isFinite else {
+            return nil
+        }
+        return min(max(fraction, 0), 1)
+    }
+
+    public var progressBytes: UInt64? {
+        guard totalBytesKnown, totalBytes > 0 else {
+            return nil
+        }
+        return min(completedBytes, totalBytes)
+    }
+
+    public var progressPercentLabel: String? {
+        guard let progressFraction else {
+            return nil
+        }
+
+        return "\(Int((progressFraction * 100).rounded()))%"
+    }
+
+    public var displayLabel: String {
+        switch state {
+        case .unspecified:
+            return "Offline fill status unavailable"
+        case .queued:
+            return "Offline fill queued"
+        case .filling:
+            return "Filling offline cache"
+        case .preempted:
+            return "Offline fill paused"
+        case .retrying:
+            return "Retrying offline cache"
+        case .blockedQuota:
+            return "Quota blocked; playable online"
+        case .completed:
+            return "Offline ready"
+        case .sourceUnavailable:
+            return "Source unavailable; playable online"
+        case .failed:
+            return failureKind == .network
+                ? "Network issue; cache may be partial"
+                : "Cache failed; playable online"
+        case .cancelled:
+            return "Offline fill cancelled"
+        }
+    }
+
+    public var systemImage: String {
+        switch state {
+        case .unspecified:
+            return "questionmark.circle"
+        case .queued:
+            return "clock"
+        case .filling:
+            return "arrow.down.circle"
+        case .preempted:
+            return "pause.circle"
+        case .retrying:
+            return "arrow.clockwise.circle"
+        case .blockedQuota:
+            return "externaldrive.badge.xmark"
+        case .completed:
+            return "externaldrive.fill.badge.checkmark"
+        case .sourceUnavailable:
+            return "wifi.slash"
+        case .failed:
+            return failureKind == .network ? "wifi.slash" : "exclamationmark.triangle"
+        case .cancelled:
+            return "xmark.circle"
+        }
+    }
+}
+
 public struct BilibiliTaskSelection: Equatable, Sendable {
     public let mode: String
     public let selectionIDs: [String]
@@ -1491,6 +1619,7 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
     public let playbackSource: CachePlaybackSource?
     public let playbackSession: CacheBilibiliPlaybackSession?
     public let identity: BilibiliContentIdentity?
+    public let hlsCacheFillStatus: HlsCacheFillStatus?
 
     public init(
         id: String,
@@ -1505,7 +1634,8 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
         libraryItemID: String,
         playbackSource: CachePlaybackSource? = nil,
         playbackSession: CacheBilibiliPlaybackSession? = nil,
-        identity: BilibiliContentIdentity? = nil
+        identity: BilibiliContentIdentity? = nil,
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) {
         self.id = id
         self.selectionID = selectionID
@@ -1520,6 +1650,7 @@ public struct BilibiliTaskResultItem: Identifiable, Equatable, Sendable {
         self.playbackSource = playbackSource
         self.playbackSession = playbackSession
         self.identity = identity
+        self.hlsCacheFillStatus = hlsCacheFillStatus
     }
 }
 
@@ -1641,13 +1772,16 @@ public struct CacheTaskResultSubject: Equatable, Sendable {
 public struct BilibiliTaskResultDetails: Equatable, Sendable {
     public let identity: BilibiliContentIdentity?
     public let playbackSession: CacheBilibiliPlaybackSession?
+    public let hlsCacheFillStatus: HlsCacheFillStatus?
 
     public init(
         identity: BilibiliContentIdentity?,
-        playbackSession: CacheBilibiliPlaybackSession?
+        playbackSession: CacheBilibiliPlaybackSession?,
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) {
         self.identity = identity
         self.playbackSession = playbackSession
+        self.hlsCacheFillStatus = hlsCacheFillStatus
     }
 }
 
@@ -1791,6 +1925,7 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
     public let bilibiliSelection: BilibiliTaskSelection?
     public let resultItems: [BilibiliTaskResultItem]
     public let outputSummary: CacheTaskOutputSummary?
+    public let hlsCacheFillStatus: HlsCacheFillStatus?
 
     public init(
         id: String,
@@ -1807,7 +1942,8 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         playbackSession: CacheBilibiliPlaybackSession?,
         bilibiliSelection: BilibiliTaskSelection? = nil,
         resultItems: [BilibiliTaskResultItem] = [],
-        outputSummary: CacheTaskOutputSummary? = nil
+        outputSummary: CacheTaskOutputSummary? = nil,
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -1824,6 +1960,7 @@ public struct CacheTask: Identifiable, Equatable, Sendable {
         self.bilibiliSelection = bilibiliSelection
         self.resultItems = resultItems
         self.outputSummary = outputSummary
+        self.hlsCacheFillStatus = hlsCacheFillStatus
     }
 
     public var isProgressivePlayback: Bool {

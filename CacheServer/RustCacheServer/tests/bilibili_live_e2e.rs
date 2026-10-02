@@ -1,6 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -9,7 +11,8 @@ use std::{
 
 use futures_util::FutureExt;
 use reqwest::{StatusCode, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -22,11 +25,13 @@ use tvos_net_player_cache_server::{
         BilibiliPlaybackOptions, BilibiliPlaybackSpec, BilibiliResolutionCandidate,
         BilibiliResolutionPage, BilibiliResolutionSelection, BilibiliResolutionSelectionMode,
         BilibiliTaskResultItem, BilibiliVideoCodec, CacheResourceRef, CreateBilibiliTaskV2Request,
-        GetBilibiliCredentialStatusRequest, GetTaskRequest,
-        ListBilibiliResolutionCandidatesRequest, ListTaskResultsRequest, PageRequest,
-        PlaybackProtocol, PlaybackSource, StartBilibiliResolutionRequest, Task, TaskArtifact,
-        TaskResult, TaskState, create_bilibili_task_v2_request::Execution as BilibiliExecutionV2,
-        server_service_client::ServerServiceClient, task_service_client::TaskServiceClient,
+        GetBilibiliCredentialStatusRequest, GetPlaybackSourceRequest, GetTaskRequest,
+        HlsCacheFillState, ListBilibiliResolutionCandidatesRequest, ListTaskResultsRequest,
+        PageRequest, PlaybackProtocol, PlaybackSource, StartBilibiliResolutionRequest, Task,
+        TaskArtifact, TaskResult, TaskState,
+        create_bilibili_task_v2_request::Execution as BilibiliExecutionV2,
+        library_service_client::LibraryServiceClient, server_service_client::ServerServiceClient,
+        task_service_client::TaskServiceClient,
     },
     run_grpc_listener, run_media_listener,
 };
@@ -34,9 +39,17 @@ use tvos_net_player_cache_server::{
 const BILIBILI_RESOLUTION_PAGE_SIZE: u32 = 1;
 const BILIBILI_TASK_RESULT_PAGE_SIZE: u32 = 1;
 const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const FULL_FILL_DEADLINE: Duration = Duration::from_secs(1_200);
+const OFFLINE_READ_DURATION: Duration = Duration::from_secs(300);
+const READY_FILE_LIMIT: usize = 4 * 1024;
+const FULL_FILL_CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+const OFFLINE_MAX_VERIFIED_BYTES: u64 = FULL_FILL_CACHE_BUDGET_BYTES;
+const OFFLINE_MAX_RESOURCES: usize = 4_096;
 const SUSTAINED_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const SUSTAINED_READ_LIMIT: u64 = 64 * 1024;
 const SUSTAINED_PLAYLIST_LIMIT: usize = 1024 * 1024;
+const SUSTAINED_FAILURE_BODY_LIMIT: usize = 4 * 1024;
+const SUSTAINED_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(1);
 const SUSTAINED_MAX_CHILD_PLAYLISTS: usize = 32;
 const BILIBILI_FAILURE_CLASS_TAG: &str = "bilibili_failure_class";
 const CREDENTIAL_SAFE_CLIENT_DETAIL: &str =
@@ -75,18 +88,25 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
 
         ran_cases += 1;
         println!("running {}", case.id);
-        let server = LiveTestServer::start().await;
+        let mut server = LiveTestServer::start_with_fill_mode(run_policy.full_fill).await;
         let task_tracker = LiveTaskTracker::default();
         let outcome = AssertUnwindSafe(async {
             let credential_status = fetch_bilibili_credential_status(server.channel().await).await;
+            let channel = server.channel().await;
+            let media_url = server.media_url.clone();
             run_live_case(
                 case,
-                server.channel().await,
+                &mut server,
+                channel,
                 &http,
-                &server.media_url,
+                &media_url,
                 Some(&credential_status),
                 &task_tracker,
                 sustained_probe.as_ref(),
+                run_policy.full_fill.then_some(FullFillContext {
+                    offline_duration: run_policy.offline_duration,
+                    ready_file: run_policy.ready_file.clone(),
+                }),
             )
             .await;
         })
@@ -113,18 +133,33 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
     );
 }
 
+// Keep independent opt-in probes and their contexts explicit at this test boundary.
+#[allow(clippy::too_many_arguments)]
 async fn run_live_case(
     case: &LiveCase,
+    server: &mut LiveTestServer,
     channel: tonic::transport::Channel,
     http: &reqwest::Client,
     media_url: &str,
     credential_status: Option<&BilibiliCredentialStatus>,
     task_tracker: &LiveTaskTracker,
     sustained_probe: Option<&SustainedProbeContext>,
+    full_fill: Option<FullFillContext>,
 ) {
+    if full_fill.is_some() {
+        assert_eq!(
+            "ordinary-video-playlist", case.id,
+            "full-fill mode is restricted to the canonical ordinary playlist case"
+        );
+        assert_eq!(
+            SelectionPolicy::First,
+            case.selection,
+            "full-fill mode requires first-candidate selection"
+        );
+    }
     assert_authenticated_case_ready(case, credential_status);
 
-    let mut task_client = TaskServiceClient::new(channel);
+    let mut task_client = TaskServiceClient::new(channel.clone());
     let source = case.source();
 
     let first_page = task_client
@@ -236,8 +271,31 @@ async fn run_live_case(
         .unwrap_or_else(|| panic!("{}: playable task has no playback source", case.id));
     assert_task_playback_source_item_id(case, &playable, source);
     assert_hls_master(case, http, source, "task playback source", media_url).await;
-    if let Some(probe) = sustained_probe {
-        sustain_hls_probe(case, &probe.client, source, media_url, probe.duration).await;
+    if let Some(full_fill) = full_fill {
+        run_full_fill_restart_and_offline_loop(
+            server,
+            case,
+            &created.id,
+            &source.variant_id,
+            media_url,
+            full_fill,
+            sustained_probe.map_or(Duration::from_secs(10), |probe| probe.duration),
+        )
+        .await;
+    } else if let Some(probe) = sustained_probe {
+        sustain_hls_probe(
+            case,
+            &probe.client,
+            source,
+            media_url,
+            probe.duration,
+            Some(SustainedProbeDiagnosticContext {
+                channel: &channel,
+                task_id: &created.id,
+                task: &playable,
+            }),
+        )
+        .await;
     }
 
     let result_sources = playable_result_sources(&playable);
@@ -280,6 +338,560 @@ async fn run_live_case(
         "{}: unexpected ListTaskResults item count",
         case.id
     );
+}
+
+async fn run_full_fill_restart_and_offline_loop(
+    server: &mut LiveTestServer,
+    case: &LiveCase,
+    task_id: &str,
+    initial_variant_id: &str,
+    media_url: &str,
+    context: FullFillContext,
+    foreground_duration: Duration,
+) {
+    let fill_deadline = tokio::time::Instant::now() + FULL_FILL_DEADLINE;
+    let channel = server.channel().await;
+    let observed_before_quiesce =
+        wait_for_fill_checkpoint(&channel, case, task_id, fill_deadline).await;
+    if !observed_before_quiesce
+        .as_ref()
+        .is_some_and(is_partial_fill_checkpoint)
+    {
+        println!(
+            "{}: partial-resume evidence inconclusive; waiting for fill completion before restart",
+            case.id
+        );
+        let _completed_without_partial_checkpoint =
+            wait_for_completed_fill(&server.channel().await, case, task_id, fill_deadline).await;
+    }
+    let quiesced = server
+        .restart_preserving_state_with_checkpoint(task_id)
+        .await
+        .unwrap_or_else(|error| panic!("{}: first same-root restart failed: {error}", case.id));
+    let checkpoint_evidence =
+        classify_quiesced_checkpoint(quiesced.fill_status.as_ref(), &quiesced.range_checkpoints)
+            .unwrap_or_else(|message| {
+                panic!("{}: quiesced checkpoint invalid: {message}", case.id)
+            });
+    let has_quiesced_partial = matches!(
+        checkpoint_evidence,
+        QuiescedCheckpointEvidence::Partial { .. }
+    );
+    match checkpoint_evidence {
+        QuiescedCheckpointEvidence::Partial {
+            status_bytes,
+            durable_bytes,
+            extent_count,
+        } => println!(
+            "{}: quiesced partial checkpoint; completed_bytes={}, durable_bytes={}, extents={}",
+            case.id, status_bytes, durable_bytes, extent_count
+        ),
+        QuiescedCheckpointEvidence::Completed => println!(
+            "{}: fill completed by the quiesced boundary; partial-resume evidence inconclusive",
+            case.id
+        ),
+        QuiescedCheckpointEvidence::Inconclusive => println!(
+            "{}: no positive durable partial checkpoint at the quiesced boundary",
+            case.id
+        ),
+    }
+    let restarted_status =
+        wait_for_fill_checkpoint(&server.channel().await, case, task_id, fill_deadline).await;
+    if let (Some(checkpoint), Some(restarted)) = (
+        has_quiesced_partial
+            .then_some(quiesced.fill_status.as_ref())
+            .flatten(),
+        restarted_status
+            .as_ref()
+            .filter(|status| is_partial_fill_checkpoint(status)),
+    ) {
+        assert_eq!(
+            checkpoint.representation_id, restarted.representation_id,
+            "{}: fill representation changed across restart checkpoint",
+            case.id
+        );
+        assert!(
+            restarted.completed_bytes >= checkpoint.completed_bytes,
+            "{}: persisted fill byte count regressed across restart",
+            case.id
+        );
+    }
+
+    let restarted_task = get_live_task(&server.channel().await, case, task_id).await;
+    let restarted_source = restarted_task.playback_source.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{}: restarted task did not expose its LAN playback source",
+            case.id
+        )
+    });
+    let client = reqwest::Client::builder()
+        .timeout(SUSTAINED_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("full-fill foreground range client should build");
+    let diagnostic_channel = server.channel().await;
+    sustain_hls_probe(
+        case,
+        &client,
+        restarted_source,
+        media_url,
+        foreground_duration,
+        Some(SustainedProbeDiagnosticContext {
+            channel: &diagnostic_channel,
+            task_id,
+            task: &restarted_task,
+        }),
+    )
+    .await;
+    let after_restart =
+        wait_for_completed_fill(&server.channel().await, case, task_id, fill_deadline).await;
+    if let Some(checkpoint) = has_quiesced_partial
+        .then_some(quiesced.fill_status.as_ref())
+        .flatten()
+    {
+        assert_eq!(
+            checkpoint.representation_id, after_restart.representation_id,
+            "{}: completed fill changed representation after restart",
+            case.id
+        );
+        assert!(
+            after_restart.completed_bytes >= checkpoint.completed_bytes,
+            "{}: completed fill byte count regressed after restart",
+            case.id
+        );
+    }
+
+    server
+        .restart_preserving_state()
+        .await
+        .unwrap_or_else(|error| panic!("{}: completed-cache restart failed: {error}", case.id));
+    let completed = get_live_task(&server.channel().await, case, task_id).await;
+    let item_id = completed.library_item_id.trim();
+    assert!(
+        !item_id.is_empty(),
+        "{}: completed fill did not publish a library item",
+        case.id
+    );
+    let mut library = LibraryServiceClient::new(server.channel().await);
+    let cache_only_source = library
+        .get_playback_source(Request::new(GetPlaybackSourceRequest {
+            item_id: item_id.to_owned(),
+            variant_id: initial_variant_id.to_owned(),
+        }))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{}: completed library playback source was unavailable after restart",
+                case.id
+            )
+        })
+        .into_inner();
+    assert_eq!(
+        PlaybackProtocol::Hls,
+        cache_only_source.protocol(),
+        "{}: completed library source is not HLS",
+        case.id
+    );
+    let source_url = assert_lan_media_url(
+        case,
+        &cache_only_source.uri,
+        media_url,
+        "completed library playback source",
+    );
+    assert_clean_lan_url(case, &source_url);
+    let session_id = hls_session_id_from_master_uri(case, &source_url);
+    assert_completed_session_has_no_upstream_urls(server.temp_root_path(), &session_id)
+        .unwrap_or_else(|_| {
+            panic!(
+                "{}: completed cache session retained upstream URL or header material",
+                case.id
+            )
+        });
+
+    let http = reqwest::Client::builder()
+        .timeout(SUSTAINED_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("offline playback client should build");
+    let payload = read_completed_hls_payloads(case, &http, &cache_only_source, media_url).await;
+    assert!(
+        payload.total_bytes > 0,
+        "{}: offline HLS walk read no media bytes",
+        case.id
+    );
+    let cache_checksums_before =
+        cached_media_checksums(server.temp_root_path(), &session_id, &payload.resources)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{}: completed cache files could not be checksummed",
+                    case.id
+                )
+            });
+    if let Some(path) = context.ready_file {
+        let offline_duration = context
+            .offline_duration
+            .expect("ready file configuration requires sustained offline reads");
+        let ready = LanPlaybackReady {
+            phase: "cache-only-ready",
+            uri: cache_only_source.uri.clone(),
+            case_id: case.id.clone(),
+            task_id: task_id.to_owned(),
+            total_bytes: payload.total_bytes,
+            expires_in_seconds: offline_duration.as_secs(),
+        };
+        let bytes = serde_json::to_vec(&ready).expect("ready document should serialize");
+        server
+            .publish_ready_file(path, bytes)
+            .unwrap_or_else(|error| {
+                panic!("{}: ready document publication failed: {error}", case.id)
+            });
+    }
+    let aggregate_bytes = if let Some(duration) = context.offline_duration {
+        sustain_offline_cache_reads(
+            case,
+            &http,
+            &payload.resources,
+            media_url,
+            duration,
+            payload.total_bytes,
+        )
+        .await
+    } else {
+        payload.total_bytes
+    };
+    let cache_checksums_after =
+        cached_media_checksums(server.temp_root_path(), &session_id, &payload.resources)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{}: completed cache files could not be checksummed after offline reads",
+                    case.id
+                )
+            });
+    assert_eq!(
+        cache_checksums_before, cache_checksums_after,
+        "{}: completed cache-file checksum changed during offline reads",
+        case.id
+    );
+    println!(
+        "{}: cache-only HTTP validation completed; resources={}, bytes={}, sha256={}",
+        case.id,
+        payload.resources.len(),
+        aggregate_bytes,
+        payload.sha256
+    );
+}
+
+fn is_partial_fill_checkpoint(
+    status: &tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus,
+) -> bool {
+    let resumable_state = matches!(
+        HlsCacheFillState::try_from(status.state),
+        Ok(HlsCacheFillState::Queued
+            | HlsCacheFillState::Filling
+            | HlsCacheFillState::Preempted
+            | HlsCacheFillState::Retrying)
+    );
+    resumable_state
+        && status.completed_bytes > 0
+        && (!status.total_bytes_known || status.completed_bytes < status.total_bytes)
+}
+
+fn snapshot_range_checkpoints(root: &Path) -> Result<RangeCheckpointSnapshot, ()> {
+    let cache_root = root.join(".tvos-net-player/hls");
+    let entries = match fs::read_dir(&cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RangeCheckpointSnapshot::default());
+        }
+        Err(_) => return Err(()),
+    };
+    if fs::symlink_metadata(&cache_root)
+        .map_err(|_| ())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(());
+    }
+
+    let mut snapshot = RangeCheckpointSnapshot::default();
+    let mut session_count = 0usize;
+    let mut json_count = 0usize;
+    let mut total_json_bytes = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|_| ())?;
+        let file_type = entry.file_type().map_err(|_| ())?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        session_count += 1;
+        if session_count > 32 {
+            return Err(());
+        }
+        let session_id = entry.file_name().into_string().map_err(|_| ())?;
+        let files = fs::read_dir(entry.path()).map_err(|_| ())?;
+        for file in files {
+            let file = file.map_err(|_| ())?;
+            if file.file_type().map_err(|_| ())?.is_symlink()
+                || file
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+            json_count += 1;
+            if json_count > 512 {
+                return Err(());
+            }
+            let metadata = file.metadata().map_err(|_| ())?;
+            if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 {
+                return Err(());
+            }
+            total_json_bytes = total_json_bytes.checked_add(metadata.len()).ok_or(())?;
+            if total_json_bytes > 8 * 1024 * 1024 {
+                return Err(());
+            }
+            let bytes = fs::read(file.path()).map_err(|_| ())?;
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(extents) = value.get("extents").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let resource_id = value
+                .get("resource_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let representation = value
+                .get("representation_digest")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let key = format!("{session_id}/{resource_id}/{representation}");
+            let mut verified = Vec::with_capacity(extents.len());
+            for extent in extents {
+                let start = extent
+                    .get("start")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(())?;
+                let end = extent
+                    .get("end")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(())?;
+                let sha256 = extent
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?;
+                if end < start
+                    || sha256.len() != 64
+                    || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(());
+                }
+                let extent_bytes = end
+                    .checked_sub(start)
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or(())?;
+                snapshot.durable_bytes =
+                    snapshot.durable_bytes.checked_add(extent_bytes).ok_or(())?;
+                verified.push(RangeExtentCheckpoint {
+                    start,
+                    end,
+                    sha256: sha256.to_owned(),
+                });
+            }
+            if !verified.is_empty() {
+                snapshot.manifests.insert(key, verified);
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn classify_quiesced_checkpoint(
+    status: Option<
+        &tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus,
+    >,
+    snapshot: &RangeCheckpointSnapshot,
+) -> Result<QuiescedCheckpointEvidence, &'static str> {
+    if status.is_some_and(|status| status.state == HlsCacheFillState::Completed as i32) {
+        return Ok(QuiescedCheckpointEvidence::Completed);
+    }
+    let Some(status) = status.filter(|status| is_partial_fill_checkpoint(status)) else {
+        return Ok(QuiescedCheckpointEvidence::Inconclusive);
+    };
+    if status.representation_id.trim().is_empty() {
+        return Err("typed partial status omitted the selected representation identity");
+    }
+    if snapshot.durable_bytes == 0 {
+        return Err("typed partial status had no quiesced durable range extents");
+    }
+    if snapshot.durable_bytes < status.completed_bytes {
+        return Err("quiesced range extents were below the typed progress lower bound");
+    }
+    Ok(QuiescedCheckpointEvidence::Partial {
+        status_bytes: status.completed_bytes,
+        durable_bytes: snapshot.durable_bytes,
+        extent_count: snapshot.manifests.values().map(Vec::len).sum(),
+    })
+}
+
+fn hls_session_id_from_master_uri(case: &LiveCase, url: &Url) -> String {
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        segments.len() == 3 && segments[0] == "hls" && segments[2] == "master.m3u8",
+        "{}: completed LAN playback URI did not identify a canonical HLS session",
+        case.id
+    );
+    segments[1].to_owned()
+}
+
+fn assert_completed_session_has_no_upstream_urls(root: &Path, session_id: &str) -> Result<(), ()> {
+    let session_path = root
+        .join(".tvos-net-player/hls")
+        .join(session_id)
+        .join("session.json");
+    let metadata = fs::symlink_metadata(&session_path).map_err(|_| ())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 2 * 1024 * 1024
+    {
+        return Err(());
+    }
+    let bytes = fs::read(session_path).map_err(|_| ())?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| ())?;
+    if persisted_session_contains_upstream_material(&value) {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn persisted_session_contains_upstream_material(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase();
+            if normalized == "headers" {
+                return match value {
+                    serde_json::Value::Array(values) => !values.is_empty(),
+                    serde_json::Value::Object(values) => !values.is_empty(),
+                    serde_json::Value::Null => false,
+                    _ => true,
+                };
+            }
+            if normalized == "url" || normalized.ends_with("_url") || normalized == "backup_urls" {
+                return match value {
+                    serde_json::Value::String(value) => !value.trim().is_empty(),
+                    serde_json::Value::Array(values) => !values.is_empty(),
+                    serde_json::Value::Null => false,
+                    _ => true,
+                };
+            }
+            persisted_session_contains_upstream_material(value)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(persisted_session_contains_upstream_material),
+        _ => false,
+    }
+}
+
+async fn get_live_task(
+    channel: &tonic::transport::Channel,
+    case: &LiveCase,
+    task_id: &str,
+) -> Task {
+    TaskServiceClient::new(channel.clone())
+        .get_task(Request::new(GetTaskRequest {
+            id: task_id.to_owned(),
+        }))
+        .await
+        .unwrap_or_else(|_| panic!("{}: safe task status query failed", case.id))
+        .into_inner()
+}
+
+async fn wait_for_fill_checkpoint(
+    channel: &tonic::transport::Channel,
+    case: &LiveCase,
+    task_id: &str,
+    fill_deadline: tokio::time::Instant,
+) -> Option<tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus> {
+    let deadline = fill_deadline.min(tokio::time::Instant::now() + Duration::from_secs(30));
+    let mut latest = None;
+    loop {
+        let task = get_live_task(channel, case, task_id).await;
+        let status = task.hls_cache_fill_status;
+        if let Some(status) = status {
+            if status.state == HlsCacheFillState::BlockedQuota as i32 {
+                panic!(
+                    "{}: fill exceeded its 1 GiB cache budget; refusing to increase the limit",
+                    case.id
+                );
+            }
+            if status.state == HlsCacheFillState::Completed as i32 || status.completed_bytes > 0 {
+                return Some(status);
+            }
+            latest = Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return latest;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_completed_fill(
+    channel: &tonic::transport::Channel,
+    case: &LiveCase,
+    task_id: &str,
+    deadline: tokio::time::Instant,
+) -> tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus {
+    loop {
+        let task = get_live_task(channel, case, task_id).await;
+        if let Some(status) = task.hls_cache_fill_status {
+            if status.state == HlsCacheFillState::Completed as i32 {
+                assert!(
+                    status.completed_bytes > 0,
+                    "{}: completed fill reported zero bytes",
+                    case.id
+                );
+                assert!(
+                    status.total_bytes_known,
+                    "{}: completed fill omitted total bytes",
+                    case.id
+                );
+                assert_eq!(
+                    status.total_bytes, status.completed_bytes,
+                    "{}: completed fill byte totals differ",
+                    case.id
+                );
+                assert!(
+                    !status.representation_id.trim().is_empty(),
+                    "{}: completed fill omitted representation identity",
+                    case.id
+                );
+                return status;
+            }
+            if matches!(
+                HlsCacheFillState::try_from(status.state),
+                Ok(HlsCacheFillState::BlockedQuota
+                    | HlsCacheFillState::Failed
+                    | HlsCacheFillState::SourceUnavailable
+                    | HlsCacheFillState::Cancelled)
+            ) {
+                panic!(
+                    "{}: fill stopped or exceeded its 1 GiB cache budget in state {:?}",
+                    case.id,
+                    HlsCacheFillState::try_from(status.state).ok()
+                );
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{}: full fill did not complete before the 1200-second deadline",
+            case.id
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn collect_resolution_candidates(
@@ -728,6 +1340,7 @@ async fn sustain_hls_probe(
     source: &PlaybackSource,
     media_url: &str,
     duration: Duration,
+    diagnostic: Option<SustainedProbeDiagnosticContext<'_>>,
 ) {
     let deadline = tokio::time::Instant::now() + duration;
     let source_url =
@@ -740,8 +1353,9 @@ async fn sustain_hls_probe(
         media_url,
         "sustained master playlist",
     );
-    let mut playlists =
-        SustainedPlaylistSet::new(unique_child_playlist_urls(child_urls, &source_url));
+    let child_roles = sustained_child_playlist_roles(&master, &source_url);
+    let child_urls = unique_child_playlist_urls(child_urls, &source_url);
+    let mut playlists = SustainedPlaylistSet::new(child_urls);
     assert!(
         playlists.len() <= SUSTAINED_MAX_CHILD_PLAYLISTS,
         "{}: sustained master playlist exceeded the child playlist limit",
@@ -750,7 +1364,16 @@ async fn sustain_hls_probe(
 
     let mut probes = 0usize;
     for index in 0..playlists.len() {
-        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        set_sustained_child_role(playlists.playlist_mut(index), &child_roles);
+        probe_sustained_child_playlist(
+            case,
+            http,
+            media_url,
+            playlists.playlist_mut(index),
+            source,
+            diagnostic.as_ref(),
+        )
+        .await;
         playlists.record_range(index);
         probes += 1;
     }
@@ -775,7 +1398,16 @@ async fn sustain_hls_probe(
                 case.id
             )
         });
-        probe_sustained_child_playlist(case, http, media_url, playlists.playlist_mut(index)).await;
+        set_sustained_child_role(playlists.playlist_mut(index), &child_roles);
+        probe_sustained_child_playlist(
+            case,
+            http,
+            media_url,
+            playlists.playlist_mut(index),
+            source,
+            diagnostic.as_ref(),
+        )
+        .await;
         playlists.record_range(index);
         probes += 1;
         if tokio::time::Instant::now() >= deadline {
@@ -796,6 +1428,8 @@ async fn probe_sustained_child_playlist(
     http: &reqwest::Client,
     media_url: &str,
     playlist: &mut SustainedChildPlaylist,
+    source: &PlaybackSource,
+    diagnostic: Option<&SustainedProbeDiagnosticContext<'_>>,
 ) {
     let media_playlist =
         fetch_sustained_playlist(case, http, &playlist.url, media_url, "media").await;
@@ -826,7 +1460,16 @@ async fn probe_sustained_child_playlist(
         )
     });
     assert_lan_media_url(case, url.as_str(), media_url, "sustained media segment");
-    fetch_sustained_media_bytes(case, http, &url, &request.range).await;
+    fetch_sustained_media_bytes(
+        case,
+        http,
+        &url,
+        &request.range,
+        source,
+        diagnostic,
+        &playlist.role,
+    )
+    .await;
 }
 
 fn unique_child_playlist_urls(urls: Vec<Url>, fallback: &Url) -> Vec<Url> {
@@ -839,6 +1482,63 @@ fn unique_child_playlist_urls(urls: Vec<Url>, fallback: &Url) -> Vec<Url> {
     urls.into_iter()
         .filter(|url| seen.insert(url.as_str().to_owned()))
         .collect()
+}
+
+fn sustained_child_playlist_roles(master: &str, master_url: &Url) -> HashMap<String, String> {
+    let mut audio_urls = HashMap::<String, String>::new();
+    let mut variants = Vec::<(Option<String>, String)>::new();
+    let mut pending_audio_group = None;
+    let mut pending_stream = false;
+
+    for line in master.lines().map(str::trim) {
+        if line.starts_with("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO") {
+            if let (Some(group), Some(uri)) =
+                (hls_attribute(line, "GROUP-ID"), hls_attribute(line, "URI"))
+                && let Ok(url) = master_url.join(&uri)
+            {
+                audio_urls.insert(group, url.to_string());
+            }
+        } else if line.starts_with("#EXT-X-STREAM-INF:") {
+            pending_audio_group = hls_attribute(line, "AUDIO");
+            pending_stream = true;
+        } else if pending_stream && !line.is_empty() && !line.starts_with('#') {
+            if let Ok(url) = master_url.join(line) {
+                variants.push((pending_audio_group.take(), url.to_string()));
+            }
+            pending_stream = false;
+        }
+    }
+
+    let mut roles = HashMap::new();
+    for (index, (audio_group, video_url)) in variants.iter().enumerate() {
+        let role = if index == 0 {
+            "primary".to_owned()
+        } else {
+            format!("alternate_{index}")
+        };
+        roles.insert(video_url.clone(), format!("video_{role}"));
+        if let Some(audio_url) = audio_group.as_ref().and_then(|group| audio_urls.get(group)) {
+            roles.insert(audio_url.clone(), format!("audio_{role}"));
+        }
+    }
+    roles
+}
+
+fn hls_attribute(line: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let start = line.find(&marker)? + marker.len();
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_owned())
+}
+
+fn set_sustained_child_role(
+    playlist: &mut SustainedChildPlaylist,
+    roles: &HashMap<String, String>,
+) {
+    playlist.role = roles
+        .get(playlist.url.as_str())
+        .cloned()
+        .unwrap_or_else(|| "unresolved_child".to_owned());
 }
 
 async fn fetch_sustained_playlist(
@@ -898,6 +1598,9 @@ async fn fetch_sustained_media_bytes(
     http: &reqwest::Client,
     url: &Url,
     range: &ByteRangeRequest,
+    source: &PlaybackSource,
+    diagnostic: Option<&SustainedProbeDiagnosticContext<'_>>,
+    child_role: &str,
 ) {
     let origin = lan_media_origin_for_diagnostic(url);
     let response = http
@@ -915,12 +1618,28 @@ async fn fetch_sustained_media_bytes(
                 error.without_url()
             )
         });
-    assert_eq!(
-        StatusCode::PARTIAL_CONTENT,
-        response.status(),
-        "{}: sustained media range did not return partial content for origin={origin}",
-        case.id,
-    );
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        let status = response.status();
+        let body = bounded_failure_body(response).await;
+        let local = match diagnostic {
+            Some(diagnostic) => {
+                sustained_failure_local_state(diagnostic, source, url, child_role).await
+            }
+            None => "local_runtime=unavailable".to_owned(),
+        };
+        panic!(
+            "{}: sustained media range returned status={} expected=206 origin={} requested_bytes={}-{} response_body_bytes={} response_body_truncated={} response_body_read={} {};",
+            case.id,
+            status.as_u16(),
+            origin,
+            range.start,
+            range.end,
+            body.bytes,
+            body.truncated,
+            body.read_status,
+            local,
+        );
+    }
     let content_range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
@@ -968,6 +1687,155 @@ async fn fetch_sustained_media_bytes(
     );
 }
 
+struct SustainedProbeDiagnosticContext<'a> {
+    channel: &'a tonic::transport::Channel,
+    task_id: &'a str,
+    task: &'a Task,
+}
+
+struct BoundedFailureBody {
+    bytes: usize,
+    truncated: bool,
+    read_status: &'static str,
+}
+
+async fn bounded_failure_body(response: reqwest::Response) -> BoundedFailureBody {
+    let result = tokio::time::timeout(SUSTAINED_DIAGNOSTIC_TIMEOUT, async move {
+        let mut response = response;
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        while let Some(chunk) = response.chunk().await? {
+            let remaining = SUSTAINED_FAILURE_BODY_LIMIT.saturating_sub(bytes);
+            bytes += chunk.len().min(remaining);
+            if chunk.len() > remaining || bytes == SUSTAINED_FAILURE_BODY_LIMIT {
+                truncated = true;
+                break;
+            }
+        }
+        Ok::<_, reqwest::Error>((bytes, truncated))
+    })
+    .await;
+    match result {
+        Ok(Ok((bytes, truncated))) => BoundedFailureBody {
+            bytes,
+            truncated,
+            read_status: "complete",
+        },
+        Ok(Err(_)) => BoundedFailureBody {
+            bytes: 0,
+            truncated: false,
+            read_status: "body_error",
+        },
+        Err(_) => BoundedFailureBody {
+            bytes: 0,
+            truncated: true,
+            read_status: "timeout",
+        },
+    }
+}
+
+async fn sustained_failure_local_state(
+    diagnostic: &SustainedProbeDiagnosticContext<'_>,
+    source: &PlaybackSource,
+    requested_url: &Url,
+    child_role: &str,
+) -> String {
+    let latest_task = tokio::time::timeout(SUSTAINED_DIAGNOSTIC_TIMEOUT, async {
+        TaskServiceClient::new(diagnostic.channel.clone())
+            .get_task(Request::new(GetTaskRequest {
+                id: diagnostic.task_id.to_owned(),
+            }))
+            .await
+    })
+    .await;
+    let task_snapshot = match latest_task {
+        Ok(Ok(response)) => format_task_diagnostic(&response.into_inner()),
+        Ok(Err(_)) => format!(
+            "task_query=grpc_error fallback=[{}]",
+            format_task_diagnostic(diagnostic.task)
+        ),
+        Err(_) => format!(
+            "task_query=timeout fallback=[{}]",
+            format_task_diagnostic(diagnostic.task)
+        ),
+    };
+
+    let Some((_session_id, resource_id)) = hls_resource_path_parts(requested_url) else {
+        return format!(
+            "task_snapshot=[{}] requested_resource=unparsed child_role={} source_variant_id={} runtime_generation=not_exposed runtime_policy=not_exposed cache_key=not_exposed",
+            task_snapshot,
+            safe_diagnostic_value(child_role),
+            safe_diagnostic_value(&source.variant_id),
+        );
+    };
+    let kind = if child_role.starts_with("audio_") {
+        "audio"
+    } else if child_role.starts_with("video_") {
+        "video"
+    } else {
+        "unknown"
+    };
+    let variant_role = if child_role.ends_with("_primary") {
+        "primary"
+    } else if child_role.contains("_alternate_") {
+        "alternate"
+    } else {
+        "unresolved"
+    };
+    format!(
+        "task_snapshot=[{}] resource_kind={} resource_id={} child_role={} variant_role={} task_source=primary_playback_source source_variant_id={} cache_key=not_exposed runtime_generation=not_exposed runtime_policy=not_exposed",
+        task_snapshot,
+        kind,
+        safe_diagnostic_value(resource_id),
+        safe_diagnostic_value(child_role),
+        variant_role,
+        safe_diagnostic_value(&source.variant_id),
+    )
+}
+
+fn format_task_diagnostic(task: &Task) -> String {
+    let state = TaskState::try_from(task.state)
+        .map(|state| format!("{state:?}"))
+        .unwrap_or_else(|_| format!("unknown:{}", task.state));
+    let revision = task
+        .output_summary
+        .as_ref()
+        .map_or(0, |summary| summary.revision);
+    format!(
+        "id={} state={} output_revision={} result_items={} fill_state={}",
+        safe_diagnostic_value(&task.id),
+        state,
+        revision,
+        task.result_items.len(),
+        task.hls_cache_fill_status
+            .as_ref()
+            .map(|status| format!("{}:{}", status.state, status.completed_bytes))
+            .unwrap_or_else(|| "none".to_owned()),
+    )
+}
+
+fn hls_resource_path_parts(url: &Url) -> Option<(&str, &str)> {
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["hls", session_id, "segments", resource_id] => Some((session_id, resource_id)),
+        _ => None,
+    }
+}
+
+fn safe_diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .take(128)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ByteRangeRequest {
     start: u64,
@@ -995,6 +1863,7 @@ struct SustainedProbeCursor {
 
 struct SustainedChildPlaylist {
     url: Url,
+    role: String,
     cursor: SustainedProbeCursor,
     ranged: bool,
 }
@@ -1011,6 +1880,7 @@ impl SustainedPlaylistSet {
                 .into_iter()
                 .map(|url| SustainedChildPlaylist {
                     url,
+                    role: "unresolved_child".to_owned(),
                     cursor: SustainedProbeCursor::default(),
                     ranged: false,
                 })
@@ -1239,6 +2109,467 @@ fn assert_lan_media_url(case: &LiveCase, uri: &str, media_url: &str, label: &str
         lan_media_origin_for_diagnostic(&parsed)
     );
     parsed
+}
+
+fn assert_clean_lan_url(case: &LiveCase, url: &Url) {
+    assert!(
+        url.username().is_empty() && url.password().is_none(),
+        "{}: completed LAN URI contained user information",
+        case.id
+    );
+    assert!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{}: completed LAN URI contained query or fragment data",
+        case.id
+    );
+}
+
+fn assert_playlist_references_are_clean(
+    case: &LiveCase,
+    base_url: &Url,
+    playlist: &str,
+    media_url: &str,
+) {
+    for reference in playlist_referenced_uris(playlist) {
+        let url = base_url.join(&reference).unwrap_or_else(|_| {
+            panic!(
+                "{}: completed playlist reference could not be resolved",
+                case.id
+            )
+        });
+        assert_lan_media_url(
+            case,
+            url.as_str(),
+            media_url,
+            "completed playlist reference",
+        );
+        assert_clean_lan_url(case, &url);
+    }
+}
+
+async fn read_completed_hls_payloads(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    source: &PlaybackSource,
+    media_url: &str,
+) -> OfflinePayload {
+    let master_url = assert_lan_media_url(
+        case,
+        &source.uri,
+        media_url,
+        "completed cache-only master playlist",
+    );
+    assert_clean_lan_url(case, &master_url);
+    let master = fetch_offline_playlist(case, http, &master_url, media_url).await;
+    assert_playlist_references_are_clean(case, &master_url, &master, media_url);
+    let child_urls = assert_playlist_stays_on_lan(
+        case,
+        &master_url,
+        &master,
+        media_url,
+        "completed cache-only master playlist",
+    );
+    assert!(
+        !child_urls.is_empty(),
+        "{}: completed master had no selected audio/video playlists",
+        case.id
+    );
+    assert!(
+        child_urls.len() <= SUSTAINED_MAX_CHILD_PLAYLISTS,
+        "{}: completed master exceeded its child-playlist limit",
+        case.id
+    );
+
+    let mut resources = Vec::new();
+    let mut seen = HashSet::new();
+    for child_url in child_urls {
+        assert_clean_lan_url(case, &child_url);
+        let playlist = fetch_offline_playlist(case, http, &child_url, media_url).await;
+        assert_playlist_references_are_clean(case, &child_url, &playlist, media_url);
+        assert_playlist_stays_on_lan(
+            case,
+            &child_url,
+            &playlist,
+            media_url,
+            "completed cache-only media playlist",
+        );
+        let parsed = hls_probe_resources(&playlist).unwrap_or_else(|_| {
+            panic!(
+                "{}: completed media playlist contained invalid or unsupported byte ranges",
+                case.id
+            )
+        });
+        for resource in parsed {
+            let url = child_url.join(&resource.uri).unwrap_or_else(|_| {
+                panic!(
+                    "{}: completed media resource URI could not be resolved",
+                    case.id
+                )
+            });
+            assert_lan_media_url(
+                case,
+                url.as_str(),
+                media_url,
+                "completed cache-only media resource",
+            );
+            assert_clean_lan_url(case, &url);
+            let key = format!("{}|{:?}", url.as_str(), resource.range);
+            if seen.insert(key) {
+                resources.push(HlsProbeResource {
+                    uri: url.to_string(),
+                    range: resource.range,
+                    initialization: resource.initialization,
+                });
+                assert!(
+                    resources.len() <= OFFLINE_MAX_RESOURCES,
+                    "{}: completed HLS resource count exceeded its limit",
+                    case.id
+                );
+            }
+        }
+    }
+    assert!(
+        resources.iter().any(|resource| !resource.initialization),
+        "{}: completed media playlists advertised no media segments",
+        case.id
+    );
+
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    for resource in &resources {
+        if let Some(range) = &resource.range {
+            let mut start = range.start;
+            while start <= range.end {
+                let end = range
+                    .end
+                    .min(start.saturating_add(SUSTAINED_READ_LIMIT - 1));
+                read_offline_range(
+                    case,
+                    http,
+                    &resource.uri,
+                    ByteRangeRequest { start, end },
+                    media_url,
+                    &mut bytes,
+                    &mut digest,
+                )
+                .await;
+                start = end.saturating_add(1);
+            }
+        } else {
+            read_offline_resource(
+                case,
+                http,
+                &resource.uri,
+                media_url,
+                &mut bytes,
+                &mut digest,
+            )
+            .await;
+        }
+    }
+    OfflinePayload {
+        resources,
+        total_bytes: bytes,
+        sha256: format!("{:x}", digest.finalize()),
+    }
+}
+
+async fn fetch_offline_playlist(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    url: &Url,
+    media_url: &str,
+) -> String {
+    assert_lan_media_url(case, url.as_str(), media_url, "cache-only playlist");
+    let response = http
+        .get(url.clone())
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("{}: cache-only playlist request failed", case.id));
+    assert_eq!(
+        StatusCode::OK,
+        response.status(),
+        "{}: cache-only playlist was not available",
+        case.id
+    );
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .unwrap_or_else(|_| panic!("{}: cache-only playlist body failed", case.id))
+    {
+        if bytes.len().saturating_add(chunk.len()) > SUSTAINED_PLAYLIST_LIMIT {
+            panic!("{}: cache-only playlist exceeded its 1 MiB limit", case.id);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(bytes)
+        .unwrap_or_else(|_| panic!("{}: cache-only playlist was not UTF-8", case.id));
+    assert!(
+        body.starts_with("#EXTM3U"),
+        "{}: cache-only playlist was malformed",
+        case.id
+    );
+    body
+}
+
+async fn read_offline_range(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    uri: &str,
+    range: ByteRangeRequest,
+    media_url: &str,
+    aggregate_bytes: &mut u64,
+    digest: &mut Sha256,
+) {
+    let url = assert_lan_media_url(case, uri, media_url, "cache-only byte range");
+    assert_clean_lan_url(case, &url);
+    let response = http
+        .get(url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", range.start, range.end),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("{}: cache-only byte-range request failed", case.id));
+    assert_eq!(
+        StatusCode::PARTIAL_CONTENT,
+        response.status(),
+        "{}: cache-only range did not return partial content",
+        case.id
+    );
+    let returned = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_range_bounds);
+    assert_eq!(
+        Some((range.start, range.end)),
+        returned,
+        "{}: cache-only Content-Range differed",
+        case.id
+    );
+    let expected = range.end - range.start + 1;
+    let received = consume_bounded_body(case, response, expected, aggregate_bytes, digest).await;
+    assert_eq!(
+        expected, received,
+        "{}: cache-only range returned an incomplete body",
+        case.id
+    );
+}
+
+async fn read_offline_resource(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    uri: &str,
+    media_url: &str,
+    aggregate_bytes: &mut u64,
+    digest: &mut Sha256,
+) {
+    let url = assert_lan_media_url(case, uri, media_url, "cache-only segment");
+    assert_clean_lan_url(case, &url);
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("{}: cache-only segment request failed", case.id));
+    assert_eq!(
+        StatusCode::OK,
+        response.status(),
+        "{}: cache-only segment was not fully available",
+        case.id
+    );
+    consume_bounded_body(
+        case,
+        response,
+        OFFLINE_MAX_VERIFIED_BYTES,
+        aggregate_bytes,
+        digest,
+    )
+    .await;
+}
+
+async fn consume_bounded_body(
+    case: &LiveCase,
+    mut response: reqwest::Response,
+    expected_max: u64,
+    aggregate_bytes: &mut u64,
+    digest: &mut Sha256,
+) -> u64 {
+    let mut received = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .unwrap_or_else(|_| panic!("{}: cache-only response body failed", case.id))
+    {
+        let chunk_len = u64::try_from(chunk.len()).expect("chunk length should fit u64");
+        received = bounded_byte_sum(received, chunk_len)
+            .unwrap_or_else(|| panic!("{}: response byte count overflowed", case.id));
+        *aggregate_bytes = bounded_byte_sum(*aggregate_bytes, chunk_len)
+            .unwrap_or_else(|| panic!("{}: aggregate byte count overflowed", case.id));
+        assert!(
+            received <= expected_max && *aggregate_bytes <= OFFLINE_MAX_VERIFIED_BYTES,
+            "{}: cache-only byte validation exceeded its 1 GiB ceiling",
+            case.id
+        );
+        digest.update(&chunk);
+    }
+    received
+}
+
+fn bounded_byte_sum(current: u64, added: u64) -> Option<u64> {
+    let total = current.checked_add(added)?;
+    (total <= OFFLINE_MAX_VERIFIED_BYTES).then_some(total)
+}
+
+fn cached_media_checksums(
+    root: &Path,
+    session_id: &str,
+    resources: &[HlsProbeResource],
+) -> Result<std::collections::BTreeMap<String, (u64, String)>, ()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let session_dir = root.join(".tvos-net-player/hls").join(session_id);
+    let directory_metadata = fs::symlink_metadata(&session_dir).map_err(|_| ())?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(());
+    }
+    let mut checksums = std::collections::BTreeMap::new();
+    let mut unique_ids = HashSet::new();
+    let mut aggregate_length = 0_u64;
+    for resource in resources {
+        let url = Url::parse(&resource.uri).map_err(|_| ())?;
+        let id = url.path_segments().and_then(Iterator::last).ok_or(())?;
+        if id.is_empty()
+            || id == "."
+            || id == ".."
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(());
+        }
+        if !unique_ids.insert(id.to_owned()) {
+            continue;
+        }
+        let path = session_dir.join(id);
+        let entry_metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+        if entry_metadata.file_type().is_symlink() || !entry_metadata.is_file() {
+            return Err(());
+        }
+        aggregate_length = aggregate_length
+            .checked_add(entry_metadata.len())
+            .ok_or(())?;
+        if aggregate_length > OFFLINE_MAX_VERIFIED_BYTES {
+            return Err(());
+        }
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|_| ())?;
+        let before = file.metadata().map_err(|_| ())?;
+        let identity = (before.dev(), before.ino(), before.len());
+        if !before.is_file() || before.len() != entry_metadata.len() {
+            return Err(());
+        }
+        let mut digest = Sha256::new();
+        let mut bytes_read = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|_| ())?;
+            if count == 0 {
+                break;
+            }
+            bytes_read = bytes_read.checked_add(count as u64).ok_or(())?;
+            if bytes_read > before.len() {
+                return Err(());
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata().map_err(|_| ())?;
+        if (after.dev(), after.ino(), after.len()) != identity || bytes_read != before.len() {
+            return Err(());
+        }
+        checksums.insert(
+            id.to_owned(),
+            (bytes_read, format!("{:x}", digest.finalize())),
+        );
+    }
+    if checksums.is_empty() {
+        return Err(());
+    }
+    Ok(checksums)
+}
+
+async fn sustain_offline_cache_reads(
+    case: &LiveCase,
+    http: &reqwest::Client,
+    resources: &[HlsProbeResource],
+    media_url: &str,
+    duration: Duration,
+    already_read: u64,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut cursor = SustainedProbeCursor::default();
+    let mut total_bytes = already_read;
+    let mut digest = Sha256::new();
+    let mut requests = 0_u64;
+    while tokio::time::Instant::now() < deadline {
+        let request = next_sustained_probe_request(resources, &mut cursor).unwrap_or_else(|| {
+            panic!(
+                "{}: no media byte ranges available for offline reads",
+                case.id
+            )
+        });
+        let read = tokio::time::timeout_at(
+            deadline,
+            read_offline_range(
+                case,
+                http,
+                &request.uri,
+                request.range,
+                media_url,
+                &mut total_bytes,
+                &mut digest,
+            ),
+        )
+        .await;
+        if read.is_err() && tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        read.unwrap_or_else(|_| {
+            panic!(
+                "{}: offline cache-read timed out before its deadline",
+                case.id
+            )
+        });
+        requests = requests.saturating_add(1);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining > Duration::from_millis(250) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        } else if !remaining.is_zero() {
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+    assert!(
+        requests > 0,
+        "{}: 300-second offline range loop issued no requests",
+        case.id
+    );
+    total_bytes
+}
+
+#[derive(Serialize)]
+struct LanPlaybackReady<'a> {
+    phase: &'a str,
+    uri: String,
+    case_id: String,
+    task_id: String,
+    total_bytes: u64,
+    expires_in_seconds: u64,
 }
 
 fn lan_media_origin_for_diagnostic(url: &Url) -> String {
@@ -1554,6 +2885,9 @@ struct LiveRunPolicy {
     include_authenticated: bool,
     include_collection_list: bool,
     sustained_duration: Option<Duration>,
+    full_fill: bool,
+    offline_duration: Option<Duration>,
+    ready_file: Option<PathBuf>,
 }
 
 struct SustainedProbeContext {
@@ -1561,17 +2895,80 @@ struct SustainedProbeContext {
     duration: Duration,
 }
 
+#[derive(Clone)]
+struct FullFillContext {
+    offline_duration: Option<Duration>,
+    ready_file: Option<PathBuf>,
+}
+
+struct OfflinePayload {
+    resources: Vec<HlsProbeResource>,
+    total_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RangeExtentCheckpoint {
+    start: u64,
+    end: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RangeCheckpointSnapshot {
+    manifests: std::collections::BTreeMap<String, Vec<RangeExtentCheckpoint>>,
+    durable_bytes: u64,
+}
+
+struct QuiescedRestartCheckpoint {
+    fill_status:
+        Option<tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus>,
+    range_checkpoints: RangeCheckpointSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuiescedCheckpointEvidence {
+    Partial {
+        status_bytes: u64,
+        durable_bytes: u64,
+        extent_count: usize,
+    },
+    Completed,
+    Inconclusive,
+}
+
 impl LiveRunPolicy {
     fn from_env() -> Self {
+        let full_fill = env_flag("BILIBILI_LIVE_E2E_FULL_FILL");
+        let offline_duration = offline_duration_from_env();
+        let ready_file = ready_file_from_env();
+        assert!(
+            offline_duration.is_none() || full_fill,
+            "BILIBILI_LIVE_E2E_OFFLINE_SECONDS requires BILIBILI_LIVE_E2E_FULL_FILL=1"
+        );
+        assert!(
+            ready_file.is_none() || (full_fill && offline_duration == Some(OFFLINE_READ_DURATION)),
+            "BILIBILI_LIVE_E2E_LAN_PLAYBACK_READY_PATH requires full-fill mode and BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300"
+        );
         Self {
             filter: case_filter_from_env(),
             include_authenticated: env_flag("BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED"),
             include_collection_list: env_flag("BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST"),
             sustained_duration: sustained_duration_from_env(),
+            full_fill,
+            offline_duration,
+            ready_file,
         }
     }
 
     fn run_decision(&self, case: &LiveCase) -> LiveRunDecision {
+        if self.full_fill
+            && (case.id != "ordinary-video-playlist" || case.selection != SelectionPolicy::First)
+        {
+            return LiveRunDecision::Skip(
+                "full-fill mode only supports the canonical ordinary playlist first candidate",
+            );
+        }
         if self.filter.is_none() && case.requires_restricted_area_path {
             return LiveRunDecision::Skip("requires explicit restricted-area live validation");
         }
@@ -1592,6 +2989,40 @@ impl LiveRunPolicy {
         }
         LiveRunDecision::Run
     }
+}
+
+fn ready_file_from_env() -> Option<PathBuf> {
+    let configured = env::var_os("BILIBILI_LIVE_E2E_LAN_PLAYBACK_READY_PATH")?;
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repository root should resolve");
+    let expected = repo_root.join(".codex-tmp/fill-pr4-live/ready.json");
+    let configured = PathBuf::from(configured);
+    assert_eq!(
+        expected, configured,
+        "BILIBILI_LIVE_E2E_LAN_PLAYBACK_READY_PATH must target the lead-owned ignored ready file"
+    );
+    Some(expected)
+}
+
+fn offline_duration_from_env() -> Option<Duration> {
+    let value = env::var("BILIBILI_LIVE_E2E_OFFLINE_SECONDS").ok();
+    parse_offline_duration(value.as_deref())
+        .unwrap_or_else(|message| panic!("BILIBILI_LIVE_E2E_OFFLINE_SECONDS {message}"))
+}
+
+fn parse_offline_duration(value: Option<&str>) -> Result<Option<Duration>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "must be an integer from 180 through 300 when set")?;
+    if !(180..=300).contains(&seconds) {
+        return Err("must be between 180 and 300 seconds when set");
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 fn sustained_duration_from_env() -> Option<Duration> {
@@ -1630,10 +3061,14 @@ fn parse_case_filter(value: String) -> HashSet<String> {
 }
 
 fn env_flag(key: &str) -> bool {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    env::var(key).ok().as_deref().is_some_and(parse_env_flag)
+}
+
+fn parse_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 async fn fetch_bilibili_credential_status(
@@ -1934,19 +3369,36 @@ struct LiveTestServer {
     state: AppState,
     grpc_url: String,
     media_url: String,
+    grpc_addr: std::net::SocketAddr,
+    media_addr: std::net::SocketAddr,
     grpc_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
     media_task: Option<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+    cache_max_bytes: u64,
+    ready_file: Option<(PathBuf, Vec<u8>)>,
+    restart_recovery_failure: Option<String>,
 }
 
 impl LiveTestServer {
     async fn start() -> Self {
+        Self::start_with_fill_mode(false).await
+    }
+
+    async fn start_with_fill_mode(full_fill: bool) -> Self {
+        let cache_max_bytes = live_cache_budget(full_fill);
         let temp_root = tempfile::tempdir().unwrap();
         let root_path = temp_root.path().canonicalize().unwrap();
         let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let grpc_url = format!("http://{}", grpc_listener.local_addr().unwrap());
+        let grpc_addr = grpc_listener.local_addr().unwrap();
+        let grpc_url = format!("http://{grpc_addr}");
         let media_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let media_url = format!("http://{}", media_listener.local_addr().unwrap());
-        let options = live_server_options(root_path.clone(), grpc_url.clone(), media_url.clone());
+        let media_addr = media_listener.local_addr().unwrap();
+        let media_url = format!("http://{media_addr}");
+        let options = live_server_options(
+            root_path.clone(),
+            grpc_url.clone(),
+            media_url.clone(),
+            cache_max_bytes,
+        );
         let state = AppState::new(options);
 
         let grpc_task = tokio::spawn(run_grpc_listener(grpc_listener, state.clone()));
@@ -1958,8 +3410,13 @@ impl LiveTestServer {
             state,
             grpc_url,
             media_url,
+            grpc_addr,
+            media_addr,
             grpc_task: Some(grpc_task),
             media_task: Some(media_task),
+            cache_max_bytes,
+            ready_file: None,
+            restart_recovery_failure: None,
         }
     }
 
@@ -1973,6 +3430,11 @@ impl LiveTestServer {
 
     async fn shutdown(mut self, task_tracker: &LiveTaskTracker) -> Result<(), String> {
         let listener_result = self.stop_listeners().await;
+        let ready_result = if listener_result.is_ok() {
+            self.remove_ready_file()
+        } else {
+            Err("ready file retained because listener shutdown was not confirmed".to_owned())
+        };
         let background_result = self.cancel_case_tasks_and_wait(task_tracker).await;
         let history_result = tokio::time::timeout(
             LIVE_CASE_TEARDOWN_TIMEOUT,
@@ -1982,8 +3444,158 @@ impl LiveTestServer {
         .map_err(|_| "CDN history persistence did not become idle".to_owned());
         self.finish_teardown(combine_teardown_results(
             combine_teardown_results(listener_result, background_result),
-            history_result,
+            combine_teardown_results(history_result, ready_result),
         ))
+    }
+
+    async fn restart_preserving_state(&mut self) -> Result<(), String> {
+        if let Err(error) = self.quiesce_for_restart().await {
+            self.restart_recovery_failure = Some(error.clone());
+            return Err(error);
+        }
+        if let Err(error) = self.restore_after_restart().await {
+            self.restart_recovery_failure = Some(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn restart_preserving_state_with_checkpoint(
+        &mut self,
+        task_id: &str,
+    ) -> Result<QuiescedRestartCheckpoint, String> {
+        if let Err(error) = self.quiesce_for_restart().await {
+            self.restart_recovery_failure = Some(error.clone());
+            return Err(error);
+        }
+        let fill_status = match self.state.tasks.get_task(task_id) {
+            Ok(task) => task.hls_cache_fill_status,
+            Err(_) => {
+                let error = "task status could not be read after fill quiescence".to_owned();
+                self.restart_recovery_failure = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let range_checkpoints = match snapshot_range_checkpoints(self.temp_root_path()) {
+            Ok(snapshot) => snapshot,
+            Err(()) => {
+                let error =
+                    "durable range checkpoints could not be inspected after quiescence".to_owned();
+                self.restart_recovery_failure = Some(error.clone());
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.restore_after_restart().await {
+            self.restart_recovery_failure = Some(error.clone());
+            return Err(error);
+        }
+        Ok(QuiescedRestartCheckpoint {
+            fill_status,
+            range_checkpoints,
+        })
+    }
+
+    async fn quiesce_for_restart(&mut self) -> Result<(), String> {
+        self.stop_listeners().await?;
+        tokio::time::timeout(
+            LIVE_CASE_TEARDOWN_TIMEOUT,
+            self.state.shutdown_hls_fill_worker(),
+        )
+        .await
+        .map_err(|_| "HLS fill worker did not join before same-root restart".to_owned())?;
+        tokio::time::timeout(
+            LIVE_CASE_TEARDOWN_TIMEOUT,
+            self.state.shutdown_cdn_history_writer(),
+        )
+        .await
+        .map_err(|_| "CDN history writer did not join before same-root restart".to_owned())?;
+        if !self.state.background_work_is_idle() {
+            return Err(format!(
+                "background work was not idle after graceful restart shutdown ({})",
+                self.state.background_work_diagnostics()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn restore_after_restart(&mut self) -> Result<(), String> {
+        let root = self
+            .temp_root
+            .as_ref()
+            .ok_or_else(|| "live e2e root was unavailable during restart".to_owned())?
+            .path()
+            .canonicalize()
+            .map_err(|_| "live e2e root could not be revalidated during restart".to_owned())?;
+        self.state = AppState::new(live_server_options(
+            root,
+            self.grpc_url.clone(),
+            self.media_url.clone(),
+            self.cache_max_bytes,
+        ));
+        let grpc_listener = TcpListener::bind(self.grpc_addr)
+            .await
+            .map_err(|_| "gRPC listener could not restart on its original address".to_owned())?;
+        let media_listener = TcpListener::bind(self.media_addr)
+            .await
+            .map_err(|_| "media listener could not restart on its original address".to_owned())?;
+        self.grpc_task = Some(tokio::spawn(run_grpc_listener(
+            grpc_listener,
+            self.state.clone(),
+        )));
+        self.media_task = Some(tokio::spawn(run_media_listener(
+            media_listener,
+            self.state.clone(),
+        )));
+        wait_for_grpc(&self.grpc_url).await;
+        Ok(())
+    }
+
+    fn publish_ready_file(&mut self, path: PathBuf, content: Vec<u8>) -> Result<(), String> {
+        if content.len() > READY_FILE_LIMIT {
+            return Err("ready document exceeded its 4 KiB limit".to_owned());
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| "ready file parent path was missing".to_owned())?;
+        reject_symlink_components(parent)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err("ready file already exists and was not overwritten".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("ready file destination could not be checked".to_owned()),
+        }
+        fs::create_dir_all(parent)
+            .map_err(|_| "ready file directory could not be created".to_owned())?;
+        let temporary = parent.join(format!(".ready.json.{}.tmp", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|_| "ready file staging file could not be created".to_owned())?;
+        let write_result = file
+            .write_all(&content)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::hard_link(&temporary, &path))
+            .and_then(|()| fs::remove_file(&temporary));
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err("ready file could not be atomically published".to_owned());
+        }
+        self.ready_file = Some((path, content));
+        Ok(())
+    }
+
+    fn remove_ready_file(&mut self) -> Result<(), String> {
+        let Some((path, expected)) = self.ready_file.take() else {
+            return Ok(());
+        };
+        match fs::read(&path) {
+            Ok(actual) if actual == expected => fs::remove_file(path)
+                .map_err(|_| "ready file could not be removed after listener shutdown".to_owned()),
+            Ok(_) => Err("ready file changed externally and was retained".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("ready file could not be revalidated for cleanup".to_owned()),
+        }
     }
 
     fn temp_root_path(&self) -> &Path {
@@ -1994,6 +3606,15 @@ impl LiveTestServer {
     }
 
     fn finish_teardown(mut self, result: Result<(), String>) -> Result<(), String> {
+        let result = match self.restart_recovery_failure.take() {
+            Some(failure) => combine_teardown_results(
+                result,
+                Err(format!(
+                    "restart did not reach a recoverable state: {failure}"
+                )),
+            ),
+            None => result,
+        };
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -2026,7 +3647,17 @@ impl LiveTestServer {
                     && self.case_tasks_are_terminal(&stable_task_ids)?
                     && self.state.background_work_is_idle()
                 {
-                    self.state.shutdown_hls_fill_worker().await;
+                    tokio::time::timeout(
+                        LIVE_CASE_TEARDOWN_TIMEOUT,
+                        self.state.shutdown_hls_fill_worker(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "HLS fill range writers did not join ({})",
+                            self.state.background_work_diagnostics()
+                        )
+                    })?;
                     return Ok(());
                 }
             }
@@ -2095,6 +3726,30 @@ impl LiveTestServer {
     }
 }
 
+fn reject_symlink_components(path: &Path) -> Result<(), String> {
+    let components = path.components().collect::<Vec<_>>();
+    let anchor = components
+        .iter()
+        .position(|component| component.as_os_str() == ".codex-tmp")
+        .ok_or_else(|| "ready file path is outside the ignored artifact directory".to_owned())?;
+    let mut current = PathBuf::new();
+    for component in &components[..=anchor] {
+        current.push(component.as_os_str());
+    }
+    for component in &components[anchor + 1..] {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("ready file path traversed a symbolic link".to_owned());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("ready file path could not be checked".to_owned()),
+        }
+    }
+    Ok(())
+}
+
 impl Drop for LiveTestServer {
     fn drop(&mut self) {
         if let Some(task) = &self.grpc_task {
@@ -2137,6 +3792,7 @@ fn live_server_options(
     root_path: PathBuf,
     grpc_url: String,
     media_url: String,
+    cache_max_bytes: u64,
 ) -> CacheServerOptions {
     let mut args = vec![
         "--Cache:ServerName".to_owned(),
@@ -2158,13 +3814,21 @@ fn live_server_options(
         "--Cache:BilibiliWorkerEnabled".to_owned(),
         "false".to_owned(),
         "--Cache:HlsCacheMaxBytes".to_owned(),
-        "0".to_owned(),
+        cache_max_bytes.to_string(),
     ];
     args.extend(live_server_environment_args(|key| env::var(key).ok()));
 
     CacheServerOptions::from_args(args)
         .expect("live e2e cache server options should parse")
         .normalized_for_runtime()
+}
+
+fn live_cache_budget(full_fill: bool) -> u64 {
+    if full_fill {
+        FULL_FILL_CACHE_BUDGET_BYTES
+    } else {
+        0
+    }
 }
 
 fn live_server_environment_args(get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
@@ -2237,6 +3901,265 @@ mod tests {
         assert!(parse_sustained_duration(Some("0")).is_err());
         assert!(parse_sustained_duration(Some("1.5")).is_err());
         assert!(parse_sustained_duration(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn full_fill_flag_is_independent_and_default_off() {
+        assert!(!parse_env_flag("0"));
+        assert!(!parse_env_flag("false"));
+        assert!(parse_env_flag("1"));
+        assert!(parse_env_flag(" YES "));
+        assert!(parse_env_flag("on"));
+    }
+
+    #[test]
+    fn full_fill_cache_budget_is_bounded_without_changing_default_options() {
+        assert_eq!(0, live_cache_budget(false));
+        assert_eq!(FULL_FILL_CACHE_BUDGET_BYTES, live_cache_budget(true));
+
+        let root = tempfile::tempdir().expect("cache budget fixture root should exist");
+        let options = live_server_options(
+            root.path().to_owned(),
+            "http://127.0.0.1:41000".to_owned(),
+            "http://127.0.0.1:41001".to_owned(),
+            live_cache_budget(true),
+        );
+        assert_eq!(FULL_FILL_CACHE_BUDGET_BYTES, options.hls_cache_max_bytes);
+
+        let default_options = live_server_options(
+            root.path().to_owned(),
+            "http://127.0.0.1:41000".to_owned(),
+            "http://127.0.0.1:41001".to_owned(),
+            live_cache_budget(false),
+        );
+        assert_eq!(0, default_options.hls_cache_max_bytes);
+    }
+
+    #[test]
+    fn offline_duration_is_independent_opt_in_and_bounded_to_180_through_300_seconds() {
+        assert_eq!(None, parse_offline_duration(None).unwrap());
+        assert_eq!(
+            Some(Duration::from_secs(180)),
+            parse_offline_duration(Some("180")).unwrap()
+        );
+        assert_eq!(
+            Some(Duration::from_secs(300)),
+            parse_offline_duration(Some("300")).unwrap()
+        );
+        assert!(parse_offline_duration(Some("179")).is_err());
+        assert!(parse_offline_duration(Some("301")).is_err());
+        assert!(parse_offline_duration(Some("300.0")).is_err());
+    }
+
+    #[test]
+    fn partial_checkpoint_requires_positive_nonterminal_durable_bytes() {
+        use tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus;
+
+        let mut status = HlsCacheFillStatus {
+            state: HlsCacheFillState::Filling as i32,
+            completed_bytes: 64,
+            total_bytes: 128,
+            total_bytes_known: true,
+            representation_id: "repr-a".to_owned(),
+            ..Default::default()
+        };
+        assert!(is_partial_fill_checkpoint(&status));
+        status.completed_bytes = 0;
+        assert!(!is_partial_fill_checkpoint(&status));
+        status.completed_bytes = 128;
+        assert!(!is_partial_fill_checkpoint(&status));
+        status.completed_bytes = 64;
+        status.state = HlsCacheFillState::Completed as i32;
+        assert!(!is_partial_fill_checkpoint(&status));
+    }
+
+    #[test]
+    fn offline_byte_aggregation_is_checked_and_capped() {
+        assert_eq!(Some(65), bounded_byte_sum(64, 1));
+        assert_eq!(None, bounded_byte_sum(u64::MAX, 1));
+        assert_eq!(None, bounded_byte_sum(OFFLINE_MAX_VERIFIED_BYTES, 1));
+    }
+
+    #[test]
+    fn checkpoint_snapshot_reads_verified_extents_without_exposing_manifest_data() {
+        let root = tempfile::tempdir().expect("checkpoint fixture root should exist");
+        let session_dir = root.path().join(".tvos-net-player/hls/session-a");
+        fs::create_dir_all(&session_dir).expect("checkpoint fixture directory should exist");
+        fs::write(
+            session_dir.join("video.m4s.range.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "resource_id": "video.m4s",
+                "representation_digest": "repr-a",
+                "extents": [{"start": 0, "end": 3, "sha256": "a".repeat(64)}]
+            })
+            .to_string(),
+        )
+        .expect("synthetic checkpoint manifest should be written");
+
+        let snapshot = snapshot_range_checkpoints(root.path())
+            .expect("synthetic checkpoint should be inspected");
+
+        assert_eq!(4, snapshot.durable_bytes);
+        assert_eq!(1, snapshot.manifests.len());
+        assert_eq!(1, snapshot.manifests.values().next().unwrap().len());
+    }
+
+    #[test]
+    fn quiesced_checkpoint_uses_durable_lower_bound_and_completed_state_wins() {
+        use tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus;
+
+        let mut status = HlsCacheFillStatus {
+            state: HlsCacheFillState::Preempted as i32,
+            completed_bytes: 32,
+            total_bytes: 128,
+            total_bytes_known: true,
+            representation_id: "repr-a".to_owned(),
+            ..Default::default()
+        };
+        let snapshot = RangeCheckpointSnapshot {
+            durable_bytes: 64,
+            manifests: [(
+                "session-a/video/repr-a".to_owned(),
+                vec![RangeExtentCheckpoint {
+                    start: 0,
+                    end: 63,
+                    sha256: "a".repeat(64),
+                }],
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        assert_eq!(
+            Ok(QuiescedCheckpointEvidence::Partial {
+                status_bytes: 32,
+                durable_bytes: 64,
+                extent_count: 1,
+            }),
+            classify_quiesced_checkpoint(Some(&status), &snapshot)
+        );
+
+        status.state = HlsCacheFillState::Completed as i32;
+        assert_eq!(
+            Ok(QuiescedCheckpointEvidence::Completed),
+            classify_quiesced_checkpoint(Some(&status), &snapshot)
+        );
+        status.state = HlsCacheFillState::Preempted as i32;
+        status.completed_bytes = 0;
+        assert_eq!(
+            Ok(QuiescedCheckpointEvidence::Inconclusive),
+            classify_quiesced_checkpoint(Some(&status), &snapshot)
+        );
+        assert_eq!(
+            Ok(QuiescedCheckpointEvidence::Inconclusive),
+            classify_quiesced_checkpoint(None, &RangeCheckpointSnapshot::default())
+        );
+    }
+
+    #[test]
+    fn quiesced_partial_status_must_be_covered_by_durable_extents() {
+        use tvos_net_player_cache_server::generated::tvos_net_player::v1::HlsCacheFillStatus;
+
+        let status = HlsCacheFillStatus {
+            state: HlsCacheFillState::Preempted as i32,
+            completed_bytes: 64,
+            total_bytes: 128,
+            total_bytes_known: true,
+            representation_id: "repr-a".to_owned(),
+            ..Default::default()
+        };
+        let snapshot = RangeCheckpointSnapshot {
+            durable_bytes: 32,
+            manifests: std::collections::BTreeMap::new(),
+        };
+
+        assert_eq!(
+            Err("quiesced range extents were below the typed progress lower bound"),
+            classify_quiesced_checkpoint(Some(&status), &snapshot)
+        );
+    }
+
+    #[test]
+    fn completed_session_metadata_rejects_upstream_urls_and_headers() {
+        assert!(!persisted_session_contains_upstream_material(
+            &serde_json::json!({
+                "variant": {"video": {"request": {"url": "", "backup_urls": [], "headers": []}}},
+                "alternate_variants": []
+            })
+        ));
+        assert!(persisted_session_contains_upstream_material(
+            &serde_json::json!({
+                "variant": {"video": {"request": {"url": "https://cdn.example.invalid/media"}}}
+            })
+        ));
+        assert!(persisted_session_contains_upstream_material(
+            &serde_json::json!({
+                "alternate_variants": [{"audio": {"request": {"headers": [{"name": "Cookie"}]}}}]
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ready_file_is_private_atomic_payload_and_removed_after_listener_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut server = LiveTestServer::start().await;
+        let path = server
+            .temp_root_path()
+            .join(".codex-tmp/fill-pr4-live/ready.json");
+        let payload = br#"{"phase":"cache-only-ready","uri":"http://127.0.0.1:42000/hls/item/master.m3u8","case_id":"ordinary-video-playlist","task_id":"task-a","total_bytes":1234,"expires_in_seconds":300}"#.to_vec();
+        server
+            .publish_ready_file(path.clone(), payload.clone())
+            .expect("ready file should publish");
+        assert_eq!(
+            payload,
+            fs::read(&path).expect("ready file should be readable")
+        );
+        assert_eq!(
+            0o600,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777
+        );
+
+        server
+            .shutdown(&LiveTaskTracker::default())
+            .await
+            .expect("server should stop and remove ready file");
+        assert!(
+            !path.exists(),
+            "ready file should not outlive listener shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_root_restart_preserves_task_identity_and_task_state() {
+        let mut server = LiveTestServer::start().await;
+        let root = server.temp_root_path().to_owned();
+        let task = server
+            .state
+            .tasks
+            .create_bilibili_task("BV1restartIdentity", None)
+            .expect("restart task should be persisted");
+
+        server
+            .restart_preserving_state()
+            .await
+            .expect("idle server should restart on the same root");
+
+        assert_eq!(root, server.temp_root_path());
+        assert_eq!(
+            task.id,
+            server
+                .state
+                .tasks
+                .get_task(&task.id)
+                .expect("persisted task should survive restart")
+                .id
+        );
+        server
+            .shutdown(&LiveTaskTracker::default())
+            .await
+            .expect("restarted server should shut down cleanly");
     }
 
     #[test]
@@ -2372,6 +4295,37 @@ mod tests {
         assert_eq!(Some(1), playlists.next_index());
         assert_eq!(Some(0), playlists.next_index());
         assert_eq!(Some(1), playlists.next_index());
+    }
+
+    #[test]
+    fn sustained_probe_identifies_first_primary_audio_child_and_skips_init() {
+        let master_url = Url::parse("http://127.0.0.1:41000/hls/task/master.m3u8").unwrap();
+        let master = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-0\",NAME=\"Default\",URI=\"segments/audio-primary.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-1\",NAME=\"Variant 1\",URI=\"segments/audio-alternate.m3u8\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"audio-0\"\n",
+            "segments/video-primary.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000,AUDIO=\"audio-1\"\n",
+            "segments/video-alternate.m3u8\n",
+        );
+        let roles = sustained_child_playlist_roles(master, &master_url);
+        let children = playlist_referenced_uris(master)
+            .into_iter()
+            .filter_map(|uri| master_url.join(&uri).ok())
+            .collect::<Vec<_>>();
+        let first = children.first().unwrap();
+        assert_eq!(Some(&"audio_primary".to_owned()), roles.get(first.as_str()));
+
+        let resources = hls_probe_resources(
+            "#EXTM3U\n#EXT-X-MAP:URI=\"segments/audio.m4s\",BYTERANGE=\"16@0\"\n#EXT-X-BYTERANGE:64@16\n#EXTINF:1.0,\nsegments/audio.m4s\n",
+        )
+        .unwrap();
+        let request =
+            next_sustained_probe_request(&resources, &mut SustainedProbeCursor::default()).unwrap();
+        assert_eq!("segments/audio.m4s", request.uri);
+        assert_eq!(16, request.range.start);
+        assert_eq!(79, request.range.end);
     }
 
     #[test]
@@ -2638,6 +4592,7 @@ mod tests {
             include_authenticated: true,
             include_collection_list: false,
             sustained_duration: None,
+            ..Default::default()
         };
         let case = test_case("authenticated-history", true, false);
 
@@ -2651,6 +4606,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: false,
             sustained_duration: None,
+            ..Default::default()
         };
         let case = test_case("authenticated-history", true, false);
 
@@ -2676,6 +4632,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: true,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("space-collection", false, false);
         case.requires_collection_list_validation = true;
@@ -2690,6 +4647,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: true,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("space-videos", true, false);
         case.requires_collection_list_validation = true;
@@ -2707,6 +4665,7 @@ mod tests {
             include_authenticated: true,
             include_collection_list: true,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("space-videos", true, false);
         case.requires_collection_list_validation = true;
@@ -2721,6 +4680,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: true,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("favorite-list", false, false);
         case.url_env = Some("BILIBILI_LIVE_E2E_TEST_SOURCE_OVERRIDE_DO_NOT_SET".to_owned());
@@ -2740,6 +4700,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: false,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("favorite-list", false, false);
         case.requires_collection_list_validation = true;
@@ -2755,6 +4716,7 @@ mod tests {
             include_authenticated: false,
             include_collection_list: false,
             sustained_duration: None,
+            ..Default::default()
         };
         let mut case = test_case("space-collection", false, false);
         case.requires_collection_list_validation = true;

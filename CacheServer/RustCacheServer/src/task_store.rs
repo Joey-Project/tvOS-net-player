@@ -27,9 +27,10 @@ use crate::generated::tvos_net_player::v1::{
     BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity, BilibiliDownloadMode,
     BilibiliDownloadOptions, BilibiliPlaybackOptions, BilibiliPlaybackSession,
     BilibiliPlaybackVariant, BilibiliRequestContext, BilibiliTaskResultDetails,
-    BilibiliTaskResultItem, BilibiliTaskSelection, CacheResourceRef, LanTranscodingPlan,
-    PlaybackSource, Task, TaskArtifact, TaskKind, TaskProblem, TaskResult, TaskResultProgress,
-    TaskResultProviderDetails, TaskResultSubject, TaskState, task_result_provider_details,
+    BilibiliTaskResultItem, BilibiliTaskSelection, CacheResourceRef, HlsCacheFillStatus,
+    LanTranscodingPlan, PlaybackSource, Task, TaskArtifact, TaskKind, TaskProblem, TaskResult,
+    TaskResultProgress, TaskResultProviderDetails, TaskResultSubject, TaskState,
+    task_result_provider_details,
 };
 use crate::library::decode_item_id;
 use crate::playback_policy::PlaybackPolicy;
@@ -50,7 +51,8 @@ const FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION: u32 = 5;
 const TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION: u32 = 7;
 const FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION: u32 = 8;
-const TASK_STATE_SCHEMA_VERSION: u32 = FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION;
+const HLS_CACHE_FILL_STATUS_TASK_STATE_SCHEMA_VERSION: u32 = 9;
+const TASK_STATE_SCHEMA_VERSION: u32 = HLS_CACHE_FILL_STATUS_TASK_STATE_SCHEMA_VERSION;
 const MAX_TASK_STATE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PERSISTED_TASKS: usize = 10_000;
 pub(crate) const MAX_PERSISTED_FILE_CLEANUP_INTENTS: usize = 100_000;
@@ -473,6 +475,7 @@ impl TaskStateStore {
                 | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
                 | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
                 | FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION
+                | FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION
                 | TASK_STATE_SCHEMA_VERSION
         ) {
             return Err(io::Error::new(
@@ -1482,6 +1485,8 @@ struct PersistedTaskFile {
     playback_source: Option<PersistedPlaybackSource>,
     #[serde(default)]
     playback_session: Option<PersistedBilibiliPlaybackSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hls_cache_fill_status: Option<PersistedHlsCacheFillStatus>,
     #[serde(default)]
     bilibili_options: Option<PersistedBilibiliDownloadOptions>,
     #[serde(default)]
@@ -1595,6 +1600,9 @@ impl From<PersistedTaskRecord> for PersistedTaskFile {
             playback_session: task
                 .playback_session
                 .map(PersistedBilibiliPlaybackSession::from),
+            hls_cache_fill_status: task
+                .hls_cache_fill_status
+                .map(PersistedHlsCacheFillStatus::from),
             bilibili_selection: task
                 .bilibili_selection
                 .map(PersistedBilibiliTaskSelection::from),
@@ -1660,6 +1668,7 @@ impl PersistedTaskFile {
             finished_at: self.finished_at.map(Timestamp::from),
             playback_source: self.playback_source.map(PlaybackSource::from),
             playback_session: self.playback_session.map(BilibiliPlaybackSession::from),
+            hls_cache_fill_status: self.hls_cache_fill_status.map(HlsCacheFillStatus::from),
             bilibili_selection: self.bilibili_selection.map(BilibiliTaskSelection::from),
             result_items: self
                 .result_items
@@ -1710,6 +1719,7 @@ impl PersistedTaskFile {
             | FILE_CLEANUP_TASK_STATE_SCHEMA_VERSION
             | TASK_RESOURCE_BODY_IDENTITY_STATE_SCHEMA_VERSION
             | FILE_CLEANUP_ROOT_IDENTITY_STATE_SCHEMA_VERSION
+            | FILE_CLEANUP_OWNER_BINDING_STATE_SCHEMA_VERSION
             | TASK_STATE_SCHEMA_VERSION => self
                 .output
                 .ok_or_else(|| {
@@ -1974,6 +1984,8 @@ struct PersistedBilibiliTaskResultDetails {
     identity: Option<PersistedProtoBilibiliContentIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playback_session: Option<PersistedBilibiliPlaybackSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hls_cache_fill_status: Option<PersistedHlsCacheFillStatus>,
 }
 
 impl From<BilibiliTaskResultDetails> for PersistedBilibiliTaskResultDetails {
@@ -1985,6 +1997,9 @@ impl From<BilibiliTaskResultDetails> for PersistedBilibiliTaskResultDetails {
             playback_session: details
                 .playback_session
                 .map(PersistedBilibiliPlaybackSession::from),
+            hls_cache_fill_status: details
+                .hls_cache_fill_status
+                .map(PersistedHlsCacheFillStatus::from),
         }
     }
 }
@@ -1994,6 +2009,7 @@ impl From<PersistedBilibiliTaskResultDetails> for BilibiliTaskResultDetails {
         Self {
             identity: details.identity.map(ProtoBilibiliContentIdentity::from),
             playback_session: details.playback_session.map(BilibiliPlaybackSession::from),
+            hls_cache_fill_status: details.hls_cache_fill_status.map(HlsCacheFillStatus::from),
         }
     }
 }
@@ -2554,6 +2570,8 @@ struct PersistedBilibiliTaskResultItem {
     playback_session: Option<PersistedBilibiliPlaybackSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<PersistedProtoBilibiliContentIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hls_cache_fill_status: Option<PersistedHlsCacheFillStatus>,
 }
 
 impl From<BilibiliTaskResultItem> for PersistedBilibiliTaskResultItem {
@@ -2576,6 +2594,9 @@ impl From<BilibiliTaskResultItem> for PersistedBilibiliTaskResultItem {
             identity: item
                 .identity
                 .map(PersistedProtoBilibiliContentIdentity::from),
+            hls_cache_fill_status: item
+                .hls_cache_fill_status
+                .map(PersistedHlsCacheFillStatus::from),
         }
     }
 }
@@ -2596,6 +2617,7 @@ impl From<PersistedBilibiliTaskResultItem> for BilibiliTaskResultItem {
             playback_source: item.playback_source.map(PlaybackSource::from),
             playback_session: item.playback_session.map(BilibiliPlaybackSession::from),
             identity: item.identity.map(ProtoBilibiliContentIdentity::from),
+            hls_cache_fill_status: item.hls_cache_fill_status.map(HlsCacheFillStatus::from),
         }
     }
 }
@@ -2604,6 +2626,45 @@ impl From<PersistedBilibiliTaskResultItem> for BilibiliTaskResultItem {
 struct PersistedTimestamp {
     seconds: i64,
     nanos: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHlsCacheFillStatus {
+    state: i32,
+    failure_kind: i32,
+    completed_bytes: u64,
+    total_bytes: u64,
+    total_bytes_known: bool,
+    representation_id: String,
+    message: String,
+}
+
+impl From<HlsCacheFillStatus> for PersistedHlsCacheFillStatus {
+    fn from(status: HlsCacheFillStatus) -> Self {
+        Self {
+            state: status.state,
+            failure_kind: status.failure_kind,
+            completed_bytes: status.completed_bytes,
+            total_bytes: status.total_bytes,
+            total_bytes_known: status.total_bytes_known,
+            representation_id: status.representation_id,
+            message: status.message,
+        }
+    }
+}
+
+impl From<PersistedHlsCacheFillStatus> for HlsCacheFillStatus {
+    fn from(status: PersistedHlsCacheFillStatus) -> Self {
+        Self {
+            state: status.state,
+            failure_kind: status.failure_kind,
+            completed_bytes: status.completed_bytes,
+            total_bytes: status.total_bytes,
+            total_bytes_known: status.total_bytes_known,
+            representation_id: status.representation_id,
+            message: status.message,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4343,6 +4404,7 @@ mod tests {
                                 effective_policy: Some(PlaybackPolicy::default().to_proto()),
                                 ..Default::default()
                             }),
+                            hls_cache_fill_status: None,
                         },
                     )),
                 }),
@@ -4638,6 +4700,7 @@ mod tests {
                 cid: 2_001,
                 epid: 0,
             }),
+            hls_cache_fill_status: None,
         };
         let task = Task {
             id: "bilibili-v2-task".to_owned(),
@@ -4806,6 +4869,7 @@ mod tests {
                 cid: 2_001,
                 epid: 0,
             }),
+            hls_cache_fill_status: None,
             ..Default::default()
         };
         let task = Task {
@@ -4985,6 +5049,7 @@ mod tests {
                 cid: 2_000 + u64::from(index),
                 epid: 0,
             }),
+            hls_cache_fill_status: None,
         };
         let task = Task {
             id: "bilibili-v2-task".to_owned(),
@@ -5134,6 +5199,7 @@ mod tests {
             playback_source: Some(playback_source.clone()),
             playback_session: Some(playback_session.clone()),
             identity: None,
+            hls_cache_fill_status: None,
         };
         let task = Task {
             id: "bilibili-playback-task".to_owned(),
@@ -5154,6 +5220,7 @@ mod tests {
             finished_at: None,
             playback_source: Some(playback_source.clone()),
             playback_session: Some(playback_session.clone()),
+            hls_cache_fill_status: None,
             bilibili_selection: Some(selection.clone()),
             result_items: vec![result_item.clone()],
             output_summary: None,

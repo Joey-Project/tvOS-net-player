@@ -241,6 +241,14 @@ impl CdnHistory {
         self.rank_request_at(request, now_seconds())
     }
 
+    pub(crate) fn rank_request_for_range(
+        &self,
+        request: &BilibiliMediaRequest,
+        chunk_index: u64,
+    ) -> Vec<String> {
+        self.rank_request_for_range_at(request, chunk_index, now_seconds())
+    }
+
     pub(crate) fn record_request(
         &self,
         request: &BilibiliMediaRequest,
@@ -357,6 +365,67 @@ impl CdnHistory {
             .tap_sort();
         ranked.extend(unchanged_tail);
         ranked
+    }
+
+    fn rank_request_for_range_at(
+        &self,
+        request: &BilibiliMediaRequest,
+        chunk_index: u64,
+        now: u64,
+    ) -> Vec<String> {
+        let ranked = self.rank_request_at(request, now);
+        let digest = representation_digest(request);
+        let mut state = self.lock_state();
+        prune(&mut state, now);
+        let mut origins = HashSet::new();
+        let mut selected = Vec::new();
+        for (index, url) in ranked.iter().take(MAX_CANDIDATES).enumerate() {
+            let Some(origin) = canonical_origin(url) else {
+                continue;
+            };
+            let host = state.hosts.get(&origin);
+            let representation = digest.as_ref().and_then(|digest| {
+                state
+                    .representations
+                    .get(&representation_map_key(digest, &origin))
+            });
+            let blocked = host
+                .and_then(|entry| entry.cooldown_until)
+                .is_some_and(|until| now < until)
+                || representation
+                    .and_then(|entry| entry.cooldown_until)
+                    .is_some_and(|until| now < until)
+                || representation
+                    .and_then(|entry| entry.quarantined_until)
+                    .is_some_and(|until| now < until)
+                || host.is_some_and(|entry| entry.range_supported == Some(false))
+                || representation.is_some_and(|entry| entry.range_supported == Some(false));
+            if !blocked && origins.insert(origin) {
+                selected.push(index);
+                if selected.len() == MAX_ORIGINS_PER_REPRESENTATION {
+                    break;
+                }
+            }
+        }
+        drop(state);
+        if selected.len() < 2 {
+            return ranked;
+        }
+
+        // This is bounded exploration, not identity proof; the range store
+        // must validate compatibility before publishing any cross-origin bytes.
+        let rotation = (chunk_index % selected.len() as u64) as usize;
+        let mut ordered = Vec::with_capacity(ranked.len());
+        for offset in 0..selected.len() {
+            ordered.push(ranked[selected[(rotation + offset) % selected.len()]].clone());
+        }
+        ordered.extend(
+            ranked
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, url)| (!selected.contains(&index)).then_some(url)),
+        );
+        ordered
     }
 
     fn record_request_at(
@@ -1043,6 +1112,116 @@ mod tests {
             Some("https://[::1]:8443".to_owned()),
             canonical_origin("https://[::1]:8443/media")
         );
+    }
+
+    #[test]
+    fn range_fanout_rotates_distinct_origins_and_keeps_every_fallback() {
+        let history = CdnHistory::default();
+        let first = "https://a.example/video";
+        let same_origin = "https://a.example/backup";
+        let second = "https://b.example/video";
+        let third = "https://c.example/video";
+        let request = make_request(first, &[same_origin, second, third]);
+        assert_eq!(
+            history.rank_request_for_range_at(&request, 0, 100),
+            vec![first, second, third, same_origin]
+        );
+        assert_eq!(
+            history.rank_request_for_range_at(&request, 1, 100),
+            vec![second, third, first, same_origin]
+        );
+        assert_eq!(
+            history.rank_request_for_range_at(&request, 3, 100),
+            vec![first, second, third, same_origin]
+        );
+    }
+
+    #[test]
+    fn range_fanout_never_promotes_cooldown_quarantine_or_nonrange_origins() {
+        let history = CdnHistory::default();
+        let good = "https://good.example/video";
+        let alternative = "https://alternative.example/video";
+        let quarantined = "https://quarantined.example/video";
+        let cooling = "https://cooling.example/video";
+        let nonrange = "https://nonrange.example/video";
+        let request = make_request(good, &[quarantined, cooling, nonrange, alternative]);
+        record_at(
+            &history,
+            &request,
+            quarantined,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::IntegrityMismatch,
+            ),
+            100,
+        );
+        record_at(
+            &history,
+            &request,
+            cooling,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::Timeout,
+            ),
+            100,
+        );
+        record_at(
+            &history,
+            &request,
+            nonrange,
+            CdnObservation::playback_complete(
+                1024,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                Some(false),
+            ),
+            100,
+        );
+        let ranked = history.rank_request_for_range_at(&request, 1, 101);
+        assert_eq!(&ranked[..2], &[alternative, good]);
+        assert_eq!(ranked.len(), 5);
+        assert!(ranked[2..].contains(&quarantined.to_owned()));
+        assert!(ranked[2..].contains(&cooling.to_owned()));
+        assert!(ranked[2..].contains(&nonrange.to_owned()));
+    }
+
+    #[test]
+    fn range_fanout_keeps_representation_quarantine_scoped_and_large_tail_unchanged() {
+        let history = CdnHistory::default();
+        let first = "https://first.example/video";
+        let second = "https://second.example:8443/video";
+        let request = make_request(first, &[second]);
+        record_at(
+            &history,
+            &request,
+            second,
+            CdnObservation::failure(
+                CdnObservationSource::Playback,
+                CdnObservationOutcome::IntegrityMismatch,
+            ),
+            100,
+        );
+        assert_eq!(
+            history.rank_request_for_range_at(&request, 1, 101)[0],
+            first
+        );
+        let mut unrelated = request.clone();
+        unrelated.stream_id = Some(64_000);
+        unrelated.cache_key.stream_id = Some(64_000);
+        assert_eq!(
+            history.rank_request_for_range_at(&unrelated, 1, 101)[0],
+            second
+        );
+
+        let backups = (0..MAX_CANDIDATES + 4)
+            .map(|index| format!("https://edge-{index}.example/video"))
+            .collect::<Vec<_>>();
+        let mut large = make_request(first, &[]);
+        large.backup_urls = backups;
+        let ordinary = history.rank_request_at(&large, 101);
+        let fanout = history.rank_request_for_range_at(&large, u64::MAX, 101);
+        assert_eq!(&fanout[MAX_CANDIDATES..], &ordinary[MAX_CANDIDATES..]);
+        assert_eq!(fanout.len(), ordinary.len());
     }
 
     #[test]

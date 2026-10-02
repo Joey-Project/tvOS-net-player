@@ -1491,8 +1491,69 @@ extension BilibiliTaskResultItem {
             libraryItemID: proto.libraryItemID,
             playbackSource: proto.hasPlaybackSource ? CachePlaybackSource(proto.playbackSource) : nil,
             playbackSession: proto.hasPlaybackSession ? CacheBilibiliPlaybackSession(proto.playbackSession) : nil,
-            identity: proto.hasIdentity ? BilibiliContentIdentity(proto.identity) : nil
+            identity: proto.hasIdentity ? BilibiliContentIdentity(proto.identity) : nil,
+            hlsCacheFillStatus: proto.hasHlsCacheFillStatus
+                ? HlsCacheFillStatus(proto.hlsCacheFillStatus)
+                : nil
         )
+    }
+}
+
+extension HlsCacheFillStatus {
+    init(_ proto: TvosNetPlayer_V1_HlsCacheFillStatus) {
+        self.init(
+            state: HlsCacheFillState(proto.state),
+            failureKind: HlsCacheFillFailureKind(proto.failureKind),
+            completedBytes: proto.completedBytes,
+            totalBytes: proto.totalBytes,
+            totalBytesKnown: proto.totalBytesKnown,
+            representationID: proto.representationID,
+            message: proto.message
+        )
+    }
+}
+
+extension HlsCacheFillState {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsCacheFillState) {
+        switch proto {
+        case .unspecified, .UNRECOGNIZED(_):
+            self = .unspecified
+        case .queued:
+            self = .queued
+        case .filling:
+            self = .filling
+        case .preempted:
+            self = .preempted
+        case .retrying:
+            self = .retrying
+        case .blockedQuota:
+            self = .blockedQuota
+        case .completed:
+            self = .completed
+        case .sourceUnavailable:
+            self = .sourceUnavailable
+        case .failed:
+            self = .failed
+        case .cancelled:
+            self = .cancelled
+        }
+    }
+}
+
+extension HlsCacheFillFailureKind {
+    fileprivate init(_ proto: TvosNetPlayer_V1_HlsCacheFillFailureKind) {
+        switch proto {
+        case .unspecified, .UNRECOGNIZED(_):
+            self = .unspecified
+        case .safety:
+            self = .safety
+        case .persistence:
+            self = .persistence
+        case .network:
+            self = .network
+        case .sourceUnavailable:
+            self = .sourceUnavailable
+        }
     }
 }
 
@@ -1584,6 +1645,9 @@ extension BilibiliTaskResultDetails {
             identity: proto.hasIdentity ? BilibiliContentIdentity(proto.identity) : nil,
             playbackSession: proto.hasPlaybackSession
                 ? CacheBilibiliPlaybackSession(proto.playbackSession)
+                : nil,
+            hlsCacheFillStatus: proto.hasHlsCacheFillStatus
+                ? HlsCacheFillStatus(proto.hlsCacheFillStatus)
                 : nil
         )
     }
@@ -1663,6 +1727,9 @@ extension CacheTask {
             resultItems: proto.resultItems.map(BilibiliTaskResultItem.init),
             outputSummary: proto.hasOutputSummary
                 ? CacheTaskOutputSummary(proto.outputSummary)
+                : nil,
+            hlsCacheFillStatus: proto.hasHlsCacheFillStatus
+                ? HlsCacheFillStatus(proto.hlsCacheFillStatus)
                 : nil
         )
     }

@@ -36,6 +36,7 @@ just test-tvos
 just test
 just test-cache-server
 just test-bilibili-live
+just test-lan-playback
 ```
 
 `just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict`、`cargo fmt --check` 和 `cargo clippy -D warnings`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `cargo fmt` 格式化 Rust cache server 源码。
@@ -80,6 +81,24 @@ just test-bilibili-live
 ```
 
 当 credential 文件是多 profile store 且目标凭证不是 default profile 时，使用 `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` 选择 server 侧 profile；该值只是 profile ID，测试不会把 cookie/access key 传给客户端或写入日志。
+
+The optional full-fill mode uses the first candidate of the canonical ordinary-video case, a bounded completion wait, same-root server restarts, and a 300-second completed-cache replay. It is separate from the online readability smoke and remains outside default CI:
+
+```bash
+BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist \
+BILIBILI_LIVE_E2E_FULL_FILL=1 \
+BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300 \
+just test-bilibili-live
+```
+
+`just test-lan-playback` compiles a native macOS `AVPlayer` probe with strict Swift 6 concurrency checks and runs credential-free argument self-tests by default. Supplying a clean LAN playback URL enables actual video-frame decoding, pause/resume, forward/backward seeks, and 1.25x playback. The URL must have no userinfo, query, or fragment. Hostname validation is an input restriction, not DNS pinning. The native deadline is cooperative; use an outer process timeout for a hard live-run bound.
+
+```bash
+LAN_PLAYBACK_URL='http://127.0.0.1:8080/hls/SESSION_ID/master.m3u8' \
+LAN_PLAYBACK_DURATION_SECONDS=60 \
+LAN_PLAYBACK_DEADLINE_SECONDS=120 \
+just test-lan-playback
+```
 
 ## LAN Cache Server
 
@@ -216,6 +235,7 @@ scripts/build-for-testing.sh
 scripts/test-tvos-simulator.sh
 scripts/test.sh
 scripts/test-macos.sh
+bash scripts/test-lan-playback.sh
 scripts/test-cache-server.sh
 ```
 

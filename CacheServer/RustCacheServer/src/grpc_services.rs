@@ -60,7 +60,8 @@ use crate::{
         GetBilibiliCredentialStatusRequest, GetBilibiliLoginSessionRequest,
         GetHlsCacheStatusRequest, GetLibraryItemRequest, GetPlaybackSourceRequest,
         GetResolverSettingsRequest, GetServerInfoRequest, GetTaskRequest, HealthState,
-        HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary, HlsCacheStatus,
+        HealthStatus, HlsCacheEvictionSummary as ProtoHlsCacheEvictionSummary,
+        HlsCacheFillFailureKind, HlsCacheFillState, HlsCacheFillStatus, HlsCacheStatus,
         HlsPlaybackActivityState as ProtoHlsPlaybackActivityState, HlsPlaybackProgressStatus,
         HlsWeakNetworkState, HlsWeakNetworkStatus, LanTranscodingPlan, LanTranscodingPlanState,
         LanTranscodingRuntimeState as ProtoLanTranscodingRuntimeState, LanTranscodingStatus,
@@ -115,7 +116,9 @@ use uuid::Uuid;
 const PLAYBACK_PLANNING_INTERRUPTED_MESSAGE: &str =
     "Playback planning was interrupted before it completed.";
 const HLS_CACHE_PROGRESS_PUBLISH_MIN_BYTES: u64 = 1024 * 1024;
+const HLS_CACHE_STATUS_PROGRESS_PUBLISH_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const HLS_CACHE_PERSISTENCE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const HLS_CACHE_NETWORK_RETRY_DELAY: Duration = Duration::from_secs(5);
 const BILIBILI_TASK_SELECTION_MODE_UNSPECIFIED: i32 = 0;
 const BILIBILI_TASK_SELECTION_MODE_DEFAULT: i32 = 1;
 const BILIBILI_TASK_SELECTION_MODE_CURRENT: i32 = 2;
@@ -2345,7 +2348,17 @@ impl TaskService for TaskGrpcService {
             self.state
                 .cancel_hls_fill_work_for_task_and_wait(&task.id)
                 .await;
-            remove_task_hls_sessions(&self.state, &task.id, &cancellation.hls_session_ids);
+            if let Err(error) = self
+                .state
+                .remove_task_hls_sessions_after_cancel(&task.id, &cancellation.hls_session_ids)
+                .await
+            {
+                eprintln!(
+                    "Failed to remove cancelled HLS cache session for task {}: {}",
+                    task.id,
+                    self.state.error_detail_for_log(&error)
+                );
+            }
         }
         let task = self.state.tasks.get_task(&task.id)?;
         Ok(Response::new(task_for_client(
@@ -2854,6 +2867,14 @@ pub(crate) async fn retry_pending_task_persistence(
             TaskPersistenceRecoveryOutcome::PermanentFailure
         }
     }
+}
+
+async fn ensure_hls_fill_persistence_ready(state: &AppState) -> TaskPersistenceRecoveryOutcome {
+    if !state.tasks.persistence_recovery_supported() || state.tasks.persistence_available() {
+        return TaskPersistenceRecoveryOutcome::Durable;
+    }
+
+    retry_pending_task_persistence(&state.tasks, "HLS cache fill").await
 }
 
 async fn complete_playback_planning_terminal(
@@ -4139,6 +4160,7 @@ fn bilibili_result_item(
         playback_source: None,
         playback_session: None,
         identity: Some(proto_bilibili_content_identity(&candidate.identity)),
+        hls_cache_fill_status: None,
     }
 }
 
@@ -4216,17 +4238,142 @@ pub(crate) async fn run_hls_cache_finalization(
     .await;
 }
 
+pub(crate) fn hls_cache_fill_status(
+    session: &HlsPlaybackSession,
+    state: HlsCacheFillState,
+    failure_kind: HlsCacheFillFailureKind,
+    completed_bytes: u64,
+    total_bytes: Option<u64>,
+    message: impl Into<String>,
+) -> HlsCacheFillStatus {
+    HlsCacheFillStatus {
+        state: state.into(),
+        failure_kind: failure_kind.into(),
+        completed_bytes,
+        total_bytes: total_bytes.unwrap_or_default(),
+        total_bytes_known: total_bytes.is_some(),
+        representation_id: session.variant.id.clone(),
+        message: message.into(),
+    }
+}
+
 pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
     let _worker_guard = state.hls_fill_scheduler.worker_guard();
     while let Some(job) = state.hls_fill_scheduler.next_job_until_shutdown().await {
-        let outcome = run_hls_cache_finalization_inner(
-            state.clone(),
-            job.task_id.clone(),
-            job.session.clone(),
-            job.failure_mode,
-            job.token.clone(),
-        )
-        .await;
+        let persistence_recovery = ensure_hls_fill_persistence_ready(&state).await;
+        let (can_fill, rejected_outcome) = match persistence_recovery {
+            TaskPersistenceRecoveryOutcome::Durable => {
+                let filling_status = hls_cache_fill_status(
+                    &job.session,
+                    HlsCacheFillState::Filling,
+                    HlsCacheFillFailureKind::Unspecified,
+                    0,
+                    hls_session_declared_size_bytes(&job.session),
+                    "Filling the selected video and audio for offline playback.",
+                );
+                match state.tasks.update_hls_cache_fill_status(
+                    &job.task_id,
+                    &job.session.id,
+                    filling_status,
+                ) {
+                    Ok(Some(_)) => (true, HlsCacheFinalizationOutcome::Finished),
+                    Ok(None) => (false, HlsCacheFinalizationOutcome::Finished),
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        (false, HlsCacheFinalizationOutcome::PersistencePending)
+                    }
+                    Err(_) => (false, HlsCacheFinalizationOutcome::Finished),
+                }
+            }
+            TaskPersistenceRecoveryOutcome::RetryableFailure => {
+                (false, HlsCacheFinalizationOutcome::PersistencePending)
+            }
+            TaskPersistenceRecoveryOutcome::PermanentFailure => {
+                (false, HlsCacheFinalizationOutcome::Finished)
+            }
+        };
+        let mut outcome = if can_fill {
+            run_hls_cache_finalization_inner(
+                state.clone(),
+                job.task_id.clone(),
+                job.session.clone(),
+                job.failure_mode,
+                job.token.clone(),
+            )
+            .await
+        } else {
+            rejected_outcome
+        };
+        let status_update = match outcome {
+            HlsCacheFinalizationOutcome::Preempted => Some((
+                HlsCacheFillState::Preempted,
+                HlsCacheFillFailureKind::Unspecified,
+                "Offline fill paused; verified partial cache data is retained.",
+            )),
+            HlsCacheFinalizationOutcome::PersistencePending => Some((
+                HlsCacheFillState::Retrying,
+                HlsCacheFillFailureKind::Persistence,
+                "Offline fill will retry after durable task-state recovery.",
+            )),
+            HlsCacheFinalizationOutcome::QuotaPending => Some((
+                HlsCacheFillState::BlockedQuota,
+                HlsCacheFillFailureKind::Unspecified,
+                "Offline fill is waiting for cache quota.",
+            )),
+            HlsCacheFinalizationOutcome::NetworkRetry => Some((
+                HlsCacheFillState::Retrying,
+                HlsCacheFillFailureKind::Network,
+                "Offline fill encountered a network error and will retry.",
+            )),
+            HlsCacheFinalizationOutcome::SourceUnavailable => Some((
+                HlsCacheFillState::SourceUnavailable,
+                HlsCacheFillFailureKind::SourceUnavailable,
+                "The current source is unavailable; verified partial cache data is retained.",
+            )),
+            HlsCacheFinalizationOutcome::SafetyFailure => Some((
+                HlsCacheFillState::Failed,
+                HlsCacheFillFailureKind::Safety,
+                "Offline fill stopped because the source response failed validation.",
+            )),
+            HlsCacheFinalizationOutcome::Finished => None,
+        };
+        if let Some((fill_state, failure_kind, fill_message)) = status_update {
+            let current = state
+                .tasks
+                .playback_task_for_any_hls_session(&job.session.id)
+                .and_then(|task| {
+                    task.result_items
+                        .iter()
+                        .find(|item| {
+                            item.playback_session
+                                .as_ref()
+                                .is_some_and(|session| session.id == job.session.id)
+                        })
+                        .and_then(|item| item.hls_cache_fill_status.clone())
+                        .or(task.hls_cache_fill_status)
+                })
+                .unwrap_or_default();
+            if state
+                .tasks
+                .update_hls_cache_fill_status(
+                    &job.task_id,
+                    &job.session.id,
+                    hls_cache_fill_status(
+                        &job.session,
+                        fill_state,
+                        failure_kind,
+                        current.completed_bytes,
+                        current.total_bytes_known.then_some(current.total_bytes),
+                        fill_message,
+                    ),
+                )
+                .is_err()
+            {
+                outcome = HlsCacheFinalizationOutcome::PersistencePending;
+            }
+        } else {
+            state.hls_fill_scheduler.finish_current(&job, false);
+            continue;
+        }
         let mut should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
         let degraded_failure_persistence_pending = outcome
             == HlsCacheFinalizationOutcome::PersistencePending
@@ -4243,6 +4390,9 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
                 }
                 (HlsCacheFinalizationOutcome::QuotaPending, _) => {
                     "Playable online; offline cache fill is waiting for quota enforcement to recover."
+                }
+                (HlsCacheFinalizationOutcome::NetworkRetry, _) => {
+                    "Playable online; offline cache fill will retry after a network error."
                 }
                 (_, crate::hls_fill_scheduler::HlsFillPriority::Foreground) => {
                     "Playable online; offline cache fill paused behind newer playback."
@@ -4265,9 +4415,15 @@ pub(crate) async fn run_hls_cache_fill_worker(state: AppState) {
             outcome,
             HlsCacheFinalizationOutcome::PersistencePending
                 | HlsCacheFinalizationOutcome::QuotaPending
+                | HlsCacheFinalizationOutcome::NetworkRetry
         ) && should_requeue
         {
-            sleep(HLS_CACHE_PERSISTENCE_RETRY_DELAY).await;
+            sleep(if outcome == HlsCacheFinalizationOutcome::NetworkRetry {
+                HLS_CACHE_NETWORK_RETRY_DELAY
+            } else {
+                HLS_CACHE_PERSISTENCE_RETRY_DELAY
+            })
+            .await;
             should_requeue = hls_cache_fill_should_requeue(&state, &job, outcome);
         }
         state
@@ -4282,6 +4438,9 @@ enum HlsCacheFinalizationOutcome {
     Preempted,
     PersistencePending,
     QuotaPending,
+    NetworkRetry,
+    SourceUnavailable,
+    SafetyFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4303,10 +4462,13 @@ fn hls_cache_fill_should_requeue(
             publication == HlsSessionPublicationState::Published
         }
         HlsCacheFinalizationOutcome::PersistencePending
-        | HlsCacheFinalizationOutcome::QuotaPending => {
+        | HlsCacheFinalizationOutcome::QuotaPending
+        | HlsCacheFinalizationOutcome::NetworkRetry => {
             publication != HlsSessionPublicationState::Absent
         }
-        HlsCacheFinalizationOutcome::Finished => false,
+        HlsCacheFinalizationOutcome::Finished
+        | HlsCacheFinalizationOutcome::SourceUnavailable
+        | HlsCacheFinalizationOutcome::SafetyFailure => false,
     }
 }
 
@@ -4344,6 +4506,15 @@ async fn run_hls_cache_finalization_inner(
     failure_mode: HlsCacheFinalizationFailureMode,
     preemption: HlsFillPreemptionToken,
 ) -> HlsCacheFinalizationOutcome {
+    match ensure_hls_fill_persistence_ready(&state).await {
+        TaskPersistenceRecoveryOutcome::Durable => {}
+        TaskPersistenceRecoveryOutcome::RetryableFailure => {
+            return HlsCacheFinalizationOutcome::PersistencePending;
+        }
+        TaskPersistenceRecoveryOutcome::PermanentFailure => {
+            return HlsCacheFinalizationOutcome::Finished;
+        }
+    }
     if !state.supports_completed_hls_cache_playback() {
         return HlsCacheFinalizationOutcome::Finished;
     }
@@ -4454,7 +4625,6 @@ async fn run_hls_cache_finalization_inner(
             return HlsCacheFinalizationOutcome::Preempted;
         }
         Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
             return HlsCacheFinalizationOutcome::Finished;
         }
         Err(error) => {
@@ -4492,7 +4662,7 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
-    let progress = hls_cache_progress_reporter(&state, &task_id);
+    let progress = hls_cache_progress_reporter(&state, &task_id, &session);
     match state
         .hls_cache
         .cache_session_resources_completion_with_control(
@@ -4508,12 +4678,8 @@ async fn run_hls_cache_finalization_inner(
             return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session)
                 .await;
         }
-        Err(crate::hls_cache::HlsCacheError::Cancelled) => {
-            remove_task_hls_sessions(&state, &task_id, std::slice::from_ref(&session_id));
-        }
-        Err(crate::hls_cache::HlsCacheError::Preempted) => {
-            return HlsCacheFinalizationOutcome::Preempted;
-        }
+        Err(crate::hls_cache::HlsCacheError::Cancelled) => HlsCacheFinalizationOutcome::Finished,
+        Err(crate::hls_cache::HlsCacheError::Preempted) => HlsCacheFinalizationOutcome::Preempted,
         Err(error) => {
             if !state
                 .tasks
@@ -4521,64 +4687,125 @@ async fn run_hls_cache_finalization_inner(
             {
                 return HlsCacheFinalizationOutcome::Finished;
             }
-            match failure_mode {
-                HlsCacheFinalizationFailureMode::KeepPlayable => {
-                    eprintln!(
-                        "Failed to finalize HLS playback cache for task {task_id}; keeping runtime playback source available: {}",
-                        state.error_detail_for_log(&error)
-                    );
-                    if let Err(status) = state.tasks.fail_hls_cache_fill_for_playback_session(
-                        &task_id,
-                        &session_id,
-                        state.error_with_context_for_client(
-                            "Playable online; offline cache fill failed",
-                            &error,
-                        ),
-                    ) {
-                        if status.code() == tonic::Code::Unavailable {
-                            return HlsCacheFinalizationOutcome::PersistencePending;
-                        }
-                        eprintln!(
-                            "Failed to publish HLS cache fill failure for task {task_id} session {session_id}: {}",
-                            state.error_detail_for_log(&status)
-                        );
-                    }
+            let detail = state.error_with_context_for_client(
+                "Playable online; offline cache fill stopped",
+                &error,
+            );
+            eprintln!(
+                "Offline HLS cache fill stopped for task {task_id}; preserving its playback source: {}",
+                state.error_detail_for_log(&error)
+            );
+            let (outcome, fill_state, failure_kind) = match &error {
+                crate::hls_cache::HlsCacheError::Io(_) => (
+                    HlsCacheFinalizationOutcome::PersistencePending,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Persistence,
+                ),
+                crate::hls_cache::HlsCacheError::Network(_) => (
+                    HlsCacheFinalizationOutcome::NetworkRetry,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Network,
+                ),
+                crate::hls_cache::HlsCacheError::UpstreamStatus(status)
+                    if matches!(status.as_u16(), 401 | 403 | 404 | 410) =>
+                {
+                    (
+                        HlsCacheFinalizationOutcome::SourceUnavailable,
+                        HlsCacheFillState::SourceUnavailable,
+                        HlsCacheFillFailureKind::SourceUnavailable,
+                    )
                 }
-                HlsCacheFinalizationFailureMode::FailRestoredTask => {
-                    let failure = {
-                        let _deletion_guard = state.completed_hls_mutation_guard();
-                        let failure = state
-                            .tasks
-                            .fail_unrestorable_playback_session_after_cache_restore(
-                                &session_id,
-                                state.error_with_context_for_client(
-                                    "Failed to restore offline HLS cache after restart",
-                                    &error,
-                                ),
-                            );
-                        if failure.is_ok() {
-                            remove_task_hls_sessions(
-                                &state,
-                                &task_id,
-                                std::slice::from_ref(&session_id),
-                            );
-                        }
-                        failure
-                    };
-                    if let Err(status) = failure {
-                        if status.code() == tonic::Code::Unavailable {
-                            return HlsCacheFinalizationOutcome::PersistencePending;
-                        }
-                        eprintln!(
-                            "Failed to mark restored HLS playback task {task_id} failed after cache finalization error: {}",
-                            state.error_detail_for_log(&status)
-                        );
-                    }
+                crate::hls_cache::HlsCacheError::UpstreamStatus(_) => (
+                    HlsCacheFinalizationOutcome::NetworkRetry,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Network,
+                ),
+                crate::hls_cache::HlsCacheError::InvalidResource(_) => (
+                    HlsCacheFinalizationOutcome::SafetyFailure,
+                    HlsCacheFillState::Failed,
+                    HlsCacheFillFailureKind::Safety,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::Io(_),
+                ) => (
+                    HlsCacheFinalizationOutcome::PersistencePending,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Persistence,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::Network(_),
+                ) => (
+                    HlsCacheFinalizationOutcome::NetworkRetry,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Network,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::UpstreamStatus(status),
+                ) if matches!(status.as_u16(), 401 | 403 | 404 | 410) => (
+                    HlsCacheFinalizationOutcome::SourceUnavailable,
+                    HlsCacheFillState::SourceUnavailable,
+                    HlsCacheFillFailureKind::SourceUnavailable,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::UpstreamStatus(_)
+                    | crate::hls_range_cache::HlsRangeError::RangeUnsupported,
+                ) => (
+                    HlsCacheFinalizationOutcome::NetworkRetry,
+                    HlsCacheFillState::Retrying,
+                    HlsCacheFillFailureKind::Network,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::QuotaExceeded,
+                ) => (
+                    HlsCacheFinalizationOutcome::QuotaPending,
+                    HlsCacheFillState::BlockedQuota,
+                    HlsCacheFillFailureKind::Unspecified,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::InvalidResponse(_)
+                    | crate::hls_range_cache::HlsRangeError::IdentityChanged,
+                ) => (
+                    HlsCacheFinalizationOutcome::SafetyFailure,
+                    HlsCacheFillState::Failed,
+                    HlsCacheFillFailureKind::Safety,
+                ),
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::Cancelled
+                    | crate::hls_range_cache::HlsRangeError::SessionRemoving,
+                ) => return HlsCacheFinalizationOutcome::Finished,
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::Preempted,
+                ) => return HlsCacheFinalizationOutcome::Preempted,
+                crate::hls_cache::HlsCacheError::Cancelled => {
+                    return HlsCacheFinalizationOutcome::Finished;
+                }
+                crate::hls_cache::HlsCacheError::Preempted => {
+                    return HlsCacheFinalizationOutcome::Preempted;
+                }
+            };
+            if let Err(status) = state.tasks.update_hls_cache_fill_status(
+                &task_id,
+                &session_id,
+                hls_cache_fill_status(
+                    &session,
+                    fill_state,
+                    failure_kind,
+                    0,
+                    hls_session_declared_size_bytes(&session),
+                    &detail,
+                ),
+            ) {
+                eprintln!(
+                    "Failed to persist HLS cache fill status for task {task_id} session {session_id}: {}",
+                    state.error_detail_for_log(&status)
+                );
+                if status.code() == tonic::Code::Unavailable {
+                    return HlsCacheFinalizationOutcome::PersistencePending;
                 }
             }
+            outcome
         }
     }
-    HlsCacheFinalizationOutcome::Finished
 }
 
 async fn publish_completed_hls_cache(
@@ -4617,6 +4844,49 @@ fn publish_completed_hls_cache_blocking(
     let library_item_id = HlsCacheStore::completed_library_item_id(session_id);
     let finalized = {
         let _deletion_guard = state.completed_hls_mutation_guard();
+        let total_bytes = match state
+            .hls_cache
+            .completed_primary_resource_bytes(completed_session)
+        {
+            Ok(total_bytes) if total_bytes > 0 => total_bytes,
+            Ok(_) => {
+                eprintln!(
+                    "Completed HLS cache has no positive selected-resource byte total for task {task_id} session {session_id}."
+                );
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Could not verify completed HLS cache byte total for task {task_id} session {session_id}: {}",
+                    state.error_detail_for_log(&error)
+                );
+                return HlsCacheFinalizationOutcome::PersistencePending;
+            }
+        };
+        // The completed manifest and media are already durable at this point. Keep serving
+        // those local files even if task-state persistence needs a later retry.
+        state.register_completed_hls_runtime_session(completed_session);
+        if let Err(error) = state
+            .tasks
+            .update_hls_cache_fill_status_from_verified_completion(
+                task_id,
+                session_id,
+                hls_cache_fill_status(
+                    completed_session,
+                    HlsCacheFillState::Completed,
+                    HlsCacheFillFailureKind::Unspecified,
+                    total_bytes,
+                    Some(total_bytes),
+                    "Selected video and audio are complete for offline playback.",
+                ),
+            )
+        {
+            eprintln!(
+                "Failed to persist completed HLS cache status for task {task_id} session {session_id}: {}",
+                state.error_detail_for_log(&error)
+            );
+            return HlsCacheFinalizationOutcome::PersistencePending;
+        }
         match state
             .tasks
             .complete_playback_hls_session_cached_with_metadata(
@@ -4682,10 +4952,13 @@ fn hls_cache_prewarm_progress_message(
 fn hls_cache_progress_reporter(
     state: &AppState,
     task_id: &str,
+    session: &HlsPlaybackSession,
 ) -> impl Fn(HlsCacheFillProgress) + Send + Sync + 'static {
     let tasks = Arc::clone(&state.tasks);
     let task_id = task_id.to_owned();
+    let session = session.clone();
     let last_published_bytes = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let last_status_bytes = Arc::new(std::sync::Mutex::new(None::<u64>));
     move |progress| {
         let should_publish = {
             let mut last_published_bytes = last_published_bytes
@@ -4705,6 +4978,39 @@ fn hls_cache_progress_reporter(
         };
         if !should_publish {
             return;
+        }
+
+        let status_progress_due = {
+            let mut last_status_bytes = last_status_bytes
+                .lock()
+                .expect("HLS cache status progress lock poisoned");
+            let reached_total = progress
+                .total_bytes
+                .is_some_and(|total| progress.downloaded_bytes >= total);
+            let due = (last_status_bytes.is_none() && progress.downloaded_bytes > 0)
+                || reached_total
+                || last_status_bytes.is_some_and(|last| {
+                    progress.downloaded_bytes.saturating_sub(last)
+                        >= HLS_CACHE_STATUS_PROGRESS_PUBLISH_MIN_BYTES
+                });
+            if due {
+                *last_status_bytes = Some(progress.downloaded_bytes);
+            }
+            due
+        };
+        if status_progress_due {
+            let _ = tasks.update_hls_cache_fill_status(
+                &task_id,
+                &session.id,
+                hls_cache_fill_status(
+                    &session,
+                    HlsCacheFillState::Filling,
+                    HlsCacheFillFailureKind::Unspecified,
+                    progress.downloaded_bytes,
+                    progress.total_bytes,
+                    "Filling selected video and audio for offline playback.",
+                ),
+            );
         }
 
         let progress_value = progress.total_bytes.and_then(|total_bytes| {
@@ -10232,6 +10538,7 @@ mod tests {
             playback_source: Some(playback_source),
             playback_session: Some(metadata.playback_session),
             identity: None,
+            hls_cache_fill_status: None,
         }];
         state
             .pending_hls_session_cleanups
@@ -10369,6 +10676,7 @@ mod tests {
             playback_source: Some(playback_source),
             playback_session: Some(metadata.playback_session),
             identity: None,
+            hls_cache_fill_status: None,
         }];
 
         let cancelled = TaskGrpcService::new(state.clone())
@@ -10812,8 +11120,17 @@ mod tests {
             .expect("cache fill failure should be accepted")
             .expect("cache fill failure should update the playable task");
         assert_eq!(TaskState::Playable, degraded.state());
+        let fill_status = degraded
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("cache-only failure should be represented independently");
+        assert_eq!(HlsCacheFillState::Failed as i32, fill_status.state);
+        assert_eq!(
+            HlsCacheFillFailureKind::Network as i32,
+            fill_status.failure_kind
+        );
         assert!(
-            fs::read_to_string(&task_state_path)
+            !fs::read_to_string(&task_state_path)
                 .expect("persisted task state should remain readable")
                 .contains(synthetic_access_token)
         );
@@ -10826,11 +11143,16 @@ mod tests {
             .expect("persisted playable task should remain readable")
             .into_inner();
         assert_eq!(TaskState::Playable, snapshot.state());
-        assert_eq!(
-            crate::credential_safe_client_error(true, &sensitive_detail),
-            snapshot.message
-        );
+        assert_eq!("Bilibili playback session is playable.", snapshot.message);
         assert!(!snapshot.message.contains(synthetic_access_token));
+        assert_eq!(
+            HlsCacheFillState::Failed as i32,
+            snapshot
+                .hls_cache_fill_status
+                .as_ref()
+                .expect("RPC task should expose the typed cache-fill state")
+                .state
+        );
 
         let mut stream = service
             .watch_tasks(Request::new(WatchTasksRequest {
@@ -13058,7 +13380,7 @@ mod tests {
             .into_inner();
 
         assert_eq!(TaskState::Cancelled, cancelled.state());
-        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(state.hls_sessions.get(&task_id).is_some());
         assert!(state.hls_cache.playback_session(&task_id).is_some());
         assert!(hls_session_dir.exists());
 
@@ -13067,6 +13389,7 @@ mod tests {
             .expect("maintenance should retry cleanup even when quota eviction is disabled");
 
         assert!(summary.is_none());
+        assert!(state.hls_sessions.get(&task_id).is_none());
         assert!(state.hls_cache.playback_session(&task_id).is_none());
         assert!(!hls_session_dir.exists());
     }
@@ -13164,6 +13487,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -13179,6 +13503,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -13415,6 +13740,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -13430,6 +13756,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -14168,6 +14495,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -14183,6 +14511,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -14317,6 +14646,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -14332,6 +14662,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -14484,6 +14815,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -14499,6 +14831,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -15084,10 +15417,9 @@ mod tests {
         let older =
             create_completed_hls_playback_task(&state, "BV1quota-failure-older", &upstream_url)
                 .await;
-        let (task_id, mut session, library_item_id) =
-            create_playable_hls_playback_task(&state, "BV1quota-failure-current", &upstream_url);
-        session.variant.video.request.size = Some(session_size);
-        state.hls_sessions.insert(session.clone());
+        let plan = sample_playback_plan_with_video_url_and_size(&upstream_url, session_size);
+        let (task_id, session, library_item_id) =
+            create_playable_hls_playback_task_with_plan(&state, "BV1quota-failure-current", plan);
         assert!(state.hls_fill_scheduler.enqueue_foreground(
             task_id.clone(),
             session.clone(),
@@ -15209,6 +15541,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_size_video_and_audio_completion_reports_verified_total_after_restart() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let options = CacheServerOptions {
+            root_path: root_path.clone(),
+            task_state_path: root_path.join(".state").join("tasks.json"),
+            public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+            bilibili_worker_enabled: false,
+            ..CacheServerOptions::default()
+        };
+        let state =
+            AppState::new_with_playback_planner(options.clone(), Arc::new(EmptyPlaybackPlanner));
+        let plan = sample_playback_plan_with_video_and_audio_url(&upstream_url);
+        let (task_id, session, _) =
+            create_playable_hls_playback_task_with_plan(&state, "BV1unknown-total", plan);
+        assert_eq!(None, hls_session_declared_size_bytes(&session));
+        let expected_total = 2 * fake_mp4().len() as u64;
+
+        run_hls_cache_finalization(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        )
+        .await;
+
+        let task = state.tasks.get_task(&task_id).expect("task should exist");
+        assert_eq!(TaskState::Completed, task.state());
+        assert_fill_status_total(task.hls_cache_fill_status.as_ref(), expected_total);
+        let v2_before_restart = TaskGrpcService::new(state.clone())
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id: task_id.clone(),
+                page: None,
+            }))
+            .await
+            .expect("v2 results should be available")
+            .into_inner();
+        assert_fill_status_total(
+            v2_before_restart.results[0]
+                .provider_details
+                .as_ref()
+                .and_then(|provider| provider.details.as_ref())
+                .and_then(|details| match details {
+                    crate::generated::tvos_net_player::v1::task_result_provider_details::Details::Bilibili(details) => {
+                        details.hls_cache_fill_status.as_ref()
+                    }
+                }),
+            expected_total,
+        );
+        state.shutdown_hls_fill_worker().await;
+        drop(state);
+
+        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
+        let restored_task = restored
+            .tasks
+            .get_task(&task_id)
+            .expect("completed task should restore");
+        assert_eq!(TaskState::Completed, restored_task.state());
+        assert_fill_status_total(restored_task.hls_cache_fill_status.as_ref(), expected_total);
+        let v2_after_restart = TaskGrpcService::new(restored)
+            .list_task_results(Request::new(ListTaskResultsRequest {
+                task_id,
+                page: None,
+            }))
+            .await
+            .expect("restored v2 results should be available")
+            .into_inner();
+        assert_fill_status_total(
+            v2_after_restart.results[0]
+                .provider_details
+                .as_ref()
+                .and_then(|provider| provider.details.as_ref())
+                .and_then(|details| match details {
+                    crate::generated::tvos_net_player::v1::task_result_provider_details::Details::Bilibili(details) => {
+                        details.hls_cache_fill_status.as_ref()
+                    }
+                }),
+            expected_total,
+        );
+    }
+
+    fn assert_fill_status_total(status: Option<&HlsCacheFillStatus>, expected_total: u64) {
+        let status = status.expect("cache fill status should be present");
+        assert_eq!(HlsCacheFillState::Completed as i32, status.state);
+        assert!(status.total_bytes_known);
+        assert!(status.total_bytes > 0);
+        assert_eq!(expected_total, status.total_bytes);
+        assert_eq!(expected_total, status.completed_bytes);
+    }
+
+    #[tokio::test]
     async fn hls_cache_finalization_quota_projects_only_uncached_session_bytes() {
         let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -15231,18 +15658,10 @@ mod tests {
         );
         let older =
             create_completed_hls_playback_task(&state, "BV1projection-older", &upstream_url).await;
-        let (current_task_id, mut current_session, current_library_item_id) =
-            create_playable_hls_playback_task(&state, "BV1projection-current", &upstream_url);
-        current_session.variant.video.request.size = Some(session_size);
-        let mut audio = current_session.variant.video.clone();
-        audio.id = "audio.m4s".to_owned();
-        audio.request.kind = BilibiliMediaRequestKind::Audio;
-        audio.request.codecs = Some("mp4a.40.2".to_owned());
-        audio.request.size = Some(session_size);
-        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
-        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
-        current_session.variant.audio = Some(audio);
-        state.hls_sessions.insert(current_session.clone());
+        let plan =
+            sample_playback_plan_with_video_and_audio_url_and_size(&upstream_url, session_size);
+        let (current_task_id, current_session, current_library_item_id) =
+            create_playable_hls_playback_task_with_plan(&state, "BV1projection-current", plan);
 
         let cache_for_preempt = state.hls_cache.clone();
         let task_id_for_preempt = current_task_id.clone();
@@ -15583,6 +16002,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -15598,6 +16018,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -15796,6 +16217,7 @@ mod tests {
                     }),
                     playback_session: Some(metadata.playback_session),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -15877,6 +16299,7 @@ mod tests {
                     }),
                     playback_session: Some(metadata.playback_session),
                     identity: None,
+                    hls_cache_fill_status: None,
                 }],
             )
             .expect("partial playback results should persist");
@@ -16589,6 +17012,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -16604,6 +17028,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -16754,6 +17179,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -16769,6 +17195,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -16784,7 +17211,18 @@ mod tests {
             .expect("primary cache fill failure should update task");
 
         assert_eq!(TaskState::Playable, degraded.state());
-        assert_eq!(i32::from(TaskState::Failed), degraded.result_items[0].state);
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            degraded.result_items[0].state
+        );
+        assert_eq!(
+            HlsCacheFillState::Failed as i32,
+            degraded.result_items[0]
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .state
+        );
         assert!(
             state
                 .tasks
@@ -16809,7 +17247,14 @@ mod tests {
             "Playable online; selected Bilibili playback results are cached offline.",
             updated.message
         );
-        assert_eq!(i32::from(TaskState::Failed), updated.result_items[0].state);
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            updated.result_items[0].state
+        );
+        assert_eq!(
+            BILIBILI_RESULT_PLAYABLE_MESSAGE,
+            updated.result_items[0].message
+        );
         assert_eq!(
             i32::from(TaskState::Completed),
             updated.result_items[1].state
@@ -16837,12 +17282,20 @@ mod tests {
             restored_task.message
         );
         assert_eq!(
-            i32::from(TaskState::Failed),
+            i32::from(TaskState::Playable),
             restored_task.result_items[0].state
         );
         assert_eq!(
-            "Playable online; offline cache fill failed: upstream returned 503",
+            BILIBILI_RESULT_PLAYABLE_MESSAGE,
             restored_task.result_items[0].message
+        );
+        assert_eq!(
+            HlsCacheFillState::Failed as i32,
+            restored_task.result_items[0]
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .state
         );
         assert!(restored_task.playback_source.is_some());
         assert!(restored_task.playback_session.is_some());
@@ -16943,6 +17396,7 @@ mod tests {
                         playback_source: Some(primary_source),
                         playback_session: Some(primary_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                     BilibiliTaskResultItem {
                         id: child_session_id.clone(),
@@ -16958,6 +17412,7 @@ mod tests {
                         playback_source: Some(child_source),
                         playback_session: Some(child_metadata.playback_session.clone()),
                         identity: None,
+                        hls_cache_fill_status: None,
                     },
                 ],
             )
@@ -16987,7 +17442,18 @@ mod tests {
             .expect("secondary cache fill failure should update task");
 
         assert_eq!(TaskState::Completed, degraded.state());
-        assert_eq!(i32::from(TaskState::Failed), degraded.result_items[1].state);
+        assert_eq!(
+            i32::from(TaskState::Playable),
+            degraded.result_items[1].state
+        );
+        assert_eq!(
+            HlsCacheFillState::Failed as i32,
+            degraded.result_items[1]
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .state
+        );
         assert!(
             state
                 .tasks
@@ -17009,7 +17475,7 @@ mod tests {
         );
         assert_eq!(TaskState::Completed, restored_task.state());
         assert_eq!(
-            i32::from(TaskState::Failed),
+            i32::from(TaskState::Playable),
             restored_task.result_items[1].state
         );
         let restored_child_source = restored_task.result_items[1]
@@ -17029,7 +17495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hls_cache_fill_failure_directory_sync_retry_does_not_repeat_cache_work() {
+    async fn hls_cache_fill_network_retry_waits_for_directory_sync_recovery() {
         let (upstream_url, _upstream_task, upstream_requests) =
             start_counted_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -17051,65 +17517,75 @@ mod tests {
             "BV1cache-fill-directory-sync-retry",
             &upstream_url,
         );
+        let playable_source_before_fill = state
+            .tasks
+            .get_task(&task_id)
+            .unwrap()
+            .playback_source
+            .expect("playback source should be present before fill");
         state.tasks.fail_next_persistence_directory_sync();
 
-        assert!(state.hls_fill_scheduler.enqueue_foreground(
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
             task_id.clone(),
-            session,
+            session.clone(),
             HlsCacheFinalizationFailureMode::KeepPlayable,
-        ));
-        let worker = tokio::spawn(run_hls_cache_fill_worker(state.clone()));
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if !state.tasks.persistence_available()
-                    && state
-                        .tasks
-                        .hls_session_has_online_playback_after_cache_fill_failure(
-                            &task_id, &task_id,
-                        )
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("cache failure marker should become visible before it is durable");
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        assert!(!state.tasks.persistence_available());
+        let pending = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, pending.state());
+        assert!(!pending.message.contains("offline cache fill failed"));
+        assert_eq!(Some(playable_source_before_fill), pending.playback_source);
+        let fill_status = pending
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("the installed status should remain visible while directory sync retries");
+        assert_eq!(HlsCacheFillState::Retrying as i32, fill_status.state);
+        assert_eq!(
+            HlsCacheFillFailureKind::Network as i32,
+            fill_status.failure_kind
+        );
         let requests_after_failure = upstream_requests.load(Ordering::Relaxed);
         assert!(requests_after_failure > 0);
 
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if state.tasks.persistence_available() && state.hls_fill_scheduler.is_idle() {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the queued failure marker should become durable");
+        assert_eq!(
+            TaskPersistenceRecoveryOutcome::Durable,
+            retry_pending_task_persistence(&state.tasks, "test HLS fill").await
+        );
         assert_eq!(
             requests_after_failure,
             upstream_requests.load(Ordering::Relaxed),
-            "durability recovery must not repeat the failed download"
+            "repairing directory-sync debt must not repeat cache work"
         );
-
-        state
-            .hls_fill_scheduler
-            .shutdown_and_wait_for_worker()
-            .await;
-        worker.await.expect("HLS cache fill worker should stop");
-        let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
-        assert!(
-            restored
-                .tasks
-                .hls_session_has_online_playback_after_cache_fill_failure(&task_id, &task_id),
-            "the failure marker should survive restart"
+        let retry_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+        assert_eq!(HlsCacheFinalizationOutcome::NetworkRetry, retry_outcome);
+        assert!(upstream_requests.load(Ordering::Relaxed) > requests_after_failure);
+        let retried = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, retried.state());
+        let fill_status = retried.hls_cache_fill_status.as_ref().unwrap();
+        assert_eq!(HlsCacheFillState::Retrying as i32, fill_status.state);
+        assert_eq!(
+            HlsCacheFillFailureKind::Network as i32,
+            fill_status.failure_kind
         );
+        assert!(state.tasks.persistence_available());
     }
 
     #[tokio::test]
-    async fn hls_cache_fill_failure_requeues_until_failure_state_is_durable() {
+    async fn hls_cache_fill_failure_recovers_snapshot_before_retrying_network() {
         let (upstream_url, _upstream_task, upstream_requests) =
             start_counted_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -17181,15 +17657,116 @@ mod tests {
         )
         .await;
 
-        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(HlsCacheFinalizationOutcome::NetworkRetry, retry_outcome);
         let playable = state.tasks.get_task(&task_id).unwrap();
         assert_eq!(TaskState::Playable, playable.state());
-        assert!(playable.message.contains("offline cache fill failed"));
-        assert!(state.tasks.persistence_available());
+        assert!(!playable.message.contains("offline cache fill failed"));
         assert_eq!(
-            requests_after_failure,
+            HlsCacheFillState::Retrying as i32,
+            playable.hls_cache_fill_status.as_ref().unwrap().state
+        );
+        assert_eq!(
+            HlsCacheFillFailureKind::Network as i32,
+            playable
+                .hls_cache_fill_status
+                .as_ref()
+                .unwrap()
+                .failure_kind
+        );
+        assert!(state.tasks.persistence_available());
+        assert!(
+            upstream_requests.load(Ordering::Relaxed) > requests_after_failure,
+            "network retry is allowed once the previous task snapshot is durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_fill_worker_waits_for_pending_task_snapshot_before_network_retry() {
+        let (upstream_url, _upstream_task, upstream_requests) =
+            start_counted_failing_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let root_path = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let task_state_path = root_path.join(".state").join("tasks.json");
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root_path.clone(),
+                task_state_path: task_state_path.clone(),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task(
+            &state,
+            "BV1cache-fill-worker-persistence-retry",
+            &upstream_url,
+        );
+
+        fs::remove_file(&task_state_path).expect("task state should be removable");
+        fs::create_dir(&task_state_path).expect("directory should block snapshot replacement");
+        let first_outcome = run_hls_cache_finalization_inner(
+            state.clone(),
+            task_id.clone(),
+            session.clone(),
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+            HlsFillPreemptionToken::default(),
+        )
+        .await;
+        assert_eq!(
+            HlsCacheFinalizationOutcome::PersistencePending,
+            first_outcome
+        );
+        let requests_before_worker = upstream_requests.load(Ordering::Relaxed);
+        assert!(requests_before_worker > 0);
+
+        assert!(state.hls_fill_scheduler.enqueue_foreground(
+            task_id.clone(),
+            session,
+            HlsCacheFinalizationFailureMode::KeepPlayable,
+        ));
+        let worker = tokio::spawn(run_hls_cache_fill_worker(state.clone()));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            requests_before_worker,
             upstream_requests.load(Ordering::Relaxed),
-            "durability recovery must not repeat the failed download"
+            "the worker must repair the rejected snapshot before retrying cache work"
+        );
+
+        fs::remove_dir(&task_state_path).expect("blocking directory should be removable");
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let task = state.tasks.get_task(&task_id).unwrap();
+                let fill_status = task.hls_cache_fill_status.as_ref();
+                if state.tasks.persistence_available()
+                    && upstream_requests.load(Ordering::Relaxed) > requests_before_worker
+                    && fill_status.is_some_and(|status| {
+                        status.state == HlsCacheFillState::Retrying as i32
+                            && status.failure_kind == HlsCacheFillFailureKind::Network as i32
+                    })
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable recovery should permit a normal typed network retry");
+
+        state
+            .hls_fill_scheduler
+            .shutdown_and_wait_for_worker()
+            .await;
+        timeout(Duration::from_secs(7), worker)
+            .await
+            .expect("fill worker should drain after graceful shutdown")
+            .expect("fill worker task should join");
+        assert!(
+            upstream_requests.load(Ordering::Relaxed) > requests_before_worker,
+            "normal network retry should run after persistence becomes durable"
         );
     }
 
@@ -17251,18 +17828,27 @@ mod tests {
         )
         .await;
 
-        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(HlsCacheFinalizationOutcome::NetworkRetry, retry_outcome);
+        let playable = state.tasks.get_task(&task_id).unwrap();
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.playback_source.is_some());
+        assert!(playable.playback_session.is_some());
+        let fill_status = playable
+            .hls_cache_fill_status
+            .as_ref()
+            .expect("network failure should remain visible as typed retry state");
+        assert_eq!(HlsCacheFillState::Retrying as i32, fill_status.state);
         assert_eq!(
-            TaskState::Failed,
-            state.tasks.get_task(&task_id).unwrap().state()
+            HlsCacheFillFailureKind::Network as i32,
+            fill_status.failure_kind
         );
-        assert!(!session_dir.exists());
-        assert!(state.hls_sessions.get(&task_id).is_none());
+        assert!(session_dir.exists());
+        assert!(state.hls_sessions.get(&task_id).is_some());
         assert!(state.tasks.persistence_available());
     }
 
     #[tokio::test]
-    async fn app_state_fails_restored_hls_task_when_cache_finalization_fails() {
+    async fn app_state_keeps_restored_hls_task_playable_when_cache_finalization_fails() {
         let (upstream_url, _upstream_task) = start_failing_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
@@ -17314,18 +17900,19 @@ mod tests {
         assert_eq!(TaskState::Playable, playable.state());
 
         let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
-        let failed =
-            wait_for_task_state(&restored.tasks, &creation.task.id, TaskState::Failed).await;
+        let playable = wait_for_task_condition(&restored.tasks, &creation.task.id, |task| {
+            task.hls_cache_fill_status.as_ref().is_some_and(|status| {
+                status.state == HlsCacheFillState::Retrying as i32
+                    && status.failure_kind == HlsCacheFillFailureKind::Network as i32
+            })
+        })
+        .await;
 
-        assert!(
-            failed
-                .message
-                .contains("Failed to restore offline HLS cache")
-        );
-        assert!(failed.playback_source.is_none());
-        assert!(failed.playback_session.is_none());
-        assert!(failed.library_item_id.is_empty());
-        assert!(restored.hls_sessions.get(&creation.task.id).is_none());
+        assert_eq!(TaskState::Playable, playable.state());
+        assert!(playable.playback_source.is_some());
+        assert!(playable.playback_session.is_some());
+        assert!(playable.library_item_id.is_empty());
+        assert!(restored.hls_sessions.get(&creation.task.id).is_some());
         assert!(
             restored
                 .hls_cache
@@ -17333,12 +17920,13 @@ mod tests {
                 .is_none()
         );
         assert!(
-            !root_path
+            root_path
                 .join(".tvos-net-player")
                 .join("hls")
                 .join(&creation.task.id)
                 .exists()
         );
+        restored.shutdown_hls_fill_worker().await;
     }
 
     #[tokio::test]
@@ -17549,6 +18137,7 @@ mod tests {
                 playback_source: None,
                 playback_session: None,
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -17564,6 +18153,7 @@ mod tests {
                 playback_source: Some(stale_source.clone()),
                 playback_session: Some(metadata.playback_session.clone()),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         state
@@ -17801,6 +18391,7 @@ mod tests {
                 playback_source: None,
                 playback_session: None,
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -17816,6 +18407,7 @@ mod tests {
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(metadata.playback_session.clone()),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         state
@@ -17936,6 +18528,7 @@ mod tests {
                 playback_source: None,
                 playback_session: None,
                 identity: None,
+                hls_cache_fill_status: None,
             },
             BilibiliTaskResultItem {
                 id: child_session_id.clone(),
@@ -17951,6 +18544,7 @@ mod tests {
                 playback_source: Some(child_source.clone()),
                 playback_session: Some(child_metadata.playback_session.clone()),
                 identity: None,
+                hls_cache_fill_status: None,
             },
         ];
         state
@@ -18159,6 +18753,14 @@ mod tests {
             .hls_cache
             .save_session(&hls_session)
             .expect("planning should persist HLS session");
+        let pre_scrub_manifest = fs::read(
+            root_path
+                .join(".tvos-net-player")
+                .join("hls")
+                .join(&creation.task.id)
+                .join("session.json"),
+        )
+        .expect("pre-scrub manifest should be readable");
         state.hls_sessions.insert(hls_session.clone());
         let playback_source = PlaybackSource {
             item_id: creation.task.id.clone(),
@@ -18191,9 +18793,7 @@ mod tests {
             .join("hls")
             .join(&creation.task.id)
             .join("session.json");
-        state
-            .hls_cache
-            .save_session(&hls_session)
+        fs::write(&manifest_path, pre_scrub_manifest)
             .expect("test should restore the pre-scrub crash-window manifest");
         let pre_restore_manifest =
             fs::read_to_string(&manifest_path).expect("manifest should be readable");
@@ -18489,6 +19089,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn hls_completion_persistence_does_not_block_runtime_worker() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -18507,8 +19108,9 @@ mod tests {
         let (task_id, session, library_item_id) = create_playable_hls_playback_task(
             &state,
             "BV1hls-completion-blocking-persistence",
-            "https://example.test/video.m4s",
+            &upstream_url,
         );
+        cache_completed_hls_test_media(&state, &session).await;
         let entered = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
         state
@@ -18557,8 +19159,13 @@ mod tests {
             .await
         });
 
-        let outcome = timeout(Duration::from_secs(3), completion)
-            .await
+        let completion_result = timeout(Duration::from_secs(3), completion).await;
+        if !persistence_entered.load(AtomicOrdering::Acquire) {
+            runtime_progressed.store(true, AtomicOrdering::Release);
+            entered.wait();
+            resume.wait();
+        }
+        let outcome = completion_result
             .expect("HLS completion should finish after the test releases storage")
             .expect("HLS completion task should not panic");
         heartbeat.await.expect("runtime heartbeat should not panic");
@@ -18577,6 +19184,7 @@ mod tests {
 
     #[tokio::test]
     async fn hls_cache_fill_retains_ownership_until_installed_completion_is_durable() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -18595,8 +19203,9 @@ mod tests {
         let (task_id, session, _) = create_playable_hls_playback_task(
             &state,
             "BV1hls-completion-directory-sync-retry",
-            "https://example.test/video.m4s",
+            &upstream_url,
         );
+        cache_completed_hls_test_media(&state, &session).await;
         assert!(state.hls_fill_scheduler.enqueue_foreground(
             task_id.clone(),
             session.clone(),
@@ -18610,11 +19219,26 @@ mod tests {
 
         assert_eq!(HlsCacheFinalizationOutcome::PersistencePending, outcome);
         assert_eq!(
-            TaskState::Completed,
-            state.tasks.get_task(&task_id).unwrap().state()
+            TaskState::Playable,
+            state.tasks.get_task(&task_id).unwrap().state(),
+            "terminal playback completion must wait for durable task-state publication"
         );
+        assert!(
+            state
+                .tasks
+                .get_task(&task_id)
+                .unwrap()
+                .playback_source
+                .is_some(),
+            "last durable online playback source must survive the pending completion status"
+        );
+        let runtime_session = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("durable completed media should replace the online runtime session");
+        assert!(runtime_session.variant.video.request.url.is_empty());
         assert_eq!(
-            HlsSessionPublicationState::Pending,
+            HlsSessionPublicationState::Published,
             state
                 .tasks
                 .hls_session_publication_state(&task_id, &session.id)
@@ -18633,16 +19257,26 @@ mod tests {
         let retry_outcome =
             publish_completed_hls_cache(&state, &retry.task_id, &retry.session.id, &retry.session)
                 .await;
-        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            HlsCacheFinalizationOutcome::Finished,
+            retry_outcome,
+            "successful re-publication must release background ownership"
+        );
         state.hls_fill_scheduler.finish_current(&retry, false);
 
         assert!(state.tasks.persistence_available());
+        assert_eq!(
+            TaskState::Completed,
+            state.tasks.get_task(&task_id).unwrap().state(),
+            "completed playback may publish only after task-state recovery is durable"
+        );
         assert!(state.hls_fill_scheduler.is_idle());
         assert!(!state.hls_fill_scheduler.owns_session(&session.id));
     }
 
     #[tokio::test]
     async fn hls_cache_fill_releases_ownership_after_permanent_publication_failure() {
+        let (upstream_url, _upstream_task) = start_mp4_upstream().await;
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -18661,8 +19295,9 @@ mod tests {
         let (task_id, session, _) = create_playable_hls_playback_task(
             &state,
             "BV1hls-completion-permanent-rejection",
-            "https://example.test/video.m4s",
+            &upstream_url,
         );
+        cache_completed_hls_test_media(&state, &session).await;
         assert!(state.hls_fill_scheduler.enqueue_foreground(
             task_id.clone(),
             session.clone(),
@@ -18693,7 +19328,11 @@ mod tests {
         .await
         .expect("permanent publication rejection must not retry forever");
 
-        assert_eq!(HlsCacheFinalizationOutcome::Finished, retry_outcome);
+        assert_eq!(
+            HlsCacheFinalizationOutcome::Finished,
+            retry_outcome,
+            "permanent output rejection must release background ownership"
+        );
         assert!(!hls_cache_fill_should_requeue(
             &state,
             &retry,
@@ -18903,6 +19542,9 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(temp.path()));
         let task_state_path = root_path.join(".state").join("tasks.json");
+        let ffmpeg_path = write_copying_fake_ffmpeg(temp.path());
+        let ffmpeg_call_log = PathBuf::from(format!("{}.calls", ffmpeg_path.display()));
+        fs::write(&ffmpeg_call_log, "").expect("fake ffmpeg call log should be enabled");
         let state = AppState::new_with_playback_planner(
             CacheServerOptions {
                 root_path,
@@ -18910,7 +19552,7 @@ mod tests {
                 public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
                 bilibili_worker_enabled: false,
                 lan_transcoding_enabled: true,
-                lan_transcoding_ffmpeg_path: write_copying_fake_ffmpeg(temp.path()),
+                lan_transcoding_ffmpeg_path: ffmpeg_path,
                 ..CacheServerOptions::default()
             },
             Arc::new(EmptyPlaybackPlanner),
@@ -18919,13 +19561,13 @@ mod tests {
             .tasks
             .create_bilibili_playback_task("BV1pending-terminal-fill", None, None)
             .expect("playback task should be created durably");
-        let metadata = playback_task_metadata(
+        let metadata = playback_task_metadata_with_options(
             &creation.task.id,
-            sample_playback_plan_with_video_url(&upstream_url),
+            sample_hevc_playback_plan_with_video_url(&upstream_url),
+            &state.options,
         )
         .expect("playback metadata should map");
-        let mut hls_session = metadata.hls_session.clone();
-        mark_hls_session_transcoding_ready(&mut hls_session);
+        let hls_session = metadata.hls_session.clone();
         state
             .hls_cache
             .save_session(&hls_session)
@@ -18981,6 +19623,13 @@ mod tests {
         );
         let requests_after_completion = upstream_requests.load(Ordering::Relaxed);
         assert!(requests_after_completion > 0);
+        assert_eq!(
+            1,
+            fs::read(&ffmpeg_call_log)
+                .expect("fake ffmpeg call log should be readable")
+                .len(),
+            "the first finalization should execute one transcode"
+        );
         let completed_session = state
             .hls_cache
             .completed_session(&creation.task.id)
@@ -19020,6 +19669,13 @@ mod tests {
             upstream_requests.load(Ordering::Relaxed),
             "durability recovery must reuse the completed transcode without another download"
         );
+        assert_eq!(
+            1,
+            fs::read(&ffmpeg_call_log)
+                .expect("fake ffmpeg call log should remain readable")
+                .len(),
+            "durability recovery must reuse the completed transcode without invoking ffmpeg again"
+        );
     }
 
     #[cfg(unix)]
@@ -19043,14 +19699,8 @@ mod tests {
             },
             Arc::new(EmptyPlaybackPlanner),
         );
-        let (task_id, mut hls_session, library_item_id) =
-            create_playable_hls_playback_task(&state, "BV1transcode", &upstream_url);
-        mark_hls_session_transcoding_ready(&mut hls_session);
-        state
-            .hls_cache
-            .save_session(&hls_session)
-            .expect("transcoding-ready session should persist");
-        state.hls_sessions.insert(hls_session.clone());
+        let (task_id, hls_session, library_item_id) =
+            create_ready_hevc_playable_hls_task(&state, "BV1transcode", &upstream_url);
 
         run_hls_cache_finalization(
             state.clone(),
@@ -19308,14 +19958,8 @@ mod tests {
             },
             Arc::new(EmptyPlaybackPlanner),
         );
-        let (task_id, mut hls_session, library_item_id) =
-            create_playable_hls_playback_task(&state, "BV1transcode-disabled", &upstream_url);
-        mark_hls_session_transcoding_ready(&mut hls_session);
-        state
-            .hls_cache
-            .save_session(&hls_session)
-            .expect("transcoding-ready session should persist");
-        state.hls_sessions.insert(hls_session.clone());
+        let (task_id, hls_session, library_item_id) =
+            create_ready_hevc_playable_hls_task(&state, "BV1transcode-disabled", &upstream_url);
 
         run_hls_cache_finalization(
             state.clone(),
@@ -19361,17 +20005,11 @@ mod tests {
             base_options.clone(),
             Arc::new(EmptyPlaybackPlanner),
         );
-        let (task_id, mut hls_session, library_item_id) = create_playable_hls_playback_task(
+        let (task_id, _hls_session, library_item_id) = create_ready_hevc_playable_hls_task(
             &state,
             "BV1transcode-restore-disabled",
             &upstream_url,
         );
-        mark_hls_session_transcoding_ready(&mut hls_session);
-        state
-            .hls_cache
-            .save_session(&hls_session)
-            .expect("transcoding-ready session should persist");
-        state.hls_sessions.insert(hls_session.clone());
 
         let restored = AppState::new_with_playback_planner(
             CacheServerOptions {
@@ -19425,10 +20063,33 @@ mod tests {
             legacy_session.variant.id.clone(),
             "Legacy completed cache was planned for LAN transcoding before execution was available.",
         );
-        state
-            .hls_cache
-            .save_session(&legacy_session)
-            .expect("legacy ready completed session should persist");
+        let manifest_path = root_path
+            .join(".tvos-net-player")
+            .join("hls")
+            .join(&completed.task_id)
+            .join("session.json");
+        let mut legacy_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("completed manifest should be readable"),
+        )
+        .expect("completed manifest should be valid JSON");
+        let legacy_transcoding = legacy_manifest["transcoding"]
+            .as_object_mut()
+            .expect("transcoding plan should be an object");
+        legacy_transcoding.insert("state".to_owned(), serde_json::json!("ready"));
+        legacy_transcoding.insert(
+            "reason".to_owned(),
+            serde_json::json!("Legacy completed cache was planned for LAN transcoding before execution was available."),
+        );
+        legacy_transcoding.insert(
+            "source_variant_id".to_owned(),
+            serde_json::json!(legacy_session.variant.id),
+        );
+        fs::write(
+            manifest_path,
+            serde_json::to_vec_pretty(&legacy_manifest)
+                .expect("legacy manifest fixture should serialize"),
+        )
+        .expect("test should seed the legacy completed manifest directly");
 
         let restored = AppState::new_with_playback_planner(options, Arc::new(EmptyPlaybackPlanner));
         let restored_task = restored
@@ -20311,21 +20972,32 @@ mod tests {
         }
     }
 
+    async fn cache_completed_hls_test_media(state: &AppState, session: &HlsPlaybackSession) {
+        let library_item_id = state
+            .hls_cache
+            .cache_session_resources(&state.hls_upstream_client, session)
+            .await
+            .expect("selected HLS media should be fully cached before publication");
+        assert_eq!(
+            HlsCacheStore::completed_library_item_id(&session.id),
+            library_item_id
+        );
+        assert!(
+            state
+                .hls_cache
+                .completed_primary_resource_bytes(session)
+                .is_ok_and(|bytes| bytes > 0)
+        );
+    }
+
     async fn create_partial_hls_playback_task(
         state: &AppState,
         source: &str,
         upstream_url: &str,
     ) -> PartialHlsTestTask {
-        let (task_id, mut hls_session, _) =
-            create_playable_hls_playback_task(state, source, upstream_url);
-        let mut audio = hls_session.variant.video.clone();
-        audio.id = "audio.m4s".to_owned();
-        audio.request.kind = BilibiliMediaRequestKind::Audio;
-        audio.request.codecs = Some("mp4a.40.2".to_owned());
-        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
-        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
-        hls_session.variant.audio = Some(audio);
-        state.hls_sessions.insert(hls_session.clone());
+        let plan = sample_playback_plan_with_video_and_audio_url(upstream_url);
+        let (task_id, hls_session, _) =
+            create_playable_hls_playback_task_with_plan(state, source, plan);
         let cache_for_preempt = state.hls_cache.clone();
         let task_id_for_preempt = task_id.clone();
 
@@ -20353,40 +21025,62 @@ mod tests {
         PartialHlsTestTask { task_id }
     }
 
-    fn mark_hls_session_transcoding_ready(session: &mut HlsPlaybackSession) {
-        let mut audio = session.variant.video.clone();
-        audio.id = "audio.m4s".to_owned();
-        audio.request.kind = BilibiliMediaRequestKind::Audio;
-        audio.request.codecs = Some("mp4a.40.2".to_owned());
-        audio.request.cache_key.media_kind = BilibiliMediaRequestKind::Audio;
-        audio.request.cache_key.codecs = Some("mp4a.40.2".to_owned());
-        audio.request.cache_key.source_hash = "audio-source-hash".to_owned();
-        session.variant.audio = Some(audio);
-        session.variant.codecs = vec!["hev1.1.6.L120.90".to_owned()];
-        session.variant.video.request.codecs = Some("hev1.1.6.L120.90".to_owned());
-        session.variant.video.request.cache_key.codecs = Some("hev1.1.6.L120.90".to_owned());
-        session.variant.video.request.cache_key.source_hash = "hevc-source-hash".to_owned();
-        session.transcoding = HlsTranscodingPlan::with_state(
-            HlsTranscodingPlanState::Ready,
-            session.variant.id.clone(),
-            "HEVC source should be converted before completed offline cache exposure.",
-        );
-    }
-
     fn create_playable_hls_playback_task(
         state: &AppState,
         source: &str,
         upstream_url: &str,
     ) -> (String, HlsPlaybackSession, String) {
+        create_playable_hls_playback_task_with_plan(
+            state,
+            source,
+            sample_playback_plan_with_video_url(upstream_url),
+        )
+    }
+
+    fn create_ready_hevc_playable_hls_task(
+        state: &AppState,
+        source: &str,
+        upstream_url: &str,
+    ) -> (String, HlsPlaybackSession, String) {
+        create_playable_hls_playback_task_with_transcoding_state(
+            state,
+            source,
+            sample_hevc_playback_plan_with_video_url(upstream_url),
+            Some(HlsTranscodingPlanState::Ready),
+        )
+    }
+
+    fn create_playable_hls_playback_task_with_plan(
+        state: &AppState,
+        source: &str,
+        plan: BilibiliPlaybackPlan,
+    ) -> (String, HlsPlaybackSession, String) {
+        create_playable_hls_playback_task_with_transcoding_state(state, source, plan, None)
+    }
+
+    fn create_playable_hls_playback_task_with_transcoding_state(
+        state: &AppState,
+        source: &str,
+        plan: BilibiliPlaybackPlan,
+        transcoding_state: Option<HlsTranscodingPlanState>,
+    ) -> (String, HlsPlaybackSession, String) {
         let creation = state
             .tasks
             .create_bilibili_playback_task(source, None, None)
             .expect("playback task should be created");
-        let metadata = playback_task_metadata(
-            &creation.task.id,
-            sample_playback_plan_with_video_url(upstream_url),
-        )
-        .expect("playback metadata should map");
+        let mut metadata =
+            playback_task_metadata_with_options(&creation.task.id, plan, &state.options)
+                .expect("playback metadata should map");
+        if let Some(transcoding_state) = transcoding_state {
+            metadata.hls_session.transcoding = HlsTranscodingPlan::with_state(
+                transcoding_state,
+                metadata.hls_session.variant.id.clone(),
+                "HEVC source should be converted before completed offline cache exposure.",
+            );
+            metadata.playback_session.transcoding_plan = Some(proto_lan_transcoding_plan(
+                &metadata.hls_session.transcoding,
+            ));
+        }
         state
             .hls_cache
             .save_session(&metadata.hls_session)
@@ -21114,6 +21808,70 @@ mod tests {
         }
     }
 
+    fn sample_playback_plan_with_video_url_and_size(
+        url: &str,
+        video_size: u64,
+    ) -> BilibiliPlaybackPlan {
+        let mut plan = sample_playback_plan_with_video_url(url);
+        for variant in &mut plan.entries[0].variants {
+            variant
+                .video
+                .as_mut()
+                .expect("sample variant should include video")
+                .size = Some(video_size);
+        }
+        plan.entries[0]
+            .selected_variant
+            .as_mut()
+            .expect("sample plan should select a variant")
+            .variant
+            .video
+            .as_mut()
+            .expect("selected sample variant should include video")
+            .size = Some(video_size);
+        plan
+    }
+
+    fn sample_playback_plan_with_video_and_audio_url(url: &str) -> BilibiliPlaybackPlan {
+        let mut plan = sample_playback_plan_with_video_url(url);
+        let entry = &mut plan.entries[0];
+        let selected = &mut entry
+            .selected_variant
+            .as_mut()
+            .expect("sample plan should select a variant")
+            .variant;
+        let audio = media_request_with_url(BilibiliMediaRequestKind::Audio, "mp4a.40.2", url);
+        selected.audio = Some(audio.clone());
+        for variant in &mut entry.variants {
+            if variant.id == selected.id {
+                variant.audio = Some(audio.clone());
+            }
+        }
+        plan
+    }
+
+    fn sample_playback_plan_with_video_and_audio_url_and_size(
+        url: &str,
+        media_size: u64,
+    ) -> BilibiliPlaybackPlan {
+        let mut plan = sample_playback_plan_with_video_url_and_size(url, media_size);
+        let entry = &mut plan.entries[0];
+        let selected = &mut entry
+            .selected_variant
+            .as_mut()
+            .expect("sample plan should select a variant")
+            .variant;
+        let mut audio = media_request_with_url(BilibiliMediaRequestKind::Audio, "mp4a.40.2", url);
+        audio.size = Some(media_size);
+        selected.audio = Some(audio.clone());
+        for variant in &mut entry.variants {
+            if variant.id == selected.id {
+                variant.audio = Some(audio.clone());
+            }
+        }
+        plan
+    }
+
     fn sample_hevc_playback_plan_with_video_url(url: &str) -> BilibiliPlaybackPlan {
         let mut selected_variant =
             playback_variant_with_url("hevc", "hev1.1.6.L120.90", 2_000_000, url);
@@ -21540,6 +22298,9 @@ for arg in "$@"; do
   last=$arg
   previous=$arg
 done
+if [ -e "$0.calls" ]; then
+  printf x >> "$0.calls"
+fi
 cp "$input" "$last"
 "#,
         )

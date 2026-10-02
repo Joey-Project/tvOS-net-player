@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::generated::tvos_net_player::v1::{
     BilibiliContentIdentity, BilibiliContentKind, BilibiliPlaybackSession, BilibiliPlaybackVariant,
-    BilibiliTaskResultDetails, CacheResourceRef, Task, TaskArtifactKind, TaskArtifactState,
-    TaskOutputSummary, TaskProblem, TaskProblemCategory, TaskResult, TaskResultProgress,
-    TaskResultProviderDetails, TaskResultSubject, TaskState, task_result_provider_details,
+    BilibiliTaskResultDetails, CacheResourceRef, HlsCacheFillStatus, Task, TaskArtifactKind,
+    TaskArtifactState, TaskOutputSummary, TaskProblem, TaskProblemCategory, TaskResult,
+    TaskResultProgress, TaskResultProviderDetails, TaskResultSubject, TaskState,
+    task_result_provider_details,
 };
 use http::HeaderValue;
 use prost::Message;
@@ -125,6 +126,48 @@ impl TaskOutputRecord {
             output.revision = previous.revision.saturating_add(1).max(1);
         }
         output
+    }
+
+    pub(crate) fn update_bilibili_cache_fill_status(
+        &mut self,
+        result_id: &str,
+        status: &HlsCacheFillStatus,
+    ) -> bool {
+        let Some(result) = self
+            .results
+            .iter_mut()
+            .find(|result| result.id == result_id)
+        else {
+            return false;
+        };
+        let Some(provider_details) = result.provider_details.as_mut() else {
+            return false;
+        };
+        let Some(task_result_provider_details::Details::Bilibili(details)) =
+            provider_details.details.as_mut()
+        else {
+            return false;
+        };
+        if details.hls_cache_fill_status.as_ref() == Some(status) {
+            return false;
+        }
+        details.hls_cache_fill_status = Some(status.clone());
+        self.revision = self.revision.saturating_add(1).max(1);
+        self.snapshot_id = new_snapshot_id();
+        true
+    }
+
+    pub(crate) fn update_bilibili_cache_fill_status_for_task(
+        &mut self,
+        task: &Task,
+        result_id: &str,
+        status: &HlsCacheFillStatus,
+    ) -> Result<bool, TaskOutputValidationError> {
+        if self.legacy_managed {
+            self.reconcile_legacy_task(task)
+        } else {
+            Ok(self.update_bilibili_cache_fill_status(result_id, status))
+        }
     }
 
     pub(crate) fn replace(
@@ -602,6 +645,30 @@ impl std::error::Error for TaskOutputValidationError {}
 
 pub(crate) fn legacy_task_results(task: &Task) -> Vec<TaskResult> {
     if task.result_items.is_empty() {
+        let subject = (task.playback_session.is_some() || task.hls_cache_fill_status.is_some())
+            .then(|| {
+                let session = task.playback_session.as_ref();
+                let id = session
+                    .map(|session| {
+                        if session.content_id.is_empty() {
+                            session.id.as_str()
+                        } else {
+                            session.content_id.as_str()
+                        }
+                    })
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(task.id.as_str());
+                TaskResultSubject {
+                    provider: "bilibili".to_owned(),
+                    kind: if session.is_some() {
+                        "playback_session".to_owned()
+                    } else {
+                        "task".to_owned()
+                    },
+                    id: id.to_owned(),
+                    index: 0,
+                }
+            });
         return vec![TaskResult {
             id: task.id.clone(),
             state: task.state,
@@ -621,8 +688,18 @@ pub(crate) fn legacy_task_results(task: &Task) -> Vec<TaskResult> {
             artifacts: Vec::new(),
             created_at: task.created_at,
             updated_at: task.updated_at,
-            subject: None,
-            provider_details: None,
+            subject,
+            provider_details: (task.playback_session.is_some()
+                || task.hls_cache_fill_status.is_some())
+            .then(|| TaskResultProviderDetails {
+                details: Some(task_result_provider_details::Details::Bilibili(
+                    BilibiliTaskResultDetails {
+                        identity: None,
+                        playback_session: task.playback_session.clone(),
+                        hls_cache_fill_status: task.hls_cache_fill_status.clone(),
+                    },
+                )),
+            }),
         }];
     }
 
@@ -640,12 +717,15 @@ pub(crate) fn legacy_task_results(task: &Task) -> Vec<TaskResult> {
                 index: item.index,
             });
             let provider_details = (subject.is_some()
-                && (item.identity.is_some() || item.playback_session.is_some()))
+                && (item.identity.is_some()
+                    || item.playback_session.is_some()
+                    || item.hls_cache_fill_status.is_some()))
             .then(|| TaskResultProviderDetails {
                 details: Some(task_result_provider_details::Details::Bilibili(
                     BilibiliTaskResultDetails {
                         identity: item.identity.clone(),
                         playback_session: item.playback_session.clone(),
+                        hls_cache_fill_status: item.hls_cache_fill_status.clone(),
                     },
                 )),
             });
@@ -789,7 +869,10 @@ fn validate_result_subject_and_provider_details(
                     result.id
                 )));
             }
-            if details.identity.is_none() && details.playback_session.is_none() {
+            if details.identity.is_none()
+                && details.playback_session.is_none()
+                && details.hls_cache_fill_status.is_none()
+            {
                 return Err(TaskOutputValidationError::new(format!(
                     "Bilibili task result details must not be empty: {}",
                     result.id
@@ -1048,7 +1131,13 @@ fn provider_details_string_bytes(details: &TaskResultProviderDetails) -> usize {
                     .iter()
                     .map(bilibili_playback_session_string_bytes),
             )
-            .fold(0_usize, usize::saturating_add),
+            .fold(0_usize, usize::saturating_add)
+            .saturating_add(details.hls_cache_fill_status.as_ref().map_or(0, |status| {
+                status
+                    .representation_id
+                    .len()
+                    .saturating_add(status.message.len())
+            })),
         None => 0,
     }
 }
@@ -1459,6 +1548,7 @@ mod tests {
                         content_id: "2001".to_owned(),
                         ..Default::default()
                     }),
+                    hls_cache_fill_status: None,
                 },
             )),
         }

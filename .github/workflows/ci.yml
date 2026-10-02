@@ -63,5 +63,8 @@ jobs:
       - name: Run macOS XCTest target
         run: scripts/test-macos.sh
 
+      - name: Build and self-test LAN AVPlayer probe
+        run: bash scripts/test-lan-playback.sh
+
       - name: Run LAN cache server integration tests
         run: scripts/test-cache-server.sh

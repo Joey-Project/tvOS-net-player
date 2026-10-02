@@ -2114,6 +2114,123 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testTypedFillFailureOverridesLegacyMessageAndKeepsPlaybackAvailable() async {
+        let fillStatus = HlsCacheFillStatus(
+            state: .sourceUnavailable,
+            failureKind: .sourceUnavailable,
+            completedBytes: 300,
+            totalBytes: 1_000,
+            totalBytesKnown: true,
+            message: "Fresh playback source is unavailable."
+        )
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(
+                    message: "Offline cache fill paused because HLS quota watermark was reached.",
+                    hlsCacheFillStatus: fillStatus
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1typed-fill",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_PLAYABLE")
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Source unavailable; playable online")
+        XCTAssertEqual(model.progressiveCacheFillStatus?.progressPercentLabel, "30%")
+
+        model.clearTask()
+    }
+
+    func testMultiResultFillStatusesRemainPerResultAndSurfaceFailureBadge() async {
+        let resultItems = [
+            BilibiliTaskResultItem.fixture(
+                id: "result-complete",
+                title: "Cached part",
+                state: "TASK_STATE_COMPLETED",
+                hlsCacheFillStatus: HlsCacheFillStatus(state: .completed)
+            ),
+            BilibiliTaskResultItem.fixture(
+                id: "result-quota",
+                selectionID: "page:2",
+                title: "Playable part",
+                index: 2,
+                hlsCacheFillStatus: HlsCacheFillStatus(state: .blockedQuota)
+            ),
+        ]
+        let client = FakeBilibiliCacheControlClient(createResponses: [
+            .success(
+                .playableFixture(
+                    message: "Playing online.",
+                    resultItems: resultItems
+                ))
+        ])
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1multi-fill",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.canPlay)
+        XCTAssertEqual(model.taskResults.compactMap(\.hlsCacheFillStatus?.state), [.completed, .blockedQuota])
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Quota blocked; playable online")
+
+        model.clearTask()
+    }
+
+    func testV2PagedFillStatusAppearsInResultPresentation() async {
+        let summary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 1,
+            terminalResultCount: 0,
+            successfulResultCount: 0,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: "page-1"
+        )
+        let fillStatus = HlsCacheFillStatus(
+            state: .filling,
+            completedBytes: 200,
+            totalBytes: 800,
+            totalBytesKnown: true
+        )
+        let page = CacheTaskResultsPage(
+            results: [
+                CacheTaskResult.fixture(
+                    id: "page-1",
+                    title: "Paged result",
+                    hlsCacheFillStatus: fillStatus
+                )
+            ],
+            pageInfo: CachePageInfo(totalSize: 1, nextPageToken: "", snapshotID: "fill-snapshot"),
+            outputRevision: 1
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1paged-fill", state: "TASK_STATE_PLAYABLE", outputSummary: summary))
+            ],
+            taskResultPagesByTaskID: ["bilibili-playback-1": [page]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1paged-fill",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await waitUntil(model.taskResults.count == 1)
+
+        XCTAssertEqual(model.taskResults.first?.hlsCacheFillStatus, fillStatus)
+        XCTAssertEqual(model.taskResults.first?.hlsCacheFillStatus?.progressPercentLabel, "25%")
+        XCTAssertEqual(model.progressiveCacheStatusBadge?.label, "Filling offline cache")
+
+        model.clearTask()
+    }
+
     func testMultiResultTaskExposesSummaryAndPlayableResultFallback() async {
         let childResultID = "bilibili-playback-1-result-2"
         let resultItems: [BilibiliTaskResultItem] = [
@@ -4632,7 +4749,8 @@ private extension BilibiliTaskResultItem {
         state: String = "TASK_STATE_PLAYABLE",
         message: String = "Playable.",
         libraryItemID: String = "",
-        playbackSourceItemID: String? = nil
+        playbackSourceItemID: String? = nil,
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) -> Self {
         let itemID = playbackSourceItemID ?? (state == "TASK_STATE_COMPLETED" ? libraryItemID : id)
         return Self(
@@ -4663,7 +4781,8 @@ private extension BilibiliTaskResultItem {
                     selectedVariantID: "h264",
                     selectedVariant: nil,
                     variants: []
-                )
+                ),
+            hlsCacheFillStatus: hlsCacheFillStatus
         )
     }
 }
@@ -4703,7 +4822,8 @@ private extension CacheTaskResult {
     static func fixture(
         id: String,
         title: String,
-        artifacts: [CacheTaskArtifact] = []
+        artifacts: [CacheTaskArtifact] = [],
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) -> Self {
         Self(
             id: id,
@@ -4716,7 +4836,15 @@ private extension CacheTaskResult {
             playbackSource: nil,
             artifacts: artifacts,
             createdAt: nil,
-            updatedAt: nil
+            updatedAt: nil,
+            providerDetails: hlsCacheFillStatus.map {
+                .bilibili(
+                    BilibiliTaskResultDetails(
+                        identity: nil,
+                        playbackSession: nil,
+                        hlsCacheFillStatus: $0
+                    ))
+            }
         )
     }
 }
@@ -4736,7 +4864,8 @@ private extension CacheTask {
         playbackSession: CacheBilibiliPlaybackSession? = nil,
         bilibiliSelection: BilibiliTaskSelection? = nil,
         resultItems: [BilibiliTaskResultItem] = [],
-        outputSummary: CacheTaskOutputSummary? = nil
+        outputSummary: CacheTaskOutputSummary? = nil,
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) -> Self {
         Self(
             id: id,
@@ -4753,7 +4882,8 @@ private extension CacheTask {
             playbackSession: playbackSession,
             bilibiliSelection: bilibiliSelection,
             resultItems: resultItems,
-            outputSummary: outputSummary
+            outputSummary: outputSummary,
+            hlsCacheFillStatus: hlsCacheFillStatus
         )
     }
 
@@ -4767,7 +4897,8 @@ private extension CacheTask {
         progress: Double? = nil,
         downloadedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
-        resultItems: [BilibiliTaskResultItem] = []
+        resultItems: [BilibiliTaskResultItem] = [],
+        hlsCacheFillStatus: HlsCacheFillStatus? = nil
     ) -> Self {
         let resolvedPlaybackSourceItemID = playbackSourceItemID ?? id
         return .fixture(
@@ -4793,7 +4924,8 @@ private extension CacheTask {
                 selectedVariant: nil,
                 variants: []
             ),
-            resultItems: resultItems
+            resultItems: resultItems,
+            hlsCacheFillStatus: hlsCacheFillStatus
         )
     }
 }
