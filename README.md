@@ -244,31 +244,41 @@ scripts/test-cache-server.sh
 后续设置 required checks 时，建议至少 gate：
 
 - `CI / tvOS build and tests`
-- `codex/review-gate`
+- Default-branch v2 cutover target: `codex/github-review-gate` (activate only after the independent canary and coordinator readback).
 
 ## Codex Review Gate
 
-模板自带的 `.github/workflows/codex-review-gate.yml` 仍然保留。它写入 `codex/review-gate` status check，并把
-`JoeyTeng/codex-review-gate-action` 设为仓库 owner 明确批准的 floating `v1` major；自动获取兼容更新是有意设计。
+目标分支上的 `.github/workflows/codex-review-gate.yml` 现在使用 floating `v2` verifier，产生 `codex/github-review-gate`；旧 v1 status producer 写入的 `codex/review-gate` 是不同的 required context，不能由 v2 verifier 代发。
 
-启用 required status check 时，可以使用 `JoeyTeng/codex-review-gate` 的 bootstrap helper：
+当前 v2 contract 只支持目标为 repository default branch 的普通同仓库 PR。Verifier workflow 对所有 `pull_request` base 都会被 GitHub 触发；对 `release/*` 等非默认 base，v2 action 会 fail closed 并返回 unsupported，而不是提供有效 review-gate 覆盖。本迁移不会为 release 分支声称 v2 支持或更改 workflow trigger。依照已批准的 release 迁移边界，既有 `release/*` required-check 需求保持单独暂停，不由本 PR 恢复或扩大；只有确认 v2 支持相应 base、完成独立验证并由协调者核验后，才恢复原有的精确 release 保护要求。Fork-head PR 也不受支持：fork 上下文中的 `workflow_run.pull_requests` 可能为空，controller 因而无法安全关联 PR 并自动请求 review；这不是本安装的支持范围。
+
+本次 v2 安装不更改 production ruleset。迁移 PR 合并后，普通 PR 在 ruleset 仍要求旧 `codex/review-gate` context 时会暂时被阻塞；这是有意限定的维护窗口。窗口期间冻结其他合并，先由独立 canary PR 证明 v2 原生 gate 为绿色，再由协调者将 required context 切换为 `codex/github-review-gate` 并回读确认，随后才退役旧 v1 required context。保留所有无关的非 status 保护，不添加 legacy status writer，也不在此 PR 修改现网规则。
+
+v2 controller 不订阅 `pull_request_review` 或 `pull_request_review_comment`。因此 Codex 通过 PR review 或 inline findings 完成后不会自动触发 reconcile；这是未授予这些 review events 写工作流权限的边界，不通过新增可写 review-event job 绕过。需要恢复 gate 状态时，可从默认分支手动运行 controller 的 `reconcile` 操作：
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+gh workflow run codex-review-gate-controller.yml \
+  --repo Joey-Project/tvOS-net-player \
+  --ref master \
+  --field operation=reconcile \
+  --field pr_number=PR_NUMBER \
+  --field expected_head_sha=CURRENT_40_CHARACTER_HEAD_SHA \
+  --field request_review=false
 ```
 
-helper 默认 dry-run，并且会在 workflow 已经存在于默认分支前拒绝要求 `codex/review-gate`。
+`expected_head_sha` 必须是该 PR 的当前完整 head SHA。`reconcile` 不会发起新的 Codex review 请求。
+
+Legacy `JoeyTeng/codex-review-gate` bootstrap helper 只适用于 v1 的 `codex/review-gate` status；不要用它代替上面的 v2 ruleset cutover。此安装不自动修改 required contexts。
 
 ## 可选仓库变量
 
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
-- `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
-  runner is allocated.
-- `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
-- `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
-- `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`: clean completion buffer.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`: set to `false` to disable
-  same-head recovery after resolved Codex findings.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`: `head` or `fresh`.
+- `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST`: set to `true` to run both v2 verifier
+  and controller on `ubuntu-latest` when `ubuntu-slim` is unavailable. Otherwise
+  both use `ubuntu-slim`.
+- `CODEX_REVIEW_GATE_AUTO_REQUEST`: set to `true` to let the controller request
+  a Codex review for an eligible failed same-repository, default-base PR run.
+- `CODEX_REVIEW_GATE_LIMITS_PROFILE`: set to `expanded` to select the v2
+  expanded limits profile; unset or other values use `default`.
+
+Legacy v1 control variables are not read by these v2 workflows; setting them
+has no effect.
