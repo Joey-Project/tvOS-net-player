@@ -248,22 +248,31 @@ scripts/test-cache-server.sh
 
 ## Codex Review Gate
 
-模板自带的 `.github/workflows/codex-review-gate.yml` 仍然保留。它写入 `codex/review-gate` status check，并把
-`JoeyTeng/codex-review-gate-action` 设为仓库 owner 明确批准的 floating `v1` major；自动获取兼容更新是有意设计。
+目标分支上的 `.github/workflows/codex-review-gate.yml` 现在使用 floating `v2` verifier，产生 `codex/github-review-gate`；旧 v1 status producer 写入的 `codex/review-gate` 是不同的 required context，不能由 v2 verifier 代发。
 
-启用 required status check 时，可以使用 `JoeyTeng/codex-review-gate` 的 bootstrap helper：
+本次 v2 安装不更改 production ruleset。迁移 PR 合并后，普通 PR 在 ruleset 仍要求旧 `codex/review-gate` context 时会暂时被阻塞；这是有意限定的维护窗口。窗口期间冻结其他合并，先由独立 canary PR 证明 v2 原生 gate 为绿色，再由协调者将 required context 切换为 `codex/github-review-gate` 并回读确认，随后才退役旧 v1 required context。保留所有无关的非 status 保护，不添加 legacy status writer，也不在此 PR 修改现网规则。
+
+v2 controller 不订阅 `pull_request_review` 或 `pull_request_review_comment`。因此 Codex 通过 PR review 或 inline findings 完成后不会自动触发 reconcile；这是未授予这些 review events 写工作流权限的边界，不通过新增可写 review-event job 绕过。需要恢复 gate 状态时，可从默认分支手动运行 controller 的 `reconcile` 操作：
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+gh workflow run codex-review-gate-controller.yml \
+  --repo Joey-Project/tvOS-net-player \
+  --ref master \
+  --field operation=reconcile \
+  --field pr_number=PR_NUMBER \
+  --field expected_head_sha=CURRENT_40_CHARACTER_HEAD_SHA \
+  --field request_review=false
 ```
 
-helper 默认 dry-run，并且会在 workflow 已经存在于默认分支前拒绝要求 `codex/review-gate`。
+`expected_head_sha` 必须是该 PR 的当前完整 head SHA。`reconcile` 不会发起新的 Codex review 请求。
+
+Legacy `JoeyTeng/codex-review-gate` bootstrap helper 只适用于 v1 的 `codex/review-gate` status；不要用它代替上面的 v2 ruleset cutover。此安装不自动修改 required contexts。
 
 ## 可选仓库变量
 
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
+- `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST`: set to `true` to run both v2 verifier
+  and controller on `ubuntu-latest` when `ubuntu-slim` is unavailable. Otherwise
+  both use `ubuntu-slim`.
 - `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
   runner is allocated.
 - `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
