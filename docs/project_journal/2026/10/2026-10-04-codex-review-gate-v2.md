@@ -18,11 +18,12 @@ superseded_by:
 ## Current State
 - `.github/workflows/codex-review-gate.yml` uses the floating `@v2` action, read-only verifier permissions including `actions: read`, `request_author_permission: any`, and `request_review: false`.
 - `.github/workflows/codex-review-gate-controller.yml` is installed; `.github/CODEOWNERS` assigns workflow and CODEOWNERS ownership to `@JoeyTeng`.
-- The README documents `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST=true`, the manual default-branch `operation=reconcile` recovery for submitted Codex reviews, and the bounded legacy-context cutover: freeze other merges, pass an independent v2 canary, switch/read back the v2 required context, then retire the v1 requirement.
+- The README documents the default-branch-only v2 scope, fail-closed `release/*`/fork boundaries (fork workflow runs may lack a safely associable PR), paused pre-existing release required-check scope, current v2 variables (not legacy v1 controls), manual default-branch `operation=reconcile` recovery, and bounded legacy-context cutover.
 - The production ruleset is unchanged by this consumer installation. This note does not claim that a v2 production requirement or the wider repository migration is complete.
 
 ## Next Steps
 - During the separately authorized ruleset transition, preserve unrelated protections and add no new `@codex` requirement; keep ordinary merges frozen across the documented v1-to-v2 required-context window.
+- Keep the exact pre-existing `release/*` required-check requirement paused until explicit release-base support and independent verification; this consumer change does not enable or restore release branch protection.
 - Continue the remaining consumer rollout before recording the shared cutover as complete.
 
 ## Evidence
