@@ -42,6 +42,8 @@ BILIBILI_LIVE_E2E_SUSTAINED_SECONDS=300 \
 just test-bilibili-live
 ```
 
+For full-asset fill, same-root restart, and cache-only validation of a canonical single-result ordinary or Bangumi case, read [references/full-fill-validation.md](references/full-fill-validation.md). Native AVPlayer decoding is a separate probe; sustained HTTP reads alone do not establish player decoding.
+
 6. Default runs skip `requires_collection_list_validation` cases. Collection/list cases cover favorite lists, uploader space videos, uploader collections, uploader series, and homepage recommendations; they are explicit because public-looking Bilibili list/feed APIs can require cookies, become empty, be rate-limited, or change availability independently of the app. Prefer `BILIBILI_LIVE_E2E_CASES=space-collection` for the stable public collection smoke. `BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST=1` adds eligible unauthenticated collection/list cases to a broader unfiltered local sweep, but that sweep can still fail on upstream availability/rate limits. Authenticated collection/list cases require `BILIBILI_LIVE_E2E_INCLUDE_AUTHENTICATED=1` and a web-cookie credential, and cases marked `requires_live_sample_override` need a current URL override before they join the unfiltered sweep:
 
 ```bash
@@ -104,5 +106,6 @@ The credential file uses the `bbdown-core` JSON shape with optional `cookie`, `a
 
 - `references/live-cases.json`: canonical real Bilibili e2e inputs.
 - `references/restricted-api-proxies.json`: BiliRoaming public reverse-proxy registry with latest known local validation status.
+- `references/full-fill-validation.md`: bounded whole-asset resume/offline validation and native-player handoff constraints.
 - `../../../scripts/test-bilibili-live.sh`: repo command used by the skill.
 - `CacheServer/RustCacheServer/tests/bilibili_live_e2e.rs`: ignored Rust integration test run by the script.
