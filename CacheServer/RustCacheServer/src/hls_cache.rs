@@ -186,6 +186,24 @@ struct EtagMismatchProbe {
     prefix_etag_syntax_valid: bool,
 }
 
+enum CandidateVerificationError {
+    Fallback(HlsRangeError),
+    Mismatch(HlsRangeError),
+    Abort(HlsRangeError),
+}
+
+impl From<HlsRangeError> for CandidateVerificationError {
+    fn from(error: HlsRangeError) -> Self {
+        match error {
+            HlsRangeError::Network(_)
+            | HlsRangeError::UpstreamStatus(_)
+            | HlsRangeError::RangeUnsupported
+            | HlsRangeError::InvalidResponse(_) => Self::Fallback(error),
+            error => Self::Abort(error),
+        }
+    }
+}
+
 impl HlsCacheStore {
     pub(crate) fn new(root_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -2173,6 +2191,7 @@ impl HlsCacheStore {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct LoadedRangeManifest {
     manifest: PersistedRangeManifest,
     bytes_digest: String,
@@ -2319,6 +2338,92 @@ impl HlsCacheStore {
             .ok_or(HlsRangeError::IdentityChanged)
     }
 
+    async fn publish_validated_origin(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        expected: LoadedRangeManifest,
+        origin: String,
+        strong_etag: Option<String>,
+    ) -> Result<LoadedRangeManifest, HlsRangeError> {
+        let prefix_sha256 = expected
+            .manifest
+            .prefix_sha256
+            .clone()
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        let key = self.range_resource_key(session_id, resource)?;
+        let publication_lock = self.range_publication_lock(&key);
+        let _publication = publication_lock.lock().await;
+        let current = self
+            .load_range_manifest(session_id, resource)?
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        if !range_manifest_rebase_compatible_for_origin_validation(
+            &expected.manifest,
+            &current.manifest,
+            &origin,
+        ) {
+            return Err(identity_error_at("origin-binding-rebase"));
+        }
+        let binding_state = |manifest: &PersistedRangeManifest| {
+            manifest
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == origin)
+                .map(|binding| (binding.prefix_sha256.clone(), binding.strong_etag.clone()))
+        };
+        let expected_binding = binding_state(&expected.manifest);
+        let current_binding = binding_state(&current.manifest);
+        let desired_binding = Some((prefix_sha256.clone(), strong_etag.clone()));
+        if current_binding == desired_binding {
+            return Ok(current);
+        }
+        if current_binding != expected_binding {
+            return Err(identity_error_at("origin-binding-validator-conflict"));
+        }
+
+        let mut manifest = current.manifest.clone();
+        if let Some(binding) = manifest
+            .validated_origins
+            .iter_mut()
+            .find(|binding| binding.origin == origin)
+        {
+            binding.prefix_sha256 = prefix_sha256;
+            binding.strong_etag = strong_etag;
+        } else {
+            manifest.validated_origins.push(PersistedRangeOrigin {
+                origin,
+                prefix_sha256,
+                strong_etag,
+            });
+            manifest.validated_origins.truncate(64);
+        }
+        manifest.generation = manifest
+            .generation
+            .checked_add(1)
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        manifest.durable_bytes = durable_extent_bytes(&manifest.extents);
+        validate_range_manifest(&manifest, resource)?;
+        let path = self.resource_range_manifest_path(session_id, &resource.id)?;
+        let latest = self
+            .load_range_manifest(session_id, resource)?
+            .ok_or(HlsRangeError::IdentityChanged)?;
+        if latest.file_identity != current.file_identity
+            || latest.bytes_digest != current.bytes_digest
+            || !range_manifest_rebase_compatible(&current.manifest, &latest.manifest)
+        {
+            return Err(identity_error_at("origin-binding-publish-content"));
+        }
+        self.write_json_atomically(&path, &manifest)?;
+        sync_directory(path.parent().ok_or_else(|| {
+            HlsRangeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cache path",
+            ))
+        })?)?;
+        self.load_range_manifest(session_id, resource)?
+            .ok_or(HlsRangeError::IdentityChanged)
+    }
+
     fn data_path_for_manifest(
         &self,
         session_id: &str,
@@ -2367,24 +2472,24 @@ impl HlsCacheStore {
         let key = self.range_resource_key(session_id, resource)?;
         let publication_lock = self.range_publication_lock(&key);
         let _publication = publication_lock.lock().await;
+        let origin = media_url_origin(final_url)
+            .ok_or_else(|| HlsRangeError::InvalidResponse("invalid CDN origin".to_owned()))?;
         let loaded = self
             .load_range_manifest(session_id, resource)?
             .ok_or(HlsRangeError::IdentityChanged)?;
-        if !range_manifest_rebase_compatible(expected, &loaded.manifest) {
+        if !range_manifest_rebase_compatible_for_extent_publication(
+            expected,
+            &loaded.manifest,
+            &origin,
+        ) {
             return Err(identity_error_at("extent-publish-rebase"));
         }
-        let origin = media_url_origin(final_url)
-            .ok_or_else(|| HlsRangeError::InvalidResponse("invalid CDN origin".to_owned()))?;
         if let Some(binding) = loaded
             .manifest
             .validated_origins
             .iter()
             .find(|binding| binding.origin == origin)
-            && binding
-                .strong_etag
-                .as_ref()
-                .zip(etag.as_ref())
-                .is_some_and(|(previous, current)| previous != current)
+            && binding.strong_etag != etag
         {
             return Err(identity_error_at("extent-origin-validator-change"));
         }
@@ -3790,7 +3895,7 @@ impl HlsCacheStore {
                     drop(flight);
                     return Ok(());
                 }
-                let (bytes, final_url, etag, last_modified, elapsed) = self
+                let (bytes, final_url, etag, last_modified, elapsed, verified_manifest) = self
                     .fetch_range_chunk(
                         client,
                         session_id,
@@ -3805,7 +3910,7 @@ impl HlsCacheStore {
                     .commit_range_extent(
                         session_id,
                         resource,
-                        &loaded.manifest,
+                        &verified_manifest,
                         range.clone(),
                         &bytes,
                         &final_url,
@@ -3944,7 +4049,17 @@ impl HlsCacheStore {
         chunk_index: u64,
         priority: HlsRangePriority,
         control: &F,
-    ) -> Result<(Vec<u8>, String, Option<String>, Option<String>, Duration), HlsRangeError>
+    ) -> Result<
+        (
+            Vec<u8>,
+            String,
+            Option<String>,
+            Option<String>,
+            Duration,
+            PersistedRangeManifest,
+        ),
+        HlsRangeError,
+    >
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
@@ -3953,16 +4068,12 @@ impl HlsCacheStore {
             .rank_request_for_range(&resource.request, chunk_index);
         let mut last_error = None;
         let mut range_unsupported_seen = false;
-        let mut quarantined_origins = HashSet::new();
         for url in candidates.into_iter().filter(|url| !url.trim().is_empty()) {
             self.range_cache
                 .check_priority_control(chunk_key, priority, control)?;
             let origin = media_url_origin(&url).ok_or_else(|| {
                 HlsRangeError::InvalidResponse("invalid CDN candidate origin".to_owned())
             })?;
-            if quarantined_origins.contains(&origin) {
-                continue;
-            }
             let Some(mut loaded) = self
                 .load_range_manifest_serialized(session_id, resource)
                 .await?
@@ -3975,16 +4086,14 @@ impl HlsCacheStore {
                 .iter()
                 .find(|entry| entry.origin == origin)
                 .cloned();
-            if let Some(prefix_digest) = &loaded.manifest.prefix_sha256
-                && existing_origin.is_none()
-            {
-                let prefix_digest = prefix_digest.clone();
+            if loaded.manifest.prefix_sha256.is_some() && existing_origin.is_none() {
                 let (validated_origin, candidate_etag) = match self
                     .verify_candidate_prefix(
                         client,
+                        session_id,
                         resource,
                         &url,
-                        &origin,
+                        None,
                         chunk_key,
                         &loaded.manifest,
                         priority,
@@ -3993,34 +4102,45 @@ impl HlsCacheStore {
                     .await
                 {
                     Ok(binding) => binding,
-                    Err(HlsRangeError::RangeUnsupported) => {
+                    Err(CandidateVerificationError::Fallback(HlsRangeError::RangeUnsupported)) => {
                         range_unsupported_seen = true;
                         last_error = Some(HlsRangeError::RangeUnsupported);
                         continue;
                     }
-                    Err(error) => {
-                        if is_retryable_range_candidate_error(&error) {
-                            last_error = Some(error);
-                            continue;
+                    Err(CandidateVerificationError::Fallback(error)) => {
+                        self.record_cdn_observation(
+                            resource,
+                            &url,
+                            passive_cache_observation(
+                                range_outcome_for_error(&error),
+                                0,
+                                None,
+                                None,
+                                Some(false),
+                            ),
+                        );
+                        if matches!(error, HlsRangeError::RangeUnsupported) {
+                            range_unsupported_seen = true;
                         }
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Mismatch(error)) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Abort(error)) => {
                         return Err(error);
                     }
                 };
                 loaded = self
-                    .publish_range_manifest(session_id, resource, loaded, |manifest| {
-                        if !manifest
-                            .validated_origins
-                            .iter()
-                            .any(|entry| entry.origin == validated_origin)
-                        {
-                            manifest.validated_origins.push(PersistedRangeOrigin {
-                                origin: validated_origin.clone(),
-                                prefix_sha256: prefix_digest.clone(),
-                                strong_etag: candidate_etag,
-                            });
-                            manifest.validated_origins.truncate(64);
-                        }
-                    })
+                    .publish_validated_origin(
+                        session_id,
+                        resource,
+                        loaded,
+                        validated_origin,
+                        candidate_etag,
+                    )
                     .await?;
             }
 
@@ -4147,14 +4267,14 @@ impl HlsCacheStore {
                 .validated_origins
                 .iter()
                 .find(|binding| binding.origin == observed_origin);
-            let baseline_etag = observed_binding
-                .as_ref()
-                .and_then(|binding| binding.strong_etag.as_ref())
-                .cloned();
-            if let (Some(baseline_etag), Some(response_etag)) =
-                (baseline_etag, response_etag.as_ref())
-                && baseline_etag.as_str() != response_etag.as_str()
-            {
+            let baseline_etag = observed_binding.and_then(|binding| binding.strong_etag.clone());
+            let validator_changed =
+                observed_binding.is_some_and(|binding| binding.strong_etag != response_etag);
+            let origin_unvalidated = observed_binding.is_none();
+            let must_revalidate = loaded.manifest.prefix_sha256.is_some()
+                && (origin_unvalidated || validator_changed);
+            if validator_changed {
+                let baseline_etag = baseline_etag.as_deref().unwrap_or_default();
                 if ETAG_MISMATCH_DIAGNOSTIC_USED
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
@@ -4167,7 +4287,7 @@ impl HlsCacheStore {
                             &observed_origin,
                             chunk_key,
                             &loaded.manifest,
-                            &baseline_etag,
+                            baseline_etag,
                             priority,
                             control,
                         )
@@ -4183,21 +4303,65 @@ impl HlsCacheStore {
                         probe.prefix_etag_syntax_valid,
                     );
                 }
-                self.record_cdn_observation(
-                    resource,
-                    &final_url,
-                    passive_cache_observation(
-                        CdnObservationOutcome::IntegrityMismatch,
-                        length,
-                        Some(started.elapsed()),
-                        None,
-                        Some(false),
-                    ),
-                );
-                quarantined_origins.insert(origin);
-                quarantined_origins.insert(observed_origin);
-                last_error = Some(identity_error_at("chunk-origin-etag-change"));
-                continue;
+            }
+            if must_revalidate {
+                match self
+                    .verify_candidate_prefix(
+                        client,
+                        session_id,
+                        resource,
+                        &url,
+                        Some(&observed_origin),
+                        chunk_key,
+                        &loaded.manifest,
+                        priority,
+                        control,
+                    )
+                    .await
+                {
+                    Ok((verified_origin, _prefix_etag)) if verified_origin == observed_origin => {
+                        loaded = self
+                            .publish_validated_origin(
+                                session_id,
+                                resource,
+                                loaded,
+                                observed_origin.clone(),
+                                response_etag.clone(),
+                            )
+                            .await?;
+                    }
+                    Ok((_, _)) => {
+                        last_error = Some(HlsRangeError::InvalidResponse(
+                            "candidate origin changed during content revalidation".to_owned(),
+                        ));
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Fallback(error)) => {
+                        self.record_cdn_observation(
+                            resource,
+                            &final_url,
+                            passive_cache_observation(
+                                range_outcome_for_error(&error),
+                                length,
+                                Some(started.elapsed()),
+                                None,
+                                Some(false),
+                            ),
+                        );
+                        if matches!(error, HlsRangeError::RangeUnsupported) {
+                            range_unsupported_seen = true;
+                        }
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Mismatch(error)) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                    Err(CandidateVerificationError::Abort(error)) => {
+                        return Err(error);
+                    }
+                }
             }
             let last_modified = headers
                 .get(reqwest::header::LAST_MODIFIED)
@@ -4211,7 +4375,14 @@ impl HlsCacheStore {
             {
                 modified = loaded.manifest.last_modified.clone();
             }
-            return Ok((body, final_url, etag, modified, started.elapsed()));
+            return Ok((
+                body,
+                final_url,
+                etag,
+                modified,
+                started.elapsed(),
+                loaded.manifest,
+            ));
         }
         Err(if range_unsupported_seen {
             HlsRangeError::RangeUnsupported
@@ -4291,20 +4462,23 @@ impl HlsCacheStore {
     async fn verify_candidate_prefix<F>(
         &self,
         client: &reqwest::Client,
+        session_id: &str,
         resource: &HlsMediaResource,
         url: &str,
-        _origin: &str,
+        expected_origin: Option<&str>,
         chunk_key: &RangeChunkKey,
         manifest: &PersistedRangeManifest,
         priority: HlsRangePriority,
         control: &F,
-    ) -> Result<(String, Option<String>), HlsRangeError>
+    ) -> Result<(String, Option<String>), CandidateVerificationError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
         let prefix_length = manifest.prefix_length;
         if prefix_length == 0 || prefix_length > chunk_key.total_length {
-            return Err(identity_error_at("prefix-length-binding"));
+            return Err(CandidateVerificationError::Abort(identity_error_at(
+                "prefix-length-binding",
+            )));
         }
         let response = self
             .send_range_request(
@@ -4320,6 +4494,13 @@ impl HlsCacheStore {
         let final_url = response.url().as_str().to_owned();
         let final_origin = media_url_origin(&final_url)
             .ok_or_else(|| HlsRangeError::InvalidResponse("invalid CDN origin".to_owned()))?;
+        if expected_origin.is_some_and(|expected| final_origin != expected) {
+            return Err(CandidateVerificationError::Fallback(
+                HlsRangeError::InvalidResponse(
+                    "prefix response redirected to an unvalidated origin".to_owned(),
+                ),
+            ));
+        }
         if response.status() == StatusCode::OK {
             self.record_cdn_observation(
                 resource,
@@ -4332,7 +4513,9 @@ impl HlsCacheStore {
                     Some(false),
                 ),
             );
-            return Err(HlsRangeError::RangeUnsupported);
+            return Err(CandidateVerificationError::Fallback(
+                HlsRangeError::RangeUnsupported,
+            ));
         }
         if response.status() != StatusCode::PARTIAL_CONTENT {
             self.record_cdn_observation(
@@ -4346,7 +4529,9 @@ impl HlsCacheStore {
                     None,
                 ),
             );
-            return Err(HlsRangeError::UpstreamStatus(response.status()));
+            return Err(CandidateVerificationError::Fallback(
+                HlsRangeError::UpstreamStatus(response.status()),
+            ));
         }
         if parse_content_range_header(response.headers())
             != Some((0, prefix_length - 1, chunk_key.total_length))
@@ -4362,8 +4547,8 @@ impl HlsCacheStore {
                     Some(false),
                 ),
             );
-            return Err(HlsRangeError::InvalidResponse(
-                "upstream prefix range is inconsistent".to_owned(),
+            return Err(CandidateVerificationError::Fallback(
+                HlsRangeError::InvalidResponse("upstream prefix range is inconsistent".to_owned()),
             ));
         }
         let etag = strong_etag(response.headers());
@@ -4391,7 +4576,7 @@ impl HlsCacheStore {
                         ),
                     );
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         if Some(sha256_hex(&bytes)) != manifest.prefix_sha256 {
@@ -4406,8 +4591,24 @@ impl HlsCacheStore {
                     Some(false),
                 ),
             );
-            return Err(identity_error_at("prefix-content-hash"));
+            return Err(CandidateVerificationError::Mismatch(
+                HlsRangeError::InvalidResponse(
+                    "candidate prefix content does not match the durable prefix".to_owned(),
+                ),
+            ));
         }
+        self.verify_candidate_samples(
+            client,
+            session_id,
+            resource,
+            url,
+            &final_origin,
+            chunk_key,
+            manifest,
+            priority,
+            control,
+        )
+        .await?;
         self.record_cdn_observation(
             resource,
             &final_url,
@@ -4420,6 +4621,103 @@ impl HlsCacheStore {
             ),
         );
         Ok((final_origin, etag))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_candidate_samples<F>(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        url: &str,
+        expected_origin: &str,
+        chunk_key: &RangeChunkKey,
+        manifest: &PersistedRangeManifest,
+        priority: HlsRangePriority,
+        control: &F,
+    ) -> Result<(), CandidateVerificationError>
+    where
+        F: Fn() -> HlsCacheFillControl + Send + Sync,
+    {
+        for sample in select_cross_cdn_sample_ranges(&manifest.extents, manifest.prefix_length) {
+            let Some(durable_bytes) = self
+                .read_durable_range(session_id, resource, sample.clone())
+                .await
+                .map_err(CandidateVerificationError::Abort)?
+            else {
+                return Err(CandidateVerificationError::Abort(identity_error_at(
+                    "sample-no-longer-durable",
+                )));
+            };
+            let response = self
+                .send_range_request(
+                    client,
+                    resource,
+                    url,
+                    sample.clone(),
+                    chunk_key,
+                    priority,
+                    control,
+                )
+                .await?;
+            if response.status() == StatusCode::OK {
+                return Err(CandidateVerificationError::Fallback(
+                    HlsRangeError::RangeUnsupported,
+                ));
+            }
+            if response.status() != StatusCode::PARTIAL_CONTENT {
+                return Err(CandidateVerificationError::Fallback(
+                    HlsRangeError::UpstreamStatus(response.status()),
+                ));
+            }
+            let response_origin = media_url_origin(response.url().as_str()).ok_or_else(|| {
+                HlsRangeError::InvalidResponse("invalid sample origin".to_owned())
+            })?;
+            if response_origin != expected_origin {
+                return Err(CandidateVerificationError::Fallback(
+                    HlsRangeError::InvalidResponse(
+                        "sample response redirected to an unvalidated origin".to_owned(),
+                    ),
+                ));
+            }
+            if parse_content_range_header(response.headers())
+                != Some((sample.start, sample.end - 1, chunk_key.total_length))
+            {
+                return Err(CandidateVerificationError::Fallback(
+                    HlsRangeError::InvalidResponse(
+                        "upstream sample range does not match the request".to_owned(),
+                    ),
+                ));
+            }
+            let sample_bytes = self
+                .read_range_body(
+                    response,
+                    sample.end - sample.start,
+                    chunk_key,
+                    priority,
+                    control,
+                )
+                .await?;
+            if sample_bytes != durable_bytes {
+                self.record_cdn_observation(
+                    resource,
+                    url,
+                    passive_cache_observation(
+                        CdnObservationOutcome::IntegrityMismatch,
+                        sample_bytes.len() as u64,
+                        None,
+                        None,
+                        Some(false),
+                    ),
+                );
+                return Err(CandidateVerificationError::Mismatch(
+                    HlsRangeError::InvalidResponse(
+                        "candidate sample content does not match the durable extent".to_owned(),
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -5304,6 +5602,41 @@ fn range_manifest_rebase_compatible(
     expected: &PersistedRangeManifest,
     current: &PersistedRangeManifest,
 ) -> bool {
+    range_manifest_rebase_compatible_ignoring_origin(expected, current, None, false)
+}
+
+fn range_manifest_rebase_compatible_for_origin_validation(
+    expected: &PersistedRangeManifest,
+    current: &PersistedRangeManifest,
+    target_origin: &str,
+) -> bool {
+    range_manifest_rebase_compatible_ignoring_origin(expected, current, Some(target_origin), true)
+}
+
+fn range_manifest_rebase_compatible_for_extent_publication(
+    expected: &PersistedRangeManifest,
+    current: &PersistedRangeManifest,
+    target_origin: &str,
+) -> bool {
+    if !range_manifest_rebase_compatible_ignoring_origin(expected, current, None, true) {
+        return false;
+    }
+    let binding_state = |manifest: &PersistedRangeManifest| {
+        manifest
+            .validated_origins
+            .iter()
+            .find(|binding| binding.origin == target_origin)
+            .map(|binding| (binding.prefix_sha256.clone(), binding.strong_etag.clone()))
+    };
+    binding_state(expected) == binding_state(current)
+}
+
+fn range_manifest_rebase_compatible_ignoring_origin(
+    expected: &PersistedRangeManifest,
+    current: &PersistedRangeManifest,
+    ignored_origin: Option<&str>,
+    allow_validator_update: bool,
+) -> bool {
     if expected.resource_id != current.resource_id
         || expected.representation_digest != current.representation_digest
         || expected.data_identity != current.data_identity
@@ -5318,18 +5651,21 @@ fn range_manifest_rebase_compatible(
     {
         return false;
     }
-    if let Some(origin) = expected.validator_origin.as_deref()
-        && let Some(old) = expected
+    for old in &expected.validated_origins {
+        if ignored_origin == Some(old.origin.as_str()) {
+            continue;
+        }
+        if current
             .validated_origins
             .iter()
-            .find(|entry| entry.origin == origin)
-        && current
-            .validated_origins
-            .iter()
-            .find(|entry| entry.origin == origin)
-            .is_none_or(|new| new.strong_etag != old.strong_etag)
-    {
-        return false;
+            .find(|new| new.origin == old.origin)
+            .is_none_or(|new| {
+                new.prefix_sha256 != old.prefix_sha256
+                    || (!allow_validator_update && new.strong_etag != old.strong_etag)
+            })
+        {
+            return false;
+        }
     }
     expected.extents.iter().all(|old| {
         current
@@ -5357,6 +5693,59 @@ fn range_is_covered(extents: &[PersistedRangeExtent], requested: Range<u64>) -> 
         }
     }
     false
+}
+
+const HLS_CROSS_CDN_SAMPLE_BYTES: u64 = 16 * 1024;
+const HLS_CROSS_CDN_MAX_SAMPLES: usize = 3;
+
+fn select_cross_cdn_sample_ranges(
+    extents: &[PersistedRangeExtent],
+    prefix_length: u64,
+) -> Vec<Range<u64>> {
+    let intervals: Vec<_> = extents
+        .iter()
+        .filter_map(|extent| {
+            let start = extent.start.max(prefix_length);
+            (start < extent.end).then_some(start..extent.end)
+        })
+        .collect();
+    let available_bytes = intervals
+        .iter()
+        .map(|range| range.end - range.start)
+        .sum::<u64>();
+    if available_bytes == 0 {
+        return Vec::new();
+    }
+
+    let mut samples = Vec::with_capacity(HLS_CROSS_CDN_MAX_SAMPLES);
+    for target in [0, (available_bytes - 1) / 2, available_bytes - 1] {
+        let mut offset = target;
+        let interval = intervals.iter().find(|range| {
+            let length = range.end - range.start;
+            if offset < length {
+                true
+            } else {
+                offset -= length;
+                false
+            }
+        });
+        let Some(interval) = interval else {
+            continue;
+        };
+        let length = (interval.end - interval.start).min(HLS_CROSS_CDN_SAMPLE_BYTES);
+        let center = interval.start + offset;
+        let start = center
+            .saturating_sub(length / 2)
+            .clamp(interval.start, interval.end - length);
+        let sample = start..start + length;
+        if !samples
+            .iter()
+            .any(|existing: &Range<u64>| existing.start < sample.end && sample.start < existing.end)
+        {
+            samples.push(sample);
+        }
+    }
+    samples
 }
 
 fn durable_extent_bytes(extents: &[PersistedRangeExtent]) -> u64 {
@@ -7111,64 +7500,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_etag_mismatch_rejects_candidate_and_retries_verified_backup() {
+    async fn same_origin_changed_etag_revalidates_samples_and_commits_with_refreshed_manifest() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
-        let body = Arc::new(fake_mp4());
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
         let prefix_length = 16_u64;
         let client = reqwest::Client::new();
 
-        for (index, corrupt_tail) in [false, true].into_iter().enumerate() {
-            let (url, _task) = start_etag_range_upstream(
-                Arc::clone(&body),
-                "\"prefix-v1\"",
-                "\"tail-v2\"",
-                corrupt_tail,
-            )
-            .await;
-            let session = sample_session(&format!("etag-reject-{index}"), &url);
-            let key = seed_range_prefix(
-                &store,
-                &session,
-                &url,
-                &body,
-                prefix_length,
-                "\"prefix-v1\"",
-            )
-            .await;
-            let _activity = store
-                .range_cache
-                .enter(&session.id, HlsRangePriority::Foreground)
-                .expect("foreground activity should be admitted");
-            let error = store
-                .fetch_range_chunk(
-                    &client,
-                    &session.id,
-                    &session.variant.video,
-                    &key,
-                    0,
-                    HlsRangePriority::Foreground,
-                    &|| HlsCacheFillControl::Continue,
-                )
-                .await
-                .expect_err("changed strong ETag must reject the candidate");
-            assert!(matches!(error, HlsRangeError::IdentityChanged));
-            let loaded = store
-                .load_range_manifest(&session.id, &session.variant.video)
-                .expect("checkpoint should revalidate")
-                .expect("prefix checkpoint should remain");
-            assert_eq!(prefix_length, loaded.manifest.durable_bytes);
-            assert_eq!(1, loaded.manifest.extents.len());
-        }
-
-        let (primary_url, _primary_task) =
+        let (url, _task) =
             start_etag_range_upstream(Arc::clone(&body), "\"prefix-v1\"", "\"tail-v2\"", false)
                 .await;
-        let (backup_url, _backup_task) = start_etag_range_upstream(
+        let session = sample_session("etag-resume-publish", &url);
+        let mut key = seed_range_prefix(
+            &store,
+            &session,
+            &url,
+            &body,
+            prefix_length,
+            "\"prefix-v1\"",
+        )
+        .await;
+        key.range = prefix_length..32 * 1024;
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                64 * 1024..128 * 1024,
+                &body[64 * 1024..128 * 1024],
+                &url,
+                Some("\"prefix-v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("sample should use the currently accepted validator");
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        store
+            .ensure_range_span(
+                &client,
+                &session.id,
+                &session.variant.video,
+                &key.resource,
+                key.range.clone(),
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+                &|_| {},
+            )
+            .await
+            .expect("verified tag update should publish the fetched chunk");
+        assert_eq!(
+            Some(body[prefix_length as usize..32 * 1024].to_vec()),
+            store
+                .read_durable_range(&session.id, &session.variant.video, key.range.clone())
+                .await
+                .expect("committed chunk should validate")
+        );
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("checkpoint should revalidate")
+            .expect("prefix checkpoint should remain");
+        assert_eq!(
+            Some("\"tail-v2\""),
+            loaded
+                .manifest
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == media_url_origin(&url).unwrap())
+                .and_then(|binding| binding.strong_etag.as_deref())
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_only_resume_accepts_later_strong_etag_without_remote_samples() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(fake_mp4());
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"prefix-v1\"", "\"tail-v2\"", false)
+                .await;
+        let session = sample_session("prefix-only-revalidation", &url);
+        let key = seed_range_prefix(&store, &session, &url, &body, 16, "\"prefix-v1\"").await;
+        assert!(
+            select_cross_cdn_sample_ranges(
+                &store
+                    .load_range_manifest(&session.id, &session.variant.video)
+                    .expect("prefix checkpoint should validate")
+                    .expect("prefix checkpoint should exist")
+                    .manifest
+                    .extents,
+                16,
+            )
+            .is_empty()
+        );
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        let (bytes, _, etag, _, _, _) = store
+            .fetch_range_chunk(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                &key,
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("prefix-only content revalidation should accept the changed tag");
+        assert_eq!(body[16..], bytes);
+        assert_eq!(Some("\"tail-v2\"".to_owned()), etag);
+    }
+
+    #[tokio::test]
+    async fn new_origin_sample_corruption_falls_back_without_identity_etag_assumptions() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let prefix_length = 16_u64;
+        let client = reqwest::Client::new();
+        let (seed_url, _seed_task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"seed\"", "\"seed\"", false).await;
+        let (primary_url, _primary_task, primary_requests) = start_etag_range_upstream_configured(
+            Arc::clone(&body),
+            "\"prefix-v1\"",
+            "\"tail-v2\"",
+            true,
+            None,
+            Some(64 * 1024),
+        )
+        .await;
+        let (backup_url, _backup_task, backup_requests) = start_etag_range_upstream_configured(
             Arc::clone(&body),
             "\"backup-prefix\"",
             "\"backup-prefix\"",
             false,
+            None,
+            Some(64 * 1024),
         )
         .await;
         let mut session = sample_session("etag-backup", &primary_url);
@@ -7178,20 +7662,38 @@ mod tests {
             .request
             .backup_urls
             .push(backup_url.clone());
-        let key = seed_range_prefix(
+        let mut key = seed_range_prefix(
             &store,
             &session,
-            &primary_url,
+            &seed_url,
             &body,
             prefix_length,
-            "\"prefix-v1\"",
+            "\"seed\"",
         )
         .await;
+        key.range = prefix_length..32 * 1024;
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                64 * 1024..128 * 1024,
+                &body[64 * 1024..128 * 1024],
+                &seed_url,
+                Some("\"seed\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("non-prefix sample bytes should become durable");
         let _activity = store
             .range_cache
             .enter(&session.id, HlsRangePriority::Foreground)
             .expect("foreground activity should be admitted");
-        let (bytes, final_url, etag, _, _) = store
+        let (bytes, final_url, etag, _, _, verified_manifest) = store
             .fetch_range_chunk(
                 &client,
                 &session.id,
@@ -7202,19 +7704,18 @@ mod tests {
                 &|| HlsCacheFillControl::Continue,
             )
             .await
-            .expect("verified backup should be accepted after candidate mismatch");
-        assert_eq!(body[prefix_length as usize..], bytes);
+            .expect("verified backup should be accepted after sampled candidate mismatch");
+        assert_eq!(body[prefix_length as usize..32 * 1024], bytes);
         assert_eq!(backup_url, final_url);
         assert_eq!(Some("\"backup-prefix\"".to_owned()), etag);
-        let loaded = store
-            .load_range_manifest(&session.id, &session.variant.video)
-            .expect("checkpoint should revalidate")
-            .expect("prefix checkpoint should remain");
+        assert!(primary_requests.load(Ordering::Relaxed) > 0);
+        assert!(primary_requests.load(Ordering::Relaxed) <= 1 + HLS_CROSS_CDN_MAX_SAMPLES);
+        assert!(backup_requests.load(Ordering::Relaxed) <= 2 + HLS_CROSS_CDN_MAX_SAMPLES);
         store
             .commit_range_extent(
                 &session.id,
                 &session.variant.video,
-                &loaded.manifest,
+                &verified_manifest,
                 key.range.clone(),
                 &bytes,
                 &final_url,
@@ -7225,9 +7726,8 @@ mod tests {
             .expect("verified backup bytes should publish");
         let loaded = store
             .load_range_manifest(&session.id, &session.variant.video)
-            .expect("complete checkpoint should validate")
-            .expect("complete checkpoint should exist");
-        assert_eq!(body.len() as u64, loaded.manifest.durable_bytes);
+            .expect("checkpoint should validate")
+            .expect("checkpoint should exist");
         assert!(
             loaded
                 .manifest
@@ -7235,6 +7735,789 @@ mod tests {
                 .iter()
                 .any(|origin| origin.strong_etag.as_deref() == Some("\"backup-prefix\""))
         );
+    }
+
+    #[tokio::test]
+    async fn sample_short_body_and_wrong_content_range_reject_new_origin() {
+        for (case, fault, expected_error) in [
+            ("short", SampleResponseFault::ShortBody, "invalid-response"),
+            (
+                "wrong-range",
+                SampleResponseFault::WrongRange,
+                "invalid-response",
+            ),
+            (
+                "ok-status",
+                SampleResponseFault::Status(StatusCode::OK),
+                "range-unsupported",
+            ),
+            (
+                "server-error",
+                SampleResponseFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+                "upstream-status",
+            ),
+        ] {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+            let body = Arc::new(
+                (0..160 * 1024)
+                    .map(|byte| (byte % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let (seed_url, _seed_task) =
+                start_etag_range_upstream(Arc::clone(&body), "\"seed\"", "\"seed\"", false).await;
+            let (candidate_url, _candidate_task, requests) = start_etag_range_upstream_configured(
+                Arc::clone(&body),
+                "\"candidate\"",
+                "\"candidate\"",
+                false,
+                Some(fault),
+                Some(64 * 1024),
+            )
+            .await;
+            let session = sample_session(&format!("sample-reject-{case}"), &candidate_url);
+            let mut key =
+                seed_range_prefix(&store, &session, &seed_url, &body, 16, "\"seed\"").await;
+            key.range = 16..32 * 1024;
+            let loaded = store
+                .load_range_manifest(&session.id, &session.variant.video)
+                .expect("prefix checkpoint should validate")
+                .expect("prefix checkpoint should exist");
+            store
+                .commit_range_extent(
+                    &session.id,
+                    &session.variant.video,
+                    &loaded.manifest,
+                    64 * 1024..128 * 1024,
+                    &body[64 * 1024..128 * 1024],
+                    &seed_url,
+                    Some("\"seed\"".to_owned()),
+                    None,
+                )
+                .await
+                .expect("sample extent should be durable");
+            let _activity = store
+                .range_cache
+                .enter(&session.id, HlsRangePriority::Foreground)
+                .expect("foreground activity should be admitted");
+            let error = store
+                .fetch_range_chunk(
+                    &reqwest::Client::new(),
+                    &session.id,
+                    &session.variant.video,
+                    &key,
+                    0,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .expect_err("malformed sample should reject the candidate");
+            match expected_error {
+                "invalid-response" => assert!(matches!(error, HlsRangeError::InvalidResponse(_))),
+                "range-unsupported" => {
+                    assert!(matches!(error, HlsRangeError::RangeUnsupported))
+                }
+                "upstream-status" => assert!(matches!(
+                    error,
+                    HlsRangeError::UpstreamStatus(status)
+                        if status == StatusCode::SERVICE_UNAVAILABLE
+                )),
+                _ => unreachable!("test case should declare an expected error"),
+            }
+            let after = store
+                .load_range_manifest(&session.id, &session.variant.video)
+                .expect("checkpoint should remain readable")
+                .expect("checkpoint should remain present");
+            assert!(
+                !after
+                    .manifest
+                    .validated_origins
+                    .iter()
+                    .any(|origin| origin.origin == media_url_origin(&candidate_url).unwrap())
+            );
+            assert!(range_is_covered(
+                &after.manifest.extents,
+                64 * 1024..128 * 1024
+            ));
+            assert!(requests.load(Ordering::Relaxed) <= 1 + HLS_CROSS_CDN_MAX_SAMPLES);
+        }
+    }
+
+    #[tokio::test]
+    async fn weak_chunk_etag_revalidates_and_replaces_old_strong_binding() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"strong-v1\"", "W/\"weak-v2\"", false)
+                .await;
+        let session = sample_session("weak-etag-transition", &url);
+        let mut key = seed_range_prefix(&store, &session, &url, &body, 16, "\"strong-v1\"").await;
+        key.range = 16..32 * 1024;
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                64 * 1024..128 * 1024,
+                &body[64 * 1024..128 * 1024],
+                &url,
+                Some("\"strong-v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("durable sample should use old accepted tag");
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        store
+            .ensure_range_span(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                &key.resource,
+                key.range.clone(),
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+                &|_| {},
+            )
+            .await
+            .expect("weak tag should be accepted after content revalidation");
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("updated checkpoint should validate")
+            .expect("updated checkpoint should exist");
+        assert_eq!(
+            None,
+            loaded
+                .manifest
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == media_url_origin(&url).unwrap())
+                .and_then(|binding| binding.strong_etag.as_deref())
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_redirected_origin_is_verified_and_used_for_chunk_publication() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (effective_url, _effective_task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"prefix\"", "\"tail\"", false).await;
+        let target = effective_url
+            .strip_suffix("/video.m4s")
+            .expect("effective URL should have the test resource path");
+        let (redirect_url, _redirect_task) = start_range_redirect(target).await;
+        let session = sample_session("stable-range-redirect", &redirect_url);
+        let mut key =
+            seed_range_prefix(&store, &session, &redirect_url, &body, 16, "\"prefix\"").await;
+        key.range = 16..32 * 1024;
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                64 * 1024..128 * 1024,
+                &body[64 * 1024..128 * 1024],
+                &redirect_url,
+                Some("\"prefix\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("sample extent should use old accepted validator");
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        store
+            .ensure_range_span(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                &key.resource,
+                key.range.clone(),
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+                &|_| {},
+            )
+            .await
+            .expect("stable effective origin should verify before publication");
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("updated checkpoint should validate")
+            .expect("updated checkpoint should exist");
+        assert!(loaded.manifest.validated_origins.iter().any(|binding| {
+            binding.origin == media_url_origin(&effective_url).unwrap()
+                && binding.strong_etag.as_deref() == Some("\"tail\"")
+        }));
+        assert_eq!(
+            Some(body[key.range.start as usize..key.range.end as usize].to_vec()),
+            store
+                .read_durable_range(&session.id, &session.variant.video, key.range.clone())
+                .await
+                .expect("redirected chunk should validate")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_sample_corruption_aborts_instead_of_falling_back_as_a_match() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"v1\"", "\"v2\"", false).await;
+        let session = sample_session("local-sample-corruption", &url);
+        let key = seed_range_prefix(&store, &session, &url, &body, 16, "\"v1\"").await;
+        let loaded = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &loaded.manifest,
+                64 * 1024..128 * 1024,
+                &body[64 * 1024..128 * 1024],
+                &url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect("sample should become durable");
+        let data_path = store
+            .resource_range_data_path(&session.id, &session.variant.video.id)
+            .expect("partial data path should be valid");
+        let mut data = fs::OpenOptions::new()
+            .write(true)
+            .open(data_path)
+            .expect("partial data file should open");
+        data.seek(SeekFrom::Start(64 * 1024))
+            .expect("sample offset should seek");
+        data.write_all(&[body[64 * 1024] ^ 1])
+            .expect("sample byte should be altered");
+        data.sync_all().expect("tampered byte should flush");
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        let error = store
+            .fetch_range_chunk(
+                &reqwest::Client::new(),
+                &session.id,
+                &session.variant.video,
+                &key,
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect_err("local extent hash failure must abort revalidation");
+        assert!(matches!(error, HlsRangeError::IdentityChanged));
+    }
+
+    #[tokio::test]
+    async fn stale_validator_snapshot_cannot_publish_a_chunk_after_revalidation() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"v1\"", "\"v2\"", false).await;
+        let session = sample_session("stale-validator-publish", &url);
+        let key = seed_range_prefix(&store, &session, &url, &body, 16, "\"v1\"").await;
+        let stale = store
+            .load_range_manifest(&session.id, &session.variant.video)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        let updated = store
+            .publish_validated_origin(
+                &session.id,
+                &session.variant.video,
+                stale.clone(),
+                media_url_origin(&url).expect("candidate origin should parse"),
+                Some("\"v2\"".to_owned()),
+            )
+            .await
+            .expect("verified binding update should publish");
+        let same_binding = store
+            .publish_validated_origin(
+                &session.id,
+                &session.variant.video,
+                stale.clone(),
+                media_url_origin(&url).expect("candidate origin should parse"),
+                Some("\"v2\"".to_owned()),
+            )
+            .await
+            .expect("the same proven target binding should be idempotent");
+        assert_eq!(
+            updated.manifest.generation,
+            same_binding.manifest.generation
+        );
+        let conflict = match store
+            .publish_validated_origin(
+                &session.id,
+                &session.variant.video,
+                stale.clone(),
+                media_url_origin(&url).expect("candidate origin should parse"),
+                Some("\"v3\"".to_owned()),
+            )
+            .await
+        {
+            Ok(_) => panic!("a competing distinct tag must remain stale"),
+            Err(error) => error,
+        };
+        assert!(matches!(conflict, HlsRangeError::IdentityChanged));
+        let error = store
+            .commit_range_extent(
+                &session.id,
+                &session.variant.video,
+                &stale.manifest,
+                key.range.start..key.range.start + 16,
+                &body[key.range.start as usize..key.range.start as usize + 16],
+                &url,
+                Some("\"v1\"".to_owned()),
+                None,
+            )
+            .await
+            .expect_err("stale response snapshot must not publish");
+        assert!(matches!(error, HlsRangeError::IdentityChanged));
+    }
+
+    #[tokio::test]
+    async fn validated_origin_publication_rebases_over_another_origins_validator_update() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"v1\"", "\"tail\"", false).await;
+        let session = sample_session("origin-validator-rebase", &url);
+        seed_range_prefix(&store, &session, &url, &body, 16, "\"v1\"").await;
+        let resource = &session.variant.video;
+        let stale = store
+            .load_range_manifest(&session.id, resource)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        let first_origin = media_url_origin(&url).expect("origin should parse");
+        let other_origin = "https://cdn-b.example:443".to_owned();
+        let target_origin = "https://cdn-c.example:443".to_owned();
+
+        let with_other_origin = store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                stale.clone(),
+                other_origin.clone(),
+                Some("\"b-v1\"".to_owned()),
+            )
+            .await
+            .expect("first content-validated origin binding should publish");
+        let stale_with_other_origin = with_other_origin.clone();
+        store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                with_other_origin,
+                other_origin,
+                Some("\"b-v2\"".to_owned()),
+            )
+            .await
+            .expect("independent content revalidation should update its validator");
+
+        store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                stale_with_other_origin.clone(),
+                target_origin.clone(),
+                Some("\"c-v1\"".to_owned()),
+            )
+            .await
+            .expect("target binding should rebase over the verified other-origin update");
+
+        let current = store
+            .load_range_manifest(&session.id, resource)
+            .expect("published checkpoint should validate")
+            .expect("published checkpoint should exist");
+        assert!(current.manifest.validated_origins.iter().any(|binding| {
+            binding.origin == first_origin && binding.strong_etag.as_deref() == Some("\"v1\"")
+        }));
+        assert!(current.manifest.validated_origins.iter().any(|binding| {
+            binding.origin == target_origin && binding.strong_etag.as_deref() == Some("\"c-v1\"")
+        }));
+        assert!(current.manifest.validated_origins.iter().any(|binding| {
+            binding.origin == "https://cdn-b.example:443"
+                && binding.strong_etag.as_deref() == Some("\"b-v2\"")
+        }));
+
+        let mut conflicting_extent = current.manifest.clone();
+        conflicting_extent.extents[0].sha256 = "0".repeat(64);
+        assert!(!range_manifest_rebase_compatible_for_origin_validation(
+            &current.manifest,
+            &conflicting_extent,
+            "https://cdn-c.example:443",
+        ));
+
+        let validator_conflict = match store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                stale_with_other_origin.clone(),
+                target_origin,
+                Some("\"c-v2\"".to_owned()),
+            )
+            .await
+        {
+            Ok(_) => panic!("a competing target-origin validator must fail its CAS"),
+            Err(error) => error,
+        };
+        assert!(matches!(validator_conflict, HlsRangeError::IdentityChanged));
+
+        let mut conflicting_content = stale_with_other_origin;
+        conflicting_content
+            .manifest
+            .validated_origins
+            .iter_mut()
+            .find(|binding| binding.origin == "https://cdn-b.example:443")
+            .expect("the independently validated origin should be present")
+            .prefix_sha256 = "0".repeat(64);
+        let content_conflict = match store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                conflicting_content,
+                "https://cdn-d.example:443".to_owned(),
+                Some("\"d-v1\"".to_owned()),
+            )
+            .await
+        {
+            Ok(_) => panic!("a conflicting validated prefix must remain incompatible"),
+            Err(error) => error,
+        };
+        assert!(matches!(content_conflict, HlsRangeError::IdentityChanged));
+    }
+
+    #[tokio::test]
+    async fn extent_publication_rebases_over_non_target_validator_update_after_fetch() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"prefix-v1\"", "\"tail-v2\"", false)
+                .await;
+        let session = sample_session("extent-origin-validator-rebase", &url);
+        let seeded = seed_range_prefix(&store, &session, &url, &body, 16, "\"prefix-v1\"").await;
+        let resource = &session.variant.video;
+        let other_origin = "https://cdn-b.example:443".to_owned();
+        let initial = store
+            .load_range_manifest(&session.id, resource)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                initial,
+                other_origin.clone(),
+                Some("\"b-v1\"".to_owned()),
+            )
+            .await
+            .expect("other origin binding should publish");
+
+        let chunk_key = RangeChunkKey {
+            resource: seeded.resource.clone(),
+            total_length: body.len() as u64,
+            range: 16..32,
+        };
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        let (bytes, final_url, etag, last_modified, _, fetched_manifest) = store
+            .fetch_range_chunk(
+                &reqwest::Client::new(),
+                &session.id,
+                resource,
+                &chunk_key,
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("range fetch and content revalidation should succeed");
+        let fetched_snapshot = store
+            .load_range_manifest(&session.id, resource)
+            .expect("fetched checkpoint should validate")
+            .expect("fetched checkpoint should exist");
+        assert_eq!(
+            fetched_manifest.generation,
+            fetched_snapshot.manifest.generation
+        );
+        let origin_update = store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                fetched_snapshot,
+                other_origin,
+                Some("\"b-v2\"".to_owned()),
+            )
+            .await
+            .expect("independent verified origin validator update should publish");
+
+        let committed = store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &fetched_manifest,
+                chunk_key.range.clone(),
+                &bytes,
+                &final_url,
+                etag,
+                last_modified,
+            )
+            .await;
+        assert!(
+            committed.is_ok(),
+            "extent should publish over unrelated verified validator update: {committed:?}; generation={}",
+            origin_update.manifest.generation
+        );
+    }
+
+    #[tokio::test]
+    async fn extent_publication_rejects_selected_origin_some_none_validator_races() {
+        for (case, tail_etag, competing_etag) in [
+            ("some-to-none", "\"tail-v2\"", None),
+            ("none-to-some", "W/\"weak-tail\"", Some("\"competing\"")),
+        ] {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+            let body = Arc::new(
+                (0..160 * 1024)
+                    .map(|byte| (byte % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let (url, _task) =
+                start_etag_range_upstream(Arc::clone(&body), "\"prefix-v1\"", tail_etag, false)
+                    .await;
+            let session = sample_session(&format!("extent-target-validator-{case}"), &url);
+            let seeded =
+                seed_range_prefix(&store, &session, &url, &body, 16, "\"prefix-v1\"").await;
+            let resource = &session.variant.video;
+            let chunk_key = RangeChunkKey {
+                resource: seeded.resource,
+                total_length: body.len() as u64,
+                range: 16..32,
+            };
+            let _activity = store
+                .range_cache
+                .enter(&session.id, HlsRangePriority::Foreground)
+                .expect("foreground activity should be admitted");
+            let (bytes, final_url, etag, last_modified, _, fetched_manifest) = store
+                .fetch_range_chunk(
+                    &reqwest::Client::new(),
+                    &session.id,
+                    resource,
+                    &chunk_key,
+                    0,
+                    HlsRangePriority::Foreground,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+                .expect("range fetch and validator revalidation should succeed");
+            let fetched_snapshot = store
+                .load_range_manifest(&session.id, resource)
+                .expect("fetched checkpoint should validate")
+                .expect("fetched checkpoint should exist");
+            assert_eq!(
+                fetched_manifest.generation,
+                fetched_snapshot.manifest.generation
+            );
+            let target_origin = media_url_origin(&url).expect("target origin should parse");
+            store
+                .publish_validated_origin(
+                    &session.id,
+                    resource,
+                    fetched_snapshot,
+                    target_origin,
+                    competing_etag.map(str::to_owned),
+                )
+                .await
+                .expect("independent target-origin revalidation should publish");
+
+            let error = match store
+                .commit_range_extent(
+                    &session.id,
+                    resource,
+                    &fetched_manifest,
+                    chunk_key.range,
+                    &bytes,
+                    &final_url,
+                    etag,
+                    last_modified,
+                )
+                .await
+            {
+                Ok(_) => {
+                    panic!("selected-origin validator race must reject extent publication: {case}")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, HlsRangeError::IdentityChanged),
+                "{case}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_origin_none_to_strong_etag_transition_revalidates_before_extent_commit() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task) =
+            start_etag_range_upstream(Arc::clone(&body), "\"prefix-v1\"", "\"tail-v2\"", false)
+                .await;
+        let session = sample_session("extent-validator-none-to-strong", &url);
+        let mut key = seed_range_prefix(&store, &session, &url, &body, 16, "\"prefix-v1\"").await;
+        key.range = 16..32;
+        let resource = &session.variant.video;
+        let initial = store
+            .load_range_manifest(&session.id, resource)
+            .expect("prefix checkpoint should validate")
+            .expect("prefix checkpoint should exist");
+        store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                initial,
+                media_url_origin(&url).expect("target origin should parse"),
+                None,
+            )
+            .await
+            .expect("strong validator should be cleared after content validation");
+
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        let (bytes, final_url, etag, last_modified, _, fetched_manifest) = store
+            .fetch_range_chunk(
+                &reqwest::Client::new(),
+                &session.id,
+                resource,
+                &key,
+                0,
+                HlsRangePriority::Foreground,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("new strong validator should trigger content revalidation");
+        assert_eq!(Some("\"tail-v2\""), etag.as_deref());
+        assert_eq!(
+            Some("\"tail-v2\""),
+            fetched_manifest
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == media_url_origin(&url).unwrap())
+                .and_then(|binding| binding.strong_etag.as_deref())
+        );
+        store
+            .commit_range_extent(
+                &session.id,
+                resource,
+                &fetched_manifest,
+                key.range,
+                &bytes,
+                &final_url,
+                etag,
+                last_modified,
+            )
+            .await
+            .expect("extent should commit against the revalidated strong binding");
+    }
+
+    #[test]
+    fn cross_cdn_samples_are_bounded_nonoverlapping_and_skip_gaps_and_prefix() {
+        let prefix_only = vec![PersistedRangeExtent {
+            start: 0,
+            end: 128 * 1024,
+            sha256: String::new(),
+        }];
+        assert!(select_cross_cdn_sample_ranges(&prefix_only, 128 * 1024).is_empty());
+
+        let extents = vec![
+            PersistedRangeExtent {
+                start: 0,
+                end: 64 * 1024,
+                sha256: String::new(),
+            },
+            PersistedRangeExtent {
+                start: 128 * 1024,
+                end: 192 * 1024,
+                sha256: String::new(),
+            },
+            PersistedRangeExtent {
+                start: 512 * 1024,
+                end: 576 * 1024,
+                sha256: String::new(),
+            },
+        ];
+        let samples = select_cross_cdn_sample_ranges(&extents, 16 * 1024);
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= HLS_CROSS_CDN_MAX_SAMPLES);
+        assert!(
+            samples
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>()
+                <= 48 * 1024
+        );
+        for sample in &samples {
+            assert!(sample.start >= 16 * 1024);
+            assert!(range_is_covered(&extents, sample.clone()));
+        }
+        for pair in samples.windows(2) {
+            assert!(pair[0].end <= pair[1].start || pair[1].end <= pair[0].start);
+        }
     }
 
     #[tokio::test]
@@ -7455,6 +8738,16 @@ mod tests {
         prefix_etag: &'static str,
         tail_etag: &'static str,
         corrupt_tail: bool,
+        sample_fault: Option<SampleResponseFault>,
+        sample_start: Option<usize>,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SampleResponseFault {
+        ShortBody,
+        WrongRange,
+        Status(StatusCode),
     }
 
     async fn upstream_range_with_etags(
@@ -7479,6 +8772,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("bad range response should build");
         };
+        fixture.request_count.fetch_add(1, Ordering::Relaxed);
         if start > end || end >= fixture.body.len() {
             return Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -7489,6 +8783,24 @@ mod tests {
         if fixture.corrupt_tail && start > 0 {
             body[0] ^= 0x01;
         }
+        let is_sample = fixture.sample_start == Some(start);
+        if let Some(SampleResponseFault::Status(status)) = fixture.sample_fault
+            && is_sample
+        {
+            return Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .expect("sample status response should build");
+        }
+        if is_sample && matches!(fixture.sample_fault, Some(SampleResponseFault::ShortBody)) {
+            body.pop();
+        }
+        let (reported_start, reported_end) =
+            if is_sample && matches!(fixture.sample_fault, Some(SampleResponseFault::WrongRange)) {
+                (start + 1, end)
+            } else {
+                (start, end)
+            };
         let etag = if start == 0 {
             fixture.prefix_etag
         } else {
@@ -7499,11 +8811,31 @@ mod tests {
             .header(CONTENT_LENGTH, body.len().to_string())
             .header(
                 reqwest::header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{}", fixture.body.len()),
+                format!(
+                    "bytes {reported_start}-{reported_end}/{}",
+                    fixture.body.len()
+                ),
             )
             .header(reqwest::header::ETAG, etag)
             .body(Body::from(body))
             .expect("range response should build")
+    }
+
+    async fn upstream_range_redirect(State(target): State<String>) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(reqwest::header::LOCATION, format!("{target}/video.m4s"))
+            .body(Body::empty())
+            .expect("range redirect response should build")
+    }
+
+    async fn start_range_redirect(target: &str) -> (String, tokio::task::JoinHandle<()>) {
+        start_hls_cache_upstream(
+            Router::new()
+                .route("/video.m4s", get(upstream_range_redirect))
+                .with_state(target.to_owned()),
+        )
+        .await
     }
 
     async fn start_etag_range_upstream(
@@ -7512,7 +8844,28 @@ mod tests {
         tail_etag: &'static str,
         corrupt_tail: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        start_hls_cache_upstream(
+        let (url, task, _) = start_etag_range_upstream_configured(
+            body,
+            prefix_etag,
+            tail_etag,
+            corrupt_tail,
+            None,
+            None,
+        )
+        .await;
+        (url, task)
+    }
+
+    async fn start_etag_range_upstream_configured(
+        body: Arc<Vec<u8>>,
+        prefix_etag: &'static str,
+        tail_etag: &'static str,
+        corrupt_tail: bool,
+        sample_fault: Option<SampleResponseFault>,
+        sample_start: Option<usize>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (url, task) = start_hls_cache_upstream(
             Router::new()
                 .route("/video.m4s", get(upstream_range_with_etags))
                 .with_state(RangeEtagFixture {
@@ -7520,9 +8873,13 @@ mod tests {
                     prefix_etag,
                     tail_etag,
                     corrupt_tail,
+                    sample_fault,
+                    sample_start,
+                    request_count: Arc::clone(&request_count),
                 }),
         )
-        .await
+        .await;
+        (url, task, request_count)
     }
 
     async fn upstream_ignores_range_and_holds_full_get(

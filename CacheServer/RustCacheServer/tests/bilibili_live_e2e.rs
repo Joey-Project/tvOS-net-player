@@ -147,14 +147,9 @@ async fn run_live_case(
     full_fill: Option<FullFillContext>,
 ) {
     if full_fill.is_some() {
-        assert_eq!(
-            "ordinary-video-playlist", case.id,
-            "full-fill mode is restricted to the canonical ordinary playlist case"
-        );
-        assert_eq!(
-            SelectionPolicy::First,
-            case.selection,
-            "full-fill mode requires first-candidate selection"
+        assert!(
+            supports_full_fill_case(case),
+            "full-fill mode requires an allowlisted canonical single-result case"
         );
     }
     assert_authenticated_case_ready(case, credential_status);
@@ -234,6 +229,18 @@ async fn run_live_case(
     assert_resolution_candidate_contract(case, &candidates);
 
     let selection = case.selection_request(&candidates, &session.default_candidate_token);
+    if full_fill.is_some() {
+        assert_eq!(
+            1, selection.expected_result_items,
+            "{}: full-fill selection must expect one result item",
+            case.id
+        );
+        assert_eq!(
+            1, selection.expected_playable_results,
+            "{}: full-fill selection must expect one playable result",
+            case.id
+        );
+    }
     let created = task_client
         .create_bilibili_task_v2(Request::new(CreateBilibiliTaskV2Request {
             session_id: session.id,
@@ -271,18 +278,7 @@ async fn run_live_case(
         .unwrap_or_else(|| panic!("{}: playable task has no playback source", case.id));
     assert_task_playback_source_item_id(case, &playable, source);
     assert_hls_master(case, http, source, "task playback source", media_url).await;
-    if let Some(full_fill) = full_fill {
-        run_full_fill_restart_and_offline_loop(
-            server,
-            case,
-            &created.id,
-            &source.variant_id,
-            media_url,
-            full_fill,
-            sustained_probe.map_or(Duration::from_secs(10), |probe| probe.duration),
-        )
-        .await;
-    } else if let Some(probe) = sustained_probe {
+    if let Some(probe) = sustained_probe.filter(|_| full_fill.is_none()) {
         sustain_hls_probe(
             case,
             &probe.client,
@@ -338,6 +334,18 @@ async fn run_live_case(
         "{}: unexpected ListTaskResults item count",
         case.id
     );
+    if let Some(full_fill) = full_fill {
+        run_full_fill_restart_and_offline_loop(
+            server,
+            case,
+            &created.id,
+            &source.variant_id,
+            media_url,
+            full_fill,
+            sustained_probe.map_or(Duration::from_secs(10), |probe| probe.duration),
+        )
+        .await;
+    }
 }
 
 async fn run_full_fill_restart_and_offline_loop(
@@ -2962,11 +2970,9 @@ impl LiveRunPolicy {
     }
 
     fn run_decision(&self, case: &LiveCase) -> LiveRunDecision {
-        if self.full_fill
-            && (case.id != "ordinary-video-playlist" || case.selection != SelectionPolicy::First)
-        {
+        if self.full_fill && !supports_full_fill_case(case) {
             return LiveRunDecision::Skip(
-                "full-fill mode only supports the canonical ordinary playlist first candidate",
+                "full-fill mode requires an allowlisted canonical single-result case",
             );
         }
         if self.filter.is_none() && case.requires_restricted_area_path {
@@ -2989,6 +2995,18 @@ impl LiveRunPolicy {
         }
         LiveRunDecision::Run
     }
+}
+
+fn supports_full_fill_case(case: &LiveCase) -> bool {
+    matches!(
+        (case.id.as_str(), case.selection),
+        ("ordinary-video-playlist", SelectionPolicy::First)
+            | ("bangumi-media-series", SelectionPolicy::First)
+            | (
+                "bangumi-episode",
+                SelectionPolicy::DefaultOrFirst | SelectionPolicy::First
+            )
+    )
 }
 
 fn ready_file_from_env() -> Option<PathBuf> {
@@ -4729,9 +4747,55 @@ mod tests {
         let policy = LiveRunPolicy::default();
         let case = test_case("bangumi-media-series", false, true);
 
+        assert!(!policy.full_fill, "live full-fill must remain opt-in");
         assert_eq!(
             policy.run_decision(&case),
             LiveRunDecision::Skip("requires explicit restricted-area live validation")
+        );
+    }
+
+    #[test]
+    fn full_fill_policy_runs_explicitly_selected_bangumi_single_result_cases() {
+        let mut media_policy = LiveRunPolicy {
+            full_fill: true,
+            filter: Some(parse_case_filter("bangumi-media-series".to_owned())),
+            ..Default::default()
+        };
+        let media_case = test_case("bangumi-media-series", false, true);
+        assert_eq!(media_policy.run_decision(&media_case), LiveRunDecision::Run);
+
+        media_policy.filter = Some(parse_case_filter("bangumi-episode".to_owned()));
+        let mut episode_case = test_case("bangumi-episode", false, true);
+        episode_case.selection = SelectionPolicy::DefaultOrFirst;
+        assert_eq!(
+            media_policy.run_decision(&episode_case),
+            LiveRunDecision::Run
+        );
+    }
+
+    #[test]
+    fn full_fill_policy_skips_multi_result_and_unknown_cases() {
+        let mut policy = LiveRunPolicy {
+            full_fill: true,
+            filter: Some(parse_case_filter("multi-part-video".to_owned())),
+            ..Default::default()
+        };
+        let mut multi_result_case = test_case("multi-part-video", false, false);
+        multi_result_case.selection = SelectionPolicy::RangeFirstTwo;
+        assert_eq!(
+            policy.run_decision(&multi_result_case),
+            LiveRunDecision::Skip(
+                "full-fill mode requires an allowlisted canonical single-result case"
+            )
+        );
+
+        policy.filter = Some(parse_case_filter("unrecognized-case".to_owned()));
+        let unknown_case = test_case("unrecognized-case", false, false);
+        assert_eq!(
+            policy.run_decision(&unknown_case),
+            LiveRunDecision::Skip(
+                "full-fill mode requires an allowlisted canonical single-result case"
+            )
         );
     }
 
