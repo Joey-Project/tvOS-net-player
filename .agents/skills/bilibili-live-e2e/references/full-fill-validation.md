@@ -32,6 +32,8 @@ The harness bounds full-fill cache usage to 1 GiB and allows up to 1,200 seconds
 
 The mode quiesces and restarts the same server root, verifies checkpoint representation and non-regressing extents when a durable partial checkpoint was observed, waits for complete selected-variant fill, then restarts with Bilibili disabled. It walks cached media and verifies that completed cache files retain their checksums across offline reads. A fill that completed before quiescence is not proof of partial-resume behavior.
 
+To exercise signed-media request refresh during that restart, additionally set `BILIBILI_LIVE_E2E_FORCE_MEDIA_REFRESH=1`. This requires full-fill mode and a verified positive partial checkpoint. After confirmed producer quiescence, the isolated test manifest's URL candidates are replaced with a loopback-only, unknown LAN route that returns 404; accepted identities, representation metadata, cache keys, and durable files are preserved. The restarted server must replan the real accepted Bilibili item, preserve those bindings, and finish the remaining bytes. This is deterministic expiration-response injection followed by real resolution/download, not proof that Bilibili naturally expired a URL during the test. Never apply this fixture mutation to a deployed cache root.
+
 ## Native Playback
 
 To expose the cache-only source to a separate native probe, also set:

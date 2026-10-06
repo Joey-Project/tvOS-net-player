@@ -11,6 +11,8 @@ use crate::bbdown_adapter::{
     BilibiliPlaybackAbrLevel as AdapterAbrLevel, BilibiliPlaybackAbrMetadata as AdapterAbrMetadata,
     BilibiliPlaybackVariant as AdapterPlaybackVariant, BilibiliPlaybackVariantKind,
 };
+use crate::bbdown_adapter::{BilibiliPlaybackEntry, BilibiliPlaybackPlan};
+use crate::bilibili_playback::{BilibiliContentIdentity, BilibiliContentKind};
 use crate::codecs::is_aac_codec;
 use crate::playback_policy::{
     PlaybackPolicy, variant_has_avplayer_h264_aac_hls_codecs,
@@ -201,6 +203,30 @@ impl HlsPlaybackRegistry {
             .expect("HLS playback registry lock poisoned");
         apply_pending_scrub(&mut inner, session_id, Some(expected_generation))
     }
+
+    pub(crate) fn replace_media_requests_if_current(
+        &self,
+        expected: &HlsPlaybackSessionHandle,
+        replacement: HlsPlaybackSession,
+        persist: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("HLS playback registry lock poisoned");
+        if replacement.id != expected.session.id
+            || inner.sessions.get(&expected.session.id) != Some(&expected.session)
+            || inner.generations.get(&expected.session.id) != Some(&expected.generation)
+            || inner.pending_scrubs.contains_key(&expected.session.id)
+        {
+            return Ok(false);
+        }
+        persist()?;
+        inner
+            .sessions
+            .insert(expected.session.id.clone(), replacement);
+        Ok(true)
+    }
 }
 
 fn session_handle(
@@ -251,6 +277,7 @@ fn apply_pending_scrub(
 pub(crate) struct HlsPlaybackSession {
     pub(crate) id: String,
     pub(crate) title: String,
+    pub(crate) accepted_identity: Option<BilibiliContentIdentity>,
     pub(crate) variant: HlsVariant,
     pub(crate) alternate_variants: Vec<HlsVariant>,
     pub(crate) advertise_alternate_variants: bool,
@@ -276,6 +303,7 @@ impl HlsPlaybackSession {
         Ok(Self {
             id: session_id.to_owned(),
             title: title.to_owned(),
+            accepted_identity: None,
             variant: hls_variant,
             alternate_variants: Vec::new(),
             advertise_alternate_variants: true,
@@ -284,6 +312,45 @@ impl HlsPlaybackSession {
             transcoding: HlsTranscodingPlan::default(),
             effective_policy: PlaybackPolicy::default(),
         })
+    }
+
+    pub(crate) fn with_refreshed_media_requests(
+        &self,
+        plan: &BilibiliPlaybackPlan,
+    ) -> Result<Self, HlsSessionError> {
+        let identity = self
+            .accepted_identity
+            .as_ref()
+            .ok_or_else(|| HlsSessionError::new("HLS session has no accepted content identity."))?;
+        if !valid_accepted_identity(identity) {
+            return Err(HlsSessionError::new(
+                "HLS session has an invalid accepted content identity.",
+            ));
+        }
+        if plan.entries.len() != 1 {
+            return Err(HlsSessionError::new(
+                "Refreshed playback plan must contain exactly one content entry.",
+            ));
+        }
+        let entry = plan.entries.first().ok_or_else(|| {
+            HlsSessionError::new("Refreshed playback plan does not contain the accepted content.")
+        })?;
+        if !entry_matches_identity(entry, identity) {
+            return Err(HlsSessionError::new(
+                "Refreshed playback plan does not contain the accepted content.",
+            ));
+        }
+
+        let mut refreshed = self.clone();
+        refresh_accepted_variant(&mut refreshed.variant, self, entry)?;
+        for (index, variant) in refreshed.alternate_variants.iter_mut().enumerate() {
+            refresh_accepted_variant(variant, self, entry).map_err(|_| {
+                HlsSessionError::new(format!(
+                    "Refreshed playback plan does not uniquely match accepted HLS alternate {index}."
+                ))
+            })?;
+        }
+        Ok(refreshed)
     }
 
     #[cfg(test)]
@@ -620,6 +687,151 @@ impl HlsPlaybackSession {
         }
         None
     }
+}
+
+fn valid_accepted_identity(identity: &BilibiliContentIdentity) -> bool {
+    if !identity.is_complete() || !identity.is_refresh_complete() {
+        return false;
+    }
+    match identity.kind {
+        BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => {
+            identity.epid.is_none()
+        }
+        BilibiliContentKind::SeasonEpisode => identity.epid.is_some_and(|epid| epid > 0),
+    }
+}
+
+fn entry_matches_identity(
+    entry: &BilibiliPlaybackEntry,
+    identity: &BilibiliContentIdentity,
+) -> bool {
+    entry.aid > 0
+        && entry.cid > 0
+        && entry.aid == identity.aid.unwrap_or_default()
+        && entry.bvid == identity.bvid
+        && entry.cid == identity.cid.unwrap_or_default()
+        && entry.epid == identity.epid
+}
+
+fn refresh_accepted_variant(
+    accepted: &mut HlsVariant,
+    session: &HlsPlaybackSession,
+    entry: &BilibiliPlaybackEntry,
+) -> Result<(), HlsSessionError> {
+    let accepted_metadata = session
+        .variants
+        .iter()
+        .find(|metadata| metadata.id == accepted.id);
+    let candidates = entry
+        .variants
+        .iter()
+        .filter(|candidate| variant_matches_accepted(accepted, accepted_metadata, candidate));
+    let mut candidates = candidates;
+    let candidate = candidates.next().ok_or_else(|| {
+        HlsSessionError::new("Refreshed playback plan is missing an accepted HLS representation.")
+    })?;
+    if candidates.next().is_some() {
+        return Err(HlsSessionError::new(
+            "Refreshed playback plan ambiguously matches an accepted HLS representation.",
+        ));
+    }
+
+    let video = candidate.video.as_ref().expect("matched video request");
+    replace_request_candidates(&mut accepted.video.request, video);
+    match (accepted.audio.as_mut(), candidate.audio.as_ref()) {
+        (Some(accepted), Some(fresh)) => replace_request_candidates(&mut accepted.request, fresh),
+        (None, None) => {}
+        _ => unreachable!("audio presence is included in representation matching"),
+    }
+    Ok(())
+}
+
+fn variant_matches_accepted(
+    accepted: &HlsVariant,
+    metadata: Option<&HlsVariantMetadata>,
+    candidate: &AdapterPlaybackVariant,
+) -> bool {
+    if candidate.kind != BilibiliPlaybackVariantKind::Dash
+        || !candidate.flv_segments.is_empty()
+        || candidate.audio.is_some() != accepted.audio.is_some()
+    {
+        return false;
+    }
+    let Some(video) = candidate.video.as_ref() else {
+        return false;
+    };
+    if !request_matches_accepted(&accepted.video.request, video) {
+        return false;
+    }
+    if let (Some(old), Some(new)) = (accepted.audio.as_ref(), candidate.audio.as_ref())
+        && !request_matches_accepted(&old.request, new)
+    {
+        return false;
+    }
+
+    if let Some(metadata) = metadata {
+        candidate.content_id == metadata.content_id
+            && candidate.bandwidth == metadata.bandwidth
+            && candidate.codecs == metadata.codecs
+            && candidate.mime_types == metadata.mime_types
+            && candidate.width == metadata.width
+            && candidate.height == metadata.height
+            && candidate.frame_rate == metadata.frame_rate
+            && candidate.duration_seconds == metadata.duration_seconds
+    } else {
+        candidate
+            .bandwidth
+            .or(video.bandwidth)
+            .unwrap_or(DEFAULT_BANDWIDTH)
+            == accepted.bandwidth
+            && hls_variant_codecs(candidate, video, candidate.audio.as_ref()) == accepted.codecs
+            && candidate.width == accepted.width
+            && candidate.height == accepted.height
+            && candidate
+                .duration_seconds
+                .or(video.duration_seconds)
+                .unwrap_or(DEFAULT_DURATION_SECONDS)
+                == accepted.duration_seconds
+    }
+}
+
+fn request_matches_accepted(
+    accepted: &BilibiliMediaRequest,
+    candidate: &BilibiliMediaRequest,
+) -> bool {
+    accepted.kind == candidate.kind
+        && accepted.stream_id == candidate.stream_id
+        && accepted.mime_type == candidate.mime_type
+        && accepted.codecs == candidate.codecs
+        && accepted.bandwidth == candidate.bandwidth
+        && accepted.width == candidate.width
+        && accepted.height == candidate.height
+        && accepted.frame_rate == candidate.frame_rate
+        && accepted.size == candidate.size
+        && accepted.duration_seconds == candidate.duration_seconds
+        && accepted.cache_key.media_kind == accepted.kind
+        && accepted.cache_key.stream_id == accepted.stream_id
+        && accepted.cache_key.codecs == accepted.codecs
+        && candidate.cache_key.media_kind == candidate.kind
+        && candidate.cache_key.stream_id == candidate.stream_id
+        && candidate.cache_key.codecs == candidate.codecs
+        && cache_key_identity_matches(&accepted.cache_key, &candidate.cache_key)
+}
+
+fn cache_key_identity_matches(
+    accepted: &BilibiliMediaCacheKey,
+    candidate: &BilibiliMediaCacheKey,
+) -> bool {
+    accepted.content_id == candidate.content_id
+        && accepted.media_kind == candidate.media_kind
+        && accepted.stream_id == candidate.stream_id
+        && accepted.codecs == candidate.codecs
+}
+
+fn replace_request_candidates(accepted: &mut BilibiliMediaRequest, fresh: &BilibiliMediaRequest) {
+    accepted.url.clone_from(&fresh.url);
+    accepted.backup_urls.clone_from(&fresh.backup_urls);
+    accepted.headers.clone_from(&fresh.headers);
 }
 
 fn split_media_playlist_for_resource(
@@ -1158,8 +1370,353 @@ fn is_avplayer_safe_alternate_variant(variant: &AdapterPlaybackVariant) -> bool 
 mod tests {
     use super::*;
     use crate::bbdown_adapter::{
-        BilibiliMediaCacheKey, BilibiliMediaRequestKind, BilibiliPlaybackVariant,
+        BilibiliMediaCacheKey, BilibiliMediaRequestKind, BilibiliPlaybackEntry,
+        BilibiliPlaybackPlan, BilibiliPlaybackVariant,
     };
+
+    #[test]
+    fn registry_media_request_publish_rejects_stale_generation() {
+        let registry = HlsPlaybackRegistry::default();
+        let original = HlsPlaybackSession::from_selected_variant(
+            "session-cas-generation",
+            "Episode",
+            &dash_variant(),
+        )
+        .unwrap();
+        let stale = registry.get_with_generation("session-cas-generation");
+        assert!(stale.is_none());
+        registry.insert(original.clone());
+        let stale = registry
+            .get_with_generation(&original.id)
+            .expect("session should be registered");
+        registry.insert(original.clone());
+        let mut replacement = original.clone();
+        replacement.variant.video.request.url.push_str("?fresh=1");
+        let mut persisted = false;
+
+        assert!(
+            !registry
+                .replace_media_requests_if_current(&stale, replacement, || {
+                    persisted = true;
+                    Ok(())
+                })
+                .expect("stale generation should be a non-error mismatch")
+        );
+        assert!(!persisted);
+    }
+
+    #[test]
+    fn registry_media_request_publish_rejects_pending_completion_scrub() {
+        let registry = HlsPlaybackRegistry::default();
+        let original = HlsPlaybackSession::from_selected_variant(
+            "session-cas-completion",
+            "Episode",
+            &dash_variant(),
+        )
+        .unwrap();
+        let completed = original.clone();
+        registry.insert_with_scrub_deadline(
+            original.clone(),
+            completed,
+            Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let expected = registry
+            .get_with_generation(&original.id)
+            .expect("session should be registered");
+        let mut replacement = original;
+        replacement.variant.video.request.url.push_str("?fresh=1");
+        let mut persisted = false;
+
+        assert!(
+            !registry
+                .replace_media_requests_if_current(&expected, replacement, || {
+                    persisted = true;
+                    Ok(())
+                })
+                .expect("pending completion should be a non-error mismatch")
+        );
+        assert!(!persisted);
+    }
+
+    #[test]
+    fn registry_media_request_publish_does_not_replace_after_persist_error() {
+        let registry = HlsPlaybackRegistry::default();
+        let original = HlsPlaybackSession::from_selected_variant(
+            "session-cas-persist-error",
+            "Episode",
+            &dash_variant(),
+        )
+        .unwrap();
+        registry.insert(original.clone());
+        let expected = registry
+            .get_with_generation(&original.id)
+            .expect("session should be registered");
+        let mut replacement = original.clone();
+        replacement.variant.video.request.url.push_str("?fresh=1");
+
+        assert!(
+            registry
+                .replace_media_requests_if_current(&expected, replacement, || {
+                    Err(std::io::Error::other("simulated persistence failure"))
+                })
+                .is_err()
+        );
+        assert_eq!(
+            original,
+            registry
+                .get_with_generation(&expected.session.id)
+                .expect("original session should remain registered")
+                .session
+        );
+    }
+
+    #[test]
+    fn registry_media_request_publish_rejects_superseded_urls() {
+        let registry = HlsPlaybackRegistry::default();
+        let original = HlsPlaybackSession::from_selected_variant(
+            "session-cas-urls",
+            "Episode",
+            &dash_variant(),
+        )
+        .unwrap();
+        registry.insert(original.clone());
+        let stale = registry
+            .get_with_generation(&original.id)
+            .expect("session should be registered");
+        let mut newer = original.clone();
+        newer.variant.video.request.url.push_str("?newer=1");
+        assert!(
+            registry
+                .replace_media_requests_if_current(&stale, newer.clone(), || Ok(()))
+                .expect("current media requests should publish")
+        );
+        let generation = registry
+            .get_with_generation(&original.id)
+            .expect("new session should remain registered")
+            .generation;
+        let mut stale_replacement = original;
+        stale_replacement
+            .variant
+            .video
+            .request
+            .url
+            .push_str("?stale=2");
+
+        assert!(
+            !registry
+                .replace_media_requests_if_current(&stale, stale_replacement, || Ok(()))
+                .expect("superseded URLs should be a non-error mismatch")
+        );
+        let current = registry
+            .get_with_generation(&newer.id)
+            .expect("current session should remain registered");
+        assert_eq!(generation, current.generation);
+        assert_eq!(newer, current.session);
+    }
+
+    #[test]
+    fn refreshed_media_requests_accept_new_url_identity_and_preserve_session_bindings() {
+        let (mut session, mut fresh) = refresh_fixture();
+        session.accepted_identity = Some(refresh_identity());
+        fresh.id = "new-upstream-variant-id".to_owned();
+        fresh.video.as_mut().unwrap().url =
+            "https://media.example.test/video.m4s?signature=new".to_owned();
+        fresh.video.as_mut().unwrap().backup_urls =
+            vec!["https://backup.example.test/video.m4s?signature=new".to_owned()];
+        fresh
+            .video
+            .as_mut()
+            .unwrap()
+            .headers
+            .push(crate::bbdown_adapter::BilibiliHttpHeader {
+                name: "referer".to_owned(),
+                value: "https://www.bilibili.com/refreshed".to_owned(),
+            });
+        fresh.video.as_mut().unwrap().cache_key.source_hash = "new-source-hash".to_owned();
+        let plan = refresh_plan(vec![fresh]);
+        let old_id = session.variant.video.id.clone();
+        let old_cache_key = session.variant.video.request.cache_key.clone();
+        let old_hash = old_cache_key.source_hash.clone();
+
+        let refreshed = session
+            .with_refreshed_media_requests(&plan)
+            .expect("same accepted representation should refresh");
+
+        assert_eq!(old_id, refreshed.variant.video.id);
+        assert_eq!(old_cache_key, refreshed.variant.video.request.cache_key);
+        assert_eq!(
+            old_hash,
+            refreshed.variant.video.request.cache_key.source_hash
+        );
+        assert_eq!(
+            "https://media.example.test/video.m4s?signature=new",
+            refreshed.variant.video.request.url
+        );
+        assert_eq!(1, refreshed.variant.video.request.backup_urls.len());
+        assert_eq!(
+            "https://www.bilibili.com/refreshed",
+            refreshed.variant.video.request.headers[0].value
+        );
+        assert_eq!(session.abr, refreshed.abr);
+        assert_eq!(session.variants, refreshed.variants);
+        assert_eq!(session.effective_policy, refreshed.effective_policy);
+    }
+
+    #[test]
+    fn refreshed_media_requests_reject_identity_representation_and_cardinality_mismatches() {
+        let (mut session, fresh) = refresh_fixture();
+        session.accepted_identity = Some(refresh_identity());
+        session
+            .with_refreshed_media_requests(&refresh_plan(vec![fresh.clone()]))
+            .expect("baseline representation should refresh before mismatch checks");
+        let mut wrong_identity = refresh_entry(vec![fresh.clone()]);
+        wrong_identity.cid += 1;
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan_with_entries(vec![wrong_identity]))
+                .is_err()
+        );
+        let mut extra_entry = refresh_entry(vec![fresh.clone()]);
+        extra_entry.cid += 1;
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan_with_entries(vec![
+                    refresh_entry(vec![fresh.clone()]),
+                    extra_entry,
+                ]))
+                .is_err()
+        );
+
+        for mutate in [
+            0_u8, // bandwidth
+            1,    // codec
+            2,    // size
+            3,    // stream ID
+        ] {
+            let mut changed = fresh.clone();
+            match mutate {
+                0 => changed.bandwidth = Some(2_000_000),
+                1 => {
+                    changed.codecs = vec!["hev1.1.6.L120.90".to_owned()];
+                    changed.video.as_mut().unwrap().codecs = Some("hev1.1.6.L120.90".to_owned());
+                    changed.video.as_mut().unwrap().cache_key.codecs =
+                        Some("hev1.1.6.L120.90".to_owned());
+                }
+                2 => changed.video.as_mut().unwrap().size = Some(20_000),
+                3 => {
+                    changed.video.as_mut().unwrap().stream_id = Some(80);
+                    changed.video.as_mut().unwrap().cache_key.stream_id = Some(80);
+                }
+                _ => unreachable!(),
+            }
+            session
+                .with_refreshed_media_requests(&refresh_plan(vec![fresh.clone()]))
+                .expect("baseline representation should remain valid");
+            assert!(
+                session
+                    .with_refreshed_media_requests(&refresh_plan(vec![changed]))
+                    .is_err()
+            );
+        }
+
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan(Vec::new()))
+                .is_err()
+        );
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan(vec![fresh.clone(), fresh]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn refreshed_media_requests_require_accepted_identity_and_retain_unknown_size() {
+        let (mut session, mut fresh) = refresh_fixture();
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan(vec![fresh.clone()]))
+                .is_err()
+        );
+        session.accepted_identity = Some(refresh_identity());
+        session.variant.video.request.size = None;
+        session.variants[0].media[0].size = None;
+        fresh.video.as_mut().unwrap().size = None;
+
+        let refreshed = session
+            .with_refreshed_media_requests(&refresh_plan(vec![fresh]))
+            .expect("unknown length should stay unknown when refreshed metadata agrees");
+
+        assert_eq!(None, refreshed.variant.video.request.size);
+    }
+
+    #[test]
+    fn refreshed_media_requests_reject_a_missing_accepted_alternate() {
+        let (mut session, fresh) = refresh_fixture();
+        session.accepted_identity = Some(refresh_identity());
+        let mut alternate = session.variant.clone();
+        alternate.id = "accepted-720p".to_owned();
+        alternate.bandwidth = 700_000;
+        alternate.width = Some(1280);
+        alternate.height = Some(720);
+        alternate.video.request.bandwidth = Some(700_000);
+        alternate.video.request.width = Some(1280);
+        alternate.video.request.height = Some(720);
+        alternate.video.request.cache_key.source_hash = "alternate-hash".to_owned();
+        session.alternate_variants.push(alternate);
+
+        assert!(
+            session
+                .with_refreshed_media_requests(&refresh_plan(vec![fresh]))
+                .is_err()
+        );
+    }
+
+    fn refresh_fixture() -> (HlsPlaybackSession, BilibiliPlaybackVariant) {
+        let variant = dash_variant();
+        let session =
+            HlsPlaybackSession::from_selected_variant("session-refresh", "Episode", &variant)
+                .expect("DASH fixture should form a session");
+        (session, variant)
+    }
+
+    fn refresh_identity() -> BilibiliContentIdentity {
+        BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(1),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(2),
+            epid: None,
+        }
+    }
+
+    fn refresh_entry(variants: Vec<BilibiliPlaybackVariant>) -> BilibiliPlaybackEntry {
+        BilibiliPlaybackEntry {
+            index: 0,
+            aid: 1,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: 2,
+            epid: None,
+            title: "Episode".to_owned(),
+            content_id: "content-1".to_owned(),
+            duration_seconds: Some(60),
+            abr: AdapterAbrMetadata { groups: Vec::new() },
+            selected_variant: None,
+            variants,
+        }
+    }
+
+    fn refresh_plan(variants: Vec<BilibiliPlaybackVariant>) -> BilibiliPlaybackPlan {
+        refresh_plan_with_entries(vec![refresh_entry(variants)])
+    }
+
+    fn refresh_plan_with_entries(entries: Vec<BilibiliPlaybackEntry>) -> BilibiliPlaybackPlan {
+        BilibiliPlaybackPlan {
+            title: "Episode".to_owned(),
+            entries,
+        }
+    }
 
     #[test]
     fn creates_master_and_media_playlists_for_dash_variant() {

@@ -5,7 +5,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -73,6 +73,14 @@ const HLS_TRANSCODING_COMMIT_MARKER_FILE: &str = "transcoding-commit.tmp";
 const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60);
 const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
+static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn session_manifest_publication_guard() -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    SESSION_MANIFEST_PUBLICATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("HLS session publication lock poisoned"))
+}
 
 #[derive(Clone)]
 pub(crate) struct HlsCacheStore {
@@ -326,8 +334,52 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn save_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
-        let mode = self.session_publication_mode(session, false)?;
-        self.save_session_with_mode_and_hook(session, mode, || {})
+        let _guard = session_manifest_publication_guard()?;
+        let existing = self.read_session_manifest_for_publication(&session.id)?;
+        let session = match existing.as_ref() {
+            Some(existing) if session_refresh_matches(existing, session) => {
+                preserve_persisted_request_candidates(existing, session)
+            }
+            _ => session.clone(),
+        };
+        let mode = self.session_publication_mode(&session, false)?;
+        self.save_session_with_mode_and_hook(&session, mode, || {})
+    }
+
+    pub(crate) fn save_refreshed_session(
+        &self,
+        expected: &HlsPlaybackSession,
+        replacement: &HlsPlaybackSession,
+    ) -> io::Result<()> {
+        let _guard = session_manifest_publication_guard()?;
+        if expected.id != replacement.id || !session_refresh_matches(expected, replacement) {
+            return Err(invalid_session_publication("refresh-replacement-binding"));
+        }
+        let existing = self
+            .read_session_manifest_for_publication(&expected.id)?
+            .ok_or_else(|| invalid_session_publication("refresh-expected-missing"))?;
+        if existing != *expected {
+            return Err(invalid_session_publication("refresh-expected-mismatch"));
+        }
+        let publication = self
+            .range_cache
+            .begin_session_publication(&replacement.id, SessionPublicationMode::Refresh)
+            .map_err(hls_range_error_to_io)?;
+        let existing = self
+            .read_session_manifest_for_publication(&expected.id)?
+            .ok_or_else(|| invalid_session_publication("refresh-recheck-missing"))?;
+        if existing != *expected {
+            return Err(invalid_session_publication("refresh-recheck-mismatch"));
+        }
+        self.validate_session_publication(replacement, SessionPublicationMode::Refresh)?;
+        let session_dir = self.session_dir(&replacement.id)?;
+        self.ensure_cache_directory(&session_dir)?;
+        self.write_json_atomically(
+            &session_dir.join("session.json"),
+            &PersistedHlsSession::from(replacement.clone()),
+        )?;
+        publication.commit();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -369,6 +421,7 @@ impl HlsCacheStore {
     }
 
     pub(crate) fn save_completed_session(&self, session: &HlsPlaybackSession) -> io::Result<()> {
+        let _guard = session_manifest_publication_guard()?;
         let completed = sanitized_completed_session(session);
         let mode = self.session_publication_mode(&completed, true)?;
         self.save_session_with_mode_and_hook(&completed, mode, || {})
@@ -379,6 +432,7 @@ impl HlsCacheStore {
         completed: &HlsPlaybackSession,
         completed_library_item_id: &str,
     ) -> io::Result<()> {
+        let _guard = session_manifest_publication_guard()?;
         let completed = sanitized_completed_session(completed);
         if completed_library_item_id != Self::completed_library_item_id(&completed.id) {
             return Err(invalid_session_publication("restore-task-item-binding"));
@@ -5928,7 +5982,10 @@ fn is_retryable_range_candidate_error(error: &HlsRangeError) -> bool {
             status.is_server_error()
                 || matches!(
                     *status,
-                    StatusCode::FORBIDDEN
+                    StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN
+                        | StatusCode::NOT_FOUND
+                        | StatusCode::GONE
                         | StatusCode::REQUEST_TIMEOUT
                         | StatusCode::TOO_MANY_REQUESTS
                 )
@@ -6336,6 +6393,7 @@ pub(crate) fn hls_session_declared_size_bytes(session: &HlsPlaybackSession) -> O
 
 pub(crate) fn sanitized_completed_session(session: &HlsPlaybackSession) -> HlsPlaybackSession {
     let mut session = completed_runtime_session(session);
+    session.accepted_identity = None;
     sanitize_completed_variant(&mut session.variant);
     for variant in &mut session.alternate_variants {
         sanitize_completed_variant(variant);
@@ -6462,6 +6520,8 @@ fn session_completion_matches(
     }
     let mut existing = normalized_session_bindings(existing);
     let mut completed = normalized_session_bindings(completed);
+    existing.accepted_identity = None;
+    completed.accepted_identity = None;
     clear_session_request_headers(&mut existing);
     clear_session_request_headers(&mut completed);
     existing == completed
@@ -6488,6 +6548,40 @@ fn normalized_session_bindings(session: &HlsPlaybackSession) -> HlsPlaybackSessi
         .alternate_variants
         .sort_by(|left, right| left.id.cmp(&right.id));
     normalized
+}
+
+fn preserve_persisted_request_candidates(
+    existing: &HlsPlaybackSession,
+    incoming: &HlsPlaybackSession,
+) -> HlsPlaybackSession {
+    let mut preserved = incoming.clone();
+    preserve_variant_request_candidates(&mut preserved.variant, &existing.variant);
+    for variant in &mut preserved.alternate_variants {
+        if let Some(existing_variant) = existing
+            .alternate_variants
+            .iter()
+            .find(|existing_variant| existing_variant.id == variant.id)
+        {
+            preserve_variant_request_candidates(variant, existing_variant);
+        }
+    }
+    preserved
+}
+
+fn preserve_variant_request_candidates(incoming: &mut HlsVariant, existing: &HlsVariant) {
+    preserve_request_candidates(&mut incoming.video.request, &existing.video.request);
+    if let (Some(incoming), Some(existing)) = (incoming.audio.as_mut(), existing.audio.as_ref()) {
+        preserve_request_candidates(&mut incoming.request, &existing.request);
+    }
+}
+
+fn preserve_request_candidates(
+    incoming: &mut BilibiliMediaRequest,
+    existing: &BilibiliMediaRequest,
+) {
+    incoming.url.clone_from(&existing.url);
+    incoming.backup_urls.clone_from(&existing.backup_urls);
+    incoming.headers.clone_from(&existing.headers);
 }
 
 fn normalize_variant_bindings(variant: &mut HlsVariant) {
@@ -6704,6 +6798,8 @@ struct PersistedHlsSession {
     schema_version: u32,
     id: String,
     title: String,
+    #[serde(default)]
+    accepted_identity: Option<crate::bilibili_playback::BilibiliContentIdentity>,
     variant: PersistedHlsVariant,
     #[serde(default)]
     alternate_variants: Vec<PersistedHlsVariant>,
@@ -6725,6 +6821,7 @@ impl From<HlsPlaybackSession> for PersistedHlsSession {
             schema_version: HLS_CACHE_SCHEMA_VERSION,
             id: session.id,
             title: session.title,
+            accepted_identity: session.accepted_identity,
             variant: PersistedHlsVariant::from(session.variant),
             alternate_variants: session
                 .alternate_variants
@@ -6752,6 +6849,7 @@ impl TryFrom<PersistedHlsSession> for HlsPlaybackSession {
         Ok(Self {
             id: session.id,
             title: session.title,
+            accepted_identity: session.accepted_identity,
             variant: HlsVariant::try_from(session.variant)?,
             alternate_variants: session
                 .alternate_variants
@@ -9547,11 +9645,14 @@ mod tests {
     #[test]
     fn sanitized_completed_session_scrubs_hidden_lookup_resources() {
         let mut session = sample_session("session-sanitized", "https://example.test/video.m4s");
+        session.accepted_identity = Some(sample_refresh_identity());
         attach_sample_alternate_variant(&mut session, "https://example.test/720p-video.m4s");
 
         let sanitized = sanitized_completed_session(&session);
 
         assert_eq!(1, sanitized.alternate_variants.len());
+        assert!(sanitized.accepted_identity.is_none());
+        assert!(session_completion_matches(&session, &sanitized));
         assert!(
             !sanitized
                 .master_playlist()
@@ -9588,6 +9689,7 @@ mod tests {
         object.remove("variants");
         object.remove("transcoding");
         object.remove("effective_policy");
+        object.remove("accepted_identity");
 
         let manifest_path = store
             .session_dir("session-legacy")
@@ -9604,6 +9706,175 @@ mod tests {
         assert_eq!(HlsTranscodingPlan::default(), sessions[0].transcoding);
         assert_eq!(PlaybackPolicy::default(), sessions[0].effective_policy);
         assert_eq!(session, sessions[0]);
+    }
+
+    #[test]
+    fn persisted_hls_session_round_trips_accepted_identity() {
+        let mut session = sample_session(
+            "session-identity-roundtrip",
+            "https://example.test/video.m4s",
+        );
+        session.accepted_identity = Some(sample_refresh_identity());
+
+        let persisted = PersistedHlsSession::from(session.clone());
+        let restored = HlsPlaybackSession::try_from(persisted)
+            .expect("persisted accepted identity should restore");
+
+        assert_eq!(session.accepted_identity, restored.accepted_identity);
+        assert_eq!(session, restored);
+    }
+
+    #[test]
+    fn stale_generic_session_save_preserves_refreshed_request_candidates() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let original = sample_session("session-monotonic-save", "https://cdn.example/video?old=1");
+        store
+            .save_session(&original)
+            .expect("initial session should save");
+        let original_range_key = store
+            .range_resource_key(&original.id, &original.variant.video)
+            .expect("range key should be valid");
+        let mut refreshed = original.clone();
+        refreshed.variant.video.request.url = "https://cdn.example/video?fresh=2".to_owned();
+        refreshed.variant.video.request.backup_urls =
+            vec!["https://backup.example/video?fresh=2".to_owned()];
+        refreshed.variant.video.request.headers[0].value =
+            "https://www.bilibili.com/fresh".to_owned();
+        store
+            .save_refreshed_session(&original, &refreshed)
+            .expect("current refresh should publish");
+
+        store
+            .save_session(&original)
+            .expect("stale fill-start save should preserve current candidates");
+
+        let persisted = store
+            .load_session(&original.id)
+            .expect("refreshed session should remain persisted");
+        assert_eq!(
+            refreshed.variant.video.request.url,
+            persisted.variant.video.request.url
+        );
+        assert_eq!(
+            refreshed.variant.video.request.backup_urls,
+            persisted.variant.video.request.backup_urls
+        );
+        assert_eq!(
+            refreshed.variant.video.request.headers,
+            persisted.variant.video.request.headers
+        );
+        assert_eq!(
+            original_range_key,
+            store
+                .range_resource_key(&persisted.id, &persisted.variant.video)
+                .expect("refreshed range key should remain valid")
+        );
+    }
+
+    #[test]
+    fn stale_refresh_compare_and_publish_does_not_overwrite_current_manifest() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let original = sample_session("session-refresh-cas", "https://cdn.example/video?old=1");
+        store
+            .save_session(&original)
+            .expect("initial session should save");
+        let mut current = original.clone();
+        current.variant.video.request.url = "https://cdn.example/video?current=2".to_owned();
+        store
+            .save_refreshed_session(&original, &current)
+            .expect("current refresh should publish");
+        let mut stale_replacement = original.clone();
+        stale_replacement.variant.video.request.url =
+            "https://cdn.example/video?stale=3".to_owned();
+
+        assert!(
+            store
+                .save_refreshed_session(&original, &stale_replacement)
+                .is_err()
+        );
+        assert_eq!(
+            current.variant.video.request.url,
+            store
+                .load_session(&original.id)
+                .expect("current manifest should load")
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_urls_preserve_durable_range_extents() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = fake_mp4();
+        let mut original =
+            sample_session("session-refresh-extents", "https://cdn.example/video?old=1");
+        original.variant.video.request.size = Some(body.len() as u64);
+        store
+            .save_session(&original)
+            .expect("initial session should save");
+        let resource = &original.variant.video;
+        let key = store
+            .range_resource_key(&original.id, resource)
+            .expect("range key should be valid");
+        let loaded = store
+            .ensure_range_manifest(&original.id, resource, &key)
+            .expect("range manifest should initialize");
+        let loaded = store
+            .publish_range_manifest(&original.id, resource, loaded, |manifest| {
+                manifest.total_length = Some(body.len() as u64);
+            })
+            .await
+            .expect("range total should publish");
+        store
+            .commit_range_extent(
+                &original.id,
+                resource,
+                &loaded.manifest,
+                0..body.len() as u64,
+                &body,
+                "https://cdn.example/video?old=1",
+                None,
+                None,
+            )
+            .await
+            .expect("range extent should become durable");
+        let mut refreshed = original.clone();
+        refreshed.variant.video.request.url = "https://cdn.example/video?fresh=2".to_owned();
+        store
+            .save_refreshed_session(&original, &refreshed)
+            .expect("same binding should refresh its request URL");
+
+        let checkpoint = store
+            .load_range_manifest(&refreshed.id, &refreshed.variant.video)
+            .expect("range manifest should remain readable")
+            .expect("durable range manifest should remain present");
+        assert_eq!(body.len() as u64, checkpoint.manifest.durable_bytes);
+        assert!(range_is_covered(
+            &checkpoint.manifest.extents,
+            0..body.len() as u64
+        ));
+    }
+
+    #[test]
+    fn retryable_candidate_statuses_include_expired_media_responses() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+        ] {
+            assert!(is_retryable_range_candidate_error(
+                &HlsRangeError::UpstreamStatus(status)
+            ));
+        }
+        assert!(!is_retryable_range_candidate_error(
+            &HlsRangeError::UpstreamStatus(StatusCode::BAD_REQUEST)
+        ));
     }
 
     #[test]
@@ -11483,6 +11754,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tries_backup_url_after_primary_returns_401() {
+        let (primary_url, _primary_task) = start_hls_cache_upstream(
+            Router::new().route("/video.m4s", get(|| async { StatusCode::UNAUTHORIZED })),
+        )
+        .await;
+        let (backup_url, _backup_task) = start_mp4_upstream().await;
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let mut session = sample_session("session-backup-401", &primary_url);
+        session.variant.video.request.backup_urls = vec![backup_url];
+
+        let item_id = store
+            .cache_session_resources(&reqwest::Client::new(), &session)
+            .await
+            .expect("working backup should succeed after primary 401");
+
+        assert_eq!("bilibili.hls.session-backup-401", item_id);
+        assert!(store.cached_resource(&session.id, "video.m4s").is_some());
+    }
+
+    #[tokio::test]
     async fn does_not_forward_sensitive_headers_to_cross_origin_backup_url() {
         let (primary_url, _primary_task) = start_invalid_mp4_upstream().await;
         let (backup_url, _backup_task) = start_hls_cache_upstream(
@@ -13009,6 +13301,7 @@ mod tests {
         HlsPlaybackSession {
             id: id.to_owned(),
             title: "Episode".to_owned(),
+            accepted_identity: None,
             variant: HlsVariant {
                 id: "h264".to_owned(),
                 bandwidth: 1_000_000,
@@ -13052,6 +13345,16 @@ mod tests {
             variants: Vec::new(),
             transcoding: Default::default(),
             effective_policy: PlaybackPolicy::default(),
+        }
+    }
+
+    fn sample_refresh_identity() -> crate::bilibili_playback::BilibiliContentIdentity {
+        crate::bilibili_playback::BilibiliContentIdentity {
+            kind: crate::bilibili_playback::BilibiliContentKind::VideoPage,
+            aid: Some(1),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(2),
+            epid: None,
         }
     }
 

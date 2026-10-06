@@ -42,6 +42,8 @@ const LIVE_CASE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const FULL_FILL_DEADLINE: Duration = Duration::from_secs(1_200);
 const OFFLINE_READ_DURATION: Duration = Duration::from_secs(300);
 const READY_FILE_LIMIT: usize = 4 * 1024;
+const SESSION_FIXTURE_LIMIT: u64 = 1024 * 1024;
+const EXPIRED_MEDIA_FIXTURE_PATH: &str = "/__e2e_expired_media";
 const FULL_FILL_CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 const OFFLINE_MAX_VERIFIED_BYTES: u64 = FULL_FILL_CACHE_BUDGET_BYTES;
 const OFFLINE_MAX_RESOURCES: usize = 4_096;
@@ -106,6 +108,7 @@ async fn bilibili_live_cases_resolve_and_create_playable_hls() {
                 run_policy.full_fill.then_some(FullFillContext {
                     offline_duration: run_policy.offline_duration,
                     ready_file: run_policy.ready_file.clone(),
+                    force_media_refresh: run_policy.force_media_refresh,
                 }),
             )
             .await;
@@ -373,7 +376,7 @@ async fn run_full_fill_restart_and_offline_loop(
             wait_for_completed_fill(&server.channel().await, case, task_id, fill_deadline).await;
     }
     let quiesced = server
-        .restart_preserving_state_with_checkpoint(task_id)
+        .restart_preserving_state_with_checkpoint(task_id, context.force_media_refresh)
         .await
         .unwrap_or_else(|error| panic!("{}: first same-root restart failed: {error}", case.id));
     let checkpoint_evidence =
@@ -453,6 +456,16 @@ async fn run_full_fill_restart_and_offline_loop(
     .await;
     let after_restart =
         wait_for_completed_fill(&server.channel().await, case, task_id, fill_deadline).await;
+    if context.force_media_refresh {
+        assert!(
+            has_quiesced_partial,
+            "forced media refresh requires a durable partial checkpoint"
+        );
+        println!(
+            "{}: forced expired-URL restart recovered through real planning and completed fill",
+            case.id
+        );
+    }
     if let Some(checkpoint) = has_quiesced_partial
         .then_some(quiesced.fill_status.as_ref())
         .flatten()
@@ -2894,6 +2907,7 @@ struct LiveRunPolicy {
     include_collection_list: bool,
     sustained_duration: Option<Duration>,
     full_fill: bool,
+    force_media_refresh: bool,
     offline_duration: Option<Duration>,
     ready_file: Option<PathBuf>,
 }
@@ -2907,6 +2921,7 @@ struct SustainedProbeContext {
 struct FullFillContext {
     offline_duration: Option<Duration>,
     ready_file: Option<PathBuf>,
+    force_media_refresh: bool,
 }
 
 struct OfflinePayload {
@@ -2948,6 +2963,11 @@ enum QuiescedCheckpointEvidence {
 impl LiveRunPolicy {
     fn from_env() -> Self {
         let full_fill = env_flag("BILIBILI_LIVE_E2E_FULL_FILL");
+        let force_media_refresh = env_flag("BILIBILI_LIVE_E2E_FORCE_MEDIA_REFRESH");
+        assert!(
+            !force_media_refresh || full_fill,
+            "BILIBILI_LIVE_E2E_FORCE_MEDIA_REFRESH requires BILIBILI_LIVE_E2E_FULL_FILL=1"
+        );
         let offline_duration = offline_duration_from_env();
         let ready_file = ready_file_from_env();
         assert!(
@@ -2964,6 +2984,7 @@ impl LiveRunPolicy {
             include_collection_list: env_flag("BILIBILI_LIVE_E2E_INCLUDE_COLLECTION_LIST"),
             sustained_duration: sustained_duration_from_env(),
             full_fill,
+            force_media_refresh,
             offline_duration,
             ready_file,
         }
@@ -3481,6 +3502,7 @@ impl LiveTestServer {
     async fn restart_preserving_state_with_checkpoint(
         &mut self,
         task_id: &str,
+        force_media_refresh: bool,
     ) -> Result<QuiescedRestartCheckpoint, String> {
         if let Err(error) = self.quiesce_for_restart().await {
             self.restart_recovery_failure = Some(error.clone());
@@ -3503,6 +3525,29 @@ impl LiveTestServer {
                 return Err(error);
             }
         };
+        if force_media_refresh {
+            let injection = (|| {
+                if !matches!(
+                    classify_quiesced_checkpoint(fill_status.as_ref(), &range_checkpoints),
+                    Ok(QuiescedCheckpointEvidence::Partial { .. })
+                ) {
+                    return Err(());
+                }
+                let fault_uri = format!("{}{}", self.media_url, EXPIRED_MEDIA_FIXTURE_PATH);
+                inject_expired_media_requests(self.temp_root_path(), task_id, &fault_uri)
+            })();
+            match injection {
+                Ok(count) => println!(
+                    "forced media refresh: replaced {count} request candidate sets after verified quiescence"
+                ),
+                Err(()) => {
+                    let error =
+                        "expired-media fixture requires a verifiable partial session".to_owned();
+                    self.restart_recovery_failure = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = self.restore_after_restart().await {
             self.restart_recovery_failure = Some(error.clone());
             return Err(error);
@@ -3905,9 +3950,209 @@ async fn wait_for_grpc(grpc_url: &str) {
     panic!("gRPC server did not start");
 }
 
+// This mutates only the isolated fixture root after every producer has quiesced.
+fn inject_expired_media_requests(
+    root: &Path,
+    session_id: &str,
+    fault_uri: &str,
+) -> Result<usize, ()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if session_id.is_empty()
+        || matches!(session_id, "." | "..")
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(());
+    }
+    let uri = Url::parse(fault_uri).map_err(|_| ())?;
+    if uri.scheme() != "http"
+        || uri.host_str() != Some("127.0.0.1")
+        || uri.port().is_none()
+        || uri.path() != EXPIRED_MEDIA_FIXTURE_PATH
+        || !uri.username().is_empty()
+        || uri.password().is_some()
+        || uri.query().is_some()
+        || uri.fragment().is_some()
+    {
+        return Err(());
+    }
+    let directory = root.join(".tvos-net-player/hls").join(session_id);
+    let path = directory.join("session.json");
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| ())?;
+    let before = file.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() > SESSION_FIXTURE_LIMIT {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(SESSION_FIXTURE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 != before.len() {
+        return Err(());
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if value.get("id").and_then(serde_json::Value::as_str) != Some(session_id)
+        || value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || value
+            .get("accepted_identity")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(());
+    }
+    let mut count = expire_variant_requests(value.get_mut("variant").ok_or(())?, fault_uri)?;
+    if let Some(alternates) = value.get_mut("alternate_variants") {
+        for variant in alternates.as_array_mut().ok_or(())? {
+            count += expire_variant_requests(variant, fault_uri)?;
+        }
+    }
+    let payload = serde_json::to_vec(&value).map_err(|_| ())?;
+    if payload.len() as u64 > SESSION_FIXTURE_LIMIT {
+        return Err(());
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(&directory).map_err(|_| ())?;
+    staged
+        .write_all(&payload)
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|_| ())?;
+    // Revalidate object identity and content, not timestamps or directory-entry churn.
+    std::io::Seek::rewind(&mut file).map_err(|_| ())?;
+    let mut rechecked_bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(SESSION_FIXTURE_LIMIT + 1)
+        .read_to_end(&mut rechecked_bytes)
+        .map_err(|_| ())?;
+    if rechecked_bytes != bytes {
+        return Err(());
+    }
+    let current = fs::symlink_metadata(&path).map_err(|_| ())?;
+    if !current.is_file()
+        || (current.dev(), current.ino(), current.len())
+            != (before.dev(), before.ino(), before.len())
+    {
+        return Err(());
+    }
+    let after = file.metadata().map_err(|_| ())?;
+    if (after.dev(), after.ino(), after.len()) != (before.dev(), before.ino(), before.len()) {
+        return Err(());
+    }
+    staged.persist(&path).map_err(|_| ())?;
+    fs::File::open(&directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ())?;
+    Ok(count)
+}
+
+fn expire_variant_requests(variant: &mut serde_json::Value, fault_uri: &str) -> Result<usize, ()> {
+    let mut count = 0;
+    for key in ["video", "audio"] {
+        let resource = variant.get_mut(key);
+        if key == "audio" && resource.as_ref().is_none_or(|value| value.is_null()) {
+            continue;
+        }
+        let request = resource
+            .ok_or(())?
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(())?;
+        if !request.get("url").is_some_and(serde_json::Value::is_string) {
+            return Err(());
+        }
+        request.insert(
+            "url".to_owned(),
+            serde_json::Value::String(fault_uri.to_owned()),
+        );
+        request.insert(
+            "backup_urls".to_owned(),
+            serde_json::Value::Array(Vec::new()),
+        );
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_request_fixture_preserves_identity_cache_keys_and_other_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".tvos-net-player/hls/session-fixture");
+        fs::create_dir_all(&directory).unwrap();
+        let original = serde_json::json!({
+            "schema_version": 1, "id": "session-fixture",
+            "accepted_identity": {"aid": 1, "cid": 2, "epid": null},
+            "variant": {
+                "id": "variant-original",
+                "video": {"id":"video.m4s", "request": {
+                    "url":"https://media.example.test/video?expired=1",
+                    "backup_urls":["https://backup.example.test/video?expired=1"],
+                    "cache_key":{"source_hash":"original", "content_id":"2"},
+                    "size":4096, "headers":[]
+                }}, "audio":null
+            }, "alternate_variants":[], "effective_policy":{"keep":true}
+        });
+        let path = directory.join("session.json");
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let fault_uri = "http://127.0.0.1:42000/__e2e_expired_media";
+        assert_eq!(
+            1,
+            inject_expired_media_requests(temp.path(), "session-fixture", fault_uri).unwrap()
+        );
+        let mut actual: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(fault_uri, actual["variant"]["video"]["request"]["url"]);
+        actual["variant"]["video"]["request"]["url"] =
+            original["variant"]["video"]["request"]["url"].clone();
+        actual["variant"]["video"]["request"]["backup_urls"] =
+            original["variant"]["video"]["request"]["backup_urls"].clone();
+        assert_eq!(original, actual);
+    }
+
+    #[test]
+    fn expired_request_fixture_rejects_unbound_session_and_nonlocal_fault_url() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            inject_expired_media_requests(
+                temp.path(),
+                "../outside",
+                "http://127.0.0.1:42000/__e2e_expired_media"
+            )
+            .is_err()
+        );
+        assert!(
+            inject_expired_media_requests(
+                temp.path(),
+                "session-fixture",
+                "https://example.test/__e2e_expired_media"
+            )
+            .is_err()
+        );
+        let directory = temp.path().join(".tvos-net-player/hls/session-fixture");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.json");
+        let bytes = br#"{"schema_version":1,"id":"session-fixture","accepted_identity":null}"#;
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            inject_expired_media_requests(
+                temp.path(),
+                "session-fixture",
+                "http://127.0.0.1:42000/__e2e_expired_media"
+            )
+            .is_err()
+        );
+        assert_eq!(bytes, fs::read(path).unwrap().as_slice());
+    }
 
     #[test]
     fn sustained_duration_is_opt_in_and_requires_positive_integer_seconds() {

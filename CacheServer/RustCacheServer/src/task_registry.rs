@@ -17,6 +17,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::{
+    bilibili_playback::{BilibiliContentIdentity, BilibiliMediaRefreshRequest},
     bilibili_resolution::{BilibiliTaskCandidateRecord, MAX_BILIBILI_RESOLUTION_TASK_CANDIDATES},
     generated::tvos_net_player::v1::{
         BilibiliApiMode, BilibiliDanmakuFormat, BilibiliDownloadMode, BilibiliDownloadOptions,
@@ -3346,6 +3347,34 @@ impl BilibiliTaskRegistry {
         })
     }
 
+    pub(crate) fn hls_media_refresh_request(
+        &self,
+        session_id: &str,
+        identity: BilibiliContentIdentity,
+        cancellation: BilibiliTaskCancellation,
+    ) -> Option<BilibiliMediaRefreshRequest> {
+        let normalized_id = normalize(session_id);
+        if normalized_id.is_empty() || !identity.is_refresh_complete() {
+            return None;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        let task = inner.visible_tasks_by_id.values().find(|task| {
+            task.kind() == TaskKind::BilibiliProgressivePlayback
+                && task.state() == TaskState::Playable
+                && task_uses_hls_session(task, &normalized_id)
+        })?;
+        Some(BilibiliMediaRefreshRequest {
+            identity,
+            options: inner
+                .playback_options_by_id
+                .get(&task.id)
+                .cloned()
+                .flatten(),
+            request_context: inner.request_context_by_id.get(&task.id).cloned().flatten(),
+            cancellation,
+        })
+    }
+
     pub fn completed_playback_task_for_hls_session(&self, session_id: &str) -> Option<Task> {
         let normalized_id = normalize(session_id);
         if normalized_id.is_empty() {
@@ -4692,6 +4721,9 @@ impl BilibiliTaskRegistry {
             task.output_summary = Some(output.summary());
 
             let is_active_task = is_active(task.state());
+            let retains_playback_refresh_context = task.kind()
+                == TaskKind::BilibiliProgressivePlayback
+                && task.state() == TaskState::Playable;
             let task_id = task.id.clone();
             let participates_in_active_dedupe = is_active_task
                 && (task.kind() == TaskKind::BilibiliDownload
@@ -4723,12 +4755,14 @@ impl BilibiliTaskRegistry {
                     .download_options_by_id
                     .insert(task_id.clone(), download_options);
             }
-            if is_active_task && task.kind() == TaskKind::BilibiliProgressivePlayback {
+            if (is_active_task || retains_playback_refresh_context)
+                && task.kind() == TaskKind::BilibiliProgressivePlayback
+            {
                 inner
                     .playback_options_by_id
                     .insert(task_id.clone(), playback_options);
             }
-            if is_active_task {
+            if is_active_task || retains_playback_refresh_context {
                 inner
                     .request_context_by_id
                     .insert(task_id.clone(), request_context);
@@ -5778,7 +5812,7 @@ impl BilibiliTaskCancellation {
         self.request_cancel();
     }
 
-    fn request_cancel(&self) {
+    pub(crate) fn request_cancel(&self) {
         self.cancelled.store(true, AtomicOrdering::Relaxed);
     }
 }
@@ -12104,6 +12138,90 @@ mod tests {
                 .as_ref()
                 .map(|options| options.quality_preference.as_str())
         );
+    }
+
+    #[test]
+    fn restored_playable_result_session_refresh_uses_persisted_options_and_profile() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("state").join("tasks.json");
+        let options = playback_options("720p");
+        let request_context = BilibiliRequestContext {
+            api_mode: BilibiliApiMode::Web.into(),
+            credential_profile_id: "fixture-refresh-profile".to_owned(),
+        };
+        let first_candidate = sample_bilibili_task_candidate();
+        let mut second_candidate = first_candidate.clone();
+        second_candidate.selection_id = "page:2:cid:2002:bvid:BV1stable:aid:1001".to_owned();
+        second_candidate.title = "Part 2".to_owned();
+        second_candidate.subtitle = "Page 2".to_owned();
+        second_candidate.content_id = "2002".to_owned();
+        second_candidate.identity.cid = Some(2_002);
+        second_candidate.index = 2;
+
+        let registry = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let creation = registry
+            .create_bilibili_playback_task_v2(
+                "BV1stable",
+                Some(options.clone()),
+                Some(request_context.clone()),
+                "Selected results".to_owned(),
+                vec![first_candidate.clone(), second_candidate.clone()],
+            )
+            .expect("playback task should persist its selection context");
+        let task_id = creation.task.id;
+        let primary_id = task_id.clone();
+        let child_id = format!("{task_id}-result-2");
+        registry
+            .complete_playback_results_playable(
+                &task_id,
+                "Playable results".to_owned(),
+                "Selected results are playable.".to_owned(),
+                playback_source(&primary_id),
+                playback_session(&primary_id),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: primary_id.clone(),
+                        selection_id: String::new(),
+                        title: first_candidate.title.clone(),
+                        source_kind: first_candidate.source_kind.clone(),
+                        content_id: first_candidate.content_id.clone(),
+                        index: first_candidate.index,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        playback_source: Some(playback_source(&primary_id)),
+                        playback_session: Some(playback_session(&primary_id)),
+                        identity: Some(first_candidate.proto_identity()),
+                        ..Default::default()
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_id.clone(),
+                        selection_id: String::new(),
+                        title: second_candidate.title.clone(),
+                        source_kind: second_candidate.source_kind.clone(),
+                        content_id: second_candidate.content_id.clone(),
+                        index: second_candidate.index,
+                        state: TaskState::Playable.into(),
+                        message: "Playable".to_owned(),
+                        playback_source: Some(playback_source(&child_id)),
+                        playback_session: Some(playback_session(&child_id)),
+                        identity: Some(second_candidate.proto_identity()),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .expect("playback results should become playable");
+        drop(registry);
+
+        let restored = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        let request = restored
+            .hls_media_refresh_request(
+                &child_id,
+                second_candidate.identity,
+                BilibiliTaskCancellation::default(),
+            )
+            .expect("restored secondary playable result should be refreshable");
+        assert_eq!(Some(options), request.options);
+        assert_eq!(Some(request_context), request.request_context);
     }
 
     #[test]
