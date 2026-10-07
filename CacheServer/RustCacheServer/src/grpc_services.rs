@@ -21244,6 +21244,22 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct PermitLimitedRefreshPlanner {
+        refreshed: BilibiliPlaybackPlan,
+        started: mpsc::UnboundedSender<usize>,
+        release: Arc<Semaphore>,
+        active: Arc<AtomicUsize>,
+        maximum_active: Arc<AtomicUsize>,
+    }
+
+    struct RefreshPlannerActivityGuard(Arc<AtomicUsize>);
+
+    impl Drop for RefreshPlannerActivityGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     impl BilibiliPlaybackPlanner for PreemptThenRefreshPlanner {
         fn plan<'a>(
             &'a self,
@@ -21274,6 +21290,39 @@ mod tests {
                 let refreshed = self.refreshed.clone();
                 Box::pin(async move { Ok(refreshed) })
             }
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for PermitLimitedRefreshPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            Box::pin(async {
+                Err(BilibiliDownloadError::Failed(
+                    "The test does not plan playback tasks.".to_owned(),
+                ))
+            })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            _request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.maximum_active.fetch_max(active, Ordering::Relaxed);
+            let _ = self.started.send(active);
+            let activity = RefreshPlannerActivityGuard(Arc::clone(&self.active));
+            let release = Arc::clone(&self.release);
+            let refreshed = self.refreshed.clone();
+            Box::pin(async move {
+                let _activity = activity;
+                let permit = release.acquire().await.map_err(|_| {
+                    BilibiliDownloadError::Failed("Test refresh gate was closed.".to_owned())
+                })?;
+                permit.forget();
+                Ok(refreshed)
+            })
         }
     }
 
@@ -21752,6 +21801,32 @@ mod tests {
             Arc::new(planner),
         );
         (state, refresh_calls, refresh_identities)
+    }
+
+    async fn hold_all_playback_planning_permits(
+        state: &AppState,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let permit_count = state.playback_planning_permits.available_permits();
+        let mut permits = Vec::with_capacity(permit_count);
+        for _ in 0..permit_count {
+            permits.push(
+                Arc::clone(&state.playback_planning_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("playback planning permit should be available"),
+            );
+        }
+        permits
+    }
+
+    async fn wait_for_playback_planning_jobs(state: &AppState, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while state.playback_planning_active_jobs.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playback planning activity should reach the expected count");
     }
 
     fn refresh_fixture_mp4() -> Vec<u8> {
@@ -22304,6 +22379,216 @@ mod tests {
             .find(|saved| saved.id == task_id)
             .expect("refreshed session manifest should remain persisted");
         assert_eq!(fresh_url, persisted.variant.video.request.url);
+    }
+
+    #[tokio::test]
+    async fn distinct_hls_refreshes_share_the_single_playback_planning_permit() {
+        let old_url = "https://old.example.test/permit-limited.m4s";
+        let fresh_url = "https://fresh.example.test/permit-limited.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let planner = PermitLimitedRefreshPlanner {
+            refreshed: sample_playback_plan_with_video_url(fresh_url),
+            started: started_sender,
+            release: Arc::clone(&release),
+            active: Arc::clone(&active),
+            maximum_active: Arc::clone(&maximum_active),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                bilibili_worker_max_concurrent_tasks: 1,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (first_task, first_session, _) =
+            create_playable_hls_playback_task(&state, "BV1permit-first", old_url);
+        let (second_task, second_session, _) =
+            create_playable_hls_playback_task(&state, "BV1permit-second", old_url);
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_hls_media_requests(&first_session, &|| HlsCacheFillControl::Continue)
+                .await
+        });
+        assert_eq!(
+            Some(1),
+            timeout(Duration::from_secs(2), started_receiver.recv())
+                .await
+                .expect("first refresh should acquire the planning permit")
+        );
+        assert!(!state.background_work_is_idle());
+        assert_eq!(0, state.playback_planning_permits.available_permits());
+
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .refresh_hls_media_requests(&second_session, &|| HlsCacheFillControl::Continue)
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 2).await;
+        assert!(started_receiver.try_recv().is_err());
+        assert!(!state.background_work_is_idle());
+
+        release.add_permits(1);
+        assert_eq!(
+            Some(1),
+            timeout(Duration::from_secs(2), started_receiver.recv())
+                .await
+                .expect("second refresh should acquire the released permit")
+        );
+        release.add_permits(1);
+        timeout(Duration::from_secs(2), async {
+            first
+                .await
+                .expect("first refresh task should not panic")
+                .expect("first refresh should succeed");
+            second
+                .await
+                .expect("second refresh task should not panic")
+                .expect("second refresh should succeed");
+        })
+        .await
+        .expect("both refreshes should finish");
+
+        assert_eq!(1, maximum_active.load(Ordering::Relaxed));
+        assert_eq!(0, active.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(state.background_work_is_idle());
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&first_task)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&second_task)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_cancellation_drops_activity_without_calling_planner() {
+        let old_url = "https://old.example.test/queued-cancel.m4s";
+        let fresh_url = "https://fresh.example.test/queued-cancel.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), old_url, fresh_url);
+        let (_task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1queued-cancel", old_url);
+        let held_permits = hold_all_playback_planning_permits(&state).await;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control_state = Arc::clone(&cancelled);
+        let refresh_state = state.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_state
+                .refresh_hls_media_requests(&session, &|| {
+                    if control_state.load(Ordering::Relaxed) {
+                        HlsCacheFillControl::Cancel
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 1).await;
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), refresh)
+                .await
+                .expect("cancelled refresh should finish")
+                .expect("refresh task should not panic"),
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Cancelled)
+        ));
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(!state.background_work_is_idle());
+        drop(held_permits);
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_preemption_drops_waiter_and_allows_retry() {
+        let old_url = "https://old.example.test/queued-preempt.m4s";
+        let fresh_url = "https://fresh.example.test/queued-preempt.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), old_url, fresh_url);
+        let (_task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1queued-preempt", old_url);
+        let held_permits = hold_all_playback_planning_permits(&state).await;
+        let preempted = Arc::new(AtomicBool::new(false));
+        let control_state = Arc::clone(&preempted);
+        let refresh_state = state.clone();
+        let queued_session = session.clone();
+        let queued = tokio::spawn(async move {
+            refresh_state
+                .refresh_hls_media_requests(&queued_session, &|| {
+                    if control_state.load(Ordering::Relaxed) {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 1).await;
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        preempted.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), queued)
+                .await
+                .expect("preempted refresh should finish")
+                .expect("refresh task should not panic"),
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Preempted)
+        ));
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        drop(held_permits);
+        assert!(state.background_work_is_idle());
+
+        let retried = state
+            .refresh_hls_media_requests(&session, &|| HlsCacheFillControl::Continue)
+            .await
+            .expect("refresh should retry after queued preemption");
+        assert_eq!(fresh_url, retried.variant.video.request.url);
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(state.background_work_is_idle());
     }
 
     #[tokio::test]

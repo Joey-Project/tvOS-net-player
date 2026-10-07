@@ -2068,8 +2068,18 @@ impl AppState {
                 .tasks
                 .hls_media_refresh_request(&failed.id, identity.clone(), cancellation.clone())
                 .ok_or(RefreshError::Unavailable)?;
+            let _planning_activity = self.begin_playback_planning();
+            let planning_permits = Arc::clone(&self.playback_planning_permits);
+            let playback_planner = Arc::clone(&self.playback_planner);
             let plan = await_plan_with_control(
-                self.playback_planner.refresh_media(request),
+                async move {
+                    let _permit = planning_permits.acquire_owned().await.map_err(|_| {
+                        crate::bilibili_worker::BilibiliDownloadError::Failed(
+                            "Playback planning concurrency limiter is unavailable.".to_owned(),
+                        )
+                    })?;
+                    playback_planner.refresh_media(request).await
+                },
                 &cancellation,
                 control,
                 hls_media_refresh::HLS_MEDIA_REFRESH_TIMEOUT,
@@ -3703,6 +3713,7 @@ mod tests {
             BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem, TaskResult,
         },
         hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
+        hls_cache::HlsCacheFillControl,
         task_store::TaskStateStore,
         transcoding::HlsTranscodingPlan,
     };
@@ -5791,6 +5802,48 @@ mod tests {
         state.cancel_hls_fill_work_for_task(&task_id);
         assert!(current_job.token.is_cancelled());
         state.hls_fill_scheduler.finish_current(&current_job, false);
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn queued_playback_planning_timeout_drops_activity_without_consuming_permit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let held_permit = Arc::clone(&state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .expect("playback planning permit should be available");
+        let planning_activity = state.begin_playback_planning();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let planner_calls = Arc::clone(&calls);
+        let planning_permits = Arc::clone(&state.playback_planning_permits);
+        let cancellation = BilibiliTaskCancellation::default();
+
+        let result = crate::hls_media_refresh::await_plan_with_control(
+            async move {
+                let _permit = planning_permits.acquire_owned().await.map_err(|_| {
+                    BilibiliDownloadError::Failed(
+                        "Playback planning concurrency limiter is unavailable.".to_owned(),
+                    )
+                })?;
+                planner_calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), BilibiliDownloadError>(())
+            },
+            &cancellation,
+            &|| HlsCacheFillControl::Continue,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable)
+        ));
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(0, calls.load(Ordering::Relaxed));
+        assert!(!state.background_work_is_idle());
+        drop(planning_activity);
+        drop(held_permit);
         assert!(state.background_work_is_idle());
     }
 
