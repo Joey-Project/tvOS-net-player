@@ -11,7 +11,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
     bbdown_adapter::BilibiliMediaRequest,
-    hls::{HlsPlaybackSession, HlsVariant},
+    hls::{HlsMediaResource, HlsPlaybackSession, HlsVariant},
     hls_cache::{HlsCacheError, HlsCacheFillControl},
     hls_range_cache::HlsRangeError,
     task_registry::BilibiliTaskCancellation,
@@ -20,6 +20,7 @@ use crate::{
 pub(crate) const HLS_MEDIA_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const HLS_MEDIA_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 pub(crate) const HLS_MEDIA_REFRESH_MAX_SESSIONS: usize = 4_096;
+pub(crate) const HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS: usize = 64;
 pub(crate) const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) enum HlsMediaRefreshError {
@@ -92,31 +93,41 @@ pub(crate) struct HlsMediaRefreshCoordinator {
 
 pub(crate) struct HlsMediaRefreshEntry {
     lock: Arc<AsyncMutex<()>>,
-    last_attempt: Mutex<Option<Instant>>,
+    last_attempts: Mutex<HashMap<Option<String>, Instant>>,
 }
 
 impl HlsMediaRefreshEntry {
-    pub(crate) fn begin_attempt(&self, now: Instant) -> bool {
-        let mut last_attempt = self
-            .last_attempt
+    pub(crate) fn begin_attempt(&self, resource_id: Option<&str>, now: Instant) -> bool {
+        let key = resource_id.map(str::to_owned);
+        let mut last_attempts = self
+            .last_attempts
             .lock()
             .expect("HLS media refresh cooldown lock poisoned");
-        if last_attempt
-            .is_some_and(|last| now.saturating_duration_since(last) < HLS_MEDIA_REFRESH_COOLDOWN)
+        if last_attempts
+            .get(&key)
+            .is_some_and(|last| now.saturating_duration_since(*last) < HLS_MEDIA_REFRESH_COOLDOWN)
         {
             return false;
         }
-        *last_attempt = Some(now);
+        last_attempts
+            .retain(|_, last| now.saturating_duration_since(*last) < HLS_MEDIA_REFRESH_COOLDOWN);
+        if !last_attempts.contains_key(&key)
+            && last_attempts.len() >= HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS
+        {
+            return false;
+        }
+        last_attempts.insert(key, now);
         true
     }
 
-    pub(crate) fn clear_attempt_if_current(&self, attempt: Instant) {
-        let mut last_attempt = self
-            .last_attempt
+    pub(crate) fn clear_attempt_if_current(&self, resource_id: Option<&str>, attempt: Instant) {
+        let key = resource_id.map(str::to_owned);
+        let mut last_attempts = self
+            .last_attempts
             .lock()
             .expect("HLS media refresh cooldown lock poisoned");
-        if *last_attempt == Some(attempt) {
-            *last_attempt = None;
+        if last_attempts.get(&key) == Some(&attempt) {
+            last_attempts.remove(&key);
         }
     }
 }
@@ -167,12 +178,11 @@ impl HlsMediaRefreshCoordinator {
                     return true;
                 }
                 let idle = entry
-                    .last_attempt
+                    .last_attempts
                     .lock()
                     .expect("HLS media refresh cooldown lock poisoned")
-                    .is_none_or(|last| {
-                        now.saturating_duration_since(last) >= HLS_MEDIA_REFRESH_COOLDOWN
-                    });
+                    .values()
+                    .all(|last| now.saturating_duration_since(*last) >= HLS_MEDIA_REFRESH_COOLDOWN);
                 !idle || entry.lock.try_lock().is_err()
             });
         }
@@ -181,7 +191,7 @@ impl HlsMediaRefreshCoordinator {
         }
         let entry = Arc::new(HlsMediaRefreshEntry {
             lock: Arc::new(AsyncMutex::new(())),
-            last_attempt: Mutex::new(None),
+            last_attempts: Mutex::new(HashMap::new()),
         });
         entries.insert(session_id.to_owned(), Arc::clone(&entry));
         Ok(entry)
@@ -244,32 +254,102 @@ pub(crate) fn same_hls_media_refresh_binding(
     expected == current
 }
 
-pub(crate) fn session_has_new_media_requests(
-    expected: &HlsPlaybackSession,
+pub(crate) fn media_resource_request_changed(
+    expected: &HlsMediaResource,
     current: &HlsPlaybackSession,
 ) -> bool {
-    let expected_requests = session_requests(expected);
-    let current_requests = session_requests(current);
-    expected_requests.len() == current_requests.len()
-        && expected_requests
-            .iter()
-            .zip(current_requests.iter())
-            .any(|(expected, current)| {
-                expected.url != current.url
-                    || expected.backup_urls != current.backup_urls
-                    || expected.headers != current.headers
-            })
+    current.media_resource(&expected.id).is_some_and(|current| {
+        expected.request.url != current.request.url
+            || expected.request.backup_urls != current.request.backup_urls
+            || expected.request.headers != current.request.headers
+    })
 }
 
-fn session_requests(session: &HlsPlaybackSession) -> Vec<&BilibiliMediaRequest> {
+pub(crate) fn failed_media_request_was_refreshed(
+    expected: &HlsPlaybackSession,
+    current: &HlsPlaybackSession,
+    failed_resource: Option<&HlsMediaResource>,
+) -> bool {
+    if let Some(resource) = failed_resource {
+        return media_resource_request_changed(resource, current);
+    }
+    if !same_hls_media_refresh_binding(expected, current) {
+        return false;
+    }
+    let expected_requests = session_resource_requests(expected);
+    let current_requests = session_resource_requests(current);
+    !expected_requests.is_empty()
+        && expected_requests.len() == current_requests.len()
+        && expected_requests.iter().zip(&current_requests).all(
+            |((expected_id, expected), (current_id, current))| {
+                expected_id == current_id && request_urls_or_headers_differ(expected, current)
+            },
+        )
+}
+
+pub(crate) fn preserve_concurrent_media_request_updates(
+    expected: &HlsPlaybackSession,
+    current: &HlsPlaybackSession,
+    replacement: &mut HlsPlaybackSession,
+    refreshed_resource_id: Option<&str>,
+) {
+    let expected_requests = session_resource_requests(expected);
+    let current_requests = session_resource_requests(current);
+    let mut replacement_requests = session_resource_requests_mut(replacement);
+    for (((expected_id, expected), (current_id, current)), (replacement_id, replacement)) in
+        expected_requests
+            .into_iter()
+            .zip(current_requests)
+            .zip(replacement_requests.iter_mut())
+    {
+        if expected_id == current_id
+            && current_id == replacement_id
+            && refreshed_resource_id != Some(current_id)
+            && request_urls_or_headers_differ(expected, current)
+        {
+            replacement.url.clone_from(&current.url);
+            replacement.backup_urls.clone_from(&current.backup_urls);
+            replacement.headers.clone_from(&current.headers);
+        }
+    }
+}
+
+fn request_urls_or_headers_differ(
+    expected: &BilibiliMediaRequest,
+    current: &BilibiliMediaRequest,
+) -> bool {
+    expected.url != current.url
+        || expected.backup_urls != current.backup_urls
+        || expected.headers != current.headers
+}
+
+fn session_resource_requests(session: &HlsPlaybackSession) -> Vec<(&str, &BilibiliMediaRequest)> {
     std::iter::once(&session.variant)
         .chain(session.alternate_variants.iter())
-        .flat_map(variant_requests)
+        .flat_map(|variant| {
+            std::iter::once((variant.video.id.as_str(), &variant.video.request)).chain(
+                variant
+                    .audio
+                    .iter()
+                    .map(|audio| (audio.id.as_str(), &audio.request)),
+            )
+        })
         .collect()
 }
 
-fn variant_requests(variant: &HlsVariant) -> impl Iterator<Item = &BilibiliMediaRequest> {
-    std::iter::once(&variant.video.request).chain(variant.audio.iter().map(|audio| &audio.request))
+fn session_resource_requests_mut(
+    session: &mut HlsPlaybackSession,
+) -> Vec<(String, &mut BilibiliMediaRequest)> {
+    let mut requests = Vec::new();
+    for variant in
+        std::iter::once(&mut session.variant).chain(session.alternate_variants.iter_mut())
+    {
+        requests.push((variant.video.id.clone(), &mut variant.video.request));
+        if let Some(audio) = &mut variant.audio {
+            requests.push((audio.id.clone(), &mut audio.request));
+        }
+    }
+    requests
 }
 
 fn clear_request_urls_and_headers(variant: &mut HlsVariant) {
@@ -323,12 +403,137 @@ mod tests {
         refreshed.variant.video.request.url = "https://cdn.example/renewed".to_owned();
         refreshed.variant.video.request.backup_urls =
             vec!["https://backup.example/renewed".to_owned()];
-        refreshed.variant.video.request.headers[0].value = "new-header-value".to_owned();
+        refreshed.variant.video.request.headers = vec![crate::bbdown_adapter::BilibiliHttpHeader {
+            name: "accept-language".to_owned(),
+            value: "en".to_owned(),
+        }];
         assert!(same_hls_media_refresh_binding(&original, &refreshed));
-        assert!(session_has_new_media_requests(&original, &refreshed));
+        assert!(media_resource_request_changed(
+            &original.variant.video,
+            &refreshed
+        ));
+        assert!(!media_resource_request_changed(
+            &original.variant.video,
+            &original
+        ));
 
         refreshed.variant.video.request.cache_key.source_hash = "different".to_owned();
         assert!(!same_hls_media_refresh_binding(&original, &refreshed));
+    }
+
+    #[test]
+    fn refresh_detection_is_scoped_to_the_failed_media_resource() {
+        let mut original = crate::tests::sample_hls_session("session");
+        let mut audio = original.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = crate::bbdown_adapter::BilibiliMediaRequestKind::Audio;
+        audio.request.url = "https://cdn.example.test/audio-old.m4s".to_owned();
+        audio.request.cache_key.media_kind = crate::bbdown_adapter::BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.source_hash = "audio-source".to_owned();
+        original.variant.audio = Some(audio);
+        let mut alternate = original.variant.clone();
+        alternate.id = "alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://cdn.example.test/alternate-old.m4s".to_owned();
+        alternate.video.request.cache_key.source_hash = "alternate-source".to_owned();
+        original.alternate_variants.push(alternate);
+
+        let mut current = original.clone();
+        current.variant.video.request.url = "https://cdn.example.test/video-fresh.m4s".to_owned();
+        current.alternate_variants[0].video.request.url =
+            "https://cdn.example.test/alternate-fresh.m4s".to_owned();
+        assert!(media_resource_request_changed(
+            &original.variant.video,
+            &current
+        ));
+        assert!(!media_resource_request_changed(
+            original.variant.audio.as_ref().unwrap(),
+            &current
+        ));
+        assert!(media_resource_request_changed(
+            &original.alternate_variants[0].video,
+            &current
+        ));
+
+        current.variant.audio.as_mut().unwrap().request.headers[0].value =
+            "https://headers.example.test/audio".to_owned();
+        assert!(media_resource_request_changed(
+            original.variant.audio.as_ref().unwrap(),
+            &current
+        ));
+        assert!(!failed_media_request_was_refreshed(
+            &original, &current, None
+        ));
+        current.variant.audio.as_mut().unwrap().request.url =
+            "https://cdn.example.test/audio-fresh.m4s".to_owned();
+        current.alternate_variants[0]
+            .audio
+            .as_mut()
+            .unwrap()
+            .request
+            .url = "https://cdn.example.test/alternate-audio-fresh.m4s".to_owned();
+        assert!(failed_media_request_was_refreshed(
+            &original, &current, None
+        ));
+        let single = crate::tests::sample_hls_session("single");
+        let mut single_refreshed = single.clone();
+        single_refreshed.variant.video.request.url =
+            "https://cdn.example.test/video-fresh.m4s".to_owned();
+        assert!(failed_media_request_was_refreshed(
+            &single,
+            &single_refreshed,
+            None
+        ));
+    }
+
+    #[test]
+    fn refresh_merge_preserves_other_resources_updated_since_failure() {
+        let mut expected = crate::tests::sample_hls_session("session");
+        let mut audio = expected.variant.video.clone();
+        audio.id = "audio.m4s".to_owned();
+        audio.request.kind = crate::bbdown_adapter::BilibiliMediaRequestKind::Audio;
+        audio.request.url = "https://cdn.example.test/audio-old.m4s".to_owned();
+        audio.request.cache_key.media_kind = crate::bbdown_adapter::BilibiliMediaRequestKind::Audio;
+        audio.request.cache_key.source_hash = "audio-source".to_owned();
+        expected.variant.audio = Some(audio);
+        let mut alternate = expected.variant.clone();
+        alternate.id = "alternate".to_owned();
+        alternate.video.id = "alternate-video.m4s".to_owned();
+        alternate.video.request.url = "https://cdn.example.test/alternate-old.m4s".to_owned();
+        alternate.video.request.cache_key.source_hash = "alternate-source".to_owned();
+        expected.alternate_variants.push(alternate);
+
+        let mut current = expected.clone();
+        current.variant.video.request.url = "https://cdn.example.test/video-current.m4s".to_owned();
+        current.alternate_variants[0].video.request.url =
+            "https://cdn.example.test/alternate-current.m4s".to_owned();
+        let mut replacement = current.clone();
+        replacement.variant.video.request.url =
+            "https://cdn.example.test/video-stale.m4s".to_owned();
+        replacement.variant.audio.as_mut().unwrap().request.url =
+            "https://cdn.example.test/audio-refreshed.m4s".to_owned();
+        replacement.alternate_variants[0].video.request.url =
+            "https://cdn.example.test/alternate-stale.m4s".to_owned();
+
+        preserve_concurrent_media_request_updates(
+            &expected,
+            &current,
+            &mut replacement,
+            Some("audio.m4s"),
+        );
+
+        assert_eq!(
+            "https://cdn.example.test/video-current.m4s",
+            replacement.variant.video.request.url
+        );
+        assert_eq!(
+            "https://cdn.example.test/audio-refreshed.m4s",
+            replacement.variant.audio.as_ref().unwrap().request.url
+        );
+        assert_eq!(
+            "https://cdn.example.test/alternate-current.m4s",
+            replacement.alternate_variants[0].video.request.url
+        );
     }
 
     #[test]
@@ -367,7 +572,8 @@ mod tests {
             .lock_session("session", &|| HlsCacheFillControl::Continue)
             .await
             .expect("first caller should acquire session lock");
-        assert!(entry.begin_attempt(Instant::now()));
+        let now = Instant::now();
+        assert!(entry.begin_attempt(Some("video.m4s"), now));
 
         let waiter_coordinator = coordinator.clone();
         let waiter = tokio::spawn(async move {
@@ -380,7 +586,51 @@ mod tests {
             .await
             .expect("waiter should finish")
             .expect("waiter should acquire session lock");
-        assert!(!waiter_entry.begin_attempt(Instant::now()));
+        assert!(!waiter_entry.begin_attempt(Some("video.m4s"), now + Duration::from_secs(1)));
+        assert!(waiter_entry.begin_attempt(Some("audio.m4s"), now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn resource_cooldown_is_bounded_and_cleared_only_for_its_attempt() {
+        let entry = HlsMediaRefreshEntry {
+            lock: Arc::new(AsyncMutex::new(())),
+            last_attempts: Mutex::new(HashMap::new()),
+        };
+        let start = Instant::now();
+        for index in 0..HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS {
+            assert!(entry.begin_attempt(Some(&format!("resource-{index}")), start));
+        }
+        assert_eq!(
+            HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS,
+            entry.last_attempts.lock().unwrap().len()
+        );
+        assert!(!entry.begin_attempt(Some("new-resource"), start + Duration::from_secs(1)));
+        for index in 0..HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS {
+            assert!(!entry.begin_attempt(
+                Some(&format!("resource-{index}")),
+                start + Duration::from_secs(1)
+            ));
+        }
+        assert_eq!(
+            HLS_MEDIA_REFRESH_MAX_RESOURCE_COOLDOWNS,
+            entry.last_attempts.lock().unwrap().len()
+        );
+        let after_cooldown = start + HLS_MEDIA_REFRESH_COOLDOWN;
+        assert!(entry.begin_attempt(Some("new-resource"), after_cooldown));
+        assert_eq!(1, entry.last_attempts.lock().unwrap().len());
+        entry.clear_attempt_if_current(
+            Some("new-resource"),
+            after_cooldown + Duration::from_secs(1),
+        );
+        assert!(!entry.begin_attempt(
+            Some("new-resource"),
+            after_cooldown + Duration::from_secs(2)
+        ));
+        entry.clear_attempt_if_current(Some("new-resource"), after_cooldown);
+        assert!(entry.begin_attempt(
+            Some("new-resource"),
+            after_cooldown + Duration::from_secs(2)
+        ));
     }
 
     #[tokio::test]
@@ -526,7 +776,7 @@ mod tests {
             let entry = coordinator
                 .entry(&format!("session-{index}"))
                 .expect("entry should fit within capacity");
-            assert!(entry.begin_attempt(now));
+            assert!(entry.begin_attempt(None, now));
             retained.push(entry);
         }
         assert!(matches!(

@@ -3360,8 +3360,7 @@ impl BilibiliTaskRegistry {
         let inner = self.inner.lock().expect("task registry lock poisoned");
         let task = inner.visible_tasks_by_id.values().find(|task| {
             task.kind() == TaskKind::BilibiliProgressivePlayback
-                && task.state() == TaskState::Playable
-                && task_uses_hls_session(task, &normalized_id)
+                && task_has_refreshable_hls_session(task, &normalized_id)
         })?;
         Some(BilibiliMediaRefreshRequest {
             identity,
@@ -4212,6 +4211,23 @@ impl BilibiliTaskRegistry {
             == HlsSessionPublicationState::Published
     }
 
+    pub(crate) fn is_hls_session_refreshable_for_task(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> bool {
+        let normalized_task_id = normalize(task_id);
+        let normalized_session_id = normalize(session_id);
+        if normalized_task_id.is_empty() || normalized_session_id.is_empty() {
+            return false;
+        }
+        let inner = self.inner.lock().expect("task registry lock poisoned");
+        inner
+            .visible_tasks_by_id
+            .get(&normalized_task_id)
+            .is_some_and(|task| task_has_refreshable_hls_session(task, &normalized_session_id))
+    }
+
     pub(crate) fn hls_session_publication_state(
         &self,
         task_id: &str,
@@ -4721,9 +4737,7 @@ impl BilibiliTaskRegistry {
             task.output_summary = Some(output.summary());
 
             let is_active_task = is_active(task.state());
-            let retains_playback_refresh_context = task.kind()
-                == TaskKind::BilibiliProgressivePlayback
-                && task.state() == TaskState::Playable;
+            let retains_playback_refresh_context = task_retains_playback_refresh_context(&task);
             let task_id = task.id.clone();
             let participates_in_active_dedupe = is_active_task
                 && (task.kind() == TaskKind::BilibiliDownload
@@ -5519,8 +5533,14 @@ impl BilibiliTaskRegistry {
         inner.running_cancellations_by_id.remove(&task.id);
         inner.planning_cancellations_by_id.remove(&task.id);
         inner.download_options_by_id.remove(&task.id);
-        inner.playback_options_by_id.remove(&task.id);
-        inner.request_context_by_id.remove(&task.id);
+        let retains_playback_refresh_context = inner
+            .tasks_by_id
+            .get(&task.id)
+            .is_some_and(task_retains_playback_refresh_context);
+        if !retains_playback_refresh_context {
+            inner.playback_options_by_id.remove(&task.id);
+            inner.request_context_by_id.remove(&task.id);
+        }
         inner.queued_task_ids.retain(|task_id| task_id != &task.id);
     }
 
@@ -6492,6 +6512,28 @@ fn completed_task_has_playable_result_session(task: &Task, session_id: &str) -> 
                 )
                 || result_item_uses_hls_session(item, session_id)
                     && result_item_has_online_playback_after_cache_fill_failure(item)
+        })
+}
+
+fn task_retains_playback_refresh_context(task: &Task) -> bool {
+    task.kind() == TaskKind::BilibiliProgressivePlayback
+        && playback_hls_session_ids(task)
+            .iter()
+            .any(|session_id| task_has_refreshable_hls_session(task, session_id))
+}
+
+fn task_has_refreshable_hls_session(task: &Task, session_id: &str) -> bool {
+    task_has_playable_hls_session(task, session_id)
+        && (task.state() != TaskState::Completed
+            || completed_task_has_refreshable_result_session(task, session_id))
+}
+
+fn completed_task_has_refreshable_result_session(task: &Task, session_id: &str) -> bool {
+    completed_task_has_playable_result_session(task, session_id)
+        && task.result_items.iter().any(|item| {
+            result_item_uses_hls_session(item, session_id)
+                && (result_item_state(item) == Some(TaskState::Playable)
+                    || result_item_has_online_playback_after_cache_fill_failure(item))
         })
 }
 
@@ -11665,6 +11707,15 @@ mod tests {
         assert!(task.result_items[1].library_item_id.is_empty());
         assert!(task.result_items[1].playback_source.is_none());
         assert!(task.result_items[1].playback_session.is_none());
+        assert!(
+            registry
+                .hls_media_refresh_request(
+                    &child_session_id,
+                    sample_bilibili_task_candidate().identity,
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -12009,6 +12060,15 @@ mod tests {
         assert_eq!(TaskState::Cancelled, stored.state());
         assert!(stored.playback_source.is_none());
         assert!(stored.playback_session.is_none());
+        assert!(
+            registry
+                .hls_media_refresh_request(
+                    &playable.id,
+                    sample_bilibili_task_candidate().identity,
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
         assert!(recreated.created);
         assert_ne!(playable.id, recreated.task.id);
     }
@@ -12210,18 +12270,131 @@ mod tests {
                 ],
             )
             .expect("playback results should become playable");
+        let primary_cached = registry
+            .complete_playback_hls_session_cached(
+                &task_id,
+                &primary_id,
+                format!("bilibili.hls.{primary_id}"),
+            )
+            .expect("primary result should complete its cache fill");
+        assert_eq!(TaskState::Completed, primary_cached.state());
+        assert!(!registry.is_hls_session_refreshable_for_task(&task_id, &primary_id));
+        assert!(
+            registry
+                .hls_media_refresh_request(
+                    &primary_id,
+                    first_candidate.identity.clone(),
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
+        assert!(registry.is_hls_session_refreshable_for_task(&task_id, &child_id));
+        let request_before_restart = registry
+            .hls_media_refresh_request(
+                &child_id,
+                second_candidate.identity.clone(),
+                BilibiliTaskCancellation::default(),
+            )
+            .expect("remaining online secondary result should be refreshable");
+        assert_eq!(Some(options.clone()), request_before_restart.options);
+        assert_eq!(
+            Some(request_context.clone()),
+            request_before_restart.request_context
+        );
+        assert!(
+            registry
+                .hls_media_refresh_request(
+                    "unknown-session",
+                    second_candidate.identity.clone(),
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
+        let mut incomplete_identity = second_candidate.identity.clone();
+        incomplete_identity.cid = None;
+        assert!(
+            registry
+                .hls_media_refresh_request(
+                    &child_id,
+                    incomplete_identity,
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
         drop(registry);
 
         let restored = BilibiliTaskRegistry::with_persistence_path(&state_path);
         let request = restored
             .hls_media_refresh_request(
                 &child_id,
-                second_candidate.identity,
+                second_candidate.identity.clone(),
                 BilibiliTaskCancellation::default(),
             )
             .expect("restored secondary playable result should be refreshable");
         assert_eq!(Some(options), request.options);
         assert_eq!(Some(request_context), request.request_context);
+        assert_eq!(
+            TaskState::Completed,
+            restored
+                .get_task(&task_id)
+                .expect("task should restore")
+                .state()
+        );
+        assert!(!restored.is_hls_session_refreshable_for_task(&task_id, &primary_id));
+        assert!(restored.is_hls_session_refreshable_for_task(&task_id, &child_id));
+
+        let all_cached = restored
+            .complete_playback_hls_session_cached(
+                &task_id,
+                &child_id,
+                format!("bilibili.hls.{child_id}"),
+            )
+            .expect("remaining result should complete its cache fill");
+        assert!(
+            all_cached
+                .result_items
+                .iter()
+                .all(|item| result_item_state(item) == Some(TaskState::Completed))
+        );
+        assert!(!restored.is_hls_session_refreshable_for_task(&task_id, &primary_id));
+        assert!(!restored.is_hls_session_refreshable_for_task(&task_id, &child_id));
+        assert!(
+            restored
+                .hls_media_refresh_request(
+                    &child_id,
+                    second_candidate.identity.clone(),
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
+        {
+            let inner = restored
+                .inner
+                .lock()
+                .expect("registry lock should be valid");
+            assert!(!inner.playback_options_by_id.contains_key(&task_id));
+            assert!(!inner.request_context_by_id.contains_key(&task_id));
+        }
+        drop(restored);
+
+        let fully_cached_restored = BilibiliTaskRegistry::with_persistence_path(&state_path);
+        assert!(
+            fully_cached_restored
+                .hls_media_refresh_request(
+                    &child_id,
+                    second_candidate.identity,
+                    BilibiliTaskCancellation::default(),
+                )
+                .is_none()
+        );
+        {
+            let inner = fully_cached_restored
+                .inner
+                .lock()
+                .expect("registry lock should be valid");
+            assert!(!inner.playback_options_by_id.contains_key(&task_id));
+            assert!(!inner.request_context_by_id.contains_key(&task_id));
+        }
     }
 
     #[test]

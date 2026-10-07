@@ -1136,7 +1136,7 @@ where
     };
     let refreshed = match state
         .state
-        .refresh_hls_media_requests(&failed_session, control)
+        .refresh_hls_media_requests_for_resource(&failed_session, &effective_resource, control)
         .await
     {
         Ok(refreshed) => refreshed,
@@ -1503,9 +1503,6 @@ async fn proxy_hls_media_resource(
     let Some(expired_status) = attempt.expired_status else {
         return attempt.response;
     };
-    if head_only {
-        return attempt.response;
-    }
     let Some(failed_session) = failed_session else {
         return attempt.response;
     };
@@ -1517,14 +1514,25 @@ async fn proxy_hls_media_resource(
     );
     let refreshed = match state
         .state
-        .refresh_hls_media_requests(&failed_session, &control)
+        .refresh_hls_media_requests_for_resource(&failed_session, &current_resource, &control)
         .await
     {
         Ok(refreshed) => refreshed,
         Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable) => {
             return attempt.response;
         }
+        Err(
+            refresh_error @ (crate::hls_media_refresh::HlsMediaRefreshError::Cancelled
+            | crate::hls_media_refresh::HlsMediaRefreshError::Preempted),
+        ) => {
+            return hls_range_error_response(
+                refresh_error.into_range_error(HlsRangeError::UpstreamStatus(expired_status)),
+            );
+        }
         Err(refresh_error) => {
+            if head_only {
+                return attempt.response;
+            }
             return hls_range_error_response(
                 refresh_error.into_range_error(HlsRangeError::UpstreamStatus(expired_status)),
             );
@@ -1537,6 +1545,9 @@ async fn proxy_hls_media_resource(
                 same_hls_range_resource_representation(&current_resource, replacement)
             })
     else {
+        if head_only {
+            return attempt.response;
+        }
         return hls_range_error_response(HlsRangeError::IdentityChanged);
     };
     proxy_hls_media_resource_once(
@@ -2295,7 +2306,7 @@ async fn load_hls_mp4_initialization(
     );
     let refreshed = state
         .state
-        .refresh_hls_media_requests(&failed_session, &control)
+        .refresh_hls_media_requests_for_resource(&failed_session, &current_resource, &control)
         .await
         .map_err(|_| ())?;
     let (_, replacement) = refreshed

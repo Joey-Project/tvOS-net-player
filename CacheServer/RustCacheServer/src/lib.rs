@@ -69,7 +69,7 @@ use crate::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
         TaskGrpcService, TaskResultPageStore, playback_session_from_hls_cache_session,
     },
-    hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
+    hls::{HlsMediaResource, HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheSessionDirectoryScan, HlsCacheStatusSnapshot, HlsCacheStore,
@@ -2004,9 +2004,36 @@ impl AppState {
     where
         F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
     {
+        self.refresh_hls_media_requests_inner(failed, None, control)
+            .await
+    }
+
+    pub(crate) async fn refresh_hls_media_requests_for_resource<F>(
+        &self,
+        failed: &HlsPlaybackSession,
+        failed_resource: &HlsMediaResource,
+        control: &F,
+    ) -> Result<HlsPlaybackSession, hls_media_refresh::HlsMediaRefreshError>
+    where
+        F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
+    {
+        self.refresh_hls_media_requests_inner(failed, Some(failed_resource), control)
+            .await
+    }
+
+    async fn refresh_hls_media_requests_inner<F>(
+        &self,
+        failed: &HlsPlaybackSession,
+        failed_resource: Option<&HlsMediaResource>,
+        control: &F,
+    ) -> Result<HlsPlaybackSession, hls_media_refresh::HlsMediaRefreshError>
+    where
+        F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
+    {
         use hls_media_refresh::{
             HlsMediaRefreshError as RefreshError, await_plan_with_control, check_control,
-            same_hls_media_refresh_binding, session_has_new_media_requests,
+            failed_media_request_was_refreshed, preserve_concurrent_media_request_updates,
+            same_hls_media_refresh_binding,
         };
 
         check_control(control)?;
@@ -2016,7 +2043,7 @@ impl AppState {
             .filter(|identity| identity.is_refresh_complete())
             .ok_or(RefreshError::Unavailable)?;
         let mut current = self.current_refresh_session(failed, identity)?;
-        if session_has_new_media_requests(failed, &current.session) {
+        if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
             return Ok(current.session);
         }
 
@@ -2026,11 +2053,12 @@ impl AppState {
             .await?;
         check_control(control)?;
         current = self.current_refresh_session(failed, identity)?;
-        if session_has_new_media_requests(failed, &current.session) {
+        if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
             return Ok(current.session);
         }
         let attempt_started = std::time::Instant::now();
-        if !entry.begin_attempt(attempt_started) {
+        let resource_id = failed_resource.map(|resource| resource.id.as_str());
+        if !entry.begin_attempt(resource_id, attempt_started) {
             return Err(RefreshError::Unavailable);
         }
 
@@ -2048,23 +2076,26 @@ impl AppState {
             )
             .await?;
             check_control(control)?;
-            let replacement = failed
-                .with_refreshed_media_requests(&plan)
-                .map_err(|_| RefreshError::IdentityMismatch)?;
-            if !same_hls_media_refresh_binding(failed, &replacement) {
-                return Err(RefreshError::IdentityMismatch);
-            }
-
             let _lifecycle_guard = self.hls_task_lifecycle_guard();
             let _completed_mutation_guard = self.completed_hls_mutation_guard();
             check_control(control)?;
             let current = self.current_refresh_session(failed, identity)?;
-            if session_has_new_media_requests(failed, &current.session) {
+            if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
                 return Ok(current.session);
             }
-            if current.session != *failed {
+            let mut replacement = current
+                .session
+                .with_refreshed_media_requests(&plan)
+                .map_err(|_| RefreshError::IdentityMismatch)?;
+            if !same_hls_media_refresh_binding(&current.session, &replacement) {
                 return Err(RefreshError::IdentityMismatch);
             }
+            preserve_concurrent_media_request_updates(
+                failed,
+                &current.session,
+                &mut replacement,
+                resource_id,
+            );
             let cache = self.hls_cache.clone();
             let saved = self
                 .hls_sessions
@@ -2082,7 +2113,7 @@ impl AppState {
             &result,
             Err(RefreshError::Cancelled | RefreshError::Preempted)
         ) {
-            entry.clear_attempt_if_current(attempt_started);
+            entry.clear_attempt_if_current(resource_id, attempt_started);
         }
         result
     }
@@ -2109,10 +2140,9 @@ impl AppState {
             .get_task(&task_id)
             .map_err(|_| RefreshError::Unavailable)?;
         if task.kind() != TaskKind::BilibiliProgressivePlayback
-            || task.state() != TaskState::Playable
             || !self
                 .tasks
-                .is_hls_session_playable_for_task(&task_id, &failed.id)
+                .is_hls_session_refreshable_for_task(&task_id, &failed.id)
         {
             return Err(RefreshError::Unavailable);
         }

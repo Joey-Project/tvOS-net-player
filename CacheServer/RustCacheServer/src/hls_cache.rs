@@ -2536,7 +2536,10 @@ impl HlsCacheStore {
             &loaded.manifest,
             &origin,
         ) {
-            return Err(identity_error_at("extent-publish-rebase"));
+            return Err(identity_error_at(
+                range_manifest_extent_rebase_failure_stage(expected, &loaded.manifest, &origin)
+                    .unwrap_or("extent-publish-rebase-unclassified"),
+            ));
         }
         if let Some(binding) = loaded
             .manifest
@@ -5685,6 +5688,87 @@ fn range_manifest_rebase_compatible_for_extent_publication(
     binding_state(expected) == binding_state(current)
 }
 
+// This mirrors the extent rebase predicate only to name its first failed signal.
+fn range_manifest_extent_rebase_failure_stage(
+    expected: &PersistedRangeManifest,
+    current: &PersistedRangeManifest,
+    target_origin: &str,
+) -> Option<&'static str> {
+    if expected.resource_id != current.resource_id {
+        return Some("extent-publish-rebase-resource-id");
+    }
+    if expected.representation_digest != current.representation_digest {
+        return Some("extent-publish-rebase-representation");
+    }
+    if expected.data_identity != current.data_identity {
+        return Some("extent-publish-rebase-data-object-identity");
+    }
+    if current.generation < expected.generation {
+        return Some("extent-publish-rebase-generation-regression");
+    }
+    if expected
+        .total_length
+        .is_some_and(|total| current.total_length != Some(total))
+    {
+        return Some("extent-publish-rebase-total-length");
+    }
+    if expected
+        .prefix_sha256
+        .as_ref()
+        .is_some_and(|prefix| current.prefix_sha256.as_ref() != Some(prefix))
+    {
+        return Some("extent-publish-rebase-prefix-digest");
+    }
+    for old in &expected.validated_origins {
+        let Some(new) = current
+            .validated_origins
+            .iter()
+            .find(|new| new.origin == old.origin)
+        else {
+            return Some(if old.origin == target_origin {
+                "extent-publish-rebase-target-origin-removed"
+            } else {
+                "extent-publish-rebase-existing-origin-prefix"
+            });
+        };
+        if new.prefix_sha256 != old.prefix_sha256 {
+            return Some(if old.origin == target_origin {
+                "extent-publish-rebase-target-origin-prefix"
+            } else {
+                "extent-publish-rebase-existing-origin-prefix"
+            });
+        }
+    }
+    if expected.extents.iter().any(|old| {
+        !current
+            .extents
+            .iter()
+            .any(|new| new.start == old.start && new.end == old.end && new.sha256 == old.sha256)
+    }) {
+        return Some("extent-publish-rebase-existing-extent");
+    }
+
+    let expected_binding = expected
+        .validated_origins
+        .iter()
+        .find(|binding| binding.origin == target_origin);
+    let current_binding = current
+        .validated_origins
+        .iter()
+        .find(|binding| binding.origin == target_origin);
+    match (expected_binding, current_binding) {
+        (Some(expected), Some(current)) if expected.prefix_sha256 != current.prefix_sha256 => {
+            Some("extent-publish-rebase-target-origin-prefix")
+        }
+        (Some(expected), Some(current)) if expected.strong_etag != current.strong_etag => {
+            Some("extent-publish-rebase-target-origin-strong-etag")
+        }
+        (None, None) | (Some(_), Some(_)) => None,
+        (None, Some(_)) => Some("extent-publish-rebase-target-origin-added"),
+        (Some(_), None) => Some("extent-publish-rebase-target-origin-removed"),
+    }
+}
+
 fn range_manifest_rebase_compatible_ignoring_origin(
     expected: &PersistedRangeManifest,
     current: &PersistedRangeManifest,
@@ -6430,8 +6514,10 @@ fn session_refresh_mismatch_stage(
     if existing.effective_policy != incoming.effective_policy {
         return Some("authorization-policy");
     }
-    let existing = normalized_session_bindings(existing);
-    let incoming = normalized_session_bindings(incoming);
+    let mut existing = normalized_session_bindings(existing);
+    let mut incoming = normalized_session_bindings(incoming);
+    clear_session_request_headers(&mut existing);
+    clear_session_request_headers(&mut incoming);
     if existing.variant != incoming.variant {
         return Some(
             variant_binding_mismatch_stage(&existing.variant, &incoming.variant)
@@ -7525,6 +7611,42 @@ mod tests {
         .with_range_budget(1024 * 1024 * 1024)
     }
 
+    fn extent_rebase_test_manifest() -> (PersistedRangeManifest, String) {
+        let target_origin = "https://target.example:443".to_owned();
+        let manifest = PersistedRangeManifest {
+            schema_version: crate::hls_range_cache::RANGE_MANIFEST_SCHEMA_VERSION,
+            generation: 4,
+            resource_id: "video-resource".to_owned(),
+            representation_digest: "representation-digest".to_owned(),
+            data_identity: Some("42:101".to_owned()),
+            total_length: Some(64),
+            strong_etag: Some("\"target-etag-v1\"".to_owned()),
+            validator_origin: Some(target_origin.clone()),
+            last_modified: None,
+            prefix_length: 8,
+            prefix_sha256: Some("startup-prefix-digest".to_owned()),
+            durable_bytes: 8,
+            validated_origins: vec![
+                PersistedRangeOrigin {
+                    origin: "https://seed.example:443".to_owned(),
+                    prefix_sha256: "seed-prefix-digest".to_owned(),
+                    strong_etag: Some("\"seed-etag-v1\"".to_owned()),
+                },
+                PersistedRangeOrigin {
+                    origin: target_origin.clone(),
+                    prefix_sha256: "target-prefix-digest".to_owned(),
+                    strong_etag: Some("\"target-etag-v1\"".to_owned()),
+                },
+            ],
+            extents: vec![PersistedRangeExtent {
+                start: 0,
+                end: 8,
+                sha256: "startup-extent-digest".to_owned(),
+            }],
+        };
+        (manifest, target_origin)
+    }
+
     #[test]
     fn strong_etag_requires_rfc_entity_tag_syntax() {
         for valid in ["\"opaque\"", "\"\"", "\"!#$%&'()*+,-./:;<=>?@[]^_`{|}~\""] {
@@ -8324,6 +8446,160 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(content_conflict, HlsRangeError::IdentityChanged));
+    }
+
+    #[test]
+    fn extent_publication_rebase_diagnostics_allow_unrelated_additions() {
+        let (expected, target_origin) = extent_rebase_test_manifest();
+        let mut current = expected.clone();
+        current.generation += 1;
+        current.extents.push(PersistedRangeExtent {
+            start: 16,
+            end: 24,
+            sha256: "concurrent-extent-digest".to_owned(),
+        });
+        current.durable_bytes = 16;
+        current.validated_origins.push(PersistedRangeOrigin {
+            origin: "https://new-origin.example:443".to_owned(),
+            prefix_sha256: "new-origin-prefix-digest".to_owned(),
+            strong_etag: Some("\"new-origin-etag\"".to_owned()),
+        });
+
+        assert!(range_manifest_rebase_compatible_for_extent_publication(
+            &expected,
+            &current,
+            &target_origin,
+        ));
+        assert_eq!(
+            None,
+            range_manifest_extent_rebase_failure_stage(&expected, &current, &target_origin)
+        );
+    }
+
+    #[test]
+    fn extent_publication_rebase_diagnostics_classify_rejections() {
+        let (expected, target_origin) = extent_rebase_test_manifest();
+        let assert_reason = |expected: &PersistedRangeManifest,
+                             current: &PersistedRangeManifest,
+                             stage: &'static str| {
+            assert!(!range_manifest_rebase_compatible_for_extent_publication(
+                expected,
+                current,
+                &target_origin,
+            ));
+            assert_eq!(
+                Some(stage),
+                range_manifest_extent_rebase_failure_stage(expected, current, &target_origin)
+            );
+        };
+
+        let mut current = expected.clone();
+        current.resource_id.push_str("-changed");
+        assert_reason(&expected, &current, "extent-publish-rebase-resource-id");
+
+        let mut current = expected.clone();
+        current.representation_digest.push_str("-changed");
+        assert_reason(&expected, &current, "extent-publish-rebase-representation");
+
+        let mut current = expected.clone();
+        current.data_identity = Some("42:102".to_owned());
+        assert_reason(
+            &expected,
+            &current,
+            "extent-publish-rebase-data-object-identity",
+        );
+
+        let mut current = expected.clone();
+        current.generation -= 1;
+        assert_reason(
+            &expected,
+            &current,
+            "extent-publish-rebase-generation-regression",
+        );
+
+        let mut current = expected.clone();
+        current.total_length = Some(65);
+        assert_reason(&expected, &current, "extent-publish-rebase-total-length");
+
+        let mut current = expected.clone();
+        current.prefix_sha256 = Some("different-startup-prefix".to_owned());
+        assert_reason(&expected, &current, "extent-publish-rebase-prefix-digest");
+
+        let mut current = expected.clone();
+        current
+            .validated_origins
+            .iter_mut()
+            .find(|binding| binding.origin == "https://seed.example:443")
+            .expect("seed origin should exist")
+            .prefix_sha256 = "different-seed-prefix".to_owned();
+        assert_reason(
+            &expected,
+            &current,
+            "extent-publish-rebase-existing-origin-prefix",
+        );
+
+        let mut current = expected.clone();
+        current.extents.clear();
+        assert_reason(&expected, &current, "extent-publish-rebase-existing-extent");
+
+        let mut current = expected.clone();
+        current.extents[0].sha256 = "different-extent-digest".to_owned();
+        assert_reason(&expected, &current, "extent-publish-rebase-existing-extent");
+
+        let mut current = expected.clone();
+        current
+            .validated_origins
+            .iter_mut()
+            .find(|binding| binding.origin == target_origin)
+            .expect("target origin should exist")
+            .prefix_sha256 = "different-target-prefix".to_owned();
+        assert_reason(
+            &expected,
+            &current,
+            "extent-publish-rebase-target-origin-prefix",
+        );
+
+        let mut current = expected.clone();
+        current
+            .validated_origins
+            .iter_mut()
+            .find(|binding| binding.origin == target_origin)
+            .expect("target origin should exist")
+            .strong_etag = Some("\"target-etag-v2\"".to_owned());
+        assert_reason(
+            &expected,
+            &current,
+            "extent-publish-rebase-target-origin-strong-etag",
+        );
+
+        let mut expected_without_target = expected.clone();
+        expected_without_target
+            .validated_origins
+            .retain(|binding| binding.origin != target_origin);
+        let mut current_with_target = expected_without_target.clone();
+        current_with_target.validated_origins.push(
+            expected
+                .validated_origins
+                .iter()
+                .find(|binding| binding.origin == target_origin)
+                .expect("target origin should exist")
+                .clone(),
+        );
+        assert_reason(
+            &expected_without_target,
+            &current_with_target,
+            "extent-publish-rebase-target-origin-added",
+        );
+
+        let mut current_without_target = expected.clone();
+        current_without_target
+            .validated_origins
+            .retain(|binding| binding.origin != target_origin);
+        assert_reason(
+            &expected,
+            &current_without_target,
+            "extent-publish-rebase-target-origin-removed",
+        );
     }
 
     #[tokio::test]
@@ -9725,6 +10001,114 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_session_accepts_added_removed_and_reordered_headers() {
+        fn header(name: &str, value: &str) -> BilibiliHttpHeader {
+            BilibiliHttpHeader {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            }
+        }
+
+        let cases = [
+            (
+                vec![header("referer", "https://www.bilibili.com")],
+                vec![
+                    header("referer", "https://www.bilibili.com/fresh"),
+                    header("x-client-hint", "player-v2"),
+                ],
+            ),
+            (
+                vec![
+                    header("referer", "https://www.bilibili.com"),
+                    header("x-client-hint", "player-v1"),
+                ],
+                vec![header("referer", "https://www.bilibili.com/fresh")],
+            ),
+            (
+                vec![
+                    header("referer", "https://www.bilibili.com"),
+                    header("x-client-hint", "player-v1"),
+                ],
+                vec![
+                    header("x-client-hint", "player-v2"),
+                    header("referer", "https://www.bilibili.com/fresh"),
+                ],
+            ),
+        ];
+
+        for (index, (original_headers, refreshed_headers)) in cases.into_iter().enumerate() {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let store = temp_store(&temp);
+            let mut original = sample_session(
+                &format!("session-refresh-headers-{index}"),
+                "https://cdn.example/video?old=1",
+            );
+            original.variant.video.request.headers = original_headers;
+            store
+                .save_session(&original)
+                .expect("initial session should save");
+
+            let mut refreshed = original.clone();
+            refreshed.variant.video.request.url = "https://cdn.example/video?fresh=2".to_owned();
+            refreshed.variant.video.request.headers = refreshed_headers.clone();
+            store
+                .save_refreshed_session(&original, &refreshed)
+                .expect("header-list changes should be refreshable");
+
+            assert_eq!(
+                refreshed_headers,
+                store
+                    .load_session(&original.id)
+                    .expect("refreshed session should load")
+                    .variant
+                    .video
+                    .request
+                    .headers
+            );
+        }
+    }
+
+    #[test]
+    fn refreshed_session_rejects_immutable_binding_and_policy_changes() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp);
+        let original = sample_session("session-refresh-binding", "https://cdn.example/video?old=1");
+        store
+            .save_session(&original)
+            .expect("initial session should save");
+
+        let mut changed_resource_id = original.clone();
+        changed_resource_id.variant.video.id = "other-video.m4s".to_owned();
+        let mut changed_cache_key = original.clone();
+        changed_cache_key
+            .variant
+            .video
+            .request
+            .cache_key
+            .source_hash = "other-source".to_owned();
+        let mut changed_policy = original.clone();
+        changed_policy.effective_policy = PlaybackPolicy {
+            transcoding_preference: TranscodingPreference::Force,
+            compatible_variant_preference: CompatibleVariantPreference::PreferRequested,
+            weak_network_preference: WeakNetworkPreference::HoldDowngrade,
+        };
+
+        for replacement in [changed_resource_id, changed_cache_key, changed_policy] {
+            assert!(
+                store
+                    .save_refreshed_session(&original, &replacement)
+                    .is_err()
+            );
+            assert_eq!(
+                original,
+                store
+                    .load_session(&original.id)
+                    .expect("original session should remain persisted")
+            );
+        }
+    }
+
+    #[test]
     fn stale_generic_session_save_preserves_refreshed_request_candidates() {
         let temp = TempDir::new().expect("temp dir should be created");
         let store = temp_store(&temp);
@@ -9739,8 +10123,16 @@ mod tests {
         refreshed.variant.video.request.url = "https://cdn.example/video?fresh=2".to_owned();
         refreshed.variant.video.request.backup_urls =
             vec!["https://backup.example/video?fresh=2".to_owned()];
-        refreshed.variant.video.request.headers[0].value =
-            "https://www.bilibili.com/fresh".to_owned();
+        refreshed.variant.video.request.headers = vec![
+            BilibiliHttpHeader {
+                name: "x-client-hint".to_owned(),
+                value: "player-v2".to_owned(),
+            },
+            BilibiliHttpHeader {
+                name: "referer".to_owned(),
+                value: "https://www.bilibili.com/fresh".to_owned(),
+            },
+        ];
         store
             .save_refreshed_session(&original, &refreshed)
             .expect("current refresh should publish");
