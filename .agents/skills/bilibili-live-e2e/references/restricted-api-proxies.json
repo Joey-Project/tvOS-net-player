@@ -21,13 +21,13 @@
       "source_area_label": "港澳台、中国大陆",
       "provider": "@M1saka10010",
       "url": "https://bili.lli.cx",
-      "last_checked_at": "2026-08-05T09:40:18Z",
-      "last_available_at": "2026-08-05T09:40:18Z",
+      "last_checked_at": "2026-10-05T22:28:48Z",
+      "last_available_at": "2026-10-05T22:28:48Z",
       "last_probe": {
         "status": "available",
         "playurl_modes": ["web"],
         "restricted_api_proxy": "hk=https://bili.lli.cx",
-        "notes": "Credential-backed bangumi-media-series and bangumi-episode live e2e cases both reached playable LAN HLS through the HK web API proxy. Access-key egress to this public host was explicitly authorized for validation; no credential values are stored in this fixture."
+        "notes": "On 2026-10-05, credential-backed bangumi-media-series and bangumi-episode smoke cases passed through the HK Web API proxy. The episode also passed 600-second foreground reads, durable partial-fill restart, complete selected-variant fill, a second restart, 300-second cache-only reads with stable checksums, and a separate 120-second macOS AVPlayer probe at 360p. The series has earlier 300-second HTTP-read evidence from 2026-10-02, not a separate latest full-fill or native-decoding run. Access-key egress to this public host was explicitly authorized; Web cookies were not forwarded and no credential values are stored here."
       }
     },
     {
