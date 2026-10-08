@@ -85,6 +85,7 @@ use crate::{
         hls_session_declared_size_bytes, timestamp_from_system_time,
     },
     hls_fill_scheduler::HlsFillPreemptionToken,
+    hls_media_refresh::{is_expired_cache_error, same_hls_media_refresh_binding},
     hls_network_policy::{
         HlsWeakNetworkSnapshot, HlsWeakNetworkState as RuntimeHlsWeakNetworkState,
     },
@@ -4662,18 +4663,12 @@ async fn run_hls_cache_finalization_inner(
     if control() == HlsCacheFillControl::Cancel {
         return HlsCacheFinalizationOutcome::Finished;
     }
-    let progress = hls_cache_progress_reporter(&state, &task_id, &session);
-    match state
-        .hls_cache
-        .cache_session_resources_completion_with_control(
-            &state.hls_upstream_client,
-            &session,
-            control,
-            progress,
-            state.hls_transcoding_execution_config(),
-        )
-        .await
-    {
+    let session = match state.hls_sessions.get(&session_id) {
+        Some(current) if same_hls_media_refresh_binding(&session, &current) => current,
+        Some(_) => return HlsCacheFinalizationOutcome::SafetyFailure,
+        None => session,
+    };
+    match cache_hls_session_with_media_refresh(&state, &task_id, &session, &control).await {
         Ok(completion) => {
             return publish_completed_hls_cache(&state, &task_id, &session_id, &completion.session)
                 .await;
@@ -5044,6 +5039,42 @@ struct PlaybackTaskMetadata {
     hls_session: HlsPlaybackSession,
 }
 
+async fn cache_hls_session_with_media_refresh<F>(
+    state: &AppState,
+    task_id: &str,
+    session: &HlsPlaybackSession,
+    control: &F,
+) -> Result<crate::hls_cache::HlsCacheCompletion, crate::hls_cache::HlsCacheError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
+    let mut current = session.clone();
+    for attempt in 0..2 {
+        let result = state
+            .hls_cache
+            .cache_session_resources_completion_with_control(
+                &state.hls_upstream_client,
+                &current,
+                control,
+                hls_cache_progress_reporter(state, task_id, &current),
+                state.hls_transcoding_execution_config(),
+            )
+            .await;
+        match result {
+            Err(original_error) if attempt == 0 && is_expired_cache_error(&original_error) => {
+                current = match state.refresh_hls_media_requests(&current, control).await {
+                    Ok(refreshed) => refreshed,
+                    Err(refresh_error) => {
+                        return Err(refresh_error.into_cache_error(original_error));
+                    }
+                };
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the second fill attempt always returns its result")
+}
+
 #[cfg(test)]
 fn playback_task_metadata(
     task_id: &str,
@@ -5091,6 +5122,20 @@ fn playback_task_metadata_with_policy(
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
     hls_session.transcoding =
         HlsTranscodingPlan::for_variant_with_policy(options, &selected.variant, playback_policy);
+    let accepted_identity = AdapterBilibiliContentIdentity {
+        kind: if entry.epid.is_some() {
+            AdapterBilibiliContentKind::SeasonEpisode
+        } else {
+            AdapterBilibiliContentKind::VideoPage
+        },
+        aid: Some(entry.aid),
+        bvid: entry.bvid.clone(),
+        cid: Some(entry.cid),
+        epid: entry.epid,
+    };
+    hls_session.accepted_identity = accepted_identity
+        .is_refresh_complete()
+        .then_some(accepted_identity);
     let playback_session = BilibiliPlaybackSession {
         id: task_id.to_owned(),
         title: title.clone(),
@@ -5705,12 +5750,12 @@ fn proto_bilibili_content_identity(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         fs,
         path::{Path, PathBuf},
         sync::{
             Arc, Barrier, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -5725,9 +5770,9 @@ mod tests {
         },
         bilibili_playback::{
             BilibiliContentIdentity, BilibiliContentKind, BilibiliInputResolution,
-            BilibiliInputResolveFuture, BilibiliInputResolveRequest, BilibiliPlaybackPlanner,
-            BilibiliPlaybackPlanningFuture, BilibiliPlaybackPlanningRequest,
-            BilibiliResolvedCandidate,
+            BilibiliInputResolveFuture, BilibiliInputResolveRequest, BilibiliMediaRefreshRequest,
+            BilibiliPlaybackPlanner, BilibiliPlaybackPlanningFuture,
+            BilibiliPlaybackPlanningRequest, BilibiliResolvedCandidate,
         },
         config::CacheServerOptions,
         generated::tvos_net_player::v1::{
@@ -5754,9 +5799,12 @@ mod tests {
     };
     use axum::{
         Router,
-        body::{Body, Bytes},
+        body::{Body, Bytes, to_bytes},
         extract::{Path as AxumPath, State},
-        http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
+        http::{
+            HeaderMap, HeaderValue, Response, StatusCode,
+            header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE},
+        },
         routing::get,
     };
     use tokio::sync::{mpsc, oneshot};
@@ -21110,6 +21158,46 @@ mod tests {
         (task_id, metadata.hls_session, library_item_id)
     }
 
+    fn create_legacy_playable_hls_test_task(
+        state: &AppState,
+        source: &str,
+        plan: BilibiliPlaybackPlan,
+    ) -> (String, HlsPlaybackSession) {
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task(source, None, None)
+            .expect("legacy playback task should be created");
+        let metadata = playback_task_metadata_with_options(&creation.task.id, plan, &state.options)
+            .expect("legacy playback metadata should map");
+        let mut hls_session = metadata.hls_session.clone();
+        hls_session.accepted_identity = None;
+        state
+            .hls_cache
+            .save_session(&hls_session)
+            .expect("legacy HLS session should persist without identity");
+        state.hls_sessions.insert(hls_session.clone());
+        let playback_source = PlaybackSource {
+            item_id: creation.task.id.clone(),
+            variant_id: metadata.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!(
+                "http://media.example.test:8080/hls/{}/master.m3u8",
+                creation.task.id
+            ),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_playable(
+                &creation.task.id,
+                metadata.title,
+                playback_source,
+                metadata.playback_session,
+            )
+            .expect("legacy playback task should become playable");
+        (creation.task.id, hls_session)
+    }
+
     struct EmptyPlaybackPlanner;
 
     impl BilibiliPlaybackPlanner for EmptyPlaybackPlanner {
@@ -21124,6 +21212,2170 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct RefreshingPlaybackPlanner {
+        initial: BilibiliPlaybackPlan,
+        refreshed: BilibiliPlaybackPlan,
+        refresh_calls: Arc<AtomicUsize>,
+        refresh_identities: Arc<Mutex<Vec<BilibiliContentIdentity>>>,
+    }
+
+    struct GatedMediaRefreshPlanner {
+        refreshed: BilibiliPlaybackPlan,
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        result:
+            Mutex<Option<oneshot::Receiver<Result<BilibiliPlaybackPlan, BilibiliDownloadError>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct SequencedMediaRefreshPlanner {
+        initial: BilibiliPlaybackPlan,
+        remaining_refreshes: Mutex<VecDeque<BilibiliPlaybackPlan>>,
+        first_started: Mutex<Option<oneshot::Sender<()>>>,
+        first_result:
+            Mutex<Option<oneshot::Receiver<Result<BilibiliPlaybackPlan, BilibiliDownloadError>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct PreemptThenRefreshPlanner {
+        refreshed: BilibiliPlaybackPlan,
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct PermitLimitedRefreshPlanner {
+        refreshed: BilibiliPlaybackPlan,
+        started: mpsc::UnboundedSender<usize>,
+        release: Arc<Semaphore>,
+        active: Arc<AtomicUsize>,
+        maximum_active: Arc<AtomicUsize>,
+    }
+
+    struct RefreshPlannerActivityGuard(Arc<AtomicUsize>);
+
+    impl Drop for RefreshPlannerActivityGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for PreemptThenRefreshPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            Box::pin(async {
+                Err(BilibiliDownloadError::Failed(
+                    "The test does not plan playback tasks.".to_owned(),
+                ))
+            })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            _request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                let started = self.started.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    std::future::pending::<Result<BilibiliPlaybackPlan, BilibiliDownloadError>>()
+                        .await
+                })
+            } else {
+                let refreshed = self.refreshed.clone();
+                Box::pin(async move { Ok(refreshed) })
+            }
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for PermitLimitedRefreshPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            Box::pin(async {
+                Err(BilibiliDownloadError::Failed(
+                    "The test does not plan playback tasks.".to_owned(),
+                ))
+            })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            _request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.maximum_active.fetch_max(active, Ordering::Relaxed);
+            let _ = self.started.send(active);
+            let activity = RefreshPlannerActivityGuard(Arc::clone(&self.active));
+            let release = Arc::clone(&self.release);
+            let refreshed = self.refreshed.clone();
+            Box::pin(async move {
+                let _activity = activity;
+                let permit = release.acquire().await.map_err(|_| {
+                    BilibiliDownloadError::Failed("Test refresh gate was closed.".to_owned())
+                })?;
+                permit.forget();
+                Ok(refreshed)
+            })
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for GatedMediaRefreshPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let refreshed = self.refreshed.clone();
+            Box::pin(async move { Ok(refreshed) })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            _request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let started = self.started.lock().unwrap().take();
+            let result = self.result.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                match result {
+                    Some(result) => result.await.unwrap_or_else(|_| {
+                        Err(BilibiliDownloadError::Failed(
+                            "Test refresh result channel closed.".to_owned(),
+                        ))
+                    }),
+                    None => Err(BilibiliDownloadError::Failed(
+                        "Test refresh result was already consumed.".to_owned(),
+                    )),
+                }
+            })
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for SequencedMediaRefreshPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let initial = self.initial.clone();
+            Box::pin(async move { Ok(initial) })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            _request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                let started = self.first_started.lock().unwrap().take();
+                let result = self.first_result.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    match result {
+                        Some(result) => result.await.unwrap_or_else(|_| {
+                            Err(BilibiliDownloadError::Failed(
+                                "Test refresh result channel closed.".to_owned(),
+                            ))
+                        }),
+                        None => Err(BilibiliDownloadError::Failed(
+                            "Test refresh result was already consumed.".to_owned(),
+                        )),
+                    }
+                })
+            } else {
+                let next = self
+                    .remaining_refreshes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("test refresh plan should be available");
+                Box::pin(async move { Ok(next) })
+            }
+        }
+    }
+
+    impl BilibiliPlaybackPlanner for RefreshingPlaybackPlanner {
+        fn plan<'a>(
+            &'a self,
+            _request: BilibiliPlaybackPlanningRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            let initial = self.initial.clone();
+            Box::pin(async move { Ok(initial) })
+        }
+
+        fn refresh_media<'a>(
+            &'a self,
+            request: BilibiliMediaRefreshRequest,
+        ) -> BilibiliPlaybackPlanningFuture<'a> {
+            self.refresh_calls.fetch_add(1, Ordering::Relaxed);
+            self.refresh_identities
+                .lock()
+                .expect("refresh identity log should not be poisoned")
+                .push(request.identity);
+            let refreshed = self.refreshed.clone();
+            Box::pin(async move { Ok(refreshed) })
+        }
+    }
+
+    async fn start_refreshable_mp4_upstream(
+        old_expired: bool,
+    ) -> (String, String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("refresh fixture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should exist");
+        let expired = Arc::new(AtomicBool::new(old_expired));
+        let old_expired = Arc::clone(&expired);
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/old.mp4",
+                        get(move |headers: HeaderMap| {
+                            let expired = Arc::clone(&old_expired);
+                            async move {
+                                refresh_fixture_mp4_response(
+                                    headers,
+                                    expired.load(Ordering::Relaxed),
+                                )
+                            }
+                        }),
+                    )
+                    .route(
+                        "/fresh.mp4",
+                        get(|headers: HeaderMap| async move {
+                            refresh_fixture_mp4_response(headers, false)
+                        }),
+                    ),
+            )
+            .await
+            .expect("refresh fixture server should run");
+        });
+        (
+            format!("http://{address}/old.mp4"),
+            format!("http://{address}/fresh.mp4"),
+            expired,
+            task,
+        )
+    }
+
+    async fn start_proxy_fallback_mp4_upstream() -> (
+        String,
+        String,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy fixture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should exist");
+        let expired = Arc::new(AtomicBool::new(false));
+        let ignore_range = Arc::new(AtomicBool::new(false));
+        let old_expired = Arc::clone(&expired);
+        let old_ignore_range = Arc::clone(&ignore_range);
+        let fresh_ignore_range = Arc::clone(&ignore_range);
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/old.mp4",
+                        get(move |headers: HeaderMap| {
+                            let expired = Arc::clone(&old_expired);
+                            let ignore_range = Arc::clone(&old_ignore_range);
+                            async move {
+                                proxy_fixture_mp4_response(
+                                    headers,
+                                    expired.load(Ordering::Relaxed),
+                                    ignore_range.load(Ordering::Relaxed),
+                                )
+                            }
+                        }),
+                    )
+                    .route(
+                        "/fresh.mp4",
+                        get(move |headers: HeaderMap| {
+                            let ignore_range = Arc::clone(&fresh_ignore_range);
+                            async move {
+                                proxy_fixture_mp4_response(
+                                    headers,
+                                    false,
+                                    ignore_range.load(Ordering::Relaxed),
+                                )
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("proxy fixture server should run");
+        });
+        (
+            format!("http://{address}/old.mp4"),
+            format!("http://{address}/fresh.mp4"),
+            expired,
+            ignore_range,
+            task,
+        )
+    }
+
+    async fn start_head_refresh_upstream() -> (
+        String,
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HEAD refresh fixture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should exist");
+        let expired_head_hits = Arc::new(AtomicUsize::new(0));
+        let expired_get_hits = Arc::new(AtomicUsize::new(0));
+        let fresh_head_hits = Arc::new(AtomicUsize::new(0));
+        let fresh_get_hits = Arc::new(AtomicUsize::new(0));
+        let expired_body_reads = Arc::new(AtomicUsize::new(0));
+        let fresh_body_reads = Arc::new(AtomicUsize::new(0));
+        let old_heads = Arc::clone(&expired_head_hits);
+        let old_gets = Arc::clone(&expired_get_hits);
+        let new_heads = Arc::clone(&fresh_head_hits);
+        let new_gets = Arc::clone(&fresh_get_hits);
+        let old_body_reads = Arc::clone(&expired_body_reads);
+        let new_body_reads = Arc::clone(&fresh_body_reads);
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/old.mp4",
+                        axum::routing::any(move |method: axum::http::Method| {
+                            let heads = Arc::clone(&old_heads);
+                            let gets = Arc::clone(&old_gets);
+                            let body_reads = Arc::clone(&old_body_reads);
+                            async move {
+                                if method == axum::http::Method::HEAD {
+                                    heads.fetch_add(1, Ordering::Relaxed);
+                                } else if method == axum::http::Method::GET {
+                                    gets.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let body = Body::from_stream(futures_util::StreamExt::inspect(
+                                    tokio_stream::iter([Ok::<_, std::convert::Infallible>(
+                                        Bytes::from_static(b"upstream error body"),
+                                    )]),
+                                    move |_| {
+                                        body_reads.fetch_add(1, Ordering::Relaxed);
+                                    },
+                                ));
+                                Response::builder()
+                                    .status(StatusCode::FORBIDDEN)
+                                    .header(CONTENT_TYPE, "video/mp4")
+                                    .header(ETAG, "\"expired-fixture\"")
+                                    .body(body)
+                                    .expect("expired HEAD response should build")
+                            }
+                        }),
+                    )
+                    .route(
+                        "/fresh.mp4",
+                        axum::routing::any(move |method: axum::http::Method| {
+                            let heads = Arc::clone(&new_heads);
+                            let gets = Arc::clone(&new_gets);
+                            let body_reads = Arc::clone(&new_body_reads);
+                            async move {
+                                if method == axum::http::Method::HEAD {
+                                    heads.fetch_add(1, Ordering::Relaxed);
+                                } else if method == axum::http::Method::GET {
+                                    gets.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let body = Body::from_stream(futures_util::StreamExt::inspect(
+                                    tokio_stream::iter([Ok::<_, std::convert::Infallible>(
+                                        Bytes::from_static(b"fresh response body"),
+                                    )]),
+                                    move |_| {
+                                        body_reads.fetch_add(1, Ordering::Relaxed);
+                                    },
+                                ));
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "video/mp4")
+                                    .header(CONTENT_LENGTH, "128")
+                                    .header(ETAG, "\"fresh-fixture\"")
+                                    .body(body)
+                                    .expect("fresh HEAD response should build")
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("HEAD refresh fixture server should run");
+        });
+        (
+            format!("http://{address}/old.mp4"),
+            format!("http://{address}/fresh.mp4"),
+            expired_head_hits,
+            expired_get_hits,
+            fresh_head_hits,
+            fresh_get_hits,
+            expired_body_reads,
+            fresh_body_reads,
+            task,
+        )
+    }
+
+    fn proxy_fixture_mp4_response(
+        headers: HeaderMap,
+        expired: bool,
+        ignore_range: bool,
+    ) -> Response<Body> {
+        if ignore_range && headers.contains_key(RANGE) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "video/mp4")
+                .body(Body::empty())
+                .expect("range-unsupported response should build");
+        }
+        if expired {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .expect("expired proxy response should build");
+        }
+        let bytes = proxy_fixture_mp4();
+        if headers.contains_key(RANGE) {
+            let Some((start, end)) = headers
+                .get(RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("bytes="))
+                .and_then(|value| value.split_once('-'))
+                .and_then(|(start, end)| {
+                    Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                })
+            else {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(Body::empty())
+                    .expect("proxy invalid range response should build");
+            };
+            if start >= bytes.len() || end < start {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(Body::empty())
+                    .expect("proxy unsatisfiable range response should build");
+            }
+            let end = end.min(bytes.len() - 1);
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_TYPE, "video/mp4")
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", bytes.len()),
+                )
+                .body(Body::from(bytes[start..=end].to_vec()))
+                .expect("proxy range response should build")
+        } else {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "video/mp4")
+                .body(Body::from(bytes))
+                .expect("proxy full response should build")
+        }
+    }
+
+    fn proxy_fixture_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(*b"mdat", &vec![b'p'; 2 * 1024 * 1024]));
+        bytes
+    }
+
+    fn refresh_fixture_mp4_response(headers: HeaderMap, expired: bool) -> Response<Body> {
+        if expired {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .expect("expired fixture response should build");
+        }
+        let bytes = refresh_fixture_mp4();
+        let Some(range) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "video/mp4")
+                .body(Body::from(bytes))
+                .expect("full fixture response should build");
+        };
+        let Some((start, end)) = range
+            .strip_prefix("bytes=")
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+            })
+        else {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("invalid range response should build");
+        };
+        if start >= bytes.len() || end < start {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .body(Body::empty())
+                .expect("unsatisfiable range response should build");
+        }
+        let end = end.min(bytes.len() - 1);
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(
+                CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", bytes.len()),
+            )
+            .body(Body::from(bytes[start..=end].to_vec()))
+            .expect("range fixture response should build")
+    }
+
+    fn media_refresh_test_state(
+        root: &Path,
+        initial_url: &str,
+        refreshed_url: &str,
+    ) -> (
+        AppState,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<BilibiliContentIdentity>>>,
+    ) {
+        media_refresh_test_state_with_plans(
+            root,
+            sample_playback_plan_with_video_url(initial_url),
+            sample_playback_plan_with_video_url(refreshed_url),
+        )
+    }
+
+    fn media_refresh_test_state_with_plans(
+        root: &Path,
+        initial: BilibiliPlaybackPlan,
+        refreshed: BilibiliPlaybackPlan,
+    ) -> (
+        AppState,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<BilibiliContentIdentity>>>,
+    ) {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_identities = Arc::new(Mutex::new(Vec::new()));
+        let planner = RefreshingPlaybackPlanner {
+            initial,
+            refreshed,
+            refresh_calls: Arc::clone(&refresh_calls),
+            refresh_identities: Arc::clone(&refresh_identities),
+        };
+        let root = root.canonicalize().unwrap_or_else(|_| PathBuf::from(root));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                public_media_base_uri: Some("http://media.example.test:8080".to_owned()),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        (state, refresh_calls, refresh_identities)
+    }
+
+    async fn hold_all_playback_planning_permits(
+        state: &AppState,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let permit_count = state.playback_planning_permits.available_permits();
+        let mut permits = Vec::with_capacity(permit_count);
+        for _ in 0..permit_count {
+            permits.push(
+                Arc::clone(&state.playback_planning_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("playback planning permit should be available"),
+            );
+        }
+        permits
+    }
+
+    async fn wait_for_playback_planning_jobs(state: &AppState, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while state.playback_planning_active_jobs.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("playback planning activity should reach the expected count");
+    }
+
+    fn refresh_fixture_mp4() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(mp4_box(*b"ftyp", b"isom"));
+        bytes.extend(mp4_box(*b"moov", b"metadata"));
+        bytes.extend(mp4_box(*b"moof", b"frag"));
+        bytes.extend(mp4_box(*b"mdat", &vec![b'm'; 512 * 1024]));
+        bytes
+    }
+
+    #[tokio::test]
+    async fn hls_mp4_playlist_probe_refreshes_after_expired_candidates() {
+        let (old_url, fresh_url, _expired, _upstream) = start_refreshable_mp4_upstream(true).await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, identities) =
+            media_refresh_test_state(temp.path(), &old_url, &fresh_url);
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-startup-refresh", &old_url);
+        let playlist_id = session
+            .variant
+            .video
+            .id
+            .strip_suffix(".m4s")
+            .map(|stem| format!("{stem}.m3u8"))
+            .expect("fixture video resource should have an MP4 segment extension");
+
+        let response = timeout(
+            Duration::from_secs(3),
+            crate::media::hls_segment_get(
+                State(crate::media::MediaState::new(state.clone())),
+                AxumPath((task_id.clone(), playlist_id)),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("startup playlist probe should be bounded");
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            Some(&session.accepted_identity.clone().unwrap()),
+            identities.lock().unwrap().first()
+        );
+        let current = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("refreshed playback session should remain registered");
+        assert_eq!(session.variant.video.id, current.variant.video.id);
+        assert_eq!(fresh_url, current.variant.video.request.url);
+    }
+
+    #[tokio::test]
+    async fn hls_proxy_refreshes_after_range_unsupported_full_get_expiry() {
+        let (old_url, fresh_url, expired, ignore_range, _upstream) =
+            start_proxy_fallback_mp4_upstream().await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let total_length = u64::try_from(proxy_fixture_mp4().len()).unwrap();
+        let mut initial = sample_playback_plan_with_video_url_and_size(&old_url, total_length);
+        let mut refreshed = sample_playback_plan_with_video_url_and_size(&fresh_url, total_length);
+        for plan in [&mut initial, &mut refreshed] {
+            plan.entries[0].variants[0]
+                .video
+                .as_mut()
+                .unwrap()
+                .bandwidth = Some(100_000);
+            plan.entries[0]
+                .selected_variant
+                .as_mut()
+                .unwrap()
+                .variant
+                .video
+                .as_mut()
+                .unwrap()
+                .bandwidth = Some(100_000);
+        }
+        let (state, refresh_calls, _) =
+            media_refresh_test_state_with_plans(temp.path(), initial.clone(), refreshed);
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1offline-proxy-refresh",
+            initial,
+        );
+        let control = || HlsCacheFillControl::Continue;
+        state
+            .hls_cache
+            .prewarm_session_first_frame_with_control(&state.hls_upstream_client, &session, control)
+            .await
+            .expect("prewarmed prefix should be prepared before expiry");
+        let prefix_length = state
+            .hls_cache
+            .prewarmed_resource(&task_id, &session.variant.video.id)
+            .expect("prewarmed resource should be registered")
+            .prefix_length;
+        assert!(prefix_length < total_length);
+        expired.store(true, Ordering::Relaxed);
+        ignore_range.store(true, Ordering::Relaxed);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes={}-{}",
+                prefix_length + 16,
+                prefix_length + 47
+            ))
+            .expect("range header should be valid"),
+        );
+        let response = timeout(
+            Duration::from_secs(5),
+            crate::media::hls_segment_get(
+                State(crate::media::MediaState::new(state.clone())),
+                AxumPath((task_id.clone(), session.variant.video.id.clone())),
+                headers,
+            ),
+        )
+        .await
+        .expect("proxy refresh should be bounded");
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(
+            usize::try_from(total_length).unwrap(),
+            to_bytes(
+                response.into_body(),
+                usize::try_from(total_length).unwrap() + 1
+            )
+            .await
+            .expect("full GET fallback body should stream")
+            .len()
+        );
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        let current = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("proxy refresh should preserve the registered session");
+        assert_eq!(session.variant.video.id, current.variant.video.id);
+        assert_eq!(
+            session.variant.video.request.cache_key,
+            current.variant.video.request.cache_key
+        );
+        assert_eq!(fresh_url, current.variant.video.request.url);
+    }
+
+    #[tokio::test]
+    async fn hls_head_proxy_refreshes_expired_media_once_without_returning_a_body() {
+        let (
+            old_url,
+            fresh_url,
+            old_head_hits,
+            old_get_hits,
+            fresh_head_hits,
+            fresh_get_hits,
+            old_body_reads,
+            fresh_body_reads,
+            _upstream,
+        ) = start_head_refresh_upstream().await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), &old_url, &fresh_url);
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1head-refresh", &old_url);
+
+        let response = timeout(
+            Duration::from_secs(3),
+            crate::media::hls_segment_head(
+                State(crate::media::MediaState::new(state.clone())),
+                AxumPath((task_id.clone(), session.variant.video.id.clone())),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("HEAD media refresh should be bounded");
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!("\"fresh-fixture\"", response.headers().get(ETAG).unwrap());
+        assert_eq!("video/mp4", response.headers().get(CONTENT_TYPE).unwrap());
+        assert_eq!("128", response.headers().get(CONTENT_LENGTH).unwrap());
+        assert!(
+            to_bytes(response.into_body(), 1)
+                .await
+                .expect("HEAD response body should be readable")
+                .is_empty()
+        );
+        assert_eq!(1, old_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_get_hits.load(Ordering::Relaxed));
+        assert_eq!(1, fresh_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_get_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_body_reads.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_body_reads.load(Ordering::Relaxed));
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&task_id)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_head_proxy_preserves_expiration_after_one_failed_retry() {
+        let (
+            old_url,
+            _fresh_url,
+            old_head_hits,
+            old_get_hits,
+            fresh_head_hits,
+            fresh_get_hits,
+            old_body_reads,
+            fresh_body_reads,
+            _upstream,
+        ) = start_head_refresh_upstream().await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), &old_url, &old_url);
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1head-retry-exhausted", &old_url);
+
+        let response = timeout(
+            Duration::from_secs(3),
+            crate::media::hls_segment_head(
+                State(crate::media::MediaState::new(state.clone())),
+                AxumPath((task_id, session.variant.video.id)),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("failed HEAD retry should be bounded");
+
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
+        assert_eq!("video/mp4", response.headers().get(CONTENT_TYPE).unwrap());
+        assert_eq!("\"expired-fixture\"", response.headers().get(ETAG).unwrap());
+        assert!(
+            to_bytes(response.into_body(), 1)
+                .await
+                .expect("failed HEAD body should be readable")
+                .is_empty()
+        );
+        assert_eq!(2, old_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_get_hits.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_get_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_body_reads.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_body_reads.load(Ordering::Relaxed));
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn hls_head_proxy_preserves_expiration_when_refresh_identity_is_rejected() {
+        let (
+            old_url,
+            fresh_url,
+            old_head_hits,
+            old_get_hits,
+            fresh_head_hits,
+            fresh_get_hits,
+            old_body_reads,
+            fresh_body_reads,
+            _upstream,
+        ) = start_head_refresh_upstream().await;
+        let mut refreshed = sample_playback_plan_with_video_url(&fresh_url);
+        refreshed.entries[0].cid += 1;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let initial = sample_playback_plan_with_video_url(&old_url);
+        let (state, refresh_calls, _) =
+            media_refresh_test_state_with_plans(temp.path(), initial.clone(), refreshed);
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1head-identity-rejected",
+            initial,
+        );
+
+        let response = timeout(
+            Duration::from_secs(3),
+            crate::media::hls_segment_head(
+                State(crate::media::MediaState::new(state)),
+                AxumPath((task_id, session.variant.video.id)),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("identity-rejected HEAD refresh should be bounded");
+
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
+        assert_eq!("video/mp4", response.headers().get(CONTENT_TYPE).unwrap());
+        assert_eq!("\"expired-fixture\"", response.headers().get(ETAG).unwrap());
+        assert!(
+            to_bytes(response.into_body(), 1)
+                .await
+                .expect("identity-rejected HEAD body should be readable")
+                .is_empty()
+        );
+        assert_eq!(1, old_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_get_hits.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_head_hits.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_get_hits.load(Ordering::Relaxed));
+        assert_eq!(0, old_body_reads.load(Ordering::Relaxed));
+        assert_eq!(0, fresh_body_reads.load(Ordering::Relaxed));
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn app_state_refresh_rejects_a_changed_content_identity() {
+        let old_url = "https://old.example.test/identity-mismatch.m4s";
+        let fresh_url = "https://fresh.example.test/identity-mismatch.m4s";
+        let initial = sample_playback_plan_with_video_url(old_url);
+        let mut changed_identity = sample_playback_plan_with_video_url(fresh_url);
+        changed_identity.entries[0].cid += 1;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) =
+            media_refresh_test_state_with_plans(temp.path(), initial.clone(), changed_identity);
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1identity-mismatch-refresh",
+            initial,
+        );
+
+        let result = state
+            .refresh_hls_media_requests_for_resource(&session, &session.variant.video, &|| {
+                HlsCacheFillControl::Continue
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::IdentityMismatch)
+        ));
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            old_url,
+            state
+                .hls_sessions
+                .get(&task_id)
+                .expect("rejected refresh should preserve the registered session")
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn background_full_fill_refreshes_after_preserving_partial_extent() {
+        let (old_url, fresh_url, expired, _upstream) = start_refreshable_mp4_upstream(false).await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), &old_url, &fresh_url);
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-partial-refresh", &old_url);
+        let control = || HlsCacheFillControl::Continue;
+        state
+            .hls_cache
+            .ensure_resource_range(
+                &state.hls_upstream_client,
+                &task_id,
+                &session.variant.video,
+                0..1,
+                crate::hls_range_cache::HlsRangePriority::Foreground,
+                &control,
+            )
+            .await
+            .expect("initial range should become durable");
+        let prefix_before = state
+            .hls_cache
+            .read_resource_range(&task_id, &session.variant.video, 0..1)
+            .await
+            .expect("initial prefix should be readable")
+            .expect("initial prefix should be cached");
+        let durable_before = state
+            .hls_cache
+            .range_durable_bytes(&task_id, &session.variant.video)
+            .expect("partial durable byte count should be readable");
+        assert!(durable_before > 0);
+        expired.store(true, Ordering::Relaxed);
+
+        let completion = timeout(
+            Duration::from_secs(5),
+            cache_hls_session_with_media_refresh(&state, &task_id, &session, &control),
+        )
+        .await
+        .expect("background fill retry should be bounded")
+        .expect("refreshed full fill should complete");
+
+        assert_eq!(
+            HlsCacheStore::completed_library_item_id(&task_id),
+            completion.library_item_id
+        );
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        let current = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("refreshed session should remain registered");
+        assert_eq!(session.variant.video.id, current.variant.video.id);
+        assert_eq!(
+            session.variant.video.request.cache_key,
+            current.variant.video.request.cache_key
+        );
+        assert_eq!(fresh_url, current.variant.video.request.url);
+        assert!(
+            state
+                .hls_cache
+                .cached_resource(&task_id, &session.variant.video.id)
+                .is_some()
+        );
+        assert!(durable_before >= u64::try_from(prefix_before.len()).unwrap());
+        let cached = state
+            .hls_cache
+            .cached_resource(&task_id, &session.variant.video.id)
+            .expect("completed video resource should be cached");
+        assert_eq!(
+            prefix_before,
+            fs::read(cached.path).expect("completed cache file should remain readable")[..1]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_queued_hls_fill_uses_latest_refreshed_session() {
+        let (old_url, fresh_url, expired, _upstream) = start_refreshable_mp4_upstream(false).await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), &old_url, &fresh_url);
+        let (task_id, stale_session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-stale-fill", &old_url);
+        let control = || HlsCacheFillControl::Continue;
+        let newest = state
+            .refresh_hls_media_requests(&stale_session, &control)
+            .await
+            .expect("explicit fixture refresh should succeed");
+        assert_eq!(fresh_url, newest.variant.video.request.url);
+        expired.store(true, Ordering::Relaxed);
+
+        timeout(
+            Duration::from_secs(5),
+            cache_hls_session_with_media_refresh(&state, &task_id, &stale_session, &control),
+        )
+        .await
+        .expect("queued stale fill should be bounded")
+        .expect("stale queued fill should use the latest media URLs");
+
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(stale_session.variant.video.id, newest.variant.video.id);
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&task_id)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_hls_refresh_waiters_share_gated_plan_and_persisted_urls() {
+        let old_url = "https://old.example.test/concurrent-refresh.m4s";
+        let fresh_url = "https://fresh.example.test/concurrent-refresh.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner_started_sender, planner_started_receiver) = oneshot::channel();
+        let (planner_result_sender, planner_result_receiver) = oneshot::channel();
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let planner = GatedMediaRefreshPlanner {
+            refreshed: sample_playback_plan_with_video_url(fresh_url),
+            started: Mutex::new(Some(planner_started_sender)),
+            result: Mutex::new(Some(planner_result_receiver)),
+            calls: Arc::clone(&refresh_calls),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-concurrent-refresh", old_url);
+        let first_state = state.clone();
+        let first_session = session.clone();
+        let first_resource = session.variant.video.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_hls_media_requests_for_resource(&first_session, &first_resource, &|| {
+                    HlsCacheFillControl::Continue
+                })
+                .await
+        });
+        timeout(Duration::from_secs(2), planner_started_receiver)
+            .await
+            .expect("first planner should start in time")
+            .expect("first planner start should be signalled");
+
+        let (second_started_sender, second_started_receiver) = oneshot::channel();
+        let second_state = state.clone();
+        let second_session = session.clone();
+        let second_resource = session.variant.video.clone();
+        let second = tokio::spawn(async move {
+            let _ = second_started_sender.send(());
+            second_state
+                .refresh_hls_media_requests_for_resource(&second_session, &second_resource, &|| {
+                    HlsCacheFillControl::Continue
+                })
+                .await
+        });
+        timeout(Duration::from_secs(2), second_started_receiver)
+            .await
+            .expect("second waiter should start in time")
+            .expect("second waiter should signal start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        planner_result_sender
+            .send(Ok(sample_playback_plan_with_video_url(fresh_url)))
+            .expect("gated planner should accept its result");
+
+        let first = timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first refresh should be bounded")
+            .expect("first refresh task should not panic")
+            .expect("first refresh should succeed");
+        let second = timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second refresh should be bounded")
+            .expect("second refresh task should not panic")
+            .expect("concurrent waiter should share the refresh");
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&task_id)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+        assert_eq!(fresh_url, first.variant.video.request.url);
+        assert_eq!(fresh_url, second.variant.video.request.url);
+        let persisted = state
+            .hls_cache
+            .load_sessions()
+            .expect("refreshed session manifest should be readable")
+            .into_iter()
+            .find(|saved| saved.id == task_id)
+            .expect("refreshed session manifest should remain persisted");
+        assert_eq!(fresh_url, persisted.variant.video.request.url);
+    }
+
+    #[tokio::test]
+    async fn distinct_hls_refreshes_share_the_single_playback_planning_permit() {
+        let old_url = "https://old.example.test/permit-limited.m4s";
+        let fresh_url = "https://fresh.example.test/permit-limited.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let planner = PermitLimitedRefreshPlanner {
+            refreshed: sample_playback_plan_with_video_url(fresh_url),
+            started: started_sender,
+            release: Arc::clone(&release),
+            active: Arc::clone(&active),
+            maximum_active: Arc::clone(&maximum_active),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                bilibili_worker_max_concurrent_tasks: 1,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (first_task, first_session, _) =
+            create_playable_hls_playback_task(&state, "BV1permit-first", old_url);
+        let (second_task, second_session, _) =
+            create_playable_hls_playback_task(&state, "BV1permit-second", old_url);
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_hls_media_requests(&first_session, &|| HlsCacheFillControl::Continue)
+                .await
+        });
+        assert_eq!(
+            Some(1),
+            timeout(Duration::from_secs(2), started_receiver.recv())
+                .await
+                .expect("first refresh should acquire the planning permit")
+        );
+        assert!(!state.background_work_is_idle());
+        assert_eq!(0, state.playback_planning_permits.available_permits());
+
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .refresh_hls_media_requests(&second_session, &|| HlsCacheFillControl::Continue)
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 2).await;
+        assert!(started_receiver.try_recv().is_err());
+        assert!(!state.background_work_is_idle());
+
+        release.add_permits(1);
+        assert_eq!(
+            Some(1),
+            timeout(Duration::from_secs(2), started_receiver.recv())
+                .await
+                .expect("second refresh should acquire the released permit")
+        );
+        release.add_permits(1);
+        timeout(Duration::from_secs(2), async {
+            first
+                .await
+                .expect("first refresh task should not panic")
+                .expect("first refresh should succeed");
+            second
+                .await
+                .expect("second refresh task should not panic")
+                .expect("second refresh should succeed");
+        })
+        .await
+        .expect("both refreshes should finish");
+
+        assert_eq!(1, maximum_active.load(Ordering::Relaxed));
+        assert_eq!(0, active.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(state.background_work_is_idle());
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&first_task)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&second_task)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_cancellation_drops_activity_without_calling_planner() {
+        let old_url = "https://old.example.test/queued-cancel.m4s";
+        let fresh_url = "https://fresh.example.test/queued-cancel.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), old_url, fresh_url);
+        let (_task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1queued-cancel", old_url);
+        let held_permits = hold_all_playback_planning_permits(&state).await;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control_state = Arc::clone(&cancelled);
+        let refresh_state = state.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_state
+                .refresh_hls_media_requests(&session, &|| {
+                    if control_state.load(Ordering::Relaxed) {
+                        HlsCacheFillControl::Cancel
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 1).await;
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), refresh)
+                .await
+                .expect("cancelled refresh should finish")
+                .expect("refresh task should not panic"),
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Cancelled)
+        ));
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(!state.background_work_is_idle());
+        drop(held_permits);
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_preemption_drops_waiter_and_allows_retry() {
+        let old_url = "https://old.example.test/queued-preempt.m4s";
+        let fresh_url = "https://fresh.example.test/queued-preempt.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), old_url, fresh_url);
+        let (_task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1queued-preempt", old_url);
+        let held_permits = hold_all_playback_planning_permits(&state).await;
+        let preempted = Arc::new(AtomicBool::new(false));
+        let control_state = Arc::clone(&preempted);
+        let refresh_state = state.clone();
+        let queued_session = session.clone();
+        let queued = tokio::spawn(async move {
+            refresh_state
+                .refresh_hls_media_requests(&queued_session, &|| {
+                    if control_state.load(Ordering::Relaxed) {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        });
+        wait_for_playback_planning_jobs(&state, 1).await;
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        preempted.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), queued)
+                .await
+                .expect("preempted refresh should finish")
+                .expect("refresh task should not panic"),
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Preempted)
+        ));
+        assert_eq!(0, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        drop(held_permits);
+        assert!(state.background_work_is_idle());
+
+        let retried = state
+            .refresh_hls_media_requests(&session, &|| HlsCacheFillControl::Continue)
+            .await
+            .expect("refresh should retry after queued preemption");
+        assert_eq!(fresh_url, retried.variant.video.request.url);
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(
+            0,
+            state.playback_planning_active_jobs.load(Ordering::SeqCst)
+        );
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
+    async fn concurrent_media_targets_refresh_independently_without_regressing_urls() {
+        let old_video = "https://old.example.test/selected-video.m4s";
+        let fresh_video = "https://fresh.example.test/selected-video.m4s";
+        let old_audio = "https://old.example.test/selected-audio.m4s";
+        let fresh_audio = "https://fresh.example.test/selected-audio.m4s";
+        let old_alternate = "https://old.example.test/alternate-video.m4s";
+        let fresh_alternate = "https://fresh.example.test/alternate-video.m4s";
+        let initial = sample_playback_plan_with_video_audio_and_alternate_urls(
+            old_video,
+            old_audio,
+            old_alternate,
+        );
+        let video_only = sample_playback_plan_with_video_audio_and_alternate_urls(
+            fresh_video,
+            old_audio,
+            old_alternate,
+        );
+        let audio_only = sample_playback_plan_with_video_audio_and_alternate_urls(
+            old_video,
+            fresh_audio,
+            old_alternate,
+        );
+        let alternate_only = sample_playback_plan_with_video_audio_and_alternate_urls(
+            old_video,
+            old_audio,
+            fresh_alternate,
+        );
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner_started_sender, planner_started_receiver) = oneshot::channel();
+        let (first_result_sender, first_result_receiver) = oneshot::channel();
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let planner = SequencedMediaRefreshPlanner {
+            initial: initial.clone(),
+            remaining_refreshes: Mutex::new(VecDeque::from([audio_only, alternate_only])),
+            first_started: Mutex::new(Some(planner_started_sender)),
+            first_result: Mutex::new(Some(first_result_receiver)),
+            calls: Arc::clone(&refresh_calls),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1offline-multi-target-refresh",
+            initial,
+        );
+        let video_resource = session.variant.video.clone();
+        let audio_resource = session
+            .variant
+            .audio
+            .clone()
+            .expect("test session should include audio");
+        let alternate_resource = session.alternate_variants[0].video.clone();
+
+        let video_state = state.clone();
+        let video_session = session.clone();
+        let video_resource_for_refresh = video_resource.clone();
+        let video_refresh = tokio::spawn(async move {
+            video_state
+                .refresh_hls_media_requests_for_resource(
+                    &video_session,
+                    &video_resource_for_refresh,
+                    &|| HlsCacheFillControl::Continue,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(2), planner_started_receiver)
+            .await
+            .expect("video refresh planner should start")
+            .expect("video planner start signal should arrive");
+
+        let (audio_started_sender, audio_started_receiver) = oneshot::channel();
+        let audio_state = state.clone();
+        let audio_session = session.clone();
+        let audio_refresh = tokio::spawn(async move {
+            let _ = audio_started_sender.send(());
+            audio_state
+                .refresh_hls_media_requests_for_resource(&audio_session, &audio_resource, &|| {
+                    HlsCacheFillControl::Continue
+                })
+                .await
+        });
+        timeout(Duration::from_secs(2), audio_started_receiver)
+            .await
+            .expect("audio refresh waiter should start")
+            .expect("audio waiter start signal should arrive");
+        first_result_sender
+            .send(Ok(video_only))
+            .expect("gated video plan should accept its result");
+
+        let video_result = timeout(Duration::from_secs(2), video_refresh)
+            .await
+            .expect("video refresh should be bounded")
+            .expect("video refresh task should not panic")
+            .expect("video-only refresh should succeed");
+        let audio_result = timeout(Duration::from_secs(2), audio_refresh)
+            .await
+            .expect("audio corrective refresh should be bounded")
+            .expect("audio refresh task should not panic")
+            .expect("unchanged expired audio should trigger its own refresh");
+        assert_eq!(2, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(fresh_video, video_result.variant.video.request.url);
+        assert_eq!(fresh_video, audio_result.variant.video.request.url);
+        assert_eq!(
+            fresh_audio,
+            audio_result.variant.audio.as_ref().unwrap().request.url
+        );
+
+        let alternate_result = state
+            .refresh_hls_media_requests_for_resource(&session, &alternate_resource, &|| {
+                HlsCacheFillControl::Continue
+            })
+            .await
+            .expect("alternate target should refresh independently");
+        assert_eq!(3, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(fresh_video, alternate_result.variant.video.request.url);
+        assert_eq!(
+            fresh_audio,
+            alternate_result.variant.audio.as_ref().unwrap().request.url
+        );
+        assert_eq!(
+            fresh_alternate,
+            alternate_result.alternate_variants[0].video.request.url
+        );
+        assert_eq!(
+            fresh_alternate,
+            state.hls_sessions.get(&task_id).unwrap().alternate_variants[0]
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_resource_refresh_replans_after_only_one_media_request_changed() {
+        let old_video = "https://old.example.test/unknown-video.m4s";
+        let fresh_video = "https://fresh.example.test/unknown-video.m4s";
+        let old_audio = "https://old.example.test/unknown-audio.m4s";
+        let fresh_audio = "https://fresh.example.test/unknown-audio.m4s";
+        let old_alternate = "https://old.example.test/unknown-alternate.m4s";
+        let fresh_alternate = "https://fresh.example.test/unknown-alternate.m4s";
+        let initial = sample_playback_plan_with_video_audio_and_alternate_urls(
+            old_video,
+            old_audio,
+            old_alternate,
+        );
+        let video_only = sample_playback_plan_with_video_audio_and_alternate_urls(
+            fresh_video,
+            old_audio,
+            old_alternate,
+        );
+        let all_fresh = sample_playback_plan_with_video_audio_and_alternate_urls(
+            fresh_video,
+            fresh_audio,
+            fresh_alternate,
+        );
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (planner_started_sender, planner_started_receiver) = oneshot::channel();
+        let (first_result_sender, first_result_receiver) = oneshot::channel();
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let planner = SequencedMediaRefreshPlanner {
+            initial: initial.clone(),
+            remaining_refreshes: Mutex::new(VecDeque::from([all_fresh])),
+            first_started: Mutex::new(Some(planner_started_sender)),
+            first_result: Mutex::new(Some(first_result_receiver)),
+            calls: Arc::clone(&refresh_calls),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1unknown-partial-refresh",
+            initial,
+        );
+        let video_resource = session.variant.video.clone();
+        let first_state = state.clone();
+        let first_session = session.clone();
+        let first_refresh = tokio::spawn(async move {
+            first_state
+                .refresh_hls_media_requests_for_resource(&first_session, &video_resource, &|| {
+                    HlsCacheFillControl::Continue
+                })
+                .await
+        });
+        timeout(Duration::from_secs(2), planner_started_receiver)
+            .await
+            .expect("video refresh planner should start")
+            .expect("video planner start signal should arrive");
+        first_result_sender
+            .send(Ok(video_only))
+            .expect("gated video plan should accept its result");
+        let video_result = timeout(Duration::from_secs(2), first_refresh)
+            .await
+            .expect("video refresh should be bounded")
+            .expect("video refresh task should not panic")
+            .expect("video refresh should succeed");
+        assert_eq!(fresh_video, video_result.variant.video.request.url);
+        assert_eq!(
+            old_audio,
+            video_result.variant.audio.as_ref().unwrap().request.url
+        );
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+
+        let background_result = state
+            .refresh_hls_media_requests(&session, &|| HlsCacheFillControl::Continue)
+            .await
+            .expect("unknown-resource refresh should replan after a partial update");
+
+        assert_eq!(2, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(fresh_video, background_result.variant.video.request.url);
+        assert_eq!(
+            fresh_audio,
+            background_result
+                .variant
+                .audio
+                .as_ref()
+                .unwrap()
+                .request
+                .url
+        );
+        assert_eq!(
+            fresh_alternate,
+            background_result.alternate_variants[0].video.request.url
+        );
+        assert_eq!(
+            fresh_alternate,
+            state.hls_sessions.get(&task_id).unwrap().alternate_variants[0]
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_parent_allows_refresh_of_its_online_secondary_result() {
+        let old_url = "https://old.example.test/secondary-online.m4s";
+        let fresh_url = "https://fresh.example.test/secondary-online.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let (state, refresh_calls, _) = media_refresh_test_state(temp.path(), old_url, fresh_url);
+        let creation = state
+            .tasks
+            .create_bilibili_playback_task("BV1completed-secondary-refresh", None, None)
+            .expect("multi-result playback task should be created");
+        let task_id = creation.task.id;
+        let child_id = format!("{task_id}-result-2");
+        let primary =
+            playback_task_metadata(&task_id, sample_playback_plan_with_video_url(old_url))
+                .expect("primary playback metadata should map");
+        let child = playback_task_metadata(&child_id, sample_playback_plan_with_video_url(old_url))
+            .expect("secondary playback metadata should map");
+        let primary_source = PlaybackSource {
+            item_id: task_id.clone(),
+            variant_id: primary.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{task_id}/master.m3u8"),
+            expires_at: None,
+        };
+        let child_source = PlaybackSource {
+            item_id: child_id.clone(),
+            variant_id: child.playback_session.selected_variant_id.clone(),
+            protocol: PlaybackProtocol::Hls.into(),
+            uri: format!("http://media.example.test:8080/hls/{child_id}/master.m3u8"),
+            expires_at: None,
+        };
+        state
+            .tasks
+            .complete_playback_results_playable(
+                &task_id,
+                "Multi-result playback".to_owned(),
+                "Results are playable.".to_owned(),
+                primary_source.clone(),
+                primary.playback_session.clone(),
+                vec![
+                    BilibiliTaskResultItem {
+                        id: task_id.clone(),
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(primary_source),
+                        playback_session: Some(primary.playback_session),
+                        ..Default::default()
+                    },
+                    BilibiliTaskResultItem {
+                        id: child_id.clone(),
+                        state: TaskState::Playable.into(),
+                        playback_source: Some(child_source),
+                        playback_session: Some(child.playback_session),
+                        identity: child
+                            .hls_session
+                            .accepted_identity
+                            .as_ref()
+                            .map(proto_bilibili_content_identity),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .expect("both playback results should become playable");
+        state.hls_sessions.insert(child.hls_session.clone());
+        state
+            .hls_cache
+            .save_session(&child.hls_session)
+            .expect("online secondary session should persist");
+        let completed_parent = state
+            .tasks
+            .complete_playback_hls_session_cached(
+                &task_id,
+                &task_id,
+                format!("bilibili.hls.{task_id}"),
+            )
+            .expect("primary offline result should complete the parent task");
+        assert_eq!(TaskState::Completed, completed_parent.state());
+        assert_eq!(
+            TaskState::Playable as i32,
+            completed_parent.result_items[1].state
+        );
+        assert!(
+            state
+                .tasks
+                .is_hls_session_refreshable_for_task(&task_id, &child_id)
+        );
+
+        let refreshed = state
+            .refresh_hls_media_requests_for_resource(
+                &child.hls_session,
+                &child.hls_session.variant.video,
+                &|| HlsCacheFillControl::Continue,
+            )
+            .await
+            .expect("completed parent should retain its online secondary refresh path");
+
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        assert_eq!(fresh_url, refreshed.variant.video.request.url);
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&child_id)
+                .unwrap()
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_range_and_background_fill_share_refresh_after_partial_cache() {
+        let (old_url, fresh_url, expired, _upstream) = start_refreshable_mp4_upstream(false).await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let body_length = u64::try_from(refresh_fixture_mp4().len()).unwrap();
+        let initial = sample_playback_plan_with_video_url_and_size(&old_url, body_length);
+        let refreshed = sample_playback_plan_with_video_url_and_size(&fresh_url, body_length);
+        let (state, refresh_calls, _) =
+            media_refresh_test_state_with_plans(temp.path(), initial.clone(), refreshed);
+        let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+            &state,
+            "BV1offline-foreground-background-refresh",
+            initial,
+        );
+        let control = || HlsCacheFillControl::Continue;
+        state
+            .hls_cache
+            .ensure_resource_range(
+                &state.hls_upstream_client,
+                &task_id,
+                &session.variant.video,
+                0..1,
+                crate::hls_range_cache::HlsRangePriority::Foreground,
+                &control,
+            )
+            .await
+            .expect("foreground prefix should become durable before expiry");
+        let prefix_before = state
+            .hls_cache
+            .read_resource_range(&task_id, &session.variant.video, 0..1)
+            .await
+            .expect("prefix read should succeed")
+            .expect("prefix should be cached");
+        let durable_before = state
+            .hls_cache
+            .range_durable_bytes(&task_id, &session.variant.video)
+            .expect("initial durable extent size should be readable");
+        assert!(!prefix_before.is_empty());
+        assert!(durable_before > 0);
+        expired.store(true, Ordering::Relaxed);
+
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert(RANGE, HeaderValue::from_static("bytes=262144-262175"));
+        let foreground = timeout(
+            Duration::from_secs(5),
+            crate::media::hls_segment_get(
+                State(crate::media::MediaState::new(state.clone())),
+                AxumPath((task_id.clone(), session.variant.video.id.clone())),
+                range_headers,
+            ),
+        );
+        let background = timeout(
+            Duration::from_secs(5),
+            cache_hls_session_with_media_refresh(&state, &task_id, &session, &control),
+        );
+        let (foreground, background) = tokio::join!(foreground, background);
+        let response = foreground.expect("foreground range refresh should be bounded");
+        assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+        assert_eq!(
+            32,
+            to_bytes(response.into_body(), 64)
+                .await
+                .expect("foreground bytes should stream")
+                .len()
+        );
+        background
+            .expect("background refresh should be bounded")
+            .expect("background fill should finish after shared refresh");
+
+        assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+        let current = state
+            .hls_sessions
+            .get(&task_id)
+            .expect("refreshed session should remain registered");
+        assert_eq!(session.variant.video.id, current.variant.video.id);
+        assert_eq!(
+            session.variant.video.request.cache_key,
+            current.variant.video.request.cache_key
+        );
+        assert_eq!(fresh_url, current.variant.video.request.url);
+        assert_eq!(
+            prefix_before,
+            state
+                .hls_cache
+                .read_resource_range(&task_id, &session.variant.video, 0..1)
+                .await
+                .expect("preserved prefix should remain readable")
+                .expect("preserved prefix should stay cached")
+        );
+        assert!(durable_before >= u64::try_from(prefix_before.len()).unwrap());
+        let cached = state
+            .hls_cache
+            .cached_resource(&task_id, &session.variant.video.id)
+            .expect("completed video resource should be cached");
+        assert_eq!(
+            prefix_before,
+            fs::read(cached.path).expect("completed cache file should remain readable")[..1]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_content_codec_and_length_mismatches_without_losing_partial_data() {
+        for mismatch in [
+            "aid-changed",
+            "aid-missing",
+            "bvid-changed",
+            "bvid-missing",
+            "cid-changed",
+            "cid-missing",
+            "epid-added",
+            "codec",
+            "length",
+        ] {
+            let (old_url, fresh_url, expired, _upstream) =
+                start_refreshable_mp4_upstream(false).await;
+            let initial = sample_playback_plan_with_video_url(&old_url);
+            let mut refreshed = sample_playback_plan_with_video_url(&fresh_url);
+            match mismatch {
+                "aid-changed" => refreshed.entries[0].aid += 1,
+                "aid-missing" => refreshed.entries[0].aid = 0,
+                "bvid-changed" => refreshed.entries[0].bvid = Some("BV1different".to_owned()),
+                "bvid-missing" => refreshed.entries[0].bvid = None,
+                "cid-changed" => refreshed.entries[0].cid += 1,
+                "cid-missing" => refreshed.entries[0].cid = 0,
+                "epid-added" => refreshed.entries[0].epid = Some(99),
+                "codec" => {
+                    refreshed.entries[0].variants[0]
+                        .video
+                        .as_mut()
+                        .unwrap()
+                        .codecs = Some("hev1.1.6.L120.90".to_owned());
+                    refreshed.entries[0]
+                        .selected_variant
+                        .as_mut()
+                        .unwrap()
+                        .variant
+                        .video
+                        .as_mut()
+                        .unwrap()
+                        .codecs = Some("hev1.1.6.L120.90".to_owned());
+                }
+                "length" => {
+                    refreshed.entries[0].variants[0]
+                        .video
+                        .as_mut()
+                        .unwrap()
+                        .size = Some(512 * 1024 + 1);
+                    refreshed.entries[0]
+                        .selected_variant
+                        .as_mut()
+                        .unwrap()
+                        .variant
+                        .video
+                        .as_mut()
+                        .unwrap()
+                        .size = Some(512 * 1024 + 1);
+                }
+                _ => unreachable!(),
+            }
+            let temp = tempfile::tempdir().expect("temporary root should be created");
+            let (state, refresh_calls, _) =
+                media_refresh_test_state_with_plans(temp.path(), initial, refreshed);
+            let (task_id, session, _) = create_playable_hls_playback_task_with_plan(
+                &state,
+                &format!("BV1offline-mismatch-{mismatch}"),
+                sample_playback_plan_with_video_url(&old_url),
+            );
+            let control = || HlsCacheFillControl::Continue;
+            state
+                .hls_cache
+                .ensure_resource_range(
+                    &state.hls_upstream_client,
+                    &task_id,
+                    &session.variant.video,
+                    0..1,
+                    crate::hls_range_cache::HlsRangePriority::Foreground,
+                    &control,
+                )
+                .await
+                .expect("partial range should become durable before expiry");
+            let durable_before = state
+                .hls_cache
+                .range_durable_bytes(&task_id, &session.variant.video)
+                .expect("partial durable bytes should be readable");
+            expired.store(true, Ordering::Relaxed);
+
+            let error = timeout(
+                Duration::from_secs(5),
+                cache_hls_session_with_media_refresh(&state, &task_id, &session, &control),
+            )
+            .await
+            .expect("mismatch refresh should be bounded")
+            .expect_err("changed content or representation must not be accepted");
+            assert!(matches!(
+                error,
+                crate::hls_cache::HlsCacheError::Range(
+                    crate::hls_range_cache::HlsRangeError::IdentityChanged
+                )
+            ));
+            assert_eq!(1, refresh_calls.load(Ordering::Relaxed));
+            assert_eq!(
+                old_url,
+                state
+                    .hls_sessions
+                    .get(&task_id)
+                    .unwrap()
+                    .variant
+                    .video
+                    .request
+                    .url
+            );
+            assert_eq!(
+                durable_before,
+                state
+                    .hls_cache
+                    .range_durable_bytes(&task_id, &session.variant.video)
+                    .expect("partial extent should remain durable")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_session_during_gated_refresh_is_not_republished() {
+        let old_url = "https://old.example.test/video.m4s";
+        let fresh_url = "https://fresh.example.test/video.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (result_sender, result_receiver) = oneshot::channel();
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let planner = GatedMediaRefreshPlanner {
+            refreshed: sample_playback_plan_with_video_url(fresh_url),
+            started: Mutex::new(Some(started_sender)),
+            result: Mutex::new(Some(result_receiver)),
+            calls: refresh_calls,
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-removal-during-refresh", old_url);
+        let state_for_refresh = state.clone();
+        let session_for_refresh = session.clone();
+        let refresh = tokio::spawn(async move {
+            state_for_refresh
+                .refresh_hls_media_requests(&session_for_refresh, &|| HlsCacheFillControl::Continue)
+                .await
+        });
+        timeout(Duration::from_secs(2), started_receiver)
+            .await
+            .expect("gated planner should start in time")
+            .expect("planner start signal should be delivered");
+
+        assert!(
+            state
+                .hls_sessions
+                .remove_with_generation_update(&task_id, |_| {})
+                .is_some()
+        );
+        result_sender
+            .send(Ok(sample_playback_plan_with_video_url(fresh_url)))
+            .expect("gated planner should accept the completed plan");
+        let result = timeout(Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh should finish after planner release")
+            .expect("refresh task should not panic");
+
+        assert!(matches!(
+            result,
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable)
+        ));
+        assert!(state.hls_sessions.get(&task_id).is_none());
+        let persisted = state
+            .hls_cache
+            .load_sessions()
+            .expect("persisted sessions should remain readable")
+            .into_iter()
+            .find(|saved| saved.id == task_id)
+            .expect("removal should not erase the persisted session manifest");
+        assert_eq!(old_url, persisted.variant.video.request.url);
+        assert_ne!(fresh_url, persisted.variant.video.request.url);
+    }
+
+    #[tokio::test]
+    async fn foreground_refresh_retries_immediately_after_background_preemption() {
+        let old_url = "https://old.example.test/preempted-video.m4s";
+        let fresh_url = "https://fresh.example.test/preempted-video.m4s";
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let (started_sender, started_receiver) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let planner = PreemptThenRefreshPlanner {
+            refreshed: sample_playback_plan_with_video_url(fresh_url),
+            started: Mutex::new(Some(started_sender)),
+            calls: Arc::clone(&calls),
+        };
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(planner),
+        );
+        let (task_id, session, _) =
+            create_playable_hls_playback_task(&state, "BV1offline-preempt-retry", old_url);
+        let preempted = Arc::new(AtomicBool::new(false));
+        let background_control_state = Arc::clone(&preempted);
+        let background_state = state.clone();
+        let background_session = session.clone();
+        let background = tokio::spawn(async move {
+            background_state
+                .refresh_hls_media_requests(&background_session, &|| {
+                    if background_control_state.load(Ordering::Relaxed) {
+                        HlsCacheFillControl::Preempt
+                    } else {
+                        HlsCacheFillControl::Continue
+                    }
+                })
+                .await
+        });
+        timeout(Duration::from_secs(2), started_receiver)
+            .await
+            .expect("background planner should start in time")
+            .expect("background planner start signal should arrive");
+        preempted.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), background)
+                .await
+                .expect("background refresh should observe preemption")
+                .expect("background refresh task should not panic"),
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Preempted)
+        ));
+
+        let foreground = timeout(
+            Duration::from_secs(2),
+            state.refresh_hls_media_requests(&session, &|| HlsCacheFillControl::Continue),
+        )
+        .await
+        .expect("foreground refresh should not inherit background cooldown")
+        .expect("foreground refresh should succeed immediately");
+
+        assert_eq!(2, calls.load(Ordering::Relaxed));
+        assert_eq!(fresh_url, foreground.variant.video.request.url);
+        assert_eq!(
+            fresh_url,
+            state
+                .hls_sessions
+                .get(&task_id)
+                .expect("refreshed session remains registered")
+                .variant
+                .video
+                .request
+                .url
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_refresh_unavailable_preserves_original_expired_cache_error() {
+        let (old_url, _fresh_url, _expired, _upstream) = start_refreshable_mp4_upstream(true).await;
+        let temp = tempfile::tempdir().expect("temporary root should be created");
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(temp.path()));
+        let state = AppState::new_with_playback_planner(
+            CacheServerOptions {
+                root_path: root.clone(),
+                task_state_path: root.join(".state").join("tasks.json"),
+                bilibili_worker_enabled: false,
+                ..CacheServerOptions::default()
+            },
+            Arc::new(EmptyPlaybackPlanner),
+        );
+        let (task_id, session) = create_legacy_playable_hls_test_task(
+            &state,
+            "BV1offline-legacy-refresh",
+            sample_playback_plan_with_video_url(&old_url),
+        );
+        let control = || HlsCacheFillControl::Continue;
+        assert!(session.accepted_identity.is_none());
+        assert!(
+            state
+                .hls_cache
+                .load_sessions()
+                .expect("legacy session manifest should load")
+                .iter()
+                .find(|saved| saved.id == task_id)
+                .is_some_and(|saved| saved.accepted_identity.is_none())
+        );
+        assert!(matches!(
+            state.refresh_hls_media_requests(&session, &control).await,
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable)
+        ));
+
+        let error = timeout(
+            Duration::from_secs(3),
+            cache_hls_session_with_media_refresh(&state, &task_id, &session, &control),
+        )
+        .await
+        .expect("legacy fill should be bounded")
+        .expect_err("expired URL should remain failed without an eligible refresh identity");
+
+        assert!(matches!(
+            error,
+            crate::hls_cache::HlsCacheError::UpstreamStatus(StatusCode::FORBIDDEN)
+        ));
     }
 
     struct FailingPlaybackPlanner {
@@ -21941,6 +24193,27 @@ mod tests {
                 variants: vec![selected_variant, alternate_variant],
             }],
         }
+    }
+
+    fn sample_playback_plan_with_video_audio_and_alternate_urls(
+        selected_video_url: &str,
+        audio_url: &str,
+        alternate_video_url: &str,
+    ) -> BilibiliPlaybackPlan {
+        let mut plan =
+            sample_playback_plan_with_alternate_video_urls(selected_video_url, alternate_video_url);
+        let audio = media_request_with_url(BilibiliMediaRequestKind::Audio, "mp4a.40.2", audio_url);
+        let entry = &mut plan.entries[0];
+        entry
+            .selected_variant
+            .as_mut()
+            .expect("sample plan should select a variant")
+            .variant
+            .audio = Some(audio.clone());
+        for variant in &mut entry.variants {
+            variant.audio = Some(audio.clone());
+        }
+        plan
     }
 
     fn playback_variant(

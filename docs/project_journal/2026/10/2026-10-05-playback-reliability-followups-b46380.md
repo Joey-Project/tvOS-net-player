@@ -3,8 +3,8 @@ id: 20261005-b46380
 title: Playback Reliability Follow-Ups
 status: active
 created: 2026-10-05
-updated: 2026-10-05
-branch: wip/bangumi-live-validation
+updated: 2026-10-07
+branch: wip/signed-media-url-refresh
 pr:
 supersedes: []
 superseded_by:
@@ -38,7 +38,10 @@ superseded_by:
 - macOS native AVPlayer probe evidence does not imply that the full macOS app UI or a physical Apple TV was exercised.
 
 ## Current Evidence
-- The first slice's corrected deterministic and extended live validation passed: 1,088 Rust tests, 343 Swift tests, four canonical URL smokes, and separate ordinary/episode 600-second foreground plus 300-second cache-only and native-control probes. The sampling journal records the earlier reproduced race and the corrected frozen source; successor runtime capabilities remain unimplemented.
+- The first slice shipped in [PR #71](https://github.com/Joey-Project/tvOS-net-player/pull/71), squash commit `c766c4951455d3169d6d632ed200fba5e8aea38d`. Exact-head GitHub Codex review, both required checks, actual simulator XCTest, and the complete conversation gate passed. The successor branch starts from updated `master`.
+- The first slice's corrected deterministic and extended live validation passed: 1,088 Rust tests, 343 Swift tests, four canonical URL smokes, and separate ordinary/episode 600-second foreground plus 300-second cache-only and native-control probes. The sampling journal records the earlier reproduced race and corrected frozen source.
+- The second slice adds accepted-identity signed-media refresh, single-flight foreground/background recovery, durable-session compare-and-replace, and restored playback/profile context. Its validation passed 1,132 Rust tests, 343 Swift tests, the four real URL smokes, and separate ordinary/episode injected-expiration recovery with 600-second foreground, 300-second cache-only, and 120-second macOS native probes. Details and limits: [Same-Identity Signed Media Refresh](2026-10-06-signed-media-refresh-b46381.md).
+- Credential lifecycle and authenticated following/dynamic regression remain the ordered successor work; physical Apple TV and TLS remain deferred.
 - Existing sampling implementation and deterministic regression results: [Bounded CDN Cross-Sampling](2026-10-05-cdn-cross-sampling-b46379.md).
 - Previously validated restricted playback, complete fill, recovery, and native controls: [Bilibili Live Playback Validation](2026-10-02-bilibili-live-playback-b46377.md).
 - Private account/profile validation: [Bilibili Account Credential Validation](2026-10-02-bilibili-account-credentials-b46376.md).

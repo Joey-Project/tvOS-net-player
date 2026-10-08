@@ -848,6 +848,7 @@ mod tests {
         HlsPlaybackSession {
             id: id.to_owned(),
             title: "Episode".to_owned(),
+            accepted_identity: None,
             variant: HlsVariant {
                 id: "h264".to_owned(),
                 bandwidth: 1_000_000,

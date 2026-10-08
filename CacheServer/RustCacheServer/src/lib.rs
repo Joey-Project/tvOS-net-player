@@ -12,6 +12,7 @@ pub mod grpc_services;
 mod hls;
 mod hls_cache;
 mod hls_fill_scheduler;
+mod hls_media_refresh;
 mod hls_network_policy;
 mod hls_playback_progress;
 mod hls_range_cache;
@@ -68,7 +69,7 @@ use crate::{
         CacheGrpcService, HlsCacheFinalizationFailureMode, LibraryGrpcService, ServerGrpcService,
         TaskGrpcService, TaskResultPageStore, playback_session_from_hls_cache_session,
     },
-    hls::{HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
+    hls::{HlsMediaResource, HlsPlaybackRegistry, HlsPlaybackSession, HlsPlaybackSessionHandle},
     hls_cache::{
         HlsCacheCompletedEntry, HlsCacheEvictionPolicy, HlsCacheEvictionSummary,
         HlsCacheSessionDirectoryScan, HlsCacheStatusSnapshot, HlsCacheStore,
@@ -87,7 +88,7 @@ use crate::{
         hls_segment_head, media_get, media_head, resource_get, resource_head,
     },
     playback::PlaybackUriFactory,
-    task_registry::BilibiliTaskRegistry,
+    task_registry::{BilibiliTaskCancellation, BilibiliTaskRegistry},
     transcoding::HlsTranscodingPlanState,
 };
 
@@ -133,6 +134,7 @@ pub struct AppState {
     pub(crate) lan_transcoding_permits: Arc<Semaphore>,
     pub(crate) lan_transcoding_active_jobs: Arc<AtomicUsize>,
     pub(crate) hls_fill_scheduler: HlsFillScheduler,
+    pub(crate) hls_media_refresh: hls_media_refresh::HlsMediaRefreshCoordinator,
     pub(crate) hls_network_policy: HlsNetworkPolicy,
     pub(crate) hls_playback_progress: HlsPlaybackProgressTracker,
     pub(crate) bilibili_login: bilibili_login::BilibiliLoginManager,
@@ -773,6 +775,7 @@ impl AppState {
             lan_transcoding_permits,
             lan_transcoding_active_jobs,
             hls_fill_scheduler,
+            hls_media_refresh: hls_media_refresh::HlsMediaRefreshCoordinator::default(),
             hls_network_policy,
             hls_playback_progress,
             bilibili_login: bilibili_login::BilibiliLoginManager::default(),
@@ -853,6 +856,7 @@ impl AppState {
 
         let tasks = Arc::downgrade(&self.tasks);
         let hls_sessions = self.hls_sessions.clone();
+        let hls_media_refresh = self.hls_media_refresh.clone();
         let hls_cache = self.hls_cache.clone();
         let hls_fill_scheduler = self.hls_fill_scheduler.clone();
         let hls_network_policy = self.hls_network_policy.clone();
@@ -944,6 +948,7 @@ impl AppState {
                                             .remove_session_generation(&session.id, generation);
                                     },
                                 );
+                                hls_media_refresh.remove_session(&session.id);
                                 hls_playback_progress.remove_session(&session.id);
                             }
                             Err(error) => {
@@ -1987,7 +1992,181 @@ impl AppState {
                 self.hls_network_policy
                     .remove_session_generation(session_id, generation);
             });
+        self.hls_media_refresh.remove_session(session_id);
         self.hls_playback_progress.remove_session(session_id);
+    }
+
+    pub(crate) async fn refresh_hls_media_requests<F>(
+        &self,
+        failed: &HlsPlaybackSession,
+        control: &F,
+    ) -> Result<HlsPlaybackSession, hls_media_refresh::HlsMediaRefreshError>
+    where
+        F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
+    {
+        self.refresh_hls_media_requests_inner(failed, None, control)
+            .await
+    }
+
+    pub(crate) async fn refresh_hls_media_requests_for_resource<F>(
+        &self,
+        failed: &HlsPlaybackSession,
+        failed_resource: &HlsMediaResource,
+        control: &F,
+    ) -> Result<HlsPlaybackSession, hls_media_refresh::HlsMediaRefreshError>
+    where
+        F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
+    {
+        self.refresh_hls_media_requests_inner(failed, Some(failed_resource), control)
+            .await
+    }
+
+    async fn refresh_hls_media_requests_inner<F>(
+        &self,
+        failed: &HlsPlaybackSession,
+        failed_resource: Option<&HlsMediaResource>,
+        control: &F,
+    ) -> Result<HlsPlaybackSession, hls_media_refresh::HlsMediaRefreshError>
+    where
+        F: Fn() -> hls_cache::HlsCacheFillControl + Send + Sync,
+    {
+        use hls_media_refresh::{
+            HlsMediaRefreshError as RefreshError, await_plan_with_control, check_control,
+            failed_media_request_was_refreshed, preserve_concurrent_media_request_updates,
+            same_hls_media_refresh_binding,
+        };
+
+        check_control(control)?;
+        let identity = failed
+            .accepted_identity
+            .as_ref()
+            .filter(|identity| identity.is_refresh_complete())
+            .ok_or(RefreshError::Unavailable)?;
+        let mut current = self.current_refresh_session(failed, identity)?;
+        if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
+            return Ok(current.session);
+        }
+
+        let (entry, _refresh_guard) = self
+            .hls_media_refresh
+            .lock_session(&failed.id, control)
+            .await?;
+        check_control(control)?;
+        current = self.current_refresh_session(failed, identity)?;
+        if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
+            return Ok(current.session);
+        }
+        let attempt_started = std::time::Instant::now();
+        let resource_id = failed_resource.map(|resource| resource.id.as_str());
+        if !entry.begin_attempt(resource_id, attempt_started) {
+            return Err(RefreshError::Unavailable);
+        }
+
+        let result = async {
+            let cancellation = BilibiliTaskCancellation::default();
+            let request = self
+                .tasks
+                .hls_media_refresh_request(&failed.id, identity.clone(), cancellation.clone())
+                .ok_or(RefreshError::Unavailable)?;
+            let _planning_activity = self.begin_playback_planning();
+            let planning_permits = Arc::clone(&self.playback_planning_permits);
+            let playback_planner = Arc::clone(&self.playback_planner);
+            let plan = await_plan_with_control(
+                async move {
+                    let _permit = planning_permits.acquire_owned().await.map_err(|_| {
+                        crate::bilibili_worker::BilibiliDownloadError::Failed(
+                            "Playback planning concurrency limiter is unavailable.".to_owned(),
+                        )
+                    })?;
+                    playback_planner.refresh_media(request).await
+                },
+                &cancellation,
+                control,
+                hls_media_refresh::HLS_MEDIA_REFRESH_TIMEOUT,
+            )
+            .await?;
+            check_control(control)?;
+            let _lifecycle_guard = self.hls_task_lifecycle_guard();
+            let _completed_mutation_guard = self.completed_hls_mutation_guard();
+            check_control(control)?;
+            let current = self.current_refresh_session(failed, identity)?;
+            if failed_media_request_was_refreshed(failed, &current.session, failed_resource) {
+                return Ok(current.session);
+            }
+            let mut replacement = current
+                .session
+                .with_refreshed_media_requests(&plan)
+                .map_err(|_| RefreshError::IdentityMismatch)?;
+            if !same_hls_media_refresh_binding(&current.session, &replacement) {
+                return Err(RefreshError::IdentityMismatch);
+            }
+            preserve_concurrent_media_request_updates(
+                failed,
+                &current.session,
+                &mut replacement,
+                resource_id,
+            );
+            let cache = self.hls_cache.clone();
+            let saved = self
+                .hls_sessions
+                .replace_media_requests_if_current(&current, replacement.clone(), || {
+                    cache.save_refreshed_session(&current.session, &replacement)
+                })
+                .map_err(RefreshError::Persistence)?;
+            if !saved {
+                return Err(RefreshError::Unavailable);
+            }
+            Ok(replacement)
+        }
+        .await;
+        if matches!(
+            &result,
+            Err(RefreshError::Cancelled | RefreshError::Preempted)
+        ) {
+            entry.clear_attempt_if_current(resource_id, attempt_started);
+        }
+        result
+    }
+
+    fn current_refresh_session(
+        &self,
+        failed: &HlsPlaybackSession,
+        identity: &crate::bilibili_playback::BilibiliContentIdentity,
+    ) -> Result<HlsPlaybackSessionHandle, hls_media_refresh::HlsMediaRefreshError> {
+        use hls_media_refresh::{
+            HlsMediaRefreshError as RefreshError, same_hls_media_refresh_binding,
+        };
+
+        let handle = self
+            .hls_sessions
+            .get_with_generation(&failed.id)
+            .ok_or(RefreshError::Unavailable)?;
+        let task_id = self
+            .tasks
+            .playable_task_id_for_hls_session(&failed.id)
+            .ok_or(RefreshError::Unavailable)?;
+        let task = self
+            .tasks
+            .get_task(&task_id)
+            .map_err(|_| RefreshError::Unavailable)?;
+        if task.kind() != TaskKind::BilibiliProgressivePlayback
+            || !self
+                .tasks
+                .is_hls_session_refreshable_for_task(&task_id, &failed.id)
+        {
+            return Err(RefreshError::Unavailable);
+        }
+        let Some(current_identity) = handle.session.accepted_identity.as_ref() else {
+            return Err(RefreshError::Unavailable);
+        };
+        if !current_identity.is_refresh_complete() {
+            return Err(RefreshError::Unavailable);
+        }
+        if current_identity != identity || !same_hls_media_refresh_binding(failed, &handle.session)
+        {
+            return Err(RefreshError::IdentityMismatch);
+        }
+        Ok(handle)
     }
 
     pub(crate) fn register_completed_hls_runtime_session(&self, session: &HlsPlaybackSession) {
@@ -3534,6 +3713,7 @@ mod tests {
             BilibiliPlaybackSession, BilibiliPlaybackVariant, BilibiliTaskResultItem, TaskResult,
         },
         hls::{HlsAbrMetadata, HlsMediaResource, HlsVariant},
+        hls_cache::HlsCacheFillControl,
         task_store::TaskStateStore,
         transcoding::HlsTranscodingPlan,
     };
@@ -5626,6 +5806,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_playback_planning_timeout_drops_activity_without_consuming_permit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let held_permit = Arc::clone(&state.playback_planning_permits)
+            .acquire_owned()
+            .await
+            .expect("playback planning permit should be available");
+        let planning_activity = state.begin_playback_planning();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let planner_calls = Arc::clone(&calls);
+        let planning_permits = Arc::clone(&state.playback_planning_permits);
+        let cancellation = BilibiliTaskCancellation::default();
+
+        let result = crate::hls_media_refresh::await_plan_with_control(
+            async move {
+                let _permit = planning_permits.acquire_owned().await.map_err(|_| {
+                    BilibiliDownloadError::Failed(
+                        "Playback planning concurrency limiter is unavailable.".to_owned(),
+                    )
+                })?;
+                planner_calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), BilibiliDownloadError>(())
+            },
+            &cancellation,
+            &|| HlsCacheFillControl::Continue,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable)
+        ));
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(0, calls.load(Ordering::Relaxed));
+        assert!(!state.background_work_is_idle());
+        drop(planning_activity);
+        drop(held_permit);
+        assert!(state.background_work_is_idle());
+    }
+
+    #[tokio::test]
     async fn app_state_shutdown_stops_idle_hls_fill_worker() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let state = test_app_state(&temp);
@@ -5931,6 +6153,76 @@ mod tests {
         (task_id, session)
     }
 
+    #[tokio::test]
+    async fn completed_scrubbed_hls_session_is_unavailable_for_media_refresh() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let (task_id, mut session) = create_playable_hls_task(&state, "BV1refresh-completed");
+        let identity = BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(1),
+            bvid: Some("BV1refresh-completed".to_owned()),
+            cid: Some(1),
+            epid: None,
+        };
+        session.accepted_identity = Some(identity.clone());
+        state.hls_sessions.insert(session.clone());
+        state
+            .tasks
+            .complete_playback_cached(&task_id, "bilibili.hls.completed-refresh".to_owned())
+            .expect("playback task should become completed");
+        let scrubbed = sanitized_completed_session(&session);
+        assert!(scrubbed.accepted_identity.is_none());
+        state.hls_sessions.insert(scrubbed);
+
+        let error = state
+            .refresh_hls_media_requests(&session, &|| {
+                crate::hls_cache::HlsCacheFillControl::Continue
+            })
+            .await
+            .expect_err("completed task must not refresh media URLs");
+
+        assert!(matches!(
+            error,
+            hls_media_refresh::HlsMediaRefreshError::Unavailable
+        ));
+        assert_eq!(
+            TaskState::Completed,
+            state
+                .tasks
+                .get_task(&task_id)
+                .expect("task remains")
+                .state()
+        );
+        assert!(
+            state
+                .hls_sessions
+                .get(&session.id)
+                .expect("scrubbed session remains registered")
+                .accepted_identity
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_hls_refresh_input_preserves_cancellation_control() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state = test_app_state(&temp);
+        let legacy_session = sample_hls_session("legacy-refresh-session");
+
+        let error = state
+            .refresh_hls_media_requests(&legacy_session, &|| {
+                crate::hls_cache::HlsCacheFillControl::Cancel
+            })
+            .await
+            .expect_err("cancellation must precede legacy identity eligibility");
+
+        assert!(matches!(
+            error,
+            hls_media_refresh::HlsMediaRefreshError::Cancelled
+        ));
+    }
+
     #[test]
     fn completed_hls_item_transition_invalidates_result_pages_by_parent_task() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -6056,10 +6348,11 @@ mod tests {
         }
     }
 
-    fn sample_hls_session(session_id: &str) -> HlsPlaybackSession {
+    pub(crate) fn sample_hls_session(session_id: &str) -> HlsPlaybackSession {
         HlsPlaybackSession {
             id: session_id.to_owned(),
             title: "Episode".to_owned(),
+            accepted_identity: None,
             variant: HlsVariant {
                 id: "h264".to_owned(),
                 bandwidth: 1_000_000,

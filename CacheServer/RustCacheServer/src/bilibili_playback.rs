@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     bbdown_adapter::{BbdownBilibiliAdapter, BilibiliPlaybackPlan},
     bilibili_worker::BilibiliDownloadError,
@@ -37,6 +39,17 @@ pub(crate) trait BilibiliPlaybackPlanner: Send + Sync + 'static {
         &'a self,
         request: BilibiliPlaybackPlanningRequest,
     ) -> BilibiliPlaybackPlanningFuture<'a>;
+
+    fn refresh_media<'a>(
+        &'a self,
+        _request: BilibiliMediaRefreshRequest,
+    ) -> BilibiliPlaybackPlanningFuture<'a> {
+        Box::pin(async {
+            Err(BilibiliDownloadError::Failed(
+                "Bilibili media refresh is not configured.".to_owned(),
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -59,14 +72,15 @@ pub(crate) struct BilibiliInputResolution {
     pub candidates_truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum BilibiliContentKind {
     VideoPage,
     SeasonEpisode,
     CollectionItem,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct BilibiliContentIdentity {
     pub kind: BilibiliContentKind,
     pub aid: Option<u64>,
@@ -98,6 +112,21 @@ impl BilibiliContentIdentity {
                 self.cid.is_some() && aid_or_bvid && self.epid.is_none()
             }
             BilibiliContentKind::SeasonEpisode => self.epid.is_some(),
+        }
+    }
+
+    pub(crate) fn is_refresh_complete(&self) -> bool {
+        if !self.is_complete() {
+            return false;
+        }
+
+        match self.kind {
+            BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => {
+                self.aid.is_some() && self.cid.is_some() && self.epid.is_none()
+            }
+            BilibiliContentKind::SeasonEpisode => {
+                self.epid.is_some() && self.aid.is_some() && self.cid.is_some()
+            }
         }
     }
 
@@ -136,6 +165,14 @@ pub(crate) struct BilibiliPlaybackPlanningRequest {
     pub options: Option<BilibiliPlaybackOptions>,
     pub request_context: Option<BilibiliRequestContext>,
     pub selection_id: Option<String>,
+    pub cancellation: BilibiliTaskCancellation,
+}
+
+#[derive(Clone)]
+pub(crate) struct BilibiliMediaRefreshRequest {
+    pub identity: BilibiliContentIdentity,
+    pub options: Option<BilibiliPlaybackOptions>,
+    pub request_context: Option<BilibiliRequestContext>,
     pub cancellation: BilibiliTaskCancellation,
 }
 
@@ -180,6 +217,26 @@ impl BilibiliPlaybackPlanner for BbdownBilibiliAdapter {
             .await
         })
     }
+
+    fn refresh_media<'a>(
+        &'a self,
+        request: BilibiliMediaRefreshRequest,
+    ) -> BilibiliPlaybackPlanningFuture<'a> {
+        Box::pin(async move {
+            let download_options = request.options.as_ref().map(playback_to_download_options);
+            let playback_policy =
+                PlaybackPolicy::from_playback_options(request.options.as_ref())
+                    .map_err(|error| BilibiliDownloadError::Failed(error.to_string()))?;
+            self.refresh_playback_media(
+                &request.identity,
+                download_options.as_ref(),
+                request.request_context.as_ref(),
+                playback_policy,
+                || request.cancellation.is_cancel_requested(),
+            )
+            .await
+        })
+    }
 }
 
 fn playback_to_download_options(options: &BilibiliPlaybackOptions) -> BilibiliDownloadOptions {
@@ -194,5 +251,24 @@ fn playback_to_download_options(options: &BilibiliPlaybackOptions) -> BilibiliDo
         download_cover: false,
         danmaku_formats: Vec::new(),
         download_mode: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BilibiliContentIdentity, BilibiliContentKind};
+
+    #[test]
+    fn refresh_identity_completeness_does_not_change_resolution_completeness() {
+        let episode = BilibiliContentIdentity {
+            kind: BilibiliContentKind::SeasonEpisode,
+            aid: None,
+            bvid: None,
+            cid: None,
+            epid: Some(370_001),
+        };
+
+        assert!(episode.is_complete());
+        assert!(!episode.is_refresh_complete());
     }
 }

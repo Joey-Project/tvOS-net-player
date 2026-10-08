@@ -35,7 +35,8 @@ use crate::{
         should_forward_media_request_header,
     },
     hls_cache::{HlsCacheFillControl, OpenedPrewarmedHlsResource},
-    hls_range_cache::{HlsRangeError, HlsRangePriority},
+    hls_media_refresh::is_expired_range_error,
+    hls_range_cache::{HlsRangeError, HlsRangePriority, HlsReadyRange},
     library::OpenedMediaFile,
     playback_policy::WeakNetworkPreference,
 };
@@ -809,18 +810,15 @@ async fn foreground_hls_range_response(
                 return hls_range_error_response(error);
             }
         };
-        match state
-            .state
-            .hls_cache
-            .ensure_resource_range(
-                &state.state.hls_upstream_client,
-                &policy_recorder.session_id,
-                &resource,
-                0..1,
-                HlsRangePriority::Foreground,
-                &control,
-            )
-            .await
+        match ensure_hls_range_with_media_refresh(
+            state,
+            &policy_recorder.session_id,
+            &resource,
+            0..1,
+            HlsRangePriority::Foreground,
+            &control,
+        )
+        .await
         {
             Ok(ready) => match state
                 .state
@@ -1072,18 +1070,15 @@ where
         ));
     }
 
-    let ready = state
-        .state
-        .hls_cache
-        .ensure_resource_range(
-            &state.state.hls_upstream_client,
-            session_id,
-            resource,
-            requested.clone(),
-            HlsRangePriority::Foreground,
-            control,
-        )
-        .await?;
+    let ready = ensure_hls_range_with_media_refresh(
+        state,
+        session_id,
+        resource,
+        requested.clone(),
+        HlsRangePriority::Foreground,
+        control,
+    )
+    .await?;
     let bytes = state
         .state
         .hls_cache
@@ -1100,6 +1095,69 @@ where
         ));
     }
     Ok((Bytes::from(bytes), true, ready.total_length))
+}
+
+async fn ensure_hls_range_with_media_refresh<F>(
+    state: &MediaState,
+    session_id: &str,
+    resource: &HlsMediaResource,
+    requested: StdRange<u64>,
+    priority: HlsRangePriority,
+    control: &F,
+) -> Result<HlsReadyRange, HlsRangeError>
+where
+    F: Fn() -> HlsCacheFillControl + Send + Sync,
+{
+    let failed_session = state.state.hls_sessions.get(session_id);
+    let effective_resource = failed_session
+        .as_ref()
+        .and_then(|session| session.media_resource_with_variant(&resource.id))
+        .map(|(_, current)| current)
+        .filter(|current| same_hls_range_resource_representation(resource, current))
+        .unwrap_or_else(|| resource.clone());
+    let result = state
+        .state
+        .hls_cache
+        .ensure_resource_range(
+            &state.state.hls_upstream_client,
+            session_id,
+            &effective_resource,
+            requested.clone(),
+            priority,
+            control,
+        )
+        .await;
+    let error = match result {
+        Err(error) if is_expired_range_error(&error) => error,
+        result => return result,
+    };
+    let Some(failed_session) = failed_session else {
+        return Err(error);
+    };
+    let refreshed = match state
+        .state
+        .refresh_hls_media_requests_for_resource(&failed_session, &effective_resource, control)
+        .await
+    {
+        Ok(refreshed) => refreshed,
+        Err(refresh_error) => return Err(refresh_error.into_range_error(error)),
+    };
+    let (_, replacement) = refreshed
+        .media_resource_with_variant(&resource.id)
+        .filter(|(_, replacement)| same_hls_range_resource_representation(resource, replacement))
+        .ok_or(HlsRangeError::IdentityChanged)?;
+    state
+        .state
+        .hls_cache
+        .ensure_resource_range(
+            &state.state.hls_upstream_client,
+            session_id,
+            &replacement,
+            requested,
+            priority,
+            control,
+        )
+        .await
 }
 
 fn range_header_is_well_formed(header: &HeaderValue) -> bool {
@@ -1426,6 +1484,97 @@ async fn proxy_hls_media_resource(
     headers: &HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
+    let failed_session = state.state.hls_sessions.get(&policy_recorder.session_id);
+    let current_resource = failed_session
+        .as_ref()
+        .and_then(|session| session.media_resource_with_variant(&resource.id))
+        .map(|(_, current)| current)
+        .filter(|current| same_hls_range_resource_representation(&resource, current))
+        .unwrap_or_else(|| resource.clone());
+    let attempt = proxy_hls_media_resource_once(
+        state,
+        policy_recorder,
+        variant_id,
+        current_resource.clone(),
+        headers,
+        head_only,
+    )
+    .await;
+    let Some(expired_status) = attempt.expired_status else {
+        return attempt.response;
+    };
+    let Some(failed_session) = failed_session else {
+        return attempt.response;
+    };
+    let control = hls_range_control(
+        Arc::clone(&state.state),
+        policy_recorder.session_id.clone(),
+        policy_recorder.generation,
+        current_resource.clone(),
+    );
+    let refreshed = match state
+        .state
+        .refresh_hls_media_requests_for_resource(&failed_session, &current_resource, &control)
+        .await
+    {
+        Ok(refreshed) => refreshed,
+        Err(crate::hls_media_refresh::HlsMediaRefreshError::Unavailable) => {
+            return attempt.response;
+        }
+        Err(
+            refresh_error @ (crate::hls_media_refresh::HlsMediaRefreshError::Cancelled
+            | crate::hls_media_refresh::HlsMediaRefreshError::Preempted),
+        ) => {
+            return hls_range_error_response(
+                refresh_error.into_range_error(HlsRangeError::UpstreamStatus(expired_status)),
+            );
+        }
+        Err(refresh_error) => {
+            if head_only {
+                return attempt.response;
+            }
+            return hls_range_error_response(
+                refresh_error.into_range_error(HlsRangeError::UpstreamStatus(expired_status)),
+            );
+        }
+    };
+    let Some((_, replacement)) =
+        refreshed
+            .media_resource_with_variant(&resource.id)
+            .filter(|(_, replacement)| {
+                same_hls_range_resource_representation(&current_resource, replacement)
+            })
+    else {
+        if head_only {
+            return attempt.response;
+        }
+        return hls_range_error_response(HlsRangeError::IdentityChanged);
+    };
+    proxy_hls_media_resource_once(
+        state,
+        policy_recorder,
+        variant_id,
+        replacement,
+        headers,
+        head_only,
+    )
+    .await
+    .response
+}
+
+struct HlsProxyAttempt {
+    response: Response<Body>,
+    expired_status: Option<StatusCode>,
+}
+
+async fn proxy_hls_media_resource_once(
+    state: &MediaState,
+    policy_recorder: &HlsNetworkPolicyRecorder,
+    variant_id: &str,
+    resource: HlsMediaResource,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> HlsProxyAttempt {
     let urls = state.state.cdn_history.rank_request(&resource.request);
     let context = HlsMediaProxyContext {
         state,
@@ -1435,6 +1584,7 @@ async fn proxy_hls_media_resource(
     };
 
     let mut last_retryable_response = None;
+    let mut last_expired_response = None;
     for url in urls {
         match send_hls_upstream_request(context, &url, headers, head_only).await {
             Ok(upstream) if upstream.range_unsupported => {
@@ -1445,17 +1595,29 @@ async fn proxy_hls_media_resource(
                         if should_retry_hls_upstream_status(fallback.response.status()) =>
                     {
                         policy_recorder.record_upstream_retry(variant_id);
-                        last_retryable_response = Some(fallback.response);
+                        if is_expired_media_status(fallback.response.status()) {
+                            last_expired_response = Some(fallback.response);
+                        } else {
+                            last_retryable_response = Some(fallback.response);
+                        }
                     }
                     Ok(fallback) if fallback.response.status() != StatusCode::OK => {
                         policy_recorder.record_upstream_failure(variant_id);
-                        return text_response(
-                            StatusCode::BAD_GATEWAY,
-                            "HLS upstream did not provide a complete response after Range fallback.\n",
-                            head_only,
-                        );
+                        return HlsProxyAttempt {
+                            response: text_response(
+                                StatusCode::BAD_GATEWAY,
+                                "HLS upstream did not provide a complete response after Range fallback.\n",
+                                head_only,
+                            ),
+                            expired_status: None,
+                        };
                     }
-                    Ok(fallback) => return fallback.response,
+                    Ok(fallback) => {
+                        return HlsProxyAttempt {
+                            response: fallback.response,
+                            expired_status: None,
+                        };
+                    }
                     Err(error) => {
                         if let Some(error_url) = error.url()
                             && let Some(observation_url) =
@@ -1481,9 +1643,18 @@ async fn proxy_hls_media_resource(
             }
             Ok(upstream) if should_retry_hls_upstream_status(upstream.response.status()) => {
                 policy_recorder.record_upstream_retry(variant_id);
-                last_retryable_response = Some(upstream.response);
+                if is_expired_media_status(upstream.response.status()) {
+                    last_expired_response = Some(upstream.response);
+                } else {
+                    last_retryable_response = Some(upstream.response);
+                }
             }
-            Ok(upstream) => return upstream.response,
+            Ok(upstream) => {
+                return HlsProxyAttempt {
+                    response: upstream.response,
+                    expired_status: None,
+                };
+            }
             Err(error) => {
                 if let Some(error_url) = error.url()
                     && let Some(observation_url) =
@@ -1509,13 +1680,24 @@ async fn proxy_hls_media_resource(
     }
 
     policy_recorder.record_upstream_failure(variant_id);
-    last_retryable_response.unwrap_or_else(|| {
-        text_response(
-            StatusCode::BAD_GATEWAY,
-            "HLS upstream media request failed.\n",
-            head_only,
-        )
-    })
+    if let Some(expired_response) = last_expired_response {
+        let expired_status = expired_response.status();
+        HlsProxyAttempt {
+            response: expired_response,
+            expired_status: Some(expired_status),
+        }
+    } else {
+        HlsProxyAttempt {
+            response: last_retryable_response.unwrap_or_else(|| {
+                text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "HLS upstream media request failed.\n",
+                    head_only,
+                )
+            }),
+            expired_status: None,
+        }
+    }
 }
 
 fn text_response(status: StatusCode, body: &'static str, head_only: bool) -> Response<Body> {
@@ -2035,8 +2217,16 @@ fn should_retry_hls_upstream_status(status: StatusCode) -> bool {
             StatusCode::UNAUTHORIZED
                 | StatusCode::FORBIDDEN
                 | StatusCode::NOT_FOUND
+                | StatusCode::GONE
                 | StatusCode::TOO_MANY_REQUESTS
         )
+}
+
+fn is_expired_media_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
+    )
 }
 
 fn range_response_invalid(
@@ -2088,6 +2278,55 @@ async fn load_hls_mp4_initialization(
     variant_id: &str,
     resource: &HlsMediaResource,
 ) -> Result<Mp4Initialization, ()> {
+    let failed_session = state.state.hls_sessions.get(&policy_recorder.session_id);
+    let current_resource = failed_session
+        .as_ref()
+        .and_then(|session| session.media_resource_with_variant(&resource.id))
+        .map(|(_, current)| current)
+        .filter(|current| same_hls_range_resource_representation(resource, current))
+        .unwrap_or_else(|| resource.clone());
+    let (result, expired_status) = probe_hls_mp4_initialization_candidates(
+        state,
+        policy_recorder,
+        variant_id,
+        &current_resource,
+    )
+    .await;
+    if result.is_ok() || expired_status.is_none() {
+        return result;
+    }
+    let Some(failed_session) = failed_session else {
+        return Err(());
+    };
+    let control = hls_range_control(
+        Arc::clone(&state.state),
+        policy_recorder.session_id.clone(),
+        policy_recorder.generation,
+        current_resource.clone(),
+    );
+    let refreshed = state
+        .state
+        .refresh_hls_media_requests_for_resource(&failed_session, &current_resource, &control)
+        .await
+        .map_err(|_| ())?;
+    let (_, replacement) = refreshed
+        .media_resource_with_variant(&resource.id)
+        .filter(|(_, replacement)| {
+            same_hls_range_resource_representation(&current_resource, replacement)
+        })
+        .ok_or(())?;
+    let (result, _) =
+        probe_hls_mp4_initialization_candidates(state, policy_recorder, variant_id, &replacement)
+            .await;
+    result
+}
+
+async fn probe_hls_mp4_initialization_candidates(
+    state: &MediaState,
+    policy_recorder: &HlsNetworkPolicyRecorder,
+    variant_id: &str,
+    resource: &HlsMediaResource,
+) -> (Result<Mp4Initialization, ()>, Option<StatusCode>) {
     let urls = state
         .state
         .cdn_history
@@ -2095,6 +2334,7 @@ async fn load_hls_mp4_initialization(
         .into_iter()
         .filter(|url| !url.trim().is_empty())
         .collect::<Vec<_>>();
+    let mut expired_status = None;
 
     for url in urls {
         match load_hls_mp4_initialization_from_url(state, resource, &url).await {
@@ -2116,20 +2356,32 @@ async fn load_hls_mp4_initialization(
                     );
                 }
                 policy_recorder.record_upstream_success(variant_id, probe.response_time);
-                return Ok(probe.initialization);
+                return (Ok(probe.initialization), expired_status);
             }
-            Err(()) => policy_recorder.record_upstream_retry(variant_id),
+            Err(Mp4InitializationProbeError::Expired(status)) => {
+                expired_status = Some(status);
+                policy_recorder.record_upstream_retry(variant_id);
+            }
+            Err(Mp4InitializationProbeError::Other) => {
+                policy_recorder.record_upstream_retry(variant_id);
+            }
         }
     }
 
-    Err(())
+    (Err(()), expired_status)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mp4InitializationProbeError {
+    Expired(StatusCode),
+    Other,
 }
 
 async fn load_hls_mp4_initialization_from_url(
     state: &MediaState,
     resource: &HlsMediaResource,
     url: &str,
-) -> Result<Mp4InitializationProbe, ()> {
+) -> Result<Mp4InitializationProbe, Mp4InitializationProbeError> {
     let started_at = Instant::now();
     let upstream = hls_upstream_request_builder(state, resource, Method::GET, url)
         .header(
@@ -2138,12 +2390,16 @@ async fn load_hls_mp4_initialization_from_url(
         )
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| Mp4InitializationProbeError::Other)?;
     let response_time = started_at.elapsed();
     let final_url = upstream.url().as_str().to_owned();
-    let status = StatusCode::from_u16(upstream.status().as_u16()).map_err(|_| ())?;
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .map_err(|_| Mp4InitializationProbeError::Other)?;
+    if is_expired_media_status(status) {
+        return Err(Mp4InitializationProbeError::Expired(status));
+    }
     if should_retry_hls_upstream_status(status) || !status.is_success() {
-        return Err(());
+        return Err(Mp4InitializationProbeError::Other);
     }
 
     let headers = upstream.headers().clone();
@@ -2151,16 +2407,19 @@ async fn load_hls_mp4_initialization_from_url(
     if status != StatusCode::PARTIAL_CONTENT
         || content_length.is_some_and(|length| length > HLS_INITIALIZATION_SCAN_BYTES)
     {
-        return Err(());
+        return Err(Mp4InitializationProbeError::Other);
     }
-    let (returned_range, total_length) = content_range_byte_range(&headers).ok_or(())?;
+    let (returned_range, total_length) =
+        content_range_byte_range(&headers).ok_or(Mp4InitializationProbeError::Other)?;
     if returned_range.start != 0 || returned_range.length() > HLS_INITIALIZATION_SCAN_BYTES {
-        return Err(());
+        return Err(Mp4InitializationProbeError::Other);
     }
-    let bytes = read_hls_initialization_probe(upstream).await?;
-    let length = mp4_initialization_length(&bytes).ok_or(())?;
+    let bytes = read_hls_initialization_probe(upstream)
+        .await
+        .map_err(|_| Mp4InitializationProbeError::Other)?;
+    let length = mp4_initialization_length(&bytes).ok_or(Mp4InitializationProbeError::Other)?;
     if length == 0 || length >= total_length {
-        return Err(());
+        return Err(Mp4InitializationProbeError::Other);
     }
 
     Ok(Mp4InitializationProbe {
@@ -2170,7 +2429,7 @@ async fn load_hls_mp4_initialization_from_url(
             segments: Vec::new(),
         },
         response_time,
-        prefix_bytes: u64::try_from(bytes.len()).map_err(|_| ())?,
+        prefix_bytes: u64::try_from(bytes.len()).map_err(|_| Mp4InitializationProbeError::Other)?,
         final_url,
     })
 }
@@ -6396,6 +6655,7 @@ mod tests {
             variants: Vec::new(),
             transcoding: Default::default(),
             effective_policy: crate::playback_policy::PlaybackPolicy::default(),
+            accepted_identity: None,
         }
     }
 

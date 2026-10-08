@@ -2183,6 +2183,56 @@ impl BbdownBilibiliAdapter {
         }
         Ok(plan)
     }
+
+    pub(crate) async fn refresh_playback_media(
+        &self,
+        identity: &BilibiliContentIdentity,
+        options: Option<&BilibiliDownloadOptions>,
+        request_context: Option<&BilibiliRequestContext>,
+        policy: PlaybackPolicy,
+        is_cancel_requested: impl Fn() -> bool,
+    ) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
+        let input = canonical_refresh_input(identity)?;
+        let preferences = playback_variant_preferences_from_options_with_policy(options, policy)?;
+        let client_config = self
+            .client_config_for_request(options, request_context)
+            .await?;
+        let client = BiliClient::new(client_config.clone());
+        let selection = match identity.kind {
+            BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => {
+                let expected_identity = PlaybackExpectedIdentity {
+                    bvid: identity.bvid.clone(),
+                    aid: identity.aid,
+                    cid: identity.cid,
+                };
+                Some(
+                    resolve_direct_collection_item_page(
+                        &client,
+                        &input,
+                        &expected_identity,
+                        &is_cancel_requested,
+                    )
+                    .await?,
+                )
+            }
+            BilibiliContentKind::SeasonEpisode => Some(Selection::Current),
+        };
+        let plan = match self
+            .plan_with_resolver_routing(
+                client_config,
+                input,
+                selection,
+                PgcPlanKind::Playback,
+                &is_cancel_requested,
+            )
+            .await?
+        {
+            PlannedPgcPlan::Playback(plan) => plan,
+            PlannedPgcPlan::Download(_) => unreachable!("playback planning returned download"),
+        };
+        let plan = BilibiliPlaybackPlan::from_core_with_preferences(plan, &preferences)?;
+        retain_exact_refresh_entry(plan, identity)
+    }
 }
 
 fn has_explicit_restricted_area_configuration(options: &CacheServerOptions) -> bool {
@@ -3865,6 +3915,65 @@ impl PlaybackExpectedIdentity {
 
         self.cid.is_some() || self.aid.is_some() || (self.bvid.is_some() && entry.bvid.is_some())
     }
+}
+
+fn canonical_refresh_input(
+    identity: &BilibiliContentIdentity,
+) -> Result<Input, BilibiliDownloadError> {
+    if !identity.is_refresh_complete() {
+        return Err(BilibiliDownloadError::Failed(
+            "Accepted Bilibili content identity is incomplete or invalid.".to_owned(),
+        ));
+    }
+
+    match identity.kind {
+        BilibiliContentKind::VideoPage | BilibiliContentKind::CollectionItem => identity
+            .bvid
+            .as_ref()
+            .map(|bvid| Input::Bvid(bvid.clone()))
+            .or_else(|| identity.aid.map(Input::Aid))
+            .ok_or_else(|| {
+                BilibiliDownloadError::Failed(
+                    "Accepted Bilibili video identity has no direct input.".to_owned(),
+                )
+            }),
+        BilibiliContentKind::SeasonEpisode => identity.epid.map(Input::Episode).ok_or_else(|| {
+            BilibiliDownloadError::Failed(
+                "Accepted Bilibili episode identity has no episode ID.".to_owned(),
+            )
+        }),
+    }
+}
+
+fn playback_entry_matches_frozen_identity(
+    identity: &BilibiliContentIdentity,
+    entry: &BilibiliPlaybackEntry,
+) -> bool {
+    identity.aid == Some(entry.aid)
+        && identity.bvid == entry.bvid
+        && identity.cid == Some(entry.cid)
+        && identity.epid == entry.epid
+}
+
+fn retain_exact_refresh_entry(
+    plan: BilibiliPlaybackPlan,
+    identity: &BilibiliContentIdentity,
+) -> Result<BilibiliPlaybackPlan, BilibiliDownloadError> {
+    let mut matches = plan
+        .entries
+        .into_iter()
+        .filter(|entry| playback_entry_matches_frozen_identity(identity, entry))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(BilibiliDownloadError::Failed(
+            "Refreshed Bilibili plan did not contain exactly one entry matching the accepted identity."
+                .to_owned(),
+        ));
+    }
+    Ok(BilibiliPlaybackPlan {
+        title: plan.title,
+        entries: vec![matches.remove(0)],
+    })
 }
 
 fn playback_selection_from_id(
@@ -11025,6 +11134,179 @@ mod tests {
         .expect("matching cid should select its actual video page");
 
         assert_eq!(selection, Selection::Page(2));
+    }
+
+    #[test]
+    fn refresh_input_uses_canonical_video_or_episode_identity() {
+        let video = BilibiliContentIdentity {
+            kind: BilibiliContentKind::CollectionItem,
+            aid: Some(170_001),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(270_001),
+            epid: None,
+        };
+        assert_eq!(
+            canonical_refresh_input(&video).expect("video identity should be valid"),
+            Input::Bvid("BV1xx411c7mD".to_owned())
+        );
+
+        let aid_only = BilibiliContentIdentity {
+            bvid: None,
+            ..video.clone()
+        };
+        assert_eq!(
+            canonical_refresh_input(&aid_only).expect("AID identity should be valid"),
+            Input::Aid(170_001)
+        );
+
+        let episode = BilibiliContentIdentity {
+            kind: BilibiliContentKind::SeasonEpisode,
+            aid: Some(170_001),
+            bvid: None,
+            cid: Some(270_001),
+            epid: Some(370_001),
+        };
+        assert_eq!(
+            canonical_refresh_input(&episode).expect("episode identity should be valid"),
+            Input::Episode(370_001)
+        );
+    }
+
+    #[test]
+    fn refresh_input_rejects_invalid_or_cross_kind_identity() {
+        let video_with_epid = BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(170_001),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(270_001),
+            epid: Some(370_001),
+        };
+        assert!(canonical_refresh_input(&video_with_epid).is_err());
+
+        let episode_without_aid = BilibiliContentIdentity {
+            kind: BilibiliContentKind::SeasonEpisode,
+            aid: None,
+            bvid: None,
+            cid: Some(270_001),
+            epid: Some(370_001),
+        };
+        assert!(canonical_refresh_input(&episode_without_aid).is_err());
+
+        let episode_without_cid = BilibiliContentIdentity {
+            cid: None,
+            ..episode_without_aid
+        };
+        assert!(canonical_refresh_input(&episode_without_cid).is_err());
+    }
+
+    #[test]
+    fn refresh_entry_requires_every_frozen_identity_field_and_option_state() {
+        let identity = BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(170_001),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(270_001),
+            epid: None,
+        };
+        let entry = BilibiliPlaybackEntry {
+            index: 2,
+            aid: 170_001,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: 270_001,
+            epid: None,
+            title: "Part 2".to_owned(),
+            content_id: "BV1xx411c7mD-cid270001".to_owned(),
+            duration_seconds: Some(90),
+            abr: BilibiliPlaybackAbrMetadata { groups: Vec::new() },
+            selected_variant: None,
+            variants: Vec::new(),
+        };
+        assert!(playback_entry_matches_frozen_identity(&identity, &entry));
+
+        let mut changed = identity.clone();
+        changed.aid = Some(170_002);
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+        changed.aid = None;
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+
+        let mut changed = identity.clone();
+        changed.bvid = Some("BV1different".to_owned());
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+        changed.bvid = None;
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+        let mut entry_without_bvid = entry.clone();
+        entry_without_bvid.bvid = None;
+        assert!(!playback_entry_matches_frozen_identity(
+            &identity,
+            &entry_without_bvid
+        ));
+
+        let mut changed = identity.clone();
+        changed.cid = Some(270_002);
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+        changed.cid = None;
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+
+        let mut changed = identity.clone();
+        changed.epid = Some(370_001);
+        assert!(!playback_entry_matches_frozen_identity(&changed, &entry));
+        let mut episode_entry = entry.clone();
+        episode_entry.epid = Some(370_001);
+        assert!(!playback_entry_matches_frozen_identity(
+            &identity,
+            &episode_entry
+        ));
+        let episode_identity = BilibiliContentIdentity {
+            kind: BilibiliContentKind::SeasonEpisode,
+            epid: Some(370_001),
+            ..identity
+        };
+        assert!(!playback_entry_matches_frozen_identity(
+            &episode_identity,
+            &entry
+        ));
+        assert!(playback_entry_matches_frozen_identity(
+            &episode_identity,
+            &episode_entry
+        ));
+    }
+
+    #[test]
+    fn refresh_plan_returns_one_exact_entry_and_rejects_ambiguous_matches() {
+        let identity = BilibiliContentIdentity {
+            kind: BilibiliContentKind::VideoPage,
+            aid: Some(170_001),
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: Some(270_001),
+            epid: None,
+        };
+        let entry = BilibiliPlaybackEntry {
+            index: 2,
+            aid: 170_001,
+            bvid: Some("BV1xx411c7mD".to_owned()),
+            cid: 270_001,
+            epid: None,
+            title: "Part 2".to_owned(),
+            content_id: "BV1xx411c7mD-cid270001".to_owned(),
+            duration_seconds: Some(90),
+            abr: BilibiliPlaybackAbrMetadata { groups: Vec::new() },
+            selected_variant: None,
+            variants: Vec::new(),
+        };
+        let plan = BilibiliPlaybackPlan {
+            title: "Fresh plan".to_owned(),
+            entries: vec![entry.clone()],
+        };
+        let retained = retain_exact_refresh_entry(plan, &identity)
+            .expect("one exact accepted entry should be retained");
+        assert_eq!(retained.title, "Fresh plan");
+        assert_eq!(retained.entries, vec![entry.clone()]);
+
+        let ambiguous = BilibiliPlaybackPlan {
+            title: "Ambiguous plan".to_owned(),
+            entries: vec![entry.clone(), entry],
+        };
+        assert!(retain_exact_refresh_entry(ambiguous, &identity).is_err());
     }
 
     #[test]
