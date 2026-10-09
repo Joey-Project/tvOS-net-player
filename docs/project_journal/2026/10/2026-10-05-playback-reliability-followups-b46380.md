@@ -3,7 +3,7 @@ id: 20261005-b46380
 title: Playback Reliability Follow-Ups
 status: active
 created: 2026-10-05
-updated: 2026-10-08
+updated: 2026-10-09
 branch: wip/credential-lifecycle
 pr:
 supersedes: []
@@ -21,7 +21,7 @@ superseded_by:
 ## Delivery Sequence
 1. **Sampling and playback regression:** retain the approved small-sample policy, validate all four canonical URLs, and exercise complete fill, same-root restart, cache-only playback, and macOS native decoding/control behavior on the updated implementation. Report HTTP reads and native-player evidence separately.
 2. **Signed-media URL refresh:** refresh the accepted content and representation without reselecting a mutable candidate list. Preserve verified extents and use explicit identity checks before resuming background fill. Extend BBDown core only if the exact pinned APIs cannot express the required contract.
-3. **Credential lifecycle:** add Mac-authorized Web-cookie renewal/replacement and a trusted origin/session-bound generic access-key login handoff. Reuse healthy saved credentials; do not let an unauthenticated LAN caller overwrite a working profile.
+3. **Credential lifecycle:** add server-owned Web-cookie renewal/replacement and an origin/session-bound generic access-key browser handoff. Clients only initiate login and display QR codes or links. Reuse healthy saved credentials and require a verified same-account identity before replacement; an Origin header alone is not callback authority.
 4. **Authenticated page-fetch regression:** rerun following/dynamic with valid saved Web credentials, classify upstream or account-state failures, and fix only demonstrated compatibility gaps.
 
 ## Delivery Gates
@@ -41,7 +41,8 @@ superseded_by:
 - The first slice shipped in [PR #71](https://github.com/Joey-Project/tvOS-net-player/pull/71), squash commit `c766c4951455d3169d6d632ed200fba5e8aea38d`. Exact-head GitHub Codex review, both required checks, actual simulator XCTest, and the complete conversation gate passed. The successor branch starts from updated `master`.
 - The first slice's corrected deterministic and extended live validation passed: 1,088 Rust tests, 343 Swift tests, four canonical URL smokes, and separate ordinary/episode 600-second foreground plus 300-second cache-only and native-control probes. The sampling journal records the earlier reproduced race and corrected frozen source.
 - The second slice adds accepted-identity signed-media refresh, single-flight foreground/background recovery, durable-session compare-and-replace, and restored playback/profile context. Replacement PR #73 merged on 2026-10-08 as squash commit `d8a13b4aa76daefec5d00542ec3912f0710d4582`; its current-head CI and required review gate succeeded, and the complete conversation gate had zero open conversations. Final historical-source validation passed 1,150 Rust tests, 343 Swift tests, one macOS XCTest, 30 native-probe tests, and macOS/tvOS builds. Simulator XCTest passed on compatible current-head CI; local simulator execution was unavailable. The four real URL smokes and separate ordinary/episode injected-expiration recovery with 600-second foreground, 300-second cache-only, and 120-second macOS native probes also passed. Details and exact receipts: [Same-Identity Signed Media Refresh](2026-10-06-signed-media-refresh-b46381.md).
-- Credential lifecycle and authenticated following/dynamic regression remain the ordered successor work; physical Apple TV and TLS remain deferred. The server-only login/renewal boundary and prerequisite core identity contract are recorded in [Server-Owned Credential Lifecycle](2026-10-08-server-credential-lifecycle-b46382.md).
+- The third slice implements server-owned credential readiness, automatic Web-cookie maintenance, same-account reauthorization, generic-key browser handoff, private account bindings, and hot reload for new default-profile playback. BBDown-rust PR #90 supplied the identity API; the consumer pins its exact merged revision. Final validation passed 1,187 Rust tests, 354 Swift tests, macOS XCTest and builds, four canonical URL smokes, and separate ordinary/Bangumi 600-second HLS plus 300-second offline and 120-second native-control probes. Local tvOS XCTest remains a compatible-runner CI requirement. Boundary, integrity remediation, and evidence: [Server-Owned Credential Lifecycle](2026-10-08-server-credential-lifecycle-b46382.md).
+- Authenticated following/dynamic live regression remains the ordered fourth slice; physical Apple TV and TLS remain deferred.
 - Existing sampling implementation and deterministic regression results: [Bounded CDN Cross-Sampling](2026-10-05-cdn-cross-sampling-b46379.md).
 - Previously validated restricted playback, complete fill, recovery, and native controls: [Bilibili Live Playback Validation](2026-10-02-bilibili-live-playback-b46377.md).
 - Private account/profile validation: [Bilibili Account Credential Validation](2026-10-02-bilibili-account-credentials-b46376.md).
