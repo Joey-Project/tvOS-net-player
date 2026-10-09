@@ -1069,7 +1069,7 @@ extension CacheHealthStatus {
 }
 
 extension BilibiliCredentialStatus {
-    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliCredentialStatus) {
+    init(_ proto: TvosNetPlayer_V1_BilibiliCredentialStatus) {
         self.init(
             state: String(describing: proto.state),
             message: proto.message,
@@ -1085,7 +1085,9 @@ extension BilibiliCredentialStatus {
             activeProfileID: proto.activeProfileID,
             defaultProfileID: proto.defaultProfileID,
             profileCount: proto.profileCount,
-            profiles: proto.profiles.map(BilibiliCredentialProfile.init)
+            profiles: proto.profiles.map(BilibiliCredentialProfile.init),
+            webCookieReadiness: BilibiliCredentialReadiness(proto.webCookieReadiness),
+            accessKeyReadiness: BilibiliCredentialReadiness(proto.accessKeyReadiness)
         )
     }
 }
@@ -1115,11 +1117,11 @@ extension BilibiliCredentialProfilesSummary {
 }
 
 extension BilibiliLoginSession {
-    fileprivate init(_ proto: TvosNetPlayer_V1_BilibiliLoginSession) {
+    init(_ proto: TvosNetPlayer_V1_BilibiliLoginSession) {
         self.init(
             id: proto.id,
             profileID: proto.profileID,
-            method: String(describing: proto.method),
+            method: Self.methodName(proto.method),
             state: String(describing: proto.state),
             message: proto.message,
             verificationURI: proto.verificationUri,
@@ -1127,13 +1129,47 @@ extension BilibiliLoginSession {
             expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil
         )
     }
+
+    private static func methodName(_ method: TvosNetPlayer_V1_BilibiliLoginMethod) -> String {
+        switch method {
+        case .webQr:
+            BilibiliLoginMethod.webQR.rawValue
+        case .accessKeyBrowser:
+            BilibiliLoginMethod.accessKeyBrowser.rawValue
+        case .unspecified, .UNRECOGNIZED(_):
+            "unspecified"
+        }
+    }
 }
 
 extension TvosNetPlayer_V1_BilibiliLoginMethod {
-    fileprivate init(_ method: BilibiliLoginMethod) {
+    init(_ method: BilibiliLoginMethod) {
         switch method {
         case .webQR:
             self = .webQr
+        case .accessKeyBrowser:
+            self = .accessKeyBrowser
+        }
+    }
+}
+
+extension BilibiliCredentialReadiness {
+    init(_ readiness: TvosNetPlayer_V1_BilibiliCredentialReadiness) {
+        switch readiness {
+        case .unspecified:
+            self = .unspecified
+        case .missing:
+            self = .missing
+        case .checking:
+            self = .checking
+        case .ready:
+            self = .ready
+        case .loginRequired:
+            self = .loginRequired
+        case .unavailable:
+            self = .unavailable
+        case .UNRECOGNIZED(_):
+            self = .unspecified
         }
     }
 }

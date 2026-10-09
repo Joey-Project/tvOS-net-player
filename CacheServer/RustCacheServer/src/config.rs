@@ -265,6 +265,23 @@ impl CacheServerOptions {
         listen_addrs(&self.media_listen_url)
     }
 
+    pub(crate) fn bilibili_login_base_uri(&self) -> Option<String> {
+        let candidate = self
+            .public_media_base_uri
+            .as_deref()
+            .unwrap_or(&self.media_listen_url);
+        validate_public_media_base_uri(candidate).ok()?;
+        let url = Url::parse(candidate).ok()?;
+        if self.public_media_base_uri.is_none() && url.scheme() != "http" {
+            return None;
+        }
+        match url.host()? {
+            url::Host::Ipv4(address) if address.is_unspecified() => None,
+            url::Host::Ipv6(address) if address.is_unspecified() => None,
+            _ => Some(url.as_str().trim_end_matches('/').to_owned()),
+        }
+    }
+
     pub fn task_state_path(&self) -> PathBuf {
         self.task_state_path.clone()
     }
@@ -844,6 +861,64 @@ mod tests {
         };
 
         options.validate().expect("public base URI should be valid");
+    }
+
+    #[test]
+    fn login_origin_uses_server_configuration_and_preserves_proxy_prefix() {
+        let options = CacheServerOptions {
+            media_listen_url: "http://0.0.0.0:8080".to_owned(),
+            public_media_base_uri: Some("https://ATRI.ink/cache/".to_owned()),
+            ..CacheServerOptions::default()
+        };
+
+        assert_eq!(
+            Some("https://atri.ink/cache".to_owned()),
+            options.bilibili_login_base_uri()
+        );
+    }
+
+    #[test]
+    fn login_origin_rejects_wildcard_and_invalid_configuration() {
+        for uri in [
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "ftp://cache.example.test",
+            "https://user@cache.example.test",
+            "https://cache.example.test?query=1",
+            "https://cache.example.test#fragment",
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(uri.to_owned()),
+                ..CacheServerOptions::default()
+            };
+            assert_eq!(None, options.bilibili_login_base_uri(), "{uri}");
+        }
+        for uri in [
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "https://localhost:8080",
+        ] {
+            let options = CacheServerOptions {
+                media_listen_url: uri.to_owned(),
+                ..CacheServerOptions::default()
+            };
+            assert_eq!(None, options.bilibili_login_base_uri(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn login_origin_accepts_explicit_plain_http_listener_hosts() {
+        for uri in [
+            "http://localhost:8080",
+            "http://192.168.1.5:8080",
+            "http://[::1]:8080",
+        ] {
+            let options = CacheServerOptions {
+                media_listen_url: uri.to_owned(),
+                ..CacheServerOptions::default()
+            };
+            assert_eq!(Some(uri.to_owned()), options.bilibili_login_base_uri());
+        }
     }
 
     #[test]

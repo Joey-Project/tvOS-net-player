@@ -45,11 +45,11 @@ use crate::{
     config::{BbdownRestrictedArea, CacheServerOptions},
     generated::tvos_net_player::v1::{
         BilibiliApiMode, BilibiliContentIdentity as ProtoBilibiliContentIdentity,
-        BilibiliContentKind, BilibiliCredentialProfile, BilibiliCredentialState,
-        BilibiliCredentialStatus, BilibiliDanmakuFormat, BilibiliDownloadMode,
-        BilibiliDownloadOptions, BilibiliDownloadSpec, BilibiliLoginMethod, BilibiliLoginSession,
-        BilibiliPlaybackOptions, BilibiliPlaybackSession, BilibiliPlaybackSpec,
-        BilibiliPlaybackVariant, BilibiliRequestContext,
+        BilibiliContentKind, BilibiliCredentialProfile, BilibiliCredentialReadiness,
+        BilibiliCredentialState, BilibiliCredentialStatus, BilibiliDanmakuFormat,
+        BilibiliDownloadMode, BilibiliDownloadOptions, BilibiliDownloadSpec, BilibiliLoginMethod,
+        BilibiliLoginSession, BilibiliPlaybackOptions, BilibiliPlaybackSession,
+        BilibiliPlaybackSpec, BilibiliPlaybackVariant, BilibiliRequestContext,
         BilibiliResolutionCandidate as ProtoBilibiliResolutionCandidate, BilibiliResolutionPage,
         BilibiliResolutionSession, BilibiliResolveResult,
         BilibiliResolvedCandidate as ProtoBilibiliResolvedCandidate, BilibiliSubtitleAiPolicy,
@@ -220,6 +220,12 @@ impl ServerService for ServerGrpcService {
             // The verification URI can itself carry a short-lived QR bearer.
             info.capabilities
                 .push(ServerCapability::BilibiliLoginSessions.into());
+            info.capabilities
+                .push(ServerCapability::BilibiliCredentialReadiness.into());
+            if self.state.options.bilibili_login_base_uri().is_some() {
+                info.capabilities
+                    .push(ServerCapability::BilibiliAccessKeyLogin.into());
+            }
         }
 
         if self.state.tasks.persistence_available() {
@@ -333,6 +339,7 @@ impl ServerService for ServerGrpcService {
     ) -> Result<Response<BilibiliCredentialStatus>, Status> {
         Ok(Response::new(bilibili_credential_status(
             &self.state.options,
+            &self.login_manager,
         )))
     }
 
@@ -357,23 +364,30 @@ impl ServerService for ServerGrpcService {
             method => method,
         };
         let profile_id = normalize_login_profile_id(&request.profile_id, &self.state.options)?;
-        if method != BilibiliLoginMethod::WebQr {
-            return Err(Status::invalid_argument(
-                "Only Bilibili Web QR login is supported.",
-            ));
-        }
         if !bilibili_login_sessions_enabled(&self.state.options) {
             return Err(Status::failed_precondition(
                 "Enable Cache:AllowBilibiliLoginSessions and set Cache:BBDownCredentialPath to writable server-side storage.",
             ));
         }
-        let session = self
-            .login_manager
-            .start(
-                profile_id,
-                self.state.options.bbdown_credential_path.clone(),
-            )
-            .await?;
+        let path = self.state.options.bbdown_credential_path.clone();
+        let session = match method {
+            BilibiliLoginMethod::WebQr => self.login_manager.start(profile_id, path).await?,
+            BilibiliLoginMethod::AccessKeyBrowser => {
+                let base = self.state.options.bilibili_login_base_uri().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "Configure a trusted public media URL or explicit HTTP listener host for access-key login.",
+                    )
+                })?;
+                self.login_manager
+                    .start_access_key(profile_id, path, &base)
+                    .await?
+            }
+            BilibiliLoginMethod::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "Unsupported Bilibili login method.",
+                ));
+            }
+        };
         Ok(Response::new(session))
     }
 
@@ -394,6 +408,7 @@ impl ServerService for ServerGrpcService {
 
 fn bilibili_credential_status(
     options: &crate::config::CacheServerOptions,
+    login_manager: &BilibiliLoginManager,
 ) -> BilibiliCredentialStatus {
     let restricted_area_configured = options.bbdown_restricted_area.is_some()
         || !options.bbdown_restricted_area_proxies.is_empty()
@@ -422,10 +437,14 @@ fn bilibili_credential_status(
         default_profile_id: String::new(),
         profile_count: 0,
         profiles: Vec::new(),
+        web_cookie_readiness: BilibiliCredentialReadiness::Unspecified.into(),
+        access_key_readiness: BilibiliCredentialReadiness::Unspecified.into(),
     };
 
     let Some(path) = options.bbdown_credential_path.as_ref() else {
         let mut status = base_status();
+        status.web_cookie_readiness = BilibiliCredentialReadiness::Missing.into();
+        status.access_key_readiness = BilibiliCredentialReadiness::Missing.into();
         if restricted_area_configured {
             status.state = BilibiliCredentialState::Degraded.into();
             status.message =
@@ -438,10 +457,36 @@ fn bilibili_credential_status(
         return status;
     };
 
+    match path.try_exists() {
+        Ok(false) => {
+            let mut status = base_status();
+            status.state = BilibiliCredentialState::NotConfigured.into();
+            status.message = "BBDown credential storage has not been initialized.".to_owned();
+            status.active_profile_id = options
+                .bbdown_credential_profile
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CREDENTIAL_PROFILE.to_owned());
+            status.default_profile_id = DEFAULT_CREDENTIAL_PROFILE.to_owned();
+            status.web_cookie_readiness = BilibiliCredentialReadiness::Missing.into();
+            status.access_key_readiness = BilibiliCredentialReadiness::Missing.into();
+            return status;
+        }
+        Err(_) => {
+            let mut status = base_status();
+            status.state = BilibiliCredentialState::Error.into();
+            status.message = "Failed to load BBDown credential file.".to_owned();
+            status.web_cookie_readiness = BilibiliCredentialReadiness::Unavailable.into();
+            status.access_key_readiness = BilibiliCredentialReadiness::Unavailable.into();
+            return status;
+        }
+        Ok(true) => {}
+    }
     if !path.is_file() {
         let mut status = base_status();
         status.state = BilibiliCredentialState::Error.into();
         status.message = "Failed to load BBDown credential file.".to_owned();
+        status.web_cookie_readiness = BilibiliCredentialReadiness::Unavailable.into();
+        status.access_key_readiness = BilibiliCredentialReadiness::Unavailable.into();
         return status;
     }
 
@@ -462,6 +507,8 @@ fn bilibili_credential_status(
                 status.active_profile_id = active_profile_id;
                 status.state = BilibiliCredentialState::Error.into();
                 status.message = "Configured BBDown credential profile was not found.".to_owned();
+                status.web_cookie_readiness = BilibiliCredentialReadiness::Unavailable.into();
+                status.access_key_readiness = BilibiliCredentialReadiness::Unavailable.into();
                 return status;
             }
             let credentials = profiles
@@ -469,6 +516,10 @@ fn bilibili_credential_status(
                 .unwrap_or_else(|_| Credentials::default());
             let profile_summaries = credential_profile_summaries(&profiles, &active_profile_id);
             let mut status = base_status();
+            let readiness = login_manager.readiness(&active_profile_id, &credentials);
+            status.web_cookie_readiness = credential_readiness_to_proto(readiness.web).into();
+            status.access_key_readiness =
+                credential_readiness_to_proto(readiness.access_key).into();
             status.credential_file_loaded = true;
             status.default_profile_id = profiles.default_profile;
             status.active_profile_id = active_profile_id;
@@ -503,8 +554,24 @@ fn bilibili_credential_status(
             let mut status = base_status();
             status.state = BilibiliCredentialState::Error.into();
             status.message = "Failed to load BBDown credential file.".to_owned();
+            status.web_cookie_readiness = BilibiliCredentialReadiness::Unavailable.into();
+            status.access_key_readiness = BilibiliCredentialReadiness::Unavailable.into();
             status
         }
+    }
+}
+
+fn credential_readiness_to_proto(
+    readiness: crate::bilibili_credentials::CredentialReadiness,
+) -> BilibiliCredentialReadiness {
+    use crate::bilibili_credentials::CredentialReadiness;
+    match readiness {
+        CredentialReadiness::Unknown => BilibiliCredentialReadiness::Unspecified,
+        CredentialReadiness::Missing => BilibiliCredentialReadiness::Missing,
+        CredentialReadiness::Checking => BilibiliCredentialReadiness::Checking,
+        CredentialReadiness::Ready => BilibiliCredentialReadiness::Ready,
+        CredentialReadiness::LoginRequired => BilibiliCredentialReadiness::LoginRequired,
+        CredentialReadiness::Unavailable => BilibiliCredentialReadiness::Unavailable,
     }
 }
 
@@ -8558,7 +8625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_bilibili_credential_status_reports_runtime_load_error_without_path() {
+    async fn get_bilibili_credential_status_distinguishes_first_boot_from_load_failure() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let root_path = temp
             .path()
@@ -8582,14 +8649,113 @@ mod tests {
             .expect("credential status should succeed")
             .into_inner();
 
-        assert_eq!(BilibiliCredentialState::Error, status.state());
+        assert_eq!(BilibiliCredentialState::NotConfigured, status.state());
         assert!(status.credential_path_configured);
         assert!(!status.credential_file_loaded);
+        assert_eq!(DEFAULT_CREDENTIAL_PROFILE, status.active_profile_id);
+        assert_eq!(
+            BilibiliCredentialReadiness::Missing,
+            status.web_cookie_readiness()
+        );
+        assert_eq!(
+            BilibiliCredentialReadiness::Missing,
+            status.access_key_readiness()
+        );
         assert!(
             !status
                 .message
                 .contains(credentials_path.to_string_lossy().as_ref())
         );
+    }
+
+    #[tokio::test]
+    async fn get_bilibili_credential_status_keeps_corrupt_and_non_file_storage_unavailable() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for (name, directory) in [("corrupt.json", false), ("directory.json", true)] {
+            let path = temp.path().join(name);
+            fs::write(&path, b"{}").expect("valid initial credential storage");
+            let service = ServerGrpcService::new(AppState::new(CacheServerOptions {
+                root_path: temp.path().to_path_buf(),
+                task_state_path: temp.path().join(format!("{name}-tasks.json")),
+                bbdown_credential_path: Some(path.clone()),
+                allow_bilibili_login_sessions: true,
+                ..CacheServerOptions::default()
+            }));
+            // Startup rejects invalid storage; exercise failures introduced after startup.
+            if directory {
+                fs::remove_file(&path).expect("remove initial credential file");
+                fs::create_dir(&path).expect("invalid credential directory");
+            } else {
+                fs::write(&path, b"not-json").expect("corrupt credential storage");
+            }
+            let status = service
+                .get_bilibili_credential_status(Request::new(GetBilibiliCredentialStatusRequest {}))
+                .await
+                .expect("redacted credential status")
+                .into_inner();
+            assert_eq!(BilibiliCredentialState::Error, status.state());
+            assert!(!status.credential_file_loaded);
+            assert_eq!(
+                BilibiliCredentialReadiness::Unavailable,
+                status.web_cookie_readiness()
+            );
+            assert_eq!(
+                BilibiliCredentialReadiness::Unavailable,
+                status.access_key_readiness()
+            );
+            assert!(!status.message.contains(path.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[tokio::test]
+    async fn access_key_login_capability_requires_a_configured_concrete_media_origin() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials_path = temp.path().join("credentials.json");
+        fs::write(&credentials_path, b"{}").expect("usable credential storage");
+        for (public_uri, media_uri, available) in [
+            (None, "http://0.0.0.0:8080", false),
+            (None, "http://[::]:8080", false),
+            (None, "http://127.0.0.1:8080", true),
+            (
+                Some("https://cache.example.test/prefix"),
+                "http://0.0.0.0:8080",
+                true,
+            ),
+        ] {
+            let service = ServerGrpcService::new(AppState::new(CacheServerOptions {
+                root_path: temp.path().to_path_buf(),
+                task_state_path: temp.path().join("tasks.json"),
+                bbdown_credential_path: Some(credentials_path.clone()),
+                allow_bilibili_login_sessions: true,
+                media_listen_url: media_uri.to_owned(),
+                public_media_base_uri: public_uri.map(str::to_owned),
+                ..CacheServerOptions::default()
+            }));
+            let info = service
+                .get_server_info(Request::new(GetServerInfoRequest {}))
+                .await
+                .expect("server info")
+                .into_inner();
+            assert!(
+                info.capabilities
+                    .contains(&(ServerCapability::BilibiliCredentialReadiness as i32))
+            );
+            assert_eq!(
+                available,
+                info.capabilities
+                    .contains(&(ServerCapability::BilibiliAccessKeyLogin as i32))
+            );
+            if !available {
+                let error = service
+                    .start_bilibili_login_session(Request::new(StartBilibiliLoginSessionRequest {
+                        profile_id: String::new(),
+                        method: BilibiliLoginMethod::AccessKeyBrowser.into(),
+                    }))
+                    .await
+                    .expect_err("wildcard login origin must be refused without provider contact");
+                assert_eq!(tonic::Code::FailedPrecondition, error.code());
+            }
+        }
     }
 
     #[tokio::test]

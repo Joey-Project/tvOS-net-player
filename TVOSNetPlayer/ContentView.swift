@@ -305,7 +305,28 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(bilibiliLoginModel.isStartingLogin)
-            } else if bilibiliLoginModel.verificationQRPayload != nil {
+            }
+
+            if bilibiliLoginModel.canStartAccessKeyLogin {
+                Button {
+                    Task { await bilibiliLoginModel.startAccessKeyLogin() }
+                } label: {
+                    Label("Sign In with Browser", systemImage: "key.horizontal")
+                }
+                .buttonStyle(.bordered)
+                .disabled(bilibiliLoginModel.isStartingLogin)
+            }
+
+            if bilibiliLoginModel.canCheckReadiness {
+                Button {
+                    Task { await bilibiliLoginModel.refreshReadiness() }
+                } label: {
+                    Label("Check Status", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if bilibiliLoginModel.verificationQRPayload != nil {
                 Button {
                     isLoginQRPresented = true
                 } label: {
@@ -330,6 +351,14 @@ struct ContentView: View {
                 BilibiliLoginQRCode(payload: payload)
                     .frame(width: 360, height: 360)
                     .accessibilityLabel("Bilibili Web login QR code")
+            }
+
+            if let link = bilibiliLoginModel.verificationLink {
+                Text(link)
+                    .font(.caption)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 760)
             }
 
             Button("Close") {

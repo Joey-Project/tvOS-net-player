@@ -77,6 +77,8 @@ enum ServerCapability {
   SERVER_CAPABILITY_BILIBILI_RESOLUTION_V2 = 14;
   SERVER_CAPABILITY_BILIBILI_EXECUTION_V2 = 15;
   SERVER_CAPABILITY_RESOLVER_SETTINGS_WRITE = 16;
+  SERVER_CAPABILITY_BILIBILI_ACCESS_KEY_LOGIN = 17;
+  SERVER_CAPABILITY_BILIBILI_CREDENTIAL_READINESS = 18;
 }
 
 message GetResolverSettingsRequest {}
@@ -142,6 +144,8 @@ message BilibiliCredentialStatus {
   string default_profile_id = 13;
   uint32 profile_count = 14;
   repeated BilibiliCredentialProfile profiles = 15;
+  BilibiliCredentialReadiness web_cookie_readiness = 16;
+  BilibiliCredentialReadiness access_key_readiness = 17;
 }
 
 message ListBilibiliCredentialProfilesRequest {}
@@ -185,6 +189,16 @@ message BilibiliLoginSession {
 enum BilibiliLoginMethod {
   BILIBILI_LOGIN_METHOD_UNSPECIFIED = 0;
   BILIBILI_LOGIN_METHOD_WEB_QR = 1;
+  BILIBILI_LOGIN_METHOD_ACCESS_KEY_BROWSER = 2;
+}
+
+enum BilibiliCredentialReadiness {
+  BILIBILI_CREDENTIAL_READINESS_UNSPECIFIED = 0;
+  BILIBILI_CREDENTIAL_READINESS_MISSING = 1;
+  BILIBILI_CREDENTIAL_READINESS_CHECKING = 2;
+  BILIBILI_CREDENTIAL_READINESS_READY = 3;
+  BILIBILI_CREDENTIAL_READINESS_LOGIN_REQUIRED = 4;
+  BILIBILI_CREDENTIAL_READINESS_UNAVAILABLE = 5;
 }
 
 enum BilibiliLoginSessionState {

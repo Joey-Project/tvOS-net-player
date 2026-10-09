@@ -1646,7 +1646,7 @@ impl BbdownBilibiliAdapter {
         options: Option<&BilibiliDownloadOptions>,
         request_context: Option<&BilibiliRequestContext>,
     ) -> Result<ClientConfig, BilibiliDownloadError> {
-        if request_context.is_none() {
+        if request_context.is_none() && self.options.bbdown_credential_path.is_none() {
             return Ok(if options.is_some_and(|options| options.prefer_tv_api) {
                 self.tv_client_config.clone()
             } else {
@@ -2752,7 +2752,11 @@ fn bbdown_client_config_for_request(
         })?
         .filter(|mode| *mode != BilibiliApiMode::Unspecified);
 
-    if request_context.is_none() && explicit_profile.is_none() && explicit_mode.is_none() {
+    if request_context.is_none()
+        && explicit_profile.is_none()
+        && explicit_mode.is_none()
+        && server_options.bbdown_credential_path.is_none()
+    {
         return Ok(None);
     }
 
@@ -10581,6 +10585,67 @@ mod tests {
         assert!(
             failed_sidecar.exists(),
             "mapping failures must leave cleanup to the bounded task-owned directory"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_default_requests_reload_credentials_after_server_owned_renewal() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials_path = temp.path().join("credentials.json");
+        let store = CredentialStore::new(credentials_path.clone());
+        // Synthetic token catalog ids: joey-private-v3/bearer-a and bearer-b.
+        let original_cookie = "codex_synth_v1_bearer_a";
+        let renewed_cookie = "JoeyPrivateV3BearerSlotB7Q9M3X5";
+        store
+            .save(&Credentials::default().with_cookie(original_cookie))
+            .expect("initial credentials");
+        let options = Arc::new(CacheServerOptions {
+            root_path: temp.path().to_path_buf(),
+            bbdown_credential_path: Some(credentials_path.clone()),
+            ..CacheServerOptions::default()
+        });
+        let adapter = BbdownBilibiliAdapter::new(
+            Arc::clone(&options),
+            Arc::new(LocalMediaLibrary::new(options)),
+        );
+        let original = adapter
+            .client_config_for_request(None, None)
+            .await
+            .expect("initial default request");
+        assert_eq!(
+            Some(original_cookie),
+            original.credentials.cookie.as_deref()
+        );
+        store
+            .save(&Credentials::default().with_cookie(renewed_cookie))
+            .expect("server-owned renewal");
+
+        for prefer_tv_api in [false, true] {
+            let mut options = bilibili_options_with_download_mode(BilibiliDownloadMode::All);
+            options.prefer_tv_api = prefer_tv_api;
+            let renewed = adapter
+                .client_config_for_request(Some(&options), None)
+                .await
+                .expect("renewed default request without restart");
+            assert_eq!(Some(renewed_cookie), renewed.credentials.cookie.as_deref());
+            assert_eq!(
+                if prefer_tv_api {
+                    PlayurlMode::Tv
+                } else {
+                    PlayurlMode::Web
+                },
+                renewed.playurl_mode
+            );
+        }
+        let anonymous = adapter
+            .client_config_for_request(None, Some(&BilibiliRequestContext::default()))
+            .await
+            .expect("frozen anonymous request");
+        assert_eq!(Credentials::default(), anonymous.credentials);
+        std_fs::write(credentials_path, b"invalid-json").expect("invalid replacement storage");
+        assert!(
+            adapter.client_config_for_request(None, None).await.is_err(),
+            "failed reload must not silently reuse stale credentials"
         );
     }
 
