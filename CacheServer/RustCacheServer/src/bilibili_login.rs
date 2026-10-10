@@ -2570,6 +2570,9 @@ fn parse_login_base_uri(value: &str) -> Result<(String, String), Status> {
             "A trusted Bilibili login origin is unavailable.",
         ));
     }
+    crate::config::validate_bilibili_login_base_path(value).map_err(|_| {
+        Status::failed_precondition("A trusted Bilibili login origin is unavailable.")
+    })?;
     let parsed = url::Url::parse(value).map_err(|_| {
         Status::failed_precondition("A trusted Bilibili login origin is unavailable.")
     })?;
@@ -2580,7 +2583,6 @@ fn parse_login_base_uri(value: &str) -> Result<(String, String), Status> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || matches!(host, "0.0.0.0" | "::")
-        || parsed.path().to_ascii_lowercase().contains("%2e")
     {
         return Err(Status::failed_precondition(
             "A trusted Bilibili login origin is unavailable.",
@@ -3746,14 +3748,73 @@ mod tests {
         manager: &BilibiliLoginManager,
         path: &Path,
     ) -> BilibiliLoginSession {
+        start_access_key_session_with_base(manager, path, "https://media.example/cache").await
+    }
+
+    async fn start_access_key_session_with_base(
+        manager: &BilibiliLoginManager,
+        path: &Path,
+        login_base_uri: &str,
+    ) -> BilibiliLoginSession {
         manager
             .start_access_key(
                 "default".to_owned(),
                 Some(path.to_path_buf()),
-                "https://media.example/cache",
+                login_base_uri,
             )
             .await
             .expect("access-key browser session starts")
+    }
+
+    #[tokio::test]
+    async fn encoded_embedded_dots_are_preserved_in_session_handoff() {
+        for (base, encoded_component) in [
+            ("https://media.example/cache%2Efolder", "cache%2Efolder"),
+            ("https://media.example/cache%2efolder", "cache%2efolder"),
+            ("https://media.example/cache%252Efolder", "cache%252Efolder"),
+        ] {
+            let (_temp, path) = temp_store();
+            seed_web_profile(&path, WEB_COOKIE_A, None);
+            let manager = manager(PollResult::Waiting);
+
+            let session = start_access_key_session_with_base(&manager, &path, base).await;
+            assert!(session.verification_uri.starts_with(&format!(
+                "https://media.example/{encoded_component}/login/bilibili/"
+            )));
+            let page = manager
+                .browser_page(&session.id, "https://media.example")
+                .expect("browser handoff accepts the issued origin");
+            assert!(page.contains("message_origin: event.origin"));
+        }
+    }
+
+    #[test]
+    fn login_base_path_validation_rejects_unsafe_encoded_components() {
+        for value in [
+            "https://media.example/./private",
+            "https://media.example/%2e/private",
+            "https://media.example/cache/%2E%2e/private",
+            "https://media.example/cache/%252e/private",
+            "https://media.example/cache/%252e%252e/private",
+            "https://media.example/cache%2Fprivate",
+            "https://media.example/cache%252Fprivate",
+            "https://media.example/cache%5cprivate",
+            "https://media.example/cache%255cprivate",
+            "https://media.example/cache%01/private",
+            "https://media.example/cache%2501/private",
+            "https://media.example/cache%E2%80%8E/private",
+            "https://media.example/cache%25E2%2580%258E/private",
+            "https://media.example/cache%GG/private",
+            "https://media.example/cache%2/private",
+        ] {
+            let error = parse_login_base_uri(value).expect_err("unsafe path is rejected");
+            assert_eq!(Code::FailedPrecondition, error.code(), "{value}");
+            assert_eq!(
+                "A trusted Bilibili login origin is unavailable.",
+                error.message(),
+                "{value}"
+            );
+        }
     }
 
     #[tokio::test]

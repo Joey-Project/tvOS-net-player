@@ -529,7 +529,7 @@ fn validate_public_media_base_uri(value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_bilibili_login_base_path(value: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_bilibili_login_base_path(value: &str) -> Result<(), ConfigError> {
     let invalid_path =
         || ConfigError::new("Public media base URI path is not compatible with Bilibili login.");
     if value.len() > MAX_BILIBILI_LOGIN_URI_BYTES
