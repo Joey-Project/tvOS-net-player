@@ -12,10 +12,15 @@ use sha2::{Digest, Sha256};
 use tonic::{Code, Status};
 use url::Url;
 
-use crate::{config::CacheServerOptions, media::MediaState};
+use crate::{
+    bilibili_login::MAX_BROWSER_MESSAGE_BYTES, config::CacheServerOptions, media::MediaState,
+};
 
 const MAX_LOGIN_PAGE_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_LOGIN_COMPLETION_BYTES: usize = 16 * 1024;
+// Covers fixed JSON keys, the 64-hex capability, provider origin, and structure with room to spare.
+const LOGIN_COMPLETION_ENVELOPE_ALLOWANCE_BYTES: usize = 1024;
+pub(crate) const MAX_LOGIN_COMPLETION_BYTES: usize =
+    6 * MAX_BROWSER_MESSAGE_BYTES + LOGIN_COMPLETION_ENVELOPE_ALLOWANCE_BYTES;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +371,61 @@ mod tests {
             oversized.headers()[header::X_CONTENT_TYPE_OPTIONS]
         );
 
+        let too_long_message = completion_body("x".repeat(MAX_BROWSER_MESSAGE_BYTES + 1));
+        let rejected_message = client
+            .post(&completion_url)
+            .header(header::ORIGIN, &origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(too_long_message)
+            .send()
+            .await
+            .expect("over-limit decoded message");
+        assert_eq!(StatusCode::BAD_REQUEST, rejected_message.status());
+        assert_eq!(
+            "no-store",
+            rejected_message.headers()[header::CACHE_CONTROL]
+        );
+        assert_eq!(
+            "no-referrer",
+            rejected_message.headers()[header::REFERRER_POLICY]
+        );
+        assert_eq!(
+            "nosniff",
+            rejected_message.headers()[header::X_CONTENT_TYPE_OPTIONS]
+        );
+
+        let mut escaped_message = String::with_capacity(MAX_BROWSER_MESSAGE_BYTES);
+        while escaped_message.len() + 3 <= MAX_BROWSER_MESSAGE_BYTES {
+            escaped_message.push_str("\"\\\u{1}");
+        }
+        escaped_message
+            .push_str(&"\u{1}".repeat(MAX_BROWSER_MESSAGE_BYTES - escaped_message.len()));
+        let exact_utf8_message = "é".repeat(MAX_BROWSER_MESSAGE_BYTES / "é".len());
+        for message in [
+            "x".repeat(MAX_BROWSER_MESSAGE_BYTES),
+            escaped_message,
+            exact_utf8_message,
+        ] {
+            let accepted_size = client
+                .post(&completion_url)
+                .header(header::ORIGIN, &origin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(completion_body(message))
+                .send()
+                .await
+                .expect("exact-limit decoded message");
+            assert_eq!(StatusCode::NOT_FOUND, accepted_size.status());
+            assert_eq!("no-store", accepted_size.headers()[header::CACHE_CONTROL]);
+            assert_eq!(
+                "no-referrer",
+                accepted_size.headers()[header::REFERRER_POLICY]
+            );
+            assert_eq!(
+                "nosniff",
+                accepted_size.headers()[header::X_CONTENT_TYPE_OPTIONS]
+            );
+        }
+
         let rejected = client
             .post(&completion_url)
             .header(header::ORIGIN, "https://untrusted.example.test")
@@ -375,6 +435,12 @@ mod tests {
             .await
             .expect("cross-origin request");
         assert_eq!(StatusCode::FORBIDDEN, rejected.status());
+        assert_eq!("no-store", rejected.headers()[header::CACHE_CONTROL]);
+        assert_eq!("no-referrer", rejected.headers()[header::REFERRER_POLICY]);
+        assert_eq!(
+            "nosniff",
+            rejected.headers()[header::X_CONTENT_TYPE_OPTIONS]
+        );
 
         let malformed = client
             .post(&completion_url)
@@ -400,6 +466,8 @@ mod tests {
             .expect("unknown session");
         assert_eq!(StatusCode::NOT_FOUND, unknown.status());
         assert_eq!("no-store", unknown.headers()[header::CACHE_CONTROL]);
+        assert_eq!("no-referrer", unknown.headers()[header::REFERRER_POLICY]);
+        assert_eq!("nosniff", unknown.headers()[header::X_CONTENT_TYPE_OPTIONS]);
         server.abort();
         assert!(
             server
@@ -407,5 +475,14 @@ mod tests {
                 .expect_err("server should be cancelled")
                 .is_cancelled()
         );
+    }
+
+    fn completion_body(message: String) -> String {
+        serde_json::json!({
+            "capability": "unused",
+            "message_origin": "https://www.biliplus.com",
+            "message": message,
+        })
+        .to_string()
     }
 }

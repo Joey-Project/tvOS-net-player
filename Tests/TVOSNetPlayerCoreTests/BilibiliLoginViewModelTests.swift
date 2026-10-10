@@ -101,6 +101,103 @@ final class BilibiliLoginViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testReadyAccessKeyAllowsOnlyMissingWebLogin() async {
+        let client = LoginClient(
+            serverInfo: .fixture(capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliLoginSessions,
+                CacheServerCapability.bilibiliAccessKeyLogin,
+                CacheServerCapability.bilibiliCredentialReadiness,
+            ]),
+            credentialStatus: .fixture(
+                webCookieReadiness: .missing,
+                accessKeyReadiness: .ready
+            )
+        )
+        let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+        await model.activate(serverAddressText: "mac-mini.local")
+
+        XCTAssertEqual(model.status, .authenticated)
+        XCTAssertTrue(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
+        XCTAssertEqual(
+            model.statusMessage,
+            "Bilibili access-key credentials are ready; Web login is available on the cache server."
+        )
+        await model.startLogin()
+
+        XCTAssertEqual(model.status, .sessionPending)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
+        let requestedMethod = await client.requestedMethod
+        XCTAssertEqual(requestedMethod, .webQR)
+        model.deactivate()
+    }
+
+    @MainActor
+    func testReadyWebLoginCanCompleteThenStartMissingAccessKeyHandoff() async {
+        let sessionID = "00000000-0000-4000-8000-000000000001"
+        let browserSession = BilibiliLoginSession(
+            id: sessionID,
+            profileID: "profile-1",
+            method: "accessKeyBrowser",
+            state: "pending",
+            message: "",
+            verificationURI:
+                "http://cache.local/media/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            createdAt: Date(),
+            expiresAt: Date().addingTimeInterval(30)
+        )
+        let client = LoginClient(
+            serverInfo: .fixture(
+                capabilities: [
+                    CacheServerCapability.bilibiliCredentialStatus,
+                    CacheServerCapability.bilibiliLoginSessions,
+                    CacheServerCapability.bilibiliAccessKeyLogin,
+                    CacheServerCapability.bilibiliCredentialReadiness,
+                ], mediaBaseURIs: ["http://cache.local/media"]),
+            credentialStatus: .fixture(
+                credentialFileLoaded: false,
+                state: "notConfigured",
+                webCookieReadiness: .loginRequired,
+                accessKeyReadiness: .missing
+            ),
+            credentialStatusAfterLogin: .fixture(
+                hasWebCookie: true,
+                webCookieReadiness: .ready,
+                accessKeyReadiness: .missing
+            ),
+            newSession: .fixture(state: "ready"),
+            subsequentSession: browserSession
+        )
+        let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+        await model.activate(serverAddressText: "cache.local")
+        XCTAssertTrue(model.canStartLogin)
+        await model.startLogin()
+
+        XCTAssertEqual(model.status, .authenticated)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertTrue(model.canStartAccessKeyLogin)
+        XCTAssertEqual(
+            model.statusMessage,
+            "Bilibili Web credentials are ready; access-key login is available on the cache server."
+        )
+        await model.startAccessKeyLogin()
+
+        XCTAssertEqual(model.status, .sessionPending)
+        XCTAssertEqual(model.verificationLink, browserSession.verificationURI)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
+        let loginStartCount = await client.loginStartCount
+        let requestedMethod = await client.requestedMethod
+        XCTAssertEqual(loginStartCount, 2)
+        XCTAssertEqual(requestedMethod, .accessKeyBrowser)
+        model.deactivate()
+    }
+
+    @MainActor
     func testReadyReadinessReusesCredentialWithoutTrustingPresenceOrLoadedFlags() async {
         let client = LoginClient(
             serverInfo: .fixture(capabilities: [
@@ -247,6 +344,45 @@ final class BilibiliLoginViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testAccessKeyLoginAcceptsEncodedSpaceAndUnicodePrefixes() async {
+        let sessionID = "00000000-0000-4000-8000-000000000001"
+        let prefixes = ["cache%20folder", "%E5%AA%92%E4%BD%93%E7%BC%93%E5%AD%98"]
+        for prefix in prefixes {
+            let baseURI = "https://cache.local/\(prefix)"
+            let verificationURI = "\(baseURI)/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))"
+            let session = BilibiliLoginSession(
+                id: sessionID,
+                profileID: "profile-1",
+                method: "accessKeyBrowser",
+                state: "pending",
+                message: "",
+                verificationURI: verificationURI,
+                createdAt: Date(),
+                expiresAt: Date().addingTimeInterval(30)
+            )
+            let client = LoginClient(
+                serverInfo: .fixture(
+                    capabilities: [
+                        CacheServerCapability.bilibiliCredentialStatus,
+                        CacheServerCapability.bilibiliLoginSessions,
+                        CacheServerCapability.bilibiliAccessKeyLogin,
+                        CacheServerCapability.bilibiliCredentialReadiness,
+                    ], mediaBaseURIs: [baseURI]),
+                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                newSession: session
+            )
+            let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+            await model.activate(serverAddressText: "cache.local")
+            await model.startAccessKeyLogin()
+
+            XCTAssertEqual(model.status, .sessionPending)
+            XCTAssertEqual(model.verificationLink, verificationURI)
+            model.deactivate()
+        }
+    }
+
+    @MainActor
     func testAccessKeyLoginRejectsForeignMalformedAndStaleLinks() async {
         let sessionID = "00000000-0000-4000-8000-000000000002"
         let links = [
@@ -260,6 +396,14 @@ final class BilibiliLoginViewModelTests: XCTestCase {
             "http://cache.local/media/login/bilibili/\(sessionID)#\(String(repeating: "g", count: 64))",
             "http://cache.local/media/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 63))",
             "http://cache.local/media/login/bilibili/\(sessionID)?next=/login#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%2Fextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%5Cextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media/%2e%2e/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%0Aextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%252Fextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%255Cextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media/%252e%252e/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+            "http://cache.local/media%250Aextra/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
             "http://cache.local:8080/media/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
             "http://cache.local/media/login/bilibili/00000000-0000-4000-8000-000000000003#capability=x",
         ]
@@ -295,6 +439,53 @@ final class BilibiliLoginViewModelTests: XCTestCase {
             XCTAssertNil(model.verificationLink)
             XCTAssertNil(model.verificationQRPayload)
             XCTAssertFalse(model.statusMessage.contains("capability"))
+            model.deactivate()
+        }
+    }
+
+    @MainActor
+    func testAccessKeyLoginRejectsUnsafeAdvertisedPathEncodings() async {
+        let sessionID = "00000000-0000-4000-8000-000000000002"
+        let unsafeBasePaths = [
+            "media%2Fextra",
+            "media%5Cextra",
+            "media/%2e%2e/extra",
+            "media%0Aextra",
+            "media%252Fextra",
+            "media%255Cextra",
+            "media/%252e%252e/extra",
+            "media%250Aextra",
+        ]
+        for basePath in unsafeBasePaths {
+            let baseURI = "http://cache.local/\(basePath)"
+            let session = BilibiliLoginSession(
+                id: sessionID,
+                profileID: "profile-1",
+                method: "accessKeyBrowser",
+                state: "pending",
+                message: "",
+                verificationURI: "\(baseURI)/login/bilibili/\(sessionID)#\(String(repeating: "a", count: 64))",
+                createdAt: Date(),
+                expiresAt: Date().addingTimeInterval(30)
+            )
+            let client = LoginClient(
+                serverInfo: .fixture(
+                    capabilities: [
+                        CacheServerCapability.bilibiliCredentialStatus,
+                        CacheServerCapability.bilibiliLoginSessions,
+                        CacheServerCapability.bilibiliAccessKeyLogin,
+                        CacheServerCapability.bilibiliCredentialReadiness,
+                    ], mediaBaseURIs: [baseURI]),
+                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                newSession: session
+            )
+            let model = BilibiliLoginViewModel(clientFactory: { _ in client })
+
+            await model.activate(serverAddressText: "cache.local")
+            await model.startAccessKeyLogin()
+
+            XCTAssertEqual(model.status, .failed)
+            XCTAssertNil(model.verificationLink)
             model.deactivate()
         }
     }
@@ -355,6 +546,8 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 
         XCTAssertEqual(model.status, .sessionPending)
         XCTAssertEqual(model.verificationQRPayload, session.verificationURI)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
         XCTAssertFalse(model.statusMessage.contains("private message"))
         XCTAssertFalse(model.statusMessage.contains("token="))
         model.deactivate()
@@ -551,7 +744,13 @@ final class BilibiliLoginViewModelTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(2))
         }
         XCTAssertTrue(model.isStartingLogin)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
 
+        await model.activate(serverAddressText: "")
+        XCTAssertEqual(model.status, .disconnected)
+        XCTAssertFalse(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
         await model.activate(serverAddressText: "second.local")
         XCTAssertEqual(model.status, .loginRequired)
         XCTAssertFalse(model.isStartingLogin)
@@ -602,6 +801,7 @@ private actor LoginClient: CacheControlClient {
     let credentialStatusAfterLogin: BilibiliCredentialStatus?
     let credentialStatusFails: Bool
     let newSession: BilibiliLoginSession
+    let subsequentSession: BilibiliLoginSession?
     let polledSession: BilibiliLoginSession?
     let startDelay: Duration
     private(set) var credentialStatusCallCount = 0
@@ -616,6 +816,7 @@ private actor LoginClient: CacheControlClient {
         credentialStatusAfterLogin: BilibiliCredentialStatus? = nil,
         credentialStatusFails: Bool = false,
         newSession: BilibiliLoginSession = .fixture(state: "pending"),
+        subsequentSession: BilibiliLoginSession? = nil,
         polledSession: BilibiliLoginSession? = nil,
         startDelay: Duration = .zero
     ) {
@@ -624,6 +825,7 @@ private actor LoginClient: CacheControlClient {
         self.credentialStatusAfterLogin = credentialStatusAfterLogin
         self.credentialStatusFails = credentialStatusFails
         self.newSession = newSession
+        self.subsequentSession = subsequentSession
         self.polledSession = polledSession
         self.startDelay = startDelay
     }
@@ -647,13 +849,14 @@ private actor LoginClient: CacheControlClient {
         profileID: String,
         method: BilibiliLoginMethod
     ) async throws -> BilibiliLoginSession {
+        let session = loginStartCount == 0 ? newSession : subsequentSession ?? newSession
         loginStartCount += 1
         requestedProfileID = profileID
         requestedMethod = method
         if startDelay > .zero {
             try await Task.sleep(for: startDelay)
         }
-        return newSession
+        return session
     }
 
     func getBilibiliLoginSession(id: String) async throws -> BilibiliLoginSession {

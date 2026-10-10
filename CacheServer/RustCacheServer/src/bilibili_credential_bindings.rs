@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{Read, Write},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,8 @@ use sha2::{Digest, Sha256};
 
 const BINDINGS_VERSION: u32 = 1;
 const MAX_BINDINGS_FILE_BYTES: usize = 256 * 1024;
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct VerifiedWebBinding {
@@ -33,6 +37,64 @@ pub(crate) enum BindingLookup {
 pub(crate) enum BindingError {
     Unavailable,
     Changed,
+}
+
+// Preserves complete binding content across cooperating writers, not against same-UID writers
+// that ignore or replace the persistent lock file.
+struct BindingLock {
+    _file: File,
+}
+
+impl BindingLock {
+    fn acquire(binding_path: &Path) -> Result<Self, BindingError> {
+        let lock_path = lock_path(binding_path);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .mode(0o600);
+        }
+        let lock_file = options
+            .open(lock_path)
+            .map_err(|_| BindingError::Unavailable)?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|_| BindingError::Unavailable)?;
+        if !metadata.is_file() {
+            return Err(BindingError::Unavailable);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o600 != 0o600
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(BindingError::Unavailable);
+            }
+        }
+
+        let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(BindingError::Unavailable);
+            }
+            match lock_file.try_lock() {
+                Ok(()) => return Ok(Self { _file: lock_file }),
+                Err(TryLockError::WouldBlock) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(BindingError::Unavailable);
+                    }
+                    thread::sleep(LOCK_RETRY_INTERVAL.min(deadline.duration_since(now)));
+                }
+                Err(TryLockError::Error(_)) => return Err(BindingError::Unavailable),
+            }
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -77,6 +139,7 @@ pub(crate) fn replace(
     expected: Option<&VerifiedWebBinding>,
 ) -> Result<VerifiedWebBinding, BindingError> {
     let path = binding_path(credential_path);
+    let _lock = BindingLock::acquire(&path)?;
     let mut file = read_file(&path)?;
     if file.profiles.get(profile_id) != expected {
         return Err(BindingError::Changed);
@@ -98,6 +161,12 @@ fn binding_path(credential_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn lock_path(binding_path: &Path) -> PathBuf {
+    let mut path = binding_path.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
 fn fingerprint(cookie: &str) -> String {
     let digest = Sha256::digest(cookie.as_bytes());
     let mut output = String::with_capacity(digest.len() * 2);
@@ -114,7 +183,7 @@ fn read_file(path: &Path) -> Result<BindingFile, BindingError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut input = match options.open(path) {
         Ok(input) => input,
@@ -186,13 +255,47 @@ fn write_file(path: &Path, file: &BindingFile) -> Result<(), BindingError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::Path,
+        process::{Child, Command, Output, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
     // Credential fixture IDs from joey-private-v3: bearer-a and bearer-b.
     const WEB_COOKIE_A: &str = "codex_synth_v1_bearer_a";
     const WEB_COOKIE_B: &str = "JoeyPrivateV3BearerSlotB7Q9M3X5";
+    const CHILD_CREDENTIAL_PATH: &str = "BINDINGS_TEST_CREDENTIAL_PATH";
+    const CHILD_PROFILE_ID: &str = "BINDINGS_TEST_PROFILE_ID";
+    const CHILD_COOKIE_ID: &str = "BINDINGS_TEST_COOKIE_ID";
+    const CHILD_ACCOUNT_ID: &str = "BINDINGS_TEST_ACCOUNT_ID";
+    const CHILD_START_PATH: &str = "BINDINGS_TEST_START_PATH";
+    const CHILD_READY_PATH: &str = "BINDINGS_TEST_READY_PATH";
+    const CHILD_EXPECTED_RESULT: &str = "BINDINGS_TEST_EXPECTED_RESULT";
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+    const FIFO_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct TestChild {
+        child: Option<Child>,
+    }
+
+    impl TestChild {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+    }
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     fn credential_path(temp: &tempfile::TempDir) -> PathBuf {
         temp.path().join("credentials.json")
@@ -238,6 +341,222 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_a_stale_same_profile_compare_and_swap() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = credential_path(&temp);
+        replace(&path, "default", WEB_COOKIE_A, 31001, None).expect("write initial binding");
+        let stale = lookup_profile(&path, "default")
+            .expect("read initial binding")
+            .expect("initial binding exists");
+        replace(&path, "default", WEB_COOKIE_B, 31002, Some(&stale))
+            .expect("replace with current binding");
+
+        assert!(matches!(
+            replace(&path, "default", WEB_COOKIE_A, 31003, Some(&stale)),
+            Err(BindingError::Changed)
+        ));
+        assert!(matches!(
+            lookup_profile(&path, "default").expect("read final binding"),
+            Some(binding) if binding.account_id() == 31002
+        ));
+    }
+
+    #[test]
+    fn process_replace_helper() {
+        let Some(path) = std::env::var_os(CHILD_CREDENTIAL_PATH) else {
+            return;
+        };
+        let profile_id = std::env::var(CHILD_PROFILE_ID).expect("child profile ID");
+        let cookie = match std::env::var(CHILD_COOKIE_ID).as_deref() {
+            Ok("a") => WEB_COOKIE_A,
+            Ok("b") => WEB_COOKIE_B,
+            _ => panic!("unknown child cookie ID"),
+        };
+        let account_id = std::env::var(CHILD_ACCOUNT_ID)
+            .expect("child account ID")
+            .parse::<u64>()
+            .expect("numeric child account ID");
+        let start_path =
+            PathBuf::from(std::env::var_os(CHILD_START_PATH).expect("child start path"));
+        let ready_path =
+            PathBuf::from(std::env::var_os(CHILD_READY_PATH).expect("child ready path"));
+        fs::write(&ready_path, b"ready").expect("signal child ready");
+
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        while !start_path.exists() {
+            assert!(Instant::now() < deadline, "child start gate timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let result = replace(Path::new(&path), &profile_id, cookie, account_id, None);
+        match std::env::var(CHILD_EXPECTED_RESULT)
+            .expect("child expected result")
+            .as_str()
+        {
+            "ok" => assert!(result.is_ok(), "child replacement failed"),
+            "unavailable" => assert!(
+                matches!(result, Err(BindingError::Unavailable)),
+                "child did not report lock contention as unavailable"
+            ),
+            _ => panic!("unknown expected child result"),
+        }
+    }
+
+    #[test]
+    fn process_fifo_lookup_helper() {
+        let Some(path) = std::env::var_os(CHILD_CREDENTIAL_PATH) else {
+            return;
+        };
+        assert!(matches!(
+            lookup(Path::new(&path), "default", WEB_COOKIE_A),
+            Err(BindingError::Unavailable)
+        ));
+    }
+
+    fn spawn_replace_process(
+        temp: &tempfile::TempDir,
+        start_path: &Path,
+        profile_id: &str,
+        cookie_id: &str,
+        account_id: u64,
+        expected_result: &str,
+    ) -> (TestChild, PathBuf) {
+        let ready_path = temp.path().join(format!("{profile_id}.ready"));
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "bilibili_credential_bindings::tests::process_replace_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_CREDENTIAL_PATH, credential_path(temp))
+            .env(CHILD_PROFILE_ID, profile_id)
+            .env(CHILD_COOKIE_ID, cookie_id)
+            .env(CHILD_ACCOUNT_ID, account_id.to_string())
+            .env(CHILD_START_PATH, start_path)
+            .env(CHILD_READY_PATH, &ready_path)
+            .env(CHILD_EXPECTED_RESULT, expected_result)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn binding writer process");
+        (TestChild::new(child), ready_path)
+    }
+
+    #[cfg(unix)]
+    fn spawn_fifo_lookup_process(credentials: &Path) -> TestChild {
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "bilibili_credential_bindings::tests::process_fifo_lookup_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_CREDENTIAL_PATH, credentials)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn FIFO lookup process");
+        TestChild::new(child)
+    }
+
+    fn release_processes(start_path: &Path, ready_paths: &[PathBuf]) {
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        while !ready_paths.iter().all(|path| path.exists()) {
+            assert!(Instant::now() < deadline, "child readiness timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(start_path, b"go").expect("release child start gate");
+    }
+
+    fn finish_process(mut child: TestChild, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = child
+                .child
+                .as_mut()
+                .expect("owned child process")
+                .try_wait();
+            match status {
+                Ok(Some(_)) => {
+                    return child
+                        .child
+                        .take()
+                        .expect("owned child process")
+                        .wait_with_output()
+                        .expect("collect child output");
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => panic!("child process timed out after {timeout:?}"),
+                Err(error) => panic!("failed to poll child process: {error}"),
+            }
+        }
+    }
+
+    fn assert_process_success(child: TestChild, timeout: Duration) {
+        let output = finish_process(child, timeout);
+        assert!(
+            output.status.success(),
+            "child process failed; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn concurrent_process_updates_preserve_different_profiles() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials = credential_path(&temp);
+        let binding = binding_path(&credentials);
+        let start_path = temp.path().join("start");
+        let lock = BindingLock::acquire(&binding).expect("hold transaction lock");
+        let (first, first_ready) =
+            spawn_replace_process(&temp, &start_path, "profile-a", "a", 31001, "ok");
+        let (second, second_ready) =
+            spawn_replace_process(&temp, &start_path, "profile-b", "b", 31002, "ok");
+        release_processes(&start_path, &[first_ready, second_ready]);
+        drop(lock);
+
+        assert_process_success(first, CHILD_TIMEOUT);
+        assert_process_success(second, CHILD_TIMEOUT);
+        assert!(matches!(
+            lookup(&credentials, "profile-a", WEB_COOKIE_A).expect("read first binding"),
+            BindingLookup::Matches(binding) if binding.account_id() == 31001
+        ));
+        assert!(matches!(
+            lookup(&credentials, "profile-b", WEB_COOKIE_B).expect("read second binding"),
+            BindingLookup::Matches(binding) if binding.account_id() == 31002
+        ));
+        assert!(
+            fs::metadata(lock_path(&binding))
+                .expect("persistent lock file")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn process_lock_contention_is_bounded_and_unavailable() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials = credential_path(&temp);
+        let binding = binding_path(&credentials);
+        let start_path = temp.path().join("start");
+        let lock = BindingLock::acquire(&binding).expect("hold transaction lock");
+        let (child, ready_path) = spawn_replace_process(
+            &temp,
+            &start_path,
+            "blocked-profile",
+            "a",
+            31001,
+            "unavailable",
+        );
+        release_processes(&start_path, &[ready_path]);
+        let started = Instant::now();
+        assert_process_success(child, CHILD_TIMEOUT);
+        assert!(started.elapsed() < LOCK_WAIT_TIMEOUT + Duration::from_secs(3));
+        drop(lock);
+    }
+
     #[cfg(unix)]
     #[test]
     fn requires_private_binding_permissions_and_caps_reads() {
@@ -271,6 +590,65 @@ mod tests {
         fs::set_permissions(&sidecar, permissions).expect("restore private mode");
         assert!(matches!(
             lookup(&path, "default", WEB_COOKIE_A),
+            Err(BindingError::Unavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lookup_rejects_fifo_sidecar_within_deadline() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials = credential_path(&temp);
+        create_fifo(&binding_path(&credentials));
+
+        assert_process_success(spawn_fifo_lookup_process(&credentials), FIFO_LOOKUP_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(
+            0,
+            unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+            "create FIFO"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_fifo_and_insecure_lock_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let credentials = credential_path(&temp);
+        let binding = binding_path(&credentials);
+        let lock = lock_path(&binding);
+
+        let target = temp.path().join("lock-target");
+        fs::write(&target, b"").expect("create symlink target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("make symlink target private");
+        symlink(&target, &lock).expect("create symlink lock");
+        assert!(matches!(
+            BindingLock::acquire(&binding),
+            Err(BindingError::Unavailable)
+        ));
+        fs::remove_file(&lock).expect("remove symlink lock");
+
+        create_fifo(&lock);
+        assert!(matches!(
+            BindingLock::acquire(&binding),
+            Err(BindingError::Unavailable)
+        ));
+        fs::remove_file(&lock).expect("remove FIFO lock");
+
+        fs::write(&lock, b"").expect("create insecure lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o640))
+            .expect("make lock accessible to group");
+        assert!(matches!(
+            BindingLock::acquire(&binding),
             Err(BindingError::Unavailable)
         ));
     }

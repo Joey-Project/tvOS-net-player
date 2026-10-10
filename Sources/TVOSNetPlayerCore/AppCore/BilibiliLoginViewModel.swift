@@ -77,19 +77,23 @@ public final class BilibiliLoginViewModel: ObservableObject {
     }
 
     public var canStartLogin: Bool {
-        active
-            && (status == .loginRequired || status == .sessionExpired || status == .failed)
-            && supportsLoginSessions
-            && webLoginAllowed
-            && !isStartingLogin
+        canStartLoginSession && webLoginAllowed
     }
 
     public var canStartAccessKeyLogin: Bool {
-        active
-            && (status == .loginRequired || status == .sessionExpired || status == .failed)
-            && supportsLoginSessions
+        canStartLoginSession
             && supportsAccessKeyLogin
             && accessKeyLoginAllowed
+    }
+
+    private var canStartLoginSession: Bool {
+        let statusAllowsLogin =
+            status == .loginRequired || status == .authenticated || status == .sessionExpired
+            || status == .failed
+        return active
+            && CacheServerEndpoint.normalized(from: serverAddressText) != nil
+            && statusAllowsLogin
+            && supportsLoginSessions
             && !isStartingLogin
     }
 
@@ -288,7 +292,26 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
         if credentials.webCookieReadiness == .ready || credentials.accessKeyReadiness == .ready {
             status = .authenticated
-            statusMessage = "Bilibili credentials are ready on the cache server."
+            if credentials.webCookieReadiness == .ready,
+                credentials.accessKeyReadiness == .ready
+            {
+                statusMessage = "Bilibili Web and access-key credentials are ready on the cache server."
+            } else if credentials.webCookieReadiness == .ready {
+                let accessKeyMessage = Self.readinessMessage(
+                    for: "access-key",
+                    readiness: credentials.accessKeyReadiness,
+                    loginAvailable: supportsLoginSessions && supportsAccessKeyLogin
+                        && accessKeyLoginAllowed
+                )
+                statusMessage = "Bilibili Web credentials are ready; \(accessKeyMessage)"
+            } else {
+                let webMessage = Self.readinessMessage(
+                    for: "Web",
+                    readiness: credentials.webCookieReadiness,
+                    loginAvailable: supportsLoginSessions && webLoginAllowed
+                )
+                statusMessage = "Bilibili access-key credentials are ready; \(webMessage)"
+            }
         } else if credentials.webCookieReadiness == .checking || credentials.accessKeyReadiness == .checking {
             status = .checking
             statusMessage = "The cache server is checking Bilibili credentials. Check again shortly."
@@ -420,6 +443,13 @@ public final class BilibiliLoginViewModel: ObservableObject {
             }
             status = .sessionPending
         case "ready":
+            if session.method.lowercased() == BilibiliLoginMethod.webQR.rawValue.lowercased() {
+                webLoginAllowed = false
+            } else if session.method.lowercased()
+                == BilibiliLoginMethod.accessKeyBrowser.rawValue.lowercased()
+            {
+                accessKeyLoginAllowed = false
+            }
             status = .authenticated
             statusMessage = "Bilibili login completed. Refreshing credential status."
             clearPresentation()
@@ -505,8 +535,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
             candidate.password == nil,
             candidate.query == nil,
             let host = candidate.host?.lowercased(),
-            candidate.percentEncodedPath == candidate.path,
-            !candidate.path.contains("\\"),
+            let candidatePath = canonicalPathComponents(candidate),
             let fragment = candidate.percentEncodedFragment,
             fragment.utf8.count == 64,
             fragment.utf8.allSatisfy({
@@ -516,11 +545,9 @@ public final class BilibiliLoginViewModel: ObservableObject {
             let url = candidate.url
         else { return nil }
 
-        let expectedSuffix = "/login/bilibili/\(sessionID)"
-        guard candidate.path.hasSuffix(expectedSuffix) else { return nil }
-
         for baseValue in mediaBaseURIs {
-            guard let base = URLComponents(string: baseValue),
+            guard baseValue.utf8.count <= 4_096,
+                let base = URLComponents(string: baseValue),
                 let baseScheme = base.scheme?.lowercased(),
                 baseScheme == "http" || baseScheme == "https",
                 base.user == nil,
@@ -528,8 +555,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
                 base.query == nil,
                 base.fragment == nil,
                 let baseHost = base.host?.lowercased(),
-                base.percentEncodedPath == base.path,
-                !base.path.contains("\\"),
+                let basePath = canonicalPathComponents(base),
                 let basePort = effectivePort(base),
                 let candidatePort = effectivePort(candidate),
                 scheme == baseScheme,
@@ -537,10 +563,72 @@ public final class BilibiliLoginViewModel: ObservableObject {
                 candidatePort == basePort
             else { continue }
 
-            let prefix = base.path == "/" ? "" : base.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let requiredPath = "\(prefix.isEmpty ? "" : "/\(prefix)")\(expectedSuffix)"
-            guard candidate.path == requiredPath else { continue }
+            let requiredPath = basePath + ["login", "bilibili", sessionID]
+            guard candidatePath == requiredPath else { continue }
             return url.absoluteString
+        }
+        return nil
+    }
+
+    private static func readinessMessage(
+        for credentialKind: String,
+        readiness: BilibiliCredentialReadiness,
+        loginAvailable: Bool
+    ) -> String {
+        if readiness == .missing || readiness == .loginRequired {
+            return loginAvailable
+                ? "\(credentialKind) login is available on the cache server."
+                : "\(credentialKind) login is required but unavailable on the cache server."
+        }
+        if readiness == .checking {
+            return "\(credentialKind) credential status is being checked on the cache server."
+        }
+        if readiness == .unavailable {
+            return "\(credentialKind) credential readiness is unavailable on the cache server."
+        }
+        return "\(credentialKind) credential readiness is unknown on the cache server."
+    }
+
+    private static func canonicalPathComponents(_ components: URLComponents) -> [String]? {
+        let encodedPath = components.percentEncodedPath
+        guard encodedPath.isEmpty || encodedPath.hasPrefix("/") else { return nil }
+
+        var path = encodedPath
+        if path.hasPrefix("/") {
+            path.removeFirst()
+        }
+        guard !path.hasPrefix("/") else { return nil }
+        if path.hasSuffix("/") {
+            path.removeLast()
+        }
+        guard !path.hasSuffix("/"), !path.contains("//") else { return nil }
+        guard !path.isEmpty else { return [] }
+
+        var canonicalComponents: [String] = []
+        for component in path.split(separator: "/", omittingEmptySubsequences: false) {
+            guard let canonicalComponent = canonicalPathComponent(String(component)) else {
+                return nil
+            }
+            canonicalComponents.append(canonicalComponent)
+        }
+        return canonicalComponents
+    }
+
+    private static func canonicalPathComponent(_ encodedComponent: String) -> String? {
+        var component = encodedComponent
+        for _ in 0..<9 {
+            guard let decoded = component.removingPercentEncoding,
+                decoded != ".",
+                decoded != "..",
+                !decoded.contains("/"),
+                !decoded.contains("\\"),
+                !decoded.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            else { return nil }
+
+            if decoded == component {
+                return decoded
+            }
+            component = decoded
         }
         return nil
     }
