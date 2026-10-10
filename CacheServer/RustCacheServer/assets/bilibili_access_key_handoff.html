@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bilibili account handoff</title>
+</head>
+<body>
+  <main>
+    <h1>Bilibili account handoff</h1>
+    <button id="open-provider" type="button">Open Bilibili authorization</button>
+    <p id="status" role="status" aria-live="polite">Continue in the authorization window.</p>
+  </main>
+  <script id="handoff-data" type="application/json">__HANDOFF_DATA_JSON__</script>
+  <script>
+    (() => {
+      const data = JSON.parse(document.getElementById("handoff-data").textContent);
+      const button = document.getElementById("open-provider");
+      const status = document.getElementById("status");
+      const capability = window.location.hash.slice(1);
+      let providerWindow = null;
+      let completed = false;
+
+      window.history.replaceState(null, "", window.location.pathname);
+      window.opener = null;
+
+      if (!/^[a-f0-9]{64}$/.test(capability)) {
+        button.disabled = true;
+        status.textContent = "This handoff link is invalid or has expired.";
+        return;
+      }
+
+      button.addEventListener("click", () => {
+        providerWindow = window.open(data.providerUrl, "bilibili-access-key-login");
+        if (!providerWindow) {
+          status.textContent = "Allow the authorization window, then try again.";
+          return;
+        }
+        status.textContent = "Waiting for Bilibili authorization.";
+      });
+
+      window.addEventListener("message", async (event) => {
+        if (
+          completed ||
+          providerWindow === null ||
+          event.origin !== data.messageOrigin ||
+          event.source !== providerWindow ||
+          typeof event.data !== "string" ||
+          new TextEncoder().encode(event.data).byteLength > 16 * 1024
+        ) {
+          return;
+        }
+
+        completed = true;
+        button.disabled = true;
+        status.textContent = "Saving the verified account handoff.";
+        try {
+          const response = await fetch(`${window.location.pathname}/complete`, {
+            method: "POST",
+            cache: "no-store",
+            credentials: "same-origin",
+            redirect: "error",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              capability,
+              message_origin: event.origin,
+              message: event.data
+            })
+          });
+          if (!response.ok) {
+            throw new Error("handoff rejected");
+          }
+          status.textContent = "Bilibili account handoff completed.";
+        } catch (_) {
+          status.textContent = "The handoff could not be completed. Start a new session.";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

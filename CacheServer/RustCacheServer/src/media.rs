@@ -95,6 +95,15 @@ impl MediaState {
             state: Arc::new(state),
         }
     }
+
+    pub(crate) fn bilibili_login_context(
+        &self,
+    ) -> (
+        &crate::bilibili_login::BilibiliLoginManager,
+        &crate::config::CacheServerOptions,
+    ) {
+        (&self.state.bilibili_login, &self.state.options)
+    }
 }
 
 pub async fn media_get(

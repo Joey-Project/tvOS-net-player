@@ -1,5 +1,8 @@
 mod bbdown_adapter;
+mod bilibili_credential_bindings;
+mod bilibili_credentials;
 mod bilibili_login;
+mod bilibili_login_http;
 mod bilibili_playback;
 mod bilibili_resolution;
 pub mod bilibili_worker;
@@ -103,6 +106,7 @@ const HLS_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HLS_CACHE_EVICTION_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const HLS_CACHE_PLAYBACK_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
 const HLS_COMPLETION_STALE_CLIENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const BILIBILI_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_PENDING_HLS_CLEANUP_KEYS: usize = 1_024;
 const MAX_PENDING_HLS_CLEANUP_SESSION_IDS: usize = 4_096;
 const HLS_CLEANUP_OVERFLOW_SCAN_BATCH_ENTRIES: usize = 1_024;
@@ -155,6 +159,74 @@ pub struct AppState {
     pending_hls_session_cleanups: Arc<Mutex<PendingHlsSessionCleanups>>,
     hls_runtime_startup: Arc<Mutex<HlsRuntimeStartupState>>,
     pending_file_cleanup_runtime: Arc<PendingFileCleanupRuntime>,
+    credential_maintenance_runtime: Arc<CredentialMaintenanceRuntime>,
+}
+
+#[derive(Default)]
+struct CredentialMaintenanceRuntime {
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl CredentialMaintenanceRuntime {
+    fn ensure_running(
+        &self,
+        options: Arc<CacheServerOptions>,
+        manager: bilibili_login::BilibiliLoginManager,
+    ) -> bool {
+        if !options.allow_bilibili_login_sessions {
+            return false;
+        }
+        let Some(path) = options.bbdown_credential_path.clone() else {
+            return false;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let Ok(mut worker) = self.worker.lock() else {
+            return false;
+        };
+        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return true;
+        }
+        // Capture configuration and the manager, not AppState or this runtime owner.
+        *worker = Some(handle.spawn(async move {
+            let mut interval = tokio::time::interval(BILIBILI_CREDENTIAL_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let profile = match options.bbdown_credential_profile.as_ref() {
+                    Some(profile) => Some(profile.clone()),
+                    None => {
+                        let path = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            bbdown_core::CredentialStore::new(path)
+                                .load_profiles()
+                                .map(|profiles| profiles.default_profile)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    }
+                };
+                if let Some(profile) = profile {
+                    manager.maintain_profile(profile, path.clone()).await;
+                }
+            }
+        }));
+        true
+    }
+}
+
+impl Drop for CredentialMaintenanceRuntime {
+    fn drop(&mut self) {
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(worker) = worker.take() {
+            worker.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -801,6 +873,7 @@ impl AppState {
                 worker_running: false,
             })),
             pending_file_cleanup_runtime: Arc::new(PendingFileCleanupRuntime::default()),
+            credential_maintenance_runtime: Arc::new(CredentialMaintenanceRuntime::default()),
         };
         state.ensure_hls_runtime_startup();
         state
@@ -3495,6 +3568,9 @@ pub async fn run_grpc_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
     let _ = state.ensure_pending_file_cleanup_worker();
+    let _ = state
+        .credential_maintenance_runtime
+        .ensure_running(Arc::clone(&state.options), state.bilibili_login.clone());
     Server::builder()
         .add_service(ServerServiceServer::new(ServerGrpcService::new(
             state.clone(),
@@ -3536,8 +3612,12 @@ pub async fn run_media_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.ensure_hls_runtime_startup();
     let _ = state.ensure_pending_file_cleanup_worker();
+    let _ = state
+        .credential_maintenance_runtime
+        .ensure_running(Arc::clone(&state.options), state.bilibili_login.clone());
     let router = Router::new()
         .route("/", get(root))
+        .merge(bilibili_login_http::router())
         .route(
             "/media/{item_id}/{variant_id}",
             get(media_get).head(media_head),
@@ -3691,6 +3771,7 @@ mod tests {
         future::Future,
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+        path::PathBuf,
         pin::Pin,
         sync::atomic::AtomicBool,
         thread,
@@ -3717,6 +3798,68 @@ mod tests {
         task_store::TaskStateStore,
         transcoding::HlsTranscodingPlan,
     };
+
+    #[test]
+    fn credential_maintenance_requires_opt_in_storage_and_a_runtime() {
+        let maintenance = CredentialMaintenanceRuntime::default();
+        let manager = bilibili_login::BilibiliLoginManager::default();
+        for options in [
+            CacheServerOptions::default(),
+            CacheServerOptions {
+                allow_bilibili_login_sessions: true,
+                ..CacheServerOptions::default()
+            },
+            CacheServerOptions {
+                allow_bilibili_login_sessions: true,
+                bbdown_credential_path: Some(PathBuf::from("missing-credentials.json")),
+                ..CacheServerOptions::default()
+            },
+        ] {
+            assert!(!maintenance.ensure_running(Arc::new(options), manager.clone()));
+        }
+        assert!(maintenance.worker.lock().expect("runtime worker").is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_maintenance_is_single_flight_and_stops_with_its_last_owner() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let options = Arc::new(CacheServerOptions {
+            allow_bilibili_login_sessions: true,
+            bbdown_credential_path: Some(temporary.path().join("missing-credentials.json")),
+            bbdown_credential_profile: Some("default".to_owned()),
+            ..CacheServerOptions::default()
+        });
+        let maintenance = Arc::new(CredentialMaintenanceRuntime::default());
+        let other_owner = Arc::clone(&maintenance);
+        let manager = bilibili_login::BilibiliLoginManager::default();
+        assert!(maintenance.ensure_running(Arc::clone(&options), manager.clone()));
+        let (first_id, abort) = {
+            let worker = maintenance.worker.lock().expect("runtime worker");
+            let worker = worker.as_ref().expect("maintenance task");
+            (worker.id(), worker.abort_handle())
+        };
+        assert!(other_owner.ensure_running(options, manager));
+        assert_eq!(
+            first_id,
+            other_owner
+                .worker
+                .lock()
+                .expect("runtime worker")
+                .as_ref()
+                .expect("one task")
+                .id()
+        );
+        drop(maintenance);
+        assert!(!abort.is_finished());
+        drop(other_owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last runtime owner must abort the task");
+    }
 
     #[test]
     fn credential_safe_log_detail_omits_raw_upstream_error() {

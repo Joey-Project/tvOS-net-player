@@ -255,6 +255,14 @@ public struct CacheServerSummary: Equatable, Sendable {
         capabilities.contains(CacheServerCapability.bilibiliLoginSessions)
     }
 
+    public var supportsBilibiliAccessKeyLogin: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliAccessKeyLogin)
+    }
+
+    public var supportsBilibiliCredentialReadiness: Bool {
+        capabilities.contains(CacheServerCapability.bilibiliCredentialReadiness)
+    }
+
     public var supportsLanTranscoding: Bool {
         capabilities.contains(CacheServerCapability.lanTranscoding)
     }
@@ -392,6 +400,17 @@ public enum CacheServerCapability {
     public static let libraryItemDelete = "libraryItemDelete"
     public static let taskOutputV2 = "taskOutputV2"
     public static let resolverSettingsWrite = "resolverSettingsWrite"
+    public static let bilibiliAccessKeyLogin = "bilibiliAccessKeyLogin"
+    public static let bilibiliCredentialReadiness = "bilibiliCredentialReadiness"
+}
+
+public enum BilibiliCredentialReadiness: String, Equatable, Sendable {
+    case unspecified
+    case missing
+    case checking
+    case ready
+    case loginRequired
+    case unavailable
 }
 
 public struct BilibiliCredentialProfile: Equatable, Sendable {
@@ -454,6 +473,8 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
     public let defaultProfileID: String
     public let profileCount: UInt32
     public let profiles: [BilibiliCredentialProfile]
+    public let webCookieReadiness: BilibiliCredentialReadiness
+    public let accessKeyReadiness: BilibiliCredentialReadiness
 
     public init(
         state: String,
@@ -470,7 +491,9 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
         activeProfileID: String = "",
         defaultProfileID: String = "",
         profileCount: UInt32 = 0,
-        profiles: [BilibiliCredentialProfile] = []
+        profiles: [BilibiliCredentialProfile] = [],
+        webCookieReadiness: BilibiliCredentialReadiness = .unspecified,
+        accessKeyReadiness: BilibiliCredentialReadiness = .unspecified
     ) {
         self.state = state
         self.message = message
@@ -487,11 +510,14 @@ public struct BilibiliCredentialStatus: Equatable, Sendable {
         self.defaultProfileID = defaultProfileID
         self.profileCount = profileCount
         self.profiles = profiles
+        self.webCookieReadiness = webCookieReadiness
+        self.accessKeyReadiness = accessKeyReadiness
     }
 }
 
 public enum BilibiliLoginMethod: String, Equatable, Sendable {
     case webQR
+    case accessKeyBrowser
 }
 
 public struct BilibiliLoginSession: Equatable, Sendable {

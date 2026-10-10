@@ -106,6 +106,92 @@ final class CacheLibraryPaginationTests: XCTestCase {
         )
     }
 
+    func testCredentialLifecycleCapabilitiesAndReadinessAreAdditive() {
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliAccessKeyLogin),
+            CacheServerCapability.bilibiliAccessKeyLogin
+        )
+        XCTAssertEqual(
+            String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliCredentialReadiness),
+            CacheServerCapability.bilibiliCredentialReadiness
+        )
+        let legacy = CacheServerSummary(
+            id: "server-1",
+            name: "Cache server",
+            version: "1.0.0",
+            mediaBaseURIs: [],
+            capabilities: []
+        )
+        XCTAssertFalse(legacy.supportsBilibiliAccessKeyLogin)
+        XCTAssertFalse(legacy.supportsBilibiliCredentialReadiness)
+
+        let current = CacheServerSummary(
+            id: "server-1",
+            name: "Cache server",
+            version: "1.0.0",
+            mediaBaseURIs: [],
+            capabilities: [
+                CacheServerCapability.bilibiliAccessKeyLogin,
+                CacheServerCapability.bilibiliCredentialReadiness,
+            ]
+        )
+        XCTAssertTrue(current.supportsBilibiliAccessKeyLogin)
+        XCTAssertTrue(current.supportsBilibiliCredentialReadiness)
+    }
+
+    func testCredentialReadinessAndLoginMethodsMapIncludingOlderDefaults() {
+        let values: [(TvosNetPlayer_V1_BilibiliCredentialReadiness, BilibiliCredentialReadiness)] = [
+            (.unspecified, .unspecified),
+            (.missing, .missing),
+            (.checking, .checking),
+            (.ready, .ready),
+            (.loginRequired, .loginRequired),
+            (.unavailable, .unavailable),
+        ]
+        for (wire, model) in values {
+            XCTAssertEqual(BilibiliCredentialReadiness(wire), model)
+        }
+        XCTAssertEqual(
+            BilibiliCredentialReadiness(.UNRECOGNIZED(1234)),
+            .unspecified
+        )
+
+        XCTAssertEqual(TvosNetPlayer_V1_BilibiliLoginMethod(.webQR), .webQr)
+        XCTAssertEqual(TvosNetPlayer_V1_BilibiliLoginMethod(.accessKeyBrowser), .accessKeyBrowser)
+
+        var loginProto = TvosNetPlayer_V1_BilibiliLoginSession()
+        loginProto.method = .accessKeyBrowser
+        XCTAssertEqual(BilibiliLoginSession(loginProto).method, BilibiliLoginMethod.accessKeyBrowser.rawValue)
+        loginProto.method = .UNRECOGNIZED(1234)
+        XCTAssertEqual(BilibiliLoginSession(loginProto).method, "unspecified")
+
+        let olderStatus = BilibiliCredentialStatus(
+            state: "ready",
+            message: "",
+            credentialPathConfigured: true,
+            credentialFileLoaded: true,
+            hasWebCookie: false,
+            hasAccessKey: false,
+            hasTVAccessKey: false,
+            restrictedArea: "",
+            restrictedPlayURLProxyCount: 0,
+            restrictedAPIProxyCount: 0,
+            checkedAt: nil
+        )
+        XCTAssertEqual(olderStatus.webCookieReadiness, .unspecified)
+        XCTAssertEqual(olderStatus.accessKeyReadiness, .unspecified)
+    }
+
+    func testCredentialReadinessFieldsMapFromProto() {
+        var proto = TvosNetPlayer_V1_BilibiliCredentialStatus()
+        proto.webCookieReadiness = .loginRequired
+        proto.accessKeyReadiness = .checking
+
+        let status = BilibiliCredentialStatus(proto)
+        XCTAssertEqual(status.webCookieReadiness, .loginRequired)
+        XCTAssertEqual(status.accessKeyReadiness, .checking)
+    }
+
     func testGeneratedBilibiliPlaybackPolicyCapabilityMatchesPublicConstant() {
         XCTAssertEqual(
             String(describing: TvosNetPlayer_V1_ServerCapability.bilibiliPlaybackPolicy),

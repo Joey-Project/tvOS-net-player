@@ -1,5 +1,6 @@
 import AVKit
 import SwiftUI
+import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import TVOSNetPlayerCacheClient
@@ -290,6 +291,46 @@ struct ContentView: View {
                         }
                         .buttonStyle(.bordered)
                         .disabled(bilibiliLoginModel.isStartingLogin)
+                    }
+
+                    if bilibiliLoginModel.canStartAccessKeyLogin {
+                        Button {
+                            Task { await bilibiliLoginModel.startAccessKeyLogin() }
+                        } label: {
+                            Label("Sign In with Browser", systemImage: "key.horizontal")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(bilibiliLoginModel.isStartingLogin)
+                    }
+
+                    if bilibiliLoginModel.canCheckReadiness {
+                        Button {
+                            Task { await bilibiliLoginModel.refreshReadiness() }
+                        } label: {
+                            Label("Check Status", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    if let link = bilibiliLoginModel.verificationLink,
+                        let url = URL(string: link)
+                    {
+                        HStack(spacing: 10) {
+                            Link(destination: url) {
+                                Label("Open Login Page", systemImage: "arrow.up.right.square")
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(link, forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Copy validated login link")
+                            .accessibilityLabel("Copy validated login link")
+                        }
                     }
                 }
 

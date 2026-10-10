@@ -3,14 +3,19 @@ id: 20261006-b46381
 title: Same-Identity Signed Media Refresh
 status: completed
 created: 2026-10-06
-updated: 2026-10-07
+updated: 2026-10-08
 branch: wip/signed-media-url-refresh
-pr: https://github.com/Joey-Project/tvOS-net-player/pull/72
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/73
 supersedes: []
 superseded_by:
 ---
 
 # Same-Identity Signed Media Refresh
+
+## Merge Receipt
+- Replacement PR [#73](https://github.com/Joey-Project/tvOS-net-player/pull/73) merged at `2026-10-08T21:39:55Z` with squash commit `d8a13b4aa76daefec5d00542ec3912f0710d4582`, whose first parent/base is `828e28ec3919c225b061a132535aa0862d4149aa`.
+- The reviewed head was `17dd7f1663337d9ea95b2fc5186449403cc282d7`. The merged source tree `fb6cbd7e7e3e767f62ca70a7fefdd458fb8b63e2` is identical to the tree of tested source commit `ab4ec7dc4d0b9e5a8143a1497e9bccafa63236bf`.
+- Original PR #72 was closed as superseded after PR #73 merged. Current-head CI run `37758098607` and required review gate run `37758098603` both succeeded. Official clean Codex review comment `6062668584` completed with zero current-head conversations.
 
 ## Scope
 - Continue the approved [Playback Reliability Follow-Ups](2026-10-05-playback-reliability-followups-b46380.md) after PR #71, from `master` commit `c766c4951455d3169d6d632ed200fba5e8aea38d`.
@@ -45,8 +50,8 @@ superseded_by:
 - The isolated full-fill harness has an opt-in expired-request injection after verified partial quiescence. It preserves accepted identities and durable files and cannot target an arbitrary deployed cache root. Its filesystem checks protect object identity and content stability, not timestamp stability or directory child-entry counts.
 
 ## Validation Results
-- Rust: 1,150 passed, zero failed, one opt-in network test ignored in the complete default-parallel and serial suites. Focused header-list, bodyless HEAD, resource-specific concurrency, completed-parent restoration, publication/rewrite recovery, generation-invalidating, and shared-planning-budget regressions passed. Release build, formatting, Clippy, ShellCheck, and Swift formatting passed through the repository gate. Loopback fixtures required the permitted local-network execution environment; sandbox bind failures are not counted as passes.
-- Swift/macOS: 343 Swift tests, one macOS XCTest, and 30 native-probe self-tests passed. macOS and tvOS builds and tvOS build-for-testing passed. Local simulator execution remains unavailable because CoreSimulator service `1051.54` does not match Xcode's `1051.55`; compatible-runner simulator execution is a CI requirement, not a claimed local pass.
+- Rust on tested source `ab4ec7dc4d0b9e5a8143a1497e9bccafa63236bf`: 1,150 passed, zero failed, one opt-in network test ignored in the complete default-parallel and serial suites. Focused header-list, bodyless HEAD, resource-specific concurrency, completed-parent restoration, publication/rewrite recovery, generation-invalidating, and shared-planning-budget regressions passed. Release build, formatting, Clippy, ShellCheck, and Swift formatting passed through the repository gate. Loopback fixtures required the permitted local-network execution environment; sandbox bind failures are not counted as passes.
+- Swift/macOS: 343 Swift tests, one macOS XCTest, and 30 native-probe self-tests passed. macOS and tvOS builds and tvOS build-for-testing passed. Simulator XCTest passed on compatible current-head CI; local simulator execution remains unavailable because CoreSimulator service `1051.54` does not match Xcode's `1051.55`.
 - All four canonical real URL smokes passed: ordinary video, multi-part video, Bangumi series, and episode. Restricted Bangumi used a Web-mode Hong Kong reverse proxy; saved credentials were reused and Web cookies were not forwarded to the public proxy.
 - Ordinary video: verified 2,621,445 durable partial bytes in five extents, with 1,048,576 completed bytes, before injection; real accepted-item replanning recovered the 404 candidates and completed fill. The 600-second foreground probe made 2,131 rounds, followed by 300-second cache-only validation of 335 resources and 85,425,918 cumulative bytes. Total test duration was 910.28 seconds.
 - Bangumi episode: a 2,097,156-byte, four-extent partial checkpoint, with 1,048,576 completed bytes, and injected-expiration recovery passed. The 600-second foreground probe made 2,025 rounds, followed by 300-second cache-only validation of 603 resources and 178,132,517 cumulative bytes. Total test duration was 931.36 seconds.

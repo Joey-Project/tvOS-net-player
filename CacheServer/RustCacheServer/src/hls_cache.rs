@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -74,6 +75,41 @@ const HLS_TRANSCODING_COMMIT_MARKER_TTL: Duration = Duration::from_secs(10 * 60)
 const HLS_TRANSCODING_COMMIT_MARKER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 static ETAG_MISMATCH_DIAGNOSTIC_USED: AtomicBool = AtomicBool::new(false);
 static SESSION_MANIFEST_PUBLICATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+type RangeChunkFetch = (
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<String>,
+    Duration,
+    PersistedRangeManifest,
+);
+
+struct RangeExtentCommitInput<'a> {
+    expected: &'a PersistedRangeManifest,
+    bytes: &'a [u8],
+    final_url: &'a str,
+    etag: &'a Option<String>,
+    last_modified: &'a Option<String>,
+}
+
+#[derive(Debug)]
+enum RangeExtentCommitFailure {
+    StaleTargetValidator,
+    Rejected(HlsRangeError),
+}
+
+impl From<HlsRangeError> for RangeExtentCommitFailure {
+    fn from(error: HlsRangeError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl From<io::Error> for RangeExtentCommitFailure {
+    fn from(error: io::Error) -> Self {
+        Self::Rejected(HlsRangeError::Io(error))
+    }
+}
 
 fn session_manifest_publication_guard() -> io::Result<std::sync::MutexGuard<'static, ()>> {
     SESSION_MANIFEST_PUBLICATION_LOCK
@@ -2506,6 +2542,7 @@ impl HlsCacheStore {
     }
 
     // Keep the response validators and expected manifest snapshot explicit at publication.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn commit_range_extent(
         &self,
@@ -2518,10 +2555,87 @@ impl HlsCacheStore {
         etag: Option<String>,
         last_modified: Option<String>,
     ) -> Result<u64, HlsRangeError> {
+        self.commit_range_extent_with_failure(
+            session_id,
+            resource,
+            range,
+            RangeExtentCommitInput {
+                expected,
+                bytes,
+                final_url,
+                etag: &etag,
+                last_modified: &last_modified,
+            },
+        )
+        .await
+        .map_err(|failure| match failure {
+            RangeExtentCommitFailure::StaleTargetValidator => HlsRangeError::IdentityChanged,
+            RangeExtentCommitFailure::Rejected(error) => error,
+        })
+    }
+
+    async fn fetch_and_commit_range_extent<F, Fut>(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        range: Range<u64>,
+        mut fetch: F,
+    ) -> Result<(u64, RangeChunkFetch), HlsRangeError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<RangeChunkFetch, HlsRangeError>>,
+    {
+        let mut fetched = fetch().await?;
+        let mut retried = false;
+        loop {
+            let (bytes, final_url, etag, last_modified, _, expected) = &fetched;
+            match self
+                .commit_range_extent_with_failure(
+                    session_id,
+                    resource,
+                    range.clone(),
+                    RangeExtentCommitInput {
+                        expected,
+                        bytes,
+                        final_url,
+                        etag,
+                        last_modified,
+                    },
+                )
+                .await
+            {
+                Ok(durable_bytes) => return Ok((durable_bytes, fetched)),
+                Err(RangeExtentCommitFailure::StaleTargetValidator) if !retried => {
+                    retried = true;
+                    drop(fetched);
+                    fetched = fetch().await?;
+                }
+                Err(RangeExtentCommitFailure::StaleTargetValidator) => {
+                    return Err(identity_error_at(
+                        "extent-publish-repeat-target-validator-change",
+                    ));
+                }
+                Err(RangeExtentCommitFailure::Rejected(error)) => return Err(error),
+            }
+        }
+    }
+
+    async fn commit_range_extent_with_failure(
+        &self,
+        session_id: &str,
+        resource: &HlsMediaResource,
+        range: Range<u64>,
+        input: RangeExtentCommitInput<'_>,
+    ) -> Result<u64, RangeExtentCommitFailure> {
+        let RangeExtentCommitInput {
+            expected,
+            bytes,
+            final_url,
+            etag,
+            last_modified,
+        } = input;
         if bytes.len() as u64 != range.end.saturating_sub(range.start) {
-            return Err(HlsRangeError::InvalidResponse(
-                "range length mismatch".to_owned(),
-            ));
+            return Err(HlsRangeError::InvalidResponse("range length mismatch".to_owned()).into());
         }
         let key = self.range_resource_key(session_id, resource)?;
         let publication_lock = self.range_publication_lock(&key);
@@ -2536,19 +2650,27 @@ impl HlsCacheStore {
             &loaded.manifest,
             &origin,
         ) {
+            if range_manifest_target_validator_snapshot_is_stale(
+                expected,
+                &loaded.manifest,
+                &origin,
+            ) {
+                return Err(RangeExtentCommitFailure::StaleTargetValidator);
+            }
             return Err(identity_error_at(
                 range_manifest_extent_rebase_failure_stage(expected, &loaded.manifest, &origin)
                     .unwrap_or("extent-publish-rebase-unclassified"),
-            ));
+            )
+            .into());
         }
         if let Some(binding) = loaded
             .manifest
             .validated_origins
             .iter()
             .find(|binding| binding.origin == origin)
-            && binding.strong_etag != etag
+            && binding.strong_etag.as_ref() != etag.as_ref()
         {
-            return Err(identity_error_at("extent-origin-validator-change"));
+            return Err(identity_error_at("extent-origin-validator-change").into());
         }
         if loaded
             .manifest
@@ -2564,7 +2686,7 @@ impl HlsCacheStore {
             if exact {
                 return Ok(loaded.manifest.durable_bytes);
             }
-            return Err(identity_error_at("extent-overlap-content"));
+            return Err(identity_error_at("extent-overlap-content").into());
         }
         let data_path = self.data_path_for_manifest(session_id, resource, &loaded.manifest)?;
         self.reject_cache_path_symlink(&data_path)?;
@@ -2574,7 +2696,7 @@ impl HlsCacheStore {
         if file_object_identity(&data.metadata()?)
             != loaded.manifest.data_identity.clone().unwrap_or_default()
         {
-            return Err(identity_error_at("extent-data-object"));
+            return Err(identity_error_at("extent-data-object").into());
         }
         data.seek(SeekFrom::Start(range.start))?;
         data.write_all(bytes)?;
@@ -2610,12 +2732,12 @@ impl HlsCacheStore {
             manifest.prefix_sha256 = prefix_sha256.clone();
             manifest.strong_etag = etag.clone();
             manifest.validator_origin = Some(origin.clone());
-            manifest.last_modified = last_modified;
+            manifest.last_modified = last_modified.clone();
             if let Some(prefix_sha256) = prefix_sha256 {
                 manifest.validated_origins.push(PersistedRangeOrigin {
                     origin,
                     prefix_sha256,
-                    strong_etag: etag,
+                    strong_etag: etag.clone(),
                 });
                 manifest.validated_origins.truncate(64);
             }
@@ -2629,7 +2751,7 @@ impl HlsCacheStore {
             || latest.bytes_digest != loaded.bytes_digest
             || !range_manifest_rebase_compatible(&loaded.manifest, &latest.manifest)
         {
-            return Err(identity_error_at("extent-checkpoint-content"));
+            return Err(identity_error_at("extent-checkpoint-content").into());
         }
         self.write_json_atomically(&manifest_path, &manifest)?;
         sync_directory(manifest_path.parent().ok_or_else(|| {
@@ -3952,28 +4074,18 @@ impl HlsCacheStore {
                     drop(flight);
                     return Ok(());
                 }
-                let (bytes, final_url, etag, last_modified, elapsed, verified_manifest) = self
-                    .fetch_range_chunk(
-                        client,
-                        session_id,
-                        resource,
-                        &chunk_key,
-                        chunk_index,
-                        priority,
-                        control,
-                    )
-                    .await?;
-                let durable_bytes = self
-                    .commit_range_extent(
-                        session_id,
-                        resource,
-                        &verified_manifest,
-                        range.clone(),
-                        &bytes,
-                        &final_url,
-                        etag,
-                        last_modified,
-                    )
+                let (durable_bytes, (bytes, final_url, _, _, elapsed, _)) = self
+                    .fetch_and_commit_range_extent(session_id, resource, range.clone(), || {
+                        self.fetch_range_chunk(
+                            client,
+                            session_id,
+                            resource,
+                            &chunk_key,
+                            chunk_index,
+                            priority,
+                            control,
+                        )
+                    })
                     .await?;
                 let file_length = self
                     .range_managed_size(session_id, &resource.id)
@@ -4106,17 +4218,7 @@ impl HlsCacheStore {
         chunk_index: u64,
         priority: HlsRangePriority,
         control: &F,
-    ) -> Result<
-        (
-            Vec<u8>,
-            String,
-            Option<String>,
-            Option<String>,
-            Duration,
-            PersistedRangeManifest,
-        ),
-        HlsRangeError,
-    >
+    ) -> Result<RangeChunkFetch, HlsRangeError>
     where
         F: Fn() -> HlsCacheFillControl + Send + Sync,
     {
@@ -5686,6 +5788,35 @@ fn range_manifest_rebase_compatible_for_extent_publication(
             .map(|binding| (binding.prefix_sha256.clone(), binding.strong_etag.clone()))
     };
     binding_state(expected) == binding_state(current)
+}
+
+fn range_manifest_target_validator_snapshot_is_stale(
+    expected: &PersistedRangeManifest,
+    current: &PersistedRangeManifest,
+    target_origin: &str,
+) -> bool {
+    if !range_manifest_rebase_compatible_ignoring_origin(
+        expected,
+        current,
+        Some(target_origin),
+        false,
+    ) {
+        return false;
+    }
+    let expected_binding = expected
+        .validated_origins
+        .iter()
+        .find(|binding| binding.origin == target_origin);
+    let current_binding = current
+        .validated_origins
+        .iter()
+        .find(|binding| binding.origin == target_origin);
+    matches!(
+        (expected_binding, current_binding),
+        (Some(expected), Some(current))
+            if expected.prefix_sha256 == current.prefix_sha256
+                && expected.strong_etag != current.strong_etag
+    )
 }
 
 // This mirrors the extent rebase predicate only to name its first failed signal.
@@ -8487,6 +8618,11 @@ mod tests {
                 current,
                 &target_origin,
             ));
+            assert!(!range_manifest_target_validator_snapshot_is_stale(
+                expected,
+                current,
+                &target_origin,
+            ));
             assert_eq!(
                 Some(stage),
                 range_manifest_extent_rebase_failure_stage(expected, current, &target_origin)
@@ -8559,18 +8695,53 @@ mod tests {
             "extent-publish-rebase-target-origin-prefix",
         );
 
+        for (old_etag, new_etag) in [
+            (Some("\"target-etag-v1\""), Some("\"target-etag-v2\"")),
+            (None, Some("\"target-etag-v2\"")),
+            (Some("\"target-etag-v1\""), None),
+        ] {
+            let mut prior = expected.clone();
+            prior
+                .validated_origins
+                .iter_mut()
+                .find(|binding| binding.origin == target_origin)
+                .expect("target origin should exist")
+                .strong_etag = old_etag.map(str::to_owned);
+            let mut current = prior.clone();
+            current
+                .validated_origins
+                .iter_mut()
+                .find(|binding| binding.origin == target_origin)
+                .expect("target origin should exist")
+                .strong_etag = new_etag.map(str::to_owned);
+            assert!(!range_manifest_rebase_compatible_for_extent_publication(
+                &prior,
+                &current,
+                &target_origin,
+            ));
+            assert!(range_manifest_target_validator_snapshot_is_stale(
+                &prior,
+                &current,
+                &target_origin,
+            ));
+            assert_eq!(
+                Some("extent-publish-rebase-target-origin-strong-etag"),
+                range_manifest_extent_rebase_failure_stage(&prior, &current, &target_origin)
+            );
+        }
+
         let mut current = expected.clone();
         current
             .validated_origins
             .iter_mut()
-            .find(|binding| binding.origin == target_origin)
-            .expect("target origin should exist")
-            .strong_etag = Some("\"target-etag-v2\"".to_owned());
-        assert_reason(
+            .find(|binding| binding.origin == "https://seed.example:443")
+            .expect("seed origin should exist")
+            .strong_etag = Some("\"seed-etag-v2\"".to_owned());
+        assert!(!range_manifest_target_validator_snapshot_is_stale(
             &expected,
             &current,
-            "extent-publish-rebase-target-origin-strong-etag",
-        );
+            &target_origin,
+        ));
 
         let mut expected_without_target = expected.clone();
         expected_without_target
@@ -8600,6 +8771,330 @@ mod tests {
             &current_without_target,
             "extent-publish-rebase-target-origin-removed",
         );
+    }
+
+    #[tokio::test]
+    async fn stale_target_validator_option_transition_discards_old_response_and_publishes_refetch()
+    {
+        for (case, initial_etag, updated_etag, old_strong_etag, updated_strong_etag) in [
+            (
+                "some-to-different-some",
+                "\"v1\"",
+                "\"v2\"",
+                Some("\"v1\""),
+                Some("\"v2\""),
+            ),
+            ("none-to-some", "W/\"v1\"", "\"v2\"", None, Some("\"v2\"")),
+            ("some-to-none", "\"v1\"", "W/\"v2\"", Some("\"v1\""), None),
+        ] {
+            let temp = TempDir::new().expect("temp dir should be created");
+            let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+            let body = Arc::new(
+                (0..160 * 1024)
+                    .map(|byte| (byte % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let (url, _task, etag_epoch, request_count) =
+                start_switchable_etag_range_upstream(Arc::clone(&body), initial_etag, updated_etag)
+                    .await;
+            let client = reqwest::Client::new();
+            let session = sample_session(&format!("stale-target-validator-{case}"), &url);
+            let seeded_key = seed_range_prefix(&store, &session, &url, &body, 16, "\"v1\"").await;
+            let chunk_key = RangeChunkKey {
+                resource: seeded_key.resource,
+                total_length: seeded_key.total_length,
+                range: 16..32,
+            };
+            let resource = &session.variant.video;
+            let origin = media_url_origin(&url).expect("fixture origin should parse");
+            if old_strong_etag.is_none() {
+                let snapshot = store
+                    .load_range_manifest(&session.id, resource)
+                    .expect("seeded checkpoint should validate")
+                    .expect("seeded checkpoint should exist");
+                store
+                    .publish_validated_origin(&session.id, resource, snapshot, origin.clone(), None)
+                    .await
+                    .expect(
+                        "target origin should retain its validated prefix without a strong ETag",
+                    );
+            }
+            let _activity = store
+                .range_cache
+                .enter(&session.id, HlsRangePriority::Foreground)
+                .expect("foreground activity should be admitted");
+            let old_response_fetched = Arc::new(Notify::new());
+            let release_old_response = Arc::new(Notify::new());
+            let stale_response_bytes = Arc::new(vec![0xEE; 16]);
+            let fetch_attempts = Arc::new(AtomicUsize::new(0));
+            let control = || HlsCacheFillControl::Continue;
+            let fill = store.fetch_and_commit_range_extent(
+                &session.id,
+                resource,
+                chunk_key.range.clone(),
+                || {
+                    let attempt = fetch_attempts.fetch_add(1, Ordering::Relaxed);
+                    let pending = store.fetch_range_chunk(
+                        &client,
+                        &session.id,
+                        resource,
+                        &chunk_key,
+                        0,
+                        HlsRangePriority::Foreground,
+                        &control,
+                    );
+                    let expected_old_etag = old_strong_etag.map(str::to_owned);
+                    let expected_updated_etag = updated_strong_etag.map(str::to_owned);
+                    let stale_response_bytes = Arc::clone(&stale_response_bytes);
+                    let old_response_fetched = Arc::clone(&old_response_fetched);
+                    let release_old_response = Arc::clone(&release_old_response);
+                    async move {
+                        let mut response = pending.await?;
+                        if attempt == 0 {
+                            assert_eq!(
+                                expected_old_etag.as_deref(),
+                                response.2.as_deref(),
+                                "{case}"
+                            );
+                            response.0.clone_from(stale_response_bytes.as_ref());
+                            old_response_fetched.notify_one();
+                            release_old_response.notified().await;
+                        } else {
+                            assert_eq!(
+                                expected_updated_etag.as_deref(),
+                                response.2.as_deref(),
+                                "{case}"
+                            );
+                        }
+                        Ok(response)
+                    }
+                },
+            );
+            tokio::pin!(fill);
+            tokio::select! {
+                _ = &mut fill => panic!("fill must wait at the old-response barrier: {case}"),
+                () = old_response_fetched.notified() => {}
+            }
+
+            etag_epoch.store(true, Ordering::Relaxed);
+            let snapshot = store
+                .load_range_manifest(&session.id, resource)
+                .expect("current checkpoint should validate")
+                .expect("current checkpoint should exist");
+            let (verified_origin, verified_etag) = store
+                .verify_candidate_prefix(
+                    &client,
+                    &session.id,
+                    resource,
+                    &url,
+                    Some(&origin),
+                    &chunk_key,
+                    &snapshot.manifest,
+                    HlsRangePriority::Foreground,
+                    &control,
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("new validator must pass bounded prefix validation: {case}")
+                });
+            assert_eq!(origin, verified_origin, "{case}");
+            assert_eq!(updated_strong_etag, verified_etag.as_deref(), "{case}");
+            store
+                .publish_validated_origin(
+                    &session.id,
+                    resource,
+                    snapshot,
+                    verified_origin,
+                    verified_etag,
+                )
+                .await
+                .expect("new validator should publish after byte validation");
+
+            release_old_response.notify_one();
+            let (durable_bytes, (published, _, published_etag, _, _, _)) =
+                fill.await.unwrap_or_else(|error| {
+                    panic!("fresh response should publish for {case}: {error}")
+                });
+            assert_eq!(&body[16..32], published.as_slice(), "{case}");
+            assert_ne!(
+                stale_response_bytes.as_slice(),
+                published.as_slice(),
+                "stale response bytes must not be published: {case}"
+            );
+            assert_eq!(updated_strong_etag, published_etag.as_deref(), "{case}");
+            assert_eq!(2, fetch_attempts.load(Ordering::Relaxed), "{case}");
+            assert_eq!(3, request_count.load(Ordering::Relaxed), "{case}");
+            assert_eq!(32, durable_bytes, "{case}");
+            assert_eq!(
+                Some(body[16..32].to_vec()),
+                store
+                    .read_durable_range(&session.id, resource, 16..32)
+                    .await
+                    .expect("published range should validate"),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn target_validator_second_conflict_fails_after_one_refetch() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let store = temp_store(&temp).with_range_budget(16 * 1024 * 1024);
+        let body = Arc::new(
+            (0..160 * 1024)
+                .map(|byte| (byte % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (url, _task, etag_epoch, request_count) =
+            start_switchable_etag_range_upstream(Arc::clone(&body), "\"v1\"", "\"v2\"").await;
+        let client = reqwest::Client::new();
+        let session = sample_session("target-validator-second-conflict", &url);
+        let seeded_key = seed_range_prefix(&store, &session, &url, &body, 16, "\"v1\"").await;
+        let chunk_key = RangeChunkKey {
+            resource: seeded_key.resource,
+            total_length: seeded_key.total_length,
+            range: 16..32,
+        };
+        let resource = &session.variant.video;
+        let origin = media_url_origin(&url).expect("fixture origin should parse");
+        let _activity = store
+            .range_cache
+            .enter(&session.id, HlsRangePriority::Foreground)
+            .expect("foreground activity should be admitted");
+        let old_response_fetched = Arc::new(Notify::new());
+        let release_old_response = Arc::new(Notify::new());
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let control = || HlsCacheFillControl::Continue;
+        let store_ref = &store;
+        let client_ref = &client;
+        let session_id_ref = session.id.as_str();
+        let resource_ref = resource;
+        let chunk_key_ref = &chunk_key;
+        let url_ref = url.as_str();
+        let origin_ref = &origin;
+        let control_ref = &control;
+        let fill = store.fetch_and_commit_range_extent(
+            &session.id,
+            resource,
+            chunk_key.range.clone(),
+            || {
+                let attempt = fetch_attempts.fetch_add(1, Ordering::Relaxed);
+                let pending = store_ref.fetch_range_chunk(
+                    client_ref,
+                    session_id_ref,
+                    resource_ref,
+                    chunk_key_ref,
+                    0,
+                    HlsRangePriority::Foreground,
+                    control_ref,
+                );
+                let etag_epoch = Arc::clone(&etag_epoch);
+                let old_response_fetched = Arc::clone(&old_response_fetched);
+                let release_old_response = Arc::clone(&release_old_response);
+                async move {
+                    let response = pending.await?;
+                    if attempt == 0 {
+                        assert_eq!(Some("\"v1\""), response.2.as_deref());
+                        old_response_fetched.notify_one();
+                        release_old_response.notified().await;
+                    } else {
+                        assert_eq!(Some("\"v2\""), response.2.as_deref());
+                        etag_epoch.store(false, Ordering::Relaxed);
+                        let snapshot = store_ref
+                            .load_range_manifest(session_id_ref, resource_ref)
+                            .expect("second checkpoint should validate")
+                            .expect("second checkpoint should exist");
+                        let (verified_origin, verified_etag) = store_ref
+                            .verify_candidate_prefix(
+                                client_ref,
+                                session_id_ref,
+                                resource_ref,
+                                url_ref,
+                                Some(origin_ref),
+                                chunk_key_ref,
+                                &snapshot.manifest,
+                                HlsRangePriority::Foreground,
+                                control_ref,
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!("second validator change should pass prefix verification")
+                            });
+                        assert_eq!(origin_ref, &verified_origin);
+                        assert_eq!(Some("\"v1\""), verified_etag.as_deref());
+                        store_ref
+                            .publish_validated_origin(
+                                session_id_ref,
+                                resource_ref,
+                                snapshot,
+                                verified_origin,
+                                verified_etag,
+                            )
+                            .await
+                            .expect("second verified validator change should publish");
+                    }
+                    Ok(response)
+                }
+            },
+        );
+        tokio::pin!(fill);
+        tokio::select! {
+            _ = &mut fill => panic!("fill must wait at the old-response barrier"),
+            () = old_response_fetched.notified() => {}
+        }
+
+        etag_epoch.store(true, Ordering::Relaxed);
+        let snapshot = store
+            .load_range_manifest(&session.id, resource)
+            .expect("current checkpoint should validate")
+            .expect("current checkpoint should exist");
+        let (verified_origin, verified_etag) = store
+            .verify_candidate_prefix(
+                &client,
+                &session.id,
+                resource,
+                &url,
+                Some(&origin),
+                &chunk_key,
+                &snapshot.manifest,
+                HlsRangePriority::Foreground,
+                &control,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("first validator change should pass prefix verification"));
+        assert_eq!(origin, verified_origin);
+        assert_eq!(Some("\"v2\""), verified_etag.as_deref());
+        store
+            .publish_validated_origin(
+                &session.id,
+                resource,
+                snapshot,
+                verified_origin,
+                verified_etag,
+            )
+            .await
+            .expect("first verified validator change should publish");
+
+        release_old_response.notify_one();
+        let error = match fill.await {
+            Ok(_) => panic!("a second target validator conflict must fail without a third fetch"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, HlsRangeError::IdentityChanged));
+        assert_eq!(2, fetch_attempts.load(Ordering::Relaxed));
+        assert_eq!(4, request_count.load(Ordering::Relaxed));
+        assert_eq!(
+            None,
+            store
+                .read_durable_range(&session.id, resource, 16..32)
+                .await
+                .expect("unpublished target range should remain readable as absent")
+        );
+        let current = store
+            .load_range_manifest(&session.id, resource)
+            .expect("final checkpoint should validate")
+            .expect("final checkpoint should exist");
+        assert_eq!(16, current.manifest.durable_bytes);
     }
 
     #[tokio::test]
@@ -9111,6 +9606,8 @@ mod tests {
         body: Arc<Vec<u8>>,
         prefix_etag: &'static str,
         tail_etag: &'static str,
+        updated_etag: &'static str,
+        etag_epoch: Option<Arc<AtomicBool>>,
         corrupt_tail: bool,
         sample_fault: Option<SampleResponseFault>,
         sample_start: Option<usize>,
@@ -9175,11 +9672,16 @@ mod tests {
             } else {
                 (start, end)
             };
-        let etag = if start == 0 {
-            fixture.prefix_etag
+        let (prefix_etag, tail_etag) = if fixture
+            .etag_epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.load(Ordering::Relaxed))
+        {
+            (fixture.updated_etag, fixture.updated_etag)
         } else {
-            fixture.tail_etag
+            (fixture.prefix_etag, fixture.tail_etag)
         };
+        let etag = if start == 0 { prefix_etag } else { tail_etag };
         Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header(CONTENT_LENGTH, body.len().to_string())
@@ -9246,6 +9748,8 @@ mod tests {
                     body,
                     prefix_etag,
                     tail_etag,
+                    updated_etag: "\"v2\"",
+                    etag_epoch: None,
                     corrupt_tail,
                     sample_fault,
                     sample_start,
@@ -9254,6 +9758,37 @@ mod tests {
         )
         .await;
         (url, task, request_count)
+    }
+
+    async fn start_switchable_etag_range_upstream(
+        body: Arc<Vec<u8>>,
+        initial_etag: &'static str,
+        updated_etag: &'static str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+    ) {
+        let etag_epoch = Arc::new(AtomicBool::new(false));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (url, task) = start_hls_cache_upstream(
+            Router::new()
+                .route("/video.m4s", get(upstream_range_with_etags))
+                .with_state(RangeEtagFixture {
+                    body,
+                    prefix_etag: initial_etag,
+                    tail_etag: initial_etag,
+                    updated_etag,
+                    etag_epoch: Some(Arc::clone(&etag_epoch)),
+                    corrupt_tail: false,
+                    sample_fault: None,
+                    sample_start: None,
+                    request_count: Arc::clone(&request_count),
+                }),
+        )
+        .await;
+        (url, task, etag_epoch, request_count)
     }
 
     async fn upstream_ignores_range_and_holds_full_get(
