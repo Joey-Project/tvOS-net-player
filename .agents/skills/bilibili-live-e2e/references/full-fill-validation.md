@@ -7,8 +7,10 @@ Use this mode when validation needs durable whole-asset fill and cache-only play
 - `ordinary-video-playlist`: first candidate.
 - `bangumi-media-series`: first candidate.
 - `bangumi-episode`: default/current candidate when available, otherwise first; explicit first-candidate selection is also supported.
+- `authenticated-following-feed`: first candidate; requires a saved Web cookie.
+- `authenticated-space-dynamic`: first candidate; requires a saved Web cookie and should use a current public uploader URL through `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL`.
 
-Unknown cases and multi-result selection are not admitted to full-fill mode. Both the expected selection and the actual playable/listed results must contain exactly one result. Bangumi remains explicitly opt-in and public restricted proxies must use Web mode, not TV API.
+Unknown cases and multi-result selection are not admitted to full-fill mode. Both the expected selection and the actual playable/listed results must contain exactly one result. Authenticated feed cases remain opt-in: use an explicit case filter or the authenticated inclusion flag. Full-fill mode alone does not authorize authenticated fetches. An empty feed or unavailable default dynamic sample is a failed live case, not a passing empty result. Bangumi remains explicitly opt-in and public restricted proxies must use Web mode, not TV API.
 
 ## Run Shape
 

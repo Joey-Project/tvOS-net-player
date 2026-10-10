@@ -82,7 +82,7 @@ just test-bilibili-live
 
 当 credential 文件是多 profile store 且目标凭证不是 default profile 时，使用 `BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE` 选择 server 侧 profile；该值只是 profile ID，测试不会把 cookie/access key 传给客户端或写入日志。
 
-The optional full-fill mode uses the first candidate of the canonical ordinary-video case, a bounded completion wait, same-root server restarts, and a 300-second completed-cache replay. It is separate from the online readability smoke and remains outside default CI:
+可选 full-fill 模式支持普通视频、番剧，以及显式启用的 following/dynamic 认证 feed。认证 feed 只允许选取首个候选项，仍需有效 Web cookie；仅设置 full-fill 不会自动启用认证用例。该模式会等待完整缓存、在同一目录重启 server，并进行 300 秒 cache-only 回放，与在线可读性 smoke 分开，仍不属于默认 CI：
 
 ```bash
 BILIBILI_LIVE_E2E_CASES=ordinary-video-playlist \
@@ -91,7 +91,21 @@ BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300 \
 just test-bilibili-live
 ```
 
-`just test-lan-playback` compiles a native macOS `AVPlayer` probe with strict Swift 6 concurrency checks and runs credential-free argument self-tests by default. Supplying a clean LAN playback URL enables actual video-frame decoding, pause/resume, forward/backward seeks, and 1.25x playback. The URL must have no userinfo, query, or fragment. Hostname validation is an input restriction, not DNS pinning. The native deadline is cooperative; use an outer process timeout for a hard live-run bound.
+认证 feed 的长时间验证可以显式选择 following，或通过 `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL` 指定当前可用的公开 uploader 动态页。空 feed、上游拒绝和默认样例不可用都保留为失败，不能降低候选数要求来算作通过：
+
+```bash
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
+BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PROFILE=test-profile \
+BILIBILI_LIVE_E2E_CASES=authenticated-following-feed \
+BILIBILI_LIVE_E2E_FULL_FILL=1 \
+BILIBILI_LIVE_E2E_SUSTAINED_SECONDS=600 \
+BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300 \
+just test-bilibili-live
+```
+
+运行长测试时需要外层进程期限和输出上限；完整缓存、恢复证据和 native probe 的交接约束见 [full-fill validation](.agents/skills/bilibili-live-e2e/references/full-fill-validation.md)。
+
+`just test-lan-playback` 会使用严格 Swift 6 并发检查编译 macOS 原生 `AVPlayer` probe，默认只运行不需要凭据的参数 self-test。提供干净的 LAN 播放 URL 后，才会验证真实视频帧解码、暂停/恢复、前后跳转和 1.25x 播放。URL 不能包含 userinfo、query 或 fragment；hostname 校验是输入限制，不是 DNS pinning。native deadline 是协作式的，硬性期限需要外层进程 timeout。
 
 ```bash
 LAN_PLAYBACK_URL='http://127.0.0.1:8080/hls/SESSION_ID/master.m3u8' \

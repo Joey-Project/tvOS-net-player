@@ -3023,6 +3023,8 @@ fn supports_full_fill_case(case: &LiveCase) -> bool {
         (case.id.as_str(), case.selection),
         ("ordinary-video-playlist", SelectionPolicy::First)
             | ("bangumi-media-series", SelectionPolicy::First)
+            | ("authenticated-following-feed", SelectionPolicy::First)
+            | ("authenticated-space-dynamic", SelectionPolicy::First)
             | (
                 "bangumi-episode",
                 SelectionPolicy::DefaultOrFirst | SelectionPolicy::First
@@ -5016,6 +5018,83 @@ mod tests {
             media_policy.run_decision(&episode_case),
             LiveRunDecision::Run
         );
+    }
+
+    #[test]
+    fn full_fill_policy_runs_explicitly_selected_authenticated_single_result_cases() {
+        let fixture_set = LiveFixtureSet::load_from_path(default_fixture_path());
+        let cases = fixture_set
+            .cases
+            .iter()
+            .map(|case| (case.id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for id in [
+            "authenticated-following-feed",
+            "authenticated-space-dynamic",
+        ] {
+            let case = cases.get(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert!(case.requires_authentication, "{id} should require auth");
+            assert_eq!(case.selection, SelectionPolicy::First);
+
+            let policy = LiveRunPolicy {
+                full_fill: true,
+                filter: Some(parse_case_filter(id.to_owned())),
+                ..Default::default()
+            };
+            assert_eq!(policy.run_decision(case), LiveRunDecision::Run);
+            assert!(supports_full_fill_case(case));
+
+            let authenticated_policy = LiveRunPolicy {
+                full_fill: true,
+                include_authenticated: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                authenticated_policy.run_decision(case),
+                LiveRunDecision::Run
+            );
+
+            assert_eq!(
+                LiveRunPolicy {
+                    full_fill: true,
+                    ..Default::default()
+                }
+                .run_decision(case),
+                LiveRunDecision::Skip("requires authenticated live validation")
+            );
+        }
+    }
+
+    #[test]
+    fn full_fill_policy_rejects_non_first_authenticated_selections() {
+        for id in [
+            "authenticated-following-feed",
+            "authenticated-space-dynamic",
+        ] {
+            let policy = LiveRunPolicy {
+                full_fill: true,
+                filter: Some(parse_case_filter(id.to_owned())),
+                ..Default::default()
+            };
+
+            for selection in [
+                SelectionPolicy::DefaultOrFirst,
+                SelectionPolicy::MultipleFirstTwo,
+                SelectionPolicy::RangeFirstTwo,
+                SelectionPolicy::All,
+            ] {
+                let mut non_single_case = test_case(id, true, false);
+                non_single_case.selection = selection;
+                assert_eq!(
+                    policy.run_decision(&non_single_case),
+                    LiveRunDecision::Skip(
+                        "full-fill mode requires an allowlisted canonical single-result case"
+                    ),
+                    "{id} should reject {selection:?}"
+                );
+            }
+        }
     }
 
     #[test]
