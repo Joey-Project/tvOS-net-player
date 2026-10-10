@@ -2042,6 +2042,7 @@ dependencies = [
  "futures-util",
  "http",
  "httpdate",
+ "icu_properties",
  "libc",
  "mdns-sd",
  "prost",

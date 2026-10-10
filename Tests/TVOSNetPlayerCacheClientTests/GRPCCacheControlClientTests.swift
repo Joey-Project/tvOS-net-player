@@ -2,22 +2,22 @@ import XCTest
 @testable import TVOSNetPlayerCacheClient
 
 final class GRPCCacheControlClientTests: XCTestCase {
-    func testLoginStartDeadlineExceedsServerTicketTimeout() {
+    func testLoginStartDeadlineDefaultsToNinetySeconds() {
         let client = GRPCCacheControlClient(
             endpoint: CacheServerEndpoint(host: "localhost"),
             rpcTimeout: .seconds(10)
         )
 
-        XCTAssertEqual(client.loginStartCallOptions.timeout, .seconds(20))
+        XCTAssertEqual(client.loginStartCallOptions.timeout, .seconds(90))
     }
 
     func testLoginStartDeadlineDoesNotShortenLongerConfiguredTimeout() {
         let client = GRPCCacheControlClient(
             endpoint: CacheServerEndpoint(host: "localhost"),
-            rpcTimeout: .seconds(30)
+            rpcTimeout: .seconds(120)
         )
 
-        XCTAssertEqual(client.loginStartCallOptions.timeout, .seconds(30))
+        XCTAssertEqual(client.loginStartCallOptions.timeout, .seconds(120))
     }
 
     func testCacheFillStatusProgressHandlesUnknownZeroAndOverflowingValues() {

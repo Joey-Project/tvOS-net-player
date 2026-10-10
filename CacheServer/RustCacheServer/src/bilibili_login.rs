@@ -137,6 +137,8 @@ struct ReadinessRecord {
     web_cookie: Option<String>,
     access_key: Option<String>,
     all_credentials: bool,
+    operation_id: Option<String>,
+    bundle_fingerprint: Option<String>,
 }
 
 struct ProfileCredentials {
@@ -1044,6 +1046,83 @@ impl BilibiliLoginManager {
         }
     }
 
+    async fn verify_preserved_access_key_after_web_login(&self, profile_id: &str, path: &Path) {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let mut reservation = match self.reserve_profile(profile_id, &operation_id) {
+            Ok(reservation) => reservation,
+            Err(_) => return,
+        };
+        let loaded = match load_profile_bundle(path, profile_id) {
+            Ok(loaded) => loaded,
+            Err(_) => return,
+        };
+        if !has_access_key(&loaded.credentials) {
+            reservation.disarm();
+            self.release_profile(profile_id, &operation_id);
+            return;
+        }
+        let Some(bundle_fingerprint) =
+            credential_bundle_fingerprint(&loaded.credentials, &loaded.secrets)
+        else {
+            reservation.disarm();
+            self.release_profile(profile_id, &operation_id);
+            return;
+        };
+        if !self.begin_temporary_access_key_check(
+            profile_id,
+            &operation_id,
+            &loaded.credentials,
+            &bundle_fingerprint,
+        ) {
+            reservation.disarm();
+            self.release_profile(profile_id, &operation_id);
+            return;
+        }
+
+        let cookie = loaded.credentials.cookie.as_deref().unwrap_or_default();
+        let binding = match bilibili_credential_bindings::lookup(path, profile_id, cookie) {
+            Ok(BindingLookup::Matches(binding)) if has_cookie(&loaded.credentials) => binding,
+            _ => {
+                self.clear_temporary_readiness(profile_id, &operation_id, &bundle_fingerprint);
+                reservation.disarm();
+                self.release_profile(profile_id, &operation_id);
+                return;
+            }
+        };
+        let access_key_readiness = self
+            .maintain_access_key(&loaded.credentials, Some(binding.clone()))
+            .await;
+
+        let current = load_profile_bundle(path, profile_id).ok();
+        let current_is_same = current.as_ref().is_some_and(|current| {
+            credential_bundle_fingerprint(&current.credentials, &current.secrets).as_deref()
+                == Some(bundle_fingerprint.as_str())
+                && current.credentials.cookie.as_deref().is_some_and(|cookie| {
+                    matches!(
+                        bilibili_credential_bindings::lookup(path, profile_id, cookie),
+                        Ok(BindingLookup::Matches(ref current_binding))
+                            if current_binding == &binding
+                    )
+                })
+        });
+
+        let published = current_is_same
+            && current.as_ref().is_some_and(|current| {
+                self.publish_temporary_access_key_readiness(
+                    profile_id,
+                    &operation_id,
+                    &current.credentials,
+                    &bundle_fingerprint,
+                    access_key_readiness,
+                )
+            });
+        if !published {
+            self.clear_temporary_readiness(profile_id, &operation_id, &bundle_fingerprint);
+        }
+        reservation.disarm();
+        self.release_profile(profile_id, &operation_id);
+    }
+
     fn reserve_profile(
         &self,
         profile_id: &str,
@@ -1104,8 +1183,109 @@ impl BilibiliLoginManager {
                     web_cookie: credential_fingerprint(credentials.cookie.as_deref()),
                     access_key: credential_fingerprint(credentials.access_key.as_deref()),
                     all_credentials: false,
+                    operation_id: None,
+                    bundle_fingerprint: None,
                 },
             );
+        }
+    }
+
+    fn begin_temporary_access_key_check(
+        &self,
+        profile_id: &str,
+        operation_id: &str,
+        credentials: &Credentials,
+        bundle_fingerprint: &str,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.active_profiles.get(profile_id).map(String::as_str) != Some(operation_id) {
+            return false;
+        }
+        let Some(previous) = state.readiness.get(profile_id) else {
+            return false;
+        };
+        if previous.all_credentials
+            || previous.web_cookie != credential_fingerprint(credentials.cookie.as_deref())
+            || previous.access_key != credential_fingerprint(credentials.access_key.as_deref())
+            || previous.operation_id.is_some()
+        {
+            return false;
+        }
+        let web = previous.snapshot.web;
+        state.readiness.insert(
+            profile_id.to_owned(),
+            ReadinessRecord {
+                snapshot: CredentialReadinessSnapshot {
+                    web,
+                    access_key: CredentialReadiness::Checking,
+                },
+                web_cookie: credential_fingerprint(credentials.cookie.as_deref()),
+                access_key: credential_fingerprint(credentials.access_key.as_deref()),
+                all_credentials: false,
+                operation_id: Some(operation_id.to_owned()),
+                bundle_fingerprint: Some(bundle_fingerprint.to_owned()),
+            },
+        );
+        true
+    }
+
+    fn publish_temporary_access_key_readiness(
+        &self,
+        profile_id: &str,
+        operation_id: &str,
+        credentials: &Credentials,
+        bundle_fingerprint: &str,
+        access_key: CredentialReadiness,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.active_profiles.get(profile_id).map(String::as_str) != Some(operation_id) {
+            return false;
+        }
+        let Some(temporary) = state.readiness.get(profile_id) else {
+            return false;
+        };
+        if temporary.operation_id.as_deref() != Some(operation_id)
+            || temporary.bundle_fingerprint.as_deref() != Some(bundle_fingerprint)
+            || temporary.web_cookie != credential_fingerprint(credentials.cookie.as_deref())
+            || temporary.access_key != credential_fingerprint(credentials.access_key.as_deref())
+        {
+            return false;
+        }
+        let web = temporary.snapshot.web;
+        state.readiness.insert(
+            profile_id.to_owned(),
+            ReadinessRecord {
+                snapshot: CredentialReadinessSnapshot { web, access_key },
+                web_cookie: credential_fingerprint(credentials.cookie.as_deref()),
+                access_key: credential_fingerprint(credentials.access_key.as_deref()),
+                all_credentials: false,
+                operation_id: None,
+                bundle_fingerprint: None,
+            },
+        );
+        true
+    }
+
+    fn clear_temporary_readiness(
+        &self,
+        profile_id: &str,
+        operation_id: &str,
+        bundle_fingerprint: &str,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            let owns_reservation =
+                state.active_profiles.get(profile_id).map(String::as_str) == Some(operation_id);
+            let owns_readiness = state.readiness.get(profile_id).is_some_and(|record| {
+                record.operation_id.as_deref() == Some(operation_id)
+                    && record.bundle_fingerprint.as_deref() == Some(bundle_fingerprint)
+            });
+            if owns_reservation && owns_readiness {
+                state.readiness.remove(profile_id);
+            }
         }
     }
 
@@ -1121,14 +1301,24 @@ impl BilibiliLoginManager {
                     web_cookie: None,
                     access_key: None,
                     all_credentials: true,
+                    operation_id: None,
+                    bundle_fingerprint: None,
                 },
             );
         }
     }
 
     fn cancel_profile_operation(&self, profile_id: &str, operation_id: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(record) = state.readiness.get_mut(profile_id) {
+        if let Ok(mut state) = self.state.lock()
+            && state.active_profiles.get(profile_id).map(String::as_str) == Some(operation_id)
+        {
+            if state
+                .readiness
+                .get(profile_id)
+                .is_some_and(|record| record.operation_id.as_deref() == Some(operation_id))
+            {
+                state.readiness.remove(profile_id);
+            } else if let Some(record) = state.readiness.get_mut(profile_id) {
                 if record.snapshot.web == CredentialReadiness::Checking {
                     record.snapshot.web = CredentialReadiness::Unavailable;
                 }
@@ -1728,7 +1918,7 @@ impl BilibiliLoginManager {
                     if self
                         .persist_credentials(
                             &session_id,
-                            path,
+                            path.clone(),
                             profile_id.clone(),
                             credentials,
                             refresh_token,
@@ -1741,6 +1931,8 @@ impl BilibiliLoginManager {
                             BilibiliLoginSessionState::Ready,
                             "Bilibili Web login completed.",
                         );
+                        self.verify_preserved_access_key_after_web_login(&profile_id, &path)
+                            .await;
                     } else {
                         self.finish_without_store(
                             &session_id,
@@ -2209,6 +2401,15 @@ fn credential_fingerprint(value: Option<&str>) -> Option<String> {
     value.map(|value| bytes_fingerprint(value.as_bytes()))
 }
 
+fn credential_bundle_fingerprint(
+    credentials: &Credentials,
+    secrets: &CredentialProfileSecrets,
+) -> Option<String> {
+    serde_json::to_vec(&(credentials, secrets))
+        .ok()
+        .map(|bundle| bytes_fingerprint(&bundle))
+}
+
 fn bytes_fingerprint(value: &[u8]) -> String {
     let digest = Sha256::digest(value);
     let mut output = String::with_capacity(digest.len() * 2);
@@ -2624,6 +2825,8 @@ mod tests {
         refresh: Mutex<FakeRefreshOutcome>,
         refresh_calls: AtomicUsize,
         identity_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+        access_key_identity_gate:
+            Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 
     impl Default for FakeCredentialProvider {
@@ -2633,6 +2836,7 @@ mod tests {
                 refresh: Mutex::new(FakeRefreshOutcome::NoRefresh),
                 refresh_calls: AtomicUsize::new(0),
                 identity_gate: Mutex::new(None),
+                access_key_identity_gate: Mutex::new(None),
             }
         }
     }
@@ -2665,6 +2869,18 @@ mod tests {
                 Some((started.clone(), resume.clone()));
             (started, resume)
         }
+
+        fn pause_next_access_key_identity_with_release(
+            &self,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *self
+                .access_key_identity_gate
+                .lock()
+                .expect("access-key identity gate") = Some((started.clone(), resume.clone()));
+            (started, resume)
+        }
     }
 
     impl CredentialProvider for FakeCredentialProvider {
@@ -2686,7 +2902,16 @@ mod tests {
                 .get(&identity_key(kind, &material))
                 .copied()
                 .unwrap_or(FakeIdentityOutcome::Account(31_001));
-            let gate = self.identity_gate.lock().expect("identity gate").take();
+            let access_key_gate = if kind == CredentialKind::AccessKey {
+                self.access_key_identity_gate
+                    .lock()
+                    .expect("access-key identity gate")
+                    .take()
+            } else {
+                None
+            };
+            let gate = access_key_gate
+                .or_else(|| self.identity_gate.lock().expect("identity gate").take());
             Box::pin(async move {
                 if let Some((started, resume)) = gate {
                     started.notify_one();
@@ -2848,6 +3073,241 @@ mod tests {
                 profiles.set_profile_secrets("default", secrets)
             })
             .expect("seed Web credential profile");
+    }
+
+    fn seed_profile_with_preserved_access_key(path: &Path) {
+        CredentialStore::new(path.to_path_buf())
+            .update_profiles(|profiles| {
+                profiles.set_profile(
+                    "default",
+                    Credentials::default().with_access_key(ACCESS_KEY_A.to_owned()),
+                )?;
+                profiles.set_profile("other", Credentials::default().with_cookie(WEB_COOKIE_B))?;
+                let mut secrets = CredentialProfileSecrets::default();
+                secrets.set_access_key_provider(
+                    AccessKeyProvider::BalhBiliplus,
+                    AccessKeyProviderSecret::default()
+                        .with_refresh_token(REFRESH_TOKEN_B.to_owned()),
+                );
+                profiles.set_profile_secrets("default", secrets)
+            })
+            .expect("seed preserved access key");
+    }
+
+    fn successful_web_login_manager(
+        credential_provider: Arc<FakeCredentialProvider>,
+    ) -> BilibiliLoginManager {
+        manager_with_provider(
+            PollResult::Succeeded {
+                credentials: Credentials::default().with_cookie(WEB_COOKIE_A.to_owned()),
+                refresh_token: Some(REFRESH_TOKEN_A.to_owned()),
+            },
+            credential_provider,
+        )
+        .0
+    }
+
+    async fn wait_for_access_readiness(
+        manager: &BilibiliLoginManager,
+        path: &Path,
+        expected: CredentialReadiness,
+    ) -> ProfileCredentials {
+        for _ in 0..200 {
+            let loaded = load_profile_bundle(path, "default").expect("profile remains readable");
+            if manager.readiness("default", &loaded.credentials).access_key == expected {
+                return loaded;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("access-key readiness did not reach the expected state");
+    }
+
+    async fn wait_for_profile_release(manager: &BilibiliLoginManager, profile_id: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !manager
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .active_profiles
+                    .contains_key(profile_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("profile operation is released");
+    }
+
+    async fn start_successful_web_login(
+        manager: &BilibiliLoginManager,
+        path: &Path,
+    ) -> BilibiliLoginSession {
+        let session = manager
+            .start("default".to_owned(), Some(path.to_path_buf()))
+            .await
+            .expect("Web QR session starts");
+        let terminal = wait_terminal(manager, &session.id).await;
+        assert_eq!(BilibiliLoginSessionState::Ready, terminal.state());
+        terminal
+    }
+
+    #[tokio::test]
+    async fn web_login_verifies_and_preserves_existing_access_key_without_waiting_for_maintenance()
+    {
+        let (_temp, path) = temp_store();
+        seed_profile_with_preserved_access_key(&path);
+        let manager = successful_web_login_manager(Arc::new(FakeCredentialProvider::default()));
+
+        let session = start_successful_web_login(&manager, &path).await;
+        let loaded = wait_for_access_readiness(&manager, &path, CredentialReadiness::Ready).await;
+
+        assert_eq!(BilibiliLoginSessionState::Ready, session.state());
+        assert_eq!(Some(WEB_COOKIE_A), loaded.credentials.cookie.as_deref());
+        assert_eq!(Some(ACCESS_KEY_A), loaded.credentials.access_key.as_deref());
+        assert_eq!(
+            Some(REFRESH_TOKEN_B),
+            loaded
+                .secrets
+                .access_key_provider(AccessKeyProvider::BalhBiliplus)
+                .and_then(|secret| secret.refresh_token.as_deref())
+        );
+        assert_eq!(
+            Some(WEB_COOKIE_B),
+            CredentialStore::new(path)
+                .load_profiles()
+                .expect("profiles remain")
+                .profile("other")
+                .expect("other profile remains")
+                .cookie
+                .as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn web_login_marks_rejected_preserved_access_key_login_required() {
+        let (_temp, path) = temp_store();
+        seed_profile_with_preserved_access_key(&path);
+        let credential_provider = Arc::new(FakeCredentialProvider::default());
+        credential_provider.set_identity(
+            CredentialKind::AccessKey,
+            ACCESS_KEY_A,
+            FakeIdentityOutcome::Rejected,
+        );
+        let manager = successful_web_login_manager(credential_provider);
+
+        start_successful_web_login(&manager, &path).await;
+        let loaded =
+            wait_for_access_readiness(&manager, &path, CredentialReadiness::LoginRequired).await;
+
+        assert_eq!(Some(ACCESS_KEY_A), loaded.credentials.access_key.as_deref());
+        assert_eq!(Some(WEB_COOKIE_A), loaded.credentials.cookie.as_deref());
+    }
+
+    #[tokio::test]
+    async fn web_login_keeps_preserved_access_key_unavailable_when_provider_fails() {
+        let (_temp, path) = temp_store();
+        seed_profile_with_preserved_access_key(&path);
+        let credential_provider = Arc::new(FakeCredentialProvider::default());
+        credential_provider.set_identity(
+            CredentialKind::AccessKey,
+            ACCESS_KEY_A,
+            FakeIdentityOutcome::Unavailable,
+        );
+        let manager = successful_web_login_manager(credential_provider);
+
+        start_successful_web_login(&manager, &path).await;
+        let loaded =
+            wait_for_access_readiness(&manager, &path, CredentialReadiness::Unavailable).await;
+
+        assert_eq!(Some(ACCESS_KEY_A), loaded.credentials.access_key.as_deref());
+        assert_eq!(Some(WEB_COOKIE_A), loaded.credentials.cookie.as_deref());
+    }
+
+    #[tokio::test]
+    async fn stale_web_login_access_key_probe_cannot_overwrite_newer_profile_readiness() {
+        let (_temp, path) = temp_store();
+        seed_profile_with_preserved_access_key(&path);
+        let credential_provider = Arc::new(FakeCredentialProvider::default());
+        let (started, resume) = credential_provider.pause_next_access_key_identity_with_release();
+        let manager = successful_web_login_manager(credential_provider);
+
+        let session = start_successful_web_login(&manager, &path).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("targeted access-key verification starts");
+        assert_eq!(
+            BilibiliLoginSessionState::Ready,
+            manager
+                .get(&session.id)
+                .expect("completed Web session remains queryable")
+                .state()
+        );
+        let checking = load_profile_bundle(&path, "default").expect("profile remains readable");
+        assert_eq!(
+            CredentialReadiness::Checking,
+            manager
+                .readiness("default", &checking.credentials)
+                .access_key
+        );
+
+        CredentialStore::new(path.clone())
+            .update_profiles(|profiles| {
+                let mut current = profiles.profile("default").unwrap_or_default();
+                current.access_key = Some(ACCESS_KEY_B.to_owned());
+                profiles.set_profile("default", current)
+            })
+            .expect("replace the profile key during verification");
+        let observed_binding =
+            match bilibili_credential_bindings::lookup(&path, "default", WEB_COOKIE_A)
+                .expect("binding remains readable")
+            {
+                BindingLookup::Matches(binding) => binding,
+                _ => panic!("Web binding is present after login"),
+            };
+        bilibili_credential_bindings::replace(
+            &path,
+            "default",
+            WEB_COOKIE_A,
+            31_002,
+            Some(&observed_binding),
+        )
+        .expect("replace the binding during verification");
+        let changed = load_profile_bundle(&path, "default").expect("updated profile remains");
+        manager.set_readiness(
+            "default",
+            &changed.credentials,
+            CredentialReadinessSnapshot {
+                web: CredentialReadiness::Ready,
+                access_key: CredentialReadiness::Ready,
+            },
+        );
+
+        resume.notify_one();
+        wait_for_profile_release(&manager, "default").await;
+
+        let current = load_profile_bundle(&path, "default").expect("updated profile remains");
+        assert_eq!(BilibiliLoginSessionState::Ready, session.state());
+        assert_eq!(
+            Some(ACCESS_KEY_B),
+            current.credentials.access_key.as_deref()
+        );
+        assert_eq!(
+            CredentialReadiness::Ready,
+            manager
+                .readiness("default", &current.credentials)
+                .access_key
+        );
+        assert_eq!(
+            CredentialReadiness::Ready,
+            manager.readiness("default", &current.credentials).web
+        );
+        assert!(matches!(
+            bilibili_credential_bindings::lookup(&path, "default", WEB_COOKIE_A),
+            Ok(BindingLookup::Matches(binding)) if binding.account_id() == 31_002
+        ));
     }
 
     #[tokio::test]

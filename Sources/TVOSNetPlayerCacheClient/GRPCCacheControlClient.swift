@@ -793,7 +793,7 @@ public final class GRPCCacheControlClient: CacheControlClient {
 
     var loginStartCallOptions: CallOptions {
         var options = callOptions
-        options.timeout = max(rpcTimeout, .seconds(20))
+        options.timeout = max(rpcTimeout, .seconds(90))
         return options
     }
 

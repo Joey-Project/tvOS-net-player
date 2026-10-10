@@ -31,6 +31,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
+    private let loginStartTimeout: Duration
     private let pollInterval: Duration
     private let maximumPollingDuration: Duration
     private var serverAddressText = ""
@@ -50,11 +51,13 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
     public init(
         operationTimeout: Duration = .seconds(10),
+        loginStartTimeout: Duration? = nil,
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
         }
     ) {
         self.operationTimeout = operationTimeout
+        self.loginStartTimeout = loginStartTimeout ?? max(.seconds(90), operationTimeout)
         pollInterval = .seconds(2)
         maximumPollingDuration = .seconds(180)
         self.clientFactory = clientFactory
@@ -62,11 +65,13 @@ public final class BilibiliLoginViewModel: ObservableObject {
 
     init(
         operationTimeout: Duration = .seconds(10),
+        loginStartTimeout: Duration? = nil,
         pollInterval: Duration,
         maximumPollingDuration: Duration = .seconds(180),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient
     ) {
         self.operationTimeout = operationTimeout
+        self.loginStartTimeout = loginStartTimeout ?? max(.seconds(90), operationTimeout)
         self.pollInterval = pollInterval
         self.maximumPollingDuration = maximumPollingDuration
         self.clientFactory = clientFactory
@@ -169,7 +174,7 @@ public final class BilibiliLoginViewModel: ObservableObject {
         let profileID = activeProfileID
 
         do {
-            let session = try await Self.withTimeout(max(operationTimeout, .seconds(20))) {
+            let session = try await Self.withTimeout(loginStartTimeout) {
                 try await client.startBilibiliLoginSession(profileID: profileID, method: method)
             }
             guard isCurrent(requestSequence, endpoint: endpoint),
@@ -287,8 +292,9 @@ public final class BilibiliLoginViewModel: ObservableObject {
             credentials.webCookieReadiness == .missing
             || credentials.webCookieReadiness == .loginRequired
         accessKeyLoginAllowed =
-            credentials.accessKeyReadiness == .missing
-            || credentials.accessKeyReadiness == .loginRequired
+            (credentials.accessKeyReadiness == .missing
+                || credentials.accessKeyReadiness == .loginRequired)
+            && credentials.webCookieReadiness == .ready
 
         if credentials.webCookieReadiness == .ready || credentials.accessKeyReadiness == .ready {
             status = .authenticated

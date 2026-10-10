@@ -6,6 +6,8 @@ use std::{
 };
 
 use bbdown_core::{CredentialProfileSelection, CredentialStore};
+use http::Uri;
+use icu_properties::{CodePointMapData, props::GeneralCategory};
 use url::Url;
 
 use crate::{task_output::MAX_TASK_RESOURCE_BASE_URI_BYTES, task_registry::TaskRetentionPolicy};
@@ -13,6 +15,8 @@ use crate::{task_output::MAX_TASK_RESOURCE_BASE_URI_BYTES, task_registry::TaskRe
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const DEFAULT_HLS_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 const RESERVED_CACHE_NAMESPACE: &str = ".tvos-net-player";
+const MAX_BILIBILI_LOGIN_URI_BYTES: usize = 4 * 1024;
+const BILIBILI_LOGIN_VERIFICATION_SUFFIX_BYTES: usize = "/login/bilibili/".len() + 36 + 1 + 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheServerOptions {
@@ -270,6 +274,8 @@ impl CacheServerOptions {
             .public_media_base_uri
             .as_deref()
             .unwrap_or(&self.media_listen_url);
+        // Inspect the supplied path before Url parsing can normalize dot segments.
+        validate_bilibili_login_base_path(candidate).ok()?;
         validate_public_media_base_uri(candidate).ok()?;
         let url = Url::parse(candidate).ok()?;
         if self.public_media_base_uri.is_none() && url.scheme() != "http" {
@@ -278,7 +284,17 @@ impl CacheServerOptions {
         match url.host()? {
             url::Host::Ipv4(address) if address.is_unspecified() => None,
             url::Host::Ipv6(address) if address.is_unspecified() => None,
-            _ => Some(url.as_str().trim_end_matches('/').to_owned()),
+            _ => {
+                let base_uri = url.as_str().trim_end_matches('/');
+                if base_uri
+                    .len()
+                    .saturating_add(BILIBILI_LOGIN_VERIFICATION_SUFFIX_BYTES)
+                    > MAX_BILIBILI_LOGIN_URI_BYTES
+                {
+                    return None;
+                }
+                Some(base_uri.to_owned())
+            }
         }
     }
 
@@ -511,6 +527,136 @@ fn validate_public_media_base_uri(value: &str) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+fn validate_bilibili_login_base_path(value: &str) -> Result<(), ConfigError> {
+    let invalid_path =
+        || ConfigError::new("Public media base URI path is not compatible with Bilibili login.");
+    if value.len() > MAX_BILIBILI_LOGIN_URI_BYTES
+        || value.chars().any(is_foundation_control_character)
+    {
+        return Err(invalid_path());
+    }
+
+    let parser_uri = escape_for_http_uri_parser(value);
+    let uri = parser_uri.parse::<Uri>().map_err(|_| invalid_path())?;
+    let mut path = uri.path();
+    if !path.is_empty() && !path.starts_with('/') {
+        return Err(invalid_path());
+    }
+    if path.starts_with('/') {
+        path = &path[1..];
+    }
+    if path.starts_with('/') {
+        return Err(invalid_path());
+    }
+    if path.ends_with('/') {
+        path = &path[..path.len() - 1];
+    }
+    if path.ends_with('/') || path.contains("//") {
+        return Err(invalid_path());
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    if !path.split('/').all(is_client_safe_login_path_component) {
+        return Err(invalid_path());
+    }
+    Ok(())
+}
+
+fn escape_for_http_uri_parser(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if is_uri_ascii_character(character) {
+            escaped.push(character);
+        } else {
+            let mut buffer = [0; 4];
+            escaped.push_str(urlencoding::encode(character.encode_utf8(&mut buffer)).as_ref());
+        }
+    }
+    escaped
+}
+
+fn is_uri_ascii_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
+}
+
+fn is_client_safe_login_path_component(component: &str) -> bool {
+    let mut current = component.to_owned();
+    for _ in 0..9 {
+        if !has_well_formed_percent_encoding(&current) {
+            return false;
+        }
+        let Ok(decoded) = urlencoding::decode(&current) else {
+            return false;
+        };
+        let decoded = decoded.as_ref();
+        if decoded == "."
+            || decoded == ".."
+            || decoded.contains('/')
+            || decoded.contains('\\')
+            || decoded.chars().any(is_foundation_control_character)
+        {
+            return false;
+        }
+        if decoded == current {
+            return true;
+        }
+        current = decoded.to_owned();
+    }
+    !current.contains('%')
+}
+
+fn has_well_formed_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || !bytes[index + 1].is_ascii_hexdigit()
+            || !bytes[index + 2].is_ascii_hexdigit()
+        {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
+fn is_foundation_control_character(character: char) -> bool {
+    matches!(
+        CodePointMapData::<GeneralCategory>::new().get(character),
+        GeneralCategory::Control | GeneralCategory::Format
+    )
 }
 
 fn parse_bool(value: &str) -> Result<bool, ConfigError> {
@@ -875,6 +1021,179 @@ mod tests {
             Some("https://atri.ink/cache".to_owned()),
             options.bilibili_login_base_uri()
         );
+    }
+
+    #[test]
+    fn login_origin_accepts_safe_encoded_space_unicode_and_embedded_dots() {
+        for (uri, expected) in [
+            (
+                "https://cache.example.test/cache%20folder",
+                "https://cache.example.test/cache%20folder",
+            ),
+            (
+                "https://cache.example.test/缓存 folder",
+                "https://cache.example.test/%E7%BC%93%E5%AD%98%20folder",
+            ),
+            (
+                "https://cache.example.test/%E7%BC%93%E5%AD%98",
+                "https://cache.example.test/%E7%BC%93%E5%AD%98",
+            ),
+            (
+                "https://cache.example.test/cache..metadata",
+                "https://cache.example.test/cache..metadata",
+            ),
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(uri.to_owned()),
+                ..CacheServerOptions::default()
+            };
+            assert_eq!(
+                Some(expected.to_owned()),
+                options.bilibili_login_base_uri(),
+                "{uri}"
+            );
+        }
+
+        let mut eight_decode_encoded_space = "%20".to_owned();
+        for _ in 0..7 {
+            eight_decode_encoded_space =
+                urlencoding::encode(&eight_decode_encoded_space).into_owned();
+        }
+        let uri = format!("https://cache.example.test/cache{eight_decode_encoded_space}");
+        let options = CacheServerOptions {
+            public_media_base_uri: Some(uri.clone()),
+            ..CacheServerOptions::default()
+        };
+        assert_eq!(Some(uri), options.bilibili_login_base_uri());
+    }
+
+    #[test]
+    fn login_origin_rejects_paths_the_client_cannot_consume() {
+        let mut nine_decode_encoded_dot = "%2e".to_owned();
+        for _ in 0..8 {
+            nine_decode_encoded_dot = urlencoding::encode(&nine_decode_encoded_dot).into_owned();
+        }
+        let nine_decode_dot_uri =
+            format!("https://cache.example.test/{nine_decode_encoded_dot}/private");
+        let mut nine_decode_encoded_percent = "%".to_owned();
+        for _ in 0..9 {
+            nine_decode_encoded_percent =
+                urlencoding::encode(&nine_decode_encoded_percent).into_owned();
+        }
+        let nine_decode_percent_uri =
+            format!("https://cache.example.test/{nine_decode_encoded_percent}");
+        for uri in [
+            "https://cache.example.test/cache%2Fprivate",
+            "https://cache.example.test/cache%5cprivate",
+            "https://cache.example.test/%2e/private",
+            "https://cache.example.test/cache/%2e%2e/private",
+            "https://cache.example.test/%252Fprivate",
+            "https://cache.example.test/cache/%252e%252e/private",
+            "https://cache.example.test/cache//private",
+            "https://cache.example.test/cache%2/private",
+            "https://cache.example.test/cache%GG/private",
+            "https://cache.example.test/cache%01/private",
+            "https://cache.example.test/cache%E2%80%8E/private",
+            nine_decode_dot_uri.as_str(),
+            nine_decode_percent_uri.as_str(),
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(uri.to_owned()),
+                ..CacheServerOptions::default()
+            };
+            assert_eq!(None, options.bilibili_login_base_uri(), "{uri}");
+        }
+
+        let raw_control = CacheServerOptions {
+            public_media_base_uri: Some("https://cache.example.test/cache\u{200e}".to_owned()),
+            ..CacheServerOptions::default()
+        };
+        assert_eq!(None, raw_control.bilibili_login_base_uri());
+        let raw_cc = CacheServerOptions {
+            public_media_base_uri: Some("https://cache.example.test/cache\u{0001}".to_owned()),
+            ..CacheServerOptions::default()
+        };
+        assert_eq!(None, raw_cc.bilibili_login_base_uri());
+    }
+
+    #[test]
+    fn login_path_restrictions_do_not_change_generic_media_uri_validation() {
+        for uri in [
+            "https://cache.example.test/cache%2Fprivate",
+            "https://cache.example.test/cache/%252e%252e/private",
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(uri.to_owned()),
+                ..CacheServerOptions::default()
+            };
+            options
+                .validate()
+                .expect("login-specific path checks must not tighten generic media validation");
+            let normalized = options.normalized_for_runtime();
+            assert_eq!(Some(uri), normalized.public_media_base_uri.as_deref());
+            assert_eq!(None, normalized.bilibili_login_base_uri());
+        }
+    }
+
+    #[test]
+    fn login_origin_checks_the_runtime_advertised_path_after_normalization() {
+        for input in [
+            "https://cache.example.test/cache/../safe",
+            "https://cache.example.test/cache/%2e%2e/safe",
+        ] {
+            let options = CacheServerOptions {
+                public_media_base_uri: Some(input.to_owned()),
+                ..CacheServerOptions::default()
+            };
+            options
+                .validate()
+                .expect("generic media URI validation must retain its existing behavior");
+            assert_eq!(None, options.bilibili_login_base_uri(), "{input}");
+
+            let normalized = options.normalized_for_runtime();
+            assert_eq!(
+                Some("https://cache.example.test/safe"),
+                normalized.public_media_base_uri.as_deref()
+            );
+            assert_eq!(
+                Some("https://cache.example.test/safe".to_owned()),
+                normalized.bilibili_login_base_uri()
+            );
+        }
+
+        let nested = CacheServerOptions {
+            public_media_base_uri: Some(
+                "https://cache.example.test/cache/%252e%252e/safe".to_owned(),
+            ),
+            ..CacheServerOptions::default()
+        }
+        .normalized_for_runtime();
+        assert_eq!(
+            Some("https://cache.example.test/cache/%252e%252e/safe"),
+            nested.public_media_base_uri.as_deref()
+        );
+        assert_eq!(None, nested.bilibili_login_base_uri());
+    }
+
+    #[test]
+    fn issued_login_verification_uri_fits_the_client_byte_limit() {
+        let prefix = "https://cache.example.test/";
+        let path_len = MAX_TASK_RESOURCE_BASE_URI_BYTES - prefix.len();
+        let options = CacheServerOptions {
+            public_media_base_uri: Some(format!("{prefix}{}", "a".repeat(path_len))),
+            ..CacheServerOptions::default()
+        };
+        options
+            .validate()
+            .expect("base at the existing canonical media URI limit is valid");
+        let base = options
+            .bilibili_login_base_uri()
+            .expect("valid public base should advertise login");
+        let verification_uri_len = base.len() + BILIBILI_LOGIN_VERIFICATION_SUFFIX_BYTES;
+
+        assert_eq!(MAX_TASK_RESOURCE_BASE_URI_BYTES, base.len());
+        assert_eq!(2165, verification_uri_len);
+        assert!(verification_uri_len <= MAX_BILIBILI_LOGIN_URI_BYTES);
     }
 
     #[test]

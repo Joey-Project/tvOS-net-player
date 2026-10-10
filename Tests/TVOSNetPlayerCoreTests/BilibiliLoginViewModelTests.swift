@@ -83,12 +83,14 @@ final class BilibiliLoginViewModelTests: XCTestCase {
             serverInfo: .fixture(capabilities: [
                 CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliLoginSessions,
+                CacheServerCapability.bilibiliAccessKeyLogin,
                 CacheServerCapability.bilibiliCredentialReadiness,
             ]),
             credentialStatus: .fixture(
                 credentialFileLoaded: false,
                 state: "notConfigured",
-                webCookieReadiness: .missing
+                webCookieReadiness: .missing,
+                accessKeyReadiness: .loginRequired
             )
         )
         let model = BilibiliLoginViewModel(clientFactory: { _ in client })
@@ -98,6 +100,16 @@ final class BilibiliLoginViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, .loginRequired)
         XCTAssertTrue(model.canStartLogin)
         XCTAssertFalse(model.canStartAccessKeyLogin)
+        await model.startAccessKeyLogin()
+        let deniedLoginStartCount = await client.loginStartCount
+        XCTAssertEqual(deniedLoginStartCount, 0)
+
+        await model.startLogin()
+
+        XCTAssertEqual(model.status, .sessionPending)
+        let requestedMethod = await client.requestedMethod
+        XCTAssertEqual(requestedMethod, .webQR)
+        model.deactivate()
     }
 
     @MainActor
@@ -136,7 +148,7 @@ final class BilibiliLoginViewModelTests: XCTestCase {
     }
 
     @MainActor
-    func testReadyWebLoginCanCompleteThenStartMissingAccessKeyHandoff() async {
+    func testCleanProfileRequiresWebLoginBeforeMissingAccessKeyHandoff() async {
         let sessionID = "00000000-0000-4000-8000-000000000001"
         let browserSession = BilibiliLoginSession(
             id: sessionID,
@@ -160,7 +172,7 @@ final class BilibiliLoginViewModelTests: XCTestCase {
             credentialStatus: .fixture(
                 credentialFileLoaded: false,
                 state: "notConfigured",
-                webCookieReadiness: .loginRequired,
+                webCookieReadiness: .missing,
                 accessKeyReadiness: .missing
             ),
             credentialStatusAfterLogin: .fixture(
@@ -175,6 +187,11 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 
         await model.activate(serverAddressText: "cache.local")
         XCTAssertTrue(model.canStartLogin)
+        XCTAssertFalse(model.canStartAccessKeyLogin)
+        await model.startAccessKeyLogin()
+        let deniedLoginStartCount = await client.loginStartCount
+        XCTAssertEqual(deniedLoginStartCount, 0)
+
         await model.startLogin()
 
         XCTAssertEqual(model.status, .authenticated)
@@ -324,7 +341,10 @@ final class BilibiliLoginViewModelTests: XCTestCase {
                     ],
                     mediaBaseURIs: ["\(origin)/media"]
                 ),
-                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                credentialStatus: .fixture(
+                    webCookieReadiness: .ready,
+                    accessKeyReadiness: .loginRequired
+                ),
                 newSession: session
             )
             let model = BilibiliLoginViewModel(clientFactory: { _ in client })
@@ -368,7 +388,10 @@ final class BilibiliLoginViewModelTests: XCTestCase {
                         CacheServerCapability.bilibiliAccessKeyLogin,
                         CacheServerCapability.bilibiliCredentialReadiness,
                     ], mediaBaseURIs: [baseURI]),
-                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                credentialStatus: .fixture(
+                    webCookieReadiness: .ready,
+                    accessKeyReadiness: .loginRequired
+                ),
                 newSession: session
             )
             let model = BilibiliLoginViewModel(clientFactory: { _ in client })
@@ -428,7 +451,10 @@ final class BilibiliLoginViewModelTests: XCTestCase {
                     ],
                     mediaBaseURIs: ["http://cache.local/media"]
                 ),
-                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                credentialStatus: .fixture(
+                    webCookieReadiness: .ready,
+                    accessKeyReadiness: .loginRequired
+                ),
                 newSession: session
             )
             let model = BilibiliLoginViewModel(clientFactory: { _ in client })
@@ -476,7 +502,10 @@ final class BilibiliLoginViewModelTests: XCTestCase {
                         CacheServerCapability.bilibiliAccessKeyLogin,
                         CacheServerCapability.bilibiliCredentialReadiness,
                     ], mediaBaseURIs: [baseURI]),
-                credentialStatus: .fixture(accessKeyReadiness: .loginRequired),
+                credentialStatus: .fixture(
+                    webCookieReadiness: .ready,
+                    accessKeyReadiness: .loginRequired
+                ),
                 newSession: session
             )
             let model = BilibiliLoginViewModel(clientFactory: { _ in client })
@@ -611,6 +640,7 @@ final class BilibiliLoginViewModelTests: XCTestCase {
         )
         let model = BilibiliLoginViewModel(
             operationTimeout: .milliseconds(20),
+            loginStartTimeout: .milliseconds(150),
             pollInterval: .seconds(2),
             clientFactory: { _ in client }
         )
@@ -620,6 +650,34 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 
         XCTAssertEqual(model.status, .sessionPending)
         XCTAssertNotNil(model.verificationQRPayload)
+        model.deactivate()
+    }
+
+    @MainActor
+    func testLoginStartUsesSeparateBoundedTimeout() async {
+        let client = LoginClient(
+            serverInfo: .fixture(capabilities: [
+                CacheServerCapability.bilibiliCredentialStatus,
+                CacheServerCapability.bilibiliLoginSessions,
+            ]),
+            credentialStatus: .fixture(),
+            startDelay: .milliseconds(120)
+        )
+        let model = BilibiliLoginViewModel(
+            operationTimeout: .milliseconds(20),
+            loginStartTimeout: .milliseconds(50),
+            pollInterval: .seconds(2),
+            clientFactory: { _ in client }
+        )
+
+        await model.activate(serverAddressText: "mac-mini.local")
+        await model.startLogin()
+
+        XCTAssertEqual(model.status, .failed)
+        XCTAssertFalse(model.isStartingLogin)
+        XCTAssertNil(model.verificationQRPayload)
+        let loginStartCount = await client.loginStartCount
+        XCTAssertEqual(loginStartCount, 1)
         model.deactivate()
     }
 

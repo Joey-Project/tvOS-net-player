@@ -157,7 +157,7 @@ BBDown adapter 相关配置：
 - `Cache:BBDownCredentialPath`: BBDown credential JSON 文件路径，字段兼容 `bbdown-core` 的 `cookie`、`access_key` 和 `tv_access_key`。不要把这个文件提交到仓库。
 - `Cache:BBDownCredentialProfile`: 可选 BBDown credential profile 名称；设置后 server 会从 `Cache:BBDownCredentialPath` 指向的 profile store 读取该 profile。未设置时继续使用 credential store 的默认 profile。
 - `Cache:AllowBilibiliLoginSessions`: 是否允许 LAN 客户端发起服务器管理的 Web QR 和通用 key 登录。默认 `false`；仅在可信 LAN 上显式设为 `true`，并同时配置 `Cache:BBDownCredentialPath` 指向不纳入版本控制的私有 JSON 路径。Mac mini 负责创建票据、轮询或验证回调、校验账号并保存凭据；tvOS/macOS 只发起登录、显示短时二维码或链接并查询脱敏状态。健康凭据直接复用；server 每 15 分钟检查所选 profile，并在有 refresh material 且提供方要求刷新时续期 Web cookie。新请求读取最新凭据，不需要重启服务器。
-- Web QR 重新登录只能更新已验证的同一账号，保留其他凭据、profile 和默认 profile。server 在 credential 文件旁保存私有的 `.bilibili-bindings.json` 账号绑定；备份时应一并保留。过期 cookie 若没有可信的既有绑定，会拒绝自动替换，不把重新扫码当作账号切换入口。
+- Web QR 重新登录只能更新已验证的同一账号，保留其他凭据、profile 和默认 profile。server 在 credential 文件旁保存私有的 `.bilibili-bindings.json` 账号绑定；备份时应一并保留。过期 cookie 若没有可信的既有绑定，会拒绝自动替换，不把重新扫码当作账号切换入口。新 profile 先完成 Web 登录，再获取通用 key；Web 登录成功后，server 会立即在后台复检保留的旧 key，不必等待下一个 15 分钟检查周期。登录启动默认至少等待 90 秒，不影响普通状态查询和轮询的超时。
 - BiliPlus/BALH 通用 `access_key` 登录通过 server 的 `/login/bilibili/<session>` 页面和一次性回调完成，必须先有已验证的同账号 Web credential。请把 `Cache:PublicMediaBaseUri` 配置成浏览器和客户端均可访问的 LAN HTTP 地址或反代 HTTPS 地址；支持路径前缀，反代必须保留配置的 `Host` 并正确移除路由前缀。未配置具体可用 origin 的 wildcard listener 不提供该登录能力。登录页只接受签发的提供方窗口、origin、短时一次性 capability，并由 server 校验账号后保存；客户端 app 没有提交 cookie、key、refresh token 或切换账号的 RPC。
 - 凭据存在不等于已验证可用。新的 credential readiness 状态区分检查中、可用、需要登录和暂时不可验证；网络故障不会被静默当作凭据失效。当前 gRPC 和 LAN HTTP 仍未鉴权、未加密，二维码及登录链接包含短时授权票据；不要直接暴露到公网，反代部署需要另行提供访问控制。
 - `Cache:BBDownRestrictedArea`: restricted-area 优先区域，可选 `cn`、`th`、`hk` 或 `tw`。
