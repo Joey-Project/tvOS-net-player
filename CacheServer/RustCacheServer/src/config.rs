@@ -630,7 +630,7 @@ fn is_client_safe_login_path_component(component: &str) -> bool {
         }
         current = decoded.to_owned();
     }
-    !current.contains('%')
+    false
 }
 
 fn has_well_formed_percent_encoding(value: &str) -> bool {
@@ -1065,6 +1065,36 @@ mod tests {
             ..CacheServerOptions::default()
         };
         assert_eq!(Some(uri), options.bilibili_login_base_uri());
+    }
+
+    #[test]
+    fn login_path_components_require_stabilization_within_nine_passes() {
+        for (component, encoded) in [
+            ("cache folder", "cache%20folder"),
+            ("cache..metadata", "%63ache..metadata"),
+            ("缓存", "%E7%BC%93%E5%AD%98"),
+        ] {
+            let mut encoded = encoded.to_owned();
+            for _ in 0..7 {
+                encoded = urlencoding::encode(&encoded).into_owned();
+            }
+            assert!(
+                is_client_safe_login_path_component(&encoded),
+                "8 transformations should leave one pass to stabilize: {component}"
+            );
+
+            encoded = urlencoding::encode(&encoded).into_owned();
+            assert!(
+                !is_client_safe_login_path_component(&encoded),
+                "9 transformations leave no pass to stabilize: {component}"
+            );
+
+            encoded = urlencoding::encode(&encoded).into_owned();
+            assert!(
+                !is_client_safe_login_path_component(&encoded),
+                "10 transformations leave no pass to stabilize: {component}"
+            );
+        }
     }
 
     #[test]
