@@ -91,7 +91,7 @@ BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300 \
 just test-bilibili-live
 ```
 
-认证 feed 的长时间验证可以显式选择 following，或通过 `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL` 指定当前可用的公开 uploader 动态页。空 feed、上游拒绝和默认样例不可用都保留为失败，不能降低候选数要求来算作通过：
+认证 feed 的长时间验证可以显式选择 following，或使用默认公开 uploader 动态样例 `https://space.bilibili.com/441167301/dynamic`，也可通过 `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL` 覆盖。仓库 pin 的 `bbdown-core v0.9.0` commit `e422a159cdf70c5bec72b4120e2a70e5bd749088` 包含个人空间动态的 WBI 签名修复。空 feed、上游拒绝和默认样例不可用都保留为失败，不能降低候选数要求来算作通过；API 返回成功也不等于视频已可播放：
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
