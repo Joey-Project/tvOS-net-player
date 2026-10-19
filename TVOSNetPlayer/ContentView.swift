@@ -486,7 +486,11 @@ struct ContentView: View {
             if bilibiliModel.isWaitingForCandidateSelection {
                 Picker("Selection Mode", selection: $bilibiliModel.candidateSelectionMode) {
                     ForEach(bilibiliModel.availableCandidateSelectionModes) { mode in
-                        Text(mode.title).tag(mode)
+                        Text(
+                            mode == .all && bilibiliModel.isResolvedCandidateWindowTruncated
+                                ? "Window"
+                                : mode.title
+                        ).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -557,6 +561,12 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(bilibiliModel.candidateSelectionMode == .all)
+                            .task(id: candidate.selectionID) {
+                                await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
+                                    appearingCandidateID: candidate.selectionID,
+                                    serverAddressText: cacheModel.serverAddressText
+                                )
+                            }
                         }
                     }
                 }
@@ -571,7 +581,11 @@ struct ContentView: View {
                         }
                     } label: {
                         Label(
-                            bilibiliModel.isLoadingMoreCandidates ? "Loading Candidates" : "Load More Candidates",
+                            bilibiliModel.isLoadingMoreCandidates
+                                ? "Loading Candidates"
+                                : (bilibiliModel.canRetryResolvedCandidatePage
+                                    ? "Retry Loading Candidates"
+                                    : "Load More Candidates"),
                             systemImage: bilibiliModel.isLoadingMoreCandidates
                                 ? "hourglass"
                                 : "chevron.down.circle"
@@ -860,9 +874,12 @@ struct ContentView: View {
     private var candidatePaginationSummary: String {
         let count = bilibiliModel.resolvedCandidates.count
         let noun = count == 1 ? "candidate" : "candidates"
-        return bilibiliModel.hasMoreResolvedCandidates
-            ? "\(count) \(noun) loaded | more available"
-            : "\(count) \(noun) loaded | all available"
+        if bilibiliModel.hasMoreResolvedCandidates {
+            return "\(count) \(noun) loaded | more items available"
+        }
+        return bilibiliModel.isResolvedCandidateWindowTruncated
+            ? "\(count) \(noun) loaded | limited list ended"
+            : "\(count) \(noun) loaded | full list loaded"
     }
 
     private func taskResultsPaginationSummary(totalCount: Int) -> String {

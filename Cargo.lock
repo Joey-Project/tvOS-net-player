@@ -124,8 +124,8 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bbdown-core"
-version = "0.7.0"
-source = "git+https://github.com/Joey-Project/BBDown-rust?rev=c9e8cba1a68689320c58ebaf61a6351b550b1b09#c9e8cba1a68689320c58ebaf61a6351b550b1b09"
+version = "0.10.0"
+source = "git+https://github.com/Joey-Project/BBDown-rust?rev=03baba367d846379f5fd4bddabc4784d1b0de8e7#03baba367d846379f5fd4bddabc4784d1b0de8e7"
 dependencies = [
  "base64",
  "flate2",
@@ -136,6 +136,7 @@ dependencies = [
  "prost",
  "rand 0.8.8",
  "reqwest",
+ "roxmltree",
  "rsa",
  "serde",
  "serde_json",
@@ -1448,6 +1449,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

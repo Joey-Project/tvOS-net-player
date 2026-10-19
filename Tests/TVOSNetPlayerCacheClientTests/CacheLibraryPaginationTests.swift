@@ -232,6 +232,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         proto.session.createdAt.nanos = 250_000_000
         proto.session.expiresAt.seconds = 1_000
         proto.session.defaultCandidateToken = "candidate-default"
+        proto.session.candidatesTruncated = true
         proto.session.context.apiMode = .web
         proto.session.context.credentialProfileID = "restricted-bangumi"
 
@@ -259,6 +260,7 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(page.session.createdAt, Date(timeIntervalSince1970: 100.25))
         XCTAssertEqual(page.session.expiresAt, Date(timeIntervalSince1970: 1_000))
         XCTAssertEqual(page.session.defaultCandidateToken, "candidate-default")
+        XCTAssertTrue(page.session.candidatesTruncated)
         XCTAssertEqual(
             page.session.context,
             BilibiliRequestContext(apiMode: .web, credentialProfileID: "restricted-bangumi")
@@ -280,6 +282,26 @@ final class CacheLibraryPaginationTests: XCTestCase {
         XCTAssertEqual(page.nextPageToken, "opaque-page-2")
         XCTAssertEqual(page.snapshotID, "snapshot-1")
         XCTAssertTrue(page.hasMoreCandidates)
+    }
+
+    func testBilibiliResolutionSessionTruncationDefaultsFalseForOlderWireData() {
+        var proto = TvosNetPlayer_V1_BilibiliResolutionPage()
+        proto.session.id = "legacy-resolution-session"
+
+        let page = BilibiliResolutionPage(proto)
+
+        XCTAssertFalse(page.session.candidatesTruncated)
+        XCTAssertFalse(
+            BilibiliResolutionSession(
+                id: "source-compatible-session",
+                source: "BV1legacy",
+                title: "Legacy session",
+                sourceKind: "video",
+                createdAt: nil,
+                expiresAt: nil,
+                defaultCandidateToken: "candidate-1"
+            ).candidatesTruncated
+        )
     }
 
     func testBilibiliResolutionPagePreservesUnknownContentKind() {

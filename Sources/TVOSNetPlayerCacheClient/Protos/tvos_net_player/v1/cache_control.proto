@@ -422,6 +422,9 @@ message BilibiliResolutionSession {
   google.protobuf.Timestamp expires_at = 6;
   string default_candidate_token = 7;
   BilibiliRequestContext context = 8;
+  // total_size and page tokens cover the frozen bounded window; true means upstream enumeration was incomplete.
+  // It does not imply another page is available in this snapshot. Older wire data defaults to false.
+  bool candidates_truncated = 9;
 }
 
 message BilibiliResolutionCandidate {

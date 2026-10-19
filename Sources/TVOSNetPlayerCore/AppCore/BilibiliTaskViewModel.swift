@@ -485,6 +485,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let defaults: UserDefaults
     private let clientFactory: @Sendable (CacheServerEndpoint) -> any CacheControlClient
     private let operationTimeout: Duration
+    private let resolutionTimeout: Duration
     private var activeEndpoint: CacheServerEndpoint?
     private var mediaBaseURIs: [String] = []
     private var resolvedInputContext: BilibiliResolvedInputContext?
@@ -500,6 +501,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private var resolutionSnapshotID = ""
     private var resolutionTotalSize: UInt64 = 0
     private var candidatePageSequence = 0
+    private var candidateAutoAttemptedPageTokens: Set<String> = []
     private var taskResultItems: [CacheTaskResult] = []
     private var taskResultPageToken = ""
     private var taskResultSnapshotID = ""
@@ -522,6 +524,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         playbackPolicy: BilibiliPlaybackPolicy? = nil,
         defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
+        resolutionTimeout: Duration = .seconds(120),
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
         }
@@ -536,6 +539,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         playbackCompatibleVariantPreference = initialPlaybackPolicy.compatibleVariantPreference
         playbackWeakNetworkPreference = initialPlaybackPolicy.weakNetworkPreference
         self.operationTimeout = operationTimeout
+        self.resolutionTimeout = resolutionTimeout
         self.clientFactory = clientFactory
     }
 
@@ -729,12 +733,17 @@ public final class BilibiliTaskViewModel: ObservableObject {
             {
                 return "Select a range of no more than 100 Bilibili items."
             }
-            return "Range \(start.displayTitle) to \(end.displayTitle) selects \(count) item\(count == 1 ? "" : "s")."
+            let windowSuffix = isResolvedCandidateWindowTruncated ? " in this limited list" : ""
+            return
+                ("Range \(start.displayTitle) to \(end.displayTitle) selects \(count) item\(count == 1 ? "" : "s")\(windowSuffix).")
         case .all:
             guard canSelectAllResolvedCandidates else {
                 return "All selection is available only for lists of up to 100 items."
             }
             let count = Int(resolutionTotalSize)
+            if isResolvedCandidateWindowTruncated {
+                return "All \(count) items in this limited list are selected."
+            }
             return "All \(count) Bilibili item\(count == 1 ? "" : "s") selected."
         }
     }
@@ -755,6 +764,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
             case .range:
                 return submissionMode == .download ? "Download Range" : "Submit Range"
             case .all:
+                if isResolvedCandidateWindowTruncated {
+                    return submissionMode == .download ? "Download Window" : "Submit Window"
+                }
                 return submissionMode == .download ? "Download All" : "Submit All"
             }
         }
@@ -812,6 +824,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         !resolutionPageToken.isEmpty && resolutionSession != nil
     }
 
+    public var isResolvedCandidateWindowTruncated: Bool {
+        resolutionSession?.candidatesTruncated ?? false
+    }
+
+    public var canRetryResolvedCandidatePage: Bool {
+        errorMessage != nil && statusMessage == "Could not load more Bilibili candidates."
+    }
+
     public var hasMoreTaskResults: Bool {
         guard !taskResultPageToken.isEmpty,
             let currentTask,
@@ -854,13 +874,23 @@ public final class BilibiliTaskViewModel: ObservableObject {
             )
         }
 
-        if resolvedInput.candidatesTruncated {
+        if isResolvedCandidateWindowTruncated {
+            return BilibiliFetchNotice(
+                title: "Limited list",
+                message: "Only part of the upstream list is included in this result.",
+                systemImage: "ellipsis",
+                tone: .info,
+                actionTitle: hasMoreResolvedCandidates ? "Load More" : nil
+            )
+        }
+
+        if hasMoreResolvedCandidates || resolvedInput.candidatesTruncated {
             return BilibiliFetchNotice(
                 title: "More items available",
-                message: "Load more candidates to browse the immutable Bilibili resolution.",
+                message: "Load more candidates from this frozen Bilibili result snapshot.",
                 systemImage: "arrow.down.to.line",
                 tone: .info,
-                actionTitle: "Load More"
+                actionTitle: hasMoreResolvedCandidates ? "Load More" : nil
             )
         }
 
@@ -1060,7 +1090,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 client: client,
                 source: source,
                 options: options,
-                operationTimeout: operationTimeout
+                operationTimeout: operationTimeout,
+                resolutionTimeout: resolutionTimeout
             )
 
             guard submissionMode == submittedMode else {
@@ -1229,7 +1260,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 client: client,
                 source: source,
                 options: options,
-                operationTimeout: operationTimeout
+                operationTimeout: operationTimeout,
+                resolutionTimeout: resolutionTimeout
             )
 
             guard sequence == operationSequence else {
@@ -1278,10 +1310,37 @@ public final class BilibiliTaskViewModel: ObservableObject {
         }
     }
 
+    public func loadMoreResolvedCandidatesIfNeeded(
+        appearingCandidateID: String,
+        serverAddressText: String
+    ) async {
+        let candidates = resolvedCandidates
+        guard !Task.isCancelled,
+            hasMoreResolvedCandidates,
+            !isLoadingMoreCandidates,
+            let candidateIndex = candidates.firstIndex(where: { $0.selectionID == appearingCandidateID }),
+            candidateIndex >= max(0, candidates.count - 3),
+            !candidateAutoAttemptedPageTokens.contains(resolutionPageToken)
+        else {
+            return
+        }
+
+        candidateAutoAttemptedPageTokens.insert(resolutionPageToken)
+        await loadMoreResolvedCandidatesPage(serverAddressText: serverAddressText)
+    }
+
     public func loadMoreResolvedCandidates(serverAddressText: String) async {
+        if !isLoadingMoreCandidates {
+            candidateAutoAttemptedPageTokens.remove(resolutionPageToken)
+        }
+        await loadMoreResolvedCandidatesPage(serverAddressText: serverAddressText)
+    }
+
+    private func loadMoreResolvedCandidatesPage(serverAddressText: String) async {
         guard !isLoadingMoreCandidates,
             hasMoreResolvedCandidates,
             let session = resolutionSession,
+            !Task.isCancelled,
             let endpoint = activeEndpoint ?? CacheServerEndpoint.normalized(from: serverAddressText)
         else {
             return
@@ -1294,10 +1353,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let snapshotID = resolutionSnapshotID
         isLoadingMoreCandidates = true
         errorMessage = nil
+        var wasCancelled = false
 
         defer {
-            if candidatePageSequence == pageSequence {
+            let isCurrentPage =
+                operation == operationSequence
+                && candidatePageSequence == pageSequence
+                && resolutionSession?.id == session.id
+            if isCurrentPage {
                 isLoadingMoreCandidates = false
+                if wasCancelled && resolutionPageToken == pageToken {
+                    candidateAutoAttemptedPageTokens.remove(pageToken)
+                }
             }
         }
 
@@ -1311,14 +1378,17 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 )
             }
 
-            guard operation == operationSequence,
+            guard !Task.isCancelled,
+                operation == operationSequence,
                 pageSequence == candidatePageSequence,
                 resolutionSession?.id == session.id
             else {
+                wasCancelled = Task.isCancelled
                 return
             }
 
             guard page.session.id == session.id,
+                page.session.candidatesTruncated == session.candidatesTruncated,
                 page.snapshotID == snapshotID
             else {
                 invalidateResolutionForExpiry()
@@ -1328,6 +1398,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
             appendResolutionPage(page)
             errorMessage = nil
         } catch {
+            if Task.isCancelled || error is CancellationError {
+                wasCancelled = true
+                return
+            }
             guard operation == operationSequence,
                 pageSequence == candidatePageSequence,
                 resolutionSession?.id == session.id
@@ -2014,7 +2088,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             sourceKind: page.session.sourceKind,
             candidates: page.candidates.map(\.resolvedCandidate),
             defaultSelectionID: page.session.defaultCandidateToken,
-            candidatesTruncated: page.hasMoreCandidates
+            candidatesTruncated: page.session.candidatesTruncated || page.hasMoreCandidates
         )
         if resetSelection {
             applyResolvedCandidateDefaults(resolvedInput!)
@@ -2045,7 +2119,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             sourceKind: resolvedInput.sourceKind,
             candidates: resolvedInput.candidates + page.candidates.map(\.resolvedCandidate),
             defaultSelectionID: resolvedInput.defaultSelectionID,
-            candidatesTruncated: page.hasMoreCandidates
+            candidatesTruncated: session.candidatesTruncated || page.hasMoreCandidates
         )
         resolutionPageToken = page.nextPageToken
         normalizeCandidateSelectionForMode()
@@ -2057,6 +2131,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         resolutionPageToken = ""
         resolutionSnapshotID = ""
         resolutionTotalSize = 0
+        candidateAutoAttemptedPageTokens = []
         isLoadingMoreCandidates = false
         resolvedInput = nil
         resolvedInputContext = nil
@@ -2076,7 +2151,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         client: any CacheControlClient,
         source: String,
         options: BilibiliPlaybackTaskOptions,
-        operationTimeout: Duration
+        operationTimeout: Duration,
+        resolutionTimeout: Duration
     ) async throws -> (BilibiliResolutionPage, CacheServerSummary) {
         do {
             let serverInfo = try await withOperationTimeout(operationTimeout) {
@@ -2090,7 +2166,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             guard serverInfo.supportsTaskOutputV2 else {
                 throw BilibiliTaskViewModelError.taskOutputUnavailable
             }
-            let page = try await withOperationTimeout(operationTimeout) {
+            let page = try await withOperationTimeout(resolutionTimeout) {
                 try await client.startBilibiliResolution(
                     urlOrID: source,
                     options: options,

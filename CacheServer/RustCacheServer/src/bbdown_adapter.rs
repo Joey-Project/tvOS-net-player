@@ -6,6 +6,7 @@ use std::{
     future::Future,
     io::{self, Seek, SeekFrom, Write},
     mem,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
@@ -17,17 +18,18 @@ use bbdown_core::{
     DanmakuFormat, DownloadArchive, DownloadCancellationToken, DownloadFileKind, DownloadMode,
     DownloadOptions, DownloadPlan, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
     DuplicateDecision, EntryDownloadReport, Error as BbdownError, HttpHeaderSpec, IndexSelection,
-    Input, MediaRequestKind, MediaRequestSpec, MuxOptions, MuxReport, PgcWebPlayurlRoute,
-    PlaybackAbrGroup, PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata,
-    PlaybackCodecPreference, PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode,
-    ResolvedContent, RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection,
-    StreamSelection, SubtitleAiPolicy, VideoCollectionKind,
+    Input, MediaRequestKind, MediaRequestSpec, MetadataPage, MetadataPageOptions,
+    MetadataStopReason, MuxOptions, MuxReport, PgcWebPlayurlRoute, PlaybackAbrGroup,
+    PlaybackAbrGroupKind, PlaybackAbrLevel, PlaybackAbrMetadata, PlaybackCodecPreference,
+    PlaybackPlan, PlaybackVariant, PlaybackVariantKind, PlayurlMode, ResolvedContent,
+    RestrictedArea, RestrictedAreaConfig, RestrictedAreaProxy, Selection, StreamSelection,
+    SubtitleAiPolicy, VideoCollectionKind,
 };
 use tokio::{
     io::AsyncReadExt,
     process::Command,
     sync::{Mutex, Semaphore},
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 
 use crate::{
@@ -89,6 +91,13 @@ const MAX_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 512;
 const FALLBACK_BILIBILI_V2_RETAINED_DESCRIPTOR_BUDGET: usize = 128;
 const BILIBILI_V2_DESCRIPTOR_LIMIT_SHARE: u64 = 4;
 const RESOLVER_ROUTE_OPERATION_BUDGET: Duration = Duration::from_secs(90);
+const DYNAMIC_METADATA_TOTAL_REQUEST_LIMIT: usize = 128;
+const DYNAMIC_METADATA_TOTAL_SOURCE_LIMIT: usize = 512;
+const DYNAMIC_METADATA_CALL_LIMIT: usize = 8;
+const DYNAMIC_METADATA_CALL_REQUEST_LIMIT: usize = 32;
+const DYNAMIC_METADATA_CALL_SOURCE_LIMIT: usize = 64;
+const DYNAMIC_METADATA_CALL_ITEM_LIMIT: usize = 64;
+const DYNAMIC_METADATA_OPERATION_BUDGET: Duration = Duration::from_secs(90);
 
 #[cfg(unix)]
 fn bilibili_v2_retained_descriptor_budget() -> usize {
@@ -116,6 +125,97 @@ fn bilibili_v2_retained_descriptor_budget() -> usize {
 struct BilibiliResolveCandidateWindow {
     candidate_limit: usize,
     truncation_probe_limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DynamicMetadataCallLimits {
+    max_items: NonZeroUsize,
+    max_source_items: NonZeroUsize,
+    max_requests: NonZeroUsize,
+}
+
+#[derive(Default)]
+struct DynamicMetadataBudget {
+    calls_used: usize,
+    requests_used: usize,
+    source_items_examined: usize,
+}
+
+fn dynamic_metadata_page_can_continue(has_cursor: bool, made_progress: bool) -> bool {
+    has_cursor && made_progress
+}
+
+fn dynamic_metadata_window_is_truncated(
+    stop_reason: MetadataStopReason,
+    has_cursor: bool,
+    candidate_probe_hit: bool,
+) -> bool {
+    candidate_probe_hit || has_cursor || stop_reason != MetadataStopReason::End
+}
+
+impl DynamicMetadataBudget {
+    fn next_limits(
+        &self,
+        candidates_seen: usize,
+        probe_limit: usize,
+    ) -> Option<DynamicMetadataCallLimits> {
+        let candidate_room = probe_limit.checked_sub(candidates_seen)?;
+        let max_items = candidate_room.min(DYNAMIC_METADATA_CALL_ITEM_LIMIT);
+        let max_source_items = DYNAMIC_METADATA_TOTAL_SOURCE_LIMIT
+            .checked_sub(self.source_items_examined)?
+            .min(DYNAMIC_METADATA_CALL_SOURCE_LIMIT);
+        let max_requests = DYNAMIC_METADATA_TOTAL_REQUEST_LIMIT
+            .checked_sub(self.requests_used)?
+            .min(DYNAMIC_METADATA_CALL_REQUEST_LIMIT);
+        if self.calls_used >= DYNAMIC_METADATA_CALL_LIMIT
+            || max_items == 0
+            || max_source_items == 0
+            || max_requests == 0
+        {
+            return None;
+        }
+        Some(DynamicMetadataCallLimits {
+            max_items: NonZeroUsize::new(max_items)?,
+            max_source_items: NonZeroUsize::new(max_source_items)?,
+            max_requests: NonZeroUsize::new(max_requests)?,
+        })
+    }
+
+    fn record(
+        &mut self,
+        page: &MetadataPage,
+        limits: DynamicMetadataCallLimits,
+    ) -> Result<(), BilibiliDownloadError> {
+        if page.requests_used > limits.max_requests.get()
+            || page.source_items_examined > limits.max_source_items.get()
+            || page.items.len() > limits.max_items.get()
+        {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown metadata page exceeded its admitted per-call budget.".to_owned(),
+            ));
+        }
+        self.calls_used = self
+            .calls_used
+            .checked_add(1)
+            .ok_or_else(resolution_materialization_overflow)?;
+        self.requests_used = self
+            .requests_used
+            .checked_add(page.requests_used)
+            .ok_or_else(resolution_materialization_overflow)?;
+        self.source_items_examined = self
+            .source_items_examined
+            .checked_add(page.source_items_examined)
+            .ok_or_else(resolution_materialization_overflow)?;
+        if self.calls_used > DYNAMIC_METADATA_CALL_LIMIT
+            || self.requests_used > DYNAMIC_METADATA_TOTAL_REQUEST_LIMIT
+            || self.source_items_examined > DYNAMIC_METADATA_TOTAL_SOURCE_LIMIT
+        {
+            return Err(BilibiliDownloadError::Failed(
+                "BBDown metadata page exceeded its admitted operation budget.".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl BilibiliResolveCandidateWindow {
@@ -1709,6 +1809,17 @@ impl BbdownBilibiliAdapter {
             .client_config_for_request(options, request_context)
             .await?;
         let client = BiliClient::new(client_config.clone());
+        if matches!(&input, Input::FollowingFeed | Input::SpaceDynamic(_)) {
+            return resolve_dynamic_metadata_window(
+                source.trim().to_owned(),
+                &input,
+                candidate_window,
+                include_candidate_cover_uri,
+                &is_cancel_requested,
+                |options| client.resolve_metadata_page(input.clone(), options),
+            )
+            .await;
+        }
         let can_retry_bounded_resolve = selection.is_some();
         let resolved = match run_bbdown_core_until_cancelled(
             client.resolve(input.clone(), selection),
@@ -3757,6 +3868,7 @@ fn default_selection_for_input(input: &Input) -> Option<Selection> {
         | Input::RecommendationFeed
         | Input::FollowingFeed
         | Input::SpaceDynamic(_)
+        | Input::RelatedRecommendations(_)
         | Input::History
         | Input::WatchLater => Some(Selection::Latest),
         Input::Aid(_)
@@ -3793,6 +3905,7 @@ fn resolve_selection_for_input(
         | Input::RecommendationFeed
         | Input::FollowingFeed
         | Input::SpaceDynamic(_)
+        | Input::RelatedRecommendations(_)
         | Input::History
         | Input::WatchLater => {
             bounded_resolve_selection(candidate_window.truncation_probe_limit).map(Some)
@@ -4045,6 +4158,7 @@ fn playback_input_accepts_collection_item_selection(input: &Input) -> bool {
             | Input::RecommendationFeed
             | Input::FollowingFeed
             | Input::SpaceDynamic(_)
+            | Input::RelatedRecommendations(_)
             | Input::History
             | Input::WatchLater
     )
@@ -4718,6 +4832,277 @@ impl BilibiliInputResolution {
     }
 }
 
+async fn resolve_dynamic_metadata_window<F, Fut>(
+    source: String,
+    input: &Input,
+    candidate_window: BilibiliResolveCandidateWindow,
+    include_candidate_cover_uri: bool,
+    is_cancel_requested: &impl Fn() -> bool,
+    mut fetch_page: F,
+) -> Result<BilibiliInputResolution, BilibiliDownloadError>
+where
+    F: FnMut(MetadataPageOptions) -> Fut,
+    Fut: Future<Output = Result<MetadataPage, BbdownError>>,
+{
+    let probe_limit = usize::try_from(candidate_window.truncation_probe_limit)
+        .map_err(|_| invalid_resolve_candidate_limit(candidate_window.candidate_limit))?;
+    let deadline = Instant::now() + DYNAMIC_METADATA_OPERATION_BUDGET;
+    let mut budget = DynamicMetadataBudget::default();
+    let mut materialization = BilibiliResolutionMaterializationBudget::default();
+    let source_kind = dynamic_metadata_source_kind(input).ok_or_else(|| {
+        BilibiliDownloadError::Failed(
+            "Dynamic metadata resolution received an unsupported input.".to_owned(),
+        )
+    })?;
+    materialization.charge_allocation(mem::size_of::<BilibiliInputResolution>())?;
+    materialization.charge_string("Bilibili resolution source", source.len())?;
+    materialization.charge_string("Bilibili resolution source kind", source_kind.len())?;
+    let mut cursor = None;
+    let mut seen_items = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut title = None;
+    let mut truncated = false;
+
+    loop {
+        if is_cancel_requested() {
+            return Err(BilibiliDownloadError::Cancelled(
+                "Cancelled while BBDown dynamic metadata resolution was running.".to_owned(),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(dynamic_metadata_timeout_error());
+        }
+        let Some(limits) = budget.next_limits(candidates.len(), probe_limit) else {
+            truncated = true;
+            break;
+        };
+        let mut options = MetadataPageOptions::default()
+            .with_max_items(limits.max_items)
+            .with_max_source_items(limits.max_source_items)
+            .with_max_requests(limits.max_requests);
+        if let Some(cursor) = cursor.take() {
+            options = options.with_cursor(cursor);
+        }
+
+        let page_result = timeout_at(
+            deadline,
+            run_bbdown_core_until_cancelled(
+                fetch_page(options),
+                is_cancel_requested,
+                "Cancelled while BBDown dynamic metadata resolution was running.",
+            ),
+        )
+        .await;
+        let page = match page_result {
+            Err(_) => {
+                if is_cancel_requested() {
+                    return Err(BilibiliDownloadError::Cancelled(
+                        "Cancelled while BBDown dynamic metadata resolution was running."
+                            .to_owned(),
+                    ));
+                }
+                return Err(dynamic_metadata_timeout_error());
+            }
+            Ok(result) => result?.map_err(failed)?,
+        };
+        let has_cursor = page.next_cursor.is_some();
+        let made_progress =
+            page.requests_used > 0 || page.source_items_examined > 0 || !page.items.is_empty();
+        budget.record(&page, limits)?;
+        if title.is_none() {
+            materialization
+                .charge_string("Bilibili resolution title", page.collection.title.len())?;
+            title = Some(page.collection.title.clone());
+        }
+
+        for item in &page.items {
+            if !seen_items.insert((item.aid, item.cid)) {
+                continue;
+            }
+            if candidates.len() == candidate_window.candidate_limit {
+                truncated = true;
+                break;
+            }
+            admit_dynamic_metadata_candidate(
+                &mut materialization,
+                input,
+                source_kind,
+                item,
+                include_candidate_cover_uri,
+            )?;
+            candidates.push(dynamic_metadata_candidate(
+                input,
+                source_kind,
+                item,
+                include_candidate_cover_uri,
+            ));
+            if candidates.len() == probe_limit {
+                break;
+            }
+        }
+
+        let stop_reason = page.stop_reason;
+        cursor = page.next_cursor;
+        if candidates.len() >= probe_limit {
+            truncated |= dynamic_metadata_window_is_truncated(stop_reason, has_cursor, true);
+            break;
+        }
+        if cursor.is_none() {
+            truncated |= dynamic_metadata_window_is_truncated(stop_reason, has_cursor, false);
+            break;
+        }
+        if !dynamic_metadata_page_can_continue(has_cursor, made_progress) {
+            truncated |= dynamic_metadata_window_is_truncated(stop_reason, has_cursor, false);
+            break;
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    let title = title.unwrap_or_else(|| match input {
+        Input::FollowingFeed => "Following".to_owned(),
+        Input::SpaceDynamic(mid) => format!("Space dynamic {mid}"),
+        _ => unreachable!(),
+    });
+    if title.is_empty() {
+        materialization.charge_string("Bilibili resolution title", title.len())?;
+    }
+    if candidates.len() == 1 {
+        materialization.charge_string(
+            "Bilibili default candidate selection ID",
+            candidates[0].selection_id.len(),
+        )?;
+    }
+    let resolution =
+        BilibiliInputResolution::with_candidates(source, title, source_kind, candidates, truncated);
+    Ok(resolution)
+}
+
+fn dynamic_metadata_timeout_error() -> BilibiliDownloadError {
+    BilibiliDownloadError::Failed(
+        "BBDown dynamic metadata resolution exceeded its 90-second deadline.".to_owned(),
+    )
+}
+
+fn dynamic_metadata_source_kind(input: &Input) -> Option<&'static str> {
+    match input {
+        Input::FollowingFeed => Some("following"),
+        Input::SpaceDynamic(_) => Some("space_dynamic"),
+        _ => None,
+    }
+}
+
+fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn admit_dynamic_metadata_candidate(
+    budget: &mut BilibiliResolutionMaterializationBudget,
+    input: &Input,
+    source_kind: &str,
+    item: &bbdown_core::VideoCollectionItem,
+    include_candidate_cover_uri: bool,
+) -> Result<(), BilibiliDownloadError> {
+    let source_token_bytes = match input {
+        Input::FollowingFeed => "following".len(),
+        Input::SpaceDynamic(mid) => "space-dynamic-".len() + decimal_digits(*mid),
+        _ => {
+            return Err(BilibiliDownloadError::Failed(
+                "Dynamic metadata candidate received an unsupported input.".to_owned(),
+            ));
+        }
+    };
+    let bvid = normalized_string(item.bvid.as_deref());
+    let selection_id_bytes = checked_materialized_string_bytes([
+        "item:".len(),
+        decimal_digits(u64::from(item.index)),
+        ":source:".len(),
+        source_token_bytes,
+        ":cid:".len(),
+        decimal_digits(item.cid),
+        if bvid.is_some() { ":bvid:".len() } else { 0 },
+        bvid.map_or(0, str::len),
+        ":aid:".len(),
+        decimal_digits(item.aid),
+    ])?;
+    let subtitle_bytes = source_kind
+        .len()
+        .checked_add(" #".len())
+        .and_then(|n| n.checked_add(decimal_digits(u64::from(item.index))))
+        .and_then(|n| {
+            item.owner
+                .as_ref()
+                .map(|owner| owner.name.trim())
+                .filter(|name| !name.is_empty())
+                .map_or(Some(n), |owner| n.checked_add(" · ".len() + owner.len()))
+        })
+        .ok_or_else(resolution_materialization_overflow)?;
+    let content_id_bytes = item
+        .bvid
+        .as_ref()
+        .map_or_else(|| 2 + decimal_digits(item.aid), String::len);
+    budget.charge_allocation(mem::size_of::<BilibiliResolvedCandidate>())?;
+    for (label, bytes) in [
+        ("Bilibili candidate selection ID", selection_id_bytes),
+        ("Bilibili candidate title", item.title.len()),
+        ("Bilibili candidate subtitle", subtitle_bytes),
+        ("Bilibili candidate source kind", source_kind.len()),
+        ("Bilibili candidate content ID", content_id_bytes),
+        (
+            "Bilibili candidate cover URI",
+            if include_candidate_cover_uri {
+                item.cover_url.as_deref().map_or(0, str::len)
+            } else {
+                0
+            },
+        ),
+    ] {
+        budget.charge_string(label, bytes)?;
+    }
+    if let Some(bvid) = bvid {
+        budget.charge_string("Bilibili candidate bvid", bvid.len())?;
+    }
+    Ok(())
+}
+
+fn dynamic_metadata_candidate(
+    input: &Input,
+    source_kind: &str,
+    item: &bbdown_core::VideoCollectionItem,
+    include_candidate_cover_uri: bool,
+) -> BilibiliResolvedCandidate {
+    BilibiliResolvedCandidate {
+        selection_id: collection_item_selection_id(input, item),
+        title: item.title.clone(),
+        subtitle: collection_item_subtitle(source_kind, item.index, &item.owner),
+        source_kind: source_kind.to_owned(),
+        content_id: item
+            .bvid
+            .clone()
+            .unwrap_or_else(|| format!("av{}", item.aid)),
+        identity: BilibiliContentIdentity {
+            kind: BilibiliContentKind::CollectionItem,
+            aid: Some(item.aid),
+            bvid: normalized_bvid(item.bvid.as_deref()),
+            cid: Some(item.cid),
+            epid: None,
+        },
+        index: item.index,
+        duration_seconds: item.duration_seconds,
+        cover_uri: if include_candidate_cover_uri {
+            item.cover_url.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+    }
+}
+
 fn resolve_should_use_full_episode_list(input: &Input) -> bool {
     matches!(
         input,
@@ -4789,6 +5174,7 @@ fn collection_source_token(input: &Input) -> Option<String> {
         Input::RecommendationFeed => Some("recommendation".to_owned()),
         Input::FollowingFeed => Some("following".to_owned()),
         Input::SpaceDynamic(owner_mid) => Some(format!("space-dynamic-{owner_mid}")),
+        Input::RelatedRecommendations(aid) => Some(format!("related-recommendations-{aid}")),
         Input::History => Some("history".to_owned()),
         Input::WatchLater => Some("watch-later".to_owned()),
         _ => None,
@@ -4816,6 +5202,7 @@ fn collection_kind_name(kind: &VideoCollectionKind) -> &'static str {
         VideoCollectionKind::Recommendation => "recommendation",
         VideoCollectionKind::Following => "following",
         VideoCollectionKind::SpaceDynamic => "space_dynamic",
+        VideoCollectionKind::RelatedRecommendation => "related_recommendation",
         VideoCollectionKind::History => "history",
         VideoCollectionKind::WatchLater => "watch_later",
     }
@@ -8067,6 +8454,49 @@ mod tests {
         stream.write_all(body).await.unwrap();
     }
 
+    fn metadata_test_client(base: &str) -> BiliClient {
+        let mut config = ClientConfig::default();
+        config.endpoints.api_base = base.to_owned();
+        config.endpoints.pgc_base = base.to_owned();
+        config.endpoints.web_base = base.to_owned();
+        config.endpoints.intl_base = base.to_owned();
+        config.endpoints.intl_passport_base = base.to_owned();
+        config.endpoints.comment_base = base.to_owned();
+        config.endpoints.passport_base = base.to_owned();
+        config.endpoints.tv_api_base = base.to_owned();
+        config.endpoints.app_grpc_base = base.to_owned();
+        config.endpoints.app_pgc_grpc_base = base.to_owned();
+        config.endpoints.tv_passport_base = base.to_owned();
+        config.endpoints.tv_passport_poll_base = base.to_owned();
+        config.user_agent = "metadata-adapter-test".to_owned();
+        config.request_timeout = Duration::from_secs(2);
+        BiliClient::new(config)
+    }
+
+    async fn start_metadata_page_server(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut targets = Vec::with_capacity(responses.len());
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_mock_request(&mut stream).await;
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .expect("mock GET request should include a target")
+                    .to_owned();
+                targets.push(target);
+                write_mock_response(&mut stream, 200, &serde_json::to_vec(&body).unwrap()).await;
+            }
+            targets
+        });
+        (format!("http://{address}"), handle)
+    }
+
     #[tokio::test]
     async fn resolver_api_proxy_uses_web_compatibility_paths_and_shared_access_key() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10926,6 +11356,348 @@ mod tests {
         );
     }
 
+    fn test_metadata_page(
+        items: Vec<bbdown_core::VideoCollectionItem>,
+        stop_reason: MetadataStopReason,
+        requests_used: usize,
+        source_items_examined: usize,
+    ) -> MetadataPage {
+        MetadataPage {
+            collection: bbdown_core::MetadataCollectionInfo {
+                id: None,
+                kind: VideoCollectionKind::SpaceDynamic,
+                title: "Dynamic feed".to_owned(),
+                description: String::new(),
+                cover_url: None,
+                pub_time: None,
+                owner: None,
+            },
+            items,
+            next_cursor: None,
+            requests_used,
+            source_items_examined,
+            stop_reason,
+            consistency: bbdown_core::MetadataConsistency::BestEffort,
+        }
+    }
+
+    #[test]
+    fn dynamic_metadata_call_limits_respect_remaining_aggregate_and_candidate_budgets() {
+        let budget = DynamicMetadataBudget {
+            calls_used: 7,
+            requests_used: 100,
+            source_items_examined: 500,
+        };
+        let limits = budget
+            .next_limits(10, 12)
+            .expect("remaining operation budget should admit one call");
+        assert_eq!(2, limits.max_items.get());
+        assert_eq!(12, limits.max_source_items.get());
+        assert_eq!(28, limits.max_requests.get());
+        assert!(budget.next_limits(12, 12).is_none());
+        assert!(
+            DynamicMetadataBudget {
+                calls_used: 8,
+                ..Default::default()
+            }
+            .next_limits(0, 1)
+            .is_none()
+        );
+        assert!(
+            DynamicMetadataBudget {
+                requests_used: DYNAMIC_METADATA_TOTAL_REQUEST_LIMIT,
+                ..Default::default()
+            }
+            .next_limits(0, 1)
+            .is_none()
+        );
+        assert!(
+            DynamicMetadataBudget {
+                source_items_examined: DYNAMIC_METADATA_TOTAL_SOURCE_LIMIT,
+                ..Default::default()
+            }
+            .next_limits(0, 1)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_metadata_aggregate_accounting_rejects_per_call_overrun() {
+        let limits = DynamicMetadataBudget::default()
+            .next_limits(0, 2)
+            .expect("initial call budget");
+        let mut budget = DynamicMetadataBudget::default();
+        budget
+            .record(
+                &test_metadata_page(
+                    vec![],
+                    MetadataStopReason::RequestLimit,
+                    limits.max_requests.get(),
+                    limits.max_source_items.get(),
+                ),
+                limits,
+            )
+            .expect("per-call maxima should be charged");
+        assert_eq!(1, budget.calls_used);
+        assert_eq!(32, budget.requests_used);
+        assert_eq!(64, budget.source_items_examined);
+        assert!(budget.next_limits(0, 2).is_some());
+
+        let overrun = test_metadata_page(
+            vec![],
+            MetadataStopReason::RequestLimit,
+            limits.max_requests.get() + 1,
+            0,
+        );
+        assert!(budget.record(&overrun, limits).is_err());
+    }
+
+    #[test]
+    fn dynamic_metadata_empty_pages_continue_only_with_progress_and_cursor() {
+        assert!(dynamic_metadata_page_can_continue(true, true));
+        assert!(!dynamic_metadata_page_can_continue(true, false));
+        assert!(!dynamic_metadata_page_can_continue(false, true));
+        assert!(!dynamic_metadata_window_is_truncated(
+            MetadataStopReason::End,
+            false,
+            false,
+        ));
+        assert!(dynamic_metadata_window_is_truncated(
+            MetadataStopReason::End,
+            true,
+            false,
+        ));
+        assert!(dynamic_metadata_window_is_truncated(
+            MetadataStopReason::RequestLimit,
+            false,
+            false,
+        ));
+        assert!(dynamic_metadata_window_is_truncated(
+            MetadataStopReason::End,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn dynamic_metadata_candidates_preserve_multi_page_identity_index_and_cover_policy() {
+        let first_page = bbdown_core::VideoCollectionItem {
+            index: 8,
+            aid: 170_001,
+            bvid: Some("BV1metadata".to_owned()),
+            cid: 270_001,
+            title: "Part one".to_owned(),
+            cover_url: Some("https://example.invalid/cover.jpg".to_owned()),
+            description: String::new(),
+            pub_time: None,
+            owner: None,
+            duration_seconds: Some(100),
+        };
+        let second_page = bbdown_core::VideoCollectionItem {
+            index: 9,
+            cid: 270_002,
+            title: "Part two".to_owned(),
+            ..first_page.clone()
+        };
+        let first = dynamic_metadata_candidate(
+            &Input::SpaceDynamic(42),
+            "space_dynamic",
+            &first_page,
+            true,
+        );
+        let second = dynamic_metadata_candidate(
+            &Input::SpaceDynamic(42),
+            "space_dynamic",
+            &second_page,
+            false,
+        );
+        assert_eq!(8, first.index);
+        assert_eq!(9, second.index);
+        assert_ne!(first.selection_id, second.selection_id);
+        assert_eq!(Some(270_001), first.identity.cid);
+        assert_eq!(Some(270_002), second.identity.cid);
+        assert_eq!("https://example.invalid/cover.jpg", first.cover_uri);
+        assert!(second.cover_uri.is_empty());
+    }
+
+    #[test]
+    fn dynamic_metadata_admission_checks_string_and_snapshot_limits_before_conversion() {
+        let oversized_title = bbdown_core::VideoCollectionItem {
+            title: "x".repeat(MAX_BILIBILI_RESOLUTION_STRING_BYTES + 1),
+            ..test_collection_item(1, "small", None)
+        };
+        let mut budget = BilibiliResolutionMaterializationBudget::default();
+        assert!(matches!(
+            admit_dynamic_metadata_candidate(
+                &mut budget,
+                &Input::FollowingFeed,
+                "following",
+                &oversized_title,
+                false,
+            ),
+            Err(BilibiliDownloadError::ResourceExhausted(_))
+        ));
+
+        let oversized_cover = bbdown_core::VideoCollectionItem {
+            cover_url: Some("x".repeat(MAX_BILIBILI_RESOLUTION_STRING_BYTES + 1)),
+            ..test_collection_item(1, "small", None)
+        };
+        let mut without_cover_budget = BilibiliResolutionMaterializationBudget::default();
+        admit_dynamic_metadata_candidate(
+            &mut without_cover_budget,
+            &Input::FollowingFeed,
+            "following",
+            &oversized_cover,
+            false,
+        )
+        .expect("opted-out cover must not be materialized or admitted");
+        let mut with_cover_budget = BilibiliResolutionMaterializationBudget::default();
+        assert!(matches!(
+            admit_dynamic_metadata_candidate(
+                &mut with_cover_budget,
+                &Input::FollowingFeed,
+                "following",
+                &oversized_cover,
+                true,
+            ),
+            Err(BilibiliDownloadError::ResourceExhausted(_))
+        ));
+
+        let maximum_title = bbdown_core::VideoCollectionItem {
+            title: "x".repeat(MAX_BILIBILI_RESOLUTION_STRING_BYTES),
+            ..test_collection_item(1, "small", None)
+        };
+        let mut aggregate_budget = BilibiliResolutionMaterializationBudget::default();
+        let mut admitted = 0;
+        while admit_dynamic_metadata_candidate(
+            &mut aggregate_budget,
+            &Input::FollowingFeed,
+            "following",
+            &maximum_title,
+            false,
+        )
+        .is_ok()
+        {
+            admitted += 1;
+        }
+        assert!(admitted > 0);
+        assert!(aggregate_budget.bytes > MAX_BILIBILI_RESOLUTION_SNAPSHOT_BYTES - 100_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_metadata_resolution_honors_cancellation_before_fetch() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(3).unwrap();
+        let result = resolve_dynamic_metadata_window(
+            "following".to_owned(),
+            &Input::FollowingFeed,
+            candidate_window,
+            false,
+            &|| true,
+            |_| async { Ok(test_metadata_page(vec![], MetadataStopReason::End, 1, 0)) },
+        )
+        .await;
+        assert!(matches!(result, Err(BilibiliDownloadError::Cancelled(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_metadata_resolution_cancels_an_in_flight_loopback_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_cancellation = Arc::clone(&cancellation);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_mock_request(&mut stream).await;
+            server_cancellation.store(true, std::sync::atomic::Ordering::Release);
+            sleep(Duration::from_millis(200)).await;
+        });
+        let client = metadata_test_client(&format!("http://{address}"));
+        let result = resolve_dynamic_metadata_window(
+            "following".to_owned(),
+            &Input::FollowingFeed,
+            BilibiliResolveCandidateWindow::new(3).unwrap(),
+            false,
+            &|| cancellation.load(std::sync::atomic::Ordering::Acquire),
+            |options| client.resolve_metadata_page(Input::FollowingFeed, options),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(matches!(result, Err(BilibiliDownloadError::Cancelled(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_metadata_resolution_deduplicates_and_probes_candidate_limit() {
+        let first = test_collection_item(1, "First", None);
+        let duplicate = first.clone();
+        let second = test_collection_item(2, "Second", None);
+        let probe = test_collection_item(3, "Probe", None);
+        let page = test_metadata_page(
+            vec![first, duplicate, second, probe],
+            MetadataStopReason::ItemLimit,
+            1,
+            4,
+        );
+        let result = resolve_dynamic_metadata_window(
+            "following".to_owned(),
+            &Input::FollowingFeed,
+            BilibiliResolveCandidateWindow::new(3).unwrap(),
+            false,
+            &|| false,
+            |_| {
+                let page = page.clone();
+                async move { Ok(page) }
+            },
+        )
+        .await
+        .expect("bounded metadata page should convert to a resolution");
+        assert_eq!(3, result.candidates.len());
+        assert!(result.candidates_truncated);
+        assert_eq!(
+            vec![1, 2, 3],
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.index)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_metadata_resolution_follows_opaque_empty_pages_to_end() {
+        let response = |offset: Option<String>, has_more: bool| {
+            serde_json::json!({
+                "code": 0,
+                "data": {"items": [], "offset": offset, "has_more": has_more}
+            })
+        };
+        let (base, server) = start_metadata_page_server(vec![
+            response(Some("offset-1".to_owned()), true),
+            response(Some("offset-2".to_owned()), true),
+            response(None, false),
+        ])
+        .await;
+        let client = metadata_test_client(&base);
+        let complete = resolve_dynamic_metadata_window(
+            "following".to_owned(),
+            &Input::FollowingFeed,
+            BilibiliResolveCandidateWindow::new(3).unwrap(),
+            false,
+            &|| false,
+            |options| client.resolve_metadata_page(Input::FollowingFeed, options),
+        )
+        .await
+        .expect("empty cursor pages should continue to feed exhaustion");
+        let targets = server.await.unwrap();
+        assert_eq!(3, targets.len());
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.starts_with("/x/polymer/web-dynamic/v1/feed/all"))
+        );
+        assert!(complete.candidates.is_empty());
+        assert!(!complete.candidates_truncated);
+    }
+
     #[test]
     fn resolve_selection_uses_bounded_windows_for_list_inputs() {
         let candidate_window = BilibiliResolveCandidateWindow::new(37).unwrap();
@@ -11064,6 +11836,40 @@ mod tests {
                 cid: Some(270_001),
             })
         );
+    }
+
+    #[test]
+    fn parses_related_recommendations_item_as_bound_direct_video_selection() {
+        let selection_id =
+            "item:7:source:related-recommendations-170001:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let input_selection =
+            playback_selection_from_id(&Input::RelatedRecommendations(170_001), Some(selection_id))
+                .unwrap();
+
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, None);
+        assert_eq!(
+            input_selection.expected_identity,
+            Some(PlaybackExpectedIdentity {
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_001),
+            })
+        );
+
+        assert!(playback_selection_from_id(
+            &Input::RelatedRecommendations(170_002),
+            Some(selection_id),
+        )
+        .is_err());
+        assert!(playback_selection_from_id(
+            &Input::RelatedRecommendations(170_001),
+            Some("item:7:source:related-recommendations-170002:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
+        )
+        .is_err());
     }
 
     #[test]

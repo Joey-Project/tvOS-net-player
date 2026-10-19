@@ -399,7 +399,10 @@ public final class GRPCCacheControlClient: CacheControlClient {
                 )
             ) { client in
                 let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
-                let response = try await service.startBilibiliResolution(request, options: callOptions)
+                let response = try await service.startBilibiliResolution(
+                    request,
+                    options: resolutionStartCallOptions
+                )
                 return BilibiliResolutionPage(response)
             }
         } catch let error as RPCError where error.code == .unimplemented {
@@ -794,6 +797,12 @@ public final class GRPCCacheControlClient: CacheControlClient {
     var loginStartCallOptions: CallOptions {
         var options = callOptions
         options.timeout = max(rpcTimeout, .seconds(90))
+        return options
+    }
+
+    var resolutionStartCallOptions: CallOptions {
+        var options = callOptions
+        options.timeout = max(rpcTimeout, .seconds(120))
         return options
     }
 
@@ -1379,7 +1388,8 @@ extension BilibiliResolutionSession {
             createdAt: proto.hasCreatedAt ? Date(proto.createdAt) : nil,
             expiresAt: proto.hasExpiresAt ? Date(proto.expiresAt) : nil,
             defaultCandidateToken: proto.defaultCandidateToken,
-            context: proto.hasContext ? BilibiliRequestContext(proto.context) : .default
+            context: proto.hasContext ? BilibiliRequestContext(proto.context) : .default,
+            candidatesTruncated: proto.candidatesTruncated
         )
     }
 }

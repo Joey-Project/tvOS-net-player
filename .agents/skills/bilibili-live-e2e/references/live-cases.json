@@ -191,8 +191,8 @@
     },
     {
       "id": "authenticated-space-dynamic",
-      "description": "Authenticated uploader dynamic feed; BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL can override the default mid for account-specific validation.",
-      "url": "https://space.bilibili.com/2/dynamic",
+      "description": "Authenticated public uploader dynamic feed; BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL can override the default sample for another uploader.",
+      "url": "https://space.bilibili.com/441167301/dynamic",
       "url_env": "BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL",
       "expected_source_kind": "space_dynamic",
       "minimum_candidates": 1,

@@ -1,11 +1,11 @@
 ---
 id: 20261005-b46380
 title: Playback Reliability Follow-Ups
-status: active
+status: completed
 created: 2026-10-05
-updated: 2026-10-09
-branch: wip/credential-lifecycle
-pr:
+updated: 2026-10-19
+branch: codex/authenticated-feed-validation
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/76
 supersedes: []
 superseded_by:
 ---
@@ -41,8 +41,8 @@ superseded_by:
 - The first slice shipped in [PR #71](https://github.com/Joey-Project/tvOS-net-player/pull/71), squash commit `c766c4951455d3169d6d632ed200fba5e8aea38d`. Exact-head GitHub Codex review, both required checks, actual simulator XCTest, and the complete conversation gate passed. The successor branch starts from updated `master`.
 - The first slice's corrected deterministic and extended live validation passed: 1,088 Rust tests, 343 Swift tests, four canonical URL smokes, and separate ordinary/episode 600-second foreground plus 300-second cache-only and native-control probes. The sampling journal records the earlier reproduced race and corrected frozen source.
 - The second slice adds accepted-identity signed-media refresh, single-flight foreground/background recovery, durable-session compare-and-replace, and restored playback/profile context. Replacement PR #73 merged on 2026-10-08 as squash commit `d8a13b4aa76daefec5d00542ec3912f0710d4582`; its current-head CI and required review gate succeeded, and the complete conversation gate had zero open conversations. Final historical-source validation passed 1,150 Rust tests, 343 Swift tests, one macOS XCTest, 30 native-probe tests, and macOS/tvOS builds. Simulator XCTest passed on compatible current-head CI; local simulator execution was unavailable. The four real URL smokes and separate ordinary/episode injected-expiration recovery with 600-second foreground, 300-second cache-only, and 120-second macOS native probes also passed. Details and exact receipts: [Same-Identity Signed Media Refresh](2026-10-06-signed-media-refresh-b46381.md).
-- The third slice implements server-owned credential readiness, automatic Web-cookie maintenance, same-account reauthorization, generic-key browser handoff, private account bindings, and hot reload for new default-profile playback. BBDown-rust PR #90 supplied the identity API; the consumer pins its exact merged revision. Final validation passed 1,187 Rust tests, 354 Swift tests, macOS XCTest and builds, four canonical URL smokes, and separate ordinary/Bangumi 600-second HLS plus 300-second offline and 120-second native-control probes. Local tvOS XCTest remains a compatible-runner CI requirement. Boundary, integrity remediation, and evidence: [Server-Owned Credential Lifecycle](2026-10-08-server-credential-lifecycle-b46382.md).
-- Authenticated following/dynamic live regression remains the ordered fourth slice; physical Apple TV and TLS remain deferred.
+- The third slice shipped in [PR #75](https://github.com/Joey-Project/tvOS-net-player/pull/75), squash commit `3bcc928ea5d57895095971b02e7bd3753b8de544`. It implements server-owned credential readiness, Web-cookie maintenance, same-account reauthorization, generic-key browser handoff, private bindings, and hot reload. Final validation passed 1,225 Rust tests, 359 Swift tests, macOS XCTest and builds, four canonical URL smokes, and separate ordinary/Bangumi 600-second HLS plus 300-second offline and 120-second native probes. Current-head GitHub CI executed tvOS XCTest; all fourteen conversations were resolved. BBDown-rust PR #90 supplied the exact pinned identity API. Boundary and remediation details: [Server-Owned Credential Lifecycle](2026-10-08-server-credential-lifecycle-b46382.md).
+- The fourth slice integrates `bbdown-core 0.10.0`, bounded following/dynamic metadata discovery, compatible V2 truncation metadata, and automatic frozen-snapshot pagination in both clients. It retains first-only authenticated full-fill admission, explicit saved credentials, server-owned media and request/snapshot limits. The related-recommendation execution allowlist also preserves source-token and frozen-content binding for the new core input type. Historical failures, source-versioned validation, and the completion boundary are recorded in [Authenticated Following And Dynamic Validation](2026-10-10-authenticated-feed-validation-b46383.md); [PR #76](https://github.com/Joey-Project/tvOS-net-player/pull/76) carries the final-head local/live, GitHub CI and remote-review acceptance receipts. Compatible-runner CI must execute tvOS XCTest; local build-for-testing is not equivalent. Physical Apple TV and TLS remain deferred.
 - Existing sampling implementation and deterministic regression results: [Bounded CDN Cross-Sampling](2026-10-05-cdn-cross-sampling-b46379.md).
 - Previously validated restricted playback, complete fill, recovery, and native controls: [Bilibili Live Playback Validation](2026-10-02-bilibili-live-playback-b46377.md).
 - Private account/profile validation: [Bilibili Account Credential Validation](2026-10-02-bilibili-account-credentials-b46376.md).

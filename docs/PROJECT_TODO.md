@@ -15,9 +15,9 @@
 - [completed] Next PR 7：增加 per-request transcoding/ABR policy controls、兼容变体选择、弱网降级/恢复模式，以及 tvOS/macOS 共享设置。
 - [completed] Deferred/non-sequential Next PR 6：按 PR6A 到 PR6E 实现通用 task output/artifact/resource、分页 Bilibili resolution、v2 BBDown 映射，以及直接使用 v2 的 tvOS/macOS 客户端。
 - [completed] `bbdown-core` dynamic feed timestamp compatibility：通过 `BBDown-rust` PR #78 接受整数或 numeric-string `module_author.pub_ts`。
-- [pending] 使用有效 Web cookie 重跑 authenticated following/dynamic live cases，确认 `pub_ts` 修复后的真实页面路径。
-- [pending] Add a core-backed, same-identity signed-media URL refresh contract so expired background fills can resume without reselecting mutable candidate lists. Preserve the accepted content/representation identity and verified extents; see [the adaptive playback journal](project_journal/2026/09/2026-09-30-adaptive-bilibili-playback-roadmap-7e2c1a.md).
-- [pending] Complete Mac-authorized Web-cookie renewal and the origin/session-bound generic access-key browser handoff. Saving a QR refresh token alone is not automatic credential refresh.
+- [completed] Integrate `bbdown-core 0.10.0` bounded following/dynamic discovery, compatible V2 truncation metadata, automatic snapshot pagination and authenticated live acceptance; see [the authenticated feed journal](project_journal/2026/10/2026-10-10-authenticated-feed-validation-b46383.md).
+- [completed] Add core-backed, same-identity signed-media URL refresh without reselecting mutable candidate lists, preserving accepted representation identity and verified extents; see [the signed-media refresh journal](project_journal/2026/10/2026-10-06-signed-media-refresh-b46381.md).
+- [completed] Complete server-owned Web-cookie renewal/replacement and the origin/session-bound generic access-key browser handoff; see [the credential lifecycle journal](project_journal/2026/10/2026-10-08-server-credential-lifecycle-b46382.md).
 - [completed] PR 9：推进 segment-level fill / prefetch。
 - [completed] PR 10：增加 adaptive weak-network policy 和对应 UX。
 - [completed] PR 11：增加 LAN transcoding foundation。
