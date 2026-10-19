@@ -1353,10 +1353,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let snapshotID = resolutionSnapshotID
         isLoadingMoreCandidates = true
         errorMessage = nil
+        var wasCancelled = false
 
         defer {
-            if candidatePageSequence == pageSequence {
+            let isCurrentPage =
+                operation == operationSequence
+                && candidatePageSequence == pageSequence
+                && resolutionSession?.id == session.id
+            if isCurrentPage {
                 isLoadingMoreCandidates = false
+                if wasCancelled && resolutionPageToken == pageToken {
+                    candidateAutoAttemptedPageTokens.remove(pageToken)
+                }
             }
         }
 
@@ -1375,6 +1383,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 pageSequence == candidatePageSequence,
                 resolutionSession?.id == session.id
             else {
+                wasCancelled = Task.isCancelled
                 return
             }
 
@@ -1390,6 +1399,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
             errorMessage = nil
         } catch {
             if Task.isCancelled || error is CancellationError {
+                wasCancelled = true
                 return
             }
             guard operation == operationSequence,

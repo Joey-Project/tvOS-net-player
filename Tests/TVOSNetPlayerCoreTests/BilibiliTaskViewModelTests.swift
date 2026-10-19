@@ -1101,6 +1101,100 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testCancelledAutomaticCandidatePageRetriesWhenSameTokenReappears() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1cancelled-auto-page",
+                        candidates: makeCandidates(count: 60, prefix: "cancelled-auto-page"),
+                        defaultSelectionID: "cancelled-auto-page-token-1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1cancelled-auto-page",
+            clientFactory: { _ in client }
+        )
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setSuspendsCandidatePageResponses(true)
+
+        let cancelledTask = Task { @MainActor in
+            await model.loadMoreResolvedCandidatesIfNeeded(
+                appearingCandidateID: "cancelled-auto-page-token-49",
+                serverAddressText: "mac-mini.local:50051"
+            )
+        }
+        await client.waitForCandidatePageRequestCount(1)
+        cancelledTask.cancel()
+        await client.completeNextCandidatePage()
+        await cancelledTask.value
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
+        XCTAssertFalse(model.isLoadingMoreCandidates)
+
+        await client.setSuspendsCandidatePageResponses(false)
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "cancelled-auto-page-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.resolvedCandidates.count, 60)
+        XCTAssertFalse(model.isLoadingMoreCandidates)
+        let requests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(requests.count, 2)
+        if requests.count == 2 {
+            XCTAssertEqual(requests[0].pageToken, requests[1].pageToken)
+        }
+        model.clearTask()
+    }
+
+    func testClientCancellationOfAutomaticCandidatePageCanRetry() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1client-cancelled-page",
+                        candidates: makeCandidates(count: 60, prefix: "client-cancelled-page"),
+                        defaultSelectionID: "client-cancelled-page-token-1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1client-cancelled-page",
+            clientFactory: { _ in client }
+        )
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setCandidatePageCancellationNext()
+
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "client-cancelled-page-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        XCTAssertFalse(model.isLoadingMoreCandidates)
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "client-cancelled-page-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+
+        XCTAssertEqual(model.resolvedCandidates.count, 60)
+        XCTAssertFalse(model.isLoadingMoreCandidates)
+        let requests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(requests.count, 2)
+        if requests.count == 2 {
+            XCTAssertEqual(requests[0].pageToken, requests[1].pageToken)
+        }
+        model.clearTask()
+    }
+
     func testCancelledAndStaleAutomaticCandidateLoadsDoNotReplaceSessionCandidates() async {
         let candidates = makeCandidates(count: 60, prefix: "stale-page")
         let client = FakeBilibiliCacheControlClient(
@@ -4176,6 +4270,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var candidateIndexesBySession: [String: [String: Int]] = [:]
     private var candidatePageCursors: [String: FakeCandidatePageCursor] = [:]
     private var candidatePageFailureNext: String?
+    private var candidatePageCancellationNext = false
     private var candidatePageSnapshotMismatchNext = false
     private var candidatePageSessionTruncationMismatchNext = false
     private var nextResolutionSessionID = 1
@@ -4388,7 +4483,13 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             candidatePageFailureNext = nil
             throw FakeLocalizedError(message: message)
         }
-        candidatePageCursors.removeValue(forKey: pageToken)
+        if candidatePageCancellationNext {
+            candidatePageCancellationNext = false
+            throw CancellationError()
+        }
+        if !suspendsCandidatePageResponses {
+            candidatePageCursors.removeValue(forKey: pageToken)
+        }
         let page = makeResolutionPage(
             session: session,
             candidates: resolutionCandidates[sessionID] ?? [],
@@ -4734,6 +4835,10 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
 
     func setCandidatePageFailureNext(_ message: String) {
         candidatePageFailureNext = message
+    }
+
+    func setCandidatePageCancellationNext() {
+        candidatePageCancellationNext = true
     }
 
     func setCandidatePageSnapshotMismatchNext() {
