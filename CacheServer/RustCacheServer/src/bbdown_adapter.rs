@@ -4158,6 +4158,7 @@ fn playback_input_accepts_collection_item_selection(input: &Input) -> bool {
             | Input::RecommendationFeed
             | Input::FollowingFeed
             | Input::SpaceDynamic(_)
+            | Input::RelatedRecommendations(_)
             | Input::History
             | Input::WatchLater
     )
@@ -11835,6 +11836,40 @@ mod tests {
                 cid: Some(270_001),
             })
         );
+    }
+
+    #[test]
+    fn parses_related_recommendations_item_as_bound_direct_video_selection() {
+        let selection_id =
+            "item:7:source:related-recommendations-170001:cid:270001:bvid:BV1xx411c7mD:aid:170001";
+        let input_selection =
+            playback_selection_from_id(&Input::RelatedRecommendations(170_001), Some(selection_id))
+                .unwrap();
+
+        assert_eq!(
+            input_selection.input_override,
+            Some(Input::Bvid("BV1xx411c7mD".to_owned()))
+        );
+        assert_eq!(input_selection.selection, None);
+        assert_eq!(
+            input_selection.expected_identity,
+            Some(PlaybackExpectedIdentity {
+                bvid: Some("BV1xx411c7mD".to_owned()),
+                aid: Some(170_001),
+                cid: Some(270_001),
+            })
+        );
+
+        assert!(playback_selection_from_id(
+            &Input::RelatedRecommendations(170_002),
+            Some(selection_id),
+        )
+        .is_err());
+        assert!(playback_selection_from_id(
+            &Input::RelatedRecommendations(170_001),
+            Some("item:7:source:related-recommendations-170002:cid:270001:bvid:BV1xx411c7mD:aid:170001"),
+        )
+        .is_err());
     }
 
     #[test]

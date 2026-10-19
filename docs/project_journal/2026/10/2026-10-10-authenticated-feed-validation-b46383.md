@@ -1,11 +1,11 @@
 ---
 id: 20261010-b46383
 title: Authenticated Following And Dynamic Validation
-status: active
+status: completed
 created: 2026-10-10
 updated: 2026-10-19
 branch: codex/authenticated-feed-validation
-pr:
+pr: https://github.com/Joey-Project/tvOS-net-player/pull/76
 supersedes: []
 superseded_by:
 ---
@@ -114,11 +114,13 @@ superseded_by:
 - The first extended following run completed 600 seconds of sustained HLS (2,243 rounds) and observed a positive partial-cache checkpoint. Its cache-only native probe then failed during readiness with `AVFoundationErrorDomain -11821`, before any decoded frames or control steps. The run was interrupted after that failure; the 300-second offline gate did not complete, and the extended dynamic case did not start. Retained test-cache files and bounded logs support local diagnosis; HTTP readability is not native playback acceptance.
 - Cache-only replay isolated that readiness failure to the execution environment: the same retained media, server, and native probe failed inside the sandbox, whereas two outside-sandbox 30-second replays completed all nine control steps and decoded 815 and 813 frames. Both the system and long-driver temporary-directory settings passed outside the sandbox. Full local FFmpeg decoding also passed. No HLS or media-production fix was made; these short replays do not replace either complete extended acceptance run.
 
-## Next Steps
-- The approved V2 truncation marker, automatic snapshot-page loading, dedicated resolution deadline, and affected deterministic/platform gates are complete. Finish the extended live gates before delivery.
-- Rerun both complete extended cases with the native probe outside the restrictive execution sandbox. Preserve the earlier interrupted receipts and archive only the proven-owned stale handoff after listener/process quiescence; do not count that interrupted offline/native run as passing.
-- The initial 2026-10-19 following-feed smoke passed 116 sustained rounds while space-dynamic failed during resolution with `empty_account_state`. Both focused cases subsequently passed on the V2 extension. A later metadata-page error still fails resolution rather than silently accepting a successful prefix; the original broad error label does not prove which page failed.
-- After both focused cases pass, run separate 600-second sustained playback, complete fill, same-root recovery, 300-second offline cache, and 120-second native decoding/control probes for each case.
-- Preserve the completed new-pin deterministic input receipts. Revalidate any subsequent fix, and require compatible-runner tvOS XCTest and current-head CI at the eventual PR head.
-- Complete current-head GitHub CI, Codex review and every conversation before any subsequent PR merge. Keep this larger workstream incomplete while dynamic live acceptance is blocked.
-- Follow up the intermittent two-second finalizer test timeout if it recurs; the isolated repetitions do not prove a root cause.
+## Related Selection Compatibility
+- The upgraded core's related-recommendation candidates use collection-item selection IDs. Admit that input type at execution as well as discovery, while retaining exact source-token and frozen content-identity checks. A related candidate must not become a selection from another recommendation source.
+- Cover valid related-candidate execution and mismatched-source rejection with a deterministic regression. This repairs the dependency-upgrade compatibility gap; it does not add a new client browsing surface or permit mutable-list reselection.
+
+## Completion Boundary
+- This delivery completes the fourth playback-reliability slice: bounded authenticated feed discovery, immutable V2 candidate windows, automatic client pagination, and first-result full-fill validation. Final-head local/live receipts, GitHub CI and Codex review belong to [PR #76](https://github.com/Joey-Project/tvOS-net-player/pull/76); the historical evidence above retains its stated source version and is not a substitute for those merge gates.
+- Each final extended case requires separate 600-second sustained HLS, complete fill with positive partial-cache recovery, 300-second cache-only checksums, and a 120-second native decoding/control probe. Preserve interrupted receipts as incomplete and reuse saved credentials without another login unless rejected. Every review conversation must be resolved before merge.
+- Native probes establish decoded frames and control behavior, not full app-UI interaction, independently audible audio, or physical Apple TV validation. Audio-capable local tests must verify player/application mute or use verified system mute, and never automatically restore system audio afterward.
+- A bounded window is not complete upstream enumeration. Re-resolve for a new window; do not expose opaque core cursors or mutate an existing snapshot. A later metadata-page error still fails resolution instead of accepting a silent successful prefix. The original broad `empty_account_state` failure remains unproven rather than an assumed expired credential or actual empty feed.
+- Physical Apple TV validation and TLS remain deferred. Investigate the historical two-second finalizer-test timeout only if it recurs; isolated successful repetitions do not prove a root cause.
