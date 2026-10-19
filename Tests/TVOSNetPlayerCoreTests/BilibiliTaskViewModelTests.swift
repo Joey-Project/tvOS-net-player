@@ -938,6 +938,207 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testCandidateNearEndAutomaticallyLoadsPagesOnceAndKeepsSnapshotBoundary() async {
+        let candidates = makeCandidates(count: 120, prefix: "auto-page")
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1auto-page",
+                        candidates: candidates,
+                        defaultSelectionID: "auto-page-token-1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1auto-page",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        async let firstAppearance: Void = model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "auto-page-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+        async let repeatedAppearance: Void = model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "auto-page-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+        _ = await (firstAppearance, repeatedAppearance)
+
+        XCTAssertEqual(model.resolvedCandidates.count, 100)
+        XCTAssertTrue(model.hasMoreResolvedCandidates)
+        let firstPageRequests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(firstPageRequests.count, 1)
+
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "auto-page-token-100",
+            serverAddressText: "mac-mini.local:50051"
+        )
+
+        XCTAssertEqual(model.resolvedCandidates.count, 120)
+        XCTAssertFalse(model.hasMoreResolvedCandidates)
+        let allPageRequests = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(allPageRequests.count, 2)
+        model.clearTask()
+    }
+
+    func testDelayedResolutionOutlivesOrdinaryOperationTimeout() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [],
+            createResponses: [],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1slow-resolution",
+            operationTimeout: .milliseconds(20),
+            resolutionTimeout: .seconds(1),
+            clientFactory: { _ in client }
+        )
+        let submitTask = Task { @MainActor in
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+        }
+
+        await client.waitForResolveRequestCount(1)
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        await client.completeNextResolve(
+            with: .success(
+                .fixture(
+                    source: "BV1slow-resolution",
+                    candidates: [
+                        .fixture(selectionID: "slow-1", title: "Slow result 1", index: 1),
+                        .fixture(selectionID: "slow-2", title: "Slow result 2", index: 2),
+                    ],
+                    defaultSelectionID: "slow-1"
+                ))
+        )
+        await submitTask.value
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.resolvedCandidates.count, 2)
+        XCTAssertTrue(model.isWaitingForCandidateSelection)
+        model.clearTask()
+    }
+
+    func testResolutionStillTimesOutAtItsDedicatedBudget() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [],
+            createResponses: [],
+            suspendsResolveResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1resolution-timeout",
+            operationTimeout: .seconds(1),
+            resolutionTimeout: .milliseconds(50),
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertTrue(model.errorMessage?.contains("timed out") == true)
+        XCTAssertEqual(model.statusMessage, "Could not resolve Bilibili input.")
+        await client.completeNextResolve(
+            with: .success(.fixture(source: "BV1resolution-timeout"))
+        )
+        model.clearTask()
+    }
+
+    func testAutomaticCandidatePageFailureWaitsForExplicitRetryAndRetainsWindowMarker() async {
+        let candidates = makeCandidates(count: 60, prefix: "bounded")
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1bounded",
+                        candidates: candidates,
+                        defaultSelectionID: "bounded-token-1",
+                        candidatesTruncated: true
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1bounded",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        XCTAssertTrue(model.isResolvedCandidateWindowTruncated)
+        XCTAssertEqual(model.fetchNotice?.title, "Limited list")
+        await client.setCandidatePageFailureNext("Temporary page failure.")
+
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "bounded-token-49",
+            serverAddressText: "mac-mini.local:50051"
+        )
+        XCTAssertTrue(model.canRetryResolvedCandidatePage)
+        XCTAssertEqual(model.resolvedCandidates.count, 50)
+        await model.loadMoreResolvedCandidatesIfNeeded(
+            appearingCandidateID: "bounded-token-50",
+            serverAddressText: "mac-mini.local:50051"
+        )
+        let requestsAfterRepeatedAppearance = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(requestsAfterRepeatedAppearance.count, 1)
+
+        await model.loadMoreResolvedCandidates(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertEqual(model.resolvedCandidates.count, 60)
+        XCTAssertFalse(model.hasMoreResolvedCandidates)
+        XCTAssertTrue(model.isResolvedCandidateWindowTruncated)
+        XCTAssertTrue(model.resolvedInput?.candidatesTruncated == true)
+        XCTAssertEqual(model.fetchNotice?.title, "Limited list")
+        model.candidateSelectionMode = .all
+        XCTAssertEqual(model.candidateSelectionSummary, "All 60 items in this limited list are selected.")
+        XCTAssertEqual(model.submitButtonTitle, "Submit Window")
+        model.candidateSelectionMode = .range
+        model.chooseCandidate(model.resolvedCandidates[0])
+        model.chooseCandidate(model.resolvedCandidates[59])
+        XCTAssertTrue(model.candidateSelectionSummary?.contains("in this limited list") == true)
+        let requestsAfterRetry = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(requestsAfterRetry.count, 2)
+        model.clearTask()
+    }
+
+    func testCancelledAndStaleAutomaticCandidateLoadsDoNotReplaceSessionCandidates() async {
+        let candidates = makeCandidates(count: 60, prefix: "stale-page")
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1stale-page",
+                        candidates: candidates,
+                        defaultSelectionID: "stale-page-token-1"
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1stale-page",
+            clientFactory: { _ in client }
+        )
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setSuspendsCandidatePageResponses(true)
+
+        let cancelledTask = Task { @MainActor in
+            await model.loadMoreResolvedCandidates(
+                serverAddressText: "mac-mini.local:50051"
+            )
+        }
+        await client.waitForCandidatePageRequestCount(1)
+        model.clearTask()
+        cancelledTask.cancel()
+        await client.completeNextCandidatePage()
+        await cancelledTask.value
+        XCTAssertTrue(model.resolvedCandidates.isEmpty)
+        XCTAssertNil(model.resolutionSession)
+        XCTAssertFalse(model.hasMoreResolvedCandidates)
+        XCTAssertFalse(model.isLoadingMoreCandidates)
+        let requestsAfterStaleCancellation = await client.resolutionPageRequestsSnapshot()
+        XCTAssertEqual(requestsAfterStaleCancellation.count, 1)
+    }
+
     func testCandidatePageSnapshotMismatchAndExpiryInvalidateResolution() async {
         let candidates = makeCandidates(count: 60, prefix: "expiry")
         for mismatch in [true, false] {
@@ -971,6 +1172,34 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             XCTAssertEqual(model.statusMessage, "Re-resolve the Bilibili input before submitting.")
             model.clearTask()
         }
+    }
+
+    func testCandidatePageCannotChangeFrozenSessionTruncationMarker() async {
+        let client = FakeBilibiliCacheControlClient(
+            resolveResponses: [
+                .success(
+                    .fixture(
+                        source: "BV1truncation-marker",
+                        candidates: makeCandidates(count: 60, prefix: "marker"),
+                        defaultSelectionID: "marker-token-1",
+                        candidatesTruncated: true
+                    ))
+            ],
+            createResponses: []
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1truncation-marker",
+            clientFactory: { _ in client }
+        )
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.setCandidatePageSessionTruncationMismatchNext()
+
+        await model.loadMoreResolvedCandidates(serverAddressText: "mac-mini.local:50051")
+
+        XCTAssertNil(model.resolutionSession)
+        XCTAssertFalse(model.hasMoreResolvedCandidates)
+        XCTAssertTrue(model.errorMessage?.contains("resolution expired") == true)
+        model.clearTask()
     }
 
     func testDynamicFeedResolveShowsVolatilityNoticeForServerSourceKinds() async {
@@ -3931,6 +4160,7 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var suspendsResolveResponses: Bool
     private var suspendsCreateResponses: Bool
     private var suspendsTaskResultResponses = false
+    private var suspendsCandidatePageResponses = false
     private var suspendsCancelResponses = false
     private var resolvedRequests: [(urlOrID: String, options: BilibiliPlaybackTaskOptions)] = []
     private var downloadRequests: [(urlOrID: String, options: BilibiliDownloadTaskOptions)] = []
@@ -3947,12 +4177,16 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private var candidatePageCursors: [String: FakeCandidatePageCursor] = [:]
     private var candidatePageFailureNext: String?
     private var candidatePageSnapshotMismatchNext = false
+    private var candidatePageSessionTruncationMismatchNext = false
     private var nextResolutionSessionID = 1
     private var createdTasksByID: [String: CacheTask] = [:]
     private var taskResultPagesByRequest: [String: [Result<CacheTaskResultsPage, Error>]] = [:]
     private var taskResultRequests: [(taskID: String, pageToken: String, pageSize: Int)] = []
     private var pendingTaskResultContinuations: [CheckedContinuation<CacheTaskResultsPage, Error>] = []
+    private var pendingCandidatePageContinuations:
+        [(page: BilibiliResolutionPage, continuation: CheckedContinuation<BilibiliResolutionPage, Error>)] = []
     private var taskResultRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var candidatePageRequestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var createdRequests:
         [(
             urlOrID: String,
@@ -4142,7 +4376,8 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         pageSize: Int
     ) async throws -> BilibiliResolutionPage {
         resolutionPageRequests.append((sessionID, pageToken, pageSize))
-        guard let cursor = candidatePageCursors.removeValue(forKey: pageToken),
+        resumeCandidatePageRequestWaiters()
+        guard let cursor = candidatePageCursors[pageToken],
             cursor.sessionID == sessionID,
             let session = resolutionSessions[sessionID],
             resolutionSnapshots[sessionID] != nil
@@ -4153,14 +4388,42 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             candidatePageFailureNext = nil
             throw FakeLocalizedError(message: message)
         }
+        candidatePageCursors.removeValue(forKey: pageToken)
         let page = makeResolutionPage(
             session: session,
             candidates: resolutionCandidates[sessionID] ?? [],
             offset: cursor.offset,
             pageSize: pageSize
         )
+        if suspendsCandidatePageResponses {
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingCandidatePageContinuations.append((page, continuation))
+            }
+        }
         guard candidatePageSnapshotMismatchNext else {
-            return page
+            guard candidatePageSessionTruncationMismatchNext else {
+                return page
+            }
+            candidatePageSessionTruncationMismatchNext = false
+            return BilibiliResolutionPage(
+                session: BilibiliResolutionSession(
+                    id: page.session.id,
+                    source: page.session.source,
+                    title: page.session.title,
+                    sourceKind: page.session.sourceKind,
+                    createdAt: page.session.createdAt,
+                    expiresAt: page.session.expiresAt,
+                    defaultCandidateToken: page.session.defaultCandidateToken,
+                    context: page.session.context,
+                    candidatesTruncated: !page.session.candidatesTruncated
+                ),
+                candidates: page.candidates,
+                pageInfo: CachePageInfo(
+                    totalSize: page.totalSize,
+                    nextPageToken: page.nextPageToken,
+                    snapshotID: page.snapshotID
+                )
+            )
         }
         candidatePageSnapshotMismatchNext = false
         return BilibiliResolutionPage(
@@ -4229,7 +4492,8 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
             createdAt: nil,
             expiresAt: nil,
             defaultCandidateToken: result.defaultSelectionID,
-            context: context
+            context: context,
+            candidatesTruncated: result.candidatesTruncated
         )
         resolutionSessions[sessionID] = session
         resolutionCandidates[sessionID] = candidates
@@ -4476,6 +4740,31 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         candidatePageSnapshotMismatchNext = true
     }
 
+    func setCandidatePageSessionTruncationMismatchNext() {
+        candidatePageSessionTruncationMismatchNext = true
+    }
+
+    func setSuspendsCandidatePageResponses(_ suspends: Bool) {
+        suspendsCandidatePageResponses = suspends
+    }
+
+    func waitForCandidatePageRequestCount(_ count: Int) async {
+        guard resolutionPageRequests.count < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            candidatePageRequestWaiters.append((count, continuation))
+        }
+    }
+
+    func completeNextCandidatePage() {
+        guard !pendingCandidatePageContinuations.isEmpty else {
+            return
+        }
+        let pending = pendingCandidatePageContinuations.removeFirst()
+        pending.continuation.resume(returning: pending.page)
+    }
+
     func resolutionPageRequestsSnapshot() -> [(sessionID: String, pageToken: String, pageSize: Int)] {
         resolutionPageRequests
     }
@@ -4646,6 +4935,12 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
     private func resumeTaskResultRequestWaiters() {
         let ready = taskResultRequestWaiters.filter { $0.count <= taskResultRequests.count }
         taskResultRequestWaiters.removeAll { $0.count <= taskResultRequests.count }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    private func resumeCandidatePageRequestWaiters() {
+        let ready = candidatePageRequestWaiters.filter { $0.count <= resolutionPageRequests.count }
+        candidatePageRequestWaiters.removeAll { $0.count <= resolutionPageRequests.count }
         ready.forEach { $0.continuation.resume() }
     }
 

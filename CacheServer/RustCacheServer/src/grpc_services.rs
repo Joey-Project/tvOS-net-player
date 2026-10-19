@@ -5772,6 +5772,7 @@ fn proto_bilibili_resolution_session(
         created_at: Some(timestamp_from_system_time(session.created_at)),
         expires_at: Some(timestamp_from_system_time(session.expires_at)),
         default_candidate_token: session.default_candidate_token,
+        candidates_truncated: session.candidates_truncated,
         context: session.request_context,
     }
 }
@@ -10022,6 +10023,7 @@ mod tests {
         let resolve_requests = Arc::new(Mutex::new(Vec::new()));
         let playback_requests = Arc::new(Mutex::new(Vec::new()));
         let mut resolution = sample_resolution_with_pages();
+        resolution.candidates_truncated = true;
         resolution.candidates[0].cover_uri =
             "https://provider.invalid/private-cover?credential=must-not-persist".to_owned();
         let state = AppState::new_with_playback_planner(
@@ -10058,6 +10060,7 @@ mod tests {
             .session
             .as_ref()
             .expect("first page should include its session");
+        assert!(session.candidates_truncated);
         let first_page_info = first
             .page_info
             .as_ref()
@@ -10088,6 +10091,13 @@ mod tests {
             .await
             .expect("continuation page should resolve")
             .into_inner();
+        assert!(
+            second
+                .session
+                .as_ref()
+                .expect("continuation page should include its session")
+                .candidates_truncated
+        );
         assert_eq!(
             vec![3],
             second
@@ -10224,6 +10234,13 @@ mod tests {
             .await
             .expect("v2 resolution should start")
             .into_inner();
+        assert!(
+            !resolution
+                .session
+                .as_ref()
+                .expect("complete resolution should include its session")
+                .candidates_truncated
+        );
         let session = resolution
             .session
             .expect("resolution should include its session");

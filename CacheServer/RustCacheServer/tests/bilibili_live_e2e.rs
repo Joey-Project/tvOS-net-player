@@ -1007,6 +1007,11 @@ fn assert_resolution_session_consistent(
         "{}: resolution title changed between pages",
         case.id
     );
+    assert_eq!(
+        expected.candidates_truncated, actual.candidates_truncated,
+        "{}: resolution truncation marker changed between pages",
+        case.id
+    );
 }
 
 async fn list_all_task_results(

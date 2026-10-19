@@ -91,7 +91,7 @@ BILIBILI_LIVE_E2E_OFFLINE_SECONDS=300 \
 just test-bilibili-live
 ```
 
-认证 feed 的长时间验证可以显式选择 following，或使用默认公开 uploader 动态样例 `https://space.bilibili.com/441167301/dynamic`，也可通过 `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL` 覆盖。仓库 pin 的 `bbdown-core v0.9.0` commit `e422a159cdf70c5bec72b4120e2a70e5bd749088` 包含个人空间动态的 WBI 签名修复。空 feed、上游拒绝和默认样例不可用都保留为失败，不能降低候选数要求来算作通过；API 返回成功也不等于视频已可播放：
+认证 feed 的长时间验证可以显式选择 following，或使用默认公开 uploader 动态样例 `https://space.bilibili.com/441167301/dynamic`，也可通过 `BILIBILI_LIVE_E2E_SPACE_DYNAMIC_URL` 覆盖。仓库 pin 的 `bbdown-core v0.10.0` commit `03baba367d846379f5fd4bddabc4784d1b0de8e7` 包含个人空间动态的 WBI 签名、缺失设备 Cookie 的内存初始化，以及有界元数据分页接口。凭据仍由 server 读取和管理，不需要让客户端接触 Cookie。空 feed、上游拒绝和默认样例不可用都保留为失败，不能降低候选数要求来算作通过；API 返回成功也不等于视频已可播放：
 
 ```bash
 BILIBILI_LIVE_E2E_BBDOWN_CREDENTIAL_PATH=/path/to/credentials.json \
@@ -105,7 +105,13 @@ just test-bilibili-live
 
 运行长测试时需要外层进程期限和输出上限；完整缓存、恢复证据和 native probe 的交接约束见 [full-fill validation](.agents/skills/bilibili-live-e2e/references/full-fill-validation.md)。
 
+following 和个人空间动态的单次候选解析最多使用 128 次上游 API 请求、扫描 512 条源记录、调用 8 次元数据分页，元数据收集阶段限制在 90 秒内。每次分页最多使用 32 次请求、扫描 64 条源记录、返回 64 个条目，同时受剩余总预算和请求候选数量约束。触及请求、扫描或调用数量预算时，非空候选窗口通过 V2 会话的 `candidates_truncated` 标记为截断，即使其数量尚未达到请求上限；预算耗尽却没有候选、超时和取消均不会伪装成成功的空 feed。上游 cursor 只提供尽力续页，不保证 feed 不变；server 先收集这个有限窗口，再创建自己的不可变候选快照。macOS 和 tvOS 列表滚动到末尾时通过 V2 的 opaque token 自动加载快照的下一页，保留手动重试；窗口本身被截断时会提示，即使所有快照页都已加载。自动分页不会突破上游解析预算或扩展现有快照。
+
+客户端启动解析使用独立的 120 秒超时，给服务器的有界元数据收集留出时间；服务器信息查询、候选快照翻页等普通操作仍使用原来的短超时。新增会话字段向后兼容旧的协议数据；旧客户端需要更新后才能显示截断提示和自动分页。
+
 `just test-lan-playback` 会使用严格 Swift 6 并发检查编译 macOS 原生 `AVPlayer` probe，默认只运行不需要凭据的参数 self-test。提供干净的 LAN 播放 URL 后，才会验证真实视频帧解码、暂停/恢复、前后跳转和 1.25x 播放。URL 不能包含 userinfo、query 或 fragment；hostname 校验是输入限制，不是 DNS pinning。native deadline 是协作式的，硬性期限需要外层进程 timeout。
+
+原生回放验证需要允许 AVFoundation 系统服务访问；受限执行沙盒可能在媒体本身可正常播放时返回 `AVFoundationErrorDomain -11821`。遇到此错误时，先用同一缓存和探针在允许系统媒体服务访问的环境中对照验证，不要仅凭此错误修改媒体格式。
 
 ```bash
 LAN_PLAYBACK_URL='http://127.0.0.1:8080/hls/SESSION_ID/master.m3u8' \

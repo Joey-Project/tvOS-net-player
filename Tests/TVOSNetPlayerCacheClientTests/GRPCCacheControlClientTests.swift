@@ -20,6 +20,24 @@ final class GRPCCacheControlClientTests: XCTestCase {
         XCTAssertEqual(client.loginStartCallOptions.timeout, .seconds(120))
     }
 
+    func testResolutionStartDeadlineHasOneHundredTwentySecondFloor() {
+        let client = GRPCCacheControlClient(
+            endpoint: CacheServerEndpoint(host: "localhost"),
+            rpcTimeout: .seconds(10)
+        )
+
+        XCTAssertEqual(client.resolutionStartCallOptions.timeout, .seconds(120))
+    }
+
+    func testResolutionStartDeadlinePreservesLongerConfiguredTimeout() {
+        let client = GRPCCacheControlClient(
+            endpoint: CacheServerEndpoint(host: "localhost"),
+            rpcTimeout: .seconds(180)
+        )
+
+        XCTAssertEqual(client.resolutionStartCallOptions.timeout, .seconds(180))
+    }
+
     func testCacheFillStatusProgressHandlesUnknownZeroAndOverflowingValues() {
         let unknownTotal = HlsCacheFillStatus(state: .filling, completedBytes: 400)
         XCTAssertNil(unknownTotal.progressFraction)

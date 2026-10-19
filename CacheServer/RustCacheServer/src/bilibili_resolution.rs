@@ -49,6 +49,7 @@ pub(crate) struct BilibiliResolutionSessionView {
     pub(crate) created_at: SystemTime,
     pub(crate) expires_at: SystemTime,
     pub(crate) default_candidate_token: String,
+    pub(crate) candidates_truncated: bool,
     pub(crate) request_context: Option<BilibiliRequestContext>,
 }
 
@@ -218,6 +219,7 @@ impl BilibiliResolutionStore {
             created_at: wall_clock_now,
             expires_at: wall_clock_expires_at,
             default_candidate_token,
+            candidates_truncated: resolution.candidates_truncated,
             request_context: request_context.clone(),
         };
         let estimated_bytes = estimate_session_bytes(
@@ -422,14 +424,17 @@ fn validate_resolution(
     options: Option<&BilibiliPlaybackOptions>,
     request_context: Option<&BilibiliRequestContext>,
 ) -> Result<(), Status> {
-    if resolution.candidates_truncated
-        || resolution.candidates.len() > MAX_BILIBILI_RESOLUTION_CANDIDATES
-    {
+    if resolution.candidates.len() > MAX_BILIBILI_RESOLUTION_CANDIDATES {
         return Err(Status::resource_exhausted(format!(
             "Bilibili input contains more than {MAX_BILIBILI_RESOLUTION_CANDIDATES} candidates."
         )));
     }
     if resolution.candidates.is_empty() {
+        if resolution.candidates_truncated {
+            return Err(Status::resource_exhausted(
+                "Bilibili input candidate window is empty and truncated.",
+            ));
+        }
         return Err(Status::failed_precondition(
             "Bilibili input did not resolve any selectable candidates.",
         ));
@@ -950,8 +955,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_resolution_instead_of_publishing_ambiguous_all_selection() {
+    fn truncated_window_pages_and_selection_stay_within_frozen_snapshot() {
         let mut resolution = sample_resolution("BV1truncated", 2);
+        resolution.candidates_truncated = true;
+        let now = Instant::now();
+        let mut store = BilibiliResolutionStore::default();
+        let first = store
+            .create_session(resolution, None, None, now, SystemTime::UNIX_EPOCH, 1)
+            .expect("bounded truncated candidate window should create a session");
+        assert!(first.session.candidates_truncated);
+        assert_eq!(vec![1], candidate_indexes(&first));
+
+        let second = store
+            .page(&first.session.id, Some(&first.next_page_token), now, 1)
+            .expect("truncated snapshot continuation should resolve");
+        assert!(second.session.candidates_truncated);
+        assert_eq!(vec![2], candidate_indexes(&second));
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+
+        let selected = store
+            .accept_selection(
+                &first.session.id,
+                &BilibiliResolutionSelection {
+                    mode: BilibiliResolutionSelectionMode::All.into(),
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("all should select the candidates in the bounded snapshot");
+        assert_eq!(vec![1, 2], accepted_indexes(&selected));
+        assert!(
+            selected
+                .candidates
+                .iter()
+                .all(|candidate| candidate.index <= 2)
+        );
+    }
+
+    #[test]
+    fn rejects_candidate_count_over_hard_limit_even_when_truncated() {
+        let mut resolution = sample_resolution(
+            "BV1oversized-truncated",
+            (MAX_BILIBILI_RESOLUTION_CANDIDATES + 1) as u32,
+        );
         resolution.candidates_truncated = true;
         let error = BilibiliResolutionStore::default()
             .create_session(
@@ -960,10 +1006,33 @@ mod tests {
                 None,
                 Instant::now(),
                 SystemTime::UNIX_EPOCH,
-                2,
+                50,
             )
-            .expect_err("truncated input must fail closed");
+            .expect_err("oversized bounded input must remain rejected");
         assert_eq!(tonic::Code::ResourceExhausted, error.code());
+    }
+
+    #[test]
+    fn distinguishes_empty_truncated_window_from_empty_complete_result() {
+        let now = Instant::now();
+        let mut truncated = sample_resolution("BV1empty-truncated", 0);
+        truncated.candidates_truncated = true;
+        let truncated_error = BilibiliResolutionStore::default()
+            .create_session(truncated, None, None, now, SystemTime::UNIX_EPOCH, 1)
+            .expect_err("empty truncated window exhausts the resolution budget");
+        assert_eq!(tonic::Code::ResourceExhausted, truncated_error.code());
+
+        let complete_error = BilibiliResolutionStore::default()
+            .create_session(
+                sample_resolution("BV1empty-complete", 0),
+                None,
+                None,
+                now,
+                SystemTime::UNIX_EPOCH,
+                1,
+            )
+            .expect_err("empty complete result remains a failed precondition");
+        assert_eq!(tonic::Code::FailedPrecondition, complete_error.code());
     }
 
     #[test]

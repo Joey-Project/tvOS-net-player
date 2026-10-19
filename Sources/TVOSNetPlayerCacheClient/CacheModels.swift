@@ -1404,6 +1404,7 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
     public let expiresAt: Date?
     public let defaultCandidateToken: String
     public let context: BilibiliRequestContext
+    public let candidatesTruncated: Bool
 
     public init(
         id: String,
@@ -1413,7 +1414,8 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
         createdAt: Date?,
         expiresAt: Date?,
         defaultCandidateToken: String,
-        context: BilibiliRequestContext = .default
+        context: BilibiliRequestContext = .default,
+        candidatesTruncated: Bool = false
     ) {
         self.id = id
         self.source = source
@@ -1423,6 +1425,7 @@ public struct BilibiliResolutionSession: Identifiable, Equatable, Sendable {
         self.expiresAt = expiresAt
         self.defaultCandidateToken = defaultCandidateToken
         self.context = context
+        self.candidatesTruncated = candidatesTruncated
     }
 }
 
