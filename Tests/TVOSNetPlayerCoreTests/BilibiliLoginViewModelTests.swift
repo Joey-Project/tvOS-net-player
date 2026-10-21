@@ -661,21 +661,24 @@ final class BilibiliLoginViewModelTests: XCTestCase {
                 CacheServerCapability.bilibiliLoginSessions,
             ]),
             credentialStatus: .fixture(),
-            startDelay: .milliseconds(120)
+            startDelay: .seconds(2)
         )
         let model = BilibiliLoginViewModel(
-            operationTimeout: .milliseconds(20),
+            operationTimeout: .seconds(5),
             loginStartTimeout: .milliseconds(50),
             pollInterval: .seconds(2),
             clientFactory: { _ in client }
         )
 
         await model.activate(serverAddressText: "mac-mini.local")
+        let start = ContinuousClock.now
         await model.startLogin()
+        let elapsed = start.duration(to: .now)
 
         XCTAssertEqual(model.status, .failed)
         XCTAssertFalse(model.isStartingLogin)
         XCTAssertNil(model.verificationQRPayload)
+        XCTAssertLessThan(elapsed, .seconds(1))
         let loginStartCount = await client.loginStartCount
         XCTAssertEqual(loginStartCount, 1)
         model.deactivate()
