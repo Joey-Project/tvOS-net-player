@@ -3871,6 +3871,8 @@ fn default_selection_for_input(input: &Input) -> Option<Selection> {
         | Input::RelatedRecommendations(_)
         | Input::History
         | Input::WatchLater => Some(Selection::Latest),
+        // Video search currently has no V2 selection policy in this consumer.
+        Input::VideoSearch { .. } => None,
         Input::Aid(_)
         | Input::Bvid(_)
         | Input::Episode(_)
@@ -3910,6 +3912,9 @@ fn resolve_selection_for_input(
         | Input::WatchLater => {
             bounded_resolve_selection(candidate_window.truncation_probe_limit).map(Some)
         }
+        Input::VideoSearch { .. } => Err(failed(
+            "Video search input is unsupported for bounded resolution.",
+        )),
         Input::ShortLink(_) => Ok(None),
     }
 }
@@ -5200,6 +5205,7 @@ fn collection_kind_name(kind: &VideoCollectionKind) -> &'static str {
         VideoCollectionKind::Collection => "collection",
         VideoCollectionKind::Series => "series",
         VideoCollectionKind::Recommendation => "recommendation",
+        VideoCollectionKind::Search => "search",
         VideoCollectionKind::Following => "following",
         VideoCollectionKind::SpaceDynamic => "space_dynamic",
         VideoCollectionKind::RelatedRecommendation => "related_recommendation",
@@ -11279,6 +11285,14 @@ mod tests {
             default_selection_for_input(&Input::WatchLater),
             Some(Selection::Latest)
         );
+        assert_eq!(
+            default_selection_for_input(&Input::VideoSearch {
+                keyword: "rust".to_owned(),
+                page: 1,
+                order: bbdown_core::VideoSearchOrder::TotalRank,
+            }),
+            None
+        );
     }
 
     #[test]
@@ -11307,6 +11321,30 @@ mod tests {
         assert!(indices.contains(100));
         assert!(indices.contains(101));
         assert!(!indices.contains(102));
+    }
+
+    #[test]
+    fn bounded_resolution_rejects_video_search_before_client_requests() {
+        let candidate_window = BilibiliResolveCandidateWindow::new(7).unwrap();
+        let result = resolve_selection_for_input(
+            &Input::VideoSearch {
+                keyword: "rust".to_owned(),
+                page: 1,
+                order: bbdown_core::VideoSearchOrder::TotalRank,
+            },
+            candidate_window,
+        );
+
+        assert!(matches!(
+            result,
+            Err(BilibiliDownloadError::Failed(message))
+                if message.ends_with("Video search input is unsupported for bounded resolution.")
+        ));
+    }
+
+    #[test]
+    fn search_collection_kind_has_a_stable_source_label_without_enabling_search_inputs() {
+        assert_eq!(collection_kind_name(&VideoCollectionKind::Search), "search");
     }
 
     #[test]
@@ -12538,6 +12576,7 @@ mod tests {
                     areas: Vec::new(),
                     tags: Vec::new(),
                     episodes: vec![episode.clone()],
+                    episode_groups: Vec::new(),
                 },
                 selected_episodes: vec![episode],
             }),
