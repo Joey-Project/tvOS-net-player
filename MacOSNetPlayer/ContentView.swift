@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import Foundation
 import TVOSNetPlayerCacheClient
 import TVOSNetPlayerCore
 
@@ -29,16 +30,20 @@ struct ContentView: View {
         .frame(minWidth: 1100, minHeight: 720)
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onAppear {
-            discoveryModel.start()
-            Task {
-                await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+            if !isUITesting {
+                discoveryModel.start()
+                Task {
+                    await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+                }
             }
             diagnosticsModel.useServerAddressText(cacheModel.serverAddressText)
             Task {
-                if cacheModel.hasServerAddress {
+                if !isUITesting, cacheModel.hasServerAddress {
                     await diagnosticsModel.refresh()
                 }
-                await autoConnectDiscoveredServerIfNeeded()
+                if !isUITesting {
+                    await autoConnectDiscoveredServerIfNeeded()
+                }
             }
         }
         .onDisappear {
@@ -46,16 +51,20 @@ struct ContentView: View {
         }
         .onChange(of: cacheModel.serverAddressText) { _, newValue in
             diagnosticsModel.useServerAddressText(newValue)
-            Task {
-                await bilibiliLoginModel.activate(serverAddressText: newValue)
+            if !isUITesting {
+                Task {
+                    await bilibiliLoginModel.activate(serverAddressText: newValue)
+                }
             }
         }
         .onChange(of: cacheModel.items) { _, _ in
             selectFirstCacheItemIfNeeded()
         }
         .onChange(of: discoveryModel.discoveredServers) { _, _ in
-            Task {
-                await autoConnectDiscoveredServerIfNeeded()
+            if !isUITesting {
+                Task {
+                    await autoConnectDiscoveredServerIfNeeded()
+                }
             }
         }
         .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
@@ -97,6 +106,14 @@ struct ContentView: View {
         return cacheModel.items.first
     }
 
+    private var isUITesting: Bool {
+        #if DEBUG
+            ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        #else
+            false
+        #endif
+    }
+
     private var cacheSidebar: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
@@ -105,6 +122,7 @@ struct ContentView: View {
                     text: $cacheModel.serverAddressText
                 )
                 .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("cache-server-address")
                 .onSubmit {
                     Task {
                         await refreshCacheAndDiagnostics()
@@ -118,6 +136,7 @@ struct ContentView: View {
                 } label: {
                     Label(cacheModel.isLoading ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
                 }
+                .accessibilityIdentifier("cache-server-refresh")
                 .disabled(!cacheModel.canRefresh)
             }
 
@@ -187,8 +206,12 @@ struct ContentView: View {
                         ForEach(cacheModel.items) { item in
                             CacheLibraryRow(item: item)
                                 .tag(item.id)
+                                .accessibilityElement(children: .combine)
+                                .accessibilityLabel(item.displayTitle)
+                                .accessibilityIdentifier("cache-library-item")
                         }
                     }
+                    .accessibilityIdentifier("cache-library-list")
 
                     cacheLoadMoreButton
                 }
@@ -236,6 +259,7 @@ struct ContentView: View {
                 )
                 .frame(maxWidth: .infinity)
             }
+            .accessibilityIdentifier("cache-library-load-more")
             .disabled(!cacheModel.canLoadMore)
         }
     }
@@ -258,18 +282,20 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .multilineTextAlignment(.trailing)
+                    .accessibilityIdentifier("app-status")
             }
 
             MacOSNativeControlScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     manualStreamControls
+                    selectedCacheItemControls
                     operatorDiagnostics
                     bilibiliLoginControls
                     bilibiliControls
-                    selectedCacheItemControls
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .accessibilityIdentifier("player-control-scroll")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             playbackArea
@@ -814,6 +840,7 @@ struct ContentView: View {
                         Label("Play Cached", systemImage: "play.rectangle.fill")
                     }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("cache-library-play-cached")
                     .disabled(
                         cacheModel.isLoading
                             || cacheModel.deletingItemIDs.contains(selectedItem.id)
@@ -937,6 +964,7 @@ struct ContentView: View {
     private var playbackArea: some View {
         VStack(alignment: .leading, spacing: 10) {
             playerSurface
+            PlaybackTimelineStatus(player: model.player, statusMessage: model.statusMessage)
             playbackControls
         }
     }
@@ -956,28 +984,48 @@ struct ContentView: View {
     }
 
     private var playbackControls: some View {
-        HStack(spacing: 10) {
-            Button {
-                model.skipBackward()
-            } label: {
-                Label("10s", systemImage: "gobackward.10")
-            }
-            .disabled(!model.canUsePlaybackControls)
-
-            Button {
-                model.skipForward()
-            } label: {
-                Label("10s", systemImage: "goforward.10")
-            }
-            .disabled(!model.canUsePlaybackControls)
-
-            Picker("Speed", selection: playbackSpeedBinding) {
-                ForEach(PlayerPlaybackSpeed.allCases) { speed in
-                    Text(speed.displayTitle).tag(speed)
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            HStack(spacing: 10) {
+                Button {
+                    guard let player = model.player else { return }
+                    if player.rate == 0 {
+                        player.defaultRate = model.playbackSpeed.rate
+                        player.play()
+                    } else {
+                        player.pause()
+                    }
+                } label: {
+                    let isPaused = model.player?.rate == 0
+                    Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
                 }
+                .accessibilityIdentifier("playback-toggle")
+                .disabled(model.player == nil)
+
+                Button {
+                    model.skipBackward()
+                } label: {
+                    Label("10s", systemImage: "gobackward.10")
+                }
+                .accessibilityIdentifier("playback-skip-backward")
+                .disabled(!model.canUsePlaybackControls)
+
+                Button {
+                    model.skipForward()
+                } label: {
+                    Label("10s", systemImage: "goforward.10")
+                }
+                .accessibilityIdentifier("playback-skip-forward")
+                .disabled(!model.canUsePlaybackControls)
+
+                Picker("Speed", selection: playbackSpeedBinding) {
+                    ForEach(PlayerPlaybackSpeed.allCases) { speed in
+                        Text(speed.displayTitle).tag(speed)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 280)
+                .accessibilityIdentifier("playback-speed")
             }
-            .pickerStyle(.segmented)
-            .frame(width: 280)
         }
     }
 
@@ -1189,6 +1237,47 @@ struct ContentView: View {
         if cacheModel.hasServerAddress {
             await diagnosticsModel.refresh(serverAddressText: cacheModel.serverAddressText)
         }
+    }
+}
+
+private struct PlaybackTimelineStatus: View {
+    let player: AVPlayer?
+    let statusMessage: String
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            let seconds = player?.currentTime().seconds ?? 0
+            let duration = player?.currentItem?.duration.seconds ?? 0
+            let validSeconds = Self.safeSeconds(seconds)
+            let validDuration = Self.safeSeconds(duration)
+            let isPlaying = (player?.rate ?? 0) != 0
+            let isFinished = statusMessage == "Playback finished."
+
+            HStack(spacing: 12) {
+                Text("Playback \(Self.timeLabel(validSeconds)) / \(Self.timeLabel(validDuration))")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Playback timeline")
+                    .accessibilityValue(String(format: "%.1f/%.1f", validSeconds, validDuration))
+                    .accessibilityIdentifier("playback-timeline")
+
+                Text(isFinished ? "Finished" : isPlaying ? "Playing" : "Paused")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityValue(isFinished ? "finished" : isPlaying ? "playing" : "paused")
+                    .accessibilityIdentifier("playback-state")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private static func timeLabel(_ seconds: Double) -> String {
+        let totalSeconds = Int(seconds.rounded(.down))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+
+    private static func safeSeconds(_ seconds: Double) -> Double {
+        guard seconds.isFinite else { return 0 }
+        return min(max(0, seconds), Double(Int32.max))
     }
 }
 

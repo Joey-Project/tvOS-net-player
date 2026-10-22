@@ -18,6 +18,7 @@
 - Rust 1.95.0 toolchain with `rustfmt` and `clippy`; `rust-toolchain.toml` pins this for Cargo/rustup.
 - `ffmpeg` 可执行文件；真实 Bilibili task worker 会调用 BBDown Rust core 下载媒体，需要合并音视频流时再用 `ffmpeg` remux。audio-only 输出保留可播放的 `.m4a`。
 - `just` task runner。
+- Python 3；UI e2e runner 只使用标准库，并需要 `ffmpeg` 与 `ffprobe`。
 - Apple TV 开启开发者模式，并在 Xcode / Devices and Simulators 中和这台 Mac 配对。
 - Xcode 里登录 Apple ID；物理设备安装时需要能生成 tvOS development provisioning profile。
 
@@ -37,6 +38,8 @@ just test
 just test-cache-server
 just test-bilibili-live
 just test-lan-playback
+just test-ui-e2e-macos
+just test-ui-e2e-tvos
 ```
 
 `just lint` 会运行 shell 脚本语法检查、`shellcheck`（如果已安装）、`swift-format lint --strict`、`cargo fmt --check` 和 `cargo clippy -D warnings`。`just format` 会用仓库根目录的 `.swift-format` 原地格式化 Swift 源码，并用 `cargo fmt` 格式化 Rust cache server 源码。
@@ -48,6 +51,16 @@ just test-lan-playback
 ```bash
 TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 ```
+
+### Native UI E2E
+
+`just test-ui-e2e-macos` 和 `just test-ui-e2e-tvos` 是独立的 XCUITest 界面测试入口，不是现有 AppCore/hosted-view XCTest 的别名。它们启动隔离的真实 Rust LAN cache server，生成不含音轨的短视频和跨越 50 条分页边界的本地目录，再通过实际客户端界面连接、选片和操作播放。tvOS 入口需要已安装且可用的 simulator runtime；仓库没有 iOS app target，安装 iOS runtime 不会增加 iOS 客户端覆盖。
+
+这两个 Just 命令会先构建 Rust server；设置 `CACHE_SERVER_BINARY` 可复用已构建的可执行文件。`DERIVED_DATA_PATH` 可复用已有 Xcode 编译缓存，该目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
+
+测试会先设置并确认系统静音，结束后保持静音。调试测试实例使用隔离偏好并禁用 Bonjour 自动连接；夹具 server 关闭 Bilibili worker、登录会话和 Bonjour，不读取已有账号凭据，也不修改日常 cache server。普通 CI 不依赖 Bilibili、账号 Cookie 或公共反代。真实 Bilibili 和长播放验证仍使用下方显式 opt-in live suite。
+
+GHA 的 UI 测试与现有构建/单元测试分开记录。只有实际执行对应 UI test target、通过界面断言并产生非零测试结果，才算 UI e2e 通过；成功编译或列出 simulator runtime 不能代替执行。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md)。
 
 真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、favorite/space/collection/series/recommendation list fetch、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
 

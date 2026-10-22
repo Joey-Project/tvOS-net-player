@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import Foundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import TVOSNetPlayerCore
@@ -32,6 +33,9 @@ struct ContentView: View {
         case bilibiliTaskResultsRetryButton
         case urlField
         case playButton
+        case playbackToggleButton
+        case playbackSkipBackwardButton
+        case playbackSkipForwardButton
     }
 
     var body: some View {
@@ -44,6 +48,7 @@ struct ContentView: View {
                         .font(.largeTitle.weight(.semibold))
                     Text("\(model.statusMessage) \(cacheModel.statusMessage) \(bilibiliModel.statusMessage)")
                         .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("app-status")
                 }
 
                 HStack(alignment: .top, spacing: 34) {
@@ -61,32 +66,40 @@ struct ContentView: View {
             .padding(.vertical, 58)
         }
         .onAppear {
-            discoveryModel.start()
-            Task {
-                await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+            if !isUITesting {
+                discoveryModel.start()
+                Task {
+                    await bilibiliLoginModel.activate(serverAddressText: cacheModel.serverAddressText)
+                }
             }
             focusedControl =
                 cacheModel.serverAddressText.isEmpty
                 ? .cacheServerField
                 : (model.streamURLText.isEmpty ? .refreshButton : .playButton)
-            Task {
-                await autoConnectDiscoveredServerIfNeeded()
+            if !isUITesting {
+                Task {
+                    await autoConnectDiscoveredServerIfNeeded()
+                }
             }
         }
         .onDisappear {
             bilibiliLoginModel.deactivate()
         }
         .onChange(of: cacheModel.serverAddressText) { _, newValue in
-            Task {
-                await bilibiliLoginModel.activate(serverAddressText: newValue)
+            if !isUITesting {
+                Task {
+                    await bilibiliLoginModel.activate(serverAddressText: newValue)
+                }
             }
         }
         .onChange(of: bilibiliLoginModel.verificationQRPayload) { _, payload in
             isLoginQRPresented = payload != nil
         }
         .onChange(of: discoveryModel.discoveredServers) { _, _ in
-            Task {
-                await autoConnectDiscoveredServerIfNeeded()
+            if !isUITesting {
+                Task {
+                    await autoConnectDiscoveredServerIfNeeded()
+                }
             }
         }
         .onChange(of: model.playbackProgressStatusRefreshRequestID) { _, _ in
@@ -127,125 +140,129 @@ struct ContentView: View {
     }
 
     private var cacheControls: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(cacheModel.serverName)
-                .font(.title2.weight(.semibold))
-
-            VStack(alignment: .leading, spacing: 10) {
-                TextField(
-                    "mac-mini.local:50051 or https://cache.example.com",
-                    text: $cacheModel.serverAddressText
-                )
-                .keyboardType(.URL)
-                .submitLabel(.go)
-                .onSubmit {
-                    Task {
-                        await cacheModel.refresh()
-                    }
-                }
-                .focused($focusedControl, equals: .cacheServerField)
-
-                if let errorMessage = cacheModel.errorMessage {
-                    Text(errorMessage)
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                }
-            }
-
-            HStack(spacing: 14) {
-                Button {
-                    Task {
-                        await cacheModel.refresh()
-                    }
-                } label: {
-                    Label(cacheModel.isLoading ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!cacheModel.canRefresh)
-                .focused($focusedControl, equals: .refreshButton)
-
-                if cacheModel.supportsResolverSettingsWrite,
-                    cacheModel.resolverSettingsEndpoint != nil
-                {
-                    Button {
-                        isResolverSettingsPresented = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-
-            discoveryControls
-
-            bilibiliLoginControls
-
-            if !cacheModel.cacheRoots.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(cacheModel.cacheRoots) { root in
-                        CacheRootRow(root: root)
-                    }
-                }
-            }
-
-            if let hlsCacheSummary = cacheModel.hlsCacheSummary {
-                Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 20) {
+                Text(cacheModel.serverName)
+                    .font(.title2.weight(.semibold))
+                Text(cacheModel.statusMessage)
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    .lineLimit(3)
-            }
+                    .accessibilityIdentifier("cache-library-status")
 
-            if !cacheModel.hlsCacheStatusBadges.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(cacheModel.hlsCacheStatusBadges) { badge in
-                        CacheStatusBadgeRow(badge: badge)
-                    }
-                }
-            }
-
-            HStack(spacing: 12) {
-                TextField("Search cached videos", text: $cacheModel.searchText)
-                    .textContentType(.none)
-                    .submitLabel(.search)
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField(
+                        "mac-mini.local:50051 or https://cache.example.com",
+                        text: $cacheModel.serverAddressText
+                    )
+                    .keyboardType(.URL)
+                    .submitLabel(.go)
+                    .accessibilityIdentifier("cache-server-address")
                     .onSubmit {
                         Task {
                             await cacheModel.refresh()
                         }
                     }
-                    .focused($focusedControl, equals: .cacheSearchField)
+                    .focused($focusedControl, equals: .cacheServerField)
 
-                Button {
-                    Task {
-                        await cacheModel.refresh()
+                    if let errorMessage = cacheModel.errorMessage {
+                        Text(errorMessage)
+                            .font(.callout)
+                            .foregroundStyle(.red)
                     }
-                } label: {
-                    Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
                 }
-                .buttonStyle(.bordered)
-                .disabled(!cacheModel.canRefresh)
-                .focused($focusedControl, equals: .cacheSearchButton)
-            }
 
-            Divider()
-
-            bilibiliControls
-
-            Divider()
-
-            if cacheModel.items.isEmpty {
-                VStack(spacing: 12) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(.white.opacity(0.08))
-                        Text("No cached videos")
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    Button {
+                        Task {
+                            await cacheModel.refresh()
+                        }
+                    } label: {
+                        Label(cacheModel.isLoading ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
                     }
-                    .frame(maxWidth: .infinity, minHeight: 220)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("cache-server-refresh")
+                    .disabled(!cacheModel.canRefresh)
+                    .focused($focusedControl, equals: .refreshButton)
 
-                    cacheLoadMoreButton
+                    if cacheModel.supportsResolverSettingsWrite,
+                        cacheModel.resolverSettingsEndpoint != nil
+                    {
+                        Button {
+                            isResolverSettingsPresented = true
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
-            } else {
-                ScrollView {
+
+                discoveryControls
+
+                bilibiliLoginControls
+
+                if !cacheModel.cacheRoots.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(cacheModel.cacheRoots) { root in
+                            CacheRootRow(root: root)
+                        }
+                    }
+                }
+
+                if let hlsCacheSummary = cacheModel.hlsCacheSummary {
+                    Label(hlsCacheSummary, systemImage: "externaldrive.badge.timemachine")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+
+                if !cacheModel.hlsCacheStatusBadges.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(cacheModel.hlsCacheStatusBadges) { badge in
+                            CacheStatusBadgeRow(badge: badge)
+                        }
+                    }
+                }
+
+                HStack(spacing: 12) {
+                    TextField("Search cached videos", text: $cacheModel.searchText)
+                        .textContentType(.none)
+                        .submitLabel(.search)
+                        .accessibilityIdentifier("cache-library-search")
+                        .onSubmit {
+                            Task {
+                                await cacheModel.refresh()
+                            }
+                        }
+                        .focused($focusedControl, equals: .cacheSearchField)
+
+                    Button {
+                        Task {
+                            await cacheModel.refresh()
+                        }
+                    } label: {
+                        Label(cacheModel.hasPendingSearch ? "Search" : "Reload", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!cacheModel.canRefresh)
+                    .focused($focusedControl, equals: .cacheSearchButton)
+                    .accessibilityIdentifier("cache-library-search-submit")
+                }
+
+                Divider()
+
+                if cacheModel.items.isEmpty {
+                    VStack(spacing: 12) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(.white.opacity(0.08))
+                            Text("No cached videos")
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 220)
+
+                        cacheLoadMoreButton
+                    }
+                } else {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(cacheModel.items) { item in
                             HStack(alignment: .center, spacing: 10) {
@@ -257,6 +274,8 @@ struct ContentView: View {
                                     CacheLibraryRow(item: item)
                                 }
                                 .buttonStyle(.bordered)
+                                .accessibilityLabel(item.displayTitle)
+                                .accessibilityIdentifier("cache-library-item")
                                 .disabled(
                                     cacheModel.isLoading
                                         || cacheModel.deletingItemIDs.contains(item.id)
@@ -279,8 +298,20 @@ struct ContentView: View {
                         cacheLoadMoreButton
                     }
                 }
+                Divider()
+                bilibiliControls
             }
+            .padding(.vertical, 4)
         }
+        .accessibilityIdentifier("cache-controls-scroll")
+    }
+
+    private var isUITesting: Bool {
+        #if DEBUG
+            ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        #else
+            false
+        #endif
     }
 
     private var bilibiliLoginControls: some View {
@@ -423,6 +454,7 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .disabled(!cacheModel.canLoadMore)
             .focused($focusedControl, equals: .cacheLoadMoreButton)
+            .accessibilityIdentifier("cache-library-load-more")
         }
     }
 
@@ -894,6 +926,7 @@ struct ContentView: View {
     private var playbackArea: some View {
         VStack(alignment: .leading, spacing: 12) {
             playerSurface
+            PlaybackTimelineStatus(player: model.player, statusMessage: model.statusMessage)
             playbackControls
         }
     }
@@ -916,28 +949,51 @@ struct ContentView: View {
     }
 
     private var playbackControls: some View {
-        HStack(spacing: 12) {
-            Button {
-                model.skipBackward()
-            } label: {
-                Label("10s", systemImage: "gobackward.10")
-            }
-            .disabled(!model.canUsePlaybackControls)
-
-            Button {
-                model.skipForward()
-            } label: {
-                Label("10s", systemImage: "goforward.10")
-            }
-            .disabled(!model.canUsePlaybackControls)
-
-            Picker("Speed", selection: playbackSpeedBinding) {
-                ForEach(PlayerPlaybackSpeed.allCases) { speed in
-                    Text(speed.displayTitle).tag(speed)
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            HStack(spacing: 12) {
+                Button {
+                    guard let player = model.player else { return }
+                    if player.rate == 0 {
+                        player.defaultRate = model.playbackSpeed.rate
+                        player.play()
+                    } else {
+                        player.pause()
+                    }
+                } label: {
+                    let isPaused = model.player?.rate == 0
+                    Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
                 }
+                .accessibilityIdentifier("playback-toggle")
+                .focused($focusedControl, equals: .playbackToggleButton)
+                .disabled(model.player == nil)
+
+                Button {
+                    model.skipBackward()
+                } label: {
+                    Label("10s", systemImage: "gobackward.10")
+                }
+                .accessibilityIdentifier("playback-skip-backward")
+                .focused($focusedControl, equals: .playbackSkipBackwardButton)
+                .disabled(!model.canUsePlaybackControls)
+
+                Button {
+                    model.skipForward()
+                } label: {
+                    Label("10s", systemImage: "goforward.10")
+                }
+                .accessibilityIdentifier("playback-skip-forward")
+                .focused($focusedControl, equals: .playbackSkipForwardButton)
+                .disabled(!model.canUsePlaybackControls)
+
+                Picker("Speed", selection: playbackSpeedBinding) {
+                    ForEach(PlayerPlaybackSpeed.allCases) { speed in
+                        Text(speed.displayTitle).tag(speed)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 360)
+                .accessibilityIdentifier("playback-speed")
             }
-            .pickerStyle(.segmented)
-            .frame(width: 360)
         }
     }
 
@@ -998,6 +1054,7 @@ struct ContentView: View {
 
     private func autoConnectDiscoveredServerIfNeeded() async {
         guard
+            !isUITesting,
             !isAutoDiscoveryConnecting,
             !cacheModel.hasServerAddress,
             let server = discoveryModel.discoveredServers.first(where: {
@@ -1118,6 +1175,47 @@ struct ContentView: View {
     private func refreshPlaybackProgressStatus() async {
         await model.flushPlaybackProgressReports()
         await cacheModel.refreshHLSCacheStatus()
+    }
+}
+
+private struct PlaybackTimelineStatus: View {
+    let player: AVPlayer?
+    let statusMessage: String
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            let seconds = player?.currentTime().seconds ?? 0
+            let duration = player?.currentItem?.duration.seconds ?? 0
+            let validSeconds = Self.safeSeconds(seconds)
+            let validDuration = Self.safeSeconds(duration)
+            let isPlaying = (player?.rate ?? 0) != 0
+            let isFinished = statusMessage == "Playback finished."
+
+            HStack(spacing: 12) {
+                Text("Playback \(Self.timeLabel(validSeconds)) / \(Self.timeLabel(validDuration))")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Playback timeline")
+                    .accessibilityValue(String(format: "%.1f/%.1f", validSeconds, validDuration))
+                    .accessibilityIdentifier("playback-timeline")
+
+                Text(isFinished ? "Finished" : isPlaying ? "Playing" : "Paused")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityValue(isFinished ? "finished" : isPlaying ? "playing" : "paused")
+                    .accessibilityIdentifier("playback-state")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private static func timeLabel(_ seconds: Double) -> String {
+        let totalSeconds = Int(seconds.rounded(.down))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+
+    private static func safeSeconds(_ seconds: Double) -> Double {
+        guard seconds.isFinite else { return 0 }
+        return min(max(0, seconds), Double(Int32.max))
     }
 }
 

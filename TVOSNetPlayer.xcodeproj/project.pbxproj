@@ -22,6 +22,8 @@
 		D00000000000000000000012 /* AppShellIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000013 /* AppShellIntegrationTests.swift */; };
 		D00000000000000000000013 /* TVOSNetPlayerCore in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000003 /* TVOSNetPlayerCore */; };
 		D00000000000000000000014 /* TVOSNetPlayerCacheClient in Frameworks */ = {isa = PBXBuildFile; productRef = I00000000000000000000002 /* TVOSNetPlayerCacheClient */; };
+		D00000000000000000000015 /* UIPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* UIPlaybackTests.swift */; };
+		D00000000000000000000016 /* UIPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* UIPlaybackTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,6 +41,20 @@
 			remoteGlobalIDString = E00000000000000000000003;
 			remoteInfo = MacOSNetPlayer;
 		};
+		H00000000000000000000005 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E00000000000000000000003;
+			remoteInfo = MacOSNetPlayer;
+		};
+		H00000000000000000000006 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E00000000000000000000001;
+			remoteInfo = TVOSNetPlayer;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
@@ -55,10 +71,14 @@
 		B0000000000000000000000F /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B00000000000000000000010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B00000000000000000000013 /* AppShellIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShellIntegrationTests.swift; sourceTree = "<group>"; };
+		B00000000000000000000014 /* UIPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPlaybackTests.swift; sourceTree = "<group>"; };
+		B00000000000000000000015 /* UIPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPlaybackTests.swift; sourceTree = "<group>"; };
 		C00000000000000000000001 /* TVOSNetPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TVOSNetPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000002 /* TVOSNetPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TVOSNetPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000003 /* MacOSNetPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacOSNetPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C00000000000000000000004 /* MacOSNetPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MacOSNetPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C00000000000000000000005 /* MacOSNetPlayerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MacOSNetPlayerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C00000000000000000000006 /* TVOSNetPlayerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TVOSNetPlayerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -98,6 +118,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0000000000000000000000E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000011 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -106,9 +140,11 @@
 			children = (
 				A00000000000000000000009 /* MacOSNetPlayer */,
 				A0000000000000000000000A /* MacOSNetPlayerTests */,
+				A0000000000000000000000B /* MacOSNetPlayerUITests */,
 				A00000000000000000000003 /* TVOSNetPlayer */,
 				A00000000000000000000007 /* TVOSNetPlayerCore */,
 				A00000000000000000000004 /* TVOSNetPlayerTests */,
+				A0000000000000000000000C /* TVOSNetPlayerUITests */,
 				A00000000000000000000005 /* Config */,
 				A00000000000000000000006 /* Products */,
 			);
@@ -169,6 +205,22 @@
 			path = MacOSNetPlayerTests;
 			sourceTree = "<group>";
 		};
+		A0000000000000000000000B /* MacOSNetPlayerUITests */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000014 /* UIPlaybackTests.swift */,
+			);
+			path = MacOSNetPlayerUITests;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000C /* TVOSNetPlayerUITests */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000015 /* UIPlaybackTests.swift */,
+			);
+			path = TVOSNetPlayerUITests;
+			sourceTree = "<group>";
+		};
 		A00000000000000000000005 /* Config */ = {
 			isa = PBXGroup;
 			children = (
@@ -184,6 +236,8 @@
 				C00000000000000000000002 /* TVOSNetPlayerTests.xctest */,
 				C00000000000000000000003 /* MacOSNetPlayer.app */,
 				C00000000000000000000004 /* MacOSNetPlayerTests.xctest */,
+				C00000000000000000000005 /* MacOSNetPlayerUITests.xctest */,
+				C00000000000000000000006 /* TVOSNetPlayerUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -277,6 +331,42 @@
 			productReference = C00000000000000000000004 /* MacOSNetPlayerTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		E00000000000000000000005 /* MacOSNetPlayerUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = G00000000000000000000014 /* Build configuration list for PBXNativeTarget "MacOSNetPlayerUITests" */;
+			buildPhases = (
+				F0000000000000000000000D /* Sources */,
+				F0000000000000000000000E /* Frameworks */,
+				F0000000000000000000000F /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				H00000000000000000000007 /* PBXTargetDependency */,
+			);
+			name = MacOSNetPlayerUITests;
+			productName = MacOSNetPlayerUITests;
+			productReference = C00000000000000000000005 /* MacOSNetPlayerUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		E00000000000000000000006 /* TVOSNetPlayerUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = G00000000000000000000015 /* Build configuration list for PBXNativeTarget "TVOSNetPlayerUITests" */;
+			buildPhases = (
+				F00000000000000000000010 /* Sources */,
+				F00000000000000000000011 /* Frameworks */,
+				F00000000000000000000012 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				H00000000000000000000008 /* PBXTargetDependency */,
+			);
+			name = TVOSNetPlayerUITests;
+			productName = TVOSNetPlayerUITests;
+			productReference = C00000000000000000000006 /* TVOSNetPlayerUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -301,6 +391,14 @@
 						CreatedOnToolsVersion = 26.5;
 						TestTargetID = E00000000000000000000003;
 					};
+					E00000000000000000000005 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = E00000000000000000000003;
+					};
+					E00000000000000000000006 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = E00000000000000000000001;
+					};
 				};
 			};
 			buildConfigurationList = G00000000000000000000007 /* Build configuration list for PBXProject "TVOSNetPlayer" */;
@@ -323,6 +421,8 @@
 				E00000000000000000000002 /* TVOSNetPlayerTests */,
 				E00000000000000000000003 /* MacOSNetPlayer */,
 				E00000000000000000000004 /* MacOSNetPlayerTests */,
+					E00000000000000000000005 /* MacOSNetPlayerUITests */,
+					E00000000000000000000006 /* TVOSNetPlayerUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -351,6 +451,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		F0000000000000000000000C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F0000000000000000000000F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000012 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -394,6 +508,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0000000000000000000000D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D00000000000000000000015 /* UIPlaybackTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000010 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D00000000000000000000016 /* UIPlaybackTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -406,6 +536,16 @@
 			isa = PBXTargetDependency;
 			target = E00000000000000000000003 /* MacOSNetPlayer */;
 			targetProxy = H00000000000000000000003 /* PBXContainerItemProxy */;
+		};
+		H00000000000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E00000000000000000000003 /* MacOSNetPlayer */;
+			targetProxy = H00000000000000000000005 /* PBXContainerItemProxy */;
+		};
+		H00000000000000000000008 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E00000000000000000000001 /* TVOSNetPlayer */;
+			targetProxy = H00000000000000000000006 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -592,6 +732,94 @@
 			};
 			name = Release;
 		};
+		G00000000000000000000010 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).macos.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TEST_TARGET_NAME = MacOSNetPlayer;
+			};
+			name = Debug;
+		};
+		G00000000000000000000011 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).macos.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TEST_TARGET_NAME = MacOSNetPlayer;
+			};
+			name = Release;
+		};
+		G00000000000000000000012 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_TARGET_NAME = TVOSNetPlayer;
+			};
+			name = Debug;
+		};
+		G00000000000000000000013 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_TARGET_NAME = TVOSNetPlayer;
+			};
+			name = Release;
+		};
 		G00000000000000000000008 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = B00000000000000000000007 /* Project.xcconfig */;
@@ -734,6 +962,24 @@
 			buildConfigurations = (
 				G0000000000000000000000D /* Debug */,
 				G0000000000000000000000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		G00000000000000000000014 /* Build configuration list for PBXNativeTarget "MacOSNetPlayerUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G00000000000000000000010 /* Debug */,
+				G00000000000000000000011 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		G00000000000000000000015 /* Build configuration list for PBXNativeTarget "TVOSNetPlayerUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G00000000000000000000012 /* Debug */,
+				G00000000000000000000013 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
