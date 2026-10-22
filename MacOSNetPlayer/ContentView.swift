@@ -22,6 +22,7 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             cacheSidebar
+                .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 480)
         } detail: {
             detailPane
         }
@@ -240,7 +241,7 @@ struct ContentView: View {
     }
 
     private var detailPane: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text("macOS Net Player")
                     .font(.title2.weight(.semibold))
@@ -259,12 +260,20 @@ struct ContentView: View {
                     .multilineTextAlignment(.trailing)
             }
 
-            manualStreamControls
-            operatorDiagnostics
-            bilibiliLoginControls
-            bilibiliControls
-            selectedCacheItemControls
+            MacOSNativeControlScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    manualStreamControls
+                    operatorDiagnostics
+                    bilibiliLoginControls
+                    bilibiliControls
+                    selectedCacheItemControls
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
             playbackArea
+                .frame(minHeight: 270, maxHeight: 400)
         }
         .padding(24)
     }
@@ -591,7 +600,7 @@ struct ContentView: View {
                             }
                         }
                     }
-                    .frame(maxHeight: 220)
+                    .frame(height: 220)
 
                     if bilibiliModel.hasMoreResolvedCandidates {
                         Button {
@@ -935,8 +944,7 @@ struct ContentView: View {
     private var playerSurface: some View {
         Group {
             if let player = model.player {
-                VideoPlayer(player: player)
-                    .id(model.loadedURL)
+                MacOSNativePlayerView(player: player)
             } else {
                 ContentUnavailableView("No Stream Loaded", systemImage: "play.rectangle")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1367,6 +1375,71 @@ private struct BilibiliTaskResultRow: View {
         [artifact.state, artifact.format, artifact.languageTag]
             .filter { !$0.isEmpty }
             .joined(separator: " | ")
+    }
+}
+
+struct MacOSNativePlayerView: NSViewRepresentable {
+    let player: AVPlayer?
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let playerView = AVPlayerView()
+        playerView.controlsStyle = .floating
+        playerView.videoGravity = .resizeAspect
+        playerView.player = player
+        return playerView
+    }
+
+    func updateNSView(_ playerView: AVPlayerView, context: Context) {
+        if playerView.player !== player {
+            playerView.player = player
+        }
+    }
+
+    static func dismantleNSView(_ playerView: AVPlayerView, coordinator: ()) {
+        playerView.player = nil
+    }
+}
+
+struct MacOSNativeControlScrollView<Content: View>: NSViewRepresentable {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+
+        let hostingView = NSHostingView(rootView: content)
+        hostingView.sizingOptions = [.intrinsicContentSize]
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = hostingView
+        hostingView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let hostingView = scrollView.documentView as? NSHostingView<Content> else {
+            return
+        }
+
+        let previousOrigin = scrollView.contentView.bounds.origin
+        hostingView.rootView = content
+        hostingView.invalidateIntrinsicContentSize()
+        hostingView.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+
+        let maximumY = max(0, hostingView.frame.height - scrollView.contentView.bounds.height)
+        let retainedOrigin = NSPoint(x: 0, y: min(max(0, previousOrigin.y), maximumY))
+        scrollView.contentView.scroll(to: retainedOrigin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 }
 
