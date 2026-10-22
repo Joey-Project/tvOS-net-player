@@ -702,17 +702,21 @@ public final class GRPCCacheControlClient: CacheControlClient {
     }
 
     public func getTask(id: String) async throws -> CacheTask {
-        try await withGRPCClient(
-            transport: .http2NIOTS(
-                target: endpoint.grpcTarget,
-                transportSecurity: endpoint.grpcTransportSecurity
-            )
-        ) { client in
-            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
-            var request = TvosNetPlayer_V1_GetTaskRequest()
-            request.id = id
-            let response = try await service.getTask(request, options: callOptions)
-            return CacheTask(response)
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_GetTaskRequest()
+                request.id = id
+                let response = try await service.getTask(request, options: callOptions)
+                return CacheTask(response)
+            }
+        } catch {
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
         }
     }
 
@@ -743,17 +747,21 @@ public final class GRPCCacheControlClient: CacheControlClient {
     }
 
     public func cancelTask(id: String) async throws -> CacheTask {
-        try await withGRPCClient(
-            transport: .http2NIOTS(
-                target: endpoint.grpcTarget,
-                transportSecurity: endpoint.grpcTransportSecurity
-            )
-        ) { client in
-            let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
-            var request = TvosNetPlayer_V1_CancelTaskRequest()
-            request.id = id
-            let response = try await service.cancelTask(request, options: callOptions)
-            return CacheTask(response)
+        do {
+            return try await withGRPCClient(
+                transport: .http2NIOTS(
+                    target: endpoint.grpcTarget,
+                    transportSecurity: endpoint.grpcTransportSecurity
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_CancelTaskRequest()
+                request.id = id
+                let response = try await service.cancelTask(request, options: callOptions)
+                return CacheTask(response)
+            }
+        } catch {
+            throw CacheTaskControlError.mapTransportError(error, callerIsCancelled: Task.isCancelled)
         }
     }
 
@@ -778,7 +786,12 @@ public final class GRPCCacheControlClient: CacheControlClient {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(
+                        throwing: CacheTaskControlError.mapTransportError(
+                            error,
+                            callerIsCancelled: Task.isCancelled
+                        )
+                    )
                 }
             }
 

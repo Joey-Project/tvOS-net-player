@@ -209,7 +209,9 @@ BBDown adapter 相关配置：
 
 新客户端使用 v2 Bilibili resolution session 读取分页候选项，以 server 生成的不透明 token 选择单项、多项、范围或全部，并用 `CreateBilibiliTaskV2` 提交播放或下载。`ListTaskResults` 分页返回每项的状态、播放或 library 引用及可用 artifact；媒体和 sidecar 字节仍由 LAN server 的 HTTP/HLS/Range endpoint 提供。一次任务最多接受 100 个候选项，较大列表需要分批选择；旧 RPC 和单结果字段仅保留给旧客户端兼容。没有 v2 能力的 server 需要升级，客户端不会回退到旧提交路径。
 
-tvOS app 目前只在刷新时请求首屏 library preview（最多 200 条），避免在服务端每页重新扫描本地 cache root 的第一片实现上触发多次全量目录枚举。cache client contract 已暴露 page token 和 search text；完整分页浏览和搜索会随后续 library UI 一起补齐。
+tvOS/macOS 使用共享 AppCore 观察已提交的任务。更新流暂时断开或提前结束时，客户端限次退避、读取原任务的最新状态，再恢复订阅；不会重新解析或提交任务，也不会因此停止已开始的播放。重连耗尽或遇到权限、任务不存在等明确错误时，可用独立的 `Reconnect Updates` 恢复同一任务的更新；原有 `Retry` 仍表示重试失败的任务，两者不是同一个操作。取消请求失败时，客户端只提示取消尚未确认，最终以服务器任务状态为准。
+
+两端 cache library 已支持每页 50 条的分页浏览和搜索，后续页面通过 page token 加载。
 
 ## Pre-commit Hook
 

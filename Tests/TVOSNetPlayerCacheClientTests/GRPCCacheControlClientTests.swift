@@ -1,7 +1,102 @@
 import XCTest
+import GRPCCore
 @testable import TVOSNetPlayerCacheClient
 
 final class GRPCCacheControlClientTests: XCTestCase {
+    func testTaskControlErrorMapsSupportedGRPCStatusCodes() {
+        let mappings: [(RPCError.Code, CacheTaskControlError)] = [
+            (.unavailable, .unavailable),
+            (.deadlineExceeded, .deadlineExceeded),
+            (.unauthenticated, .unauthenticated),
+            (.permissionDenied, .permissionDenied),
+            (.notFound, .notFound),
+            (.invalidArgument, .invalidArgument),
+            (.failedPrecondition, .failedPrecondition),
+            (.unimplemented, .unimplemented),
+            (.cancelled, .cancelled),
+            (.unknown, .unknown),
+        ]
+
+        for (code, expected) in mappings {
+            let rpcError = RPCError(code: code, message: "PRIVATE_UPSTREAM_DETAIL")
+            let mappedError = CacheTaskControlError.mapTransportError(
+                rpcError,
+                callerIsCancelled: false
+            )
+
+            XCTAssertEqual(mappedError as? CacheTaskControlError, expected)
+            XCTAssertFalse(mappedError.localizedDescription.contains("PRIVATE_UPSTREAM_DETAIL"))
+        }
+    }
+
+    func testTaskControlErrorOnlyRetriesObservationForTransientCases() {
+        let errors: [(CacheTaskControlError, Bool)] = [
+            (.unavailable, true),
+            (.deadlineExceeded, true),
+            (.unauthenticated, false),
+            (.permissionDenied, false),
+            (.notFound, false),
+            (.invalidArgument, false),
+            (.failedPrecondition, false),
+            (.unimplemented, false),
+            (.cancelled, true),
+            (.unknown, true),
+        ]
+
+        for (error, canRetry) in errors {
+            XCTAssertEqual(error.canRetryObservation, canRetry, "Unexpected retry policy for \(error).")
+        }
+    }
+
+    func testUnknownTaskControlErrorRedactsUnderlyingTransportText() {
+        let diagnosticSentinel = "PRIVATE_UPSTREAM_DETAIL"
+        let nonGRPCError = CacheTaskControlError.mapTransportError(
+            SentinelTransportError(message: diagnosticSentinel),
+            callerIsCancelled: false
+        )
+
+        XCTAssertEqual(nonGRPCError as? CacheTaskControlError, .unknown)
+        XCTAssertFalse(nonGRPCError.localizedDescription.contains(diagnosticSentinel))
+    }
+
+    func testUnclassifiedGRPCStatusCodesBecomeRedactedUnknown() {
+        let codes: [RPCError.Code] = [
+            .alreadyExists,
+            .resourceExhausted,
+            .aborted,
+            .outOfRange,
+            .internalError,
+            .dataLoss,
+        ]
+        let diagnosticSentinel = "PRIVATE_UPSTREAM_DETAIL"
+
+        for code in codes {
+            let rpcError = RPCError(code: code, message: diagnosticSentinel)
+            let mappedError = CacheTaskControlError.mapTransportError(
+                rpcError,
+                callerIsCancelled: false
+            )
+
+            XCTAssertEqual(mappedError as? CacheTaskControlError, .unknown)
+            XCTAssertFalse(mappedError.localizedDescription.contains(diagnosticSentinel))
+            XCTAssertTrue((mappedError as? CacheTaskControlError)?.canRetryObservation == true)
+        }
+    }
+
+    func testLocalCancellationRemainsCancellationErrorAndTakesPrecedence() {
+        let cancellation = CacheTaskControlError.mapTransportError(
+            CancellationError(),
+            callerIsCancelled: false
+        )
+        XCTAssertTrue(cancellation is CancellationError)
+
+        let callerCancelled = CacheTaskControlError.mapTransportError(
+            SentinelTransportError(message: "transport failure"),
+            callerIsCancelled: true
+        )
+        XCTAssertTrue(callerCancelled is CancellationError)
+    }
+
     func testLoginStartDeadlineDefaultsToNinetySeconds() {
         let client = GRPCCacheControlClient(
             endpoint: CacheServerEndpoint(host: "localhost"),
@@ -127,5 +222,11 @@ final class GRPCCacheControlClientTests: XCTestCase {
         unknownProto.failureKind = .UNRECOGNIZED(5678)
         XCTAssertEqual(HlsCacheFillStatus(unknownProto).state, .unspecified)
         XCTAssertEqual(HlsCacheFillStatus(unknownProto).failureKind, .unspecified)
+    }
+
+    private struct SentinelTransportError: Error, LocalizedError {
+        let message: String
+
+        var errorDescription: String? { message }
     }
 }
