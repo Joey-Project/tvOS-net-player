@@ -1,0 +1,71 @@
+name: UI E2E
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-e2e:
+    name: ${{ matrix.platform }} UI playback E2E
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos, tvos]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record installed Apple toolchain
+        timeout-minutes: 2
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Record installed tvOS runtimes and devices
+        if: matrix.platform == 'tvos'
+        timeout-minutes: 2
+        run: |
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+
+      - name: Install and verify fixture tools
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+
+      - name: Run UI E2E helper regression tests
+        run: python3 -m unittest discover -s scripts -p 'test_ui_e2e.py' -v
+
+      - name: Build Rust cache server
+        run: scripts/build-cache-server.sh
+
+      - name: Run ${{ matrix.platform }} UI E2E
+        env:
+          CACHE_SERVER_BINARY: ${{ github.workspace }}/target/release/tvos-net-player-cache-server
+          UI_E2E_ARTIFACT_DIR: ${{ runner.temp }}/ui-e2e-artifacts/${{ matrix.platform }}
+        run: python3 scripts/ui-e2e.py --platform "${{ matrix.platform }}"
+
+      - name: Upload bounded UI E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-e2e-${{ matrix.platform }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ui-e2e-artifacts/${{ matrix.platform }}
+          if-no-files-found: warn
+          retention-days: 3

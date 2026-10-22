@@ -655,13 +655,14 @@ final class BilibiliLoginViewModelTests: XCTestCase {
 
     @MainActor
     func testLoginStartUsesSeparateBoundedTimeout() async {
+        let startGate = LoginStartCancellationGate()
         let client = LoginClient(
             serverInfo: .fixture(capabilities: [
                 CacheServerCapability.bilibiliCredentialStatus,
                 CacheServerCapability.bilibiliLoginSessions,
             ]),
             credentialStatus: .fixture(),
-            startDelay: .milliseconds(120)
+            startGate: startGate
         )
         let model = BilibiliLoginViewModel(
             operationTimeout: .milliseconds(20),
@@ -671,13 +672,23 @@ final class BilibiliLoginViewModelTests: XCTestCase {
         )
 
         await model.activate(serverAddressText: "mac-mini.local")
-        await model.startLogin()
+        let completed = XCTestExpectation(description: "Login start returns after its bounded timeout")
+        let startTask = Task {
+            await model.startLogin()
+            completed.fulfill()
+        }
+        let completionResult = await XCTWaiter.fulfillment(of: [completed], timeout: 5)
+        startTask.cancel()
+        await startTask.value
 
+        XCTAssertEqual(completionResult, .completed, "The model did not finish its login-start timeout.")
         XCTAssertEqual(model.status, .failed)
         XCTAssertFalse(model.isStartingLogin)
         XCTAssertNil(model.verificationQRPayload)
         let loginStartCount = await client.loginStartCount
         XCTAssertEqual(loginStartCount, 1)
+        let cancellationObserved = await startGate.cancellationObserved
+        XCTAssertTrue(cancellationObserved, "The bounded timeout must cancel the pending login operation.")
         model.deactivate()
     }
 
@@ -853,6 +864,33 @@ final class BilibiliLoginViewModelTests: XCTestCase {
     }
 }
 
+// A pending operation cannot race the timeout with a delayed successful response.
+private actor LoginStartCancellationGate {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private(set) var cancellationObserved = false
+
+    func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if cancellationObserved || Task.isCancelled {
+                    cancellationObserved = true
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    private func cancel() {
+        cancellationObserved = true
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
+    }
+}
+
 private actor LoginClient: CacheControlClient {
     let serverInfo: CacheServerSummary
     let credentialStatus: BilibiliCredentialStatus
@@ -862,6 +900,7 @@ private actor LoginClient: CacheControlClient {
     let subsequentSession: BilibiliLoginSession?
     let polledSession: BilibiliLoginSession?
     let startDelay: Duration
+    let startGate: LoginStartCancellationGate?
     private(set) var credentialStatusCallCount = 0
     private(set) var loginStartCount = 0
     private(set) var loginPollCount = 0
@@ -876,7 +915,8 @@ private actor LoginClient: CacheControlClient {
         newSession: BilibiliLoginSession = .fixture(state: "pending"),
         subsequentSession: BilibiliLoginSession? = nil,
         polledSession: BilibiliLoginSession? = nil,
-        startDelay: Duration = .zero
+        startDelay: Duration = .zero,
+        startGate: LoginStartCancellationGate? = nil
     ) {
         self.serverInfo = serverInfo
         self.credentialStatus = credentialStatus
@@ -886,6 +926,7 @@ private actor LoginClient: CacheControlClient {
         self.subsequentSession = subsequentSession
         self.polledSession = polledSession
         self.startDelay = startDelay
+        self.startGate = startGate
     }
 
     func getServerInfo() async throws -> CacheServerSummary {
@@ -911,6 +952,9 @@ private actor LoginClient: CacheControlClient {
         loginStartCount += 1
         requestedProfileID = profileID
         requestedMethod = method
+        if let startGate {
+            try await startGate.wait()
+        }
         if startDelay > .zero {
             try await Task.sleep(for: startDelay)
         }

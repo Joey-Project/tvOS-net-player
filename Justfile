@@ -49,3 +49,9 @@ test-lan-playback:
 
 test-tvos:
     scripts/test-tvos-simulator.sh
+
+test-ui-e2e-macos:
+    if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi && python3 scripts/ui-e2e.py --platform macos
+
+test-ui-e2e-tvos:
+    if [[ -z "${CACHE_SERVER_BINARY:-}" ]]; then scripts/build-cache-server.sh; fi && python3 scripts/ui-e2e.py --platform tvos
