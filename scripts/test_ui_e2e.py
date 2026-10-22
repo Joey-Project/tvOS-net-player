@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,61 @@ SPEC.loader.exec_module(ui_e2e)
 
 
 class ProcessSupervisorTests(unittest.TestCase):
+    def test_exited_leader_descendant_is_terminated_before_leader_reaping(self) -> None:
+        owned: list[object] = []
+        popen = ui_e2e.subprocess.Popen
+
+        def spawn(*args: object, **kwargs: object) -> object:
+            process = popen(*args, **kwargs)
+            owned.append(process)
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "descendant.log"
+            try:
+                with mock.patch.object(ui_e2e.subprocess, "Popen", side_effect=spawn):
+                    result = ui_e2e.run_process(
+                        [sys.executable, "-c",
+                         "import subprocess,sys; child=subprocess.Popen([sys.executable,'-c',"
+                         "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)']); print(child.pid,flush=True)"],
+                        log_path=log_path,
+                        timeout_seconds=0.3,
+                        max_output_bytes=1024,
+                    )
+                self.assertTrue(result.timed_out)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(owned[0].wait(timeout=0), 0)
+                descendant_pid = int(log_path.read_text().strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(descendant_pid, 0)
+            finally:
+                for process in owned:
+                    if process.returncode is None:
+                        ui_e2e.stop_process_group(process)
+
+    def test_reaped_leader_cannot_authorize_signals_to_reused_group(self) -> None:
+        process = mock.Mock(pid=4244, returncode=0)
+        with (
+            mock.patch.object(ui_e2e, "_group_has_live_members", return_value=True),
+            mock.patch.object(ui_e2e.os, "killpg") as killpg,
+        ):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "unreserved PGID"):
+                ui_e2e.stop_process_group(process)
+        killpg.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_changed_group_identity_is_not_signalled(self) -> None:
+        process = mock.Mock(pid=4245, returncode=None)
+        with (
+            mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+            mock.patch.object(ui_e2e.os, "getpgid", return_value=9999),
+            mock.patch.object(ui_e2e.os, "killpg") as killpg,
+        ):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "original session/group leader"):
+                ui_e2e.stop_process_group(process)
+        killpg.assert_not_called()
+        process.wait.assert_not_called()
+
     def test_deadline_terminates_and_reaps_owned_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "deadline.log"
@@ -49,6 +105,7 @@ class ProcessSupervisorTests(unittest.TestCase):
     def test_timeout_reports_denied_cleanup_without_claiming_reaping(self) -> None:
         process = mock.Mock()
         process.pid = 4242
+        process.returncode = None
         process.poll.return_value = None
         process.stdout.fileno.return_value = 99
         selector = mock.Mock()
@@ -60,6 +117,10 @@ class ProcessSupervisorTests(unittest.TestCase):
                 mock.patch.object(ui_e2e.subprocess, "Popen", return_value=process),
                 mock.patch.object(ui_e2e.selectors, "DefaultSelector", return_value=selector),
                 mock.patch.object(ui_e2e.os, "set_blocking"),
+                mock.patch.object(ui_e2e.os, "getpgid", return_value=4242),
+                mock.patch.object(ui_e2e.os, "getsid", return_value=4242),
+                mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+                mock.patch.object(ui_e2e, "_group_has_live_members", return_value=True),
                 mock.patch.object(ui_e2e.time, "monotonic", side_effect=[0.0, 1.0]),
                 mock.patch.object(ui_e2e.os, "killpg", side_effect=denied) as killpg,
                 self.assertRaises(ui_e2e.UIE2EError) as caught,
@@ -87,6 +148,7 @@ class ProcessSupervisorTests(unittest.TestCase):
     def test_primary_command_error_keeps_cause_when_cleanup_is_denied(self) -> None:
         process = mock.Mock()
         process.pid = 4243
+        process.returncode = None
         process.poll.return_value = None
         process.stdout.fileno.return_value = 99
         selector = mock.Mock()
@@ -99,6 +161,10 @@ class ProcessSupervisorTests(unittest.TestCase):
                 mock.patch.object(ui_e2e.subprocess, "Popen", return_value=process),
                 mock.patch.object(ui_e2e.selectors, "DefaultSelector", return_value=selector),
                 mock.patch.object(ui_e2e.os, "set_blocking"),
+                mock.patch.object(ui_e2e.os, "getpgid", return_value=4243),
+                mock.patch.object(ui_e2e.os, "getsid", return_value=4243),
+                mock.patch.object(ui_e2e, "_child_has_exited", return_value=False),
+                mock.patch.object(ui_e2e, "_group_has_live_members", return_value=True),
                 mock.patch.object(ui_e2e.time, "monotonic", return_value=0.0),
                 mock.patch.object(ui_e2e.os, "read", side_effect=primary),
                 mock.patch.object(ui_e2e.os, "killpg", side_effect=denied),
@@ -384,7 +450,7 @@ class XcresultValidationTests(unittest.TestCase):
         self.tests = {
             "testNodes": [
                 {
-                    "nodeType": "Test Target",
+                    "nodeType": "UI test bundle",
                     "name": "MacOSNetPlayerUITests",
                     "children": [
                         {"nodeType": "Test Case", "name": "testPlayback", "result": "Passed"}
@@ -392,6 +458,42 @@ class XcresultValidationTests(unittest.TestCase):
                 }
             ]
         }
+
+    def test_documented_ui_bundle_with_case_attachments_counts_execution(self) -> None:
+        case = self.tests["testNodes"][0]["children"][0]
+        case["children"] = [{"nodeType": "Attachment", "name": "Screenshot"}]
+        counts = ui_e2e.validate_xcresult(self.summary, self.tests, "MacOSNetPlayerUITests")
+        self.assertEqual(counts["target_passed"], 1)
+
+    def test_ui_bundle_identifier_is_exact_and_unrelated_types_are_rejected(self) -> None:
+        bundle = self.tests["testNodes"][0]
+        bundle["name"] = "UI tests"
+        bundle["nodeIdentifier"] = "/products/MacOSNetPlayerUITests.xctest"
+        self.assertEqual(
+            ui_e2e.validate_xcresult(self.summary, self.tests, "MacOSNetPlayerUITests")["target_passed"],
+            1,
+        )
+        for node_type in ("Unit test bundle", "Test Target", "Other UI test bundle"):
+            with self.subTest(node_type=node_type):
+                bundle["nodeType"] = node_type
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "does not contain expected"):
+                    ui_e2e.validate_xcresult(self.summary, self.tests, "MacOSNetPlayerUITests")
+
+    def test_failed_case_with_failure_message_child_is_not_a_pass(self) -> None:
+        case = self.tests["testNodes"][0]["children"][0]
+        case["result"] = "Failed"
+        case["children"] = [{"nodeType": "Failure Message", "name": "XCTAssertTrue failed"}]
+        with self.assertRaises(ui_e2e.UIE2EError):
+            ui_e2e.validate_xcresult(self.summary, self.tests, "MacOSNetPlayerUITests")
+
+    def test_skipped_case_run_cannot_hide_under_passed_parent(self) -> None:
+        case = self.tests["testNodes"][0]["children"][0]
+        case["children"] = [
+            {"nodeType": "Test Case Run", "name": "run 1", "result": "Passed"},
+            {"nodeType": "Test Case Run", "name": "run 2", "result": "Skipped"},
+        ]
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "skipped UI tests"):
+            ui_e2e.validate_xcresult(self.summary, self.tests, "MacOSNetPlayerUITests")
 
     def test_requires_exact_target_and_executed_pass(self) -> None:
         counts = ui_e2e.validate_xcresult(
@@ -422,6 +524,184 @@ class XcresultValidationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ui_e2e.UIE2EError, "does not contain expected"):
             ui_e2e.validate_xcresult(self.summary, {"testNodes": []}, "MacOSNetPlayerUITests")
+
+
+class FailedXcodeDiagnosticsTests(unittest.TestCase):
+    def _payloads(self) -> dict[str, object]:
+        return {
+            "summary": {"totalTestCount": 1, "passedTests": 0, "failedTests": 1, "skippedTests": 0},
+            "tests": {"testNodes": [{
+                "nodeType": "UI test bundle", "name": "MacOSNetPlayerUITests",
+                "children": [{
+                    "nodeType": "Test Case", "name": "testConnectBrowseAndControlRealPlayback()",
+                    "nodeIdentifier": "UIPlaybackTests/testConnectBrowseAndControlRealPlayback()",
+                    "result": "Failed",
+                    "children": [{"nodeType": "Failure Message", "name": "XCTAssertTrue failed - cache row missing"}],
+                }],
+            }]},
+            "test-details": {"testRuns": [{"nodeType": "Failure Message", "name": "UI control was not found"}]},
+            "activities": {"activities": [{
+                "title": "Find Cache tab", "isAssociatedWithFailure": True,
+                "attachments": [{"name": "Screenshot", "payloadId": "fixture-payload", "uuid": "fixture-attachment"}],
+            }]},
+        }
+
+    def test_failed_exit_retains_bounded_summary_details_and_primary_reason(self) -> None:
+        payloads = self._payloads()
+        payloads["summary"]["message"] = "ordinary diagnostic detail"
+        messages: list[str] = []
+        activities_available = True
+
+        def capture(command: list[str], **kwargs: object) -> object:
+            if command[4] == "activities" and not activities_available:
+                raise ui_e2e.UIE2EError("activities extraction fixture failure")
+            kwargs["log_path"].write_text(json.dumps(payloads[command[4]]), encoding="utf-8")
+            self.assertLessEqual(kwargs["timeout_seconds"], 120)
+            self.assertLessEqual(kwargs["max_output_bytes"], ui_e2e.MAX_RESULT_SUMMARY_BYTES)
+            return ui_e2e.CommandResult(0, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture) as run:
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild test exited 65"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=messages.append,
+                    )
+            self.assertEqual([call.args[0][4] for call in run.call_args_list],
+                             ["summary", "tests", "test-details", "activities"])
+            self.assertTrue((root / "xcresult-summary.json").is_file())
+            self.assertTrue((root / "xcresult-tests.json").is_file())
+            self.assertTrue((root / "xcresult-failure-details.json").is_file())
+            self.assertTrue((root / "xcresult-failure-activities.json").is_file())
+            self.assertFalse((root / "result-validation.json").exists())
+            self.assertTrue(any("cache row missing" in message for message in messages))
+            self.assertTrue(any("standalone screenshot/AX payloads" in message for message in messages))
+            self.assertTrue(any("bounded failure activity metadata retained" in message for message in messages))
+            self.assertIn("xcresult diagnostic: ordinary diagnostic detail", messages)
+            self.assertFalse(any(message.startswith("xcresult failure:") for message in messages))
+
+        activities_available = False
+        messages.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild test exited 65"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=messages.append,
+                    )
+            self.assertTrue(any("failure activity metadata unavailable" in message for message in messages))
+            self.assertFalse(any("metadata retained" in message for message in messages))
+            self.assertFalse((root / "xcresult-failure-activities.json").exists())
+
+    def test_extraction_error_never_replaces_failed_xcode_exit(self) -> None:
+        calls: list[str] = []
+        messages: list[str] = []
+
+        def capture(command: list[str], **kwargs: object) -> object:
+            calls.append(command[4])
+            if command[4] == "summary":
+                raise ui_e2e.UIE2EError("summary extraction fixture failure")
+            kwargs["log_path"].write_text('{"testNodes": []}', encoding="utf-8")
+            return ui_e2e.CommandResult(0, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild test exited 65"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=messages.append,
+                    )
+            self.assertEqual(calls, ["summary", "tests"])
+            self.assertTrue(any("summary extraction fixture failure" in message for message in messages))
+
+    def test_failed_xcode_cannot_pass_even_with_passing_result_payloads(self) -> None:
+        payloads = {
+            "summary": {"totalTestCount": 1, "passedTests": 1, "failedTests": 0, "skippedTests": 0},
+            "tests": {"testNodes": [{
+                "nodeType": "UI test bundle", "name": "MacOSNetPlayerUITests",
+                "children": [{"nodeType": "Test Case", "name": "testPlayback", "result": "Passed"}],
+            }]},
+        }
+
+        def capture(command: list[str], **kwargs: object) -> object:
+            kwargs["log_path"].write_text(json.dumps(payloads[command[4]]), encoding="utf-8")
+            return ui_e2e.CommandResult(0, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild test exited 65"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=lambda _message: None,
+                    )
+
+    def test_successful_xcode_with_missing_diagnostics_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=ui_e2e.UIE2EError("fixture failure")):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "Required xcresult diagnostics failed"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(0, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=lambda _message: None,
+                    )
+
+    def test_oversized_bundle_drop_preserves_failure_text_and_omission_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            logs = work / "logs"
+            logs.mkdir(parents=True)
+            (logs / "runner.log").write_text("xcodebuild exited 65", encoding="utf-8")
+            (logs / "xcresult-summary.json").write_text('{"message":"cache row missing"}', encoding="utf-8")
+            bundle = work / "UIE2E.xcresult"
+            bundle.mkdir()
+            (bundle / "data").write_bytes(b"x" * 128)
+            stager = ui_e2e.ArtifactStager(root / "artifacts", max_bytes=2048)
+            cleanup = ui_e2e.CleanupStack()
+            ui_e2e.defer_workspace_cleanup(cleanup, stager, work_dir=work, result_bundle=bundle)
+            with mock.patch.object(ui_e2e, "MAX_RESULT_BUNDLE_BYTES", 64), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "exited 65"):
+                    with cleanup:
+                        raise ui_e2e.UIE2EError("xcodebuild exited 65")
+            self.assertFalse(work.exists())
+            self.assertFalse((stager.destination / "result.xcresult").exists())
+            self.assertIn("cache row missing", (stager.destination / "xcresult-summary.json").read_text())
+            self.assertIn("result.xcresult omitted", (stager.destination / "artifact-staging.log").read_text())
+            self.assertLessEqual(stager.used_bytes, 2048)
+
+    def test_bundle_staging_error_does_not_replace_primary_test_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            logs = work / "logs"
+            logs.mkdir(parents=True)
+            (logs / "runner.log").write_text("xcodebuild exited 65", encoding="utf-8")
+            bundle = work / "UIE2E.xcresult"
+            bundle.mkdir()
+            (bundle / "unsafe-link").symlink_to(root)
+            stager = ui_e2e.ArtifactStager(root / "artifacts")
+            cleanup = ui_e2e.CleanupStack()
+            ui_e2e.defer_workspace_cleanup(cleanup, stager, work_dir=work, result_bundle=bundle)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild exited 65"):
+                    with cleanup:
+                        raise ui_e2e.UIE2EError("xcodebuild exited 65")
+            self.assertFalse(work.exists())
+            self.assertIn("staging failed", (stager.destination / "artifact-staging.log").read_text())
 
 
 if __name__ == "__main__":

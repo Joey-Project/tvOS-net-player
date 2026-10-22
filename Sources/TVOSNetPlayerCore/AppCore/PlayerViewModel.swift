@@ -34,6 +34,58 @@ public enum PlayerPlaybackSpeed: Float, CaseIterable, Hashable, Identifiable, Se
     }
 }
 
+public enum PlayerPlaybackState: String, Sendable {
+    case paused
+    case buffering
+    case playing
+    case finished
+
+    init(timeControlStatus: AVPlayer.TimeControlStatus, isFinished: Bool = false) {
+        if isFinished {
+            self = .finished
+            return
+        }
+
+        switch timeControlStatus {
+        case .paused:
+            self = .paused
+        case .waitingToPlayAtSpecifiedRate:
+            self = .buffering
+        case .playing:
+            self = .playing
+        @unknown default:
+            self = .paused
+        }
+    }
+
+    public var canPause: Bool {
+        self == .buffering || self == .playing
+    }
+
+    public var displayTitle: String {
+        switch self {
+        case .paused:
+            return "Paused"
+        case .buffering:
+            return "Buffering"
+        case .playing:
+            return "Playing"
+        case .finished:
+            return "Finished"
+        }
+    }
+}
+
+@MainActor
+protocol PlayerPlaybackControlling: AnyObject {
+    var timeControlStatus: AVPlayer.TimeControlStatus { get }
+    var defaultRate: Float { get set }
+    func play()
+    func pause()
+}
+
+extension AVPlayer: PlayerPlaybackControlling {}
+
 public struct PlayerPlaybackProgressContext: Equatable, Sendable {
     public let endpoint: CacheServerEndpoint
     public let playbackURI: String
@@ -98,6 +150,13 @@ public final class PlayerViewModel: ObservableObject {
 
     public var canUsePlaybackControls: Bool {
         player != nil
+    }
+
+    public var playbackState: PlayerPlaybackState {
+        PlayerPlaybackState(
+            timeControlStatus: player?.timeControlStatus ?? .paused,
+            isFinished: statusMessage == "Playback finished."
+        )
     }
 
     public init(
@@ -200,6 +259,21 @@ public final class PlayerViewModel: ObservableObject {
 
     public func skipBackward() {
         seek(by: -Self.defaultSkipInterval)
+    }
+
+    public func togglePlayback() {
+        markManualInteraction()
+        guard let player else { return }
+        Self.togglePlayback(player: player, speed: playbackSpeed)
+    }
+
+    static func togglePlayback(player: any PlayerPlaybackControlling, speed: PlayerPlaybackSpeed) {
+        if PlayerPlaybackState(timeControlStatus: player.timeControlStatus).canPause {
+            player.pause()
+        } else {
+            player.defaultRate = speed.rate
+            player.play()
+        }
     }
 
     public func skipForward() {

@@ -926,7 +926,7 @@ struct ContentView: View {
     private var playbackArea: some View {
         VStack(alignment: .leading, spacing: 12) {
             playerSurface
-            PlaybackTimelineStatus(player: model.player, statusMessage: model.statusMessage)
+            PlaybackTimelineStatus(model: model)
             playbackControls
         }
     }
@@ -952,15 +952,9 @@ struct ContentView: View {
         TimelineView(.periodic(from: .now, by: 0.5)) { _ in
             HStack(spacing: 12) {
                 Button {
-                    guard let player = model.player else { return }
-                    if player.rate == 0 {
-                        player.defaultRate = model.playbackSpeed.rate
-                        player.play()
-                    } else {
-                        player.pause()
-                    }
+                    model.togglePlayback()
                 } label: {
-                    let isPaused = model.player?.rate == 0
+                    let isPaused = !model.playbackState.canPause
                     Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
                 }
                 .accessibilityIdentifier("playback-toggle")
@@ -1179,17 +1173,15 @@ struct ContentView: View {
 }
 
 private struct PlaybackTimelineStatus: View {
-    let player: AVPlayer?
-    let statusMessage: String
+    @ObservedObject var model: PlayerViewModel
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            let seconds = player?.currentTime().seconds ?? 0
-            let duration = player?.currentItem?.duration.seconds ?? 0
+            let seconds = model.player?.currentTime().seconds ?? 0
+            let duration = model.player?.currentItem?.duration.seconds ?? 0
             let validSeconds = Self.safeSeconds(seconds)
             let validDuration = Self.safeSeconds(duration)
-            let isPlaying = (player?.rate ?? 0) != 0
-            let isFinished = statusMessage == "Playback finished."
+            let state = model.playbackState
 
             HStack(spacing: 12) {
                 Text("Playback \(Self.timeLabel(validSeconds)) / \(Self.timeLabel(validDuration))")
@@ -1198,9 +1190,9 @@ private struct PlaybackTimelineStatus: View {
                     .accessibilityValue(String(format: "%.1f/%.1f", validSeconds, validDuration))
                     .accessibilityIdentifier("playback-timeline")
 
-                Text(isFinished ? "Finished" : isPlaying ? "Playing" : "Paused")
+                Text(state.displayTitle)
                     .accessibilityElement(children: .ignore)
-                    .accessibilityValue(isFinished ? "finished" : isPlaying ? "playing" : "paused")
+                    .accessibilityValue(state.rawValue)
                     .accessibilityIdentifier("playback-state")
             }
             .font(.caption)

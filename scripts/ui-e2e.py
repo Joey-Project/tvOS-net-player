@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -35,6 +36,8 @@ MAX_COMMAND_LOG_BYTES = 8 * 1024 * 1024
 MAX_SERVER_LOG_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_RESULT_BUNDLE_BYTES = 20 * 1024 * 1024
+MAX_ARTIFACT_REPORT_BYTES = 8192
+RESULT_DIAGNOSTIC_TIMEOUT_SECONDS = 240
 COMMAND_TIMEOUT_SECONDS = 30 * 60
 SERVER_READY_TIMEOUT_SECONDS = 45
 TVOS_BOOT_TIMEOUT_SECONDS = 300
@@ -64,28 +67,100 @@ PLATFORMS = {
 }
 
 
+def _group_has_live_members(pgid: int) -> bool:
+    if sys.platform == "darwin":
+        # Darwin killpg reports EPERM for zombie-only/empty groups. Query only
+        # this PGID through libproc; a full buffer or denied query is unverified.
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        query = library.proc_listpgrppids
+        query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        query.restype = ctypes.c_int
+        pids = (ctypes.c_int * 4096)()
+        ctypes.set_errno(0)
+        result = query(pgid, pids, ctypes.sizeof(pids))
+        error = ctypes.get_errno()
+        if result < 0 or (result == 0 and error):
+            raise OSError(error, "Could not inspect the owned process group")
+        if all(pids):
+            raise UIE2EError("Cleanup unverified: owned process group exceeds the 4096-member query cap.")
+        for pid in pids:
+            if not pid:
+                continue
+            try:
+                if os.getpgid(pid) == pgid:
+                    return True
+            except ProcessLookupError:
+                continue  # A zombie or member that already exited.
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _signal_process_group(process: subprocess.Popen[bytes], signum: int) -> None:
     try:
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        if _group_has_live_members(process.pid):
+            raise
+
+
+def _child_has_exited(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        return True
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        raise UIE2EError("Cannot reserve the owned process-group ID without waitid(WNOWAIT).")
+    try:
+        status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError as error:
+        if process.returncode is not None:
+            return True
+        raise UIE2EError("Owned child was reaped externally; process-group identity is unverified.") from error
+    return status is not None and status.si_pid == process.pid
 
 
 def stop_process_group(
     process: subprocess.Popen[bytes], grace_seconds: float = 2.0
 ) -> None:
-    if process.poll() is not None:
-        return
+    if process.returncode is not None:
+        if not _group_has_live_members(process.pid):
+            return
+        raise UIE2EError(
+            "Cleanup unverified: leader already reaped; refusing to signal an unreserved PGID."
+        )
+    # Keep the direct child unreaped until all signals are dispatched. Its PID
+    # reserves our start_new_session PGID against reuse by an unrelated group.
+    if not _child_has_exited(process):
+        try:
+            matches = os.getpgid(process.pid) == process.pid and os.getsid(process.pid) == process.pid
+        except ProcessLookupError:
+            # Darwin does not expose group/session metadata for a zombie. A
+            # WNOWAIT observation still proves our unreaped child reserves PID.
+            matches = _child_has_exited(process)
+        if not matches:
+            raise UIE2EError("Cleanup unverified: owned child is not its original session/group leader.")
     _signal_process_group(process, signal.SIGTERM)
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
+    deadline = time.monotonic() + grace_seconds
+    while not _child_has_exited(process) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    _signal_process_group(process, signal.SIGKILL)
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired as error:
         raise UIE2EError("Could not reap an owned child process group.") from error
+    # After reaping, never send another signal: a newly reused PGID would no
+    # longer be anchored by our child. Only observe bounded group disappearance.
+    deadline = time.monotonic() + 2
+    while True:
+        if not _group_has_live_members(process.pid):
+            return
+        if time.monotonic() >= deadline:
+            raise UIE2EError("Cleanup unverified: process group still exists after leader reaping.")
+        time.sleep(0.02)
 
 
 def run_process(
@@ -148,7 +223,7 @@ def run_process(
 
                 if output_limited:
                     break
-                if process.poll() is not None and not selector.get_map():
+                if _child_has_exited(process) and not selector.get_map():
                     break
 
             log_file.flush()
@@ -262,6 +337,7 @@ class BoundedOwnedProcess:
         self.bytes_written = 0
         self.output_limited = False
         self._lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         self._log_file = log_path.open("xb")
         self.process = subprocess.Popen(
             argv,
@@ -294,11 +370,13 @@ class BoundedOwnedProcess:
                 self._log_file.flush()
                 limited = self.output_limited
             if limited:
-                stop_process_group(self.process)
+                with self._stop_lock:
+                    stop_process_group(self.process)
                 break
 
     def stop(self) -> None:
-        stop_process_group(self.process)
+        with self._stop_lock:
+            stop_process_group(self.process)
         self._reader.join(timeout=5)
         if self._reader.is_alive():
             if self.process.stdout is not None:
@@ -309,7 +387,7 @@ class BoundedOwnedProcess:
             raise UIE2EError("Owned server output reader did not stop.")
 
     def is_running(self) -> bool:
-        return self.process.poll() is None
+        return not _child_has_exited(self.process)
 
 
 def _require_result(result: CommandResult, description: str, log_path: Path) -> None:
@@ -959,19 +1037,19 @@ def _node_children(node: dict[str, object]) -> list[object]:
 def _normalized_target_name(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    name = value.rsplit("/", 1)[-1].strip()
+    name = value.rstrip("/").rsplit("/", 1)[-1].strip()
     if name.endswith(".xctest"):
         name = name[: -len(".xctest")]
     return name
 
 
 def _is_expected_target(node: dict[str, object], expected_target: str) -> bool:
-    node_type = str(node.get("nodeType", "")).lower()
-    if "target" not in node_type:
+    node_type = str(node.get("nodeType", "")).strip().lower()
+    if node_type != "ui test bundle":
         return False
     return any(
         _normalized_target_name(node.get(key)) == expected_target
-        for key in ("name", "nodeIdentifier", "identifier")
+        for key in ("name", "nodeIdentifier", "nodeIdentifierURL", "identifier")
     )
 
 
@@ -986,20 +1064,23 @@ def _test_status_counts(node: object) -> dict[str, int]:
         return counts
 
     children = _node_children(node)
-    if children:
+    node_type = str(node.get("nodeType", "")).lower()
+    name = str(node.get("name", ""))
+    result = str(node.get("result", "")).lower()
+    is_case = "case" in node_type or "method" in node_type or (
+        not node_type and name.startswith("test")
+    )
+    nested_runs = any(
+        "case" in str(child.get("nodeType", "")).lower() and child.get("result")
+        for child in _all_dicts(children)
+    )
+    if children and (not is_case or nested_runs):
         for child in children:
             for status, value in _test_status_counts(child).items():
                 counts[status] += value
         return counts
 
-    node_type = str(node.get("nodeType", "")).lower()
-    name = str(node.get("name", ""))
-    result = str(node.get("result", "")).lower()
-    if result and (
-        "case" in node_type
-        or "method" in node_type
-        or (not node_type and name.startswith("test"))
-    ):
+    if result and is_case:
         if result in ("passed", "success"):
             counts["passed"] += 1
         elif result in ("skipped", "expected failure"):
@@ -1048,6 +1129,114 @@ def validate_xcresult(
     return overall | {f"target_{key}": value for key, value in target_counts.items()}
 
 
+def finish_xcode_run(
+    result: CommandResult,
+    *,
+    result_bundle: Path,
+    logs_dir: Path,
+    expected_target: str,
+    log: Callable[[str], None],
+) -> dict[str, int]:
+    primary: UIE2EError | None = None
+    if result.timed_out:
+        primary = UIE2EError(
+            f"xcodebuild test exceeded its {COMMAND_TIMEOUT_SECONDS // 60}-minute deadline."
+        )
+    elif result.output_limited:
+        primary = UIE2EError(
+            f"xcodebuild test exceeded its {MAX_COMMAND_LOG_BYTES // (1024 * 1024)} MiB log limit."
+        )
+    elif result.returncode != 0:
+        primary = UIE2EError(f"xcodebuild test exited {result.returncode}.")
+    if not result_bundle.is_dir():
+        log("xcresult diagnostics unavailable: no result bundle was created.")
+        raise primary or UIE2EError("xcodebuild exited 0 without creating an xcresult bundle.")
+
+    outputs: dict[str, object] = {}
+    errors: list[Exception] = []
+    deadline = time.monotonic() + RESULT_DIAGNOSTIC_TIMEOUT_SECONDS
+
+    def extract(kind: str, command: list[str], *, optional: bool = False) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = UIE2EError("shared 240-second xcresult diagnostic deadline exhausted")
+            errors.append(error)
+            log(f"xcresult {kind} omitted: {error}")
+            return
+        path = logs_dir / f"xcresult-{kind}.json"
+        try:
+            captured = run_process(
+                command,
+                log_path=path,
+                timeout_seconds=min(30 if optional else 120, remaining),
+                max_output_bytes=512 * 1024 if optional else MAX_RESULT_SUMMARY_BYTES,
+                cwd=ROOT,
+            )
+            _require_result(captured, f"xcresult {kind}", path)
+            outputs[kind] = _read_json_file(path)
+        except Exception as error:
+            errors.append(error)
+            log(f"xcresult {kind} extraction failed: {type(error).__name__}: {str(error)[:512]}")
+
+    for kind in ("summary", "tests"):
+        extract(kind, build_xcresulttool_command(kind, result_bundle))
+
+    failed_cases = [
+        node
+        for node in _all_dicts(outputs.get("tests"))
+        if str(node.get("nodeType", "")).lower() == "test case"
+        and str(node.get("result", "")).lower() == "failed"
+    ]
+    if failed_cases:
+        case = failed_cases[0]
+        log(f"failed UI case: {str(case.get('name', 'unknown'))[:512]}")
+        test_id = case.get("nodeIdentifierURL") or case.get("nodeIdentifier")
+        if isinstance(test_id, str) and 0 < len(test_id) <= 2048:
+            for kind, filename in (
+                ("test-details", "failure-details"),
+                ("activities", "failure-activities"),
+            ):
+                extract(
+                    filename,
+                    ["xcrun", "xcresulttool", "get", "test-results", kind,
+                     "--path", str(result_bundle), "--test-id", test_id],
+                    optional=True,
+                )
+            metadata_status = (
+                "bounded failure activity metadata retained."
+                if "failure-activities" in outputs
+                else "failure activity metadata unavailable."
+            )
+            log("This runner does not export standalone screenshot/AX payloads; " + metadata_status)
+        else:
+            log("Failure details/attachments omitted: no bounded test identifier in xcresult.")
+
+    reasons: list[str] = []
+    for payload in outputs.values():
+        for node in _all_dicts(payload):
+            candidates = [node.get(key) for key in ("message", "failureText", "issueDescription")]
+            if str(node.get("nodeType", "")).lower() == "failure message":
+                candidates.append(node.get("name"))
+            if node.get("isAssociatedWithFailure") is True:
+                candidates.append(node.get("title"))
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    reason = " ".join(candidate.split())[:512]
+                    if reason not in reasons and len(reasons) < 5:
+                        reasons.append(reason)
+    for reason in reasons:
+        log(f"xcresult diagnostic: {reason}")
+    if primary is not None:
+        if not reasons:
+            log("xcresult supplied no diagnostic message; inspect retained summary/tests and extraction diagnostics.")
+        raise primary
+    if errors:
+        raise UIE2EError(f"Required xcresult diagnostics failed: {str(errors[0])[:512]}") from errors[0]
+    counts = validate_xcresult(outputs.get("summary"), outputs.get("tests"), expected_target)
+    _write_json(logs_dir / "result-validation.json", counts)
+    return counts
+
+
 class ArtifactStager:
     """Copy only an explicit small allowlist, never fixture or build directories."""
 
@@ -1057,18 +1246,29 @@ class ArtifactStager:
         "xcodebuild.log",
         "xcresult-summary.json",
         "xcresult-tests.json",
+        "xcresult-failure-details.json",
+        "xcresult-failure-activities.json",
         "result-validation.json",
+        "artifact-staging.log",
     }
 
     def __init__(self, destination: Path, max_bytes: int = MAX_ARTIFACT_BYTES) -> None:
         self.destination = destination
         self.max_bytes = max_bytes
         self.used_bytes = 0
+        self.report_bytes = min(MAX_ARTIFACT_REPORT_BYTES, max_bytes // 4)
+        self.diagnostics: list[str] = []
         self.destination.mkdir(parents=True, exist_ok=True, mode=0o700)
         if any(self.destination.iterdir()):
             raise UIE2EError(
                 f"Artifact directory must be empty before use: {self.destination}"
             )
+
+    def note(self, message: str) -> None:
+        message = " ".join(message.split())[:512]
+        if len(self.diagnostics) < 12:
+            self.diagnostics.append(message)
+        print(f"[ui-e2e] artifact: {message}", flush=True)
 
     def stage_file(self, source: Path) -> None:
         if source.name not in self.ALLOWED_FILES:
@@ -1076,20 +1276,30 @@ class ArtifactStager:
         if not source.is_file() or source.is_symlink():
             return
         size = source.stat().st_size
-        if size > MAX_COMMAND_LOG_BYTES or self.used_bytes + size > self.max_bytes:
+        limit = self.max_bytes if source.name == "artifact-staging.log" else self.max_bytes - self.report_bytes
+        if size > MAX_COMMAND_LOG_BYTES or self.used_bytes + size > limit:
+            self.note(f"{source.name} omitted: file or aggregate byte cap exceeded ({size} bytes).")
             return
         shutil.copyfile(source, self.destination / source.name)
         self.used_bytes += size
 
     def stage_result_bundle(self, source: Path) -> bool:
         if not source.is_dir() or source.is_symlink():
+            self.note("result.xcresult omitted: source bundle is missing or is not a regular directory.")
             return False
         staged = self.destination / "result.xcresult"
         temp = self.destination / f".result-{uuid.uuid4().hex}.tmp"
         count = 0
+        entries = 0
+        deadline = time.monotonic() + 30
         try:
             temp.mkdir(mode=0o700)
             for current, directories, files in os.walk(source, followlinks=False):
+                entries += len(directories) + len(files)
+                if entries > 4096 or time.monotonic() > deadline:
+                    self.note("result.xcresult omitted: 4096-entry/30-second staging budget exceeded.")
+                    shutil.rmtree(temp)
+                    return False
                 current_path = Path(current)
                 safe_dirs: list[str] = []
                 for name in directories:
@@ -1112,15 +1322,22 @@ class ArtifactStager:
                             count += len(chunk)
                             if (
                                 count > MAX_RESULT_BUNDLE_BYTES
-                                or self.used_bytes + count > self.max_bytes
+                                or self.used_bytes + count > self.max_bytes - self.report_bytes
+                                or time.monotonic() > deadline
                             ):
+                                self.note(
+                                    "result.xcresult omitted: bundle/aggregate byte or 30-second time cap "
+                                    f"exceeded (bundle cap={MAX_RESULT_BUNDLE_BYTES}, artifact cap={self.max_bytes}, "
+                                    f"observed={count} bytes); diagnostic texts retained."
+                                )
                                 shutil.rmtree(temp)
                                 return False
                             writer.write(chunk)
             temp.rename(staged)
             self.used_bytes += count
             return True
-        except Exception:
+        except Exception as error:
+            self.note(f"result.xcresult staging failed: {type(error).__name__}: {str(error)[:384]}")
             if temp.exists():
                 shutil.rmtree(temp)
             raise
@@ -1149,18 +1366,29 @@ def _stage_artifacts(
     work_dir: Path,
     result_bundle: Path,
 ) -> None:
-    for source_name in (
-        "runner.log",
-        "server.log",
-        "xcodebuild.log",
-        "xcresult-summary.json",
-        "xcresult-tests.json",
-        "result-validation.json",
-    ):
-        source = work_dir / "logs" / source_name
-        if source.exists():
-            stager.stage_file(source)
-    stager.stage_result_bundle(result_bundle)
+    try:
+        for source_name in (
+            "runner.log",
+            "xcresult-summary.json",
+            "xcresult-tests.json",
+            "xcresult-failure-details.json",
+            "xcresult-failure-activities.json",
+            "result-validation.json",
+            "server.log",
+            "xcodebuild.log",
+        ):
+            source = work_dir / "logs" / source_name
+            if source.exists():
+                stager.stage_file(source)
+        stager.stage_result_bundle(result_bundle)
+    except Exception as error:
+        stager.note(f"Artifact staging error: {type(error).__name__}: {str(error)[:384]}")
+        raise
+    finally:
+        report = work_dir / "logs" / "artifact-staging.log"
+        text = "\n".join(stager.diagnostics) or "Existing allowlisted artifacts staged within byte budgets."
+        report.write_bytes((text + "\n").encode("utf-8")[:stager.report_bytes])
+        stager.stage_file(report)
 
 
 def defer_workspace_cleanup(
@@ -1296,46 +1524,13 @@ def run_ui_e2e(platform: str) -> int:
                 env=child_env,
                 cwd=ROOT,
             )
-            if xcode_result.timed_out:
-                raise UIE2EError(
-                    f"xcodebuild test exceeded its {COMMAND_TIMEOUT_SECONDS // 60}-minute deadline."
-                )
-            if xcode_result.output_limited:
-                raise UIE2EError(
-                    f"xcodebuild test exceeded its {MAX_COMMAND_LOG_BYTES // (1024 * 1024)} MiB log limit."
-                )
-            if xcode_result.returncode != 0:
-                raise UIE2EError(
-                    f"xcodebuild test exited {xcode_result.returncode}; "
-                    "inspect the bounded xcodebuild log and xcresult."
-                )
-            if not result_bundle.is_dir():
-                raise UIE2EError("xcodebuild exited 0 without creating an xcresult bundle.")
-
-            summary_path = logs_dir / "xcresult-summary.json"
-            summary_result = run_process(
-                build_xcresulttool_command("summary", result_bundle),
-                log_path=summary_path,
-                timeout_seconds=120,
-                max_output_bytes=MAX_RESULT_SUMMARY_BYTES,
-                cwd=ROOT,
+            counts = finish_xcode_run(
+                xcode_result,
+                result_bundle=result_bundle,
+                logs_dir=logs_dir,
+                expected_target=config.test_target,
+                log=log,
             )
-            _require_result(summary_result, "xcresult summary", summary_path)
-            tests_path = logs_dir / "xcresult-tests.json"
-            tests_result = run_process(
-                build_xcresulttool_command("tests", result_bundle),
-                log_path=tests_path,
-                timeout_seconds=120,
-                max_output_bytes=MAX_RESULT_SUMMARY_BYTES,
-                cwd=ROOT,
-            )
-            _require_result(tests_result, "xcresult test tree", tests_path)
-            counts = validate_xcresult(
-                _read_json_file(summary_path),
-                _read_json_file(tests_path),
-                config.test_target,
-            )
-            _write_json(logs_dir / "result-validation.json", counts)
             log(
                 "xcresult proves target execution: "
                 f"{counts['target_passed']} passed, "

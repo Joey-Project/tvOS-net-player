@@ -101,6 +101,90 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertTrue(model.canUsePlaybackControls)
     }
 
+    func testPausedPlaybackStateOffersResume() {
+        let state = PlayerPlaybackState(timeControlStatus: .paused)
+
+        XCTAssertEqual(state, .paused)
+        XCTAssertEqual(state.displayTitle, "Paused")
+        XCTAssertFalse(state.canPause)
+    }
+
+    func testWaitingPlaybackStateOffersPauseAndReportsBuffering() {
+        let state = PlayerPlaybackState(timeControlStatus: .waitingToPlayAtSpecifiedRate)
+
+        XCTAssertEqual(state, .buffering)
+        XCTAssertEqual(state.displayTitle, "Buffering")
+        XCTAssertEqual(state.rawValue, "buffering")
+        XCTAssertTrue(state.canPause)
+    }
+
+    func testPlayingPlaybackStateOffersPause() {
+        let state = PlayerPlaybackState(timeControlStatus: .playing)
+
+        XCTAssertEqual(state, .playing)
+        XCTAssertEqual(state.displayTitle, "Playing")
+        XCTAssertTrue(state.canPause)
+    }
+
+    func testFinishedPlaybackStateKeepsTerminalPresentation() {
+        let state = PlayerPlaybackState(timeControlStatus: .paused, isFinished: true)
+
+        XCTAssertEqual(state, .finished)
+        XCTAssertEqual(state.displayTitle, "Finished")
+        XCTAssertFalse(state.canPause)
+    }
+
+    @MainActor
+    func testToggleDuringWaitingCallsPauseInsteadOfPlay() {
+        let player = PlaybackControlSpy(timeControlStatus: .waitingToPlayAtSpecifiedRate)
+
+        PlayerViewModel.togglePlayback(player: player, speed: .double)
+
+        XCTAssertEqual(player.pauseCallCount, 1)
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(player.timeControlStatus, .paused)
+    }
+
+    @MainActor
+    func testToggleDuringPlayingCallsPause() {
+        let player = PlaybackControlSpy(timeControlStatus: .playing)
+
+        PlayerViewModel.togglePlayback(player: player, speed: .oneAndHalf)
+
+        XCTAssertEqual(player.pauseCallCount, 1)
+        XCTAssertEqual(player.playCallCount, 0)
+    }
+
+    @MainActor
+    func testToggleAfterBufferingPauseResumesAtSelectedSpeed() {
+        let player = PlaybackControlSpy(timeControlStatus: .waitingToPlayAtSpecifiedRate)
+        PlayerViewModel.togglePlayback(player: player, speed: .double)
+
+        PlayerViewModel.togglePlayback(player: player, speed: .double)
+
+        XCTAssertEqual(player.pauseCallCount, 1)
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+    }
+
+    @MainActor
+    func testToggleWithoutPlayerInvalidatesPendingTransientPlayback() {
+        let model = PlayerViewModel(defaultStreamURLText: "", defaults: defaults, autoplay: false)
+        let sequence = model.manualInteractionSequence
+
+        model.togglePlayback()
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence + 1)
+        XCTAssertFalse(
+            model.loadTransient(
+                streamURLText: "http://127.0.0.1:1/media/fixture.mp4",
+                ifManualInteractionSequenceMatches: sequence
+            )
+        )
+        XCTAssertNil(model.player)
+        XCTAssertNil(model.loadedURL)
+    }
+
     @MainActor
     func testPlaybackSpeedCanBeSelectedBeforePlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
@@ -580,6 +664,28 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(model.streamURLText, "")
         XCTAssertNil(model.loadedURL)
         XCTAssertNil(model.player)
+    }
+}
+
+@MainActor
+private final class PlaybackControlSpy: PlayerPlaybackControlling {
+    var timeControlStatus: AVPlayer.TimeControlStatus
+    var defaultRate: Float = 1
+    private(set) var playCallCount = 0
+    private(set) var pauseCallCount = 0
+
+    init(timeControlStatus: AVPlayer.TimeControlStatus) {
+        self.timeControlStatus = timeControlStatus
+    }
+
+    func play() {
+        playCallCount += 1
+        timeControlStatus = .waitingToPlayAtSpecifiedRate
+    }
+
+    func pause() {
+        pauseCallCount += 1
+        timeControlStatus = .paused
     }
 }
 
