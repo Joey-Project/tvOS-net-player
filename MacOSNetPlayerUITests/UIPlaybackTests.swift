@@ -56,6 +56,7 @@ final class UIPlaybackTests: XCTestCase {
     }
 
     func testConnectBrowseAndControlRealPlayback() throws {
+        executionTimeAllowance = 600
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
         let initialStatus = app.staticTexts["app-status"]
@@ -126,17 +127,45 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 10))
         XCTAssertNotNil(waitForTimeline(timeout: 15) { $0 >= pausedAt + 2 })
 
-        let beforeForward = try XCTUnwrap(timelineSeconds())
+        clickVisible(toggle)
+        let beforeForward = try pausedSeekBaseline(state: state, timeline: timeline, action: "Forward")
         clickVisible(app.buttons["playback-skip-forward"])
         let afterForward = try XCTUnwrap(
             waitForTimeline(timeout: 10) { $0 >= beforeForward + 8 && $0 <= beforeForward + 16 },
-            "The forward control did not seek approximately ten seconds."
+            "Paused Forward did not seek approximately ten seconds from baseline \(beforeForward). "
+                + "Expected [\(beforeForward + 8), \(beforeForward + 16)]; "
+                + "current: \(String(describing: timelineSeconds())); \(accessibilityDescription(timeline)); "
+                + "state: \(accessibilityDescription(state))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "Forward must remain paused. Baseline: \(beforeForward); observed: \(afterForward); "
+                + "current: \(String(describing: timelineSeconds())); state: \(accessibilityDescription(state))"
         )
 
+        let beforeBackward = try pausedSeekBaseline(state: state, timeline: timeline, action: "Backward")
         clickVisible(app.buttons["playback-skip-backward"])
+        let afterBackward = try XCTUnwrap(
+            waitForTimeline(timeout: 10) { $0 >= beforeBackward - 13 && $0 <= beforeBackward - 7 },
+            "Paused Backward did not seek approximately ten seconds from baseline \(beforeBackward). "
+                + "Expected [\(beforeBackward - 13), \(beforeBackward - 7)]; "
+                + "current: \(String(describing: timelineSeconds())); \(accessibilityDescription(timeline)); "
+                + "state: \(accessibilityDescription(state))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "Backward must remain paused. Baseline: \(beforeBackward); observed: \(afterBackward); "
+                + "current: \(String(describing: timelineSeconds())); state: \(accessibilityDescription(state))"
+        )
+        clickVisible(toggle)
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "playing", timeout: 10),
+            "Playback did not resume after the paused seek checks. \(accessibilityDescription(state))"
+        )
         XCTAssertNotNil(
-            waitForTimeline(timeout: 10) { $0 >= afterForward - 13 && $0 <= afterForward - 7 },
-            "The backward control did not seek approximately ten seconds."
+            waitForTimeline(timeout: 15) { $0 >= afterBackward + 2 },
+            "Playback did not advance after resuming from \(afterBackward). "
+                + "Current: \(String(describing: timelineSeconds())); state: \(accessibilityDescription(state))"
         )
 
         let speedPicker = app.radioGroups["playback-speed"]
@@ -216,6 +245,105 @@ final class UIPlaybackTests: XCTestCase {
             "The rewound timeline did not advance after Resume. \(accessibilityDescription(timeline))"
         )
         XCTAssertTrue(radioButtonIsSelected(twoX), "Resume should preserve the selected 2x playback speed.")
+
+        clickVisible(toggle)
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "The replay must pause before seeking near EOF. \(accessibilityDescription(state))"
+        )
+        let forward = app.buttons["playback-skip-forward"]
+        for _ in 0..<12 {
+            let position = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+            if position.duration - position.current <= 10 {
+                break
+            }
+            clickVisible(forward)
+            XCTAssertNotNil(
+                waitForTimeline(timeout: 10) {
+                    $0 >= position.current + 8 && $0 <= min(position.current + 11, position.duration)
+                },
+                "Paused Forward did not advance approximately ten seconds from \(position.current). "
+                    + accessibilityDescription(timeline)
+            )
+            XCTAssertTrue(
+                waitUntilTimelineState(state, equals: "paused", timeout: 10),
+                "Seeking before the terminal position must remain paused. \(accessibilityDescription(state))"
+            )
+        }
+
+        var nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The bounded seek loop reached EOF too early.")
+        XCTAssertLessThanOrEqual(
+            nearEnd.duration - nearEnd.current, 10,
+            "Twelve Forward actions did not reach the final ten seconds. \(accessibilityDescription(timeline))"
+        )
+        if nearEnd.duration - nearEnd.current >= 10 {
+            let exactStepStart = nearEnd
+            clickVisible(toggle)
+            XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 10))
+            XCTAssertNotNil(
+                waitForTimeline(timeout: 10) {
+                    $0 >= exactStepStart.current + 1 && $0 < exactStepStart.duration - 1
+                },
+                "Playback did not advance into the final ten seconds. \(accessibilityDescription(timeline))"
+            )
+            clickVisible(toggle)
+            XCTAssertTrue(waitUntilTimelineState(state, equals: "paused", timeout: 10))
+            nearEnd = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline))
+        }
+        XCTAssertGreaterThan(nearEnd.duration - nearEnd.current, 0, "The video must be paused before EOF.")
+        XCTAssertLessThan(
+            nearEnd.duration - nearEnd.current, 10,
+            "The final Forward must start less than ten seconds from EOF. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertEqual(state.value as? String, "paused")
+
+        clickVisible(forward)
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= nearEnd.duration - 0.1 && $0 <= nearEnd.duration },
+            "Paused Forward must clamp to EOF at \(nearEnd.duration). \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "finished", timeout: 10),
+            "The confirmed paused seek to EOF must expose finished state. \(accessibilityDescription(state))"
+        )
+        XCTAssertTrue(waitUntil(timeout: 5) { toggle.label == "Resume" })
+        clickVisible(toggle)
+        let resumedAfterTerminalSeek = try XCTUnwrap(
+            waitForTimeline(timeout: 10) { $0 < 4 },
+            "Resume after a paused terminal seek did not reset the timeline. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "playing", timeout: 10),
+            "Resume after a paused terminal seek did not play. \(accessibilityDescription(state))"
+        )
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= resumedAfterTerminalSeek + 2 && $0 < 20 },
+            "The timeline did not advance after resuming the paused terminal seek. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(radioButtonIsSelected(twoX), "Resume after a paused terminal seek should preserve 2x speed.")
+    }
+
+    private func pausedSeekBaseline(state: XCUIElement, timeline: XCUIElement, action: String) throws -> Double {
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "paused", timeout: 10),
+            "\(action) requires a paused baseline. \(accessibilityDescription(state)); "
+                + "timeline: \(accessibilityDescription(timeline))"
+        )
+        let baseline = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        RunLoop.current.run(until: Date().addingTimeInterval(2.2))
+        let current = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        XCTAssertEqual(
+            state.value as? String, "paused",
+            "\(action) baseline changed playback state. Baseline: \(baseline); current: \(current); "
+                + "state: \(accessibilityDescription(state))"
+        )
+        XCTAssertLessThanOrEqual(
+            abs(current - baseline), 1,
+            "\(action) baseline was not stable while paused. Baseline: \(baseline); current: \(current); "
+                + "state: \(accessibilityDescription(state))"
+        )
+        return current
     }
 
     private func identifiedElement(_ identifier: String) -> XCUIElement {
