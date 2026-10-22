@@ -1185,13 +1185,11 @@ private struct PlaybackTimelineStatus: View {
 
             HStack(spacing: 12) {
                 Text("Playback \(Self.timeLabel(validSeconds)) / \(Self.timeLabel(validDuration))")
-                    .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Playback timeline")
                     .accessibilityValue(String(format: "%.1f/%.1f", validSeconds, validDuration))
                     .accessibilityIdentifier("playback-timeline")
 
                 Text(state.displayTitle)
-                    .accessibilityElement(children: .ignore)
                     .accessibilityValue(state.rawValue)
                     .accessibilityIdentifier("playback-state")
             }

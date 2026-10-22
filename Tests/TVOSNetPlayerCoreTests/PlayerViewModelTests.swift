@@ -165,6 +165,7 @@ final class PlayerViewModelTests: XCTestCase {
         XCTAssertEqual(player.pauseCallCount, 1)
         XCTAssertEqual(player.playCallCount, 1)
         XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+        XCTAssertTrue(player.seekTargets.isEmpty)
     }
 
     @MainActor
@@ -183,6 +184,202 @@ final class PlayerViewModelTests: XCTestCase {
         )
         XCTAssertNil(model.player)
         XCTAssertNil(model.loadedURL)
+    }
+
+    @MainActor
+    private func endedPlaybackFixture() async throws -> (
+        PlayerViewModel, PlaybackControlSpy, FakePlaybackProgressClient
+    ) {
+        let client = FakePlaybackProgressClient()
+        let model = PlayerViewModel(
+            defaults: defaults, autoplay: false, playbackProgressReportInterval: nil,
+            cacheClientFactory: { _ in client }
+        )
+        model.setPlaybackSpeed(.double)
+        _ = model.loadTransient(
+            streamURLText: "http://127.0.0.1:1/fixture.mp4",
+            progressContext: PlayerPlaybackProgressContext(endpoint: CacheServerEndpoint(host: "127.0.0.1"))
+        )
+        let item = try XCTUnwrap(model.player?.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        let reports = await Self.waitForReports(from: client, minimumCount: 2)
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        XCTAssertEqual(model.playbackState, .finished)
+        return (model, PlaybackControlSpy(timeControlStatus: .paused, currentItem: item), client)
+    }
+
+    @MainActor
+    func testEndedToggleSeeksBeforePlayingAndReportsReplayAtZero() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        let sequence = model.manualInteractionSequence
+
+        model.togglePlayback(using: player)
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence + 1)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [0])
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(model.playbackState, .buffering)
+
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+        XCTAssertNotEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped, .seek, .playing])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [0, 0])
+        XCTAssertEqual(
+            reports.suffix(2).map(\.playbackURI), Array(repeating: "http://127.0.0.1:1/fixture.mp4", count: 2))
+    }
+
+    @MainActor
+    func testReplayUsesSpeedSelectedWhileSeekIsPending() async throws {
+        let (model, player, _) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+
+        model.setPlaybackSpeed(.oneAndHalf)
+        player.completeNextSeek(finished: true)
+
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.oneAndHalf.rate)
+    }
+
+    @MainActor
+    func testPauseCancelsPendingEndedReplay() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+
+        model.togglePlayback(using: player)
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.pauseCallCount, 1)
+        XCTAssertEqual(player.playCallCount, 0)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testReplacingPlaybackRejectsStaleReplaySeekCompletion() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+        _ = model.loadTransient(streamURLText: "http://127.0.0.1:1/replacement.mp4")
+        await model.flushPlaybackProgressReports()
+        let beforeCompletion = await client.reportsSnapshot()
+
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(model.loadedURL?.lastPathComponent, "replacement.mp4")
+        let afterCompletion = await client.reportsSnapshot()
+        XCTAssertEqual(afterCompletion, beforeCompletion)
+    }
+
+    @MainActor
+    func testStopRejectsPendingReplaySeekCompletion() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+        model.stop()
+        await model.flushPlaybackProgressReports()
+        let beforeCompletion = await client.reportsSnapshot()
+
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertNil(model.player)
+        XCTAssertEqual(player.playCallCount, 0)
+        let afterCompletion = await client.reportsSnapshot()
+        XCTAssertEqual(afterCompletion, beforeCompletion)
+    }
+
+    @MainActor
+    func testStopReleasesPendingReplayControllerWithoutSeekCallback() async throws {
+        var fixture: (PlayerViewModel, PlaybackControlSpy, FakePlaybackProgressClient)? =
+            try await endedPlaybackFixture()
+        let model = try XCTUnwrap(fixture?.0)
+        let controller = { [weak controller = fixture?.1] in controller }
+        model.togglePlayback(using: fixture?.1)
+        fixture = nil
+        XCTAssertNotNil(controller())
+
+        model.stop()
+
+        XCTAssertNil(controller())
+    }
+
+    @MainActor
+    func testReplacementReleasesPendingReplayControllerWithoutSeekCallback() async throws {
+        var fixture: (PlayerViewModel, PlaybackControlSpy, FakePlaybackProgressClient)? =
+            try await endedPlaybackFixture()
+        let model = try XCTUnwrap(fixture?.0)
+        let controller = { [weak controller = fixture?.1] in controller }
+        model.togglePlayback(using: fixture?.1)
+        fixture = nil
+        XCTAssertNotNil(controller())
+
+        _ = model.loadTransient(streamURLText: "http://127.0.0.1:1/replacement.mp4")
+
+        XCTAssertNil(controller())
+        XCTAssertEqual(model.loadedURL?.lastPathComponent, "replacement.mp4")
+    }
+
+    @MainActor
+    func testFailedReplaySeekDoesNotPlayOrReportReplay() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+
+        player.completeNextSeek(finished: false)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        model.togglePlayback(using: player)
+        XCTAssertEqual(player.seekTargets.count, 2)
+    }
+
+    @MainActor
+    func testOldReplaySeekCompletionDoesNotResumeNewRequest() async throws {
+        let (model, player, _) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+        model.togglePlayback(using: player)
+        model.togglePlayback(using: player)
+
+        player.completeNextSeek(finished: true)
+
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(model.playbackState, .buffering)
+        player.completeNextSeek(finished: true)
+        XCTAssertEqual(player.playCallCount, 1)
+    }
+
+    @MainActor
+    func testPausedReplacementItemDoesNotRewindFromOldEndMarker() async throws {
+        let (model, player, _) = try await endedPlaybackFixture()
+        let replacement = AVPlayerItem(asset: AVMutableComposition())
+        model.player?.replaceCurrentItem(with: replacement)
+        player.currentItem = replacement
+
+        model.togglePlayback(using: player)
+
+        XCTAssertTrue(player.seekTargets.isEmpty)
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertNotEqual(model.playbackState, .finished)
+    }
+
+    @MainActor
+    func testBufferingToggleDoesNotRewindEndedItem() async throws {
+        let (model, player, _) = try await endedPlaybackFixture()
+        player.timeControlStatus = .waitingToPlayAtSpecifiedRate
+
+        model.togglePlayback(using: player)
+
+        XCTAssertTrue(player.seekTargets.isEmpty)
+        XCTAssertEqual(player.pauseCallCount, 1)
+        XCTAssertEqual(player.playCallCount, 0)
     }
 
     @MainActor
@@ -669,13 +866,17 @@ final class PlayerViewModelTests: XCTestCase {
 
 @MainActor
 private final class PlaybackControlSpy: PlayerPlaybackControlling {
+    var currentItem: AVPlayerItem?
     var timeControlStatus: AVPlayer.TimeControlStatus
     var defaultRate: Float = 1
     private(set) var playCallCount = 0
     private(set) var pauseCallCount = 0
+    private(set) var seekTargets: [CMTime] = []
+    private var seekCompletions: [@MainActor @Sendable (Bool) -> Void] = []
 
-    init(timeControlStatus: AVPlayer.TimeControlStatus) {
+    init(timeControlStatus: AVPlayer.TimeControlStatus, currentItem: AVPlayerItem? = nil) {
         self.timeControlStatus = timeControlStatus
+        self.currentItem = currentItem
     }
 
     func play() {
@@ -686,6 +887,15 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     func pause() {
         pauseCallCount += 1
         timeControlStatus = .paused
+    }
+
+    func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
+        seekTargets.append(time)
+        seekCompletions.append(completion)
+    }
+
+    func completeNextSeek(finished: Bool) {
+        seekCompletions.removeFirst()(finished)
     }
 }
 

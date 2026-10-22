@@ -27,7 +27,7 @@ struct ContentView: View {
         } detail: {
             detailPane
         }
-        .frame(minWidth: 1100, minHeight: 720)
+        .frame(minWidth: 900, minHeight: 560)
         .onAppear(perform: selectFirstCacheItemIfNeeded)
         .onAppear {
             if !isUITesting {
@@ -218,6 +218,7 @@ struct ContentView: View {
                         }
                     }
                     .accessibilityIdentifier("cache-library-list")
+                    .frame(minHeight: 120, maxHeight: .infinity)
 
                     cacheLoadMoreButton
                 }
@@ -307,7 +308,7 @@ struct ContentView: View {
             playbackArea
                 .frame(minHeight: 270, maxHeight: 400)
         }
-        .padding(24)
+        .padding(16)
     }
 
     private var bilibiliLoginControls: some View {
@@ -991,42 +992,59 @@ struct ContentView: View {
 
     private var playbackControls: some View {
         TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            HStack(spacing: 10) {
-                Button {
-                    model.togglePlayback()
-                } label: {
-                    let isPaused = !model.playbackState.canPause
-                    Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    playbackTransportControls
+                    playbackSpeedPicker
                 }
-                .accessibilityIdentifier("playback-toggle")
-                .disabled(model.player == nil)
 
-                Button {
-                    model.skipBackward()
-                } label: {
-                    Label("10s", systemImage: "gobackward.10")
-                }
-                .accessibilityIdentifier("playback-skip-backward")
-                .disabled(!model.canUsePlaybackControls)
-
-                Button {
-                    model.skipForward()
-                } label: {
-                    Label("10s", systemImage: "goforward.10")
-                }
-                .accessibilityIdentifier("playback-skip-forward")
-                .disabled(!model.canUsePlaybackControls)
-
-                Picker("Speed", selection: playbackSpeedBinding) {
-                    ForEach(PlayerPlaybackSpeed.allCases) { speed in
-                        Text(speed.displayTitle).tag(speed)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        playbackTransportControls
                     }
+                    playbackSpeedPicker
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 280)
-                .accessibilityIdentifier("playback-speed")
             }
         }
+    }
+
+    @ViewBuilder
+    private var playbackTransportControls: some View {
+        Button {
+            model.togglePlayback()
+        } label: {
+            let isPaused = !model.playbackState.canPause
+            Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
+        }
+        .accessibilityIdentifier("playback-toggle")
+        .disabled(model.player == nil)
+
+        Button {
+            model.skipBackward()
+        } label: {
+            Label("10s", systemImage: "gobackward.10")
+        }
+        .accessibilityIdentifier("playback-skip-backward")
+        .disabled(!model.canUsePlaybackControls)
+
+        Button {
+            model.skipForward()
+        } label: {
+            Label("10s", systemImage: "goforward.10")
+        }
+        .accessibilityIdentifier("playback-skip-forward")
+        .disabled(!model.canUsePlaybackControls)
+    }
+
+    private var playbackSpeedPicker: some View {
+        Picker("Speed", selection: playbackSpeedBinding) {
+            ForEach(PlayerPlaybackSpeed.allCases) { speed in
+                Text(speed.displayTitle).tag(speed)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 280)
+        .accessibilityIdentifier("playback-speed")
     }
 
     private var playbackSpeedBinding: Binding<PlayerPlaybackSpeed> {
@@ -1253,13 +1271,11 @@ private struct PlaybackTimelineStatus: View {
 
             HStack(spacing: 12) {
                 Text("Playback \(Self.timeLabel(validSeconds)) / \(Self.timeLabel(validDuration))")
-                    .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Playback timeline")
                     .accessibilityValue(String(format: "%.1f/%.1f", validSeconds, validDuration))
                     .accessibilityIdentifier("playback-timeline")
 
                 Text(state.displayTitle)
-                    .accessibilityElement(children: .ignore)
                     .accessibilityValue(state.rawValue)
                     .accessibilityIdentifier("playback-state")
             }

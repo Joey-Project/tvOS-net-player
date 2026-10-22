@@ -43,6 +43,7 @@ struct MacOSNetPlayerApp: App {
                 bilibiliLoginModel: bilibiliLoginModel
             )
         }
+        .defaultSize(width: 960, height: 600)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

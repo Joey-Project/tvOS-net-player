@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 
@@ -72,9 +73,9 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(refresh.isEnabled, "Refresh should be disabled until an address is entered.")
         XCTAssertEqual(libraryItems.count, 0, "An isolated launch should not load any cache library items.")
 
-        addressField.click()
+        clickVisible(addressField)
         addressField.typeText(serverAddress)
-        refresh.click()
+        clickVisible(refresh)
 
         let libraryStatus = app.staticTexts["cache-library-status"]
         XCTAssertTrue(
@@ -84,7 +85,7 @@ final class UIPlaybackTests: XCTestCase {
 
         let loadMore = app.buttons["cache-library-load-more"]
         XCTAssertTrue(loadMore.waitForExistence(timeout: 10), "The 55-item catalog should have a second page.")
-        loadMore.click()
+        clickVisible(loadMore)
         XCTAssertTrue(
             waitUntil(timeout: 30) { status(libraryStatus, contains: "Loaded 55 cached item(s)") },
             "The app did not load the second catalog page. Status: \(accessibilityDescription(libraryStatus))"
@@ -96,57 +97,56 @@ final class UIPlaybackTests: XCTestCase {
             .matching(identifier: "cache-library-list")
             .firstMatch
         XCTAssertTrue(libraryList.waitForExistence(timeout: 10))
-        for _ in 0..<12 where !fixture.isHittable {
-            libraryList.swipeUp()
-        }
-        XCTAssertTrue(fixture.isHittable, "Fixture 055 should be reachable by scrolling the real library list.")
-        fixture.click()
+        clickVisible(fixture, scrollingIn: libraryList)
 
         let playCached = app.buttons["cache-library-play-cached"]
         XCTAssertTrue(waitUntil(timeout: 10) { playCached.exists && playCached.isEnabled })
-        playCached.click()
+        let controlScroll = app.scrollViews["player-control-scroll"]
+        clickVisible(playCached, scrollingIn: controlScroll)
 
-        let timeline = app.staticTexts["playback-timeline"]
-        let state = app.staticTexts["playback-state"]
+        let timeline = identifiedElement("playback-timeline")
+        let state = identifiedElement("playback-state")
         XCTAssertTrue(timeline.waitForExistence(timeout: 20))
         XCTAssertTrue(state.waitForExistence(timeout: 20))
-        XCTAssertNotNil(waitForTimeline(timeout: 45) { $0 >= 2 }, "The server-backed MP4 timeline never advanced.")
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 45) { $0 >= 2 },
+            "The server-backed MP4 timeline never advanced. \(accessibilityDescription(timeline))"
+        )
         XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 15))
 
         let toggle = app.buttons["playback-toggle"]
-        toggle.click()
+        clickVisible(toggle)
         XCTAssertTrue(waitUntilTimelineState(state, equals: "paused", timeout: 10))
         let pausedAt = try XCTUnwrap(timelineSeconds())
         RunLoop.current.run(until: Date().addingTimeInterval(2.2))
         let stillPausedAt = try XCTUnwrap(timelineSeconds())
         XCTAssertLessThanOrEqual(abs(stillPausedAt - pausedAt), 1, "Playback time moved while paused.")
 
-        toggle.click()
+        clickVisible(toggle)
         XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 10))
         XCTAssertNotNil(waitForTimeline(timeout: 15) { $0 >= pausedAt + 2 })
 
         let beforeForward = try XCTUnwrap(timelineSeconds())
-        app.buttons["playback-skip-forward"].click()
+        clickVisible(app.buttons["playback-skip-forward"])
         let afterForward = try XCTUnwrap(
             waitForTimeline(timeout: 10) { $0 >= beforeForward + 8 && $0 <= beforeForward + 16 },
             "The forward control did not seek approximately ten seconds."
         )
 
-        app.buttons["playback-skip-backward"].click()
+        clickVisible(app.buttons["playback-skip-backward"])
         XCTAssertNotNil(
             waitForTimeline(timeout: 10) { $0 >= afterForward - 13 && $0 <= afterForward - 7 },
             "The backward control did not seek approximately ten seconds."
         )
 
-        let twoX = app.buttons["2x"]
+        let speedPicker = app.radioGroups["playback-speed"]
+        XCTAssertTrue(speedPicker.waitForExistence(timeout: 10))
+        let twoX = speedPicker.radioButtons["2x"]
         XCTAssertTrue(twoX.waitForExistence(timeout: 10))
-        twoX.click()
-        let speedPicker = app.segmentedControls["playback-speed"]
+        clickVisible(twoX)
         XCTAssertTrue(
-            waitUntil(timeout: 10) {
-                (speedPicker.value as? String) == "2x" || twoX.isSelected
-            },
-            "The actual speed control did not expose 2x as selected."
+            waitUntil(timeout: 10) { radioButtonIsSelected(twoX) },
+            "The actual speed radio button did not expose 2x as selected. \(accessibilityDescription(twoX))"
         )
 
         let measurementStart = ProcessInfo.processInfo.systemUptime
@@ -162,7 +162,7 @@ final class UIPlaybackTests: XCTestCase {
             measuredRate, 2.8, "Measured playback rate \(measuredRate)x is outside the 2x tolerance.")
 
         let naturalPlaybackStart = ProcessInfo.processInfo.systemUptime
-        playCached.click()
+        clickVisible(playCached, scrollingIn: controlScroll)
         let replayStart = try XCTUnwrap(waitForTimeline(timeout: 15) { $0 < 4 })
         XCTAssertLessThanOrEqual(replayStart, 4, "Replay should restart near the beginning of Fixture 055.")
         XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 15))
@@ -184,6 +184,114 @@ final class UIPlaybackTests: XCTestCase {
         completionScreenshot.name = "Natural playback completion"
         completionScreenshot.lifetime = .keepAlways
         add(completionScreenshot)
+
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { toggle.label == "Resume" },
+            "Natural completion should expose Resume. \(accessibilityDescription(toggle))"
+        )
+        clickVisible(toggle)
+        let resumedAt = try XCTUnwrap(
+            waitForTimeline(timeout: 10) { $0 < 4 },
+            "Resume after natural completion did not reset the timeline. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "playing", timeout: 10),
+            "Resume after natural completion did not start playback. \(accessibilityDescription(state))"
+        )
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= resumedAt + 2 && $0 < 20 },
+            "The rewound timeline did not advance after Resume. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(radioButtonIsSelected(twoX), "Resume should preserve the selected 2x playback speed.")
+    }
+
+    private func identifiedElement(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).element
+    }
+
+    private var visibleScreenFrames: [CGRect] {
+        let screens = NSScreen.screens
+        guard let primaryScreen = screens.first else { return [] }
+        return screens.map { screen in
+            let visibleFrame = screen.visibleFrame
+            return CGRect(
+                x: visibleFrame.minX,
+                y: primaryScreen.frame.maxY - visibleFrame.maxY,
+                width: visibleFrame.width,
+                height: visibleFrame.height
+            )
+        }
+    }
+
+    private func isWithinVisibleWindow(_ element: XCUIElement) -> Bool {
+        guard app.state == .runningForeground, app.isEnabled, element.exists, app.windows.firstMatch.exists else {
+            return false
+        }
+        let frame = element.frame
+        return frame.width > 0 && frame.height > 0
+            && app.windows.firstMatch.frame.contains(frame)
+            && visibleScreenFrames.contains(where: { $0.contains(frame) })
+    }
+
+    private func isVisible(_ element: XCUIElement, in container: XCUIElement? = nil) -> Bool {
+        guard isWithinVisibleWindow(element), element.isEnabled, element.isHittable else { return false }
+        return container.map { $0.exists && $0.frame.contains(element.frame) } ?? true
+    }
+
+    private func clickVisible(
+        _ element: XCUIElement,
+        scrollingIn container: XCUIElement? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        app.activate()
+        guard waitUntil(timeout: 10, condition: { app.state == .runningForeground && app.isEnabled }) else {
+            XCTFail(
+                "The player did not become enabled and foreground before clicking. \(app.state)", file: file, line: line
+            )
+            return
+        }
+        guard element.waitForExistence(timeout: 10) else {
+            XCTFail(
+                "The requested control does not exist. \(accessibilityDescription(element))", file: file, line: line)
+            return
+        }
+
+        if let container {
+            for _ in 0..<24 where !isVisible(element, in: container) {
+                guard isWithinVisibleWindow(container) else { break }
+                let deltaY: CGFloat
+                if element.frame.minY < container.frame.minY {
+                    deltaY = min(400, max(40, container.frame.minY - element.frame.minY + 24))
+                } else {
+                    deltaY = -min(400, max(40, element.frame.maxY - container.frame.maxY + 24))
+                }
+                container.scroll(byDeltaX: 0, deltaY: deltaY)
+                RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            }
+        }
+
+        guard waitUntil(timeout: 5, condition: { isVisible(element, in: container) }) else {
+            XCTFail(
+                "The control is not visible and hittable inside the player and usable display area. "
+                    + "\(accessibilityDescription(element)); frame=\(element.frame); "
+                    + "window=\(app.windows.firstMatch.frame); displays=\(visibleScreenFrames)",
+                file: file, line: line
+            )
+            return
+        }
+        element.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 2) { app.state == .runningForeground && app.isEnabled },
+            "Clicking the player control changed the foreground application.", file: file, line: line
+        )
+    }
+
+    private func radioButtonIsSelected(_ element: XCUIElement) -> Bool {
+        if let value = element.value as? NSNumber {
+            return value.intValue == 1
+        }
+        return element.value as? String == "1"
     }
 
     private func status(_ element: XCUIElement, contains expectedText: String) -> Bool {
@@ -204,12 +312,12 @@ final class UIPlaybackTests: XCTestCase {
     private func libraryItem(named title: String) -> XCUIElement {
         app.descendants(matching: .any)
             .matching(identifier: "cache-library-item")
-            .matching(NSPredicate(format: "label CONTAINS[c] %@", title))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", title, title))
             .firstMatch
     }
 
     private func playbackTimeline() -> (current: Double, duration: Double)? {
-        let value = app.staticTexts["playback-timeline"].value
+        let value = identifiedElement("playback-timeline").value
         guard
             let string = value as? String,
             let separator = string.firstIndex(of: "/"),
@@ -245,7 +353,7 @@ final class UIPlaybackTests: XCTestCase {
     private func waitForNaturalCompletion(timeout: TimeInterval) -> (current: Double, duration: Double)? {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         repeat {
-            if app.staticTexts["playback-state"].value as? String == "finished",
+            if identifiedElement("playback-state").value as? String == "finished",
                 let timeline = playbackTimeline(), timeline.duration >= 90,
                 timeline.current >= timeline.duration - 1
             {

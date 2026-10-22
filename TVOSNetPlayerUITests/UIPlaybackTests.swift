@@ -117,16 +117,37 @@ final class UIPlaybackTests: XCTestCase {
         )
 
         let fixture = libraryItem(named: "Fixture 055")
-        XCTAssertTrue(fixture.waitForExistence(timeout: 20))
-        XCTAssertTrue(focusUp(until: fixture, limit: 8), "Fixture 055 did not receive remote focus after paging.")
+        XCTAssertTrue(
+            focusDown(until: fixture, limit: 20),
+            "Remote navigation did not materialize and focus Fixture 055 after paging. "
+                + "Target: \(accessibilityDescription(fixture)); \(libraryFocusDescription())"
+        )
         remote.press(.select)
 
-        let timeline = app.staticTexts["playback-timeline"]
-        let state = app.staticTexts["playback-state"]
-        XCTAssertTrue(timeline.waitForExistence(timeout: 25))
-        XCTAssertTrue(state.waitForExistence(timeout: 25))
-        XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 30))
-        XCTAssertNotNil(waitForTimeline(timeout: 45) { $0 >= 2 }, "The server-backed MP4 timeline never advanced.")
+        let timeline = identifiedElement("playback-timeline")
+        let state = identifiedElement("playback-state")
+        XCTAssertTrue(
+            timeline.waitForExistence(timeout: 25),
+            "Playback timeline is missing after selecting Fixture 055. \(accessibilityDescription(timeline))"
+        )
+        XCTAssertTrue(
+            state.waitForExistence(timeout: 25),
+            "Playback state is missing after selecting Fixture 055. \(accessibilityDescription(state))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "playing", timeout: 30),
+            "Fixture 055 did not enter playing state. \(accessibilityDescription(state)); "
+                + "timeline: \(accessibilityDescription(timeline))"
+        )
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 45) { $0 >= 2 },
+            "The server-backed MP4 timeline never advanced. \(accessibilityDescription(timeline)); "
+                + "state: \(accessibilityDescription(state))"
+        )
+    }
+
+    private func identifiedElement(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).element
     }
 
     private func status(_ element: XCUIElement, contains expectedText: String) -> Bool {
@@ -159,12 +180,14 @@ final class UIPlaybackTests: XCTestCase {
             .firstMatch
     }
 
-    private func focusDown(until element: XCUIElement, limit: Int) -> Bool {
-        moveFocus(until: element, direction: .down, limit: limit)
+    private func libraryFocusDescription() -> String {
+        let items = app.buttons.matching(identifier: "cache-library-item").allElementsBoundByIndex
+        let focused = items.first(where: { $0.hasFocus }).map { accessibilityDescription($0) } ?? "none"
+        return "focusedLibraryItem: \(focused); materializedLibraryItems: \(items.count)"
     }
 
-    private func focusUp(until element: XCUIElement, limit: Int) -> Bool {
-        moveFocus(until: element, direction: .up, limit: limit)
+    private func focusDown(until element: XCUIElement, limit: Int) -> Bool {
+        moveFocus(until: element, direction: .down, limit: limit)
     }
 
     private func moveFocus(
@@ -183,7 +206,7 @@ final class UIPlaybackTests: XCTestCase {
     }
 
     private func playbackTimeline() -> (current: Double, duration: Double)? {
-        let value = app.staticTexts["playback-timeline"].value
+        let value = identifiedElement("playback-timeline").value
         guard
             let string = value as? String,
             let separator = string.firstIndex(of: "/"),
