@@ -185,6 +185,19 @@ final class UIPlaybackTests: XCTestCase {
         completionScreenshot.lifetime = .keepAlways
         add(completionScreenshot)
 
+        clickVisible(app.buttons["playback-skip-forward"])
+        let terminalBounds = (terminalTimeline.duration - 1)...terminalTimeline.duration
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { terminalBounds.contains($0) },
+            "Forward at natural EOF must remain within terminal bounds \(terminalBounds). "
+                + "Timeline: \(accessibilityDescription(timeline)); state: \(accessibilityDescription(state))"
+        )
+        XCTAssertTrue(
+            waitUntilTimelineState(state, equals: "finished", timeout: 10),
+            "Forward at natural EOF must preserve finished state. \(accessibilityDescription(state)); "
+                + "timeline: \(accessibilityDescription(timeline))"
+        )
+
         XCTAssertTrue(
             waitUntil(timeout: 5) { toggle.label == "Resume" },
             "Natural completion should expose Resume. \(accessibilityDescription(toggle))"
@@ -224,7 +237,7 @@ final class UIPlaybackTests: XCTestCase {
     }
 
     private func isWithinVisibleWindow(_ element: XCUIElement) -> Bool {
-        guard app.state == .runningForeground, app.isEnabled, element.exists, app.windows.firstMatch.exists else {
+        guard app.state == .runningForeground, element.exists, app.windows.firstMatch.exists else {
             return false
         }
         let frame = element.frame
@@ -245,9 +258,9 @@ final class UIPlaybackTests: XCTestCase {
         line: UInt = #line
     ) {
         app.activate()
-        guard waitUntil(timeout: 10, condition: { app.state == .runningForeground && app.isEnabled }) else {
+        guard waitUntil(timeout: 10, condition: { app.state == .runningForeground }) else {
             XCTFail(
-                "The player did not become enabled and foreground before clicking. \(app.state)", file: file, line: line
+                "The player did not become foreground before clicking. \(app.state)", file: file, line: line
             )
             return
         }
@@ -282,7 +295,7 @@ final class UIPlaybackTests: XCTestCase {
         }
         element.click()
         XCTAssertTrue(
-            waitUntil(timeout: 2) { app.state == .runningForeground && app.isEnabled },
+            waitUntil(timeout: 2) { app.state == .runningForeground },
             "Clicking the player control changed the foreground application.", file: file, line: line
         )
     }

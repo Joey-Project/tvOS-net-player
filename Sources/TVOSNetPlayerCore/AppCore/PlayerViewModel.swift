@@ -81,8 +81,10 @@ protocol PlayerPlaybackControlling: AnyObject {
     var currentItem: AVPlayerItem? { get }
     var timeControlStatus: AVPlayer.TimeControlStatus { get }
     var defaultRate: Float { get set }
+    func currentTime() -> CMTime
     func play()
     func pause()
+    func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime)
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void)
 }
 
@@ -345,20 +347,34 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     public func seek(by offset: TimeInterval) {
+        seek(by: offset, using: player)
+    }
+
+    func seek(by offset: TimeInterval, using controller: (any PlayerPlaybackControlling)?) {
         markManualInteraction()
-        guard let player else {
+        guard let controller else {
             statusMessage = "No stream loaded."
             return
         }
+        guard offset.isFinite, abs(offset) < Double(Int.max) else { return }
 
-        let currentSeconds = player.currentTime().seconds
-        let baseSeconds = currentSeconds.isFinite ? currentSeconds : 0
-        let targetSeconds = max(0, baseSeconds + offset)
+        let currentSeconds = controller.currentTime().seconds
+        let baseSeconds = currentSeconds.isFinite ? max(0, currentSeconds) : 0
+        let durationSeconds = currentPlaybackDurationSeconds()
+        let targetSeconds = Self.seekTargetSeconds(
+            currentSeconds: baseSeconds, durationSeconds: durationSeconds, offset: offset)
+        let isEnded = controller.currentItem != nil && playbackProgressEndedItem === controller.currentItem
+        if isEnded,
+            offset >= 0 || targetSeconds >= baseSeconds || durationSeconds.map({ targetSeconds >= $0 }) == true
+        {
+            return
+        }
+
         let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        controller.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
         queuePlaybackProgressReport(
             positionSeconds: targetSeconds,
-            durationSeconds: currentPlaybackDurationSeconds(),
+            durationSeconds: durationSeconds,
             intent: .seek
         )
         restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: nil)
@@ -368,6 +384,13 @@ public final class PlayerViewModel: ObservableObject {
             offset < 0
             ? "Skipped back \(label)."
             : "Skipped forward \(label)."
+    }
+
+    static func seekTargetSeconds(currentSeconds: Double, durationSeconds: Double?, offset: TimeInterval) -> Double {
+        let baseSeconds = currentSeconds.isFinite ? max(0, currentSeconds) : 0
+        let duration = durationSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let upperBound = min(duration ?? .infinity, Double(Int64.max / 600))
+        return min(max(0, baseSeconds + offset), upperBound)
     }
 
     public func setPlaybackSpeed(_ speed: PlayerPlaybackSpeed) {

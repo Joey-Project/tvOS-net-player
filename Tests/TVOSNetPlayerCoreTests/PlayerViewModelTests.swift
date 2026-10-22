@@ -383,6 +383,133 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testForwardAtEndPreservesFinishedStateAndResumeRewinds() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        let sequence = model.manualInteractionSequence
+
+        model.skipForward()
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence + 1)
+        XCTAssertEqual(model.playbackState, .finished)
+        XCTAssertEqual(model.statusMessage, "Playback finished.")
+        let reportsAfterSkip = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterSkip.map(\.intent), [.started, .stopped])
+
+        model.togglePlayback(using: player)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [0])
+        XCTAssertEqual(player.playCallCount, 0)
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+        let reportsAfterResume = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterResume.map(\.intent), [.started, .stopped, .seek, .playing])
+        XCTAssertEqual(reportsAfterResume.suffix(2).map(\.positionSeconds), [0, 0])
+    }
+
+    @MainActor
+    func testZeroAndClampedBackwardAtEndPreserveFinishedState() async throws {
+        let (model, _, client) = try await endedPlaybackFixture()
+
+        model.seek(by: 0)
+        XCTAssertEqual(model.playbackState, .finished)
+        model.skipBackward()
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .finished)
+        XCTAssertEqual(model.statusMessage, "Playback finished.")
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testBackwardAwayFromEndResumesChosenPositionWithoutReplaySeek() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        player.positionSeconds = 92
+
+        model.seek(by: -10, using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [82])
+        XCTAssertEqual(player.positionSeconds, 82)
+        XCTAssertEqual(model.playbackState, .paused)
+        let reportsAfterSeek = await client.reportsSnapshot()
+        XCTAssertEqual(reportsAfterSeek.map(\.intent), [.started, .stopped, .seek])
+        XCTAssertEqual(reportsAfterSeek.last?.positionSeconds, 82)
+        XCTAssertNil(reportsAfterSeek.last?.durationSeconds)
+
+        model.togglePlayback(using: player)
+
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [82])
+        XCTAssertEqual(player.positionSeconds, 82)
+    }
+
+    @MainActor
+    func testForwardAtEndWithUnknownDurationDoesNotSeekPastTerminalPosition() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        player.positionSeconds = 92
+        XCTAssertFalse(try XCTUnwrap(player.currentItem).duration.seconds.isFinite)
+
+        model.seek(by: 10, using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertTrue(player.seekTargets.isEmpty)
+        XCTAssertEqual(player.positionSeconds, 92)
+        XCTAssertEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+    }
+
+    @MainActor
+    func testForwardAtEndCancelsPendingReplayWithoutClearingFinishedState() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        model.togglePlayback(using: player)
+
+        model.skipForward()
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        model.togglePlayback(using: player)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [0, 0])
+        player.completeNextSeek(finished: true)
+        XCTAssertEqual(player.playCallCount, 1)
+    }
+
+    @MainActor
+    func testSeekTargetsRespectKnownDurationAndLowerBound() {
+        XCTAssertEqual(PlayerViewModel.seekTargetSeconds(currentSeconds: 87, durationSeconds: 92, offset: 10), 92)
+        XCTAssertEqual(PlayerViewModel.seekTargetSeconds(currentSeconds: 92, durationSeconds: 92, offset: -10), 82)
+        XCTAssertEqual(PlayerViewModel.seekTargetSeconds(currentSeconds: 2, durationSeconds: 92, offset: -10), 0)
+        XCTAssertEqual(PlayerViewModel.seekTargetSeconds(currentSeconds: 0, durationSeconds: 0, offset: 10), 0)
+    }
+
+    @MainActor
+    func testSeekWithUnknownDurationReportsActualTargetWithoutInventingDuration() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        player.positionSeconds = 92
+        model.seek(by: -10, using: player)
+        model.seek(by: 10, using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [82, 92])
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [82, 92])
+        XCTAssertTrue(reports.suffix(2).allSatisfy { $0.durationSeconds == nil })
+        for duration: Double? in [nil, .nan, .infinity, -1] {
+            XCTAssertEqual(
+                PlayerViewModel.seekTargetSeconds(currentSeconds: 82, durationSeconds: duration, offset: 10), 92)
+        }
+    }
+
+    @MainActor
     func testPlaybackSpeedCanBeSelectedBeforePlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let sequence = model.manualInteractionSequence
@@ -628,7 +755,7 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
-    func testSeekAfterPlaybackEndRestartsPeriodicProgress() async throws {
+    func testBackwardSeekAwayFromPlaybackEndRestartsPeriodicProgress() async throws {
         let client = FakePlaybackProgressClient()
         let endpoint = CacheServerEndpoint(host: "mac-mini.local")
         let model = PlayerViewModel(
@@ -653,7 +780,9 @@ final class PlayerViewModelTests: XCTestCase {
         let reportsAfterEnd = await Self.waitForReports(from: client, minimumCount: 2)
         XCTAssertEqual(reportsAfterEnd.map(\.intent), [.started, .stopped])
 
-        model.skipForward()
+        let controller = PlaybackControlSpy(timeControlStatus: .paused, currentItem: item)
+        controller.positionSeconds = 92
+        model.seek(by: -10, using: controller)
 
         let replayReports = await Self.waitForReports(
             from: client,
@@ -869,6 +998,7 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     var currentItem: AVPlayerItem?
     var timeControlStatus: AVPlayer.TimeControlStatus
     var defaultRate: Float = 1
+    var positionSeconds: Double = 0
     private(set) var playCallCount = 0
     private(set) var pauseCallCount = 0
     private(set) var seekTargets: [CMTime] = []
@@ -887,6 +1017,15 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     func pause() {
         pauseCallCount += 1
         timeControlStatus = .paused
+    }
+
+    func currentTime() -> CMTime {
+        CMTime(seconds: positionSeconds, preferredTimescale: 600)
+    }
+
+    func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime) {
+        seekTargets.append(time)
+        positionSeconds = time.seconds
     }
 
     func seekForPlayback(to time: CMTime, completion: @escaping @MainActor @Sendable (Bool) -> Void) {
