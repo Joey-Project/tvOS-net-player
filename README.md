@@ -60,6 +60,8 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 
 测试会先设置并确认系统静音，结束后保持静音。调试测试实例使用隔离偏好并禁用 Bonjour 自动连接；夹具 server 关闭 Bilibili worker、登录会话和 Bonjour，不读取已有账号凭据，也不修改日常 cache server。普通 CI 不依赖 Bilibili、账号 Cookie 或公共反代。真实 Bilibili 和长播放验证仍使用下方显式 opt-in live suite。
 
+macOS UI 测试使用本地 ad-hoc 签名，不需要开发者证书或 team；tvOS simulator 构建不启用签名。这不替代实机 provisioning、分发签名或公证。本机 UI 执行仍需可用的桌面会话及 Xcode 所需权限，成功构建和签名校验不代表 UI 测试通过。
+
 GHA 的 UI 测试与现有构建/单元测试分开记录。只有实际执行对应 UI test target、通过界面断言并产生非零测试结果，才算 UI e2e 通过；成功编译或列出 simulator runtime 不能代替执行。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md)。
 
 真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、favorite/space/collection/series/recommendation list fetch、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：

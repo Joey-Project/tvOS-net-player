@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("ui-e2e.py")
@@ -44,6 +45,132 @@ class ProcessSupervisorTests(unittest.TestCase):
             self.assertTrue(result.output_limited)
             self.assertLessEqual(result.bytes_written, 128)
             self.assertLessEqual(log_path.stat().st_size, 128)
+
+    def test_timeout_reports_denied_cleanup_without_claiming_reaping(self) -> None:
+        process = mock.Mock()
+        process.pid = 4242
+        process.poll.return_value = None
+        process.stdout.fileno.return_value = 99
+        selector = mock.Mock()
+        denied = PermissionError("signal denied")
+        command = ["xcrun", "simctl", "list", "runtimes", "--json"]
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "timeout.log"
+            with (
+                mock.patch.object(ui_e2e.subprocess, "Popen", return_value=process),
+                mock.patch.object(ui_e2e.selectors, "DefaultSelector", return_value=selector),
+                mock.patch.object(ui_e2e.os, "set_blocking"),
+                mock.patch.object(ui_e2e.time, "monotonic", side_effect=[0.0, 1.0]),
+                mock.patch.object(ui_e2e.os, "killpg", side_effect=denied) as killpg,
+                self.assertRaises(ui_e2e.UIE2EError) as caught,
+            ):
+                ui_e2e.run_process(
+                    command,
+                    log_path=log_path,
+                    timeout_seconds=0.5,
+                    max_output_bytes=1024,
+                )
+            message = str(caught.exception)
+            self.assertIn("exceeded its 0.5-second deadline", message)
+            self.assertIn("cleanup unverified; child reaping not confirmed", message)
+            self.assertIn("PermissionError: signal denied", message)
+            self.assertIn(f"argv={json.dumps(command)}", message)
+            self.assertIn("pid=4242", message)
+            self.assertIn("max_output_bytes=1024", message)
+            self.assertIn(f"log={log_path}", message)
+            self.assertIs(caught.exception.__cause__, denied)
+            killpg.assert_called_once_with(4242, ui_e2e.signal.SIGTERM)
+            process.wait.assert_not_called()
+            process.stdout.close.assert_called_once()
+            selector.close.assert_called_once()
+
+    def test_primary_command_error_keeps_cause_when_cleanup_is_denied(self) -> None:
+        process = mock.Mock()
+        process.pid = 4243
+        process.poll.return_value = None
+        process.stdout.fileno.return_value = 99
+        selector = mock.Mock()
+        selector.select.return_value = [(mock.Mock(fd=99), ui_e2e.selectors.EVENT_READ)]
+        primary = OSError("read failure " + "x" * 8192)
+        denied = PermissionError("signal denied")
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "read-error.log"
+            with (
+                mock.patch.object(ui_e2e.subprocess, "Popen", return_value=process),
+                mock.patch.object(ui_e2e.selectors, "DefaultSelector", return_value=selector),
+                mock.patch.object(ui_e2e.os, "set_blocking"),
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=0.0),
+                mock.patch.object(ui_e2e.os, "read", side_effect=primary),
+                mock.patch.object(ui_e2e.os, "killpg", side_effect=denied),
+                self.assertRaises(ui_e2e.UIE2EError) as caught,
+            ):
+                ui_e2e.run_process(
+                    ["fixture-command"],
+                    log_path=log_path,
+                    timeout_seconds=1,
+                    max_output_bytes=1024,
+                )
+            self.assertIs(caught.exception.__cause__, primary)
+            self.assertIn("Command failed: OSError: read failure", str(caught.exception))
+            self.assertIn("cleanup unverified", str(caught.exception))
+            self.assertIn("PermissionError: signal denied", str(caught.exception))
+            self.assertLess(len(str(caught.exception)), 2048)
+            process.wait.assert_not_called()
+            process.stdout.close.assert_called_once()
+            selector.close.assert_called_once()
+
+
+class ToolInventoryTests(unittest.TestCase):
+    def test_macos_inventory_never_invokes_simctl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(ui_e2e, "run_capture", return_value="tool metadata\n") as capture:
+                ui_e2e._record_tool_inventory("macos", root, root / "runner.log")
+            self.assertEqual(
+                [call.args[0] for call in capture.call_args_list],
+                [["xcodebuild", "-version"], ["xcodebuild", "-showsdks"]],
+            )
+
+    def test_tvos_inventory_includes_runtime_and_devices(self) -> None:
+        runtime = "com.apple.CoreSimulator.SimRuntime.tvOS-26-0"
+        runtimes = {
+            "runtimes": [{"identifier": runtime, "version": "26.0", "isAvailable": True}]
+        }
+        devices = {
+            "devices": {
+                runtime: [
+                    {"isAvailable": True, "deviceTypeIdentifier": "Apple-TV-fixture"}
+                ]
+            }
+        }
+
+        def output(command: list[str], **_kwargs: object) -> str:
+            if "runtimes" in command:
+                return json.dumps(runtimes)
+            if "devices" in command:
+                return json.dumps(devices)
+            return "tool metadata\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(ui_e2e, "run_capture", side_effect=output) as capture:
+                ui_e2e._record_tool_inventory("tvos", root, root / "runner.log")
+            self.assertEqual(
+                [call.args[0] for call in capture.call_args_list],
+                [
+                    ["xcodebuild", "-version"],
+                    ["xcodebuild", "-showsdks"],
+                    ["xcrun", "simctl", "list", "runtimes", "--json"],
+                    ["xcrun", "simctl", "list", "devices", "available", "--json"],
+                ],
+            )
+
+    def test_tvos_inventory_requires_available_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(ui_e2e, "run_capture", return_value="{}"):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "No installed, available tvOS"):
+                    ui_e2e._record_tool_inventory("tvos", root, root / "runner.log")
 
 
 class CleanupTests(unittest.TestCase):
@@ -131,6 +258,35 @@ class RunnerContractTests(unittest.TestCase):
             sum(argument.startswith("APP_BUNDLE_IDENTIFIER=") for argument in command),
             1,
         )
+
+    def test_xcodebuild_signing_is_platform_specific(self) -> None:
+        for platform in ("macos", "tvos"):
+            with self.subTest(platform=platform):
+                command = ui_e2e.build_xcodebuild_command(
+                    platform=platform,
+                    server_address="http://127.0.0.1:43210",
+                    app_bundle_identifier="dev.joey.tvos-net-player.uie2e." + "a" * 32,
+                    derived_data_path=Path("/tmp/DerivedData"),
+                    result_bundle_path=Path("/tmp/UIE2E.xcresult"),
+                    destination="platform=macOS" if platform == "macos" else "platform=tvOS Simulator",
+                )
+                settings = dict(
+                    argument.split("=", 1)
+                    for argument in command
+                    if argument.startswith(("CODE_SIGN", "DEVELOPMENT_TEAM="))
+                )
+                if platform == "macos":
+                    self.assertEqual(
+                        settings,
+                        {
+                            "CODE_SIGN_IDENTITY": "-",
+                            "CODE_SIGNING_ALLOWED": "YES",
+                            "CODE_SIGN_STYLE": "Manual",
+                            "DEVELOPMENT_TEAM": "",
+                        },
+                    )
+                else:
+                    self.assertEqual(settings, {"CODE_SIGNING_ALLOWED": "NO"})
 
     def test_scheme_requires_test_action_endpoint_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

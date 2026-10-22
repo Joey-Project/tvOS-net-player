@@ -151,23 +151,55 @@ def run_process(
                 if process.poll() is not None and not selector.get_map():
                     break
 
-            if timed_out or output_limited:
-                stop_process_group(process)
-
-            if process.poll() is None:
-                stop_process_group(process)
-            returncode = process.wait()
             log_file.flush()
     finally:
-        selector.close()
+        primary_error = sys.exc_info()[1]
+        cleanup_errors: list[Exception] = []
+        try:
+            selector.close()
+        except Exception as error:
+            cleanup_errors.append(error)
         if process is not None:
-            if process.poll() is None:
+            try:
                 stop_process_group(process)
+            except Exception as error:
+                cleanup_errors.append(error)
             if process.stdout is not None:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except Exception as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            context = []
+            if timed_out:
+                context.append(f"Command exceeded its {timeout_seconds:g}-second deadline")
+            if output_limited:
+                context.append(f"Command exceeded its {max_output_bytes}-byte output limit")
+            if primary_error is not None:
+                context.append(
+                    f"Command failed: {type(primary_error).__name__}: {str(primary_error)[:512]}"
+                )
+            if not context:
+                context.append("Command process cleanup failed")
+            command = json.dumps(argv, ensure_ascii=True)
+            if len(command) > 4096:
+                command = command[:4096] + " [argv truncated]"
+            details = "; ".join(
+                f"{type(error).__name__}: {str(error)[:512]}"
+                for error in cleanup_errors
+            )
+            raise UIE2EError(
+                "; ".join(context)
+                + "; cleanup unverified; child reaping not confirmed: "
+                + details
+                + f"; argv={command}; pid={process.pid if process is not None else 'not-started'}"
+                + f"; timeout_seconds={timeout_seconds:g}; max_output_bytes={max_output_bytes}"
+                + f"; retained_bytes={bytes_written}; log={log_path}"
+            ) from (primary_error if primary_error is not None else cleanup_errors[0])
 
+    assert process is not None
     return CommandResult(
-        returncode=returncode,
+        returncode=process.wait(timeout=0),
         bytes_written=bytes_written,
         timed_out=timed_out,
         output_limited=output_limited,
@@ -381,6 +413,16 @@ def build_xcodebuild_command(
     ):
         raise UIE2EError("APP_BUNDLE_IDENTIFIER must be unique to this UI E2E run.")
     config = PLATFORMS[platform]
+    signing_settings = (
+        [
+            "CODE_SIGN_IDENTITY=-",
+            "CODE_SIGNING_ALLOWED=YES",
+            "CODE_SIGN_STYLE=Manual",
+            "DEVELOPMENT_TEAM=",
+        ]
+        if platform == "macos"
+        else ["CODE_SIGNING_ALLOWED=NO"]
+    )
     return [
         "xcodebuild",
         "-quiet",
@@ -400,7 +442,7 @@ def build_xcodebuild_command(
         str(result_bundle_path),
         "-parallel-testing-enabled",
         "NO",
-        "CODE_SIGNING_ALLOWED=NO",
+        *signing_settings,
         f"APP_BUNDLE_IDENTIFIER={app_bundle_identifier}",
         f"UI_E2E_SERVER_ADDRESS={endpoint}",
         "test",
@@ -788,13 +830,19 @@ def delete_owned_simulator(*, name: str, udid: str, logs_dir: Path) -> None:
         raise UIE2EError("Owned simulator remained after simctl delete.")
 
 
-def _record_tool_inventory(logs_dir: Path, runner_log: Path) -> None:
+def _record_tool_inventory(platform: str, logs_dir: Path, runner_log: Path) -> None:
     commands = [
         ("xcode-version", ["xcodebuild", "-version"]),
         ("xcode-sdks", ["xcodebuild", "-showsdks"]),
-        ("simctl-runtimes-inventory", ["xcrun", "simctl", "list", "runtimes", "--json"]),
-        ("simctl-devices-inventory", ["xcrun", "simctl", "list", "devices", "available", "--json"]),
     ]
+    if platform == "tvos":
+        commands.extend(
+            [
+                ("simctl-runtimes-inventory", ["xcrun", "simctl", "list", "runtimes", "--json"]),
+                ("simctl-devices-inventory", ["xcrun", "simctl", "list", "devices", "available", "--json"]),
+            ]
+        )
+    simulator_inventory: dict[str, dict[str, object]] = {}
     with runner_log.open("a", encoding="utf-8") as output:
         for name, argv in commands:
             text = run_capture(
@@ -806,6 +854,9 @@ def _record_tool_inventory(logs_dir: Path, runner_log: Path) -> None:
             )
             if "runtimes-inventory" in name or "devices-inventory" in name:
                 payload = json.loads(text)
+                if not isinstance(payload, dict):
+                    raise UIE2EError("Simulator inventory is not a JSON object.")
+                simulator_inventory[name] = payload
                 if "runtimes-inventory" in name:
                     listed: Iterable[object] = payload.get("runtimes", [])
                     compact = [
@@ -839,6 +890,11 @@ def _record_tool_inventory(logs_dir: Path, runner_log: Path) -> None:
             else:
                 output.write(f"{name}: {text.strip()}\n")
         output.flush()
+    if platform == "tvos":
+        _available_tvos_device(
+            simulator_inventory["simctl-runtimes-inventory"],
+            simulator_inventory["simctl-devices-inventory"],
+        )
 
 
 def mute_system_audio(logs_dir: Path) -> None:
@@ -1164,7 +1220,7 @@ def run_ui_e2e(platform: str) -> int:
     with cleanup:
             mute_system_audio(logs_dir)
             log("macOS system output mute is set and verified.")
-            _record_tool_inventory(logs_dir, runner_log)
+            _record_tool_inventory(platform, logs_dir, runner_log)
 
             scheme_path = (
                 ROOT
