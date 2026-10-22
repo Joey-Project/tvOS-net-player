@@ -578,8 +578,8 @@ class FailedXcodeDiagnosticsTests(unittest.TestCase):
             self.assertTrue((root / "xcresult-failure-activities.json").is_file())
             self.assertFalse((root / "result-validation.json").exists())
             self.assertTrue(any("cache row missing" in message for message in messages))
-            self.assertTrue(any("standalone screenshot/AX payloads" in message for message in messages))
-            self.assertTrue(any("bounded failure activity metadata retained" in message for message in messages))
+            self.assertTrue(any("no eligible named teardown AX/screenshot" in message for message in messages))
+            self.assertTrue((root / "xcresult-attachment-export.json").is_file())
             self.assertIn("xcresult diagnostic: ordinary diagnostic detail", messages)
             self.assertFalse(any(message.startswith("xcresult failure:") for message in messages))
 
@@ -595,8 +595,8 @@ class FailedXcodeDiagnosticsTests(unittest.TestCase):
                         ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
                         expected_target="MacOSNetPlayerUITests", log=messages.append,
                     )
-            self.assertTrue(any("failure activity metadata unavailable" in message for message in messages))
-            self.assertFalse(any("metadata retained" in message for message in messages))
+            self.assertTrue(any("activities extraction fixture failure" in message for message in messages))
+            self.assertTrue(any("no eligible named teardown AX/screenshot" in message for message in messages))
             self.assertFalse((root / "xcresult-failure-activities.json").exists())
 
     def test_extraction_error_never_replaces_failed_xcode_exit(self) -> None:
@@ -702,6 +702,280 @@ class FailedXcodeDiagnosticsTests(unittest.TestCase):
                         raise ui_e2e.UIE2EError("xcodebuild exited 65")
             self.assertFalse(work.exists())
             self.assertIn("staging failed", (stager.destination / "artifact-staging.log").read_text())
+
+
+class FailureAttachmentExportTests(unittest.TestCase):
+    @staticmethod
+    def activities() -> dict[str, object]:
+        # Xcode 26 activities schema: repeated attachments have immutable payloadId.
+        screenshot = {
+            "lifetime": "keepAlways",
+            "name": "Failure screenshot_0_37B8A5AC-F0CD-4FBE-B5C6-5A48ED58FEAE.png",
+            "payloadId": "0~screenshot-fixture==",
+            "timestamp": 1792683962.115,
+            "uuid": "4F6042E7-21E8-4AAD-83A8-E77085689EE8",
+        }
+        ax = {
+            "lifetime": "keepAlways",
+            "name": "Failure accessibility tree_0_0A07D7A0-A499-4387-9789-7EB80C24F684.txt",
+            "payloadId": "0~ax-fixture==",
+            "timestamp": 1792683962.506,
+            "uuid": "5494B0A0-2656-4DB5-8EAD-5DAA35070440",
+        }
+        return {
+            "testRuns": [{
+                "activities": [
+                    {"title": "Start Test", "attachments": [{
+                        "lifetime": "deleteOnSuccess",
+                        "name": "Screen Recording.mp4",
+                        "payloadId": "0~recording-fixture==",
+                        "timestamp": 1792683952.93,
+                        "uuid": "0A239948-2F98-492B-9EC7-7EAFB094B660",
+                    }]},
+                    {
+                        "title": "Tear Down",
+                        "attachments": [screenshot, ax],
+                        "childActivities": [
+                            {
+                                "title": "Added attachment named 'Failure screenshot'",
+                                "attachments": [dict(screenshot)],
+                            },
+                            {
+                                "title": "Added attachment named 'Failure accessibility tree'",
+                                "attachments": [dict(ax)],
+                            },
+                        ],
+                    },
+                ],
+            }],
+        }
+
+    def test_actual_schema_selects_two_named_teardown_payloads_not_recordings(self) -> None:
+        selected = ui_e2e._selected_failure_attachments(self.activities())
+        self.assertEqual(
+            [item["payloadId"] for item in selected],
+            ["0~ax-fixture==", "0~screenshot-fixture=="],
+        )
+        altered = self.activities()
+        teardown = altered["testRuns"][0]["activities"][1]
+        teardown["attachments"][0]["payloadId"] = "../unsafe"
+        teardown["childActivities"] = []
+        self.assertEqual(len(ui_e2e._selected_failure_attachments(altered)), 1)
+        teardown["title"] = "Set Up"
+        self.assertEqual(ui_e2e._selected_failure_attachments(altered), [])
+
+    def test_selected_export_uses_id_fixed_paths_and_per_payload_limits(self) -> None:
+        calls: list[list[str]] = []
+
+        def capture(command: list[str], **kwargs: object) -> object:
+            calls.append(command)
+            payload_id = command[command.index("--id") + 1]
+            output = Path(command[command.index("--output-path") + 1])
+            self.assertEqual(output.name, "payload")
+            self.assertNotIn("attachments", command)
+            self.assertIn("--legacy", command)
+            expected_limit = (
+                512 * 1024 if payload_id == "0~ax-fixture==" else 2 * 1024 * 1024
+            )
+            self.assertEqual(int(command[3]), expected_limit)
+            self.assertLessEqual(kwargs["timeout_seconds"], 10)
+            self.assertEqual(kwargs["max_output_bytes"], 16 * 1024)
+            kwargs["log_path"].write_text("exported", encoding="utf-8")
+            output.write_bytes(
+                b"Application tree\n"
+                if "ax-fixture" in payload_id else b"\x89PNG\r\n\x1a\nfixture"
+            )
+            return ui_e2e.CommandResult(0, 8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture):
+                ui_e2e.export_failure_attachments(
+                    self.activities(),
+                    result_bundle=root / "test.xcresult",
+                    logs_dir=root,
+                    deadline=ui_e2e.time.monotonic() + 10,
+                    log=lambda _message: None,
+                )
+            self.assertEqual(len(calls), 2)
+            receipt = json.loads((root / "xcresult-attachment-export.json").read_text())
+            self.assertEqual(
+                [item["status"] for item in receipt["attachments"]],
+                ["exported", "exported"],
+            )
+            self.assertEqual(
+                (root / "xcresult-failure-ax.txt").read_text(), "Application tree\n"
+            )
+            self.assertTrue((root / "xcresult-failure-screenshot.png").is_file())
+            self.assertFalse(list(root.glob(".xcresult-attachment-*")))
+
+    def test_kernel_limit_bounds_single_export_file_during_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "payload"
+            command = ui_e2e._file_limited_command(
+                [
+                    sys.executable, "-c",
+                    "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'x'*8192)",
+                    str(output),
+                ],
+                128,
+            )
+            result = ui_e2e.run_process(
+                command, log_path=root / "writer.log",
+                timeout_seconds=5, max_output_bytes=4096,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertLessEqual(output.stat().st_size, 128)
+
+    def test_oversize_and_partial_failed_exports_are_removed(self) -> None:
+        def capture(command: list[str], **kwargs: object) -> object:
+            output = Path(command[command.index("--output-path") + 1])
+            output.write_bytes(b"partial" * 10)
+            kwargs["log_path"].write_text("fixture export failed", encoding="utf-8")
+            payload_id = command[command.index("--id") + 1]
+            return ui_e2e.CommandResult(0 if "ax-fixture" in payload_id else 70, 1)
+
+        messages: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            limits = {
+                "xcresult-failure-ax.txt": 8,
+                "xcresult-failure-screenshot.png": 128,
+            }
+            with (
+                mock.patch.object(ui_e2e, "run_process", side_effect=capture),
+                mock.patch.object(ui_e2e, "FAILURE_ATTACHMENT_LIMITS", limits),
+            ):
+                ui_e2e.export_failure_attachments(
+                    self.activities(), result_bundle=root / "test.xcresult", logs_dir=root,
+                    deadline=ui_e2e.time.monotonic() + 10, log=messages.append,
+                )
+            receipt = json.loads((root / "xcresult-attachment-export.json").read_text())
+            self.assertEqual(
+                [item["status"] for item in receipt["attachments"]],
+                ["unavailable", "unavailable"],
+            )
+            self.assertIn("byte cap", receipt["attachments"][0]["error"])
+            self.assertIn("exited 70", receipt["attachments"][1]["error"])
+            self.assertFalse((root / "xcresult-failure-ax.txt").exists())
+            self.assertFalse((root / "xcresult-failure-screenshot.png").exists())
+            self.assertFalse(list(root.glob(".xcresult-attachment-*")))
+
+    def test_shared_deadline_does_not_start_additional_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(ui_e2e, "run_process") as run:
+                ui_e2e.export_failure_attachments(
+                    self.activities(), result_bundle=root / "test.xcresult", logs_dir=root,
+                    deadline=ui_e2e.time.monotonic() - 1, log=lambda _message: None,
+                )
+            run.assert_not_called()
+            receipt = json.loads((root / "xcresult-attachment-export.json").read_text())
+            self.assertTrue(all(
+                "deadline exhausted" in item["error"]
+                for item in receipt["attachments"]
+            ))
+
+    def test_partial_export_never_replaces_original_xcode_failure(self) -> None:
+        payloads = FailedXcodeDiagnosticsTests()._payloads()
+        payloads["activities"] = self.activities()
+        second_case = {
+            "nodeType": "Test Case", "name": "testOther",
+            "result": "Failed", "nodeIdentifier": "other",
+        }
+        payloads["tests"]["testNodes"][0]["children"].append(second_case)
+        test_ids: list[str] = []
+
+        def capture(command: list[str], **kwargs: object) -> object:
+            if "--output-path" in command:
+                output = Path(command[command.index("--output-path") + 1])
+                output.write_text("Application tree\n", encoding="utf-8")
+                kwargs["log_path"].write_text("fixture diagnostic", encoding="utf-8")
+                payload_id = command[command.index("--id") + 1]
+                return ui_e2e.CommandResult(0 if "ax-fixture" in payload_id else 70, 1)
+            if "--test-id" in command:
+                test_ids.append(command[command.index("--test-id") + 1])
+            kwargs["log_path"].write_text(json.dumps(payloads[command[4]]), encoding="utf-8")
+            return ui_e2e.CommandResult(0, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "UIE2E.xcresult"
+            bundle.mkdir()
+            with mock.patch.object(ui_e2e, "run_process", side_effect=capture):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "xcodebuild test exited 65"):
+                    ui_e2e.finish_xcode_run(
+                        ui_e2e.CommandResult(65, 1), result_bundle=bundle, logs_dir=root,
+                        expected_target="MacOSNetPlayerUITests", log=lambda _message: None,
+                    )
+            self.assertEqual(
+                test_ids,
+                ["UIPlaybackTests/testConnectBrowseAndControlRealPlayback()"] * 2,
+            )
+            self.assertTrue((root / "xcresult-failure-ax.txt").exists())
+            self.assertFalse((root / "xcresult-failure-screenshot.png").exists())
+            self.assertFalse((root / "result-validation.json").exists())
+            receipt = json.loads((root / "xcresult-attachment-export.json").read_text())
+            self.assertEqual(
+                [item["status"] for item in receipt["attachments"]],
+                ["exported", "unavailable"],
+            )
+
+    def test_staging_selected_payloads_keeps_allowlist_and_aggregate_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            logs = work / "logs"
+            logs.mkdir(parents=True)
+            (logs / "xcresult-failure-ax.txt").write_bytes(b"a" * 16)
+            (logs / "xcresult-failure-screenshot.png").write_bytes(b"x" * 64)
+            (logs / "xcresult-attachment-export.json").write_text("{}", encoding="utf-8")
+            (logs / "recording.mp4").write_bytes(b"not allowlisted")
+            bundle = work / "test.xcresult"
+            bundle.mkdir()
+            (bundle / "data").write_bytes(b"x" * 128)
+            stager = ui_e2e.ArtifactStager(root / "artifacts", max_bytes=256)
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "not allowlisted"):
+                stager.stage_file(logs / "recording.mp4")
+            with (
+                mock.patch.object(ui_e2e, "MAX_RESULT_BUNDLE_BYTES", 64),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                ui_e2e._stage_artifacts(stager, work_dir=work, result_bundle=bundle)
+            self.assertTrue((stager.destination / "xcresult-failure-ax.txt").is_file())
+            self.assertTrue((stager.destination / "xcresult-failure-screenshot.png").is_file())
+            self.assertFalse((stager.destination / "result.xcresult").exists())
+            self.assertFalse((stager.destination / "recording.mp4").exists())
+            self.assertIn(
+                "staged:", (stager.destination / "artifact-staging.log").read_text()
+            )
+            self.assertLessEqual(
+                sum(file.stat().st_size for file in stager.destination.iterdir()), 256
+            )
+            self.assertLessEqual(stager.used_bytes, 256)
+            extra = logs / "xcodebuild.log"
+            extra.write_bytes(b"x" * 256)
+            with contextlib.redirect_stdout(io.StringIO()):
+                stager.stage_file(extra)
+            self.assertFalse((stager.destination / "xcodebuild.log").exists())
+
+    def test_staging_oversized_selected_payload_is_explicitly_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "xcresult-failure-screenshot.png"
+            source.write_bytes(b"x" * 64)
+            stager = ui_e2e.ArtifactStager(root / "artifacts")
+            with (
+                mock.patch.object(
+                    ui_e2e, "FAILURE_ATTACHMENT_LIMITS", {source.name: 32}
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                stager.stage_file(source)
+            self.assertEqual(stager.used_bytes, 0)
+            self.assertFalse((stager.destination / source.name).exists())
+            self.assertIn("omitted", stager.diagnostics[0])
 
 
 if __name__ == "__main__":

@@ -57,24 +57,37 @@ final class UIPlaybackTests: XCTestCase {
     func testConnectBrowseAndControlRealPlayback() throws {
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["app-status"].label.contains("Cache server not connected"))
+        let initialStatus = app.staticTexts["app-status"]
+        let refresh = app.buttons["cache-server-refresh"]
+        let libraryItems = app.descendants(matching: .any).matching(identifier: "cache-library-item")
+        XCTAssertTrue(
+            waitUntil(timeout: 10) { status(initialStatus, contains: "Cache server not connected.") },
+            "Expected an initially disconnected cache server. Status: \(accessibilityDescription(initialStatus)); "
+                + "address: \(accessibilityDescription(addressField)); cached items: \(libraryItems.count)"
+        )
+        XCTAssertTrue(
+            serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))"
+        )
+        XCTAssertTrue(refresh.waitForExistence(timeout: 10))
+        XCTAssertFalse(refresh.isEnabled, "Refresh should be disabled until an address is entered.")
+        XCTAssertEqual(libraryItems.count, 0, "An isolated launch should not load any cache library items.")
 
         addressField.click()
         addressField.typeText(serverAddress)
-        app.buttons["cache-server-refresh"].click()
+        refresh.click()
 
         let libraryStatus = app.staticTexts["cache-library-status"]
         XCTAssertTrue(
-            waitUntil(timeout: 60) { libraryStatus.label.contains("Loaded 50 cached item(s)") },
-            "The app did not load the first real catalog page. Status: \(libraryStatus.label)"
+            waitUntil(timeout: 60) { status(libraryStatus, contains: "Loaded 50 cached item(s)") },
+            "The app did not load the first real catalog page. Status: \(accessibilityDescription(libraryStatus))"
         )
 
         let loadMore = app.buttons["cache-library-load-more"]
         XCTAssertTrue(loadMore.waitForExistence(timeout: 10), "The 55-item catalog should have a second page.")
         loadMore.click()
         XCTAssertTrue(
-            waitUntil(timeout: 30) { libraryStatus.label.contains("Loaded 55 cached item(s)") },
-            "The app did not load the second catalog page. Status: \(libraryStatus.label)"
+            waitUntil(timeout: 30) { status(libraryStatus, contains: "Loaded 55 cached item(s)") },
+            "The app did not load the second catalog page. Status: \(accessibilityDescription(libraryStatus))"
         )
 
         let fixture = libraryItem(named: "Fixture 055")
@@ -171,6 +184,21 @@ final class UIPlaybackTests: XCTestCase {
         completionScreenshot.name = "Natural playback completion"
         completionScreenshot.lifetime = .keepAlways
         add(completionScreenshot)
+    }
+
+    private func status(_ element: XCUIElement, contains expectedText: String) -> Bool {
+        guard element.exists else { return false }
+        return element.label.contains(expectedText) || (element.value as? String)?.contains(expectedText) == true
+    }
+
+    private func serverAddressIsEmpty(_ element: XCUIElement) -> Bool {
+        guard let value = element.value as? String else { return false }
+        return value.isEmpty || value == element.placeholderValue
+    }
+
+    private func accessibilityDescription(_ element: XCUIElement) -> String {
+        guard element.exists else { return "exists=false" }
+        return "label=\(element.label.debugDescription), value=\(String(describing: element.value))"
     }
 
     private func libraryItem(named title: String) -> XCUIElement {

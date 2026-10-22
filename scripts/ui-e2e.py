@@ -37,6 +37,11 @@ MAX_SERVER_LOG_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_RESULT_BUNDLE_BYTES = 20 * 1024 * 1024
 MAX_ARTIFACT_REPORT_BYTES = 8192
+FAILURE_ATTACHMENT_LIMITS = {
+    "xcresult-failure-ax.txt": 512 * 1024,
+    "xcresult-failure-screenshot.png": 2 * 1024 * 1024,
+}
+MAX_ATTACHMENT_EXPORT_LOG_BYTES = 16 * 1024
 RESULT_DIAGNOSTIC_TIMEOUT_SECONDS = 240
 COMMAND_TIMEOUT_SECONDS = 30 * 60
 SERVER_READY_TIMEOUT_SECONDS = 45
@@ -1129,6 +1134,136 @@ def validate_xcresult(
     return overall | {f"target_{key}": value for key, value in target_counts.items()}
 
 
+def _selected_failure_attachments(activities: object) -> list[dict[str, str]]:
+    """Select only the named teardown AX/screenshot from this failed case."""
+    selected: dict[str, dict[str, str]] = {}
+    patterns = (
+        (
+            r"Failure accessibility tree(?:_\d{1,6}_[0-9A-Fa-f-]{36})?\.txt",
+            "xcresult-failure-ax.txt",
+        ),
+        (
+            r"Failure screenshot(?:_\d{1,6}_[0-9A-Fa-f-]{36})?\.png",
+            "xcresult-failure-screenshot.png",
+        ),
+    )
+    for activity in _all_dicts(activities):
+        if activity.get("title") != "Tear Down":
+            continue
+        for node in _all_dicts(activity):
+            attachments = node.get("attachments", [])
+            if not isinstance(attachments, list):
+                continue
+            for attachment in attachments:
+                if (
+                    not isinstance(attachment, dict)
+                    or attachment.get("lifetime") != "keepAlways"
+                ):
+                    continue
+                name, payload_id = attachment.get("name"), attachment.get("payloadId")
+                if not isinstance(name, str) or not isinstance(payload_id, str):
+                    continue
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_~+=-]{0,511}", payload_id):
+                    continue
+                for pattern, filename in patterns:
+                    if filename not in selected and re.fullmatch(pattern, name):
+                        selected[filename] = {
+                            "file": filename, "name": name, "payloadId": payload_id
+                        }
+    return [selected[name] for name in FAILURE_ATTACHMENT_LIMITS if name in selected]
+
+
+def _file_limited_command(command: list[str], max_bytes: int) -> list[str]:
+    # Set limits in a fresh interpreter, not preexec_fn in this multithreaded
+    # runner. exec preserves our owned PID/session and the kernel file cap.
+    launcher = (
+        "import os,resource,sys; "
+        "limit=int(sys.argv[1]); "
+        "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
+        "resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit)); "
+        "os.execvp(sys.argv[2],sys.argv[2:])"
+    )
+    return [sys.executable, "-c", launcher, str(max_bytes), *command]
+
+
+def export_failure_attachments(
+    activities: object,
+    *,
+    result_bundle: Path,
+    logs_dir: Path,
+    deadline: float,
+    log: Callable[[str], None],
+) -> None:
+    selected = _selected_failure_attachments(activities)
+    receipt: list[dict[str, object]] = []
+    for attachment in selected:
+        filename = attachment["file"]
+        limit = FAILURE_ATTACHMENT_LIMITS[filename]
+        item: dict[str, object] = dict(
+            attachment, maxBytes=limit, status="unavailable"
+        )
+        receipt.append(item)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UIE2EError("shared xcresult diagnostic deadline exhausted")
+            with tempfile.TemporaryDirectory(
+                prefix=".xcresult-attachment-", dir=logs_dir
+            ) as directory:
+                payload = Path(directory) / "payload"
+                export_log = logs_dir / f"{filename}.export.log"
+                command = [
+                    "xcrun", "xcresulttool", "export", "object", "--legacy",
+                    "--path", str(result_bundle), "--type", "file",
+                    "--id", attachment["payloadId"], "--output-path", str(payload),
+                ]
+                captured = run_process(
+                    _file_limited_command(command, limit),
+                    log_path=export_log,
+                    timeout_seconds=min(30, remaining),
+                    max_output_bytes=MAX_ATTACHMENT_EXPORT_LOG_BYTES,
+                    cwd=ROOT,
+                )
+                _require_result(captured, f"export {filename}", export_log)
+                if payload.is_symlink() or not payload.is_file():
+                    raise UIE2EError("export did not produce a regular payload file")
+                size = payload.stat().st_size
+                if not 0 < size <= limit:
+                    raise UIE2EError(
+                        f"payload byte cap exceeded or empty: {size} bytes, cap={limit}"
+                    )
+                if filename.endswith(".png"):
+                    with payload.open("rb") as reader:
+                        if reader.read(8) != b"\x89PNG\r\n\x1a\n":
+                            raise UIE2EError("exported screenshot has no PNG signature")
+                else:
+                    payload.read_text(encoding="utf-8")
+                payload.rename(logs_dir / filename)
+                item.update(status="exported", bytes=size)
+                log(
+                    f"xcresult attachment exported: {filename} "
+                    f"({size} bytes, cap={limit})."
+                )
+        except Exception as error:
+            item["error"] = f"{type(error).__name__}: {' '.join(str(error).split())[:512]}"
+            log(f"xcresult attachment {filename} unavailable: {item['error']}")
+    if not selected:
+        log(
+            "xcresult attachments unavailable: no eligible named teardown "
+            "AX/screenshot in first failed case metadata."
+        )
+    _write_json(
+        logs_dir / "xcresult-attachment-export.json",
+        {
+            "selection": (
+                "first failed case; at most one named teardown AX "
+                "and one screenshot; no recordings"
+            ),
+            "attachments": receipt,
+        },
+    )
+
+
 def finish_xcode_run(
     result: CommandResult,
     *,
@@ -1202,12 +1337,19 @@ def finish_xcode_run(
                      "--path", str(result_bundle), "--test-id", test_id],
                     optional=True,
                 )
-            metadata_status = (
-                "bounded failure activity metadata retained."
-                if "failure-activities" in outputs
-                else "failure activity metadata unavailable."
-            )
-            log("This runner does not export standalone screenshot/AX payloads; " + metadata_status)
+            try:
+                export_failure_attachments(
+                    outputs.get("failure-activities"),
+                    result_bundle=result_bundle,
+                    logs_dir=logs_dir,
+                    deadline=deadline,
+                    log=log,
+                )
+            except Exception as error:
+                log(
+                    f"xcresult attachment receipt failed: "
+                    f"{type(error).__name__}: {str(error)[:512]}"
+                )
         else:
             log("Failure details/attachments omitted: no bounded test identifier in xcresult.")
 
@@ -1248,6 +1390,11 @@ class ArtifactStager:
         "xcresult-tests.json",
         "xcresult-failure-details.json",
         "xcresult-failure-activities.json",
+        "xcresult-attachment-export.json",
+        "xcresult-failure-ax.txt",
+        "xcresult-failure-screenshot.png",
+        "xcresult-failure-ax.txt.export.log",
+        "xcresult-failure-screenshot.png.export.log",
         "result-validation.json",
         "artifact-staging.log",
     }
@@ -1277,11 +1424,21 @@ class ArtifactStager:
             return
         size = source.stat().st_size
         limit = self.max_bytes if source.name == "artifact-staging.log" else self.max_bytes - self.report_bytes
-        if size > MAX_COMMAND_LOG_BYTES or self.used_bytes + size > limit:
+        file_limit = FAILURE_ATTACHMENT_LIMITS.get(source.name, MAX_COMMAND_LOG_BYTES)
+        if source.name.endswith(".export.log"):
+            file_limit = MAX_ATTACHMENT_EXPORT_LOG_BYTES
+        elif source.name == "xcresult-attachment-export.json":
+            file_limit = MAX_ARTIFACT_REPORT_BYTES
+        if size > file_limit or self.used_bytes + size > limit:
             self.note(f"{source.name} omitted: file or aggregate byte cap exceeded ({size} bytes).")
             return
         shutil.copyfile(source, self.destination / source.name)
         self.used_bytes += size
+        if source.name in FAILURE_ATTACHMENT_LIMITS:
+            self.note(
+                f"{source.name} staged: {size} bytes "
+                f"(aggregate used={self.used_bytes}/{self.max_bytes})."
+            )
 
     def stage_result_bundle(self, source: Path) -> bool:
         if not source.is_dir() or source.is_symlink():
@@ -1373,6 +1530,11 @@ def _stage_artifacts(
             "xcresult-tests.json",
             "xcresult-failure-details.json",
             "xcresult-failure-activities.json",
+            "xcresult-attachment-export.json",
+            "xcresult-failure-ax.txt",
+            "xcresult-failure-screenshot.png",
+            "xcresult-failure-ax.txt.export.log",
+            "xcresult-failure-screenshot.png.export.log",
             "result-validation.json",
             "server.log",
             "xcodebuild.log",
