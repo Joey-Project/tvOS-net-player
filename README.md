@@ -58,6 +58,8 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 
 macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
 
+自然播放的 90 秒等待窗口从实际重播点击开始计算，滚动和查找按钮的准备时间单独记录；按钮已经可见时立即停止滚动检查。播放结束后用原生播放器控件往回拖动，再点自定义 Resume，会从所选位置续播并保留倍速，而不是无条件回到开头；这项共享 AppCore 行为另有专项回归测试。
+
 这两个 Just 命令会先构建 Rust server；设置 `CACHE_SERVER_BINARY` 可复用已构建的可执行文件。`DERIVED_DATA_PATH` 可复用已有 Xcode 编译缓存，该目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
 
 Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据，并从首个失败用例的 teardown 附件中单独导出最多一份 accessibility tree（512 KiB）和一张截图（2 MiB），不导出录屏。完整 xcresult 超限时仍可保留这些小附件；导出结果见 `xcresult-attachment-export.json`，归档缺失、超限或失败见 `artifact-staging.log`。附件导出失败不会覆盖原始测试失败，只有元数据不等于图片留存。

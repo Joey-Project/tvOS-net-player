@@ -156,8 +156,11 @@ public final class PlayerViewModel: ObservableObject {
     private var playbackProgressReportTask: Task<Void, Never>?
     private var playbackProgressReportChain: Task<PlaybackProgressReportResult?, Never>?
     private var playbackEndObserver: AnyCancellable?
+    private var playbackEndObservationID = UUID()
     private var playbackResumeObserver: AnyCancellable?
+    private var playbackTimeJumpObserver: AnyCancellable?
     private weak var playbackProgressEndedItem: AVPlayerItem?
+    private var playbackProgressEndedTime: CMTime?
     private struct PendingReplay {
         let player: AVPlayer
         let item: AVPlayerItem
@@ -284,6 +287,7 @@ public final class PlayerViewModel: ObservableObject {
         }
         observePlaybackEnd(for: nextPlayer.currentItem)
         observePlaybackResume(for: nextPlayer)
+        observePlaybackTimeJumps(for: nextPlayer.currentItem)
         queueCurrentPlaybackProgressReport(intent: .started)
         startPlaybackProgressReporting()
     }
@@ -297,6 +301,7 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     func togglePlayback(using controller: (any PlayerPlaybackControlling)?) {
+        handlePlaybackTimeJump(using: controller)
         let wasRestarting =
             pendingReplay != nil
             && pendingReplay?.player === player
@@ -320,7 +325,7 @@ public final class PlayerViewModel: ObservableObject {
 
         if playbackProgressEndedItem !== item {
             finishPlaybackProgressReporting(
-                for: item, terminalPosition: controller.currentTime().seconds,
+                for: item, terminalTime: controller.currentTime(),
                 durationSeconds: Self.playbackDurationSeconds(controller.itemDuration))
         }
         let sequence = manualInteractionSequence
@@ -339,7 +344,16 @@ public final class PlayerViewModel: ObservableObject {
             player?.currentItem === request.item,
             request.controller.currentItem === request.item,
             playbackProgressEndedItem === request.item
-        else { return }
+        else {
+            handlePlaybackTimeJump(using: request.controller)
+            return
+        }
+        if CMTimeCompare(request.controller.currentTime(), .zero) != 0,
+            hasMovedAwayFromPlaybackEnd(using: request.controller)
+        {
+            handlePlaybackTimeJump(using: request.controller)
+            return
+        }
 
         let durationSeconds = Self.playbackDurationSeconds(request.controller.itemDuration)
         queuePlaybackProgressReport(positionSeconds: 0, durationSeconds: durationSeconds, intent: .seek)
@@ -368,6 +382,7 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     func seek(by offset: TimeInterval, using controller: (any PlayerPlaybackControlling)?) {
+        handlePlaybackTimeJump(using: controller)
         markManualInteraction()
         guard let controller else {
             statusMessage = "No stream loaded."
@@ -391,7 +406,7 @@ public final class PlayerViewModel: ObservableObject {
         {
             if let item = controller.currentItem, playbackProgressEndedItem !== item {
                 finishPlaybackProgressReporting(
-                    for: item, terminalPosition: currentSeconds, durationSeconds: durationSeconds)
+                    for: item, terminalTime: currentTime, durationSeconds: durationSeconds)
             }
             return
         }
@@ -410,10 +425,11 @@ public final class PlayerViewModel: ObservableObject {
                     Self.isAtPlaybackEnd(currentTime: controller.currentTime(), duration: controller.itemDuration),
                     self.playbackProgressEndedItem !== item
                 else { return }
-                let position = controller.currentTime().seconds
+                let position = controller.currentTime()
                 let duration = Self.playbackDurationSeconds(controller.itemDuration)
-                self.queuePlaybackProgressReport(positionSeconds: position, durationSeconds: duration, intent: .seek)
-                self.finishPlaybackProgressReporting(for: item, terminalPosition: position, durationSeconds: duration)
+                self.queuePlaybackProgressReport(
+                    positionSeconds: position.seconds, durationSeconds: duration, intent: .seek)
+                self.finishPlaybackProgressReporting(for: item, terminalTime: position, durationSeconds: duration)
             }
         } else {
             controller.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -508,6 +524,7 @@ public final class PlayerViewModel: ObservableObject {
     public func reportCurrentPlaybackProgress(
         intent: PlaybackProgressIntent = .playing
     ) async -> PlaybackProgressReportResult? {
+        handlePlaybackTimeJump(using: player)
         guard let report = currentPlaybackProgressReport(intent: intent),
             let endpoint = playbackProgressContext?.endpoint
         else {
@@ -557,11 +574,15 @@ public final class PlayerViewModel: ObservableObject {
     private func stopPlaybackProgressReporting() {
         pendingReplay = nil
         stopPlaybackProgressHeartbeat()
+        playbackEndObservationID = UUID()
         playbackEndObserver?.cancel()
         playbackEndObserver = nil
         playbackResumeObserver?.cancel()
         playbackResumeObserver = nil
+        playbackTimeJumpObserver?.cancel()
+        playbackTimeJumpObserver = nil
         playbackProgressEndedItem = nil
+        playbackProgressEndedTime = nil
     }
 
     private func stopPlaybackProgressHeartbeat() {
@@ -570,6 +591,8 @@ public final class PlayerViewModel: ObservableObject {
     }
 
     private func observePlaybackEnd(for item: AVPlayerItem?) {
+        let observationID = UUID()
+        playbackEndObservationID = observationID
         guard let item else {
             return
         }
@@ -578,11 +601,16 @@ public final class PlayerViewModel: ObservableObject {
             .publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
             .sink { [weak self] notification in
                 let endedItem = notification.object as? AVPlayerItem
+                let observedEndTime = endedItem?.currentTime() ?? .invalid
                 Task { @MainActor [weak self, endedItem] in
-                    guard let endedItem, self?.player?.currentItem === endedItem else {
+                    guard let self, let endedItem, let player = self.player,
+                        player.currentItem === endedItem, self.playbackEndObservationID == observationID,
+                        !Self.hasMovedAwayFromEnd(
+                            currentTime: player.currentTime(), endTime: observedEndTime, duration: player.itemDuration)
+                    else {
                         return
                     }
-                    self?.finishPlaybackProgressReporting(for: endedItem)
+                    self.finishPlaybackProgressReporting(for: endedItem)
                 }
             }
     }
@@ -595,30 +623,80 @@ public final class PlayerViewModel: ObservableObject {
                 }
 
                 Task { @MainActor [weak self, weak player] in
-                    guard let self, let player, self.player === player else {
+                    guard let self, let player, self.player === player, player.timeControlStatus == .playing else {
                         return
                     }
-                    self.restartPlaybackProgressReportingAfterEndIfNeeded(immediateIntent: .playing)
+                    self.handlePlaybackTimeJump(using: player)
                 }
             }
     }
 
+    private func observePlaybackTimeJumps(for item: AVPlayerItem?) {
+        guard let item else { return }
+        playbackTimeJumpObserver = NotificationCenter.default
+            .publisher(for: .AVPlayerItemTimeJumped, object: item)
+            .sink { [weak self, weak item] _ in
+                Task { @MainActor [weak self, weak item] in
+                    guard let self, let item, self.player?.currentItem === item else { return }
+                    self.handlePlaybackTimeJump(using: self.player)
+                }
+            }
+    }
+
+    private func hasMovedAwayFromPlaybackEnd(using controller: any PlayerPlaybackControlling) -> Bool {
+        guard let item = controller.currentItem, playbackProgressEndedItem === item,
+            let endTime = playbackProgressEndedTime
+        else { return false }
+        return Self.hasMovedAwayFromEnd(
+            currentTime: controller.currentTime(), endTime: endTime, duration: controller.itemDuration)
+    }
+
+    static func hasMovedAwayFromEnd(currentTime: CMTime, endTime: CMTime, duration: CMTime) -> Bool {
+        endTime.isNumeric && CMTimeCompare(endTime, .zero) > 0
+            && currentTime.isNumeric && CMTimeCompare(currentTime, .zero) >= 0
+            && CMTimeCompare(currentTime, endTime) < 0
+            && !Self.isAtPlaybackEnd(currentTime: currentTime, duration: duration)
+    }
+
+    func handlePlaybackTimeJump(using controller: (any PlayerPlaybackControlling)?) {
+        guard let controller, let player, let item = controller.currentItem,
+            player.currentItem === item, hasMovedAwayFromPlaybackEnd(using: controller)
+        else { return }
+        if let pendingReplay, pendingReplay.player === player, pendingReplay.item === item,
+            CMTimeCompare(controller.currentTime(), .zero) == 0
+        {
+            return
+        }
+
+        let position = controller.currentTime().seconds
+        let duration = Self.playbackDurationSeconds(controller.itemDuration)
+        let intent: PlaybackProgressIntent = controller.timeControlStatus == .playing ? .playing : .paused
+        markManualInteraction()
+        queuePlaybackProgressReport(positionSeconds: position, durationSeconds: duration, intent: .seek)
+        restartPlaybackProgressReportingAfterEndIfNeeded(
+            immediateIntent: intent, positionSeconds: position, durationSeconds: duration)
+        statusMessage = intent == .playing ? "Playing \(loadedURL?.absoluteString ?? "stream")." : "Playback paused."
+    }
+
     private func finishPlaybackProgressReporting(
-        for item: AVPlayerItem, terminalPosition: Double? = nil, durationSeconds: Double? = nil
+        for item: AVPlayerItem, terminalTime: CMTime? = nil, durationSeconds: Double? = nil
     ) {
         guard player?.currentItem === item, playbackProgressEndedItem !== item else {
             return
         }
         let queuedStoppedReport: Bool
-        if let terminalPosition {
+        if let terminalTime {
             queuePlaybackProgressReport(
-                positionSeconds: terminalPosition, durationSeconds: durationSeconds, intent: .stopped)
+                positionSeconds: terminalTime.seconds, durationSeconds: durationSeconds, intent: .stopped)
             queuedStoppedReport = playbackProgressContext != nil
         } else {
             queuedStoppedReport = queueCurrentPlaybackProgressReport(intent: .stopped)
         }
         playbackProgressEndedItem = item
+        let endTime = terminalTime ?? player?.currentTime() ?? .invalid
+        playbackProgressEndedTime = endTime.isNumeric && CMTimeCompare(endTime, .zero) > 0 ? endTime : nil
         stopPlaybackProgressHeartbeat()
+        playbackEndObservationID = UUID()
         playbackEndObserver?.cancel()
         playbackEndObserver = nil
         statusMessage = "Playback finished."
@@ -636,6 +714,7 @@ public final class PlayerViewModel: ObservableObject {
         }
 
         playbackProgressEndedItem = nil
+        playbackProgressEndedTime = nil
         observePlaybackEnd(for: currentItem)
         if let immediateIntent {
             if let positionSeconds {

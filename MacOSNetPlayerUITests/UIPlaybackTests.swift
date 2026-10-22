@@ -190,16 +190,25 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             measuredRate, 2.8, "Measured playback rate \(measuredRate)x is outside the 2x tolerance.")
 
-        let naturalPlaybackStart = ProcessInfo.processInfo.systemUptime
-        clickVisible(playCached, scrollingIn: controlScroll)
+        let replayPreparationStart = ProcessInfo.processInfo.systemUptime
+        let naturalPlaybackStart = try XCTUnwrap(clickVisible(playCached, scrollingIn: controlScroll))
+        let replayPreparationDuration = naturalPlaybackStart - replayPreparationStart
         let replayStart = try XCTUnwrap(waitForTimeline(timeout: 15) { $0 < 4 })
         XCTAssertLessThanOrEqual(replayStart, 4, "Replay should restart near the beginning of Fixture 055.")
         XCTAssertTrue(waitUntilTimelineState(state, equals: "playing", timeout: 15))
 
-        let naturalEnd = waitForNaturalCompletion(timeout: 90)
+        let naturalEnd = waitForNaturalCompletion(deadline: naturalPlaybackStart + 90)
         let naturalPlaybackDuration = ProcessInfo.processInfo.systemUptime - naturalPlaybackStart
-        XCTAssertNotNil(naturalEnd, "Fixture 055 did not naturally finish within 90 seconds.")
-        XCTAssertLessThanOrEqual(naturalPlaybackDuration, 90)
+        XCTAssertNotNil(
+            naturalEnd,
+            "Fixture 055 did not naturally finish within 90 seconds of the actual replay click. "
+                + "Playback elapsed: \(naturalPlaybackDuration); pre-click preparation: \(replayPreparationDuration); "
+                + "timeline: \(accessibilityDescription(timeline)); state: \(accessibilityDescription(state))"
+        )
+        XCTAssertLessThanOrEqual(
+            naturalPlaybackDuration, 90,
+            "Playback elapsed: \(naturalPlaybackDuration); pre-click preparation: \(replayPreparationDuration)."
+        )
         let terminalTimeline = try XCTUnwrap(naturalEnd)
         XCTAssertGreaterThanOrEqual(terminalTimeline.duration, 90)
         XCTAssertGreaterThanOrEqual(
@@ -379,27 +388,31 @@ final class UIPlaybackTests: XCTestCase {
         return container.map { $0.exists && $0.frame.contains(element.frame) } ?? true
     }
 
+    @discardableResult
     private func clickVisible(
         _ element: XCUIElement,
         scrollingIn container: XCUIElement? = nil,
         file: StaticString = #filePath,
         line: UInt = #line
-    ) {
-        app.activate()
+    ) -> TimeInterval? {
+        if app.state != .runningForeground {
+            app.activate()
+        }
         guard waitUntil(timeout: 10, condition: { app.state == .runningForeground }) else {
             XCTFail(
                 "The player did not become foreground before clicking. \(app.state)", file: file, line: line
             )
-            return
+            return nil
         }
         guard element.waitForExistence(timeout: 10) else {
             XCTFail(
                 "The requested control does not exist. \(accessibilityDescription(element))", file: file, line: line)
-            return
+            return nil
         }
 
         if let container {
-            for _ in 0..<24 where !isVisible(element, in: container) {
+            for _ in 0..<24 {
+                if isVisible(element, in: container) { break }
                 guard isWithinVisibleWindow(container) else { break }
                 let deltaY: CGFloat
                 if element.frame.minY < container.frame.minY {
@@ -419,13 +432,15 @@ final class UIPlaybackTests: XCTestCase {
                     + "window=\(app.windows.firstMatch.frame); displays=\(visibleScreenFrames)",
                 file: file, line: line
             )
-            return
+            return nil
         }
+        let clickStart = ProcessInfo.processInfo.systemUptime
         element.click()
         XCTAssertTrue(
             waitUntil(timeout: 2) { app.state == .runningForeground },
             "Clicking the player control changed the foreground application.", file: file, line: line
         )
+        return clickStart
     }
 
     private func radioButtonIsSelected(_ element: XCUIElement) -> Bool {
@@ -491,8 +506,7 @@ final class UIPlaybackTests: XCTestCase {
         waitUntil(timeout: timeout) { element.value as? String == expectedValue }
     }
 
-    private func waitForNaturalCompletion(timeout: TimeInterval) -> (current: Double, duration: Double)? {
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    private func waitForNaturalCompletion(deadline: TimeInterval) -> (current: Double, duration: Double)? {
         repeat {
             if identifiedElement("playback-state").value as? String == "finished",
                 let timeline = playbackTimeline(), timeline.duration >= 90,

@@ -46,8 +46,12 @@ class ProcessSupervisorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(owned[0].wait(timeout=0), 0)
                 descendant_pid = int(log_path.read_text().strip())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(descendant_pid, 0)
+                if sys.platform.startswith("linux"):
+                    # Container PID 1 may leave a terminated orphan as a zombie.
+                    self.assertFalse(ui_e2e._group_has_live_members(owned[0].pid))
+                else:
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(descendant_pid, 0)
             finally:
                 for process in owned:
                     if process.returncode is None:
@@ -184,6 +188,120 @@ class ProcessSupervisorTests(unittest.TestCase):
             process.wait.assert_not_called()
             process.stdout.close.assert_called_once()
             selector.close.assert_called_once()
+
+
+class LinuxGroupStateTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def proc_view(self, rows: list[tuple[int, str, int]]):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pid, state, pgid in rows:
+                process_dir = root / str(pid)
+                process_dir.mkdir()
+                (process_dir / "stat").write_text(
+                    f"{pid} (worker ) (nested) name) {state} 1 {pgid} {pgid} 0 0\n",
+                    encoding="ascii",
+                )
+            with (
+                mock.patch.object(ui_e2e.sys, "platform", "linux"),
+                mock.patch.object(ui_e2e, "_LINUX_PROC_ROOT", root),
+                mock.patch.object(ui_e2e.os, "killpg") as killpg,
+            ):
+                yield root, killpg
+
+    def test_zombie_only_and_dead_group_is_terminated(self) -> None:
+        rows = [(101, "Z", 4244), (102, "X", 4244), (103, "S", 9999)]
+        with self.proc_view(rows) as (_, killpg):
+            self.assertFalse(ui_e2e._group_has_live_members(4244))
+            killpg.assert_called_once_with(4244, 0)
+
+    def test_live_group_member_is_not_mistaken_for_zombie(self) -> None:
+        for state in ("R", "S", "D", "T", "t", "I"):
+            with (
+                self.subTest(state=state),
+                self.proc_view([(101, "Z", 4244), (102, state, 4244)]),
+            ):
+                self.assertTrue(ui_e2e._group_has_live_members(4244))
+
+    def test_unreadable_or_malformed_stat_is_not_absence(self) -> None:
+        with self.proc_view([(101, "Z", 4244)]) as (root, _):
+            for error in (PermissionError("denied"), OSError("read failed")):
+                with (
+                    self.subTest(error=type(error).__name__),
+                    mock.patch.object(Path, "open", side_effect=error),
+                ):
+                    with self.assertRaises(type(error)) as caught:
+                        ui_e2e._group_has_live_members(4244)
+                    self.assertIs(caught.exception, error)
+            for content in (b"101 (bad) Z 1 invalid", b"bad fields", b"x" * 4097):
+                with self.subTest(content=content[:32]):
+                    (root / "101" / "stat").write_bytes(content)
+                    with self.assertRaisesRegex(ui_e2e.UIE2EError, "Cleanup unverified"):
+                        ui_e2e._group_has_live_members(4244)
+
+    def test_disappearing_process_is_tolerated_but_hidden_group_is_unverified(self) -> None:
+        with self.proc_view([(101, "Z", 4244), (102, "S", 4244)]) as (root, _):
+            (root / "102" / "stat").unlink()
+            self.assertFalse(ui_e2e._group_has_live_members(4244))
+            (root / "101" / "stat").unlink()
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "no visible members"):
+                ui_e2e._group_has_live_members(4244)
+
+    def test_missing_group_needs_no_proc_query_and_query_errors_propagate(self) -> None:
+        with self.proc_view([]) as (_, killpg):
+            killpg.side_effect = ProcessLookupError()
+            with mock.patch.object(ui_e2e.os, "scandir") as scan:
+                self.assertFalse(ui_e2e._group_has_live_members(4244))
+                scan.assert_not_called()
+            killpg.side_effect = None
+            errors = [PermissionError("proc denied"), FileNotFoundError("no proc mount")]
+            for error in errors:
+                with (
+                    self.subTest(error=type(error).__name__),
+                    mock.patch.object(ui_e2e.os, "scandir", side_effect=error),
+                ):
+                    with self.assertRaises(type(error)) as caught:
+                        ui_e2e._group_has_live_members(4244)
+                    self.assertIs(caught.exception, error)
+
+    def test_linux_proc_query_has_entry_and_time_bounds(self) -> None:
+        with self.proc_view([(101, "Z", 4244)]):
+            with mock.patch.object(ui_e2e.time, "monotonic", side_effect=[0.0, 1.0]):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "4096-entry/1-second cap"):
+                    ui_e2e._group_has_live_members(4244)
+            entry = mock.Mock()
+            entry.name = "self"
+            scan = mock.MagicMock()
+            scan.__enter__.return_value = iter([entry] * 4097)
+            with (
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=0.0),
+                mock.patch.object(ui_e2e.os, "scandir", return_value=scan),
+                self.assertRaisesRegex(ui_e2e.UIE2EError, "4096-entry/1-second cap"),
+            ):
+                ui_e2e._group_has_live_members(4244)
+
+    def test_leader_is_reaped_and_zombie_descendant_requires_no_more_signals(self) -> None:
+        process = mock.Mock(pid=4244, returncode=None)
+        process.wait.side_effect = lambda **kwargs: setattr(process, "returncode", 0)
+        with (
+            self.proc_view([(101, "Z", 4244)]) as (_, killpg),
+            mock.patch.object(ui_e2e, "_child_has_exited", return_value=True),
+        ):
+            ui_e2e.stop_process_group(process)
+            process.wait.assert_called_once_with(timeout=5)
+            self.assertEqual(killpg.call_args_list, [
+                mock.call(4244, ui_e2e.signal.SIGTERM),
+                mock.call(4244, ui_e2e.signal.SIGKILL),
+                mock.call(4244, 0),
+            ])
+
+    def test_reaped_leader_with_live_group_still_cannot_authorize_signals(self) -> None:
+        process = mock.Mock(pid=4244, returncode=0)
+        with self.proc_view([(101, "S", 4244)]) as (_, killpg):
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "unreserved PGID"):
+                ui_e2e.stop_process_group(process)
+            killpg.assert_called_once_with(4244, 0)
+            process.wait.assert_not_called()
 
 
 class ToolInventoryTests(unittest.TestCase):

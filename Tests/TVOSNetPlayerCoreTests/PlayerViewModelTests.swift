@@ -209,12 +209,12 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
-    private func pausedNearEndPlaybackFixture() async throws -> (
+    private func pausedNearEndPlaybackFixture(playbackProgressReportInterval: Duration? = nil) async throws -> (
         PlayerViewModel, PlaybackControlSpy, FakePlaybackProgressClient
     ) {
         let client = FakePlaybackProgressClient()
         let model = PlayerViewModel(
-            defaults: defaults, autoplay: false, playbackProgressReportInterval: nil,
+            defaults: defaults, autoplay: false, playbackProgressReportInterval: playbackProgressReportInterval,
             cacheClientFactory: { _ in client }
         )
         model.setPlaybackSpeed(.double)
@@ -228,6 +228,19 @@ final class PlayerViewModelTests: XCTestCase {
         player.positionSeconds = 87
         await model.flushPlaybackProgressReports()
         XCTAssertEqual(model.playbackState, .paused)
+        return (model, player, client)
+    }
+
+    @MainActor
+    private func completedTerminalPlaybackFixture(playbackProgressReportInterval: Duration? = nil) async throws -> (
+        PlayerViewModel, PlaybackControlSpy, FakePlaybackProgressClient
+    ) {
+        let (model, player, client) = try await pausedNearEndPlaybackFixture(
+            playbackProgressReportInterval: playbackProgressReportInterval)
+        model.seek(by: 10, using: player)
+        player.completeNextSeek(finished: true, position: player.itemDuration)
+        await model.flushPlaybackProgressReports()
+        XCTAssertEqual(model.playbackState, .finished)
         return (model, player, client)
     }
 
@@ -768,6 +781,318 @@ final class PlayerViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testExternalBackwardScrubClearsFinishedAndPreservesSelectedPositionAndSpeed() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        let sequence = model.manualInteractionSequence
+        player.positionSeconds = 42
+
+        model.handlePlaybackTimeJump(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .paused)
+        XCTAssertEqual(model.manualInteractionSequence, sequence + 1)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92])
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [42, 42])
+        XCTAssertEqual(reports.suffix(2).map(\.durationSeconds), [92, 92])
+
+        model.setPlaybackSpeed(.oneAndHalf)
+        model.togglePlayback(using: player)
+
+        XCTAssertEqual(player.positionSeconds, 42)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92])
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.oneAndHalf.rate)
+        XCTAssertNotEqual(model.playbackState, .finished)
+    }
+
+    @MainActor
+    func testCustomResumeReconcilesExternalScrubBeforeTimeJumpNotification() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        player.positionSeconds = 37
+        model.setPlaybackSpeed(.oneAndQuarter)
+
+        model.togglePlayback(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92])
+        XCTAssertEqual(player.positionSeconds, 37)
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.oneAndQuarter.rate)
+        XCTAssertNotEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [37, 37])
+    }
+
+    @MainActor
+    func testNativeTimeJumpNotificationSurvivesCompletionAndRestoresPausedAtZero() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        let nativePlayer = try XCTUnwrap(model.player)
+        let item = try XCTUnwrap(nativePlayer.currentItem)
+        XCTAssertEqual(nativePlayer.currentTime().seconds, 0)
+        let before = await client.reportsSnapshot()
+
+        NotificationCenter.default.post(name: .AVPlayerItemTimeJumped, object: item)
+
+        let reports = await Self.waitForReports(from: client, minimumCount: before.count + 2)
+        XCTAssertEqual(model.playbackState, .paused)
+        XCTAssertEqual(reports.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [0, 0])
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92])
+    }
+
+    @MainActor
+    func testExternalScrubRearmsHeartbeatAndNextEndObserver() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture(
+            playbackProgressReportInterval: .milliseconds(25))
+        let before = await client.reportsSnapshot()
+        player.positionSeconds = 42
+
+        model.handlePlaybackTimeJump(using: player)
+
+        let restarted = await Self.waitForReports(from: client, minimumCount: before.count + 3)
+        let afterEnd = Array(restarted.dropFirst(before.count))
+        XCTAssertEqual(afterEnd.prefix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(afterEnd.prefix(2).map(\.positionSeconds), [42, 42])
+        XCTAssertTrue(afterEnd.dropFirst(2).contains { $0.intent == .paused })
+
+        NotificationCenter.default.post(
+            name: .AVPlayerItemDidPlayToEndTime, object: try XCTUnwrap(model.player?.currentItem))
+
+        var stoppedReports: [PlaybackProgressReport] = []
+        for _ in 0..<100 {
+            stoppedReports = await client.reportsSnapshot().filter { $0.intent == .stopped }
+            if stoppedReports.count == 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(stoppedReports.count, 2)
+        XCTAssertEqual(model.playbackState, .finished)
+        XCTAssertEqual(model.statusMessage, "Playback finished.")
+    }
+
+    @MainActor
+    func testTimeJumpDuringPendingRewindDoesNotClearEndedMarkerBeforeCompletion() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        model.togglePlayback(using: player)
+        player.positionSeconds = 0
+
+        model.handlePlaybackTimeJump(using: player)
+        NotificationCenter.default.post(name: .AVPlayerItemTimeJumped, object: try XCTUnwrap(model.player?.currentItem))
+        await model.flushPlaybackProgressReports()
+        model.handlePlaybackTimeJump(using: player)
+
+        XCTAssertEqual(model.playbackState, .buffering)
+        XCTAssertEqual(player.playCallCount, 0)
+        let beforeCompletion = await client.reportsSnapshot()
+        XCTAssertEqual(beforeCompletion.map(\.intent), [.started, .seek, .stopped])
+
+        player.completeNextSeek(finished: true, position: .zero)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.defaultRate, PlayerPlaybackSpeed.double.rate)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .seek, .stopped, .seek, .playing])
+    }
+
+    @MainActor
+    func testExternalNonzeroScrubCancelsPendingReplayAndRejectsItsCompletion() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        model.togglePlayback(using: player)
+        player.positionSeconds = 45
+
+        model.handlePlaybackTimeJump(using: player)
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .paused)
+        XCTAssertEqual(player.playCallCount, 0)
+        XCTAssertEqual(player.positionSeconds, 45)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [45, 45])
+        model.togglePlayback(using: player)
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92, 0])
+    }
+
+    @MainActor
+    func testReplayCompletionDetectsNativeScrubBeforeItsNotification() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        model.togglePlayback(using: player)
+        player.positionSeconds = 45
+
+        player.completeNextSeek(finished: true)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .paused)
+        XCTAssertEqual(player.playCallCount, 0)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [45, 45])
+    }
+
+    @MainActor
+    func testExternalScrubToZeroWithoutPendingReplayRestoresPausedState() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        player.positionSeconds = 0
+
+        model.handlePlaybackTimeJump(using: player)
+        model.togglePlayback(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertNotEqual(model.playbackState, .finished)
+        XCTAssertEqual(player.playCallCount, 1)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [92])
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [0, 0])
+    }
+
+    @MainActor
+    func testExternalScrubWithUnknownDurationUsesObservedEndPositionWithoutInventingDuration() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        player.itemDuration = .indefinite
+        player.positionSeconds = 30
+
+        model.handlePlaybackTimeJump(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .paused)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.suffix(2).map(\.positionSeconds), [30, 30])
+        XCTAssertTrue(reports.suffix(2).allSatisfy { $0.durationSeconds == nil })
+    }
+
+    @MainActor
+    func testUnknownUnobservedEndPositionKeepsAuthoritativeNaturalEndMarker() async throws {
+        let (model, player, client) = try await endedPlaybackFixture()
+        player.positionSeconds = 30
+
+        model.handlePlaybackTimeJump(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.playbackState, .finished)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .stopped])
+        model.togglePlayback(using: player)
+        XCTAssertEqual(player.seekTargets.map(\.seconds), [0])
+    }
+
+    @MainActor
+    func testInvalidOrTerminalTimeJumpDoesNotClearFinishedState() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        let sequence = model.manualInteractionSequence
+        for time in [
+            CMTime.invalid, .indefinite, .positiveInfinity,
+            CMTime(seconds: -1, preferredTimescale: 600),
+            CMTime(seconds: 92, preferredTimescale: 600), CMTime(seconds: 93, preferredTimescale: 600),
+        ] {
+            player.playbackTime = time
+            model.handlePlaybackTimeJump(using: player)
+            XCTAssertEqual(model.playbackState, .finished)
+        }
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .seek, .stopped])
+    }
+
+    @MainActor
+    func testStaleReplacedItemTimeJumpCannotReactivateOldProgress() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        let oldItem = try XCTUnwrap(player.currentItem)
+        player.positionSeconds = 30
+        _ = model.loadTransient(streamURLText: "http://127.0.0.1:1/replacement.mp4")
+        await model.flushPlaybackProgressReports()
+        let before = await client.reportsSnapshot()
+
+        model.handlePlaybackTimeJump(using: player)
+        NotificationCenter.default.post(name: .AVPlayerItemTimeJumped, object: oldItem)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.loadedURL?.lastPathComponent, "replacement.mp4")
+        XCTAssertEqual(model.playbackState, .paused)
+        let after = await client.reportsSnapshot()
+        XCTAssertEqual(after, before)
+    }
+
+    @MainActor
+    func testModelBackwardSeekDoesNotDoubleReportAsExternalScrub() async throws {
+        let (model, player, client) = try await completedTerminalPlaybackFixture()
+        let sequence = model.manualInteractionSequence
+
+        model.seek(by: -10, using: player)
+        model.handlePlaybackTimeJump(using: player)
+        await model.flushPlaybackProgressReports()
+
+        XCTAssertEqual(model.manualInteractionSequence, sequence + 1)
+        XCTAssertEqual(player.positionSeconds, 82)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .seek, .stopped, .seek])
+        XCTAssertEqual(reports.last?.positionSeconds, 82)
+    }
+
+    @MainActor
+    func testQueuedOldEndCannotFinishAfterNativeScrubRearmsObserver() async throws {
+        let (model, player, client) = try await pausedNearEndPlaybackFixture()
+        let item = try XCTUnwrap(player.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        model.seek(by: 10, using: player)
+        player.completeNextSeek(finished: true, position: player.itemDuration)
+        player.positionSeconds = 42
+        model.handlePlaybackTimeJump(using: player)
+        await model.flushPlaybackProgressReports()
+        try await Task.sleep(for: .milliseconds(25))
+
+        XCTAssertEqual(model.playbackState, .paused)
+        let beforeNewEnd = await client.reportsSnapshot()
+        XCTAssertEqual(beforeNewEnd.filter { $0.intent == .stopped }.count, 1)
+        XCTAssertEqual(beforeNewEnd.suffix(2).map(\.intent), [.seek, .paused])
+        XCTAssertEqual(beforeNewEnd.suffix(2).map(\.positionSeconds), [42, 42])
+
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+
+        let afterNewEnd = await Self.waitForReports(from: client, minimumCount: beforeNewEnd.count + 1)
+        XCTAssertEqual(afterNewEnd.filter { $0.intent == .stopped }.count, 2)
+        XCTAssertEqual(model.playbackState, .finished)
+    }
+
+    @MainActor
+    func testQueuedOldEndCannotFinishAfterReplayRestoresObservation() async throws {
+        let (model, player, client) = try await pausedNearEndPlaybackFixture()
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: try XCTUnwrap(player.currentItem))
+        model.seek(by: 10, using: player)
+        player.completeNextSeek(finished: true, position: player.itemDuration)
+        model.togglePlayback(using: player)
+        player.completeNextSeek(finished: true, position: .zero)
+        await model.flushPlaybackProgressReports()
+        try await Task.sleep(for: .milliseconds(25))
+
+        XCTAssertNotEqual(model.playbackState, .finished)
+        XCTAssertEqual(player.playCallCount, 1)
+        let reports = await client.reportsSnapshot()
+        XCTAssertEqual(reports.map(\.intent), [.started, .seek, .stopped, .seek, .playing])
+    }
+
+    @MainActor
+    func testObservedEndPositionComparisonRequiresPositiveBackwardEvidence() {
+        let end = CMTime(seconds: 92, preferredTimescale: 600)
+        let earlier = CMTime(seconds: 42, preferredTimescale: 600)
+        XCTAssertTrue(PlayerViewModel.hasMovedAwayFromEnd(currentTime: earlier, endTime: end, duration: end))
+        XCTAssertTrue(PlayerViewModel.hasMovedAwayFromEnd(currentTime: .zero, endTime: end, duration: .indefinite))
+        XCTAssertFalse(PlayerViewModel.hasMovedAwayFromEnd(currentTime: end, endTime: end, duration: end))
+        XCTAssertFalse(PlayerViewModel.hasMovedAwayFromEnd(currentTime: .invalid, endTime: end, duration: end))
+        XCTAssertFalse(PlayerViewModel.hasMovedAwayFromEnd(currentTime: earlier, endTime: .invalid, duration: end))
+        XCTAssertFalse(PlayerViewModel.hasMovedAwayFromEnd(currentTime: earlier, endTime: .zero, duration: .indefinite))
+        XCTAssertFalse(
+            PlayerViewModel.hasMovedAwayFromEnd(
+                currentTime: end, endTime: CMTime(seconds: 93, preferredTimescale: 600), duration: end))
+    }
+
+    @MainActor
     func testPlaybackSpeedCanBeSelectedBeforePlayback() {
         let model = PlayerViewModel(defaults: defaults, autoplay: false)
         let sequence = model.manualInteractionSequence
@@ -1257,7 +1582,7 @@ private final class PlaybackControlSpy: PlayerPlaybackControlling {
     var itemDuration: CMTime = .indefinite
     var timeControlStatus: AVPlayer.TimeControlStatus
     var defaultRate: Float = 1
-    private var playbackTime: CMTime = .zero
+    var playbackTime: CMTime = .zero
     var positionSeconds: Double {
         get { playbackTime.seconds }
         set { playbackTime = CMTime(seconds: newValue, preferredTimescale: 600) }

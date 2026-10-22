@@ -72,6 +72,63 @@ PLATFORMS = {
 }
 
 
+_LINUX_PROC_ROOT = Path("/proc")
+
+
+def _linux_group_has_live_members(pgid: int) -> bool:
+    """Observe this PGID without mistaking unreaped zombies for live members."""
+    observed_member = False
+    deadline = time.monotonic() + 1
+    with os.scandir(_LINUX_PROC_ROOT) as entries:
+        for count, entry in enumerate(entries, start=1):
+            if count > 4096 or time.monotonic() >= deadline:
+                raise UIE2EError(
+                    "Cleanup unverified: Linux process query exceeded its "
+                    "4096-entry/1-second cap."
+                )
+            if not re.fullmatch(r"[0-9]+", entry.name):
+                continue
+            try:
+                with (Path(entry.path) / "stat").open("rb") as reader:
+                    stat = reader.read(4097)
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # The process disappeared during enumeration.
+            if len(stat) > 4096:
+                raise UIE2EError(
+                    "Cleanup unverified: Linux process stat exceeds 4096 bytes."
+                )
+            # comm can contain spaces and closing parentheses. Fields following
+            # the final ') ' are state, ppid, pgrp, sid, ... in /proc/PID/stat.
+            prefix, separator, suffix = stat.rpartition(b") ")
+            fields = suffix.split()
+            try:
+                if (
+                    not separator
+                    or not prefix.startswith(entry.name.encode("ascii") + b" (")
+                    or len(fields) < 3
+                    or len(fields[0]) != 1
+                ):
+                    raise ValueError("missing process stat fields")
+                member_pgid = int(fields[2])
+            except ValueError as error:
+                raise UIE2EError(
+                    "Cleanup unverified: malformed Linux process stat."
+                ) from error
+            if member_pgid == pgid:
+                observed_member = True
+                if fields[0] not in (b"Z", b"X", b"x"):
+                    return True
+    if observed_member:
+        return False
+    # An empty/hidden /proc view is not proof of termination when the group
+    # still exists. Recheck only for disappearance, never send a signal here.
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    raise UIE2EError("Cleanup unverified: Linux process group has no visible members.")
+
+
 def _group_has_live_members(pgid: int) -> bool:
     if sys.platform == "darwin":
         # Darwin killpg reports EPERM for zombie-only/empty groups. Query only
@@ -101,6 +158,8 @@ def _group_has_live_members(pgid: int) -> bool:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
+    if sys.platform.startswith("linux"):
+        return _linux_group_has_live_members(pgid)
     return True
 
 
