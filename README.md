@@ -64,6 +64,8 @@ macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的�
 
 这两个 Just 命令会先构建 Rust server；设置 `CACHE_SERVER_BINARY` 可复用已构建的可执行文件。`DERIVED_DATA_PATH` 可复用已有 Xcode 编译缓存，该目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
 
+本地 helper 的工作预算上限为 25 分钟。GHA 在 checkout 前记录整个 job 的单调时钟工作期限，最晚在首步后的 30 分钟结束主要构建/测试工作，包含安装工具和 Rust 构建已花费的时间；45 分钟 job 的余量留给有界诊断、清理和产物上传。诊断与清理使用独立期限，不复用已耗尽的工作预算。
+
 Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据，并从首个失败用例的 teardown 附件中单独导出最多一份 accessibility tree（512 KiB）和一张截图（2 MiB），不导出录屏。完整 xcresult 超限时仍可保留这些小附件；导出结果见 `xcresult-attachment-export.json`，归档缺失、超限或失败见 `artifact-staging.log`。附件导出失败不会覆盖原始测试失败，只有元数据不等于图片留存。
 
 测试会先设置并确认系统静音，结束后保持静音。调试测试实例使用隔离偏好并禁用 Bonjour 自动连接；夹具 server 关闭 Bilibili worker、登录会话和 Bonjour，不读取已有账号凭据，也不修改日常 cache server。普通 CI 不依赖 Bilibili、账号 Cookie 或公共反代。真实 Bilibili 和长播放验证仍使用下方显式 opt-in live suite。

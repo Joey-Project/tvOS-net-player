@@ -457,6 +457,134 @@ class CleanupTests(unittest.TestCase):
                     self.assertIn("failed: test failure", staged_log)
 
 
+class WorkBudgetTests(unittest.TestCase):
+    def test_absent_job_deadline_uses_local_cap(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline(), 100 + 25 * 60)
+        self.assertEqual(ui_e2e.FIXTURE_BUILD_TIMEOUT_SECONDS, 12 * 60)
+
+    def test_earlier_job_deadline_limits_local_work(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline("200"), 200)
+
+    def test_later_job_deadline_cannot_extend_local_cap(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline("10000"), 100 + 25 * 60)
+
+    def test_expired_job_deadlines_are_rejected(self) -> None:
+        for deadline in ("100", "99", "0", "-1"):
+            with (
+                self.subTest(deadline=deadline),
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=100),
+                self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget has expired"),
+            ):
+                ui_e2e.resolve_work_deadline(deadline)
+
+    def test_malformed_and_nonfinite_job_deadlines_are_rejected_without_values(self) -> None:
+        for deadline in ("", "untrusted-deadline-value", "NaN", "Inf", "-Inf", "1e999"):
+            with self.subTest(deadline=deadline), mock.patch.object(
+                ui_e2e.time, "monotonic", return_value=100
+            ):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget is invalid") as caught:
+                    ui_e2e.resolve_work_deadline(deadline)
+                if deadline:
+                    self.assertNotIn(deadline, str(caught.exception))
+
+    def test_remaining_work_is_checked_at_phase_boundaries(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.require_work_remaining(105), 5)
+            for deadline in (100, 99):
+                with self.subTest(deadline=deadline), self.assertRaises(ui_e2e.UIE2EError):
+                    ui_e2e.require_work_remaining(deadline)
+
+    def test_invalid_or_expired_budget_stages_failure_before_workspace_removal(self) -> None:
+        for deadline in ("untrusted-deadline-value", "99"):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                work = root / "work"
+                work.mkdir()
+                artifacts = root / "artifacts"
+                with (
+                    mock.patch.object(ui_e2e.sys, "platform", "darwin"),
+                    mock.patch.object(ui_e2e.time, "monotonic", return_value=100),
+                    mock.patch.dict(
+                        ui_e2e.os.environ,
+                        {"UI_E2E_JOB_WORK_DEADLINE_MONOTONIC": deadline},
+                    ),
+                    mock.patch.object(ui_e2e, "_artifact_dir", return_value=artifacts),
+                    mock.patch.object(ui_e2e, "_private_work_dir", return_value=work),
+                    mock.patch.object(ui_e2e, "mute_system_audio", autospec=True) as mute,
+                    self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget"),
+                ):
+                    ui_e2e.run_ui_e2e("macos")
+                mute.assert_not_called()
+                self.assertFalse(work.exists())
+                failure = (artifacts / "runner.log").read_text()
+                self.assertIn("failed: UIE2EError: UI E2E work budget", failure)
+                self.assertNotIn(deadline, failure)
+
+    def test_budget_expiring_during_fixture_build_prevents_media_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            artifacts = root / "artifacts"
+            with (
+                mock.patch.object(ui_e2e.sys, "platform", "darwin"),
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=100) as clock,
+                mock.patch.dict(
+                    ui_e2e.os.environ,
+                    {"UI_E2E_JOB_WORK_DEADLINE_MONOTONIC": "110"},
+                ),
+                mock.patch.object(ui_e2e, "_artifact_dir", return_value=artifacts),
+                mock.patch.object(ui_e2e, "_private_work_dir", return_value=work),
+                mock.patch.object(ui_e2e, "mute_system_audio", autospec=True),
+                mock.patch.object(ui_e2e, "_record_tool_inventory", autospec=True),
+                mock.patch.object(ui_e2e, "verify_scheme_contract", autospec=True),
+                mock.patch.object(ui_e2e, "create_fixture_media", autospec=True) as media,
+            ):
+                def finish_build(*args: object, **kwargs: object) -> Path:
+                    clock.return_value = 111
+                    return root / "fixture"
+
+                with (
+                    mock.patch.object(
+                        ui_e2e, "build_task_fixture", autospec=True, side_effect=finish_build
+                    ) as build,
+                    self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget has expired"),
+                ):
+                    ui_e2e.run_ui_e2e("macos")
+                build.assert_called_once_with(work / "logs", timeout_seconds=10)
+                media.assert_not_called()
+            self.assertFalse(work.exists())
+            self.assertIn("work budget has expired", (artifacts / "runner.log").read_text())
+
+    def test_workflow_deadline_is_first_and_exports_same_host_monotonic_time(self) -> None:
+        workflow = (ui_e2e.ROOT / ".github" / "workflows" / "ui-e2e.yml").read_text()
+        first_step = workflow.split("    steps:\n", 1)[1].split("\n      - name:", 1)[0]
+        lines = first_step.splitlines()
+        self.assertEqual(lines[0], "      - name: Establish UI E2E work deadline")
+        self.assertEqual(lines[1], "        run: |")
+        fragment = "\n".join(line[10:] for line in lines[2:] if line.startswith("          "))
+        self.assertEqual(len(fragment.splitlines()), 2)
+        ui_e2e.subprocess.run(
+            ["bash", "-n"], input=fragment, text=True, capture_output=True, check=True, timeout=5
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "github-env"
+            env = ui_e2e.os.environ.copy()
+            env["GITHUB_ENV"] = str(env_file)
+            started = ui_e2e.time.monotonic()
+            ui_e2e.subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", fragment],
+                env=env, text=True, capture_output=True, check=True, timeout=5,
+            )
+            name, value = env_file.read_text().strip().split("=", 1)
+            self.assertEqual(name, "UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+            self.assertGreaterEqual(float(value), started + 30 * 60)
+            self.assertLessEqual(float(value), ui_e2e.time.monotonic() + 30 * 60)
+
+
 class RunnerContractTests(unittest.TestCase):
     def test_missing_or_non_loopback_endpoint_fails_closed(self) -> None:
         for address in (None, "", "http://localhost:5000", "http://127.0.0.1:70000"):

@@ -23,6 +23,11 @@ jobs:
       matrix:
         platform: [macos, tvos]
     steps:
+      - name: Establish UI E2E work deadline
+        run: |
+          deadline="$(python3 -c 'import time; print(time.monotonic() + 30 * 60)')"
+          printf 'UI_E2E_JOB_WORK_DEADLINE_MONOTONIC=%s\n' "$deadline" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@v4
 

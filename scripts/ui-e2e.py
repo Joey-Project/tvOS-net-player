@@ -7,6 +7,7 @@ import argparse
 import base64
 import ctypes
 import json
+import math
 import os
 import re
 import selectors
@@ -48,8 +49,8 @@ FAILURE_ATTACHMENT_LIMITS = {
 MAX_ATTACHMENT_EXPORT_LOG_BYTES = 16 * 1024
 RESULT_DIAGNOSTIC_TIMEOUT_SECONDS = 240
 COMMAND_TIMEOUT_SECONDS = 30 * 60
-TOTAL_RUN_BUDGET_SECONDS = 43 * 60
-FIXTURE_BUILD_TIMEOUT_SECONDS = 25 * 60
+TOTAL_RUN_BUDGET_SECONDS = 25 * 60
+FIXTURE_BUILD_TIMEOUT_SECONDS = 12 * 60
 SERVER_READY_TIMEOUT_SECONDS = 45
 TASK_FIXTURE_READY_TIMEOUT_SECONDS = 45
 TVOS_BOOT_TIMEOUT_SECONDS = 300
@@ -1611,7 +1612,7 @@ def finish_xcode_run(
     primary: UIE2EError | None = None
     if result.timed_out:
         primary = UIE2EError(
-            f"xcodebuild test exceeded its {COMMAND_TIMEOUT_SECONDS // 60}-minute deadline."
+            "xcodebuild test exceeded its effective work deadline."
         )
     elif result.output_limited:
         primary = UIE2EError(
@@ -1931,8 +1932,30 @@ def _simulator_destination(udid: str) -> str:
     return f"platform=tvOS Simulator,id={udid}"
 
 
+def resolve_work_deadline(configured_deadline: str | None = None) -> float:
+    now = time.monotonic()
+    deadline = now + TOTAL_RUN_BUDGET_SECONDS
+    if configured_deadline is not None:
+        try:
+            job_deadline = float(configured_deadline)
+        except (TypeError, ValueError, OverflowError):
+            raise UIE2EError("UI E2E work budget is invalid.") from None
+        if not math.isfinite(job_deadline):
+            raise UIE2EError("UI E2E work budget is invalid.")
+        deadline = min(deadline, job_deadline)
+    if deadline <= now:
+        raise UIE2EError("UI E2E work budget has expired.")
+    return deadline
+
+
+def require_work_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UIE2EError("UI E2E work budget has expired.")
+    return remaining
+
+
 def run_ui_e2e(platform: str) -> int:
-    run_deadline = time.monotonic() + TOTAL_RUN_BUDGET_SECONDS
     if platform not in PLATFORMS:
         raise UIE2EError(f"Unsupported UI E2E platform: {platform}")
     if sys.platform != "darwin":
@@ -1963,8 +1986,12 @@ def run_ui_e2e(platform: str) -> int:
     )
 
     with cleanup:
+            run_deadline = resolve_work_deadline(
+                os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+            )
             mute_system_audio(logs_dir)
             log("macOS system output mute is set and verified.")
+            require_work_remaining(run_deadline)
             _record_tool_inventory(platform, logs_dir, runner_log)
 
             scheme_path = (
@@ -1979,13 +2006,12 @@ def run_ui_e2e(platform: str) -> int:
 
             build_seconds = min(
                 FIXTURE_BUILD_TIMEOUT_SECONDS,
-                run_deadline - time.monotonic() - SERVER_READY_TIMEOUT_SECONDS,
+                require_work_remaining(run_deadline),
             )
-            if build_seconds <= 0:
-                raise UIE2EError("UI E2E total runtime budget expired before fixture build.")
             task_fixture_binary = build_task_fixture(logs_dir, timeout_seconds=build_seconds)
             log(f"built SwiftPM debug product {TASK_FIXTURE_PRODUCT}.")
 
+            require_work_remaining(run_deadline)
             server_binary = resolve_server_binary()
             log(f"using existing cache server binary: {server_binary.name}")
             cache_dir = create_fixture_media(work_dir, logs_dir)
@@ -1993,6 +2019,7 @@ def run_ui_e2e(platform: str) -> int:
             state_dir.mkdir(mode=0o700)
             grpc_port, media_port = allocate_loopback_ports()
             endpoint = validate_server_address(f"http://127.0.0.1:{grpc_port}")
+            require_work_remaining(run_deadline)
             server = BoundedOwnedProcess(
                 build_server_argv(
                     server_binary,
@@ -2019,6 +2046,7 @@ def run_ui_e2e(platform: str) -> int:
             )
             ready_file = logs_dir / "task-fixture-ready.json"
             metrics_file = logs_dir / "task-fixture-metrics.json"
+            require_work_remaining(run_deadline)
             task_fixture = BoundedOwnedProcess(
                 build_task_fixture_command(
                     task_fixture_binary,
@@ -2042,6 +2070,7 @@ def run_ui_e2e(platform: str) -> int:
             log("owned Swift task fixture is ready on loopback.")
 
             if platform == "tvos":
+                require_work_remaining(run_deadline)
                 simulator_udid = create_owned_tvos_simulator(
                     logs_dir=logs_dir, cleanup=cleanup
                 )
@@ -2073,9 +2102,7 @@ def run_ui_e2e(platform: str) -> int:
             child_env["UI_E2E_TASK_SERVER_ADDRESS"] = task_endpoint
             xcode_log = logs_dir / "xcodebuild.log"
             log("starting actual xcodebuild test execution.")
-            test_timeout = min(COMMAND_TIMEOUT_SECONDS, run_deadline - time.monotonic())
-            if test_timeout <= 0:
-                raise UIE2EError("UI E2E total runtime budget expired before xcodebuild test.")
+            test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
             xcode_result = run_process(
                 command,
                 log_path=xcode_log,
