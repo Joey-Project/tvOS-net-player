@@ -36,6 +36,7 @@ final class FixtureConfigurationTests: XCTestCase {
             try FixtureSourceResolver.scenario(for: "https://www.bilibili.com/video/BV1uW4y1s7zN/?p=1"),
             .manual
         )
+        XCTAssertEqual(try FixtureSourceResolver.scenario(for: FixtureScenario.silent.source), .silent)
         XCTAssertThrowsError(try FixtureSourceResolver.scenario(for: "BV1unknown"))
         XCTAssertThrowsError(try FixtureSourceResolver.scenario(for: "https://example.com/video/BV1QtjA6BEB8"))
     }

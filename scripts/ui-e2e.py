@@ -59,6 +59,7 @@ TASK_FIXTURE_TARGET = "TaskWatchUIFixture"
 EXPECTED_UI_CASES = (
     "testAutomaticTaskWatchRecoversWithoutResubmission",
     "testManualTaskWatchReconnectPreservesPlayback",
+    "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
 )
 EXPECTED_CASES_BY_PLATFORM = {
     "macos": EXPECTED_UI_CASES + ("testConnectBrowseAndControlRealPlayback",),
@@ -67,6 +68,7 @@ EXPECTED_CASES_BY_PLATFORM = {
 EXPECTED_TASK_IDS = {
     "automatic": "ui-e2e-automatic",
     "manual": "ui-e2e-manual",
+    "silent": "ui-e2e-silent",
 }
 
 
@@ -812,7 +814,7 @@ def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
     if not isinstance(scenarios, dict):
         raise UIE2EError("Task fixture metrics are missing scenario counters.")
     validated: dict[str, object] = {}
-    for scenario in ("automatic", "manual"):
+    for scenario in ("automatic", "manual", "silent"):
         counters = scenarios.get(scenario)
         if not isinstance(counters, dict):
             raise UIE2EError(f"Task fixture metrics are missing the {scenario} scenario.")
@@ -833,6 +835,29 @@ def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
         raise UIE2EError(
             "Manual task fixture did not confirm GetTask after retry exhaustion and before its final watch."
         )
+    silent = scenarios["silent"]
+    if type(silent.get("watch_count")) is not int or silent["watch_count"] != 1:
+        raise UIE2EError("Silent task fixture must keep exactly one WatchTasks subscription.")
+    if type(silent.get("watch_stream_open_count")) is not int or silent["watch_stream_open_count"] != 1:
+        raise UIE2EError("Silent task fixture must prove its original WatchTasks stream opened.")
+    for key, minimum in (
+        ("get_task_count", 2),
+        ("unchanged_get_task_count", 1),
+        ("completed_get_task_count", 1),
+        ("output_count", 2),
+    ):
+        value = silent.get(key)
+        if type(value) is not int or value < minimum:
+            raise UIE2EError(f"Silent task fixture requires at least {minimum} {key}.")
+    trace = silent.get("rpc_trace")
+    if not isinstance(trace, list) or not all(isinstance(entry, str) for entry in trace):
+        raise UIE2EError("Silent task fixture is missing its ordered RPC trace.")
+    try:
+        watch_index = trace.index("watch")
+    except ValueError as error:
+        raise UIE2EError("Silent task fixture did not trace its WatchTasks subscription.") from error
+    if "get_task" not in trace[watch_index + 1 :]:
+        raise UIE2EError("Silent task fixture must reconcile with GetTask after opening WatchTasks.")
     return {"schema_version": 1, "scenarios": validated}
 
 
@@ -2126,7 +2151,7 @@ def run_ui_e2e(platform: str) -> int:
                 _read_bounded_json(metrics_file, description="Task fixture metrics")
             )
             _write_json(logs_dir / "task-fixture-validation.json", metrics)
-            log("task fixture metrics prove one task creation and successful watch/output coverage per scenario.")
+            log("task fixture metrics prove task creation, watch reconciliation, and output coverage per scenario.")
             log(
                 "xcresult proves target execution: "
                 f"{counts['target_passed']} passed, "

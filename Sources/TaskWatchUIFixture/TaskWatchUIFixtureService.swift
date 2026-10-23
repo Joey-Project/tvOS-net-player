@@ -121,9 +121,17 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
             guard await runtime.hasTask(scenario) else {
                 throw RPCError(code: .notFound, message: "Task not found.")
             }
+            let observation = await runtime.observeGetTask(for: scenario)
+            if observation.countsForSilentReconciliation {
+                try await Self.recordGetTaskObservation(
+                    scenario: scenario,
+                    completed: observation.state == .completed,
+                    metrics: metrics
+                )
+            }
             return Self.task(
                 for: scenario,
-                runtimeState: await runtime.state(for: scenario),
+                runtimeState: observation.state,
                 mediaURL: mediaURL
             )
         }
@@ -164,7 +172,7 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
             forMethod: TvosNetPlayer_V1_TaskService.Method.WatchTasks.descriptor,
             deserializer: ProtobufDeserializer<TvosNetPlayer_V1_WatchTasksRequest>(),
             serializer: ProtobufSerializer<TvosNetPlayer_V1_TaskEvent>()
-        ) { request, _ in
+        ) { request, context in
             let request = try await ServerRequest(stream: request)
             guard request.message.ids.count == 1,
                 let scenario = Self.scenario(forTaskID: request.message.ids[0])
@@ -178,7 +186,23 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
                 throw RPCError(code: .notFound, message: "Task not found.")
             }
 
+            let cancellation = context.cancellation
             return StreamingServerResponse(of: TvosNetPlayer_V1_TaskEvent.self) { writer in
+                if scenario == .silent {
+                    let watchID = try await runtime.openSilentWatch()
+                    do {
+                        try await Self.recordWatchStreamOpen(scenario: scenario, metrics: metrics)
+                        // RPC cancellation does not necessarily cancel the producer's Swift task.
+                        try await cancellation.cancelled
+                    } catch {
+                        await runtime.cancelSilentWatch(id: watchID)
+                        throw error
+                    }
+                    await runtime.cancelSilentWatch(id: watchID)
+                    return [:]
+                }
+
+                try await Self.recordWatchStreamOpen(scenario: scenario, metrics: metrics)
                 let failureLimit = scenario == .automatic ? 3 : 7
                 guard attempt > failureLimit else {
                     throw RPCError(code: .unavailable, message: "Task updates are temporarily unavailable.")
@@ -258,6 +282,29 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
         }
     }
 
+    private static func recordWatchStreamOpen(
+        scenario: FixtureScenario,
+        metrics: FixtureMetricsStore
+    ) async throws {
+        do {
+            try await metrics.recordWatchStreamOpen(for: scenario)
+        } catch {
+            throw RPCError(code: .internalError, message: "Fixture metrics could not be persisted.")
+        }
+    }
+
+    private static func recordGetTaskObservation(
+        scenario: FixtureScenario,
+        completed: Bool,
+        metrics: FixtureMetricsStore
+    ) async throws {
+        do {
+            try await metrics.recordGetTaskObservation(for: scenario, completed: completed)
+        } catch {
+            throw RPCError(code: .internalError, message: "Fixture metrics could not be persisted.")
+        }
+    }
+
     private static func persistMetrics(_ operation: @Sendable () async throws -> Void) async throws {
         do {
             try await operation()
@@ -315,10 +362,18 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
         if runtimeState == .completed {
             task.progress = 1
         }
-        task.message =
-            runtimeState == .completed
-            ? (scenario == .automatic ? "Automatic recovery complete" : "Manual recovery complete")
-            : "Playable fixture output is available."
+        if runtimeState == .completed {
+            switch scenario {
+            case .automatic:
+                task.message = "Automatic recovery complete"
+            case .manual:
+                task.message = "Manual recovery complete"
+            case .silent:
+                task.message = "Silent task reconciliation complete"
+            }
+        } else {
+            task.message = "Playable fixture output is available."
+        }
         task.libraryItemID = scenario.taskID
         task.playbackSource = playbackSource
         task.resultItems = [resultItem(for: scenario, runtimeState: runtimeState, mediaURL: mediaURL)]
@@ -443,6 +498,8 @@ private actor FixtureTaskRuntime {
     }
 
     private var states: [FixtureScenario: State] = [:]
+    private var silentWatchID: UUID?
+    private var silentWatchDidObserveUnchangedTask = false
 
     func create(_ scenario: FixtureScenario) {
         states[scenario] = .active
@@ -454,6 +511,38 @@ private actor FixtureTaskRuntime {
 
     func state(for scenario: FixtureScenario) -> State {
         states[scenario] ?? .absent
+    }
+
+    func openSilentWatch() throws -> UUID {
+        guard silentWatchID == nil else {
+            throw RPCError(code: .alreadyExists, message: "A silent task watch is already open.")
+        }
+        let id = UUID()
+        silentWatchID = id
+        return id
+    }
+
+    func observeGetTask(for scenario: FixtureScenario) -> (
+        state: State,
+        countsForSilentReconciliation: Bool
+    ) {
+        let currentState = states[scenario] ?? .absent
+        guard scenario == .silent, silentWatchID != nil, currentState == .active else {
+            return (currentState, false)
+        }
+
+        if !silentWatchDidObserveUnchangedTask {
+            silentWatchDidObserveUnchangedTask = true
+            return (.active, true)
+        }
+
+        states[scenario] = .completed
+        return (.completed, true)
+    }
+
+    func cancelSilentWatch(id: UUID) {
+        guard silentWatchID == id else { return }
+        silentWatchID = nil
     }
 
     func complete(_ scenario: FixtureScenario) {

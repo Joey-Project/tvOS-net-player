@@ -3,11 +3,13 @@ import Foundation
 package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
     case automatic
     case manual
+    case silent
 
     package var taskID: String {
         switch self {
         case .automatic: "ui-e2e-automatic"
         case .manual: "ui-e2e-manual"
+        case .silent: "ui-e2e-silent"
         }
     }
 
@@ -15,6 +17,7 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
         switch self {
         case .automatic: "BV1QtjA6BEB8"
         case .manual: "BV1uW4y1s7zN"
+        case .silent: "BV1s7ZxqR9Kp"
         }
     }
 
@@ -22,6 +25,7 @@ package enum FixtureScenario: String, CaseIterable, Codable, Sendable {
         switch self {
         case .automatic: "Automatic recovery fixture"
         case .manual: "Manual recovery fixture"
+        case .silent: "Silent task reconciliation fixture"
         }
     }
 

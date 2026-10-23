@@ -777,6 +777,22 @@ class XcresultValidationTests(unittest.TestCase):
             ]
         }
 
+    def test_platform_case_matrix_requires_four_cases_without_dropping_existing_coverage(self) -> None:
+        task_watch_cases = (
+            "testAutomaticTaskWatchRecoversWithoutResubmission",
+            "testManualTaskWatchReconnectPreservesPlayback",
+            "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
+        )
+        self.assertEqual(ui_e2e.EXPECTED_UI_CASES, task_watch_cases)
+        self.assertEqual(
+            ui_e2e.EXPECTED_CASES_BY_PLATFORM["macos"],
+            task_watch_cases + ("testConnectBrowseAndControlRealPlayback",),
+        )
+        self.assertEqual(
+            ui_e2e.EXPECTED_CASES_BY_PLATFORM["tvos"],
+            task_watch_cases + ("testRemoteConnectPageSelectAndPlayRealFixture",),
+        )
+
     def test_documented_ui_bundle_with_case_attachments_counts_execution(self) -> None:
         case = self.tests["testNodes"][0]["children"][0]
         case["children"] = [{"nodeType": "Attachment", "name": "Screenshot"}]
@@ -827,6 +843,15 @@ class XcresultValidationTests(unittest.TestCase):
 
     def test_runner_requires_each_named_task_watch_case(self) -> None:
         expected = ui_e2e.EXPECTED_CASES_BY_PLATFORM["macos"]
+        self.assertEqual(
+            expected,
+            (
+                "testAutomaticTaskWatchRecoversWithoutResubmission",
+                "testManualTaskWatchReconnectPreservesPlayback",
+                "testSilentTaskWatchReconcilesWithoutInterruptingPlayback",
+                "testConnectBrowseAndControlRealPlayback",
+            ),
+        )
         cases = [
             {"nodeType": "Test Case", "name": name, "result": "Passed"}
             for name in expected
@@ -883,17 +908,21 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
                 name: {
                     "task_id": ui_e2e.EXPECTED_TASK_IDS[name],
                     "create_count": 1,
-                    "watch_count": 2,
-                    "get_task_count": 1,
-                    "output_count": 1,
+                    "watch_count": 1 if name == "silent" else 2,
+                    "watch_stream_open_count": 1 if name == "silent" else 2,
+                    "get_task_count": 2 if name == "silent" else 1,
+                    "unchanged_get_task_count": 1 if name == "silent" else 0,
+                    "completed_get_task_count": 1 if name == "silent" else 0,
+                    "output_count": 2 if name == "silent" else 1,
                     "cancel_count": 0,
+                    "rpc_trace": ["watch", "get_task", "get_task"] if name == "silent" else [],
                     **(
                         {"manual_resume_read_before_watch": True}
                         if name == "manual"
                         else {}
                     ),
                 }
-                for name in ("automatic", "manual")
+                for name in ("automatic", "manual", "silent")
             },
         }
 
@@ -1044,8 +1073,33 @@ class TaskFixtureOrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ui_e2e.UIE2EError, "positive output_count"):
             ui_e2e.validate_task_fixture_metrics(metrics)
 
+    def test_fixture_metrics_require_silent_watch_reconciliation_evidence(self) -> None:
+        metrics = self._metrics()
+        self.assertIn("silent", ui_e2e.validate_task_fixture_metrics(metrics)["scenarios"])
+
+        missing = json.loads(json.dumps(metrics))
+        del missing["scenarios"]["silent"]
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "missing the silent scenario"):
+            ui_e2e.validate_task_fixture_metrics(missing)
+
+        invalid_values = (
+            ("watch_count", 2, "exactly one WatchTasks"),
+            ("watch_stream_open_count", 0, "stream opened"),
+            ("get_task_count", 1, "at least 2 get_task_count"),
+            ("unchanged_get_task_count", 0, "at least 1 unchanged_get_task_count"),
+            ("completed_get_task_count", 0, "at least 1 completed_get_task_count"),
+            ("output_count", 1, "at least 2 output_count"),
+            ("rpc_trace", ["get_task", "watch"], "after opening WatchTasks"),
+        )
+        for key, value, message in invalid_values:
+            with self.subTest(key=key):
+                bad = json.loads(json.dumps(metrics))
+                bad["scenarios"]["silent"][key] = value
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, message):
+                    ui_e2e.validate_task_fixture_metrics(bad)
+
     def test_fixture_metrics_reject_cancellation_side_effects(self) -> None:
-        for scenario in ("automatic", "manual"):
+        for scenario in ("automatic", "manual", "silent"):
             for cancel_count in (1, -1, True, "0", None):
                 with self.subTest(scenario=scenario, cancel_count=cancel_count):
                     metrics = self._metrics()

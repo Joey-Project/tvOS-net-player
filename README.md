@@ -69,7 +69,7 @@ Rust 测试 waiter 的超时诊断仅包含有限的任务/结果状态、观察
 
 macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
 
-每个平台还执行自动恢复、手动重连两项任务观察用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；实际客户端仍通过界面输入、提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。runner 独立核对每个场景只创建一个任务；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
+每个平台还执行自动恢复、手动重连、静默校准三项任务观察用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；实际客户端仍通过界面输入、提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。静默用例保持 watch 连接打开，跨越状态未变和发现完成的校准读取，检查没有错误重连且已有播放持续推进。runner 独立核对每个场景只创建一个任务；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
 
 自然播放的 90 秒等待窗口从实际重播点击开始计算，滚动和查找按钮的准备时间单独记录；按钮已经可见时立即停止滚动检查。播放结束后用原生播放器控件往回拖动，再点自定义 Resume，会从所选位置续播并保留倍速，而不是无条件回到开头；这项共享 AppCore 行为另有专项回归测试。
 
@@ -83,7 +83,7 @@ Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据�
 
 macOS UI 测试使用本地 ad-hoc 签名，不需要开发者证书或 team；tvOS simulator 构建不启用签名。这不替代实机 provisioning、分发签名或公证。本机 UI 执行仍需可用的桌面会话及 Xcode 所需权限，成功构建和签名校验不代表 UI 测试通过。
 
-GHA 的 UI 测试与现有构建/单元测试分开记录。每个平台预期的三项用例都必须实际执行并通过，且失败、跳过数量均为零；只执行其中一项、成功编译或列出 simulator runtime 都不能代替完整 UI e2e。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md) 和 [任务观察恢复 UI journal](docs/project_journal/2026/10/2026-10-23-task-watch-ui-e2e-b46387.md)。
+GHA 的 UI 测试与现有构建/单元测试分开记录。每个平台预期的四项用例都必须实际执行并通过，且失败、跳过数量均为零；只执行其中一项、成功编译或列出 simulator runtime 都不能代替完整 UI e2e。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md)、[任务观察恢复 UI journal](docs/project_journal/2026/10/2026-10-23-task-watch-ui-e2e-b46387.md) 和 [静默校准 journal](docs/project_journal/2026/10/2026-10-23-silent-task-reconciliation-b46390.md)。
 
 真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、favorite/space/collection/series/recommendation list fetch、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
 
@@ -225,6 +225,8 @@ BBDown adapter 相关配置：
 新客户端使用 v2 Bilibili resolution session 读取分页候选项，以 server 生成的不透明 token 选择单项、多项、范围或全部，并用 `CreateBilibiliTaskV2` 提交播放或下载。`ListTaskResults` 分页返回每项的状态、播放或 library 引用及可用 artifact；媒体和 sidecar 字节仍由 LAN server 的 HTTP/HLS/Range endpoint 提供。一次任务最多接受 100 个候选项，较大列表需要分批选择；旧 RPC 和单结果字段仅保留给旧客户端兼容。没有 v2 能力的 server 需要升级，客户端不会回退到旧提交路径。
 
 tvOS/macOS 使用共享 AppCore 观察已提交的任务。更新流暂时断开或提前结束时，客户端限次退避、读取原任务的最新状态，再恢复订阅；不会重新解析或提交任务，也不会因此停止已开始的播放。重连耗尽或遇到权限、任务不存在等明确错误时，可用独立的 `Reconnect Updates` 恢复同一任务的更新；原有 `Retry` 仍表示重试失败的任务，两者不是同一个操作。取消请求失败时，客户端只提示取消尚未确认，最终以服务器任务状态为准。
+
+watch 保持打开但长期没有消息时，客户端默认按 30 秒静默观察窗口，用有超时上限的 `GetTask` 校准原任务。有效更新会推迟读取；状态未变的正常响应不会显示重连错误、消耗或补充恢复次数，也不会重新订阅或打断播放。真正的读取错误才进入原有恢复或不可用路径。取消请求进行中暂停新的校准读取，先前读取的迟到响应不能覆盖取消或新快照；取消未确认时仍保留原任务的权威状态观察。清除、任务替换和完成会结束旧校准。本阶段不包含退出应用后的任务或播放位置续接。
 
 两端 cache library 已支持每页 50 条的分页浏览和搜索，后续页面通过 page token 加载。
 
