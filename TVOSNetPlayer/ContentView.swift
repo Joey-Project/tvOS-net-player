@@ -466,6 +466,7 @@ struct ContentView: View {
             TextField("BV1xx411c7mD or Bilibili URL", text: $bilibiliModel.sourceText)
                 .keyboardType(.URL)
                 .submitLabel(.go)
+                .accessibilityIdentifier("bilibili-source")
                 .onSubmit {
                     Task {
                         await bilibiliModel.submit(serverAddressText: cacheModel.serverAddressText)
@@ -479,6 +480,7 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .accessibilityIdentifier("bilibili-mode")
 
             HStack(spacing: 10) {
                 TextField("Quality", text: $bilibiliModel.qualityPreference)
@@ -505,6 +507,7 @@ struct ContentView: View {
                 Text(errorMessage)
                     .font(.callout)
                     .foregroundStyle(.red)
+                    .accessibilityIdentifier("bilibili-error")
             }
 
             if let notice = bilibiliModel.fetchNotice {
@@ -593,6 +596,7 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(bilibiliModel.candidateSelectionMode == .all)
+                            .accessibilityIdentifier("bilibili-candidate")
                             .task(id: candidate.selectionID) {
                                 await bilibiliModel.loadMoreResolvedCandidatesIfNeeded(
                                     appearingCandidateID: candidate.selectionID,
@@ -636,6 +640,7 @@ struct ContentView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                        .accessibilityIdentifier("bilibili-task-status")
                     if bilibiliModel.isReconnecting {
                         Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
                             .font(.caption)
@@ -656,6 +661,8 @@ struct ContentView: View {
                         }
                         .buttonStyle(.bordered)
                         .accessibilityIdentifier("bilibili.watch.retry")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .focusSection()
                     }
                     if let summary = bilibiliModel.activePlaybackPolicySummary {
                         Text(summary)
@@ -693,6 +700,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!bilibiliModel.canSubmit)
                 .focused($focusedControl, equals: .bilibiliSubmitButton)
+                .accessibilityIdentifier("bilibili-submit")
 
                 Button {
                     Task {
@@ -702,6 +710,7 @@ struct ContentView: View {
                     Label("Play", systemImage: "play.fill")
                 }
                 .disabled(!bilibiliModel.canPlay)
+                .accessibilityIdentifier("bilibili-play")
 
                 Button {
                     Task {
@@ -711,6 +720,7 @@ struct ContentView: View {
                     Label(bilibiliModel.isCancelling ? "Cancelling" : "Cancel", systemImage: "xmark.circle")
                 }
                 .disabled(!bilibiliModel.canCancel)
+                .accessibilityIdentifier("bilibili-cancel")
             }
 
             HStack(spacing: 12) {
@@ -722,6 +732,7 @@ struct ContentView: View {
                     Label("Retry", systemImage: "arrow.clockwise")
                 }
                 .disabled(!bilibiliModel.canRetry)
+                .accessibilityIdentifier("bilibili-retry")
 
                 Button {
                     bilibiliModel.clearTask()
@@ -729,6 +740,7 @@ struct ContentView: View {
                     Label("Clear", systemImage: "trash")
                 }
                 .disabled(!bilibiliModel.canClear)
+                .accessibilityIdentifier("bilibili-clear")
             }
         }
     }
@@ -890,7 +902,10 @@ struct ContentView: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .disabled(!bilibiliModel.canPlay(result: result))
+                                    .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .focusSection()
 
                                 ForEach(result.artifacts) { artifact in
                                     BilibiliTaskArtifactRow(artifact: artifact)
@@ -1310,6 +1325,7 @@ private struct BilibiliTaskResultRow: View {
 
                 HStack(spacing: 8) {
                     Text(result.statusLabel)
+                        .accessibilityIdentifier("bilibili-result-status-\(result.id)")
                     if !result.subtitle.isEmpty {
                         Text(result.subtitle)
                     }

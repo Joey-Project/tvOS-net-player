@@ -190,6 +190,44 @@ class ProcessSupervisorTests(unittest.TestCase):
             selector.close.assert_called_once()
 
 
+class RunCaptureTests(unittest.TestCase):
+    def test_capture_forwards_cwd_to_real_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            working_dir = root / "working"
+            working_dir.mkdir()
+            output = ui_e2e.run_capture(
+                [sys.executable, "-c", "import os; print(os.getcwd())"],
+                logs_dir=root / "logs",
+                name="capture-cwd",
+                timeout_seconds=5,
+                max_output_bytes=4096,
+                cwd=working_dir,
+            )
+            self.assertEqual(Path(output.strip()), working_dir.resolve())
+            self.assertEqual((root / "logs" / "capture-cwd.log").read_text(), output)
+
+    def test_capture_keeps_real_deadline_and_output_bounds_with_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, code, timeout, limit, message in (
+                ("deadline", "import time; time.sleep(10)", 0.1, 1024, "deadline"),
+                ("output", "print('x' * 8192)", 5, 128, "output limit"),
+            ):
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ui_e2e.UIE2EError, message
+                ):
+                    ui_e2e.run_capture(
+                        [sys.executable, "-c", code],
+                        logs_dir=root / "logs",
+                        name=name,
+                        timeout_seconds=timeout,
+                        max_output_bytes=limit,
+                        cwd=root,
+                    )
+                self.assertLessEqual((root / "logs" / f"{name}.log").stat().st_size, limit)
+
+
 class LinuxGroupStateTests(unittest.TestCase):
     @contextlib.contextmanager
     def proc_view(self, rows: list[tuple[int, str, int]]):
@@ -419,6 +457,135 @@ class CleanupTests(unittest.TestCase):
                     self.assertIn("failed: test failure", staged_log)
 
 
+class WorkBudgetTests(unittest.TestCase):
+    def test_absent_job_deadline_uses_local_cap(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline(), 100 + 35 * 60)
+        self.assertEqual(ui_e2e.FIXTURE_BUILD_TIMEOUT_SECONDS, 15 * 60)
+
+    def test_earlier_job_deadline_limits_local_work(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline("200"), 200)
+
+    def test_later_job_deadline_cannot_extend_local_cap(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.resolve_work_deadline("10000"), 100 + 35 * 60)
+
+    def test_expired_job_deadlines_are_rejected(self) -> None:
+        for deadline in ("100", "99", "0", "-1"):
+            with (
+                self.subTest(deadline=deadline),
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=100),
+                self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget has expired"),
+            ):
+                ui_e2e.resolve_work_deadline(deadline)
+
+    def test_malformed_and_nonfinite_job_deadlines_are_rejected_without_values(self) -> None:
+        for deadline in ("", "untrusted-deadline-value", "NaN", "Inf", "-Inf", "1e999"):
+            with self.subTest(deadline=deadline), mock.patch.object(
+                ui_e2e.time, "monotonic", return_value=100
+            ):
+                with self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget is invalid") as caught:
+                    ui_e2e.resolve_work_deadline(deadline)
+                if deadline:
+                    self.assertNotIn(deadline, str(caught.exception))
+
+    def test_remaining_work_is_checked_at_phase_boundaries(self) -> None:
+        with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
+            self.assertEqual(ui_e2e.require_work_remaining(105), 5)
+            for deadline in (100, 99):
+                with self.subTest(deadline=deadline), self.assertRaises(ui_e2e.UIE2EError):
+                    ui_e2e.require_work_remaining(deadline)
+
+    def test_invalid_or_expired_budget_stages_failure_before_workspace_removal(self) -> None:
+        for deadline in ("untrusted-deadline-value", "99"):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                work = root / "work"
+                work.mkdir()
+                artifacts = root / "artifacts"
+                with (
+                    mock.patch.object(ui_e2e.sys, "platform", "darwin"),
+                    mock.patch.object(ui_e2e.time, "monotonic", return_value=100),
+                    mock.patch.dict(
+                        ui_e2e.os.environ,
+                        {"UI_E2E_JOB_WORK_DEADLINE_MONOTONIC": deadline},
+                    ),
+                    mock.patch.object(ui_e2e, "_artifact_dir", return_value=artifacts),
+                    mock.patch.object(ui_e2e, "_private_work_dir", return_value=work),
+                    mock.patch.object(ui_e2e, "mute_system_audio", autospec=True) as mute,
+                    self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget"),
+                ):
+                    ui_e2e.run_ui_e2e("macos")
+                mute.assert_not_called()
+                self.assertFalse(work.exists())
+                failure = (artifacts / "runner.log").read_text()
+                self.assertIn("failed: UIE2EError: UI E2E work budget", failure)
+                self.assertNotIn(deadline, failure)
+
+    def test_budget_expiring_during_fixture_build_prevents_media_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            artifacts = root / "artifacts"
+            with (
+                mock.patch.object(ui_e2e.sys, "platform", "darwin"),
+                mock.patch.object(ui_e2e.time, "monotonic", return_value=100) as clock,
+                mock.patch.dict(
+                    ui_e2e.os.environ,
+                    {"UI_E2E_JOB_WORK_DEADLINE_MONOTONIC": "110"},
+                ),
+                mock.patch.object(ui_e2e, "_artifact_dir", return_value=artifacts),
+                mock.patch.object(ui_e2e, "_private_work_dir", return_value=work),
+                mock.patch.object(ui_e2e, "mute_system_audio", autospec=True),
+                mock.patch.object(ui_e2e, "_record_tool_inventory", autospec=True),
+                mock.patch.object(ui_e2e, "verify_scheme_contract", autospec=True),
+                mock.patch.object(ui_e2e, "create_fixture_media", autospec=True) as media,
+            ):
+                def finish_build(*args: object, **kwargs: object) -> Path:
+                    clock.return_value = 111
+                    return root / "fixture"
+
+                with (
+                    mock.patch.object(
+                        ui_e2e, "build_task_fixture", autospec=True, side_effect=finish_build
+                    ) as build,
+                    self.assertRaisesRegex(ui_e2e.UIE2EError, "work budget has expired"),
+                ):
+                    ui_e2e.run_ui_e2e("macos")
+                build.assert_called_once_with(work / "logs", timeout_seconds=10)
+                media.assert_not_called()
+            self.assertFalse(work.exists())
+            self.assertIn("work budget has expired", (artifacts / "runner.log").read_text())
+
+    def test_workflow_deadline_is_first_and_exports_same_host_monotonic_time(self) -> None:
+        workflow = (ui_e2e.ROOT / ".github" / "workflows" / "ui-e2e.yml").read_text()
+        self.assertIn("    timeout-minutes: 60\n", workflow.split("    steps:\n", 1)[0])
+        first_step = workflow.split("    steps:\n", 1)[1].split("\n      - name:", 1)[0]
+        lines = first_step.splitlines()
+        self.assertEqual(lines[0], "      - name: Establish UI E2E work deadline")
+        self.assertEqual(lines[1], "        run: |")
+        fragment = "\n".join(line[10:] for line in lines[2:] if line.startswith("          "))
+        self.assertEqual(len(fragment.splitlines()), 2)
+        ui_e2e.subprocess.run(
+            ["bash", "-n"], input=fragment, text=True, capture_output=True, check=True, timeout=5
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "github-env"
+            env = ui_e2e.os.environ.copy()
+            env["GITHUB_ENV"] = str(env_file)
+            started = ui_e2e.time.monotonic()
+            ui_e2e.subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", fragment],
+                env=env, text=True, capture_output=True, check=True, timeout=5,
+            )
+            name, value = env_file.read_text().strip().split("=", 1)
+            self.assertEqual(name, "UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+            self.assertGreaterEqual(float(value), started + 45 * 60)
+            self.assertLessEqual(float(value), ui_e2e.time.monotonic() + 45 * 60)
+
+
 class RunnerContractTests(unittest.TestCase):
     def test_missing_or_non_loopback_endpoint_fails_closed(self) -> None:
         for address in (None, "", "http://localhost:5000", "http://127.0.0.1:70000"):
@@ -442,6 +609,19 @@ class RunnerContractTests(unittest.TestCase):
             sum(argument.startswith("APP_BUNDLE_IDENTIFIER=") for argument in command),
             1,
         )
+
+    def test_xcodebuild_passes_task_fixture_endpoint_when_configured(self) -> None:
+        command = ui_e2e.build_xcodebuild_command(
+            platform="macos",
+            server_address="http://127.0.0.1:43210",
+            task_server_address="http://127.0.0.1:43211",
+            app_bundle_identifier="dev.joey.tvos-net-player.uie2e." + "b" * 32,
+            derived_data_path=Path("/tmp/DerivedData"),
+            result_bundle_path=Path("/tmp/UIE2E.xcresult"),
+            destination="platform=macOS",
+        )
+        self.assertIn("UI_E2E_SERVER_ADDRESS=http://127.0.0.1:43210", command)
+        self.assertIn("UI_E2E_TASK_SERVER_ADDRESS=http://127.0.0.1:43211", command)
 
     def test_xcodebuild_signing_is_platform_specific(self) -> None:
         for platform in ("macos", "tvos"):
@@ -480,6 +660,8 @@ class RunnerContractTests(unittest.TestCase):
                 '<EnvironmentVariables><EnvironmentVariable '
                 'key="UI_E2E_SERVER_ADDRESS" '
                 'value="$(UI_E2E_SERVER_ADDRESS)" isEnabled="YES" />'
+                '<EnvironmentVariable key="UI_E2E_TASK_SERVER_ADDRESS" '
+                'value="$(UI_E2E_TASK_SERVER_ADDRESS)" isEnabled="YES" />'
                 '</EnvironmentVariables><Testables><TestableReference skipped="NO">'
                 '<BuildableReference BlueprintName="ExampleUITests" />'
                 '</TestableReference></Testables></TestAction></Scheme>',
@@ -500,6 +682,8 @@ class RunnerContractTests(unittest.TestCase):
                 '<EnvironmentVariables><EnvironmentVariable '
                 'key="UI_E2E_SERVER_ADDRESS" '
                 'value="$(UI_E2E_SERVER_ADDRESS)" isEnabled="YES" />'
+                '<EnvironmentVariable key="UI_E2E_TASK_SERVER_ADDRESS" '
+                'value="$(UI_E2E_TASK_SERVER_ADDRESS)" isEnabled="YES" />'
                 '</EnvironmentVariables><Testables><TestableReference skipped="YES">'
                 '<BuildableReference BlueprintName="ExampleUITests" />'
                 '</TestableReference></Testables></TestAction></Scheme>',
@@ -507,6 +691,22 @@ class RunnerContractTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ui_e2e.UIE2EError, "does not test"):
                 ui_e2e.verify_scheme_contract(scheme, "ExampleUITests")
+
+    def test_shared_ui_e2e_schemes_map_both_loopback_services(self) -> None:
+        expected_targets = {
+            "MacOSNetPlayerUIE2E": "MacOSNetPlayerUITests",
+            "TVOSNetPlayerUIE2E": "TVOSNetPlayerUITests",
+        }
+        for scheme_name, target in expected_targets.items():
+            with self.subTest(scheme=scheme_name):
+                ui_e2e.verify_scheme_contract(
+                    ui_e2e.ROOT
+                    / "TVOSNetPlayer.xcodeproj"
+                    / "xcshareddata"
+                    / "xcschemes"
+                    / f"{scheme_name}.xcscheme",
+                    target,
+                )
 
     def test_server_cli_uses_alternating_pairs_and_disables_optional_services(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -625,6 +825,37 @@ class XcresultValidationTests(unittest.TestCase):
                 self.summary, wrong_target, "MacOSNetPlayerUITests"
             )
 
+    def test_runner_requires_each_named_task_watch_case(self) -> None:
+        expected = ui_e2e.EXPECTED_CASES_BY_PLATFORM["macos"]
+        cases = [
+            {"nodeType": "Test Case", "name": name, "result": "Passed"}
+            for name in expected
+        ]
+        summary = dict(self.summary, totalTestCount=len(cases), passedTests=len(cases))
+        tests = {
+            "testNodes": [{
+                "nodeType": "UI test bundle",
+                "name": "MacOSNetPlayerUITests",
+                "children": cases,
+            }]
+        }
+        counts = ui_e2e.validate_xcresult(
+            summary, tests, "MacOSNetPlayerUITests", expected
+        )
+        self.assertEqual(counts["target_passed"], len(expected))
+        for missing in expected:
+            incomplete = json.loads(json.dumps(tests))
+            incomplete["testNodes"][0]["children"] = [
+                case for case in incomplete["testNodes"][0]["children"]
+                if case["name"] != missing
+            ]
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                ui_e2e.UIE2EError, "did not execute and pass required UI case"
+            ):
+                ui_e2e.validate_xcresult(
+                    summary, incomplete, "MacOSNetPlayerUITests", expected
+                )
+
     def test_rejects_zero_tests_skipped_tests_and_missing_target(self) -> None:
         zero = dict(self.summary, totalTestCount=0, passedTests=0)
         with self.assertRaisesRegex(ui_e2e.UIE2EError, "no UI test"):
@@ -643,6 +874,193 @@ class XcresultValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ui_e2e.UIE2EError, "does not contain expected"):
             ui_e2e.validate_xcresult(self.summary, {"testNodes": []}, "MacOSNetPlayerUITests")
 
+
+class TaskFixtureOrchestrationTests(unittest.TestCase):
+    def _metrics(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "scenarios": {
+                name: {
+                    "task_id": ui_e2e.EXPECTED_TASK_IDS[name],
+                    "create_count": 1,
+                    "watch_count": 2,
+                    "get_task_count": 1,
+                    "output_count": 1,
+                    "cancel_count": 0,
+                    **(
+                        {"manual_resume_read_before_watch": True}
+                        if name == "manual"
+                        else {}
+                    ),
+                }
+                for name in ("automatic", "manual")
+            },
+        }
+
+    def test_fixture_command_requires_loopback_mp4_route(self) -> None:
+        media_url = ui_e2e.build_rust_fixture_media_url(43211)
+        command = ui_e2e.build_task_fixture_command(
+            Path("/build/task-watch-ui-fixture"),
+            ready_file=Path("/tmp/ready.json"),
+            metrics_file=Path("/tmp/metrics.json"),
+            media_url=media_url,
+        )
+        self.assertEqual(command[-2:], ["--media-url", media_url])
+        for invalid in (
+            "https://127.0.0.1:43211/media/example/original",
+            "http://127.0.0.1:43211/media/example/original?token=secret",
+            "http://example.test:43211/media/example/original",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ui_e2e.UIE2EError):
+                ui_e2e.validate_media_fixture_url(invalid)
+
+    def test_fixture_build_uses_bounded_debug_product_and_rejects_incomplete_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / ui_e2e.TASK_FIXTURE_PRODUCT
+            binary.touch(mode=0o700)
+            with (
+                mock.patch.object(
+                    ui_e2e,
+                    "run_process",
+                    return_value=ui_e2e.CommandResult(0, 10),
+                ) as run_process,
+                mock.patch.object(ui_e2e, "resolve_swift_bin_path", return_value=Path(directory)),
+            ):
+                result = ui_e2e.build_task_fixture(Path(directory), timeout_seconds=60)
+            self.assertEqual(result, binary)
+            args = run_process.call_args
+            self.assertEqual(args.args[0], ui_e2e.build_task_fixture_swift_command())
+            self.assertEqual(args.kwargs["timeout_seconds"], 60)
+            self.assertEqual(args.kwargs["cwd"], ui_e2e.ROOT)
+
+            for incomplete in (
+                ui_e2e.CommandResult(0, 10, timed_out=True),
+                ui_e2e.CommandResult(0, 10, output_limited=True),
+            ):
+                with (
+                    mock.patch.object(ui_e2e, "run_process", return_value=incomplete),
+                    self.assertRaises(ui_e2e.UIE2EError),
+                ):
+                    ui_e2e.build_task_fixture(Path(directory), timeout_seconds=60)
+
+    def test_swift_bin_path_capture_call_matches_real_wrapper_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = root / "logs"
+            bin_path = root / ".build" / "debug"
+            with (
+                mock.patch.object(ui_e2e, "ROOT", root),
+                mock.patch.object(
+                    ui_e2e, "run_capture", autospec=True, return_value=f"{bin_path}\n"
+                ) as capture,
+            ):
+                self.assertEqual(ui_e2e.resolve_swift_bin_path(logs), bin_path.resolve())
+            capture.assert_called_once_with(
+                ["swift", "build", "--show-bin-path", "--disable-automatic-resolution"],
+                logs_dir=logs,
+                name="task-fixture-bin-path",
+                timeout_seconds=30,
+                max_output_bytes=16 * 1024,
+                cwd=root,
+            )
+
+    def test_fixture_ready_file_is_bounded_and_returns_grpc_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready.json"
+            ready.write_text(
+                '{"schema_version":1,"server_address":"127.0.0.1:43211"}',
+                encoding="utf-8",
+            )
+            process = mock.Mock(output_limited=False)
+            process.is_running.return_value = True
+            self.assertEqual(
+                ui_e2e.wait_for_task_fixture(process, ready),
+                "http://127.0.0.1:43211",
+            )
+            ready.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(ui_e2e.time, "monotonic", side_effect=[0.0, 1.0]),
+                mock.patch.object(ui_e2e.time, "sleep"),
+                self.assertRaisesRegex(ui_e2e.UIE2EError, "readiness timed out"),
+            ):
+                ui_e2e.wait_for_task_fixture(process, ready, timeout_seconds=0.5)
+
+    def test_rust_media_fixture_head_probe_is_finite_and_checks_real_mp4(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.headers.get_content_type.return_value = "video/mp4"
+        response.headers.get.return_value = "4096"
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(ui_e2e.urllib.request, "build_opener", return_value=opener):
+            ui_e2e.verify_media_fixture_url(
+                ui_e2e.build_rust_fixture_media_url(43211), 4096
+            )
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "HEAD")
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 3)
+
+        response.status = 404
+        with (
+            mock.patch.object(ui_e2e.urllib.request, "build_opener", return_value=opener),
+            self.assertRaisesRegex(ui_e2e.UIE2EError, "expected MP4 HEAD response"),
+        ):
+            ui_e2e.verify_media_fixture_url(
+                ui_e2e.build_rust_fixture_media_url(43211), 4096
+            )
+
+    def test_fixture_readiness_fails_on_output_limit_or_early_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready.json"
+            process = mock.Mock(output_limited=True)
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "bounded log"):
+                ui_e2e.wait_for_task_fixture(process, ready)
+            process.output_limited = False
+            process.is_running.return_value = False
+            with self.assertRaisesRegex(ui_e2e.UIE2EError, "exited before becoming ready"):
+                ui_e2e.wait_for_task_fixture(process, ready)
+
+    def test_fixture_metrics_accept_success_and_reject_bad_counts_and_resume_proof(self) -> None:
+        metrics = self._metrics()
+        validated = ui_e2e.validate_task_fixture_metrics(metrics)
+        self.assertEqual(validated["scenarios"]["automatic"]["create_count"], 1)
+        bad = json.loads(json.dumps(metrics))
+        bad["scenarios"]["manual"]["create_count"] = 2
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "exactly one task"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+        bad = json.loads(json.dumps(metrics))
+        bad["scenarios"]["manual"]["manual_resume_read_before_watch"] = False
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "before its final watch"):
+            ui_e2e.validate_task_fixture_metrics(bad)
+
+    def test_fixture_metrics_require_expected_task_ids_and_positive_io(self) -> None:
+        metrics = self._metrics()
+        metrics["scenarios"]["automatic"]["task_id"] = "unexpected"
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "unexpected task ID"):
+            ui_e2e.validate_task_fixture_metrics(metrics)
+        metrics = self._metrics()
+        metrics["scenarios"]["manual"]["output_count"] = 0
+        with self.assertRaisesRegex(ui_e2e.UIE2EError, "positive output_count"):
+            ui_e2e.validate_task_fixture_metrics(metrics)
+
+    def test_fixture_metrics_reject_cancellation_side_effects(self) -> None:
+        for scenario in ("automatic", "manual"):
+            for cancel_count in (1, -1, True, "0", None):
+                with self.subTest(scenario=scenario, cancel_count=cancel_count):
+                    metrics = self._metrics()
+                    metrics["scenarios"][scenario]["cancel_count"] = cancel_count
+                    with self.assertRaisesRegex(ui_e2e.UIE2EError, "must not cancel server work"):
+                        ui_e2e.validate_task_fixture_metrics(metrics)
+
+    def test_fixture_cleanup_runs_after_test_failure(self) -> None:
+        stopped: list[str] = []
+        cleanup = ui_e2e.CleanupStack()
+        cleanup.defer("owned Swift task fixture", lambda: stopped.append("fixture"))
+        with self.assertRaisesRegex(RuntimeError, "xcode failure"):
+            with cleanup:
+                raise RuntimeError("xcode failure")
+        self.assertEqual(stopped, ["fixture"])
 
 class FailedXcodeDiagnosticsTests(unittest.TestCase):
     def _payloads(self) -> dict[str, object]:

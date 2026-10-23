@@ -4,7 +4,7 @@ import XCTest
 @MainActor
 final class UIPlaybackTests: XCTestCase {
     private enum SetupError: Error {
-        case missingServerAddress
+        case missingServerAddress(String)
     }
 
     private var app: XCUIApplication!
@@ -16,12 +16,16 @@ final class UIPlaybackTests: XCTestCase {
         try await MainActor.run {
             continueAfterFailure = false
 
+            let addressVariable =
+                name.contains("testRemoteConnectPageSelectAndPlayRealFixture")
+                ? "UI_E2E_SERVER_ADDRESS"
+                : "UI_E2E_TASK_SERVER_ADDRESS"
             guard
-                let address = ProcessInfo.processInfo.environment["UI_E2E_SERVER_ADDRESS"]?
+                let address = ProcessInfo.processInfo.environment[addressVariable]?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                 !address.isEmpty
             else {
-                throw SetupError.missingServerAddress
+                throw SetupError.missingServerAddress(addressVariable)
             }
 
             serverAddress = address
@@ -144,6 +148,153 @@ final class UIPlaybackTests: XCTestCase {
             "The server-backed MP4 timeline never advanced. \(accessibilityDescription(timeline)); "
                 + "state: \(accessibilityDescription(state))"
         )
+    }
+
+    func testAutomaticTaskWatchRecoversWithoutResubmission() throws {
+        executionTimeAllowance = 600
+        try prepareTaskWatchScenario(source: "BV1QtjA6BEB8")
+        XCUIRemote.shared.press(.select)
+
+        let reconnecting = identifiedElement("bilibili.watch.status")
+        XCTAssertTrue(
+            waitUntil(timeout: 60) { status(reconnecting, contains: "Reconnecting task updates") },
+            "The submitted task did not show reconnecting task updates within 60 seconds. "
+                + accessibilityDescription(identifiedElement("bilibili-task-status"))
+        )
+        XCTAssertTrue(status(reconnecting, contains: "Reconnecting task updates"))
+        let taskStatus = identifiedElement("bilibili-task-status")
+        XCTAssertTrue(
+            waitUntil(timeout: 60) {
+                status(taskStatus, contains: "Automatic recovery complete")
+                    && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
+            },
+            "The original task did not reach the fixture's automatic-recovery terminal status. "
+                + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(reconnecting.exists, "The terminal task must stop showing a reconnecting state.")
+        XCTAssertFalse(
+            identifiedElement("bilibili.watch.error").exists, "A recovered task must not retain a watch error.")
+        XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists, "A terminal task must not offer watch retry.")
+    }
+
+    func testManualTaskWatchReconnectPreservesPlayback() throws {
+        executionTimeAllowance = 600
+        try prepareTaskWatchScenario(source: "BV1uW4y1s7zN")
+        XCUIRemote.shared.press(.select)
+
+        let watchError = identifiedElement("bilibili.watch.error")
+        let reconnect = identifiedElement("bilibili.watch.retry")
+        let reconnecting = identifiedElement("bilibili.watch.status")
+        XCTAssertTrue(
+            waitUntil(timeout: 100) { watchError.exists && reconnect.exists && !reconnecting.exists },
+            "Automatic task-watch retries did not stop with an error and manual reconnect control. "
+                + accessibilityDescription(identifiedElement("bilibili-task-status"))
+        )
+        XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
+        XCTAssertFalse(reconnecting.exists)
+
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 40),
+            "Remote focus could not recover the cache server address landmark. "
+                + taskWatchFocusDescription(target: addressField)
+        )
+        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
+        XCTAssertTrue(
+            focusDown(until: play, limit: 80),
+            "Remote focus could not reach the visible result Play control. " + taskWatchFocusDescription(target: play)
+        )
+        XCTAssertTrue(play.isEnabled, "The fixture's task media must be playable while updates are unavailable.")
+        XCUIRemote.shared.press(.select)
+
+        let timeline = identifiedElement("playback-timeline")
+        let playbackState = identifiedElement("playback-state")
+        XCTAssertTrue(timeline.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 20))
+        let beforeOfflineProgress = try XCTUnwrap(waitForTimeline(timeout: 15) { $0 >= 2 })
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= beforeOfflineProgress + 1.5 },
+            "The available task media did not advance while task updates remained unavailable. "
+                + accessibilityDescription(timeline)
+        )
+        XCTAssertTrue(watchError.exists, "The watch error should remain visible until manual reconnection.")
+
+        let beforeReconnect = try XCTUnwrap(timelineSeconds())
+        XCTAssertTrue(
+            moveFocus(until: reconnect, direction: .up, limit: 20),
+            "Remote focus could not return to Reconnect Updates from the result Play control. "
+                + taskWatchFocusDescription(target: reconnect)
+        )
+        XCUIRemote.shared.press(.select)
+        let taskStatus = identifiedElement("bilibili-task-status")
+        XCTAssertTrue(
+            waitUntil(timeout: 60) {
+                status(taskStatus, contains: "Manual recovery complete")
+                    && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
+            },
+            "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(watchError.exists, "Successful manual reconnection must clear the stale watch warning.")
+        XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists)
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 10))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= beforeReconnect + 1 },
+            "Playback did not remain progressing across manual task-watch reconnection. "
+                + accessibilityDescription(timeline)
+        )
+    }
+
+    private func prepareTaskWatchScenario(source: String) throws {
+        let remote = XCUIRemote.shared
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(addressField.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntil(timeout: 10) { addressField.hasFocus })
+        XCTAssertTrue(
+            serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))")
+        remote.press(.select)
+        addressField.typeText(serverAddress)
+        if app.keyboards.firstMatch.exists {
+            remote.press(.menu)
+        }
+        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+
+        let sourceField = app.textFields["bilibili-source"]
+        XCTAssertTrue(sourceField.waitForExistence(timeout: 15))
+        XCTAssertTrue(
+            focusDown(until: sourceField, limit: 80),
+            "Remote focus could not reach the Bilibili source field. \(accessibilityDescription(sourceField))"
+        )
+        remote.press(.select)
+        sourceField.typeText(source)
+        if app.keyboards.firstMatch.exists {
+            remote.press(.menu)
+        }
+        XCTAssertTrue(waitUntil(timeout: 10) { !app.keyboards.firstMatch.exists })
+
+        let submit = app.buttons["bilibili-submit"]
+        XCTAssertTrue(
+            focusDown(until: submit, limit: 80),
+            "Remote focus could not reach the visible Bilibili submit control. \(accessibilityDescription(submit))"
+        )
+        XCTAssertTrue(submit.isEnabled, "The single-result Bilibili input should be ready for one submission.")
+    }
+
+    private func taskWatchFocusDescription(target: XCUIElement) -> String {
+        let submit = app.buttons["bilibili-submit"]
+        let reconnect = identifiedElement("bilibili.watch.retry")
+        let focusedControl = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasFocus == true"))
+            .firstMatch
+        let focusedDescription =
+            focusedControl.exists
+            ? "id=\(focusedControl.identifier.debugDescription), label=\(focusedControl.label.debugDescription)"
+            : "none"
+        let targetExists = target.exists
+        return "targetExists=\(targetExists), targetEnabled=\(targetExists && target.isEnabled), "
+            + "targetHittable=\(targetExists && target.isHittable), targetFocused=\(targetExists && target.hasFocus), "
+            + "submitFocused=\(submit.exists && submit.hasFocus), "
+            + "reconnectFocused=\(reconnect.exists && reconnect.hasFocus), focusedControl={\(focusedDescription)}; "
+            + "target: \(accessibilityDescription(target))"
     }
 
     private func identifiedElement(_ identifier: String) -> XCUIElement {

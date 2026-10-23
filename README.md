@@ -58,9 +58,13 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 
 macOS 用例还检查暂停/恢复、以暂停后的稳定时间点为基准的前后跳转、实际 2x 时间推进、92 秒视频自然结束，以及先在终点点击前进、再通过普通 Resume 控件回到开头继续播放并保留倍速。另一路径会在片尾前暂停，再点击前进到终点，确认显示播放结束且 Resume 能回到开头继续播放。tvOS 用例通过真实遥控器导航到惰性加载的第 55 条，再检查播放状态和时间推进。macOS 点击必须落在应用窗口及屏幕可用区域内，不通过后台调用替代界面操作。
 
+每个平台还执行自动恢复、手动重连两项任务观察用例。独立的测试专用 Swift gRPC 进程只监听 loopback，并注入明确的控制流故障；实际客户端仍通过界面输入、提交任务和点击 `Reconnect Updates`。手动重连用例会等待生产代码的限次退避耗尽，在更新停止时播放已有结果，再恢复原任务的更新并确认播放继续。runner 独立核对每个场景只创建一个任务；媒体仍来自真实 Rust server，不访问 Bilibili，也不给生产服务器加入故障注入开关。
+
 自然播放的 90 秒等待窗口从实际重播点击开始计算，滚动和查找按钮的准备时间单独记录；按钮已经可见时立即停止滚动检查。播放结束后用原生播放器控件往回拖动，再点自定义 Resume，会从所选位置续播并保留倍速，而不是无条件回到开头；这项共享 AppCore 行为另有专项回归测试。
 
 这两个 Just 命令会先构建 Rust server；设置 `CACHE_SERVER_BINARY` 可复用已构建的可执行文件。`DERIVED_DATA_PATH` 可复用已有 Xcode 编译缓存，该目录不会作为夹具状态被删除。使用 `UI_E2E_ARTIFACT_DIR` 可指定一个新的空目录保存诊断；默认目录位于系统临时目录下的 `tvos-net-player-ui-e2e-artifacts/`。保留的诊断仅限 allowlist 日志、测试结果 JSON 和大小允许的 xcresult，不包含生成媒体、server 状态或整个编译目录；总计最多 32 MiB，xcresult 最多 20 MiB。
+
+本地 helper 的工作预算上限为 35 分钟，fixture 编译最多 15 分钟。GHA 在 checkout 前记录整个 job 的单调时钟工作期限，最晚在首步后的 45 分钟结束主要构建/测试工作，包含安装工具和 Rust 构建已花费的时间；60 分钟 job 的余量留给有界诊断、清理和产物上传。诊断与清理使用独立期限，不复用已耗尽的工作预算。
 
 Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据，并从首个失败用例的 teardown 附件中单独导出最多一份 accessibility tree（512 KiB）和一张截图（2 MiB），不导出录屏。完整 xcresult 超限时仍可保留这些小附件；导出结果见 `xcresult-attachment-export.json`，归档缺失、超限或失败见 `artifact-staging.log`。附件导出失败不会覆盖原始测试失败，只有元数据不等于图片留存。
 
@@ -68,7 +72,7 @@ Xcode 失败退出后也会尝试提取有界的失败摘要和活动元数据�
 
 macOS UI 测试使用本地 ad-hoc 签名，不需要开发者证书或 team；tvOS simulator 构建不启用签名。这不替代实机 provisioning、分发签名或公证。本机 UI 执行仍需可用的桌面会话及 Xcode 所需权限，成功构建和签名校验不代表 UI 测试通过。
 
-GHA 的 UI 测试与现有构建/单元测试分开记录。只有实际执行对应 UI test target、通过界面断言并产生非零测试结果，才算 UI e2e 通过；成功编译或列出 simulator runtime 不能代替执行。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md)。
+GHA 的 UI 测试与现有构建/单元测试分开记录。每个平台预期的三项用例都必须实际执行并通过，且失败、跳过数量均为零；只执行其中一项、成功编译或列出 simulator runtime 都不能代替完整 UI e2e。设计、验证证据与限制见 [UI e2e journal](docs/project_journal/2026/10/2026-10-22-ui-e2e-ci-b46385.md) 和 [任务观察恢复 UI journal](docs/project_journal/2026/10/2026-10-23-task-watch-ui-e2e-b46387.md)。
 
 真实 Bilibili URL smoke suite 由 repo-local skill `.agents/skills/bilibili-live-e2e/` 维护，覆盖公开视频、多 P 视频、favorite/space/collection/series/recommendation list fetch、restricted Bangumi 页面，以及需要 web cookie 的账号页面 fetch case。它会访问公网 Bilibili 和 BBDown core，所以不属于默认 CI；需要显式运行：
 

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import json
+import math
 import os
 import re
 import selectors
@@ -18,6 +20,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -34,6 +37,8 @@ MAX_FIXTURE_BYTES = 64 * 1024 * 1024
 MAX_RESULT_SUMMARY_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_LOG_BYTES = 8 * 1024 * 1024
 MAX_SERVER_LOG_BYTES = 256 * 1024
+MAX_TASK_FIXTURE_LOG_BYTES = 256 * 1024
+MAX_FIXTURE_JSON_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_RESULT_BUNDLE_BYTES = 20 * 1024 * 1024
 MAX_ARTIFACT_REPORT_BYTES = 8192
@@ -44,8 +49,25 @@ FAILURE_ATTACHMENT_LIMITS = {
 MAX_ATTACHMENT_EXPORT_LOG_BYTES = 16 * 1024
 RESULT_DIAGNOSTIC_TIMEOUT_SECONDS = 240
 COMMAND_TIMEOUT_SECONDS = 30 * 60
+TOTAL_RUN_BUDGET_SECONDS = 35 * 60
+FIXTURE_BUILD_TIMEOUT_SECONDS = 15 * 60
 SERVER_READY_TIMEOUT_SECONDS = 45
+TASK_FIXTURE_READY_TIMEOUT_SECONDS = 45
 TVOS_BOOT_TIMEOUT_SECONDS = 300
+TASK_FIXTURE_PRODUCT = "task-watch-ui-fixture"
+TASK_FIXTURE_TARGET = "TaskWatchUIFixture"
+EXPECTED_UI_CASES = (
+    "testAutomaticTaskWatchRecoversWithoutResubmission",
+    "testManualTaskWatchReconnectPreservesPlayback",
+)
+EXPECTED_CASES_BY_PLATFORM = {
+    "macos": EXPECTED_UI_CASES + ("testConnectBrowseAndControlRealPlayback",),
+    "tvos": EXPECTED_UI_CASES + ("testRemoteConnectPageSelectAndPlayRealFixture",),
+}
+EXPECTED_TASK_IDS = {
+    "automatic": "ui-e2e-automatic",
+    "manual": "ui-e2e-manual",
+}
 
 
 class UIE2EError(RuntimeError):
@@ -473,6 +495,7 @@ def run_capture(
     timeout_seconds: float = 30,
     max_output_bytes: int = 64 * 1024,
     env: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> str:
     log_path = logs_dir / f"{name}.log"
     result = run_process(
@@ -481,6 +504,7 @@ def run_capture(
         timeout_seconds=timeout_seconds,
         max_output_bytes=max_output_bytes,
         env=env,
+        cwd=cwd,
     )
     _require_result(result, name, log_path)
     return log_path.read_text(encoding="utf-8", errors="replace")
@@ -527,6 +551,20 @@ def verify_scheme_contract(scheme_path: Path, expected_target: str) -> None:
             "UI_E2E_SERVER_ADDRESS=$(UI_E2E_SERVER_ADDRESS)."
         )
 
+    task_endpoint_mapping = any(
+        variable.get("key") == "UI_E2E_TASK_SERVER_ADDRESS"
+        and variable.get("value") == "$(UI_E2E_TASK_SERVER_ADDRESS)"
+        and variable.get("isEnabled", "YES").upper() == "YES"
+        for variable in test_action.findall(
+            "./EnvironmentVariables/EnvironmentVariable"
+        )
+    )
+    if not task_endpoint_mapping:
+        raise UIE2EError(
+            "UI E2E TestAction must explicitly map "
+            "UI_E2E_TASK_SERVER_ADDRESS=$(UI_E2E_TASK_SERVER_ADDRESS)."
+        )
+
     test_target_present = any(
         testable.get("skipped", "NO").upper() != "YES"
         and reference.get("BlueprintName") == expected_target
@@ -543,12 +581,14 @@ def build_xcodebuild_command(
     *,
     platform: str,
     server_address: str | None,
+    task_server_address: str | None = None,
     app_bundle_identifier: str,
     derived_data_path: Path,
     result_bundle_path: Path,
     destination: str,
 ) -> list[str]:
     endpoint = validate_server_address(server_address)
+    task_endpoint = validate_server_address(task_server_address) if task_server_address else None
     if not re.fullmatch(
         r"dev\.joey\.tvos-net-player\.uie2e\.[0-9a-f]{32}",
         app_bundle_identifier,
@@ -587,8 +627,213 @@ def build_xcodebuild_command(
         *signing_settings,
         f"APP_BUNDLE_IDENTIFIER={app_bundle_identifier}",
         f"UI_E2E_SERVER_ADDRESS={endpoint}",
+        *([f"UI_E2E_TASK_SERVER_ADDRESS={task_endpoint}"] if task_endpoint else []),
         "test",
     ]
+
+
+def build_task_fixture_command(
+    executable: Path,
+    *,
+    ready_file: Path,
+    metrics_file: Path,
+    media_url: str,
+) -> list[str]:
+    validate_media_fixture_url(media_url)
+    return [
+        str(executable),
+        "--ready-file",
+        str(ready_file),
+        "--metrics-file",
+        str(metrics_file),
+        "--media-url",
+        media_url,
+    ]
+
+
+def validate_media_fixture_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise UIE2EError("Task fixture media URL is malformed.") from error
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(r"/media/local\.default\.[A-Za-z0-9_-]+/original", parsed.path)
+    ):
+        raise UIE2EError(
+            "Task fixture media URL must be a loopback Rust cache /media/<fixture>/original URL."
+        )
+    return value
+
+
+def build_rust_fixture_media_url(media_port: int) -> str:
+    if not 1 <= media_port <= 65535:
+        raise UIE2EError("Rust cache media port is invalid.")
+    relative_path = "Fixture 055.mp4"
+    encoded_path = base64.urlsafe_b64encode(relative_path.encode("utf-8")).decode("ascii").rstrip("=")
+    item_id = f"local.default.{encoded_path}"
+    return validate_media_fixture_url(
+        f"http://127.0.0.1:{media_port}/media/{urllib.parse.quote(item_id, safe='')}/original"
+    )
+
+
+def verify_media_fixture_url(media_url: str, expected_size: int) -> None:
+    validate_media_fixture_url(media_url)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    )
+    request = urllib.request.Request(media_url, method="HEAD")
+    try:
+        with opener.open(request, timeout=3) as response:
+            if (
+                response.status != 200
+                or response.headers.get_content_type() != "video/mp4"
+                or response.headers.get("Content-Length") != str(expected_size)
+            ):
+                raise UIE2EError(
+                    "Rust cache fixture URL did not return the expected MP4 HEAD response."
+                )
+    except (OSError, urllib.error.URLError) as error:
+        raise UIE2EError("Rust cache fixture media endpoint is not ready.") from error
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, response: object, code: int, message: str,
+                         headers: object, new_url: str) -> None:
+        return None
+
+
+def build_task_fixture_swift_command() -> list[str]:
+    return [
+        "swift",
+        "build",
+        "--product",
+        TASK_FIXTURE_PRODUCT,
+        "--configuration",
+        "debug",
+        "--disable-automatic-resolution",
+    ]
+
+
+def resolve_swift_bin_path(logs_dir: Path) -> Path:
+    output = run_capture(
+        ["swift", "build", "--show-bin-path", "--disable-automatic-resolution"],
+        logs_dir=logs_dir,
+        name="task-fixture-bin-path",
+        timeout_seconds=30,
+        max_output_bytes=16 * 1024,
+        cwd=ROOT,
+    )
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        raise UIE2EError("SwiftPM did not report a fixture binary directory.")
+    bin_path = Path(lines[-1]).resolve()
+    build_path = (ROOT / ".build").resolve()
+    if not bin_path.is_relative_to(build_path):
+        raise UIE2EError("Swift fixture binary path is outside the reusable package .build directory.")
+    return bin_path
+
+
+def build_task_fixture(logs_dir: Path, *, timeout_seconds: float) -> Path:
+    result = run_process(
+        build_task_fixture_swift_command(),
+        log_path=logs_dir / "task-fixture-build.log",
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        cwd=ROOT,
+    )
+    _require_result(result, "TaskWatchUIFixture SwiftPM debug build", logs_dir / "task-fixture-build.log")
+    binary = resolve_swift_bin_path(logs_dir) / TASK_FIXTURE_PRODUCT
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise UIE2EError("SwiftPM task fixture product is missing or not executable.")
+    return binary
+
+
+def _read_bounded_json(path: Path, *, description: str) -> object:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FIXTURE_JSON_BYTES:
+            raise UIE2EError(f"{description} is missing, non-regular, or exceeds its size cap.")
+        with path.open("rb") as source:
+            payload = source.read(MAX_FIXTURE_JSON_BYTES + 1)
+        if len(payload) > MAX_FIXTURE_JSON_BYTES:
+            raise UIE2EError(f"{description} exceeds its size cap.")
+        return json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise UIE2EError(f"Could not read {description} JSON.") from error
+
+
+def wait_for_task_fixture(
+    fixture: BoundedOwnedProcess,
+    ready_file: Path,
+    *,
+    timeout_seconds: float = TASK_FIXTURE_READY_TIMEOUT_SECONDS,
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "readiness file has not been created"
+    while time.monotonic() < deadline:
+        if fixture.output_limited:
+            raise UIE2EError("Task fixture exceeded its bounded log size.")
+        if not fixture.is_running():
+            raise UIE2EError("Owned task fixture exited before becoming ready.")
+        if ready_file.exists():
+            payload = _read_bounded_json(ready_file, description="Task fixture readiness")
+            if (
+                isinstance(payload, dict)
+                and type(payload.get("schema_version")) is int
+                and payload.get("schema_version") == 1
+            ):
+                address = payload.get("server_address")
+                if isinstance(address, str) and re.fullmatch(
+                    r"127\.0\.0\.1:[1-9][0-9]{0,4}", address
+                ) and int(address.rsplit(":", 1)[1]) <= 65535:
+                    return validate_server_address(f"http://{address}")
+            last_error = "readiness JSON has an unexpected schema or address"
+        time.sleep(0.1)
+    raise UIE2EError(f"Task fixture readiness timed out: {last_error}")
+
+
+def validate_task_fixture_metrics(payload: object) -> dict[str, object]:
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+    ):
+        raise UIE2EError("Task fixture metrics have an unsupported schema.")
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, dict):
+        raise UIE2EError("Task fixture metrics are missing scenario counters.")
+    validated: dict[str, object] = {}
+    for scenario in ("automatic", "manual"):
+        counters = scenarios.get(scenario)
+        if not isinstance(counters, dict):
+            raise UIE2EError(f"Task fixture metrics are missing the {scenario} scenario.")
+        if counters.get("task_id") != EXPECTED_TASK_IDS[scenario]:
+            raise UIE2EError(f"Task fixture {scenario} scenario returned an unexpected task ID.")
+        if type(counters.get("create_count")) is not int or counters.get("create_count") != 1:
+            raise UIE2EError(f"Task fixture {scenario} scenario must create exactly one task.")
+        for key in ("watch_count", "get_task_count", "output_count"):
+            value = counters.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise UIE2EError(f"Task fixture {scenario} scenario requires positive {key}.")
+        cancel_count = counters.get("cancel_count")
+        if type(cancel_count) is not int or cancel_count != 0:
+            raise UIE2EError(f"Task fixture {scenario} scenario must not cancel server work.")
+        validated[scenario] = dict(counters)
+    manual = scenarios["manual"]
+    if manual.get("manual_resume_read_before_watch") is not True:
+        raise UIE2EError(
+            "Manual task fixture did not confirm GetTask after retry exhaustion and before its final watch."
+        )
+    return {"schema_version": 1, "scenarios": validated}
 
 
 def allocate_loopback_ports() -> tuple[int, int]:
@@ -1155,7 +1400,10 @@ def _test_status_counts(node: object) -> dict[str, int]:
 
 
 def validate_xcresult(
-    summary: object, tests: object, expected_target: str
+    summary: object,
+    tests: object,
+    expected_target: str,
+    expected_cases: tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     if not isinstance(summary, dict):
         raise UIE2EError("xcresult summary is not a JSON object.")
@@ -1190,6 +1438,35 @@ def validate_xcresult(
         raise UIE2EError(f"xcresult target {expected_target} contains failures.")
     if target_counts["skipped"] > 0 or overall["skippedTests"] > 0:
         raise UIE2EError("xcresult reports skipped UI tests; this gate requires none.")
+    if expected_cases is not None:
+        target_cases = [
+            case
+            for target in matching
+            for case in _all_dicts(_node_children(target))
+            if "case" in str(case.get("nodeType", "")).lower()
+            or "method" in str(case.get("nodeType", "")).lower()
+        ]
+        for expected_case in expected_cases:
+            matching_cases = [
+                case
+                for case in target_cases
+                if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(expected_case)}(?![A-Za-z0-9_])",
+                    str(case.get("name", "")),
+                )
+            ]
+            case_counts = {"passed": 0, "failed": 0, "skipped": 0}
+            for case in matching_cases:
+                for status, count in _test_status_counts(case).items():
+                    case_counts[status] += count
+            if not matching_cases or case_counts["passed"] <= 0:
+                raise UIE2EError(
+                    f"xcresult did not execute and pass required UI case {expected_case}."
+                )
+            if case_counts["failed"] or case_counts["skipped"]:
+                raise UIE2EError(
+                    f"xcresult required UI case {expected_case} failed or was skipped."
+                )
     return overall | {f"target_{key}": value for key, value in target_counts.items()}
 
 
@@ -1330,11 +1607,12 @@ def finish_xcode_run(
     logs_dir: Path,
     expected_target: str,
     log: Callable[[str], None],
+    expected_cases: tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     primary: UIE2EError | None = None
     if result.timed_out:
         primary = UIE2EError(
-            f"xcodebuild test exceeded its {COMMAND_TIMEOUT_SECONDS // 60}-minute deadline."
+            "xcodebuild test exceeded its effective work deadline."
         )
     elif result.output_limited:
         primary = UIE2EError(
@@ -1433,7 +1711,9 @@ def finish_xcode_run(
         raise primary
     if errors:
         raise UIE2EError(f"Required xcresult diagnostics failed: {str(errors[0])[:512]}") from errors[0]
-    counts = validate_xcresult(outputs.get("summary"), outputs.get("tests"), expected_target)
+    counts = validate_xcresult(
+        outputs.get("summary"), outputs.get("tests"), expected_target, expected_cases
+    )
     _write_json(logs_dir / "result-validation.json", counts)
     return counts
 
@@ -1444,6 +1724,12 @@ class ArtifactStager:
     ALLOWED_FILES = {
         "runner.log",
         "server.log",
+        "task-fixture-build.log",
+        "task-fixture-bin-path.log",
+        "task-fixture.log",
+        "task-fixture-ready.json",
+        "task-fixture-metrics.json",
+        "task-fixture-validation.json",
         "xcodebuild.log",
         "xcresult-summary.json",
         "xcresult-tests.json",
@@ -1484,6 +1770,10 @@ class ArtifactStager:
         size = source.stat().st_size
         limit = self.max_bytes if source.name == "artifact-staging.log" else self.max_bytes - self.report_bytes
         file_limit = FAILURE_ATTACHMENT_LIMITS.get(source.name, MAX_COMMAND_LOG_BYTES)
+        if source.name.startswith("task-fixture-") and source.name.endswith(".json"):
+            file_limit = MAX_FIXTURE_JSON_BYTES
+        elif source.name == "task-fixture.log":
+            file_limit = MAX_TASK_FIXTURE_LOG_BYTES
         if source.name.endswith(".export.log"):
             file_limit = MAX_ATTACHMENT_EXPORT_LOG_BYTES
         elif source.name == "xcresult-attachment-export.json":
@@ -1596,6 +1886,12 @@ def _stage_artifacts(
             "xcresult-failure-screenshot.png.export.log",
             "result-validation.json",
             "server.log",
+            "task-fixture-build.log",
+            "task-fixture-bin-path.log",
+            "task-fixture.log",
+            "task-fixture-ready.json",
+            "task-fixture-metrics.json",
+            "task-fixture-validation.json",
             "xcodebuild.log",
         ):
             source = work_dir / "logs" / source_name
@@ -1636,6 +1932,29 @@ def _simulator_destination(udid: str) -> str:
     return f"platform=tvOS Simulator,id={udid}"
 
 
+def resolve_work_deadline(configured_deadline: str | None = None) -> float:
+    now = time.monotonic()
+    deadline = now + TOTAL_RUN_BUDGET_SECONDS
+    if configured_deadline is not None:
+        try:
+            job_deadline = float(configured_deadline)
+        except (TypeError, ValueError, OverflowError):
+            raise UIE2EError("UI E2E work budget is invalid.") from None
+        if not math.isfinite(job_deadline):
+            raise UIE2EError("UI E2E work budget is invalid.")
+        deadline = min(deadline, job_deadline)
+    if deadline <= now:
+        raise UIE2EError("UI E2E work budget has expired.")
+    return deadline
+
+
+def require_work_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise UIE2EError("UI E2E work budget has expired.")
+    return remaining
+
+
 def run_ui_e2e(platform: str) -> int:
     if platform not in PLATFORMS:
         raise UIE2EError(f"Unsupported UI E2E platform: {platform}")
@@ -1667,8 +1986,12 @@ def run_ui_e2e(platform: str) -> int:
     )
 
     with cleanup:
+            run_deadline = resolve_work_deadline(
+                os.environ.get("UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
+            )
             mute_system_audio(logs_dir)
             log("macOS system output mute is set and verified.")
+            require_work_remaining(run_deadline)
             _record_tool_inventory(platform, logs_dir, runner_log)
 
             scheme_path = (
@@ -1681,6 +2004,14 @@ def run_ui_e2e(platform: str) -> int:
             verify_scheme_contract(scheme_path, config.test_target)
             log(f"validated shared scheme and endpoint mapping: {config.scheme}")
 
+            build_seconds = min(
+                FIXTURE_BUILD_TIMEOUT_SECONDS,
+                require_work_remaining(run_deadline),
+            )
+            task_fixture_binary = build_task_fixture(logs_dir, timeout_seconds=build_seconds)
+            log(f"built SwiftPM debug product {TASK_FIXTURE_PRODUCT}.")
+
+            require_work_remaining(run_deadline)
             server_binary = resolve_server_binary()
             log(f"using existing cache server binary: {server_binary.name}")
             cache_dir = create_fixture_media(work_dir, logs_dir)
@@ -1688,6 +2019,7 @@ def run_ui_e2e(platform: str) -> int:
             state_dir.mkdir(mode=0o700)
             grpc_port, media_port = allocate_loopback_ports()
             endpoint = validate_server_address(f"http://127.0.0.1:{grpc_port}")
+            require_work_remaining(run_deadline)
             server = BoundedOwnedProcess(
                 build_server_argv(
                     server_binary,
@@ -1707,7 +2039,38 @@ def run_ui_e2e(platform: str) -> int:
                 f"owned cache server is ready on loopback; 55 fixtures at {cache_dir.name}."
             )
 
+            media_url = build_rust_fixture_media_url(media_port)
+            verify_media_fixture_url(
+                media_url,
+                (cache_dir / "Fixture 055.mp4").stat().st_size,
+            )
+            ready_file = logs_dir / "task-fixture-ready.json"
+            metrics_file = logs_dir / "task-fixture-metrics.json"
+            require_work_remaining(run_deadline)
+            task_fixture = BoundedOwnedProcess(
+                build_task_fixture_command(
+                    task_fixture_binary,
+                    ready_file=ready_file,
+                    metrics_file=metrics_file,
+                    media_url=media_url,
+                ),
+                log_path=logs_dir / "task-fixture.log",
+                max_output_bytes=MAX_TASK_FIXTURE_LOG_BYTES,
+            )
+            task_fixture_stopped = False
+
+            def stop_task_fixture() -> None:
+                nonlocal task_fixture_stopped
+                if not task_fixture_stopped:
+                    task_fixture.stop()
+                    task_fixture_stopped = True
+
+            cleanup.defer("owned Swift task fixture", stop_task_fixture)
+            task_endpoint = wait_for_task_fixture(task_fixture, ready_file)
+            log("owned Swift task fixture is ready on loopback.")
+
             if platform == "tvos":
+                require_work_remaining(run_deadline)
                 simulator_udid = create_owned_tvos_simulator(
                     logs_dir=logs_dir, cleanup=cleanup
                 )
@@ -1726,6 +2089,7 @@ def run_ui_e2e(platform: str) -> int:
             command = build_xcodebuild_command(
                 platform=platform,
                 server_address=endpoint,
+                task_server_address=task_endpoint,
                 app_bundle_identifier=(
                     f"dev.joey.tvos-net-player.uie2e.{uuid.uuid4().hex}"
                 ),
@@ -1735,12 +2099,14 @@ def run_ui_e2e(platform: str) -> int:
             )
             child_env = os.environ.copy()
             child_env["UI_E2E_SERVER_ADDRESS"] = endpoint
+            child_env["UI_E2E_TASK_SERVER_ADDRESS"] = task_endpoint
             xcode_log = logs_dir / "xcodebuild.log"
             log("starting actual xcodebuild test execution.")
+            test_timeout = min(COMMAND_TIMEOUT_SECONDS, require_work_remaining(run_deadline))
             xcode_result = run_process(
                 command,
                 log_path=xcode_log,
-                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+                timeout_seconds=test_timeout,
                 max_output_bytes=MAX_COMMAND_LOG_BYTES,
                 env=child_env,
                 cwd=ROOT,
@@ -1751,7 +2117,16 @@ def run_ui_e2e(platform: str) -> int:
                 logs_dir=logs_dir,
                 expected_target=config.test_target,
                 log=log,
+                expected_cases=EXPECTED_CASES_BY_PLATFORM[platform],
             )
+            if not task_fixture.is_running():
+                raise UIE2EError("Owned task fixture exited before UI test completion.")
+            stop_task_fixture()
+            metrics = validate_task_fixture_metrics(
+                _read_bounded_json(metrics_file, description="Task fixture metrics")
+            )
+            _write_json(logs_dir / "task-fixture-validation.json", metrics)
+            log("task fixture metrics prove one task creation and successful watch/output coverage per scenario.")
             log(
                 "xcresult proves target execution: "
                 f"{counts['target_passed']} passed, "

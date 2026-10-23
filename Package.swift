@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .library(name: "TVOSNetPlayerCore", targets: ["TVOSNetPlayerCore"]),
         .library(name: "TVOSNetPlayerCacheClient", targets: ["TVOSNetPlayerCacheClient"]),
+        .executable(name: "task-watch-ui-fixture", targets: ["TaskWatchUIFixture"]),
     ],
     dependencies: [
         .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.4.1"),
@@ -55,6 +56,30 @@ let package = Package(
                 .product(name: "GRPCCore", package: "grpc-swift-2"),
             ],
             path: "Tests/TVOSNetPlayerCacheClientTests"
+        ),
+        .executableTarget(
+            name: "TaskWatchUIFixture",
+            dependencies: [
+                "TVOSNetPlayerCacheClient",
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+                .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            path: "Sources/TaskWatchUIFixture"
+        ),
+        .testTarget(
+            name: "TaskWatchUIFixtureTests",
+            dependencies: [
+                "TaskWatchUIFixture",
+                "TVOSNetPlayerCore",
+                "TVOSNetPlayerCacheClient",
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+                .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            path: "Tests/TaskWatchUIFixtureTests"
         ),
     ]
 )

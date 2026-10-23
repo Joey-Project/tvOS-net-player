@@ -44,6 +44,7 @@
       shouldAutocreateTestPlan = "YES">
       <EnvironmentVariables>
          <EnvironmentVariable key="UI_E2E_SERVER_ADDRESS" value="$(UI_E2E_SERVER_ADDRESS)" isEnabled="YES" />
+         <EnvironmentVariable key="UI_E2E_TASK_SERVER_ADDRESS" value="$(UI_E2E_TASK_SERVER_ADDRESS)" isEnabled="YES" />
       </EnvironmentVariables>
       <Testables>
          <TestableReference skipped = "NO">
