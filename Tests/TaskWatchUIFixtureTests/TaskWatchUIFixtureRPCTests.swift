@@ -269,6 +269,9 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
                 let duplicateOptions = options
 
                 for phase in 0..<2 {
+                    let initialSnapshot = self.expectation(
+                        description: "silent watch \(phase) sends its initial snapshot"
+                    )
                     let finished = self.expectation(description: "silent watch \(phase) is cancelled")
                     var watchDidFinish = false
                     let watch = Task { @MainActor in
@@ -281,8 +284,23 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
                         while !Task.isCancelled {
                             do {
                                 try await service.watchTasks(watchRequest, options: watchOptions) { response in
-                                    for try await _ in response.messages {
-                                        XCTFail("The silent watch unexpectedly emitted an event.")
+                                    var eventCount = 0
+                                    for try await event in response.messages {
+                                        eventCount += 1
+                                        XCTAssertEqual(eventCount, 1, "The silent watch emitted a subsequent event.")
+                                        XCTAssertTrue(event.hasTask)
+                                        XCTAssertEqual(event.task.id, FixtureScenario.silent.taskID)
+                                        XCTAssertEqual(event.task.state, .playable)
+                                        XCTAssertEqual(event.task.progress, 0.42)
+                                        XCTAssertTrue(event.task.hasOutputSummary)
+                                        XCTAssertEqual(event.task.outputSummary.revision, 1)
+                                        XCTAssertEqual(
+                                            event.task.outputSummary.primaryResultID,
+                                            FixtureScenario.silent.resultID
+                                        )
+                                        if eventCount == 1 {
+                                            initialSnapshot.fulfill()
+                                        }
                                     }
                                 }
                                 if !Task.isCancelled {
@@ -315,6 +333,14 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
                     }
                     XCTAssertTrue(opened, "Cancellation did not release the previous silent watch's ownership.")
                     guard opened else { return }
+                    let snapshotReceived = await XCTWaiter.fulfillment(of: [initialSnapshot], timeout: 3)
+                    XCTAssertEqual(
+                        snapshotReceived,
+                        .completed,
+                        "The accepted silent watch did not send its initial snapshot."
+                    )
+                    guard snapshotReceived == .completed else { return }
+                    XCTAssertFalse(watchDidFinish, "The initial snapshot ended the accepted silent watch.")
 
                     do {
                         try await service.watchTasks(watchRequest, options: duplicateOptions) { response in

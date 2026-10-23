@@ -21,6 +21,7 @@ superseded_by:
 ## Reconciliation Contract
 - An open watch with no messages is not proof of failure. After a quiet observation window, read the original task through the existing bounded `GetTask` operation.
 - Use a conservative default 30-second observation interval. Accepted watch activity, including identical valid snapshots, defers the idle read. Tests may inject a shorter interval or a cancellation-aware sleeper.
+- Measure the quiet deadline from the latest accepted watch event using monotonic time, rather than adding a full interval when a periodic tick notices activity. An immediate subscription snapshot must not double the initial quiet window; later events wait only the remainder of their own quiet window.
 - Successful unchanged reads keep the existing subscription and healthy presentation. They do not consume reconnect attempts, show an error or restart playback.
 - Keep at most one idle reconciliation read active. Cancel its lifecycle before genuine stream-recovery reads and on clear, replacement, terminal completion or teardown. Pause new idle reads during an in-flight cancellation request and invalidate older responses; preserve authoritative observation when cancellation remains unconfirmed or pending.
 - Bind every asynchronous result to the original task, operation and observation generation. Reuse snapshot-generation and output-revision fences so a late unary result cannot replace a newer watched snapshot or resurrect cancelled work.
@@ -34,6 +35,7 @@ superseded_by:
 - Test server streams await the pinned gRPC library's explicit RPC cancellation handle. A closed RPC does not necessarily cancel its producer's Swift task; release per-RPC ownership on normal cancellation and error rather than leaving a manual continuation suspended.
 - Add a native silent-watch playback scenario on both platforms, retaining all existing cases and assertions. Require actual named-case execution plus independent fixture metrics; do not accept a green job with missing cases.
 - Native acceptance should span unchanged and changed idle reads while real fixture playback advances, using the normal interval when practical. Keep media long enough for the observed window and all fixture resources bounded and owned.
+- The silent native fixture mirrors the production server's immediate initial watch snapshot and then emits no more stream events. Keep its existing terminal-wait deadline so a doubled first quiet window fails the native regression instead of being hidden by a more permissive timeout.
 - Freeze all writers before complete validation. Require the complete local test/lint/format/build set, actual current-head ordinary and native UI CI, current-head GitHub Codex review and resolution of every conversation before authorized merge.
 - Verify output mute before any local media test and keep it muted afterward. Deterministic tests use no real Bilibili credential or public service.
 
@@ -48,6 +50,6 @@ superseded_by:
 
 ## Delivery State
 - Shared AppCore now reconciles quiet task watches without resubmission or healthy-watch reconnection. Both native UI suites include a fourth named silent-watch playback case, with strict independent fixture metrics.
-- Focused local validation passed 151 Swift cases, including the normal-interval silent fixture, real HTTP/2 cancellation and subscription reuse. All 103 Python helper regressions and repository pre-commit lint/format checks passed on the same unchanged source inputs.
+- Focused local validation passed 152 Swift cases, including monotonic quiet-deadline boundaries, the normal-interval initial-snapshot fixture, real HTTP/2 cancellation and subscription reuse. All 103 Python helper regressions and repository pre-commit lint/format checks passed on the same unchanged source inputs.
 - Full local CI, actual current-head GitHub ordinary/native UI CI and GitHub Codex review remain mandatory delivery gates. Focused tests do not substitute for those gates or live Bilibili acceptance.
 - PR-specific head, checks, review, approval and merge receipts belong in PR metadata and ignored local evidence, not this squash-merge target-branch journal.

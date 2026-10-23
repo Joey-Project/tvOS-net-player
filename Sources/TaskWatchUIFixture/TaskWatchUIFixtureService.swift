@@ -192,6 +192,13 @@ package struct TaskWatchUIFixtureService: RegistrableRPCService, Sendable {
                     let watchID = try await runtime.openSilentWatch()
                     do {
                         try await Self.recordWatchStreamOpen(scenario: scenario, metrics: metrics)
+                        var event = TvosNetPlayer_V1_TaskEvent()
+                        event.task = Self.task(
+                            for: scenario,
+                            runtimeState: await runtime.state(for: scenario),
+                            mediaURL: mediaURL
+                        )
+                        try await writer.write(event)
                         // RPC cancellation does not necessarily cancel the producer's Swift task.
                         try await cancellation.cancelled
                     } catch {

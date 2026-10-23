@@ -4177,6 +4177,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1silent-output",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4206,6 +4207,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
     func testSilentWatchReconciliationKeepsHealthyIdenticalSnapshotWithoutResubscribing() async {
         let taskID = "bilibili-playback-1"
         let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
         let initialTask = CacheTask.fixture(source: "BV1silent-healthy", state: "TASK_STATE_PREPARING")
         let client = FakeBilibiliCacheControlClient(
             createResponses: [.success(initialTask)],
@@ -4214,6 +4216,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1silent-healthy",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4230,9 +4233,12 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let taskIDs = await client.getTaskIDsSnapshot()
         let subscriptionCount = await client.watchSubscriptionCountSnapshot()
         let submittedTasks = await client.v2TaskRequestsSnapshot()
+        let intervals = await sleeper.intervalsSnapshot()
         XCTAssertEqual(taskIDs, Array(repeating: taskID, count: 3))
         XCTAssertEqual(subscriptionCount, 1)
         XCTAssertEqual(submittedTasks.count, 1)
+        XCTAssertEqual(intervals, Array(repeating: .seconds(30), count: 4))
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(90))
         XCTAssertEqual(model.currentTask, initialTask)
         XCTAssertTrue(model.isWatching)
         XCTAssertFalse(model.isReconnecting)
@@ -4242,9 +4248,10 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
-    func testAcceptedIdenticalWatchActivityDefersTheIdleProbe() async {
+    func testImmediateInitialWatchSnapshotProbesAfterOneQuietInterval() async {
         let taskID = "bilibili-playback-1"
         let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
         let initialTask = CacheTask.fixture(source: "BV1identical-activity", state: "TASK_STATE_PREPARING")
         let client = FakeBilibiliCacheControlClient(
             createResponses: [.success(initialTask)],
@@ -4253,8 +4260,10 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1identical-activity",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
+        defer { model.clearTask() }
 
         await model.submit(serverAddressText: "mac-mini.local:50051")
         await client.waitForWatchSubscription()
@@ -4270,19 +4279,110 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         observation.cancel()
 
         await sleeper.advanceNext()
+        let probeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 1
+        }
+        XCTAssertTrue(probeArrived, "Expected the first idle read after one quiet interval.")
+        guard probeArrived else { return }
         await sleeper.waitForSleepCount(2)
-        var taskIDs = await client.getTaskIDsSnapshot()
-        XCTAssertTrue(taskIDs.isEmpty)
-
-        await sleeper.advanceNext()
-        await client.waitForGetTaskRequestCount(1)
-        await sleeper.waitForSleepCount(3)
-        taskIDs = await client.getTaskIDsSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let intervals = await sleeper.intervalsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let createdTasks = await client.v2TaskRequestsSnapshot()
+        let cancelledTaskIDs = await client.cancelledIDsSnapshot()
         XCTAssertEqual(taskIDs, [taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(30)])
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(30))
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertEqual(createdTasks.count, 1)
+        XCTAssertTrue(cancelledTaskIDs.isEmpty)
         XCTAssertTrue(model.isWatching)
         XCTAssertNil(model.watchErrorMessage)
+    }
 
-        model.clearTask()
+    func testIdenticalWatchActivityNearDeadlineSleepsOnlyRemainingQuietTime() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
+        let initialTask = CacheTask.fixture(source: "BV1near-deadline", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: [.success(initialTask), .success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1near-deadline",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+        defer { model.clearTask() }
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        sleeper.clock.advance(by: .seconds(29))
+
+        let firstHeartbeat = expectation(description: "identical heartbeat at 29 seconds accepted")
+        firstHeartbeat.assertForOverFulfill = false
+        let firstObservation = model.objectWillChange.sink { firstHeartbeat.fulfill() }
+        await client.yield(initialTask)
+        await fulfillment(of: [firstHeartbeat], timeout: 1)
+        firstObservation.cancel()
+
+        await sleeper.advanceNext()
+        await sleeper.waitForSleepCount(2)
+        var taskIDs = await client.getTaskIDsSnapshot()
+        var intervals = await sleeper.intervalsSnapshot()
+        XCTAssertTrue(taskIDs.isEmpty)
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29)])
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(30))
+
+        await sleeper.advanceNext()
+        let firstProbeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 1
+        }
+        XCTAssertTrue(firstProbeArrived, "Expected the idle read at 59 virtual seconds.")
+        guard firstProbeArrived else { return }
+        await sleeper.waitForSleepCount(3)
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(59))
+
+        sleeper.clock.advance(by: .seconds(29))
+        let secondHeartbeat = expectation(description: "repeated identical heartbeat at 88 seconds accepted")
+        secondHeartbeat.assertForOverFulfill = false
+        let secondObservation = model.objectWillChange.sink { secondHeartbeat.fulfill() }
+        await client.yield(initialTask)
+        await fulfillment(of: [secondHeartbeat], timeout: 1)
+        secondObservation.cancel()
+
+        await sleeper.advanceNext()
+        await sleeper.waitForSleepCount(4)
+        taskIDs = await client.getTaskIDsSnapshot()
+        intervals = await sleeper.intervalsSnapshot()
+        XCTAssertEqual(taskIDs, [taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29), .seconds(30), .seconds(29)])
+
+        await sleeper.advanceNext()
+        let secondProbeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 2
+        }
+        XCTAssertTrue(secondProbeArrived, "Expected the idle read after repeated identical activity.")
+        guard secondProbeArrived else { return }
+        await sleeper.waitForSleepCount(5)
+        taskIDs = await client.getTaskIDsSnapshot()
+        intervals = await sleeper.intervalsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let createdTasks = await client.v2TaskRequestsSnapshot()
+        let cancelledTaskIDs = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(118))
+        XCTAssertEqual(taskIDs, [taskID, taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29), .seconds(30), .seconds(29), .seconds(30)])
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertEqual(createdTasks.count, 1)
+        XCTAssertTrue(cancelledTaskIDs.isEmpty)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertNil(model.watchErrorMessage)
     }
 
     func testSuspendedIdleProbeDoesNotOverlapAnotherTick() async {
@@ -4296,6 +4396,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1singleflight",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4306,7 +4407,6 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         await client.waitForGetTaskRequestCount(1)
 
         await sleeper.advanceNext()
-        await Task.yield()
         let taskIDsWhileSuspended = await client.getTaskIDsSnapshot()
         let sleepsWhileSuspended = await sleeper.sleepCountSnapshot()
         XCTAssertEqual(taskIDsWhileSuspended.count, 1)
@@ -4331,6 +4431,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1idle-race",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4388,6 +4489,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1idle-cancel",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4487,6 +4589,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1idle-retry",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4523,6 +4626,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1recover-silent",
             watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
             watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4575,6 +4679,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1idle-budget",
             watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
             watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4634,6 +4739,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1idle-budget-exhaustion",
             watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
             watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4707,6 +4813,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             sourceText: "BV1idle-progress",
             watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
             watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4749,6 +4856,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1idle-fatal",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4781,6 +4889,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         let model = BilibiliTaskViewModel(
             sourceText: "BV1idle-old",
             watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
             clientFactory: { _ in client }
         )
 
@@ -4822,6 +4931,7 @@ final class BilibiliTaskViewModelTests: XCTestCase {
             let model = BilibiliTaskViewModel(
                 sourceText: "BV1idle-deinit",
                 watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+                watchReconciliationNow: { sleeper.clock.now() },
                 clientFactory: { _ in client }
             )
             weakModel = model
@@ -5406,6 +5516,21 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    private func waitForTaskWatchCondition(
+        timeout: Duration,
+        _ condition: @MainActor () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
+
     private func waitUntil(
         _ condition: @autoclosure @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,
@@ -5469,9 +5594,28 @@ private actor TaskWatchRecoverySleepRecorder {
     }
 }
 
+private final class TaskWatchReconciliationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    func now() -> ContinuousClock.Instant {
+        lock.withLock { instant }
+    }
+
+    func advance(by duration: Duration) {
+        lock.withLock { instant = instant.advanced(by: duration) }
+    }
+
+    func advance(to deadline: ContinuousClock.Instant) {
+        lock.withLock { instant = max(instant, deadline) }
+    }
+}
+
 private actor TaskWatchReconciliationSleepGate {
+    nonisolated let clock = TaskWatchReconciliationClock()
     private var intervals: [Duration] = []
-    private var sleepers: [(id: UUID, continuation: CheckedContinuation<Void, Never>)] = []
+    private var sleepers:
+        [(id: UUID, deadline: ContinuousClock.Instant, continuation: CheckedContinuation<Void, Never>)] = []
     private var activeSleeperWaiters: [CheckedContinuation<Void, Never>] = []
     private var sleepCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var cancellationCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
@@ -5482,7 +5626,7 @@ private actor TaskWatchReconciliationSleepGate {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 intervals.append(interval)
-                sleepers.append((id, continuation))
+                sleepers.append((id, clock.now().advanced(by: interval), continuation))
                 let activeWaiters = activeSleeperWaiters
                 activeSleeperWaiters = []
                 activeWaiters.forEach { $0.resume() }
@@ -5520,11 +5664,17 @@ private actor TaskWatchReconciliationSleepGate {
         guard !sleepers.isEmpty else {
             return
         }
-        sleepers.removeFirst().continuation.resume()
+        let sleeper = sleepers.removeFirst()
+        clock.advance(to: sleeper.deadline)
+        sleeper.continuation.resume()
     }
 
     func sleepCountSnapshot() -> Int {
         intervals.count
+    }
+
+    func intervalsSnapshot() -> [Duration] {
+        intervals
     }
 
     func waitForCancellationCount(_ count: Int) async {
