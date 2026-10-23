@@ -435,7 +435,7 @@ final class UIPlaybackTests: XCTestCase {
                 return true
             }
             return play.exists && play.isEnabled
-                && status(taskStatus, contains: "Playable fixture output is available.")
+                && status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
         }
         XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
         XCTAssertTrue(

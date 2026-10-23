@@ -163,6 +163,7 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
             }
             XCTAssertTrue(playable, "The silent task did not expose its initial playable output and open watch.")
             guard playable else { return }
+            XCTAssertEqual(model.statusMessage, "\(FixtureScenario.silent.title) is ready to play.")
             XCTAssertNil(model.watchErrorMessage)
             XCTAssertFalse(model.isReconnecting)
             XCTAssertFalse(model.canRetryTaskUpdates)
@@ -184,6 +185,7 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
             )
             guard unchangedReadObserved, !observedFalseWatchState else { return }
             XCTAssertEqual(model.currentTask?.message, "Playable fixture output is available.")
+            XCTAssertEqual(model.statusMessage, "\(FixtureScenario.silent.title) is ready to play.")
             XCTAssertEqual(model.currentTask?.progress, 0.42)
             XCTAssertEqual(model.currentTask?.outputSummary?.revision, 1)
             XCTAssertTrue(model.isWatching)
@@ -206,6 +208,8 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
             guard completed, !observedFalseWatchState else { return }
 
             XCTAssertEqual(model.currentTask?.id, FixtureScenario.silent.taskID)
+            XCTAssertEqual(model.currentTask?.message, "Silent task reconciliation complete")
+            XCTAssertEqual(model.statusMessage, "Silent task reconciliation complete")
             XCTAssertEqual(model.currentTask?.progress, 1)
             XCTAssertEqual(model.currentTask?.outputSummary?.revision, 2)
             XCTAssertNil(model.watchErrorMessage)
