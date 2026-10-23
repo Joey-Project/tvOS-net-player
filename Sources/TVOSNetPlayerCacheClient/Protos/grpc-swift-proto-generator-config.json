@@ -5,7 +5,7 @@
     "messages": true
   },
   "generatedSource": {
-    "accessLevel": "internal"
+    "accessLevel": "package"
   },
   "protoc": {
     "importPaths": [

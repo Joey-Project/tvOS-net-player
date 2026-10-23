@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class UIPlaybackTests: XCTestCase {
     private enum SetupError: Error {
-        case missingServerAddress
+        case missingServerAddress(String)
     }
 
     private var app: XCUIApplication!
@@ -17,12 +17,16 @@ final class UIPlaybackTests: XCTestCase {
         try await MainActor.run {
             continueAfterFailure = false
 
+            let addressVariable =
+                name.contains("testConnectBrowseAndControlRealPlayback")
+                ? "UI_E2E_SERVER_ADDRESS"
+                : "UI_E2E_TASK_SERVER_ADDRESS"
             guard
-                let address = ProcessInfo.processInfo.environment["UI_E2E_SERVER_ADDRESS"]?
+                let address = ProcessInfo.processInfo.environment[addressVariable]?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                 !address.isEmpty
             else {
-                throw SetupError.missingServerAddress
+                throw SetupError.missingServerAddress(addressVariable)
             }
 
             serverAddress = address
@@ -331,6 +335,101 @@ final class UIPlaybackTests: XCTestCase {
             "The timeline did not advance after resuming the paused terminal seek. \(accessibilityDescription(timeline))"
         )
         XCTAssertTrue(radioButtonIsSelected(twoX), "Resume after a paused terminal seek should preserve 2x speed.")
+    }
+
+    func testAutomaticTaskWatchRecoversWithoutResubmission() throws {
+        try prepareTaskWatchScenario(source: "BV1QtjA6BEB8")
+        clickVisible(app.buttons["bilibili-submit"], scrollingIn: app.scrollViews["player-control-scroll"])
+
+        let reconnecting = identifiedElement("bilibili.watch.status")
+        XCTAssertTrue(
+            waitUntil(timeout: 6) { reconnecting.exists },
+            "Automatic watch recovery was not shown promptly after the single task submission. "
+                + accessibilityDescription(identifiedElement("bilibili-task-status"))
+        )
+        XCTAssertTrue(status(reconnecting, contains: "Reconnecting task updates"))
+
+        let taskStatus = identifiedElement("bilibili-task-status")
+        XCTAssertTrue(
+            waitUntil(timeout: 60) {
+                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
+                    && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
+            },
+            "The original task did not reach the fixture's automatic-recovery terminal status. "
+                + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(reconnecting.exists, "The terminal task must stop showing a reconnecting state.")
+        XCTAssertFalse(
+            identifiedElement("bilibili.watch.error").exists, "A recovered task must not retain a watch error.")
+        XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists, "A terminal task must not offer watch retry.")
+    }
+
+    func testManualTaskWatchReconnectPreservesPlayback() throws {
+        try prepareTaskWatchScenario(source: "BV1uW4y1s7zN")
+        clickVisible(app.buttons["bilibili-submit"], scrollingIn: app.scrollViews["player-control-scroll"])
+
+        let watchError = identifiedElement("bilibili.watch.error")
+        let reconnect = identifiedElement("bilibili.watch.retry")
+        let reconnecting = identifiedElement("bilibili.watch.status")
+        XCTAssertTrue(
+            waitUntil(timeout: 100) { watchError.exists && reconnect.exists && !reconnecting.exists },
+            "Automatic task-watch retries did not stop with an error and manual reconnect control. "
+                + accessibilityDescription(identifiedElement("bilibili-task-status"))
+        )
+        XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
+        XCTAssertFalse(reconnecting.exists)
+
+        let controls = app.scrollViews["player-control-scroll"]
+        let play = app.buttons["bilibili-play"]
+        XCTAssertTrue(waitUntil(timeout: 10) { play.exists && play.isEnabled }, accessibilityDescription(play))
+        clickVisible(play, scrollingIn: controls)
+
+        let timeline = identifiedElement("playback-timeline")
+        let playbackState = identifiedElement("playback-state")
+        XCTAssertTrue(timeline.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 20))
+        let beforeOfflineProgress = try XCTUnwrap(waitForTimeline(timeout: 15) { $0 >= 2 })
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= beforeOfflineProgress + 1.5 },
+            "The available task media did not advance while task updates remained unavailable. "
+                + accessibilityDescription(timeline)
+        )
+        XCTAssertTrue(watchError.exists, "The watch error should remain visible until manual reconnection.")
+
+        let beforeReconnect = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        clickVisible(reconnect, scrollingIn: controls)
+        let taskStatus = identifiedElement("bilibili-task-status")
+        XCTAssertTrue(
+            waitUntil(timeout: 60) {
+                status(taskStatus, contains: "Playing Manual recovery fixture.")
+                    && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
+            },
+            "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(watchError.exists, "Successful manual reconnection must clear the stale watch warning.")
+        XCTAssertFalse(identifiedElement("bilibili.watch.retry").exists)
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 10))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= beforeReconnect + 1 },
+            "Playback did not remain progressing across manual task-watch reconnection. "
+                + accessibilityDescription(timeline)
+        )
+    }
+
+    private func prepareTaskWatchScenario(source: String) throws {
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(addressField.waitForExistence(timeout: 15))
+        XCTAssertTrue(
+            serverAddressIsEmpty(addressField), "Unexpected initial address: \(accessibilityDescription(addressField))")
+        clickVisible(addressField)
+        addressField.typeText(serverAddress)
+
+        let controls = app.scrollViews["player-control-scroll"]
+        let sourceField = app.textFields["bilibili-source"]
+        clickVisible(sourceField, scrollingIn: controls)
+        XCTAssertTrue(
+            serverAddressIsEmpty(sourceField), "Unexpected initial source: \(accessibilityDescription(sourceField))")
+        sourceField.typeText(source)
     }
 
     private func pausedSeekBaseline(state: XCUIElement, timeline: XCUIElement, action: String) throws -> Double {
