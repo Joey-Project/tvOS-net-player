@@ -460,8 +460,8 @@ class CleanupTests(unittest.TestCase):
 class WorkBudgetTests(unittest.TestCase):
     def test_absent_job_deadline_uses_local_cap(self) -> None:
         with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
-            self.assertEqual(ui_e2e.resolve_work_deadline(), 100 + 25 * 60)
-        self.assertEqual(ui_e2e.FIXTURE_BUILD_TIMEOUT_SECONDS, 12 * 60)
+            self.assertEqual(ui_e2e.resolve_work_deadline(), 100 + 35 * 60)
+        self.assertEqual(ui_e2e.FIXTURE_BUILD_TIMEOUT_SECONDS, 15 * 60)
 
     def test_earlier_job_deadline_limits_local_work(self) -> None:
         with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
@@ -469,7 +469,7 @@ class WorkBudgetTests(unittest.TestCase):
 
     def test_later_job_deadline_cannot_extend_local_cap(self) -> None:
         with mock.patch.object(ui_e2e.time, "monotonic", return_value=100):
-            self.assertEqual(ui_e2e.resolve_work_deadline("10000"), 100 + 25 * 60)
+            self.assertEqual(ui_e2e.resolve_work_deadline("10000"), 100 + 35 * 60)
 
     def test_expired_job_deadlines_are_rejected(self) -> None:
         for deadline in ("100", "99", "0", "-1"):
@@ -561,6 +561,7 @@ class WorkBudgetTests(unittest.TestCase):
 
     def test_workflow_deadline_is_first_and_exports_same_host_monotonic_time(self) -> None:
         workflow = (ui_e2e.ROOT / ".github" / "workflows" / "ui-e2e.yml").read_text()
+        self.assertIn("    timeout-minutes: 60\n", workflow.split("    steps:\n", 1)[0])
         first_step = workflow.split("    steps:\n", 1)[1].split("\n      - name:", 1)[0]
         lines = first_step.splitlines()
         self.assertEqual(lines[0], "      - name: Establish UI E2E work deadline")
@@ -581,8 +582,8 @@ class WorkBudgetTests(unittest.TestCase):
             )
             name, value = env_file.read_text().strip().split("=", 1)
             self.assertEqual(name, "UI_E2E_JOB_WORK_DEADLINE_MONOTONIC")
-            self.assertGreaterEqual(float(value), started + 30 * 60)
-            self.assertLessEqual(float(value), ui_e2e.time.monotonic() + 30 * 60)
+            self.assertGreaterEqual(float(value), started + 45 * 60)
+            self.assertLessEqual(float(value), ui_e2e.time.monotonic() + 45 * 60)
 
 
 class RunnerContractTests(unittest.TestCase):

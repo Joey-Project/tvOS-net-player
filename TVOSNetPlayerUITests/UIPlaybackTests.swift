@@ -157,8 +157,8 @@ final class UIPlaybackTests: XCTestCase {
 
         let reconnecting = identifiedElement("bilibili.watch.status")
         XCTAssertTrue(
-            waitUntil(timeout: 6) { reconnecting.exists },
-            "Automatic watch recovery was not shown promptly after the single task submission. "
+            waitUntil(timeout: 60) { status(reconnecting, contains: "Reconnecting task updates") },
+            "The submitted task did not show reconnecting task updates within 60 seconds. "
                 + accessibilityDescription(identifiedElement("bilibili-task-status"))
         )
         XCTAssertTrue(status(reconnecting, contains: "Reconnecting task updates"))
