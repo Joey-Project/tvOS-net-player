@@ -165,7 +165,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
+                status(taskStatus, contains: "Automatic recovery complete")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
@@ -193,8 +193,11 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
         XCTAssertFalse(reconnecting.exists)
 
-        let play = app.buttons["bilibili-play"]
-        XCTAssertTrue(focusDown(until: play, limit: 80), "Remote focus could not reach the visible Play control.")
+        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
+        XCTAssertTrue(
+            moveFocus(until: play, direction: .up, limit: 20),
+            "Remote focus could not reach the visible result Play control. " + taskWatchFocusDescription(target: play)
+        )
         XCTAssertTrue(play.isEnabled, "The fixture's task media must be playable while updates are unavailable.")
         XCUIRemote.shared.press(.select)
 
@@ -213,7 +216,8 @@ final class UIPlaybackTests: XCTestCase {
         let beforeReconnect = try XCTUnwrap(timelineSeconds())
         XCTAssertTrue(
             moveFocus(until: reconnect, direction: .up, limit: 20),
-            "Remote focus could not return to Reconnect Updates from the player controls."
+            "Remote focus could not return to Reconnect Updates from the result Play control. "
+                + taskWatchFocusDescription(target: reconnect)
         )
         XCUIRemote.shared.press(.select)
         let taskStatus = identifiedElement("bilibili-task-status")
@@ -267,6 +271,15 @@ final class UIPlaybackTests: XCTestCase {
             "Remote focus could not reach the visible Bilibili submit control. \(accessibilityDescription(submit))"
         )
         XCTAssertTrue(submit.isEnabled, "The single-result Bilibili input should be ready for one submission.")
+    }
+
+    private func taskWatchFocusDescription(target: XCUIElement) -> String {
+        let submit = app.buttons["bilibili-submit"]
+        let reconnect = identifiedElement("bilibili.watch.retry")
+        return "targetFocused=\(target.exists && target.hasFocus), "
+            + "submitFocused=\(submit.exists && submit.hasFocus), "
+            + "reconnectFocused=\(reconnect.exists && reconnect.hasFocus); "
+            + "target: \(accessibilityDescription(target))"
     }
 
     private func identifiedElement(_ identifier: String) -> XCUIElement {

@@ -940,6 +940,7 @@ struct ContentView: View {
                                     Label("Play", systemImage: "play.fill")
                                 }
                                 .disabled(!bilibiliModel.canPlay(result: result))
+                                .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                             }
                         }
                     }

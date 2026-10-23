@@ -900,6 +900,7 @@ struct ContentView: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .disabled(!bilibiliModel.canPlay(result: result))
+                                    .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                                 }
 
                                 ForEach(result.artifacts) { artifact in

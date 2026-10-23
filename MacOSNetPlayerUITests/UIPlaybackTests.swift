@@ -352,7 +352,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Automatic recovery fixture is cached for LAN playback.")
+                status(taskStatus, contains: "Automatic recovery complete")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-automatic-result"), contains: "Cached")
             },
             "The original task did not reach the fixture's automatic-recovery terminal status. "
@@ -380,7 +380,7 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(reconnecting.exists)
 
         let controls = app.scrollViews["player-control-scroll"]
-        let play = app.buttons["bilibili-play"]
+        let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
         XCTAssertTrue(waitUntil(timeout: 10) { play.exists && play.isEnabled }, accessibilityDescription(play))
         clickVisible(play, scrollingIn: controls)
 
