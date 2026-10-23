@@ -376,7 +376,10 @@ final class UIPlaybackTests: XCTestCase {
             "Automatic task-watch retries did not stop with an error and manual reconnect control. "
                 + accessibilityDescription(identifiedElement("bilibili-task-status"))
         )
-        XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
+        XCTAssertTrue(
+            status(watchError, contains: "Task updates could not be restored."),
+            "The exhausted watch error must expose user-visible text. " + accessibilityDescription(watchError)
+        )
         XCTAssertFalse(reconnecting.exists)
 
         let controls = app.scrollViews["player-control-scroll"]
@@ -401,7 +404,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Playing Manual recovery fixture.")
+                status(taskStatus, contains: "Manual recovery complete")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
             },
             "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)

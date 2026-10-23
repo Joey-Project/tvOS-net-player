@@ -229,7 +229,7 @@ final class UIPlaybackTests: XCTestCase {
         let taskStatus = identifiedElement("bilibili-task-status")
         XCTAssertTrue(
             waitUntil(timeout: 60) {
-                status(taskStatus, contains: "Playing Manual recovery fixture.")
+                status(taskStatus, contains: "Manual recovery complete")
                     && status(identifiedElement("bilibili-result-status-ui-e2e-manual-result"), contains: "Cached")
             },
             "Manual reconnect did not finish observing the original task. " + accessibilityDescription(taskStatus)
