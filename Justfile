@@ -15,7 +15,7 @@ build-cache-server:
 build-for-testing:
     scripts/build-for-testing.sh
 
-ci: lint build build-macos build-cache-server build-for-testing test-tvos test test-macos test-lan-playback test-cache-server
+ci: lint test-ci-helpers build build-macos build-cache-server build-for-testing test-tvos test test-macos test-lan-playback test-cache-server
 
 deploy:
     scripts/deploy-lan.sh
@@ -37,6 +37,9 @@ test:
 
 test-cache-server:
     scripts/test-cache-server.sh
+
+test-ci-helpers:
+    python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
 test-bilibili-live:
     scripts/test-bilibili-live.sh
