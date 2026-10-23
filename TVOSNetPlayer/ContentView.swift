@@ -636,6 +636,27 @@ struct ContentView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                    if bilibiliModel.isReconnecting {
+                        Label("Reconnecting task updates", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("bilibili.watch.status")
+                    }
+                    if let message = bilibiliModel.watchErrorMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("bilibili.watch.error")
+                    }
+                    if bilibiliModel.canRetryTaskUpdates {
+                        Button {
+                            bilibiliModel.retryTaskUpdates()
+                        } label: {
+                            Label("Reconnect Updates", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("bilibili.watch.retry")
+                    }
                     if let summary = bilibiliModel.activePlaybackPolicySummary {
                         Text(summary)
                             .font(.caption)

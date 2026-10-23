@@ -39,12 +39,21 @@ let package = Package(
         ),
         .testTarget(
             name: "TVOSNetPlayerCoreTests",
-            dependencies: ["TVOSNetPlayerCore"],
+            dependencies: [
+                "TVOSNetPlayerCore",
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+                .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
             path: "Tests/TVOSNetPlayerCoreTests"
         ),
         .testTarget(
             name: "TVOSNetPlayerCacheClientTests",
-            dependencies: ["TVOSNetPlayerCacheClient"],
+            dependencies: [
+                "TVOSNetPlayerCacheClient",
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+            ],
             path: "Tests/TVOSNetPlayerCacheClientTests"
         ),
     ]
