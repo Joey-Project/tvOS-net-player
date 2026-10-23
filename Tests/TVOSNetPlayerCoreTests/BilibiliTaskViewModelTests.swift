@@ -1,3 +1,4 @@
+import Combine
 import TVOSNetPlayerCacheClient
 import XCTest
 @testable import TVOSNetPlayerCore
@@ -3899,6 +3900,49 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    func testDefaultTaskWatchRecoverySleepReconcilesAndResubscribesOriginalTask() async {
+        let taskID = "default-sleep-task"
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(id: taskID, source: "BV1default-sleep", state: "TASK_STATE_PREPARING"))
+            ],
+            getTaskResponses: [
+                taskID: [
+                    .success(
+                        .fixture(id: taskID, source: "BV1default-sleep", state: "TASK_STATE_RUNNING", progress: 0.5))
+                ]
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1default-sleep",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        let clock = ContinuousClock()
+        let recoveryStarted = clock.now
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await client.waitForGetTaskRequestCount(1)
+        await client.waitForWatchSubscription(count: 2)
+        let recoveryElapsed = recoveryStarted.duration(to: clock.now)
+
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let createdTasks = await client.v2TaskRequestsSnapshot()
+        XCTAssertGreaterThanOrEqual(recoveryElapsed, .seconds(1))
+        XCTAssertEqual(taskIDs, [taskID])
+        XCTAssertEqual(subscriptionCount, 2)
+        XCTAssertEqual(createdTasks.count, 1)
+        XCTAssertEqual(model.currentTask?.id, taskID)
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_RUNNING")
+        XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+        let cancelledTaskIDs = await client.cancelledIDsSnapshot()
+        XCTAssertTrue(cancelledTaskIDs.isEmpty)
+    }
+
     func testTaskWatchRecoveryBackoffIgnoresHeartbeatAndResetsOnProgress() async {
         let taskID = "bilibili-playback-1"
         let sleeper = TaskWatchRecoverySleepRecorder()
@@ -4086,6 +4130,821 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         XCTAssertEqual(reconciledTaskIDs, Array(repeating: taskID, count: 6))
 
         model.clearTask()
+    }
+
+    func testSilentWatchReconciliationAppliesOpenOutputAndTerminalSnapshots() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let outputSummary = CacheTaskOutputSummary(
+            revision: 1,
+            resultCount: 1,
+            terminalResultCount: 1,
+            successfulResultCount: 1,
+            failedResultCount: 0,
+            cancelledResultCount: 0,
+            availableArtifactCount: 0,
+            primaryResultID: "silent-result"
+        )
+        let resultPage = CacheTaskResultsPage(
+            results: [.fixture(id: "silent-result", title: "Silent result")],
+            pageInfo: CachePageInfo(totalSize: 1, nextPageToken: "", snapshotID: "silent-snapshot"),
+            outputRevision: 1
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1silent-output", state: "TASK_STATE_PREPARING"))
+            ],
+            getTaskResponses: [
+                taskID: [
+                    .success(
+                        .fixture(
+                            source: "BV1silent-output",
+                            state: "TASK_STATE_RUNNING",
+                            progress: 0.7,
+                            outputSummary: outputSummary
+                        )),
+                    .success(
+                        .fixture(
+                            source: "BV1silent-output",
+                            state: "TASK_STATE_COMPLETED",
+                            progress: 1,
+                            outputSummary: outputSummary
+                        )),
+                ]
+            ],
+            taskResultPagesByTaskID: [taskID: [resultPage]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1silent-output",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(1)
+        await waitUntil(model.currentTask?.state == "TASK_STATE_RUNNING")
+        await client.waitForTaskResultRequestCount(1)
+        await waitUntil(model.taskResults.map(\.id) == ["silent-result"])
+
+        await sleeper.waitForSleepCount(2)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await waitUntil(!model.isWatching)
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_COMPLETED")
+        XCTAssertEqual(model.currentTask?.outputSummary?.revision, 1)
+        XCTAssertEqual(model.taskResults.map(\.id), ["silent-result"])
+        XCTAssertEqual(model.statusMessage, "Ready video is cached for LAN playback.")
+        XCTAssertNil(model.watchErrorMessage)
+
+        model.clearTask()
+    }
+
+    func testSilentWatchReconciliationKeepsHealthyIdenticalSnapshotWithoutResubscribing() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
+        let initialTask = CacheTask.fixture(source: "BV1silent-healthy", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: Array(repeating: .success(initialTask), count: 3)]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1silent-healthy",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+
+        for tick in 1...3 {
+            await sleeper.waitForSleepCount(tick)
+            await sleeper.advanceNext()
+            await client.waitForGetTaskRequestCount(tick)
+            await sleeper.waitForSleepCount(tick + 1)
+        }
+
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let submittedTasks = await client.v2TaskRequestsSnapshot()
+        let intervals = await sleeper.intervalsSnapshot()
+        XCTAssertEqual(taskIDs, Array(repeating: taskID, count: 3))
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertEqual(submittedTasks.count, 1)
+        XCTAssertEqual(intervals, Array(repeating: .seconds(30), count: 4))
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(90))
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertFalse(model.isReconnecting)
+        XCTAssertNil(model.watchErrorMessage)
+        XCTAssertNil(model.errorMessage)
+
+        model.clearTask()
+    }
+
+    func testImmediateInitialWatchSnapshotProbesAfterOneQuietInterval() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
+        let initialTask = CacheTask.fixture(source: "BV1identical-activity", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: [.success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1identical-activity",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+        defer { model.clearTask() }
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+
+        let snapshotApplied = expectation(description: "identical watch snapshot accepted")
+        snapshotApplied.assertForOverFulfill = false
+        let observation = model.objectWillChange.sink {
+            snapshotApplied.fulfill()
+        }
+        await client.yield(initialTask)
+        await fulfillment(of: [snapshotApplied], timeout: 1)
+        observation.cancel()
+
+        await sleeper.advanceNext()
+        let probeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 1
+        }
+        XCTAssertTrue(probeArrived, "Expected the first idle read after one quiet interval.")
+        guard probeArrived else { return }
+        await sleeper.waitForSleepCount(2)
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let intervals = await sleeper.intervalsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let createdTasks = await client.v2TaskRequestsSnapshot()
+        let cancelledTaskIDs = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(taskIDs, [taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(30)])
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(30))
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertEqual(createdTasks.count, 1)
+        XCTAssertTrue(cancelledTaskIDs.isEmpty)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertNil(model.watchErrorMessage)
+    }
+
+    func testIdenticalWatchActivityNearDeadlineSleepsOnlyRemainingQuietTime() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let startedAt = sleeper.clock.now()
+        let initialTask = CacheTask.fixture(source: "BV1near-deadline", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: [.success(initialTask), .success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1near-deadline",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+        defer { model.clearTask() }
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        sleeper.clock.advance(by: .seconds(29))
+
+        let firstHeartbeat = expectation(description: "identical heartbeat at 29 seconds accepted")
+        firstHeartbeat.assertForOverFulfill = false
+        let firstObservation = model.objectWillChange.sink { firstHeartbeat.fulfill() }
+        await client.yield(initialTask)
+        await fulfillment(of: [firstHeartbeat], timeout: 1)
+        firstObservation.cancel()
+
+        await sleeper.advanceNext()
+        await sleeper.waitForSleepCount(2)
+        var taskIDs = await client.getTaskIDsSnapshot()
+        var intervals = await sleeper.intervalsSnapshot()
+        XCTAssertTrue(taskIDs.isEmpty)
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29)])
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(30))
+
+        await sleeper.advanceNext()
+        let firstProbeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 1
+        }
+        XCTAssertTrue(firstProbeArrived, "Expected the idle read at 59 virtual seconds.")
+        guard firstProbeArrived else { return }
+        await sleeper.waitForSleepCount(3)
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(59))
+
+        sleeper.clock.advance(by: .seconds(29))
+        let secondHeartbeat = expectation(description: "repeated identical heartbeat at 88 seconds accepted")
+        secondHeartbeat.assertForOverFulfill = false
+        let secondObservation = model.objectWillChange.sink { secondHeartbeat.fulfill() }
+        await client.yield(initialTask)
+        await fulfillment(of: [secondHeartbeat], timeout: 1)
+        secondObservation.cancel()
+
+        await sleeper.advanceNext()
+        await sleeper.waitForSleepCount(4)
+        taskIDs = await client.getTaskIDsSnapshot()
+        intervals = await sleeper.intervalsSnapshot()
+        XCTAssertEqual(taskIDs, [taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29), .seconds(30), .seconds(29)])
+
+        await sleeper.advanceNext()
+        let secondProbeArrived = await waitForTaskWatchCondition(timeout: .seconds(1)) {
+            (await client.getTaskIDsSnapshot()).count >= 2
+        }
+        XCTAssertTrue(secondProbeArrived, "Expected the idle read after repeated identical activity.")
+        guard secondProbeArrived else { return }
+        await sleeper.waitForSleepCount(5)
+        taskIDs = await client.getTaskIDsSnapshot()
+        intervals = await sleeper.intervalsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let createdTasks = await client.v2TaskRequestsSnapshot()
+        let cancelledTaskIDs = await client.cancelledIDsSnapshot()
+        XCTAssertEqual(startedAt.duration(to: sleeper.clock.now()), .seconds(118))
+        XCTAssertEqual(taskIDs, [taskID, taskID])
+        XCTAssertEqual(intervals, [.seconds(30), .seconds(29), .seconds(30), .seconds(29), .seconds(30)])
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertEqual(createdTasks.count, 1)
+        XCTAssertTrue(cancelledTaskIDs.isEmpty)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertNil(model.watchErrorMessage)
+    }
+
+    func testSuspendedIdleProbeDoesNotOverlapAnotherTick() async {
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1singleflight", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsGetTaskResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1singleflight",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(1)
+
+        await sleeper.advanceNext()
+        let taskIDsWhileSuspended = await client.getTaskIDsSnapshot()
+        let sleepsWhileSuspended = await sleeper.sleepCountSnapshot()
+        XCTAssertEqual(taskIDsWhileSuspended.count, 1)
+        XCTAssertEqual(sleepsWhileSuspended, 1)
+
+        await client.completeNextGetTask(
+            with: .success(.fixture(source: "BV1singleflight", state: "TASK_STATE_RUNNING", progress: 0.5)))
+        await client.waitForGetTaskResponseCompletionCount(1)
+        await sleeper.waitForSleepCount(2)
+
+        model.clearTask()
+    }
+
+    func testLateIdleProbeSuccessAndFailureAreFencedByAcceptedWatchActivity() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let initialTask = CacheTask.fixture(source: "BV1idle-race", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            suspendsGetTaskResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-race",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(1)
+
+        let heartbeatAccepted = expectation(description: "identical watch heartbeat accepted")
+        heartbeatAccepted.assertForOverFulfill = false
+        let observation = model.objectWillChange.sink {
+            heartbeatAccepted.fulfill()
+        }
+        await client.yield(initialTask)
+        await fulfillment(of: [heartbeatAccepted], timeout: 1)
+        observation.cancel()
+        await client.completeNextGetTask(
+            with: .success(
+                .fixture(source: "BV1idle-race", state: "TASK_STATE_RUNNING", progress: 0.2, message: "Late probe.")))
+        await client.waitForGetTaskResponseCompletionCount(1)
+        await sleeper.waitForSleepCount(2)
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_PREPARING")
+        XCTAssertNil(model.watchErrorMessage)
+
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await client.yield(
+            .fixture(source: "BV1idle-race", state: "TASK_STATE_RUNNING", progress: 0.8, message: "Newer watch."))
+        await waitUntil(model.currentTask?.message == "Newer watch.")
+        await client.completeNextGetTask(with: .failure(CacheTaskControlError.permissionDenied))
+        await client.waitForGetTaskResponseCompletionCount(2)
+        await sleeper.waitForSleepCount(3)
+
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        XCTAssertEqual(taskIDs, [taskID, taskID])
+        XCTAssertEqual(subscriptionCount, 1)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertNil(model.watchErrorMessage)
+        XCTAssertEqual(model.currentTask?.message, "Newer watch.")
+
+        model.clearTask()
+    }
+
+    func testLateIdleProbeCannotOverwriteCancellationAndObservationResumesAfterward() async {
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1idle-cancel", state: "TASK_STATE_PREPARING"))
+            ],
+            suspendsGetTaskResponses: true
+        )
+        await client.setSuspendsCancelResponses(true)
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-cancel",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(1)
+
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+        XCTAssertTrue(model.isCancelling)
+        await client.completeNextGetTask(
+            with: .success(.fixture(source: "BV1idle-cancel", state: "TASK_STATE_RUNNING", progress: 0.9)))
+        await client.waitForGetTaskResponseCompletionCount(1)
+        await sleeper.waitForSleepCount(2)
+        await sleeper.advanceNext()
+        await sleeper.waitForSleepCount(3)
+        let taskIDsWhileCancelling = await client.getTaskIDsSnapshot()
+
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_PREPARING")
+        XCTAssertEqual(model.statusMessage, "Cancelling Ready video...")
+        XCTAssertTrue(model.isCancelling)
+        XCTAssertEqual(taskIDsWhileCancelling, ["bilibili-playback-1"])
+
+        await client.completeNextCancel(
+            with: .success(.fixture(source: "BV1idle-cancel", state: "TASK_STATE_CANCEL_REQUESTED")))
+        await cancelTask.value
+        XCTAssertFalse(model.isCancelling)
+
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await client.completeNextGetTask(
+            with: .success(.fixture(source: "BV1idle-cancel", state: "TASK_STATE_CANCEL_REQUESTED")))
+        await client.waitForGetTaskResponseCompletionCount(2)
+        await sleeper.waitForSleepCount(4)
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_CANCEL_REQUESTED")
+        XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+    }
+
+    func testIdenticalWatchHeartbeatDuringCancelDoesNotInvalidateCancelResponse() async {
+        let initialTask = CacheTask.fixture(source: "BV1cancel-heartbeat", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(createResponses: [.success(initialTask)])
+        await client.setSuspendsCancelResponses(true)
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1cancel-heartbeat",
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        let cancelTask = Task {
+            await model.cancel(serverAddressText: "mac-mini.local:50051")
+        }
+        await client.waitForCancelRequestCount(1)
+
+        let heartbeatAccepted = expectation(description: "identical heartbeat accepted while cancelling")
+        heartbeatAccepted.assertForOverFulfill = false
+        let observation = model.objectWillChange.sink {
+            heartbeatAccepted.fulfill()
+        }
+        await client.yield(initialTask)
+        await fulfillment(of: [heartbeatAccepted], timeout: 1)
+        observation.cancel()
+
+        XCTAssertTrue(model.isCancelling)
+        XCTAssertNil(model.errorMessage)
+        await client.completeNextCancel(with: .success(initialTask))
+        await cancelTask.value
+
+        XCTAssertFalse(model.isCancelling)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.currentTask, initialTask)
+        XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+    }
+
+    func testRetryableIdleProbeFailureHandsOffToBoundedRecovery() async {
+        let taskID = "bilibili-playback-1"
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1idle-retry", state: "TASK_STATE_PREPARING"))
+            ],
+            getTaskResponses: [
+                taskID: [
+                    .failure(CacheTaskControlError.unavailable),
+                    .success(.fixture(source: "BV1idle-retry", state: "TASK_STATE_RUNNING", progress: 0.5)),
+                ]
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-retry",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await client.waitForWatchSubscription(count: 2)
+
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let submittedTasks = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(taskIDs, [taskID, taskID])
+        XCTAssertEqual(subscriptionCount, 2)
+        XCTAssertEqual(submittedTasks.count, 1)
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_RUNNING")
+        XCTAssertTrue(model.isWatching)
+        XCTAssertNil(model.watchErrorMessage)
+
+        model.clearTask()
+    }
+
+    func testRecoveredSilentStreamClearsReconnectPresentationAfterHealthyIdleRead() async {
+        let taskID = "bilibili-playback-1"
+        let recoverySleeper = TaskWatchRecoverySleepRecorder()
+        let reconciliationSleeper = TaskWatchReconciliationSleepGate()
+        let initialTask = CacheTask.fixture(source: "BV1recover-silent", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: [.success(initialTask), .success(initialTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1recover-silent",
+            watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
+            watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(1)
+        await client.waitForGetTaskRequestCount(1)
+        await client.waitForWatchSubscription(count: 2)
+        await reconciliationSleeper.waitForSleepCount(1)
+
+        XCTAssertTrue(model.isReconnecting)
+        XCTAssertNotNil(model.watchErrorMessage)
+
+        await reconciliationSleeper.waitForActiveSleeper()
+        await reconciliationSleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await reconciliationSleeper.waitForSleepCount(2)
+        await waitUntil(!model.isReconnecting)
+
+        let recoveryDelays = await recoverySleeper.delaysSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        XCTAssertEqual(recoveryDelays, [.seconds(1)])
+        XCTAssertEqual(subscriptionCount, 2)
+        XCTAssertTrue(model.isWatching)
+        XCTAssertFalse(model.isReconnecting)
+        XCTAssertNil(model.watchErrorMessage)
+
+        model.clearTask()
+    }
+
+    func testUnchangedIdleReadsAndFailuresDoNotResetRecoveryBudget() async {
+        let taskID = "bilibili-playback-1"
+        let recoverySleeper = TaskWatchRecoverySleepRecorder()
+        let reconciliationSleeper = TaskWatchReconciliationSleepGate()
+        let initialTask = CacheTask.fixture(source: "BV1idle-budget", state: "TASK_STATE_PREPARING")
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [
+                taskID: [
+                    .success(initialTask),
+                    .success(initialTask),
+                    .failure(CacheTaskControlError.unavailable),
+                    .success(initialTask),
+                    .success(initialTask),
+                ]
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-budget",
+            watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
+            watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(1)
+        await client.waitForGetTaskRequestCount(1)
+        await client.waitForWatchSubscription(count: 2)
+        await reconciliationSleeper.waitForSleepCount(1)
+
+        await reconciliationSleeper.waitForActiveSleeper()
+        await reconciliationSleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await reconciliationSleeper.waitForSleepCount(2)
+        await reconciliationSleeper.waitForActiveSleeper()
+        await reconciliationSleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(4)
+        await client.waitForWatchSubscription(count: 3)
+        await reconciliationSleeper.waitForSleepCount(3)
+
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(2)
+        await client.waitForGetTaskRequestCount(5)
+        await client.waitForWatchSubscription(count: 4)
+
+        let recoveryDelays = await recoverySleeper.delaysSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        let submittedTasks = await client.v2TaskRequestsSnapshot()
+        XCTAssertEqual(recoveryDelays, [.seconds(1), .seconds(4)])
+        XCTAssertEqual(taskIDs, Array(repeating: taskID, count: 5))
+        XCTAssertEqual(subscriptionCount, 4)
+        XCTAssertEqual(submittedTasks.count, 1)
+        XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+    }
+
+    func testRepeatedIdleFailuresExhaustBudgetDespiteUnchangedSuccesses() async {
+        let taskID = "bilibili-playback-1"
+        let recoverySleeper = TaskWatchRecoverySleepRecorder()
+        let reconciliationSleeper = TaskWatchReconciliationSleepGate()
+        let initialTask = CacheTask.fixture(source: "BV1idle-budget-exhaustion", state: "TASK_STATE_PREPARING")
+        var responses: [Result<CacheTask, Error>] = [.success(initialTask)]
+        for _ in 1...5 {
+            responses.append(.success(initialTask))
+            responses.append(.failure(CacheTaskControlError.unavailable))
+            responses.append(.success(initialTask))
+        }
+        responses.append(.failure(CacheTaskControlError.unavailable))
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: responses]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-budget-exhaustion",
+            watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
+            watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await reconciliationSleeper.waitForSleepCount(1)
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(1)
+        await client.waitForGetTaskRequestCount(1)
+        await client.waitForWatchSubscription(count: 2)
+        await reconciliationSleeper.waitForSleepCount(2)
+
+        var requestCount = 1
+        var sleepCount = 2
+        var subscriptionCount = 2
+        for _ in 1...5 {
+            await reconciliationSleeper.waitForActiveSleeper()
+            await reconciliationSleeper.advanceNext()
+            requestCount += 1
+            await client.waitForGetTaskRequestCount(requestCount)
+            sleepCount += 1
+            await reconciliationSleeper.waitForSleepCount(sleepCount)
+            await reconciliationSleeper.waitForActiveSleeper()
+
+            await reconciliationSleeper.advanceNext()
+            requestCount += 1
+            await client.waitForGetTaskRequestCount(requestCount)
+            requestCount += 1
+            subscriptionCount += 1
+            await client.waitForGetTaskRequestCount(requestCount)
+            await client.waitForWatchSubscription(count: subscriptionCount)
+            sleepCount += 1
+            await reconciliationSleeper.waitForSleepCount(sleepCount)
+            await reconciliationSleeper.waitForActiveSleeper()
+        }
+        await reconciliationSleeper.advanceNext()
+        requestCount += 1
+        await client.waitForGetTaskRequestCount(requestCount)
+        await waitUntil(!model.isWatching)
+
+        let recoveryDelays = await recoverySleeper.delaysSnapshot()
+        let taskIDs = await client.getTaskIDsSnapshot()
+        let finalSubscriptionCount = await client.watchSubscriptionCountSnapshot()
+        XCTAssertEqual(recoveryDelays, [.seconds(1)])
+        XCTAssertEqual(taskIDs.count, 17)
+        XCTAssertEqual(finalSubscriptionCount, 7)
+        XCTAssertTrue(model.canRetryTaskUpdates)
+        XCTAssertEqual(
+            model.watchErrorMessage,
+            "Task updates could not be restored. Retry to resume observation."
+        )
+
+        model.clearTask()
+    }
+
+    func testAcceptedIdleProgressResetsRecoveryBudget() async {
+        let taskID = "bilibili-playback-1"
+        let recoverySleeper = TaskWatchRecoverySleepRecorder()
+        let reconciliationSleeper = TaskWatchReconciliationSleepGate()
+        let initialTask = CacheTask.fixture(source: "BV1idle-progress", state: "TASK_STATE_PREPARING")
+        let progressedTask = CacheTask.fixture(
+            source: "BV1idle-progress",
+            state: "TASK_STATE_RUNNING",
+            progress: 0.5
+        )
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [.success(initialTask)],
+            getTaskResponses: [taskID: [.success(initialTask), .success(progressedTask), .success(progressedTask)]]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-progress",
+            watchReconciliationSleep: { delay in try await reconciliationSleeper.sleep(delay) },
+            watchRecoverySleep: { delay in await recoverySleeper.record(delay) },
+            watchReconciliationNow: { reconciliationSleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(1)
+        await client.waitForGetTaskRequestCount(1)
+        await client.waitForWatchSubscription(count: 2)
+        await reconciliationSleeper.waitForSleepCount(1)
+
+        await reconciliationSleeper.waitForActiveSleeper()
+        await reconciliationSleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(2)
+        await waitUntil(model.currentTask?.state == "TASK_STATE_RUNNING")
+        await reconciliationSleeper.waitForSleepCount(2)
+        await client.failWatching(with: CacheTaskControlError.unavailable)
+        await recoverySleeper.waitForCount(2)
+        await client.waitForGetTaskRequestCount(3)
+        await client.waitForWatchSubscription(count: 3)
+
+        let recoveryDelays = await recoverySleeper.delaysSnapshot()
+        XCTAssertEqual(recoveryDelays, [.seconds(1), .seconds(1)])
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_RUNNING")
+        XCTAssertTrue(model.isWatching)
+
+        model.clearTask()
+    }
+
+    func testFatalIdleProbeFailureStopsAndCleansUpObservation() async {
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1idle-fatal", state: "TASK_STATE_PREPARING"))
+            ],
+            getTaskResponses: [
+                "bilibili-playback-1": [.failure(CacheTaskControlError.permissionDenied)]
+            ]
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-fatal",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await waitUntil(!model.isWatching)
+        await client.waitForWatchTermination()
+
+        XCTAssertTrue(model.canRetryTaskUpdates)
+        XCTAssertNotNil(model.watchErrorMessage)
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        XCTAssertEqual(subscriptionCount, 1)
+
+        model.clearTask()
+    }
+
+    func testClearingAndReplacingTaskIgnoresLateIdleProbeResponse() async {
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let oldTaskID = "old-idle-task"
+        let newTaskID = "new-idle-task"
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(id: oldTaskID, source: "BV1idle-old", state: "TASK_STATE_PREPARING")),
+                .success(.fixture(id: newTaskID, source: "BV1idle-new", state: "TASK_STATE_PREPARING")),
+            ],
+            suspendsGetTaskResponses: true
+        )
+        let model = BilibiliTaskViewModel(
+            sourceText: "BV1idle-old",
+            watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+            watchReconciliationNow: { sleeper.clock.now() },
+            clientFactory: { _ in client }
+        )
+
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription()
+        await sleeper.waitForSleepCount(1)
+        await sleeper.advanceNext()
+        await client.waitForGetTaskRequestCount(1)
+
+        model.clearTask()
+        model.sourceText = "BV1idle-new"
+        await model.submit(serverAddressText: "mac-mini.local:50051")
+        await client.waitForWatchSubscription(count: 2)
+        await client.completeNextGetTask(
+            with: .success(
+                .fixture(id: oldTaskID, source: "BV1idle-old", state: "TASK_STATE_RUNNING", progress: 0.9)))
+        await client.waitForGetTaskResponseCompletionCount(1)
+
+        let subscriptionCount = await client.watchSubscriptionCountSnapshot()
+        XCTAssertEqual(model.currentTask?.id, newTaskID)
+        XCTAssertEqual(model.currentTask?.source, "BV1idle-new")
+        XCTAssertEqual(model.currentTask?.state, "TASK_STATE_PREPARING")
+        XCTAssertTrue(model.isWatching)
+        XCTAssertEqual(subscriptionCount, 2)
+
+        model.clearTask()
+    }
+
+    func testModelDeinitCancelsIdleReconciliationSleeper() async {
+        let sleeper = TaskWatchReconciliationSleepGate()
+        let client = FakeBilibiliCacheControlClient(
+            createResponses: [
+                .success(.fixture(source: "BV1idle-deinit", state: "TASK_STATE_PREPARING"))
+            ]
+        )
+        weak var weakModel: BilibiliTaskViewModel?
+
+        do {
+            let model = BilibiliTaskViewModel(
+                sourceText: "BV1idle-deinit",
+                watchReconciliationSleep: { delay in try await sleeper.sleep(delay) },
+                watchReconciliationNow: { sleeper.clock.now() },
+                clientFactory: { _ in client }
+            )
+            weakModel = model
+            await model.submit(serverAddressText: "mac-mini.local:50051")
+            await client.waitForWatchSubscription()
+            await sleeper.waitForSleepCount(1)
+        }
+
+        await waitUntil(weakModel == nil)
+        await sleeper.waitForCancellationCount(1)
+        let taskIDs = await client.getTaskIDsSnapshot()
+        XCTAssertNil(weakModel)
+        XCTAssertTrue(taskIDs.isEmpty)
     }
 
     func testExplicitTaskWatchRetryReconcilesBeforeResubscribingWithoutCreatingTask() async {
@@ -4657,6 +5516,21 @@ final class BilibiliTaskViewModelTests: XCTestCase {
         model.clearTask()
     }
 
+    private func waitForTaskWatchCondition(
+        timeout: Duration,
+        _ condition: @MainActor () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
+
     private func waitUntil(
         _ condition: @autoclosure @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,
@@ -4717,6 +5591,111 @@ private actor TaskWatchRecoverySleepRecorder {
 
     func delaysSnapshot() -> [Duration] {
         delays
+    }
+}
+
+private final class TaskWatchReconciliationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    func now() -> ContinuousClock.Instant {
+        lock.withLock { instant }
+    }
+
+    func advance(by duration: Duration) {
+        lock.withLock { instant = instant.advanced(by: duration) }
+    }
+
+    func advance(to deadline: ContinuousClock.Instant) {
+        lock.withLock { instant = max(instant, deadline) }
+    }
+}
+
+private actor TaskWatchReconciliationSleepGate {
+    nonisolated let clock = TaskWatchReconciliationClock()
+    private var intervals: [Duration] = []
+    private var sleepers:
+        [(id: UUID, deadline: ContinuousClock.Instant, continuation: CheckedContinuation<Void, Never>)] = []
+    private var activeSleeperWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sleepCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var cancellationCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var cancellationCount = 0
+
+    func sleep(_ interval: Duration) async throws {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                intervals.append(interval)
+                sleepers.append((id, clock.now().advanced(by: interval), continuation))
+                let activeWaiters = activeSleeperWaiters
+                activeSleeperWaiters = []
+                activeWaiters.forEach { $0.resume() }
+                let ready = sleepCountWaiters.filter { $0.count <= intervals.count }
+                sleepCountWaiters.removeAll { $0.count <= intervals.count }
+                ready.forEach { $0.continuation.resume() }
+            }
+        } onCancel: {
+            Task {
+                await self.cancelSleep(id: id)
+            }
+        }
+        try Task.checkCancellation()
+    }
+
+    func waitForSleepCount(_ count: Int) async {
+        guard intervals.count < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            sleepCountWaiters.append((count, continuation))
+        }
+    }
+
+    func waitForActiveSleeper() async {
+        guard sleepers.isEmpty else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            activeSleeperWaiters.append(continuation)
+        }
+    }
+
+    func advanceNext() {
+        guard !sleepers.isEmpty else {
+            return
+        }
+        let sleeper = sleepers.removeFirst()
+        clock.advance(to: sleeper.deadline)
+        sleeper.continuation.resume()
+    }
+
+    func sleepCountSnapshot() -> Int {
+        intervals.count
+    }
+
+    func intervalsSnapshot() -> [Duration] {
+        intervals
+    }
+
+    func waitForCancellationCount(_ count: Int) async {
+        guard cancellationCount < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            cancellationCountWaiters.append((count, continuation))
+        }
+    }
+
+    private func cancelSleep(id: UUID) {
+        guard let index = sleepers.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let sleeper = sleepers.remove(at: index)
+        cancellationCount += 1
+        sleeper.continuation.resume()
+        let ready = cancellationCountWaiters.filter { $0.count <= cancellationCount }
+        cancellationCountWaiters.removeAll { $0.count <= cancellationCount }
+        ready.forEach { $0.continuation.resume() }
     }
 }
 
@@ -4873,12 +5852,16 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         getTaskIDs.append(id)
         resumeGetTaskRequestWaiters()
         if suspendsGetTaskResponses {
-            let task = try await withCheckedThrowingContinuation { continuation in
-                pendingGetTaskContinuations.append(continuation)
+            do {
+                let task = try await withCheckedThrowingContinuation { continuation in
+                    pendingGetTaskContinuations.append(continuation)
+                }
+                recordGetTaskResponseCompletion()
+                return task
+            } catch {
+                recordGetTaskResponseCompletion()
+                throw error
             }
-            getTaskResponseCompletionCount += 1
-            resumeGetTaskResponseCompletionWaiters()
-            return task
         }
         guard var responses = getTaskResponses[id], !responses.isEmpty else {
             throw FakeBilibiliCacheControlClientError.notImplemented
@@ -5623,6 +6606,11 @@ private actor FakeBilibiliCacheControlClient: CacheControlClient {
         let ready = getTaskResponseCompletionWaiters.filter { $0.count <= getTaskResponseCompletionCount }
         getTaskResponseCompletionWaiters.removeAll { $0.count <= getTaskResponseCompletionCount }
         ready.forEach { $0.continuation.resume() }
+    }
+
+    private func recordGetTaskResponseCompletion() {
+        getTaskResponseCompletionCount += 1
+        resumeGetTaskResponseCompletionWaiters()
     }
 
     private func recordWatchTermination() {

@@ -137,15 +137,271 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
         }
     }
 
-    private func makeModel(source: String, defaults: UserDefaults) -> BilibiliTaskViewModel {
-        BilibiliTaskViewModel(
+    func testSilentWatchUsesUnchangedGetTaskBeforeReturningCompletedOutput() async throws {
+        let (directory, metricsURL) = try makeMetricsFile()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = makeModel(
+            source: FixtureScenario.silent.source,
+            defaults: defaults,
+            acceleratesWatchRecovery: false,
+            rpcTimeout: .seconds(90)
+        )
+        let mediaURL = try XCTUnwrap(URL(string: mediaAddress))
+
+        try await withFixtureServer(metricsURL: metricsURL) { endpoint in
+            defer { model.clearTask() }
+            await model.submit(serverAddressText: endpoint.displayAddress)
+
+            let playable = await waitUntil {
+                model.isWatching
+                    && model.currentTask?.id == FixtureScenario.silent.taskID
+                    && model.currentTask?.progress == 0.42
+                    && model.taskResults.first?.id == FixtureScenario.silent.resultID
+                    && model.taskResults.first?.playbackURL == mediaURL
+            }
+            XCTAssertTrue(playable, "The silent task did not expose its initial playable output and open watch.")
+            guard playable else { return }
+            XCTAssertEqual(model.statusMessage, "\(FixtureScenario.silent.title) is ready to play.")
+            XCTAssertNil(model.watchErrorMessage)
+            XCTAssertFalse(model.isReconnecting)
+            XCTAssertFalse(model.canRetryTaskUpdates)
+
+            var observedFalseWatchState = false
+            let unchangedReadObserved = await waitUntil(
+                timeout: .seconds(45),
+                pollInterval: .milliseconds(100)
+            ) {
+                if model.watchErrorMessage != nil || model.isReconnecting || model.canRetryTaskUpdates {
+                    observedFalseWatchState = true
+                    return true
+                }
+                return ((try? readScenario("silent", from: metricsURL).unchangedGetTaskCount) ?? 0) >= 1
+            }
+            XCTAssertTrue(
+                unchangedReadObserved && !observedFalseWatchState,
+                "The first healthy silent GetTask read did not arrive within 45 seconds."
+            )
+            guard unchangedReadObserved, !observedFalseWatchState else { return }
+            XCTAssertEqual(model.currentTask?.message, "Playable fixture output is available.")
+            XCTAssertEqual(model.statusMessage, "\(FixtureScenario.silent.title) is ready to play.")
+            XCTAssertEqual(model.currentTask?.progress, 0.42)
+            XCTAssertEqual(model.currentTask?.outputSummary?.revision, 1)
+            XCTAssertTrue(model.isWatching)
+
+            let completed = await waitUntil(
+                timeout: .seconds(45),
+                pollInterval: .milliseconds(100)
+            ) {
+                if model.watchErrorMessage != nil || model.isReconnecting || model.canRetryTaskUpdates {
+                    observedFalseWatchState = true
+                    return true
+                }
+                return model.currentTask?.message == "Silent task reconciliation complete"
+                    && model.currentTask?.state.lowercased().contains("succeeded") == true
+                    && !model.isWatching
+            }
+            XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed retry or reconnect UI state.")
+            XCTAssertTrue(
+                completed && !observedFalseWatchState, "The silent task did not reconcile within 45 more seconds.")
+            guard completed, !observedFalseWatchState else { return }
+
+            XCTAssertEqual(model.currentTask?.id, FixtureScenario.silent.taskID)
+            XCTAssertEqual(model.currentTask?.message, "Silent task reconciliation complete")
+            XCTAssertEqual(model.statusMessage, "Silent task reconciliation complete")
+            XCTAssertEqual(model.currentTask?.progress, 1)
+            XCTAssertEqual(model.currentTask?.outputSummary?.revision, 2)
+            XCTAssertNil(model.watchErrorMessage)
+            XCTAssertFalse(model.isReconnecting)
+            XCTAssertFalse(model.canRetryTaskUpdates)
+
+            let outputReady = await waitUntil {
+                model.taskResults.first?.id == FixtureScenario.silent.resultID
+                    && model.taskResults.first?.playbackURL == mediaURL
+                    && model.taskResults.first?.isCached == true
+            }
+            XCTAssertTrue(outputReady, "GetTask completion did not expose the updated playable output.")
+            guard outputReady, let result = model.taskResults.first else { return }
+            assertPlayableResult(result, in: model, expectedID: FixtureScenario.silent.resultID, url: mediaURL)
+
+            let metrics = try readScenario("silent", from: metricsURL)
+            XCTAssertEqual(metrics.taskID, FixtureScenario.silent.taskID)
+            XCTAssertEqual(metrics.createCount, 1)
+            XCTAssertEqual(metrics.watchCount, 1)
+            XCTAssertEqual(metrics.watchStreamOpenCount, 1)
+            XCTAssertGreaterThanOrEqual(metrics.getTaskCount, 2)
+            XCTAssertGreaterThanOrEqual(metrics.unchangedGetTaskCount, 1)
+            XCTAssertGreaterThanOrEqual(metrics.completedGetTaskCount, 1)
+            XCTAssertGreaterThanOrEqual(metrics.outputCount, 2)
+            XCTAssertEqual(metrics.cancelCount, 0)
+            let watchIndex = try XCTUnwrap(metrics.rpcTrace.firstIndex(of: "watch"))
+            let postWatchGetTaskIndex = metrics.rpcTrace.indices.first {
+                $0 > watchIndex && metrics.rpcTrace[$0] == "get_task"
+            }
+            XCTAssertNotNil(postWatchGetTaskIndex, "The original watch must open before unary reconciliation.")
+        }
+    }
+
+    func testSilentWatchRejectsOverlappingRPCsAndReleasesCancelledSubscriptions() async throws {
+        let (directory, metricsURL) = try makeMetricsFile()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try await withFixtureServer(metricsURL: metricsURL) { endpoint in
+            let setupClient = GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+            _ = try await setupClient.startBilibiliResolution(urlOrID: FixtureScenario.silent.source)
+            let task = try await setupClient.createBilibiliPlaybackTaskV2(
+                sessionID: FixtureScenario.silent.resolutionSessionID,
+                selection: .single(candidateToken: FixtureScenario.silent.candidateToken)
+            )
+            XCTAssertEqual(task.id, FixtureScenario.silent.taskID)
+
+            try await withGRPCClient(
+                transport: .http2NIOPosix(
+                    target: .ipv4(address: endpoint.host, port: endpoint.port),
+                    transportSecurity: .plaintext
+                )
+            ) { client in
+                let service = TvosNetPlayer_V1_TaskService.Client(wrapping: client)
+                var request = TvosNetPlayer_V1_WatchTasksRequest()
+                request.ids = [FixtureScenario.silent.taskID]
+                let watchRequest = request
+                var options = CallOptions.defaults
+                options.timeout = .seconds(15)
+                let watchOptions = options
+                options.timeout = .seconds(3)
+                let duplicateOptions = options
+
+                for phase in 0..<2 {
+                    let initialSnapshot = self.expectation(
+                        description: "silent watch \(phase) sends its initial snapshot"
+                    )
+                    let finished = self.expectation(description: "silent watch \(phase) is cancelled")
+                    var watchDidFinish = false
+                    let watch = Task { @MainActor in
+                        defer {
+                            watchDidFinish = true
+                            finished.fulfill()
+                        }
+                        let clock = ContinuousClock()
+                        let reopenDeadline = clock.now.advanced(by: .seconds(3))
+                        while !Task.isCancelled {
+                            do {
+                                try await service.watchTasks(watchRequest, options: watchOptions) { response in
+                                    var eventCount = 0
+                                    for try await event in response.messages {
+                                        eventCount += 1
+                                        XCTAssertEqual(eventCount, 1, "The silent watch emitted a subsequent event.")
+                                        XCTAssertTrue(event.hasTask)
+                                        XCTAssertEqual(event.task.id, FixtureScenario.silent.taskID)
+                                        XCTAssertEqual(event.task.state, .playable)
+                                        XCTAssertEqual(event.task.progress, 0.42)
+                                        XCTAssertTrue(event.task.hasOutputSummary)
+                                        XCTAssertEqual(event.task.outputSummary.revision, 1)
+                                        XCTAssertEqual(
+                                            event.task.outputSummary.primaryResultID,
+                                            FixtureScenario.silent.resultID
+                                        )
+                                        if eventCount == 1 {
+                                            initialSnapshot.fulfill()
+                                        }
+                                    }
+                                }
+                                if !Task.isCancelled {
+                                    XCTFail("The silent watch ended before client cancellation.")
+                                }
+                                return
+                            } catch let error as RPCError
+                                where error.code == .alreadyExists
+                                && phase > 0 && clock.now < reopenDeadline
+                            {
+                                // Wait for the preceding RPC's server-side cancellation to arrive.
+                                do {
+                                    try await Task.sleep(for: .milliseconds(10))
+                                } catch {
+                                    return
+                                }
+                            } catch {
+                                if !Task.isCancelled {
+                                    XCTFail("The silent watch failed unexpectedly: \(error)")
+                                }
+                                return
+                            }
+                        }
+                    }
+                    defer { watch.cancel() }
+
+                    let opened = await self.waitUntil(timeout: .seconds(3)) {
+                        ((try? self.readScenario("silent", from: metricsURL).watchStreamOpenCount) ?? 0)
+                            == UInt64(phase + 1)
+                    }
+                    XCTAssertTrue(opened, "Cancellation did not release the previous silent watch's ownership.")
+                    guard opened else { return }
+                    let snapshotReceived = await XCTWaiter.fulfillment(of: [initialSnapshot], timeout: 3)
+                    XCTAssertEqual(
+                        snapshotReceived,
+                        .completed,
+                        "The accepted silent watch did not send its initial snapshot."
+                    )
+                    guard snapshotReceived == .completed else { return }
+                    XCTAssertFalse(watchDidFinish, "The initial snapshot ended the accepted silent watch.")
+
+                    do {
+                        try await service.watchTasks(watchRequest, options: duplicateOptions) { response in
+                            for try await _ in response.messages {
+                                XCTFail("An overlapping watch unexpectedly emitted an event.")
+                            }
+                        }
+                        XCTFail("An overlapping silent watch was accepted.")
+                    } catch let error as RPCError {
+                        XCTAssertEqual(error.code, .alreadyExists)
+                    }
+                    XCTAssertFalse(watchDidFinish, "Rejecting a duplicate ended the accepted silent watch.")
+                    let overlappingMetrics = try self.readScenario("silent", from: metricsURL)
+                    XCTAssertEqual(overlappingMetrics.watchStreamOpenCount, UInt64(phase + 1))
+
+                    watch.cancel()
+                    let cancellation = await XCTWaiter.fulfillment(of: [finished], timeout: 3)
+                    XCTAssertEqual(cancellation, .completed, "The cancelled watch did not release its client task.")
+                    guard cancellation == .completed else { return }
+                    await watch.value
+                }
+            }
+
+            let metrics = try self.readScenario("silent", from: metricsURL)
+            XCTAssertEqual(metrics.createCount, 1)
+            XCTAssertEqual(metrics.watchStreamOpenCount, 2)
+            XCTAssertGreaterThanOrEqual(metrics.watchCount, 4)
+            XCTAssertEqual(metrics.getTaskCount, 0)
+            XCTAssertEqual(metrics.cancelCount, 0)
+        }
+    }
+
+    private func makeModel(
+        source: String,
+        defaults: UserDefaults,
+        acceleratesWatchRecovery: Bool = true,
+        rpcTimeout: Duration = .seconds(3)
+    ) -> BilibiliTaskViewModel {
+        if acceleratesWatchRecovery {
+            return BilibiliTaskViewModel(
+                sourceText: source,
+                defaults: defaults,
+                operationTimeout: .seconds(3),
+                resolutionTimeout: .seconds(3),
+                watchRecoverySleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
+                clientFactory: { endpoint in
+                    GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: rpcTimeout)
+                }
+            )
+        }
+        return BilibiliTaskViewModel(
             sourceText: source,
             defaults: defaults,
             operationTimeout: .seconds(3),
             resolutionTimeout: .seconds(3),
-            watchRecoverySleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
             clientFactory: { endpoint in
-                GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(3))
+                GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: rpcTimeout)
             }
         )
     }
@@ -176,13 +432,14 @@ final class TaskWatchUIFixtureRPCTests: XCTestCase {
 
     private func waitUntil(
         timeout: Duration = .seconds(10),
+        pollInterval: Duration = .milliseconds(10),
         condition: @MainActor () -> Bool
     ) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
             if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
+            try? await Task.sleep(for: pollInterval)
         }
         return condition()
     }
@@ -237,7 +494,10 @@ private struct MetricsScenario: Decodable {
     let taskID: String
     let createCount: UInt64
     let watchCount: UInt64
+    let watchStreamOpenCount: UInt64
     let getTaskCount: UInt64
+    let unchangedGetTaskCount: UInt64
+    let completedGetTaskCount: UInt64
     let outputCount: UInt64
     let cancelCount: UInt64
     let manualResumeReadBeforeWatch: Bool
@@ -247,7 +507,10 @@ private struct MetricsScenario: Decodable {
         case taskID = "task_id"
         case createCount = "create_count"
         case watchCount = "watch_count"
+        case watchStreamOpenCount = "watch_stream_open_count"
         case getTaskCount = "get_task_count"
+        case unchangedGetTaskCount = "unchanged_get_task_count"
+        case completedGetTaskCount = "completed_get_task_count"
         case outputCount = "output_count"
         case cancelCount = "cancel_count"
         case manualResumeReadBeforeWatch = "manual_resume_read_before_watch"

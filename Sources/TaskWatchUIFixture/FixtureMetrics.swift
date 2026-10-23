@@ -22,7 +22,10 @@ package struct FixtureScenarioMetrics: Codable, Sendable {
     package var taskID: String
     package var createCount: UInt64 = 0
     package var watchCount: UInt64 = 0
+    package var watchStreamOpenCount: UInt64 = 0
     package var getTaskCount: UInt64 = 0
+    package var unchangedGetTaskCount: UInt64 = 0
+    package var completedGetTaskCount: UInt64 = 0
     package var outputCount: UInt64 = 0
     package var cancelCount: UInt64 = 0
     package var manualResumeReadBeforeWatch = false
@@ -32,7 +35,10 @@ package struct FixtureScenarioMetrics: Codable, Sendable {
         case taskID = "task_id"
         case createCount = "create_count"
         case watchCount = "watch_count"
+        case watchStreamOpenCount = "watch_stream_open_count"
         case getTaskCount = "get_task_count"
+        case unchangedGetTaskCount = "unchanged_get_task_count"
+        case completedGetTaskCount = "completed_get_task_count"
         case outputCount = "output_count"
         case cancelCount = "cancel_count"
         case manualResumeReadBeforeWatch = "manual_resume_read_before_watch"
@@ -107,6 +113,28 @@ package actor FixtureMetricsStore {
         document.scenarios[scenario.rawValue] = values
         try persist()
         return count(for: rpc, in: values)
+    }
+
+    package func recordWatchStreamOpen(for scenario: FixtureScenario) throws {
+        guard var values = document.scenarios[scenario.rawValue] else {
+            throw FixtureMetricsError.invalidScenario
+        }
+        values.watchStreamOpenCount = increment(values.watchStreamOpenCount)
+        document.scenarios[scenario.rawValue] = values
+        try persist()
+    }
+
+    package func recordGetTaskObservation(for scenario: FixtureScenario, completed: Bool) throws {
+        guard var values = document.scenarios[scenario.rawValue] else {
+            throw FixtureMetricsError.invalidScenario
+        }
+        if completed {
+            values.completedGetTaskCount = increment(values.completedGetTaskCount)
+        } else {
+            values.unchangedGetTaskCount = increment(values.unchangedGetTaskCount)
+        }
+        document.scenarios[scenario.rawValue] = values
+        try persist()
     }
 
     package func recordServerInfo() throws {

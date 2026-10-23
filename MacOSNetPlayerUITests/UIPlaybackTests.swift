@@ -419,6 +419,76 @@ final class UIPlaybackTests: XCTestCase {
         )
     }
 
+    func testSilentTaskWatchReconcilesWithoutInterruptingPlayback() throws {
+        try prepareTaskWatchScenario(source: "BV1s7ZxqR9Kp")
+        clickVisible(app.buttons["bilibili-submit"], scrollingIn: app.scrollViews["player-control-scroll"])
+
+        let taskStatus = identifiedElement("bilibili-task-status")
+        let reconnecting = identifiedElement("bilibili.watch.status")
+        let watchError = identifiedElement("bilibili.watch.error")
+        let retry = identifiedElement("bilibili.watch.retry")
+        let play = app.buttons["bilibili-result-play-ui-e2e-silent-result"]
+        var observedFalseWatchState = false
+        let playable = waitUntil(timeout: 20) {
+            if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
+                observedFalseWatchState = true
+                return true
+            }
+            return play.exists && play.isEnabled
+                && status(taskStatus, contains: "Silent task reconciliation fixture is ready to play.")
+        }
+        XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
+        XCTAssertTrue(
+            playable && !observedFalseWatchState,
+            "The silent task did not expose its initial playable output. " + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(status(reconnecting, contains: "Reconnecting task updates"))
+        XCTAssertFalse(watchError.exists)
+        XCTAssertFalse(retry.exists)
+
+        let controls = app.scrollViews["player-control-scroll"]
+        clickVisible(play, scrollingIn: controls)
+        let timeline = identifiedElement("playback-timeline")
+        let playbackState = identifiedElement("playback-state")
+        XCTAssertTrue(timeline.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 20))
+        let duringSilence = try XCTUnwrap(
+            waitForTimeline(timeout: 15) { $0 >= 2 },
+            "Silent-task playback did not start. "
+                + accessibilityDescription(timeline)
+        )
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= duringSilence + 1.5 },
+            "Playback did not advance while task updates were silent. " + accessibilityDescription(timeline)
+        )
+        let duration = try XCTUnwrap(playbackTimeline(), accessibilityDescription(timeline)).duration
+        XCTAssertGreaterThanOrEqual(duration, 90, "The task media must cover the bounded reconciliation window.")
+
+        let reconciled = waitUntil(timeout: 75) {
+            if status(reconnecting, contains: "Reconnecting task updates") || watchError.exists || retry.exists {
+                observedFalseWatchState = true
+                return true
+            }
+            return status(taskStatus, contains: "Silent task reconciliation complete")
+                && status(identifiedElement("bilibili-result-status-ui-e2e-silent-result"), contains: "Cached")
+        }
+        XCTAssertFalse(observedFalseWatchState, "A healthy silent watch exposed reconnect or retry UI.")
+        XCTAssertTrue(
+            reconciled && !observedFalseWatchState,
+            "The original silent task did not reconcile to cached output within 75 seconds. "
+                + accessibilityDescription(taskStatus)
+        )
+        XCTAssertFalse(status(reconnecting, contains: "Reconnecting task updates"))
+        XCTAssertFalse(watchError.exists)
+        XCTAssertFalse(retry.exists)
+        XCTAssertTrue(waitUntilTimelineState(playbackState, equals: "playing", timeout: 10))
+        let afterReconciliation = try XCTUnwrap(timelineSeconds(), accessibilityDescription(timeline))
+        XCTAssertNotNil(
+            waitForTimeline(timeout: 10) { $0 >= afterReconciliation + 1.5 },
+            "Playback did not continue after silent task reconciliation. " + accessibilityDescription(timeline)
+        )
+    }
+
     private func prepareTaskWatchScenario(source: String) throws {
         let addressField = app.textFields["cache-server-address"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 15))

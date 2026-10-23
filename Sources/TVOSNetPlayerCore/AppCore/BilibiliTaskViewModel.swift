@@ -490,13 +490,21 @@ public final class BilibiliTaskViewModel: ObservableObject {
     private let operationTimeout: Duration
     private let resolutionTimeout: Duration
     private let watchRecoverySleep: @Sendable (Duration) async throws -> Void
+    private let watchReconciliationInterval: Duration
+    private let watchReconciliationSleep: @Sendable (Duration) async throws -> Void
+    private let watchReconciliationNow: @Sendable () -> ContinuousClock.Instant
     private var activeEndpoint: CacheServerEndpoint?
     private var mediaBaseURIs: [String] = []
     private var resolvedInputContext: BilibiliResolvedInputContext?
     private var taskWatcher: Task<Void, Never>?
+    private var watchReconciliationTask: Task<Void, Never>?
+    private var watchReconciliationGeneration: Int?
     private var operationSequence = 0
     private var taskWatchGeneration = 0
     private var taskSnapshotGeneration = 0
+    private var taskWatchActivityGeneration = 0
+    private var taskWatchLastActivityInstant: ContinuousClock.Instant?
+    private var taskWatchRecoveryAttempts = 0
     private var activePlaybackTaskID: String?
     private var activePlaybackLibraryItemID: String?
     private var activePlaybackResultID: String?
@@ -533,9 +541,10 @@ public final class BilibiliTaskViewModel: ObservableObject {
         defaults: UserDefaults = .standard,
         operationTimeout: Duration = .seconds(10),
         resolutionTimeout: Duration = .seconds(120),
-        watchRecoverySleep: @escaping @Sendable (Duration) async throws -> Void = {
-            try await Task.sleep(for: $0)
-        },
+        watchReconciliationInterval: Duration = .seconds(30),
+        watchReconciliationSleep: (@Sendable (Duration) async throws -> Void)? = nil,
+        watchRecoverySleep: (@Sendable (Duration) async throws -> Void)? = nil,
+        watchReconciliationNow: (@Sendable () -> ContinuousClock.Instant)? = nil,
         clientFactory: @escaping @Sendable (CacheServerEndpoint) -> any CacheControlClient = {
             GRPCCacheControlClient(endpoint: $0)
         }
@@ -551,12 +560,22 @@ public final class BilibiliTaskViewModel: ObservableObject {
         playbackWeakNetworkPreference = initialPlaybackPolicy.weakNetworkPreference
         self.operationTimeout = operationTimeout
         self.resolutionTimeout = resolutionTimeout
-        self.watchRecoverySleep = watchRecoverySleep
+        self.watchReconciliationInterval = watchReconciliationInterval
+        self.watchReconciliationSleep =
+            watchReconciliationSleep ?? { duration in
+                try await Task.sleep(for: duration)
+            }
+        self.watchRecoverySleep =
+            watchRecoverySleep ?? { duration in
+                try await Task.sleep(for: duration)
+            }
+        self.watchReconciliationNow = watchReconciliationNow ?? { ContinuousClock().now }
         self.clientFactory = clientFactory
     }
 
     deinit {
         taskWatcher?.cancel()
+        watchReconciliationTask?.cancel()
         taskResultRefreshTask?.cancel()
     }
 
@@ -2050,7 +2069,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         taskID: String,
         endpoint: CacheServerEndpoint,
         sequence: Int,
-        reconcileBeforeSubscribe: Bool = false
+        reconcileBeforeSubscribe: Bool = false,
+        recoveryAttempts: Int = 0
     ) {
         stopWatching()
         guard currentTask?.id == taskID,
@@ -2062,12 +2082,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         isWatching = true
         isReconnecting = reconcileBeforeSubscribe
         watchErrorMessage = nil
+        taskWatchRecoveryAttempts = min(max(recoveryAttempts, 0), Self.maximumTaskWatchRecoveryAttempts)
         let generation = taskWatchGeneration
         let client = clientFactory(endpoint)
         let timeout = operationTimeout
         let sleep = watchRecoverySleep
+        let reconciliationInterval = watchReconciliationInterval
+        let reconciliationSleep = watchReconciliationSleep
         taskWatcher = Task { [weak self] in
-            var recoveryAttempts = 0
             var shouldReconcileBeforeSubscribe = reconcileBeforeSubscribe
             while !Task.isCancelled {
                 guard
@@ -2117,6 +2139,9 @@ public final class BilibiliTaskViewModel: ObservableObject {
                         guard update.shouldKeepWatching else {
                             return
                         }
+                        if update.progressChanged {
+                            self?.taskWatchRecoveryAttempts = 0
+                        }
                     } catch {
                         guard !Task.isCancelled else {
                             return
@@ -2136,6 +2161,16 @@ public final class BilibiliTaskViewModel: ObservableObject {
                 }
 
                 if !needsRecovery {
+                    self?.startTaskWatchReconciliation(
+                        taskID: taskID,
+                        endpoint: endpoint,
+                        sequence: sequence,
+                        generation: generation,
+                        client: client,
+                        timeout: timeout,
+                        interval: reconciliationInterval,
+                        sleep: reconciliationSleep
+                    )
                     let stream = await client.watchTask(id: taskID)
                     guard !Task.isCancelled,
                         self?.isTaskWatchCurrent(
@@ -2166,7 +2201,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                                 continue
                             }
                             if update.progressChanged {
-                                recoveryAttempts = 0
+                                self?.taskWatchRecoveryAttempts = 0
                             }
                             guard update.shouldKeepWatching else {
                                 return
@@ -2180,6 +2215,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
                         streamError = error
                         needsRecovery = true
                     }
+                }
+
+                guard !Task.isCancelled else {
+                    return
+                }
+                await self?.stopTaskWatchReconciliation(generation: generation)
+                guard !Task.isCancelled else {
+                    return
                 }
 
                 guard needsRecovery else {
@@ -2206,7 +2249,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
 
                 var shouldResubscribe = false
                 while !Task.isCancelled,
-                    recoveryAttempts < Self.maximumTaskWatchRecoveryAttempts
+                    (self?.taskWatchRecoveryAttempts ?? Self.maximumTaskWatchRecoveryAttempts)
+                        < Self.maximumTaskWatchRecoveryAttempts
                 {
                     guard
                         self?.isTaskWatchCurrent(
@@ -2218,14 +2262,18 @@ public final class BilibiliTaskViewModel: ObservableObject {
                         return
                     }
 
-                    recoveryAttempts += 1
+                    guard let recoveryAttempts = self?.taskWatchRecoveryAttempts else {
+                        return
+                    }
+                    let nextRecoveryAttempt = recoveryAttempts + 1
+                    self?.taskWatchRecoveryAttempts = nextRecoveryAttempt
                     self?.markTaskWatchReconnecting(
                         taskID: taskID,
                         sequence: sequence,
                         generation: generation
                     )
                     do {
-                        try await sleep(Self.taskWatchRecoveryDelay(forAttempt: recoveryAttempts))
+                        try await sleep(Self.taskWatchRecoveryDelay(forAttempt: nextRecoveryAttempt))
                     } catch {
                         guard !Task.isCancelled else {
                             return
@@ -2276,7 +2324,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
                             continue
                         }
                         if update.progressChanged {
-                            recoveryAttempts = 0
+                            self?.taskWatchRecoveryAttempts = 0
                         }
                         guard update.shouldKeepWatching else {
                             return
@@ -2623,6 +2671,7 @@ public final class BilibiliTaskViewModel: ObservableObject {
         taskWatchGeneration += 1
         taskWatcher?.cancel()
         taskWatcher = nil
+        cancelTaskWatchReconciliation()
         isWatching = false
         isReconnecting = false
         watchErrorMessage = nil
@@ -2657,6 +2706,14 @@ public final class BilibiliTaskViewModel: ObservableObject {
         watchErrorMessage = "Task updates were interrupted. Reconnecting."
     }
 
+    private func markTaskWatchHealthy(taskID: String, sequence: Int, generation: Int) {
+        guard isTaskWatchCurrent(taskID: taskID, sequence: sequence, generation: generation) else {
+            return
+        }
+        isReconnecting = false
+        watchErrorMessage = nil
+    }
+
     private func finishWatching(
         taskID: String,
         sequence: Int,
@@ -2666,13 +2723,218 @@ public final class BilibiliTaskViewModel: ObservableObject {
         guard isTaskWatchCurrent(taskID: taskID, sequence: sequence, generation: generation) else {
             return
         }
+        taskWatcher?.cancel()
+        taskWatcher = nil
+        cancelTaskWatchReconciliation()
         isWatching = false
         isReconnecting = false
         watchErrorMessage =
             exhausted
             ? "Task updates could not be restored. Retry to resume observation."
             : "Task updates are unavailable. Check the cache server, then retry."
-        taskWatcher = nil
+    }
+
+    private func startTaskWatchReconciliation(
+        taskID: String,
+        endpoint: CacheServerEndpoint,
+        sequence: Int,
+        generation: Int,
+        client: any CacheControlClient,
+        timeout: Duration,
+        interval: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
+        guard isTaskWatchCurrent(taskID: taskID, sequence: sequence, generation: generation),
+            watchReconciliationGeneration != generation
+        else {
+            return
+        }
+
+        watchReconciliationGeneration = generation
+        let now = watchReconciliationNow
+        let subscriptionStarted = now()
+        taskWatchLastActivityInstant = subscriptionStarted
+        var nextProbeNotBefore = subscriptionStarted.advanced(by: interval)
+        watchReconciliationTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard
+                    self?.isTaskWatchCurrent(
+                        taskID: taskID,
+                        sequence: sequence,
+                        generation: generation
+                    ) == true,
+                    let lastActivity = self?.taskWatchLastActivityInstant
+                else {
+                    return
+                }
+
+                let quietDeadline = max(lastActivity.advanced(by: interval), nextProbeNotBefore)
+                let remaining = now().duration(to: quietDeadline)
+                if remaining > .zero {
+                    do {
+                        try await sleep(remaining)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+                if self?.isCancelling == true {
+                    nextProbeNotBefore = now().advanced(by: interval)
+                    continue
+                }
+                guard let activityGeneration = self?.taskWatchActivityGeneration else {
+                    return
+                }
+                guard
+                    let snapshotGeneration = self?.taskWatchSnapshotGeneration(
+                        taskID: taskID,
+                        sequence: sequence,
+                        generation: generation
+                    )
+                else {
+                    return
+                }
+
+                nextProbeNotBefore = now().advanced(by: interval)
+                do {
+                    let task = try await Self.withCancellableOperationTimeout(timeout) {
+                        try await client.getTask(id: taskID)
+                    }
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    guard
+                        self?.isCurrentTaskWatchReconciliation(
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation,
+                            expectedSnapshotGeneration: snapshotGeneration,
+                            expectedActivityGeneration: activityGeneration
+                        ) == true
+                    else {
+                        guard
+                            self?.isTaskWatchCurrent(
+                                taskID: taskID,
+                                sequence: sequence,
+                                generation: generation
+                            ) == true
+                        else {
+                            return
+                        }
+                        continue
+                    }
+                    guard
+                        let update = self?.applyReconciledTask(
+                            task,
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation,
+                            expectedSnapshotGeneration: snapshotGeneration
+                        )
+                    else {
+                        return
+                    }
+                    guard update.accepted else {
+                        continue
+                    }
+                    guard update.shouldKeepWatching else {
+                        return
+                    }
+                    if update.progressChanged {
+                        self?.taskWatchRecoveryAttempts = 0
+                    }
+                    self?.markTaskWatchHealthy(
+                        taskID: taskID,
+                        sequence: sequence,
+                        generation: generation
+                    )
+                } catch {
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    guard
+                        self?.isTaskWatchCurrent(
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation
+                        ) == true
+                    else {
+                        return
+                    }
+                    guard
+                        self?.isCurrentTaskWatchReconciliation(
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation,
+                            expectedSnapshotGeneration: snapshotGeneration,
+                            expectedActivityGeneration: activityGeneration
+                        ) == true
+                    else {
+                        continue
+                    }
+                    guard Self.canRetryTaskObservation(after: error) else {
+                        self?.finishWatching(
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation,
+                            exhausted: false
+                        )
+                        return
+                    }
+                    let nextRecoveryAttempt =
+                        (self?.taskWatchRecoveryAttempts
+                            ?? Self.maximumTaskWatchRecoveryAttempts) + 1
+                    guard nextRecoveryAttempt <= Self.maximumTaskWatchRecoveryAttempts else {
+                        self?.finishWatching(
+                            taskID: taskID,
+                            sequence: sequence,
+                            generation: generation,
+                            exhausted: true
+                        )
+                        return
+                    }
+                    self?.startWatching(
+                        taskID: taskID,
+                        endpoint: endpoint,
+                        sequence: sequence,
+                        reconcileBeforeSubscribe: true,
+                        recoveryAttempts: nextRecoveryAttempt
+                    )
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopTaskWatchReconciliation(generation: Int) async {
+        guard watchReconciliationGeneration == generation else {
+            return
+        }
+        let reconciliationTask = watchReconciliationTask
+        watchReconciliationTask = nil
+        watchReconciliationGeneration = nil
+        reconciliationTask?.cancel()
+        await reconciliationTask?.value
+    }
+
+    private func cancelTaskWatchReconciliation() {
+        watchReconciliationTask?.cancel()
+        watchReconciliationTask = nil
+        watchReconciliationGeneration = nil
+    }
+
+    private func isCurrentTaskWatchReconciliation(
+        taskID: String,
+        sequence: Int,
+        generation: Int,
+        expectedSnapshotGeneration: Int,
+        expectedActivityGeneration: Int
+    ) -> Bool {
+        isTaskWatchCurrent(taskID: taskID, sequence: sequence, generation: generation)
+            && currentTask?.shouldKeepWatchingBilibiliTask == true
+            && !isCancelling
+            && taskSnapshotGeneration == expectedSnapshotGeneration
+            && taskWatchActivityGeneration == expectedActivityGeneration
     }
 
     private static let maximumTaskWatchRecoveryAttempts = 6
@@ -2827,6 +3089,8 @@ public final class BilibiliTaskViewModel: ObservableObject {
         let progressChanged =
             BilibiliTaskWatchProgressSnapshot(task)
             != BilibiliTaskWatchProgressSnapshot(currentTask)
+        taskWatchActivityGeneration += 1
+        taskWatchLastActivityInstant = watchReconciliationNow()
         applyTaskUpdate(task)
         isReconnecting = false
         watchErrorMessage = nil

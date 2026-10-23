@@ -22,6 +22,9 @@ STAGES = (
     "pre-commit", "tvos-build", "macos-build", "rust-build", "tvos-test-build",
     "tvos-tests", "core-tests", "macos-tests", "lan-probe", "rust-tests",
 )
+CORE_STAGES = ("core-tests",)
+APPLE_STAGES = tuple(stage for stage in STAGES if stage not in CORE_STAGES)
+SUMMARY_GROUPS = {"all": STAGES, "apple": APPLE_STAGES, "core": CORE_STAGES}
 MAX_LOG_BYTES = 512 * 1024
 HEAD_BYTES = 64 * 1024
 MAX_JSON_BYTES = 4096
@@ -289,11 +292,13 @@ def run_stage(
     return exit_code, result
 
 
-def summarize(artifact_dir: Path) -> dict[str, object]:
+def summarize(artifact_dir: Path, group: str = "all") -> dict[str, object]:
+    if group not in SUMMARY_GROUPS:
+        raise StageError("Unknown summary group.")
     artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     stages = []
     total_bytes = 0
-    for stage in STAGES:
+    for stage in SUMMARY_GROUPS[group]:
         for suffix, limit in (("log", MAX_LOG_BYTES), ("json", MAX_JSON_BYTES)):
             path = artifact_dir / f"{stage}.{suffix}"
             if path.is_symlink():
@@ -367,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=STAGES)
     parser.add_argument("--summarize", action="store_true")
+    parser.add_argument("--summary-group", choices=SUMMARY_GROUPS, default="all")
     parser.add_argument("--artifact-dir", type=Path,
                         default=os.environ.get("CI_STAGE_ARTIFACT_DIR"))
     parser.add_argument("--timeout-seconds", type=float, default=WORK_SECONDS)
@@ -376,8 +382,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Choose a stage or summary and provide an artifact directory.")
     try:
         if args.summarize:
-            summarize(args.artifact_dir)
+            summarize(args.artifact_dir, group=args.summary_group)
             return 0
+        if args.summary_group != "all":
+            parser.error("--summary-group requires --summarize.")
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         return run_stage(args.stage, command, args.artifact_dir,
                          timeout_seconds=args.timeout_seconds)[0]

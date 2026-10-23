@@ -92,6 +92,112 @@ final class TaskWatchTransportIntegrationTests: XCTestCase {
         }
     }
 
+    func testSilentWatchReconcilesUnchangedAndTerminalSnapshotsWithoutResubscribing() async throws {
+        let probe = TaskWatchRPCProbe(scenario: .silentReconciliation)
+        let service = TaskWatchTestService(probe: probe)
+
+        try await withLoopbackServer(service: service) { endpoint in
+            let model = self.makeModel(
+                endpoint: endpoint,
+                source: "BV1silent-reconciliation",
+                watchReconciliationInterval: .milliseconds(100)
+            )
+            defer { model.clearTask() }
+
+            let watchOpened = self.expectation(description: "silent watch stream is open")
+            let runningSnapshot = self.expectation(description: "first reconciliation updates the task")
+            let healthySilentWatch = self.expectation(description: "unchanged snapshots keep the watch healthy")
+            let completed = self.expectation(description: "terminal reconciliation publishes task output")
+            let watchClosed = self.expectation(description: "client cancellation closes the silent watch stream")
+            await probe.holdGetTaskResponse(attempt: 3)
+            let openWaiter = Task { @MainActor in
+                await probe.waitForWatchOpenCount(1)
+                watchOpened.fulfill()
+            }
+            let healthyWatchWaiter = Task { @MainActor in
+                await probe.waitForGetTaskCount(3)
+                healthySilentWatch.fulfill()
+            }
+            let closeWaiter = Task { @MainActor in
+                await probe.waitForWatchCloseCount(1)
+                watchClosed.fulfill()
+            }
+            defer {
+                openWaiter.cancel()
+                healthyWatchWaiter.cancel()
+                closeWaiter.cancel()
+            }
+
+            let runningSnapshotOnce = TaskWatchExpectationOnce(runningSnapshot)
+            let taskToken = model.$currentTask.sink { task in
+                if task?.id == self.taskID,
+                    task?.state.localizedCaseInsensitiveContains("running") == true
+                {
+                    Task { @MainActor in runningSnapshotOnce.fulfill() }
+                }
+            }
+            let completionToken = self.observeTerminalResult(
+                in: model,
+                resultID: "loopback-result-1",
+                expectation: completed
+            )
+
+            await model.submit(serverAddressText: endpoint.displayAddress)
+
+            guard
+                await self.assertTaskSubmitted(
+                    model: model,
+                    probe: probe,
+                    expectations: [watchOpened, runningSnapshot, healthySilentWatch, completed, watchClosed]
+                )
+            else {
+                return
+            }
+
+            let firstReconciliation = await XCTWaiter.fulfillment(
+                of: [watchOpened, runningSnapshot],
+                timeout: 20
+            )
+            XCTAssertEqual(firstReconciliation, .completed)
+
+            let healthyWatchWait = await XCTWaiter.fulfillment(of: [healthySilentWatch], timeout: 20)
+            XCTAssertEqual(healthyWatchWait, .completed)
+            XCTAssertTrue(model.isWatching)
+            XCTAssertFalse(model.isReconnecting)
+            XCTAssertNil(model.watchErrorMessage)
+            XCTAssertEqual(model.currentTask?.id, self.taskID)
+            XCTAssertTrue(model.currentTask?.state.localizedCaseInsensitiveContains("running") == true)
+
+            await probe.releaseGetTaskResponse(attempt: 3)
+            let completedWait = await XCTWaiter.fulfillment(of: [completed], timeout: 20)
+            XCTAssertEqual(completedWait, .completed)
+            XCTAssertEqual(model.currentTask?.id, self.taskID)
+            XCTAssertTrue(model.currentTask?.state.localizedCaseInsensitiveContains("succeeded") == true)
+            XCTAssertEqual(model.currentTask?.outputSummary?.revision, 42)
+            XCTAssertEqual(model.taskResults.map(\.id), ["loopback-result-1"])
+            XCTAssertEqual(model.taskResults.first?.title, "Loopback result")
+            XCTAssertNil(model.watchErrorMessage)
+            XCTAssertFalse(model.isWatching)
+
+            model.clearTask()
+            let watchClosedWait = await XCTWaiter.fulfillment(of: [watchClosed], timeout: 20)
+            XCTAssertEqual(watchClosedWait, .completed)
+
+            let snapshot = await probe.snapshot()
+            XCTAssertEqual(snapshot.resolutionSources, ["BV1silent-reconciliation"])
+            XCTAssertEqual(snapshot.createdTaskIDs, [self.taskID])
+            XCTAssertEqual(snapshot.watchRequestIDs, [[self.taskID]])
+            XCTAssertEqual(snapshot.getTaskIDs, [self.taskID, self.taskID, self.taskID])
+            XCTAssertEqual(snapshot.cancelledTaskIDs, [])
+            XCTAssertEqual(snapshot.openWatchStreams, 1)
+            XCTAssertEqual(snapshot.closedWatchStreams, 1)
+            XCTAssertEqual(snapshot.taskResultQueries, [self.taskID])
+            XCTAssertEqual(snapshot.resultOutputRevisions, [42])
+
+            _ = [taskToken, completionToken]
+        }
+    }
+
     func testPermissionDeniedStopsAutomaticRecovery() async throws {
         let probe = TaskWatchRPCProbe(scenario: .permissionDenied)
         let service = TaskWatchTestService(probe: probe)
@@ -264,11 +370,16 @@ final class TaskWatchTransportIntegrationTests: XCTestCase {
         }
     }
 
-    private func makeModel(endpoint: CacheServerEndpoint, source: String) -> BilibiliTaskViewModel {
+    private func makeModel(
+        endpoint: CacheServerEndpoint,
+        source: String,
+        watchReconciliationInterval: Duration = .seconds(30)
+    ) -> BilibiliTaskViewModel {
         BilibiliTaskViewModel(
             sourceText: source,
             operationTimeout: .seconds(10),
             resolutionTimeout: .seconds(10),
+            watchReconciliationInterval: watchReconciliationInterval,
             clientFactory: { endpoint in
                 GRPCCacheControlClient(endpoint: endpoint, rpcTimeout: .seconds(10))
             }
@@ -365,12 +476,20 @@ private enum TaskWatchFixtureScenario: Equatable, Sendable {
     case permissionDenied
     case notFoundAfterUnavailable
     case interruptThenComplete
+    case silentReconciliation
 }
 
 private enum TaskWatchFixturePlan: Sendable {
     case unavailableAfterProgress
     case permissionDenied
     case complete
+    case remainOpen
+}
+
+private enum TaskWatchGetTaskPlan: Sendable {
+    case notFound
+    case running
+    case terminal
 }
 
 private actor TaskWatchRPCProbe {
@@ -380,8 +499,23 @@ private actor TaskWatchRPCProbe {
         let createdTaskIDs: [String]
         let watchRequestIDs: [[String]]
         let getTaskIDs: [String]
+        let cancelledTaskIDs: [String]
+        let openWatchStreams: Int
+        let closedWatchStreams: Int
         let taskResultQueries: [String]
         let resultOutputRevisions: [UInt64]
+    }
+
+    private enum EventKind: Hashable {
+        case getTask
+        case watchOpen
+        case watchClose
+    }
+
+    private struct EventWaiter {
+        let kind: EventKind
+        let target: Int
+        let continuation: CheckedContinuation<Void, Never>
     }
 
     private let scenario: TaskWatchFixtureScenario
@@ -390,8 +524,15 @@ private actor TaskWatchRPCProbe {
     private var createdTaskIDs: [String] = []
     private var watchRequestIDs: [[String]] = []
     private var getTaskIDs: [String] = []
+    private var cancelledTaskIDs: [String] = []
+    private var openWatchStreams = 0
+    private var closedWatchStreams = 0
     private var taskResultQueries: [String] = []
     private var resultOutputRevisions: [UInt64] = []
+    private var eventWaiters: [UUID: EventWaiter] = [:]
+    private var heldGetTaskAttempts: Set<Int> = []
+    private var releasedGetTaskAttempts: Set<Int> = []
+    private var getTaskResponseWaiters: [UUID: (attempt: Int, continuation: CheckedContinuation<Void, Never>)] = [:]
 
     init(scenario: TaskWatchFixtureScenario) {
         self.scenario = scenario
@@ -420,15 +561,133 @@ private actor TaskWatchRPCProbe {
             return attempt == 1 ? .unavailableAfterProgress : .complete
         case .permissionDenied:
             return attempt == 1 ? .permissionDenied : .complete
+        case .silentReconciliation:
+            return .remainOpen
         }
     }
 
-    func recordGetTask(id: String) {
+    func recordGetTask(id: String) -> Int {
         getTaskIDs.append(id)
+        resumeEventWaiters(for: .getTask)
+        return getTaskIDs.count
     }
 
-    func getTaskShouldBeNotFound() -> Bool {
-        scenario == .notFoundAfterUnavailable
+    func getTaskPlan(attempt: Int) -> TaskWatchGetTaskPlan {
+        switch scenario {
+        case .notFoundAfterUnavailable:
+            .notFound
+        case .silentReconciliation:
+            attempt >= 3 ? .terminal : .running
+        case .recoverAfterUnavailable, .permissionDenied, .interruptThenComplete:
+            .running
+        }
+    }
+
+    func holdGetTaskResponse(attempt: Int) {
+        heldGetTaskAttempts.insert(attempt)
+    }
+
+    func releaseGetTaskResponse(attempt: Int) {
+        releasedGetTaskAttempts.insert(attempt)
+        let readyIDs = getTaskResponseWaiters.compactMap { id, waiter in
+            waiter.attempt == attempt ? id : nil
+        }
+        for id in readyIDs {
+            getTaskResponseWaiters.removeValue(forKey: id)?.continuation.resume()
+        }
+    }
+
+    func waitForGetTaskResponseRelease(attempt: Int) async {
+        guard heldGetTaskAttempts.contains(attempt), !releasedGetTaskAttempts.contains(attempt) else {
+            return
+        }
+
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, !releasedGetTaskAttempts.contains(attempt) else {
+                    continuation.resume()
+                    return
+                }
+                getTaskResponseWaiters[id] = (attempt, continuation)
+            }
+        } onCancel: {
+            Task { await self.cancelGetTaskResponseWaiter(id) }
+        }
+    }
+
+    func recordCancellation(id: String) {
+        cancelledTaskIDs.append(id)
+    }
+
+    func recordWatchOpened() {
+        openWatchStreams += 1
+        resumeEventWaiters(for: .watchOpen)
+    }
+
+    func recordWatchClosed() {
+        closedWatchStreams += 1
+        resumeEventWaiters(for: .watchClose)
+    }
+
+    func waitForGetTaskCount(_ count: Int) async {
+        await waitForEvent(.getTask, count: count)
+    }
+
+    func waitForWatchOpenCount(_ count: Int) async {
+        await waitForEvent(.watchOpen, count: count)
+    }
+
+    func waitForWatchCloseCount(_ count: Int) async {
+        await waitForEvent(.watchClose, count: count)
+    }
+
+    private func waitForEvent(_ kind: EventKind, count: Int) async {
+        guard eventCount(for: kind) < count else {
+            return
+        }
+
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, eventCount(for: kind) < count else {
+                    continuation.resume()
+                    return
+                }
+                eventWaiters[id] = EventWaiter(kind: kind, target: count, continuation: continuation)
+            }
+        } onCancel: {
+            Task { await self.cancelEventWaiter(id) }
+        }
+    }
+
+    private func eventCount(for kind: EventKind) -> Int {
+        switch kind {
+        case .getTask:
+            getTaskIDs.count
+        case .watchOpen:
+            openWatchStreams
+        case .watchClose:
+            closedWatchStreams
+        }
+    }
+
+    private func resumeEventWaiters(for kind: EventKind) {
+        let reached = eventCount(for: kind)
+        let readyIDs = eventWaiters.compactMap { id, waiter in
+            waiter.kind == kind && waiter.target <= reached ? id : nil
+        }
+        for id in readyIDs {
+            eventWaiters.removeValue(forKey: id)?.continuation.resume()
+        }
+    }
+
+    private func cancelEventWaiter(_ id: UUID) {
+        eventWaiters.removeValue(forKey: id)?.continuation.resume()
+    }
+
+    private func cancelGetTaskResponseWaiter(_ id: UUID) {
+        getTaskResponseWaiters.removeValue(forKey: id)?.continuation.resume()
     }
 
     func recordTaskResults(id: String, outputRevision: UInt64) {
@@ -443,6 +702,9 @@ private actor TaskWatchRPCProbe {
             createdTaskIDs: createdTaskIDs,
             watchRequestIDs: watchRequestIDs,
             getTaskIDs: getTaskIDs,
+            cancelledTaskIDs: cancelledTaskIDs,
+            openWatchStreams: openWatchStreams,
+            closedWatchStreams: closedWatchStreams,
             taskResultQueries: taskResultQueries,
             resultOutputRevisions: resultOutputRevisions
         )
@@ -547,10 +809,22 @@ private struct TaskWatchTestService: RegistrableRPCService {
             TvosNetPlayer_V1_TaskService.Method.GetTask.descriptor,
             with: &router
         ) { (request: TvosNetPlayer_V1_GetTaskRequest) in
-            await probe.recordGetTask(id: request.id)
-            if await probe.getTaskShouldBeNotFound() {
+            let attempt = await probe.recordGetTask(id: request.id)
+            await probe.waitForGetTaskResponseRelease(attempt: attempt)
+            switch await probe.getTaskPlan(attempt: attempt) {
+            case .notFound:
                 throw RPCError(code: .notFound, message: "Synthetic task not found.")
+            case .running:
+                return Self.task(state: .running, progress: 0.65)
+            case .terminal:
+                return Self.task(state: .succeeded, progress: 1, outputRevision: 42)
             }
+        }
+        Self.registerUnary(
+            TvosNetPlayer_V1_TaskService.Method.CancelTask.descriptor,
+            with: &router
+        ) { (request: TvosNetPlayer_V1_CancelTaskRequest) in
+            await probe.recordCancellation(id: request.id)
             return Self.task(state: .running, progress: 0.65)
         }
         Self.registerUnary(
@@ -570,7 +844,8 @@ private struct TaskWatchTestService: RegistrableRPCService {
             forMethod: TvosNetPlayer_V1_TaskService.Method.WatchTasks.descriptor,
             deserializer: ProtobufDeserializer<TvosNetPlayer_V1_WatchTasksRequest>(),
             serializer: ProtobufSerializer<TvosNetPlayer_V1_TaskEvent>()
-        ) { request, _ in
+        ) { request, context in
+            let rpcCancellation = context.cancellation
             let request = try await ServerRequest(stream: request)
             let attempt = await probe.beginWatch(ids: request.message.ids)
             return StreamingServerResponse(of: TvosNetPlayer_V1_TaskEvent.self) { writer in
@@ -588,6 +863,16 @@ private struct TaskWatchTestService: RegistrableRPCService {
                                 progress: 1,
                                 outputRevision: 42
                             )))
+                    return [:]
+                case .remainOpen:
+                    await probe.recordWatchOpened()
+                    do {
+                        try await rpcCancellation.cancelled
+                    } catch {
+                        await probe.recordWatchClosed()
+                        throw error
+                    }
+                    await probe.recordWatchClosed()
                     return [:]
                 }
             }
