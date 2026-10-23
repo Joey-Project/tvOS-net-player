@@ -661,6 +661,8 @@ struct ContentView: View {
                         }
                         .buttonStyle(.bordered)
                         .accessibilityIdentifier("bilibili.watch.retry")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .focusSection()
                     }
                     if let summary = bilibiliModel.activePlaybackPolicySummary {
                         Text(summary)
@@ -902,6 +904,8 @@ struct ContentView: View {
                                     .disabled(!bilibiliModel.canPlay(result: result))
                                     .accessibilityIdentifier("bilibili-result-play-\(result.id)")
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .focusSection()
 
                                 ForEach(result.artifacts) { artifact in
                                     BilibiliTaskArtifactRow(artifact: artifact)

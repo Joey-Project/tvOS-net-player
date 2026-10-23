@@ -193,9 +193,15 @@ final class UIPlaybackTests: XCTestCase {
         XCTAssertFalse(watchError.label.isEmpty, "The exhausted watch error must expose user-visible text.")
         XCTAssertFalse(reconnecting.exists)
 
+        let addressField = app.textFields["cache-server-address"]
+        XCTAssertTrue(
+            moveFocus(until: addressField, direction: .up, limit: 40),
+            "Remote focus could not recover the cache server address landmark. "
+                + taskWatchFocusDescription(target: addressField)
+        )
         let play = app.buttons["bilibili-result-play-ui-e2e-manual-result"]
         XCTAssertTrue(
-            moveFocus(until: play, direction: .up, limit: 20),
+            focusDown(until: play, limit: 80),
             "Remote focus could not reach the visible result Play control. " + taskWatchFocusDescription(target: play)
         )
         XCTAssertTrue(play.isEnabled, "The fixture's task media must be playable while updates are unavailable.")
@@ -276,9 +282,18 @@ final class UIPlaybackTests: XCTestCase {
     private func taskWatchFocusDescription(target: XCUIElement) -> String {
         let submit = app.buttons["bilibili-submit"]
         let reconnect = identifiedElement("bilibili.watch.retry")
-        return "targetFocused=\(target.exists && target.hasFocus), "
+        let focusedControl = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasFocus == true"))
+            .firstMatch
+        let focusedDescription =
+            focusedControl.exists
+            ? "id=\(focusedControl.identifier.debugDescription), label=\(focusedControl.label.debugDescription)"
+            : "none"
+        let targetExists = target.exists
+        return "targetExists=\(targetExists), targetEnabled=\(targetExists && target.isEnabled), "
+            + "targetHittable=\(targetExists && target.isHittable), targetFocused=\(targetExists && target.hasFocus), "
             + "submitFocused=\(submit.exists && submit.hasFocus), "
-            + "reconnectFocused=\(reconnect.exists && reconnect.hasFocus); "
+            + "reconnectFocused=\(reconnect.exists && reconnect.hasFocus), focusedControl={\(focusedDescription)}; "
             + "target: \(accessibilityDescription(target))"
     }
 
