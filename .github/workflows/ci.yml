@@ -17,54 +17,179 @@ jobs:
   apple-platforms:
     name: tvOS build and tests
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
+      - name: Establish CI work deadline
+        run: |
+          deadline="$(python3 -c 'import time; print(time.monotonic() + 45 * 60)')"
+          printf 'CI_WORK_DEADLINE_MONOTONIC=%s\n' "$deadline" >> "$GITHUB_ENV"
+          printf 'CI_STAGE_ARTIFACT_DIR=%s/ci-stage-artifacts\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Show Xcode toolchain
+        timeout-minutes: 3
         run: |
-          xcodebuild -version
-          xcodebuild -showsdks
+          python3 scripts/ci-stage.py --stage toolchain-apple --timeout-seconds 120 -- bash -e -o pipefail -c '
+            xcodebuild -version
+            xcodebuild -showsdks
+          '
 
       - name: Install shellcheck
+        timeout-minutes: 6
         run: |
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            brew install shellcheck
-          fi
+          python3 scripts/ci-stage.py --stage install-shellcheck --timeout-seconds 300 -- bash -e -o pipefail -c '
+            if ! command -v shellcheck >/dev/null 2>&1; then
+              brew install shellcheck
+            fi
+          '
 
       - name: Show Rust toolchain
+        timeout-minutes: 3
         run: |
-          rustc --version
-          cargo --version
-          cargo clippy --version
+          python3 scripts/ci-stage.py --stage toolchain-rust --timeout-seconds 120 -- bash -e -o pipefail -c '
+            rustc --version
+            cargo --version
+            cargo clippy --version
+          '
+
+      - name: Compute compiled cache identities
+        id: cache-toolchains
+        timeout-minutes: 2
+        continue-on-error: true
+        run: |
+          apple="$(xcodebuild -version)"
+          swift="$(xcrun swift --version)"
+          sdks="$(xcodebuild -showsdks)"
+          clang="$(xcrun clang --version)"
+          os="$(sw_vers -buildVersion)"
+          rust="$(rustc -Vv)"
+          cargo="$(cargo -V)"
+          apple_key="$(printf '%s\n' "$apple" "$swift" "$sdks" "$clang" "$os" | shasum -a 256 | cut -d ' ' -f 1)"
+          rust_key="$(printf '%s\n' "$apple_key" "$rust" "$cargo" | shasum -a 256 | cut -d ' ' -f 1)"
+          printf 'swift=%s\nrust=%s\n' "$apple_key" "$rust_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Rust compiled cache
+        id: restore-rust
+        if: steps.cache-toolchains.outputs.rust != ''
+        uses: actions/cache/restore@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+        with:
+          path: target
+          key: ci-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-toolchains.outputs.rust }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'CacheServer/RustCacheServer/Cargo.toml', 'CacheServer/RustCacheServer/build.rs', 'CacheServer/RustCacheServer/src/**', 'CacheServer/RustCacheServer/tests/**', 'Sources/TVOSNetPlayerCacheClient/Protos/**', 'scripts/build-cache-server.sh', 'scripts/test-cache-server.sh', 'scripts/lint-rust.sh') }}
+
+      - name: Restore Swift compiled cache
+        id: restore-swift
+        if: steps.cache-toolchains.outputs.swift != ''
+        uses: actions/cache/restore@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+        with:
+          path: .build
+          key: ci-swift-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-toolchains.outputs.swift }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Vendor/**', 'Sources/**', 'Tests/**', 'scripts/test.sh', 'scripts/ui-e2e.py') }}
+
+      - name: Run CI helper regression tests
+        run: python3 scripts/ci-stage.py --stage helper-regressions -- python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
       - name: Run pre-commit checks
-        run: scripts/pre-commit.sh
+        run: python3 scripts/ci-stage.py --stage pre-commit -- scripts/pre-commit.sh
 
       - name: Build tvOS simulator app
-        run: scripts/build.sh
+        run: python3 scripts/ci-stage.py --stage tvos-build -- scripts/build.sh
 
       - name: Build macOS app
-        run: scripts/build-macos.sh
+        run: python3 scripts/ci-stage.py --stage macos-build -- scripts/build-macos.sh
 
       - name: Build LAN cache server
-        run: scripts/build-cache-server.sh
+        run: python3 scripts/ci-stage.py --stage rust-build -- scripts/build-cache-server.sh
 
       - name: Build tvOS XCTest bundle
-        run: scripts/build-for-testing.sh
+        run: python3 scripts/ci-stage.py --stage tvos-test-build -- scripts/build-for-testing.sh
 
       - name: Run tvOS XCTest target
-        run: scripts/test-tvos-simulator.sh
+        run: python3 scripts/ci-stage.py --stage tvos-tests -- scripts/test-tvos-simulator.sh
 
       - name: Run core unit tests
-        run: scripts/test.sh
+        run: python3 scripts/ci-stage.py --stage core-tests -- scripts/test.sh
 
       - name: Run macOS XCTest target
-        run: scripts/test-macos.sh
+        run: python3 scripts/ci-stage.py --stage macos-tests -- scripts/test-macos.sh
 
       - name: Build and self-test LAN AVPlayer probe
-        run: bash scripts/test-lan-playback.sh
+        run: python3 scripts/ci-stage.py --stage lan-probe -- bash scripts/test-lan-playback.sh
 
       - name: Run LAN cache server integration tests
-        run: scripts/test-cache-server.sh
+        run: python3 scripts/ci-stage.py --stage rust-tests -- scripts/test-cache-server.sh
+
+      - name: Summarize bounded CI diagnostics
+        if: always()
+        timeout-minutes: 1
+        env:
+          CI_RUST_CACHE_OUTCOME: ${{ steps.restore-rust.outcome }}
+          CI_RUST_CACHE_HIT: ${{ steps.restore-rust.outputs.cache-hit }}
+          CI_SWIFT_CACHE_OUTCOME: ${{ steps.restore-swift.outcome }}
+          CI_SWIFT_CACHE_HIT: ${{ steps.restore-swift.outputs.cache-hit }}
+        run: python3 scripts/ci-stage.py --summarize
+
+      - name: Upload bounded CI diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: ci-stages-${{ github.run_id }}
+          path: |
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/toolchain-apple.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/toolchain-apple.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/install-shellcheck.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/install-shellcheck.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/toolchain-rust.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/toolchain-rust.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/helper-regressions.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/helper-regressions.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/pre-commit.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/pre-commit.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-build.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-build.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-build.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-build.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/rust-build.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/rust-build.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-test-build.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-test-build.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-tests.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-tests.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-tests.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-tests.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/lan-probe.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/lan-probe.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/rust-tests.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/rust-tests.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/summary.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Save Rust compiled cache
+        if: success() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.restore-rust.outputs.cache-primary-key != '' && steps.restore-rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: target
+          key: ${{ steps.restore-rust.outputs.cache-primary-key }}
+
+      - name: Save Swift compiled cache
+        if: success() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.restore-swift.outputs.cache-primary-key != '' && steps.restore-swift.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: .build
+          key: ${{ steps.restore-swift.outputs.cache-primary-key }}

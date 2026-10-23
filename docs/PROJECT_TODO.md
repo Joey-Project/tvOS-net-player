@@ -1,5 +1,7 @@
 # Project TODO
 
+- [in_progress] Execute the approved [home LAN reliability and preview roadmap](project_journal/2026/10/2026-10-23-home-lan-readiness-roadmap-b46388.md), including client task/playback resumption after silent-state reconciliation.
+
 - [completed] PR 1：增加 shared AppCore、tvOS 和 macOS 播放器 seek/skip/playback speed controls。
 - [completed] PR 2：支持 remote/Cloudflare Tunnel style cache server endpoint，包括 `https://` gRPC transport、scheme-aware endpoint normalization 和 remote URL 输入提示。
 - [completed] PR 3：实现 LAN transcoding execution MVP，包括 ffmpeg/job runner、落盘恢复、取消和输出 HLS manifest。

@@ -24086,19 +24086,169 @@ mod tests {
         task_id: &str,
         predicate: impl Fn(&Task) -> bool,
     ) -> Task {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let started = StdInstant::now();
+        let mut diagnostics = TaskWaitDiagnostics::default();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let task = tasks
                     .get_task(task_id)
                     .expect("task should exist while waiting for state");
+                diagnostics.observe(&task);
                 if predicate(&task) {
                     return task;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("task should reach expected state")
+        .await;
+        result.unwrap_or_else(|_| {
+            panic!(
+                "task should reach expected state: {}",
+                diagnostics.describe(started.elapsed())
+            )
+        })
+    }
+
+    #[derive(Default)]
+    struct TaskWaitDiagnostics {
+        observations: usize,
+        last_snapshot: Option<String>,
+    }
+
+    impl TaskWaitDiagnostics {
+        fn observe(&mut self, task: &Task) {
+            let mut result_status_counts = std::collections::BTreeMap::new();
+            let mut result_hls_fill_status_counts = std::collections::BTreeMap::new();
+            let fill_status = |status: &HlsCacheFillStatus| (status.state(), status.failure_kind());
+            // Enum aggregation bounds diagnostic output independently of the result count.
+            for item in &task.result_items {
+                *result_status_counts.entry(item.state()).or_insert(0_usize) += 1;
+                *result_hls_fill_status_counts
+                    .entry(item.hls_cache_fill_status.as_ref().map(fill_status))
+                    .or_insert(0_usize) += 1;
+            }
+            self.observations += 1;
+            self.last_snapshot = Some(format!(
+                "state={:?}, result_count={}, result_status_counts={:?}, hls_fill={:?}, result_hls_fill_status_counts={:?}",
+                task.state(),
+                task.result_items.len(),
+                result_status_counts,
+                task.hls_cache_fill_status.as_ref().map(fill_status),
+                result_hls_fill_status_counts,
+            ));
+        }
+
+        fn describe(&self, elapsed: Duration) -> String {
+            format!(
+                "observations={}, elapsed_ms={}, last_snapshot=[{}]",
+                self.observations,
+                elapsed.as_millis(),
+                self.last_snapshot.as_deref().unwrap_or("unobserved"),
+            )
+        }
+    }
+
+    #[test]
+    fn task_wait_diagnostics_records_last_task_snapshot() {
+        let mut diagnostics = TaskWaitDiagnostics::default();
+        assert_eq!(
+            diagnostics.describe(Duration::ZERO),
+            "observations=0, elapsed_ms=0, last_snapshot=[unobserved]"
+        );
+        diagnostics.observe(&Task {
+            state: TaskState::Preparing.into(),
+            ..Default::default()
+        });
+        diagnostics.observe(&Task {
+            state: TaskState::Completed.into(),
+            hls_cache_fill_status: Some(HlsCacheFillStatus {
+                state: HlsCacheFillState::Completed.into(),
+                ..Default::default()
+            }),
+            result_items: vec![
+                BilibiliTaskResultItem {
+                    state: TaskState::Completed.into(),
+                    hls_cache_fill_status: Some(HlsCacheFillStatus {
+                        state: HlsCacheFillState::Completed.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                BilibiliTaskResultItem {
+                    state: TaskState::Playable.into(),
+                    hls_cache_fill_status: Some(HlsCacheFillStatus {
+                        state: HlsCacheFillState::Retrying.into(),
+                        failure_kind: HlsCacheFillFailureKind::Network.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let description = diagnostics.describe(Duration::from_millis(2037));
+        assert!(description.contains("observations=2, elapsed_ms=2037"));
+        assert!(description.contains("state=Completed, result_count=2"));
+        assert!(description.contains("result_status_counts={Playable: 1, Completed: 1}"));
+        assert!(description.contains("hls_fill=Some((Completed, Unspecified))"));
+        assert!(description.contains(
+            "result_hls_fill_status_counts={Some((Retrying, Network)): 1, Some((Completed, Unspecified)): 1}"
+        ));
+        assert!(!description.contains("Preparing"));
+    }
+
+    #[test]
+    fn task_wait_diagnostics_redacts_and_bounds_result_details() {
+        let sentinels = [
+            "source-omission-marker",
+            "title-omission-marker",
+            "message-omission-marker",
+            "location-omission-marker",
+            "fill-omission-marker",
+            "result-omission-marker",
+        ];
+        let task = Task {
+            source: sentinels[0].to_owned(),
+            title: sentinels[1].to_owned(),
+            message: sentinels[2].to_owned(),
+            playback_source: Some(PlaybackSource {
+                uri: sentinels[3].to_owned(),
+                ..Default::default()
+            }),
+            hls_cache_fill_status: Some(HlsCacheFillStatus {
+                message: sentinels[4].to_owned(),
+                ..Default::default()
+            }),
+            result_items: (0..4096)
+                .map(|index| BilibiliTaskResultItem {
+                    state: i32::MAX - index,
+                    title: sentinels[5].to_owned(),
+                    hls_cache_fill_status: Some(HlsCacheFillStatus {
+                        state: i32::MAX - index,
+                        failure_kind: i32::MAX - index,
+                        message: sentinels[4].to_owned(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut diagnostics = TaskWaitDiagnostics::default();
+        diagnostics.observe(&task);
+
+        let description = diagnostics.describe(Duration::from_secs(2));
+        assert!(description.contains("result_count=4096"));
+        assert!(description.contains("result_status_counts={Unspecified: 4096}"));
+        assert!(
+            description
+                .contains("result_hls_fill_status_counts={Some((Unspecified, Unspecified)): 4096}")
+        );
+        assert!(description.len() < 1024);
+        for sentinel in sentinels {
+            assert!(!description.contains(sentinel));
+        }
     }
 
     fn bilibili_execution_v2_request(
