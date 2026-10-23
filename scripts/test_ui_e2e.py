@@ -5,8 +5,11 @@ import importlib.util
 import io
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,8 +23,37 @@ sys.modules[SPEC.name] = ui_e2e
 SPEC.loader.exec_module(ui_e2e)
 
 
+def assert_darwin_pid_not_live(pid: int) -> None:
+    """Independently observe one former descendant without requiring PID removal."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AssertionError("Darwin PID state query failed; cleanup is unverified.") from error
+    if len(result.stdout) > 128 or len(result.stderr) > 128:
+        raise AssertionError("Darwin PID state query exceeded its one-field output bound.")
+    if result.returncode == 1 and not result.stdout and not result.stderr:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError as error:
+            raise AssertionError("Empty ps output did not prove PID absence.") from error
+        raise AssertionError("Empty ps output did not prove PID absence.")
+    if result.returncode != 0 or result.stderr:
+        raise AssertionError("Darwin PID state query failed; cleanup is unverified.")
+    if re.fullmatch(rb"[ \t]*Z[+<>AELNSsVWX]*[ \t]*\n?", result.stdout) is None:
+        raise AssertionError("Darwin PID state was not explicitly Z; cleanup is unverified.")
+
+
 class ProcessSupervisorTests(unittest.TestCase):
-    def test_exited_leader_descendant_is_terminated_before_leader_reaping(self) -> None:
+    def test_exited_leader_descendant_is_terminated_and_leader_reaped(self) -> None:
         owned: list[object] = []
         popen = ui_e2e.subprocess.Popen
 
@@ -49,6 +81,8 @@ class ProcessSupervisorTests(unittest.TestCase):
                 if sys.platform.startswith("linux"):
                     # Container PID 1 may leave a terminated orphan as a zombie.
                     self.assertFalse(ui_e2e._group_has_live_members(owned[0].pid))
+                elif sys.platform == "darwin":
+                    assert_darwin_pid_not_live(descendant_pid)
                 else:
                     with self.assertRaises(ProcessLookupError):
                         os.kill(descendant_pid, 0)
@@ -188,6 +222,174 @@ class ProcessSupervisorTests(unittest.TestCase):
             process.wait.assert_not_called()
             process.stdout.close.assert_called_once()
             selector.close.assert_called_once()
+
+
+class DarwinPIDStateAssertionTests(unittest.TestCase):
+    def test_explicit_zombie_state_is_terminal(self) -> None:
+        for output in (
+            b"Z", b"Z\n", b"   Z \n", b"\tZ\n",
+            b"Z+\n", b"Zs\n", b"Z+N\n", b"Z+<>AELNSsVWX\n",
+        ):
+            with (
+                self.subTest(output=output),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, output, b""
+                )) as query,
+                mock.patch.object(os, "kill") as kill,
+            ):
+                assert_darwin_pid_not_live(4244)
+                query.assert_called_once_with(
+                    ["ps", "-p", "4244", "-o", "stat="],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=1,
+                    check=False,
+                )
+                kill.assert_not_called()
+
+    def test_live_or_unknown_states_are_not_terminal(self) -> None:
+        for state in (
+            b"R", b"S", b"I", b"T", b"U", b"D", b"X", b"x", b"?",
+            b"R+", b"Ss", b"Z?", b"ZZ", b"Zinvalid",
+        ):
+            with (
+                self.subTest(state=state),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, state + b"\n", b""
+                )) as query,
+                mock.patch.object(os, "kill") as kill,
+                self.assertRaisesRegex(AssertionError, "not explicitly Z"),
+            ):
+                assert_darwin_pid_not_live(4244)
+            query.assert_called_once()
+            kill.assert_not_called()
+
+    def test_malformed_or_oversized_state_is_not_terminal(self) -> None:
+        for output in (b"", b"\n", b"z\n", b"Z\nR\n", b"Z invalid\n", b"Z\x00", b" " * 129):
+            with (
+                self.subTest(output=output[:32]),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, output, b""
+                )) as query,
+                mock.patch.object(os, "kill") as kill,
+                self.assertRaises(AssertionError),
+            ):
+                assert_darwin_pid_not_live(4244)
+            query.assert_called_once()
+            kill.assert_not_called()
+
+    def test_failed_or_denied_query_is_not_absence(self) -> None:
+        for returncode, stdout, stderr in (
+            (1, b"", b"operation denied"),
+            (1, b"\n", b""),
+            (2, b"", b""),
+            (-9, b"", b""),
+            (0, b"Z\n", b"warning"),
+            (0, b"Z\n", b"x" * 129),
+        ):
+            with (
+                self.subTest(returncode=returncode, stderr_bytes=len(stderr)),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], returncode, stdout, stderr
+                )) as query,
+                mock.patch.object(os, "kill") as kill,
+                self.assertRaises(AssertionError),
+            ):
+                assert_darwin_pid_not_live(4244)
+            query.assert_called_once()
+            kill.assert_not_called()
+
+    def test_query_errors_fail_closed_without_retry(self) -> None:
+        for error in (
+            PermissionError("query denied"),
+            FileNotFoundError("ps unavailable"),
+            OSError("query failed"),
+            subprocess.TimeoutExpired(["ps"], 1),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                mock.patch.object(subprocess, "run", side_effect=error) as query,
+                mock.patch.object(os, "kill") as kill,
+                self.assertRaisesRegex(AssertionError, "query failed"),
+            ):
+                assert_darwin_pid_not_live(4244)
+            query.assert_called_once()
+            kill.assert_not_called()
+
+    def test_empty_ps_and_esrch_together_prove_absence(self) -> None:
+        with (
+            mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 1, b"", b""
+            )) as query,
+            mock.patch.object(os, "kill", side_effect=ProcessLookupError()) as kill,
+        ):
+            assert_darwin_pid_not_live(4244)
+        query.assert_called_once()
+        kill.assert_called_once_with(4244, 0)
+
+    def test_empty_ps_with_existing_or_denied_pid_is_unverified(self) -> None:
+        for error in (None, PermissionError("signal zero denied"), OSError("query failed")):
+            with (
+                self.subTest(error=type(error).__name__),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 1, b"", b""
+                )) as query,
+                mock.patch.object(os, "kill", side_effect=error) as kill,
+                self.assertRaisesRegex(AssertionError, "did not prove PID absence"),
+            ):
+                assert_darwin_pid_not_live(4244)
+            query.assert_called_once()
+            kill.assert_called_once_with(4244, 0)
+
+    @contextlib.contextmanager
+    def owned_child(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            yield child
+        finally:
+            if child.stdin is not None and not child.stdin.closed:
+                child.stdin.close()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()  # This unreaped direct child still reserves its PID.
+                child.wait(timeout=2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin ps state assertion")
+    def test_owned_live_child_is_rejected_even_when_signal_zero_succeeds(self) -> None:
+        with self.owned_child() as child:
+            os.kill(child.pid, 0)
+            with self.assertRaisesRegex(AssertionError, "not explicitly Z"):
+                assert_darwin_pid_not_live(child.pid)
+            self.assertIsNone(child.returncode)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and hasattr(os, "waitid") and hasattr(os, "WNOWAIT"),
+        "Darwin waitid(WNOWAIT) is required to reserve a zombie PID",
+    )
+    def test_owned_unreaped_zombie_is_accepted_even_when_signal_zero_succeeds(self) -> None:
+        with self.owned_child() as child:
+            self.assertIsNotNone(child.stdin)
+            child.stdin.close()
+            # Prepare a controlled exit; the state assertion itself never retries.
+            deadline = time.monotonic() + 2
+            status = None
+            while time.monotonic() < deadline:
+                status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if status is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(status, "The owned child did not exit within two seconds.")
+            self.assertEqual(status.si_pid, child.pid)
+            self.assertIsNone(child.returncode)
+            os.kill(child.pid, 0)
+            assert_darwin_pid_not_live(child.pid)
 
 
 class RunCaptureTests(unittest.TestCase):

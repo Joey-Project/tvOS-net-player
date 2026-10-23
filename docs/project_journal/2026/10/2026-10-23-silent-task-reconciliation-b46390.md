@@ -42,6 +42,8 @@ superseded_by:
 ## Retained Observation
 - PR #82's otherwise passing macOS native results contain a non-failing SwiftUI warning about publishing changes during view updates. Preserve its result-tree evidence for focused client diagnosis; no root cause or introduction attribution is established by that observation.
 - Do not fold an unrelated UI rewrite into this control-plane slice. A demonstrated defect in the changed lifecycle should receive a narrowly justified fix and regression coverage.
+- A hosted macOS helper regression failed a PID-disappearance assertion before native UI execution. A separate owned-child experiment observed signal 0 succeeding for both a live process and an exited, unreaped process; the original hosted child's state was not retained, so its exact cause remains unproved.
+- The cleanup regression now independently queries the exact descendant's state, admitting explicit zombie states with documented modifiers or corroborated absence, and rejecting live or uncertain observations. [Apple's ps documentation](https://raw.githubusercontent.com/apple-oss-distributions/adv_cmds/main/ps/ps.1) defines the leading state separately from its modifiers. Production cleanup, identity guards and time budgets are unchanged; real owned-child and failed-query counterexamples cover the assertion.
 
 ## Default Async Callback Compatibility
 - A local debug test aborted reproducibly at the default recovery sleep. The unchanged compiled binary reproduced the failure in the original single wire case; the crash report and matching debug symbols identify the `await sleep(...)` call.
@@ -50,6 +52,6 @@ superseded_by:
 
 ## Delivery State
 - Shared AppCore now reconciles quiet task watches without resubmission or healthy-watch reconnection. Both native UI suites include a fourth named silent-watch playback case, with strict independent fixture metrics.
-- Focused local validation passed 152 Swift cases, including monotonic quiet-deadline boundaries, the normal-interval initial-snapshot fixture, real HTTP/2 cancellation and subscription reuse. All 103 Python helper regressions and repository pre-commit lint/format checks passed on the same unchanged source inputs.
+- Focused local validation passed 152 Swift cases, including monotonic quiet-deadline boundaries, the normal-interval initial-snapshot fixture, real HTTP/2 cancellation and subscription reuse. All 112 Python helper regressions passed, including 82 UI helper cases with no skips. Repository pre-commit lint/format checks remain required.
 - Full local CI, actual current-head GitHub ordinary/native UI CI and GitHub Codex review remain mandatory delivery gates. Focused tests do not substitute for those gates or live Bilibili acceptance.
 - PR-specific head, checks, review, approval and merge receipts belong in PR metadata and ignored local evidence, not this squash-merge target-branch journal.
