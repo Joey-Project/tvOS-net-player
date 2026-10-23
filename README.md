@@ -55,9 +55,11 @@ TVOS_TEST_DESTINATION='platform=tvOS Simulator,name=Apple TV' just test-tvos
 
 ### CI Diagnostics
 
-`just test-ci-helpers` 会运行普通 CI 阶段 runner 与原生 UI helper 的 Python 回归；`just ci` 也包含此检查。普通 GHA CI 保留原有构建、lint 和测试顺序，在外层记录各阶段的真实退出码、耗时、超时、输出截断及清理结果，并上传有界日志和小型 JSON 摘要。本版 JSON 的 `test_summary` 明确为 `null`，测试计数需从保留的阶段日志或原生 UI 结果读取，不把缺失计数当作零；阶段退出成功不替代原生 UI 的指定用例和 metrics 验证。
+`just test-ci-helpers` 会运行普通 CI 阶段 runner 与原生 UI helper 的 Python 回归；`just ci` 也包含此检查。普通 GHA CI 将共享 Core 测试与其余 Apple 构建、lint、XCTest 和 Rust 检查分为两个并行作业，保留全部原有命令。统一的 `tvOS build and tests` 门禁只有在两个作业都成功时才通过，失败、取消或跳过均不算成功。
 
-普通 CI 与 UI job 的上限均为 60 分钟，主要工作期限在 checkout 前记录，截止于首步后的 45 分钟；余量用于独立的诊断、清理、上传和缓存保存。取消或 runner 被强制终止时，不能保证仍能上传产物。普通 CI 每阶段只保留有界的首尾输出并继续排空其余日志，不因正常输出量大而终止测试。
+各阶段记录真实退出码、耗时、超时、输出截断及清理结果，并上传有界日志和小型 JSON 摘要。`ci-stages-<run_id>` 与 `ci-core-stages-<run_id>` 分别保存各自负责的阶段；核对完整 CI 时需一并检查两个产物。本版 JSON 的 `test_summary` 明确为 `null`，测试计数需从保留的阶段日志或原生 UI 结果读取，不把缺失计数当作零；阶段退出成功不替代原生 UI 的指定用例和 metrics 验证。
+
+执行构建和测试的普通 CI 与 UI job 的上限均为 60 分钟，主要工作期限在各自 checkout 前记录，截止于各自首步后的 45 分钟；余量用于独立的诊断、清理、上传和缓存保存。普通 CI 的汇总门禁另有两分钟上限，不执行测试。取消或 runner 被强制终止时，不能保证仍能上传产物。普通 CI 每阶段只保留有界的首尾输出并继续排空其余日志，不因正常输出量大而终止测试。
 
 编译缓存区分 Rust、Swift、普通 CI 与两端 UI job，并绑定实际工具链、平台、依赖及对应源码。PR 可读取适用缓存，只有成功的默认分支 push 才保存；不缓存凭据、用户目录、运行状态、媒体或诊断。缓存命中不会跳过任何原有命令，未命中仍须完成冷构建；配置缓存本身不证明实际命中或提速。
 

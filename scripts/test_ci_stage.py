@@ -220,6 +220,7 @@ class StageTests(IsolatedEnvironmentTests):
 
 class BudgetAndBufferTests(IsolatedEnvironmentTests):
     def test_budget_defaults_and_earlier_absolute_deadline(self) -> None:
+        self.assertEqual(ci_stage.WORK_SECONDS, 45 * 60)
         with mock.patch.object(ci_stage.time, "monotonic", return_value=100):
             self.assertEqual(ci_stage.work_deadline(None, 2700), 2800)
             self.assertEqual(ci_stage.work_deadline("150", 2700), 150)
@@ -257,10 +258,46 @@ class SummaryTests(IsolatedEnvironmentTests):
             root = Path(directory)
             with contextlib.redirect_stdout(io.StringIO()):
                 result = ci_stage.summarize(root)
+            self.assertEqual(set(result), {"schema_version", "stages", "cache_restores"})
+            self.assertEqual(result["schema_version"], 1)
+            self.assertEqual([stage["stage"] for stage in result["stages"]], list(ci_stage.STAGES))
             self.assertEqual(len(result["stages"]), len(ci_stage.STAGES))
             self.assertTrue(all(stage["status"] == "unavailable" for stage in result["stages"]))
             self.assertTrue(all(stage["test_summary"] is None for stage in result["stages"]))
             self.assertEqual(result["cache_restores"], {"rust": "unavailable", "swift": "unavailable"})
+
+    def test_selected_group_reports_only_its_stages_and_missing_selected_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            ci_stage.run_stage("core-tests", [sys.executable, "-c", "pass"], root)
+            ci_stage.run_stage("toolchain-apple", [sys.executable, "-c", "pass"], root)
+            apple = ci_stage.summarize(root, group="apple")
+            core = ci_stage.summarize(root, group="core")
+
+        self.assertEqual([stage["stage"] for stage in apple["stages"]], list(ci_stage.APPLE_STAGES))
+        self.assertEqual(apple["stages"][0]["status"], "passed")
+        self.assertTrue(all(stage["status"] == "unavailable" for stage in apple["stages"][1:]))
+        self.assertNotIn("core-tests", [stage["stage"] for stage in apple["stages"]])
+        self.assertEqual([stage["stage"] for stage in core["stages"]], ["core-tests"])
+        self.assertEqual(core["stages"][0]["status"], "passed")
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            missing = ci_stage.summarize(Path(directory), group="core")
+        self.assertEqual([stage["stage"] for stage in missing["stages"]], ["core-tests"])
+        self.assertEqual(missing["stages"][0]["status"], "unavailable")
+        self.assertIsNone(missing["stages"][0]["test_summary"])
+
+    def test_invalid_summary_group_is_rejected_by_function_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(ci_stage.StageError):
+                ci_stage.summarize(root, group="unknown")
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT), "--artifact-dir", str(root), "--summarize",
+                 "--summary-group", "unknown"],
+                capture_output=True, timeout=5, check=False,
+            )
+        self.assertEqual(completed.returncode, 2)
 
     def test_summary_records_real_results_and_cache_state_not_performance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -323,6 +360,16 @@ def workflow_steps(path: Path) -> dict[str, str]:
     body = path.read_text().split("    steps:\n", 1)[1]
     return {block.splitlines()[0].removeprefix("      - name: "): block
             for block in re.split(r"(?=      - name: )", body) if block.strip()}
+
+
+def workflow_job(path: Path, job_id: str) -> str:
+    source = path.read_text()
+    match = re.search(rf"(?m)^  {re.escape(job_id)}:\n", source)
+    if match is None:
+        raise AssertionError(f"Missing workflow job {job_id}.")
+    rest = source[match.end():]
+    next_job = re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", rest)
+    return rest[:next_job.start()] if next_job else rest
 
 
 def run_fragment(step: str) -> str:
@@ -391,6 +438,12 @@ class WorkflowTests(IsolatedEnvironmentTests):
                     for source in ("Package.swift", "Package.resolved", "Vendor/**", "Sources/**", "Tests/**"):
                         self.assertIn(source, key)
                     self.assertNotIn("Cargo.lock", key)
+                    if path.name == "ci.yml":
+                        self.assertEqual(
+                            re.findall(r"'([^']+)'", key),
+                            ["Package.swift", "Package.resolved", "Vendor/**", "Sources/**", "Tests/**",
+                             "scripts/test.sh", "scripts/ui-e2e.py"],
+                        )
 
     def test_original_commands_order_concurrency_and_policies_are_preserved(self) -> None:
         ci = self.paths[0].read_text()
@@ -398,13 +451,14 @@ class WorkflowTests(IsolatedEnvironmentTests):
             ("pre-commit", "scripts/pre-commit.sh"), ("tvos-build", "scripts/build.sh"),
             ("macos-build", "scripts/build-macos.sh"), ("rust-build", "scripts/build-cache-server.sh"),
             ("tvos-test-build", "scripts/build-for-testing.sh"), ("tvos-tests", "scripts/test-tvos-simulator.sh"),
-            ("core-tests", "scripts/test.sh"), ("macos-tests", "scripts/test-macos.sh"),
+            ("macos-tests", "scripts/test-macos.sh"),
             ("lan-probe", "bash scripts/test-lan-playback.sh"), ("rust-tests", "scripts/test-cache-server.sh"),
         )
         offsets = []
         for stage, command in originals:
             offsets.append(ci.index(f"run: python3 scripts/ci-stage.py --stage {stage} -- {command}\n"))
         self.assertEqual(offsets, sorted(offsets))
+        self.assertEqual(ci.count("run: python3 scripts/ci-stage.py --stage core-tests -- scripts/test.sh\n"), 1)
         self.assertIn("--stage helper-regressions -- python3 -m unittest discover -s scripts -p 'test_*.py' -v", ci)
         for path in self.paths:
             text = path.read_text()
@@ -417,16 +471,79 @@ class WorkflowTests(IsolatedEnvironmentTests):
         self.assertIn('run: python3 scripts/ui-e2e.py --platform "${{ matrix.platform }}"', ui)
         self.assertIn("        run: scripts/build-cache-server.sh", ui)
 
+    def test_jobs_partition_all_stages_and_aggregate_both_results(self) -> None:
+        path = self.paths[0]
+        apple = workflow_job(path, "apple-platforms")
+        core = workflow_job(path, "core-unit-tests")
+        aggregate = workflow_job(path, "tvos-build-and-tests")
+        apple_stages = re.findall(r"python3 scripts/ci-stage.py --stage ([a-z-]+)", apple)
+        core_stages = re.findall(r"python3 scripts/ci-stage.py --stage ([a-z-]+)", core)
+
+        self.assertEqual(len(apple_stages), 13)
+        self.assertEqual(len(core_stages), 1)
+        self.assertEqual(set(apple_stages), set(ci_stage.APPLE_STAGES))
+        self.assertEqual(core_stages, ["core-tests"])
+        self.assertFalse(set(apple_stages) & set(core_stages))
+        self.assertEqual(set(apple_stages) | set(core_stages), set(ci_stage.STAGES))
+        self.assertNotIn("needs:", apple)
+        self.assertNotIn("needs:", core)
+        self.assertTrue(core.split("    steps:\n", 1)[1].startswith(
+            "      - name: Establish CI work deadline\n"))
+        self.assertIn("timeout-minutes: 60", core)
+
+        self.assertIn("name: tvOS build and tests", aggregate)
+        self.assertIn("needs: [apple-platforms, core-unit-tests]", aggregate)
+        self.assertIn("if: always()", aggregate)
+        self.assertIn("runs-on: ubuntu-latest", aggregate)
+        self.assertIn("timeout-minutes: 2", aggregate)
+        self.assertNotIn("actions/checkout@", aggregate)
+        self.assertIn("APPLE_RESULT: ${{ needs.apple-platforms.result }}", aggregate)
+        self.assertIn("CORE_RESULT: ${{ needs.core-unit-tests.result }}", aggregate)
+        self.assertIn('"$APPLE_RESULT" != "success"', aggregate)
+        self.assertIn('"$CORE_RESULT" != "success"', aggregate)
+
+    def test_aggregate_script_accepts_only_both_success_results(self) -> None:
+        step = workflow_steps(self.paths[0])["Require both CI jobs to succeed"]
+        fragment = run_fragment(step)
+        safe_keys = {
+            "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+            "TERM", "CI", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "SWIFT_EXEC",
+            "SWIFT_DRIVER_SWIFT_FRONTEND_EXEC", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
+            "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR",
+        }
+        safe_env = {key: value for key, value in os.environ.items() if key in safe_keys}
+        safe_env.setdefault("PATH", os.defpath)
+        results = ("success", "failure", "cancelled", "skipped", "", "unknown")
+
+        for apple_result in results:
+            for core_result in results:
+                with self.subTest(apple=apple_result, core=core_result):
+                    completed = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", fragment],
+                        env={**safe_env, "APPLE_RESULT": apple_result, "CORE_RESULT": core_result},
+                        capture_output=True, timeout=2, check=False,
+                    )
+                    self.assertEqual(completed.returncode == 0,
+                                     apple_result == "success" and core_result == "success")
+
     def test_upload_is_always_and_exact_allowlist_is_under_aggregate_cap(self) -> None:
         steps = workflow_steps(self.paths[0])
         upload = steps["Upload bounded CI diagnostics"]
+        core_upload = steps["Upload bounded core diagnostics"]
         summary = steps["Summarize bounded CI diagnostics"]
+        core_summary = steps["Summarize bounded core CI diagnostics"]
         self.assertIn("if: always()", upload)
+        self.assertIn("if: always()", core_upload)
         self.assertIn("if: always()", summary)
+        self.assertIn("if: always()", core_summary)
         paths = re.findall(r"\$\{\{ env.CI_STAGE_ARTIFACT_DIR \}\}/([^\n]+)", upload)
-        expected = {f"{stage}.{suffix}" for stage in ci_stage.STAGES for suffix in ("log", "json")}
+        expected = {f"{stage}.{suffix}" for stage in ci_stage.APPLE_STAGES for suffix in ("log", "json")}
         self.assertEqual(set(paths), expected | {"summary.json"})
         self.assertEqual(len(paths), len(expected) + 1)
+        core_paths = re.findall(r"\$\{\{ env.CI_STAGE_ARTIFACT_DIR \}\}/([^\n]+)", core_upload)
+        self.assertEqual(set(core_paths), {"core-tests.log", "core-tests.json", "summary.json"})
+        self.assertIn("--summary-group apple", summary)
+        self.assertIn("--summary-group core", core_summary)
 
 
 if __name__ == "__main__":

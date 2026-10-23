@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   apple-platforms:
-    name: tvOS build and tests
+    name: Apple platform build and tests
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -82,18 +82,6 @@ jobs:
           path: target
           key: ci-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-toolchains.outputs.rust }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/**', 'CacheServer/RustCacheServer/Cargo.toml', 'CacheServer/RustCacheServer/build.rs', 'CacheServer/RustCacheServer/src/**', 'CacheServer/RustCacheServer/tests/**', 'Sources/TVOSNetPlayerCacheClient/Protos/**', 'scripts/build-cache-server.sh', 'scripts/test-cache-server.sh', 'scripts/lint-rust.sh') }}
 
-      - name: Restore Swift compiled cache
-        id: restore-swift
-        if: steps.cache-toolchains.outputs.swift != ''
-        uses: actions/cache/restore@v5
-        timeout-minutes: 2
-        continue-on-error: true
-        env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
-        with:
-          path: .build
-          key: ci-swift-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-toolchains.outputs.swift }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Vendor/**', 'Sources/**', 'Tests/**', 'scripts/test.sh', 'scripts/ui-e2e.py') }}
-
       - name: Run CI helper regression tests
         run: python3 scripts/ci-stage.py --stage helper-regressions -- python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
@@ -115,9 +103,6 @@ jobs:
       - name: Run tvOS XCTest target
         run: python3 scripts/ci-stage.py --stage tvos-tests -- scripts/test-tvos-simulator.sh
 
-      - name: Run core unit tests
-        run: python3 scripts/ci-stage.py --stage core-tests -- scripts/test.sh
-
       - name: Run macOS XCTest target
         run: python3 scripts/ci-stage.py --stage macos-tests -- scripts/test-macos.sh
 
@@ -133,9 +118,7 @@ jobs:
         env:
           CI_RUST_CACHE_OUTCOME: ${{ steps.restore-rust.outcome }}
           CI_RUST_CACHE_HIT: ${{ steps.restore-rust.outputs.cache-hit }}
-          CI_SWIFT_CACHE_OUTCOME: ${{ steps.restore-swift.outcome }}
-          CI_SWIFT_CACHE_HIT: ${{ steps.restore-swift.outputs.cache-hit }}
-        run: python3 scripts/ci-stage.py --summarize
+        run: python3 scripts/ci-stage.py --summarize --summary-group apple
 
       - name: Upload bounded CI diagnostics
         if: always()
@@ -164,8 +147,6 @@ jobs:
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-test-build.json
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-tests.log
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/tvos-tests.json
-            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.log
-            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.json
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-tests.log
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/macos-tests.json
             ${{ env.CI_STAGE_ARTIFACT_DIR }}/lan-probe.log
@@ -185,6 +166,71 @@ jobs:
           path: target
           key: ${{ steps.restore-rust.outputs.cache-primary-key }}
 
+  core-unit-tests:
+    name: Core unit tests
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Establish CI work deadline
+        run: |
+          deadline="$(python3 -c 'import time; print(time.monotonic() + 45 * 60)')"
+          printf 'CI_WORK_DEADLINE_MONOTONIC=%s\n' "$deadline" >> "$GITHUB_ENV"
+          printf 'CI_STAGE_ARTIFACT_DIR=%s/ci-stage-artifacts\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compute Swift compiled cache identity
+        id: cache-swift-toolchain
+        timeout-minutes: 2
+        continue-on-error: true
+        run: |
+          apple="$(xcodebuild -version)"
+          swift="$(xcrun swift --version)"
+          sdks="$(xcodebuild -showsdks)"
+          clang="$(xcrun clang --version)"
+          os="$(sw_vers -buildVersion)"
+          printf 'Apple:\n%s\nSwift:\n%s\nSDKs:\n%s\nClang:\n%s\nmacOS build: %s\n' \
+            "$apple" "$swift" "$sdks" "$clang" "$os"
+          apple_key="$(printf '%s\n' "$apple" "$swift" "$sdks" "$clang" "$os" | shasum -a 256 | cut -d ' ' -f 1)"
+          printf 'swift=%s\n' "$apple_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Swift compiled cache
+        id: restore-swift
+        if: steps.cache-swift-toolchain.outputs.swift != ''
+        uses: actions/cache/restore@v5
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+        with:
+          path: .build
+          key: ci-swift-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-swift-toolchain.outputs.swift }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Vendor/**', 'Sources/**', 'Tests/**', 'scripts/test.sh', 'scripts/ui-e2e.py') }}
+
+      - name: Run core unit tests
+        run: python3 scripts/ci-stage.py --stage core-tests -- scripts/test.sh
+
+      - name: Summarize bounded core CI diagnostics
+        if: always()
+        timeout-minutes: 1
+        env:
+          CI_SWIFT_CACHE_OUTCOME: ${{ steps.restore-swift.outcome }}
+          CI_SWIFT_CACHE_HIT: ${{ steps.restore-swift.outputs.cache-hit }}
+        run: python3 scripts/ci-stage.py --summarize --summary-group core
+
+      - name: Upload bounded core diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: ci-core-stages-${{ github.run_id }}
+          path: |
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.log
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/core-tests.json
+            ${{ env.CI_STAGE_ARTIFACT_DIR }}/summary.json
+          if-no-files-found: warn
+          retention-days: 3
+
       - name: Save Swift compiled cache
         if: success() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.restore-swift.outputs.cache-primary-key != '' && steps.restore-swift.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -193,3 +239,20 @@ jobs:
         with:
           path: .build
           key: ${{ steps.restore-swift.outputs.cache-primary-key }}
+
+  tvos-build-and-tests:
+    name: tvOS build and tests
+    needs: [apple-platforms, core-unit-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require both CI jobs to succeed
+        env:
+          APPLE_RESULT: ${{ needs.apple-platforms.result }}
+          CORE_RESULT: ${{ needs.core-unit-tests.result }}
+        run: |
+          if [[ "$APPLE_RESULT" != "success" || "$CORE_RESULT" != "success" ]]; then
+            printf 'Required CI jobs did not both succeed (apple=%s, core=%s).\n' "$APPLE_RESULT" "$CORE_RESULT" >&2
+            exit 1
+          fi
